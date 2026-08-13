@@ -561,6 +561,44 @@ function syncLibrary(files) {
   });
 }
 
+// --- Library uploads ---
+
+const libUpload = document.getElementById('lib-upload');
+const libUploadStatus = document.getElementById('lib-upload-status');
+
+libUpload.addEventListener('change', async () => {
+  const files = [...libUpload.files];
+  libUpload.value = '';
+  for (const file of files) {
+    await uploadClip(file);
+  }
+  setTimeout(() => { libUploadStatus.textContent = ''; }, 4000);
+});
+
+function uploadClip(file) {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/upload?name=${encodeURIComponent(file.name)}`);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        libUploadStatus.textContent = `${file.name} — ${Math.round((e.loaded / e.total) * 100)}%`;
+      }
+    };
+    xhr.onload = () => {
+      libUploadStatus.textContent = xhr.status === 200
+        ? `${xhr.responseText} added`
+        : `${file.name}: ${xhr.responseText || 'upload failed'}`;
+      resolve();
+    };
+    xhr.onerror = () => {
+      libUploadStatus.textContent = `${file.name}: upload failed`;
+      resolve();
+    };
+    libUploadStatus.textContent = `${file.name} — 0%`;
+    xhr.send(file);
+  });
+}
+
 // --- Sync transport ---
 
 function syncTransport(paused) {
@@ -843,9 +881,26 @@ audioGain.addEventListener('input', () => {
   sendAction({ action: 'set_audio', param: 'gain', value: v });
 });
 
+const audioDevice = document.getElementById('audio-device');
+audioDevice.addEventListener('change', () => {
+  sendAction({ action: 'set_audio', param: 'device', value: audioDevice.value });
+});
+
+let knownDevices = '';
+function syncAudioDevices(devices, selected) {
+  const key = (devices || []).join('|');
+  if (key !== knownDevices) {
+    knownDevices = key;
+    audioDevice.innerHTML = '<option value="">Default</option>' +
+      (devices || []).map(d => `<option value="${d.replace(/"/g, '&quot;')}">${d}</option>`).join('');
+  }
+  if (document.activeElement !== audioDevice) audioDevice.value = selected || '';
+}
+
 function syncAudio(a) {
   if (!a) return;
   if (document.activeElement !== audioEnabled) audioEnabled.checked = a.enabled;
+  syncAudioDevices(a.devices, a.selected);
   if (document.activeElement !== audioGain) {
     audioGain.value = a.gain;
     audioGainVal.textContent = a.gain.toFixed(2);

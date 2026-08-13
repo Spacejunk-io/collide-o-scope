@@ -20,6 +20,8 @@ pub struct WebState {
     pub thumbnails: std::sync::RwLock<HashMap<String, Vec<u8>>>,
     /// Preview frames: filename → vec of JPEG frames (for hover animation)
     pub preview_frames: std::sync::RwLock<HashMap<String, Vec<Vec<u8>>>>,
+    /// Library folder for clip uploads (set by the app; None until known).
+    pub library_folder: std::sync::RwLock<Option<std::path::PathBuf>>,
     /// Per-session access token. Loopback clients are exempt; LAN clients
     /// must present it (the QR code carries it) and get a cookie back.
     pub access_token: String,
@@ -262,6 +264,12 @@ pub struct AudioSnapshot {
     pub device: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// Available input device names, for the device select.
+    #[serde(default)]
+    pub devices: Vec<String>,
+    /// Preferred device name ("" = system default).
+    #[serde(default)]
+    pub selected: String,
 }
 
 impl ModSnapshot {
@@ -455,6 +463,9 @@ pub enum WebAction {
     /// Set the morph crossfader position (0 = A, 1 = B)
     #[serde(rename = "set_morph")]
     SetMorph { value: f32 },
+    /// Rescan the library folder (pushed internally after an upload)
+    #[serde(rename = "rescan_library")]
+    RescanLibrary,
     /// Set a temporal effect parameter
     #[serde(rename = "set_temporal")]
     SetTemporal { param: String, value: serde_json::Value },
@@ -546,6 +557,7 @@ impl WebState {
             actions: Mutex::new(Vec::new()),
             thumbnails: std::sync::RwLock::new(HashMap::new()),
             preview_frames: std::sync::RwLock::new(HashMap::new()),
+            library_folder: std::sync::RwLock::new(None),
             access_token: generate_token(),
             lan_url: std::sync::RwLock::new(String::new()),
         })

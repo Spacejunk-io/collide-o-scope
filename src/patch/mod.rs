@@ -117,6 +117,8 @@ pub struct ModConfig {
     #[serde(default = "one")]
     pub audio_gain: f32,
     #[serde(default)]
+    pub audio_device: String,
+    #[serde(default)]
     pub midi_enabled: bool,
     #[serde(default = "default_midi_ccs")]
     pub midi_ccs: Vec<u8>,
@@ -181,6 +183,7 @@ impl ModConfig {
                 .collect(),
             audio_enabled: m.audio_enabled,
             audio_gain: m.audio_gain,
+            audio_device: m.audio_device.clone(),
             midi_enabled: m.midi_enabled,
             midi_ccs: m.midi_ccs.to_vec(),
             midi_clock_sync: m.midi_clock_sync,
@@ -208,6 +211,7 @@ impl ModConfig {
             .collect();
         m.audio_enabled = self.audio_enabled;
         m.audio_gain = self.audio_gain.clamp(0.0, 8.0);
+        m.audio_device = self.audio_device.clone();
         m.midi_enabled = self.midi_enabled;
         for (i, &cc) in self.midi_ccs.iter().take(m.midi_ccs.len()).enumerate() {
             m.midi_ccs[i] = cc & 0x7F;

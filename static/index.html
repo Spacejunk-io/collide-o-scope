@@ -11,7 +11,12 @@
     <main class="columns">
       <!-- LEFT: Library -->
       <aside class="col-left">
-        <h3 class="panel-title">Library</h3>
+        <h3 class="panel-title">Library
+          <label class="lib-upload-btn" title="Add clips to the library">+
+            <input type="file" id="lib-upload" accept="video/mp4,video/webm,video/quicktime,video/x-msvideo,video/x-matroska,.mp4,.webm,.mov,.avi,.mkv" multiple hidden>
+          </label>
+        </h3>
+        <div class="lib-upload-status" id="lib-upload-status"></div>
         <div class="library-grid" id="library-grid">
           <!-- Library items rendered by JS -->
         </div>
@@ -289,6 +294,10 @@
               <div class="param-row toggle-row">
                 <label>Enable</label>
                 <label class="toggle"><input type="checkbox" id="audio-enabled"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row select-row">
+                <label>Input</label>
+                <select id="audio-device"><option value="">Default</option></select>
               </div>
               <div class="param-row">
                 <label>Gain</label>

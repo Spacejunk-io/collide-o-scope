@@ -17,13 +17,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{ConnectInfo, Path, Request, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use futures::{SinkExt, StreamExt};
+use tokio::io::AsyncWriteExt;
 
 use super::state::{WebAction, WebState};
 use super::static_files;
@@ -66,6 +67,10 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
                 .route("/thumb/:filename", get(thumb_handler))
                 .route("/preview/:filename/:index", get(preview_handler))
                 .route("/qr.svg", get(qr_handler))
+                .route(
+                    "/upload",
+                    post(upload_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)),
+                )
                 .fallback(get(static_files::serve))
                 .layer(middleware::from_fn_with_state(state.clone(), auth))
                 .with_state(state);
@@ -265,6 +270,104 @@ async fn qr_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
         )
             .into_response(),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct UploadQuery {
+    name: String,
+}
+
+/// Streamed clip upload into the library folder. The body is written in
+/// chunks to a temp file (never buffered whole in memory), renamed into
+/// place on success, and the render thread is asked to rescan. Names are
+/// reduced to their final path component and must carry a known video
+/// extension; collisions get a numbered suffix rather than overwriting.
+async fn upload_handler(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<UploadQuery>,
+    body: axum::body::Body,
+) -> Response {
+    // Sanitize: no directory components, no hidden files.
+    let name = std::path::Path::new(&query.name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = std::path::Path::new(&name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name.is_empty() || name.starts_with('.')
+        || !matches!(ext.as_str(), "mp4" | "webm" | "mov" | "avi" | "mkv")
+    {
+        return (StatusCode::BAD_REQUEST, "unsupported file type").into_response();
+    }
+
+    let Some(folder) = state.library_folder.read().ok().and_then(|f| f.clone()) else {
+        return (
+            StatusCode::CONFLICT,
+            "no library folder open — load a folder in the app first",
+        )
+            .into_response();
+    };
+
+    // Collisions get " (n)" suffixes instead of overwriting.
+    let stem = std::path::Path::new(&name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "clip".to_string());
+    let mut final_name = name.clone();
+    let mut counter = 1;
+    while folder.join(&final_name).exists() {
+        final_name = format!("{stem} ({counter}).{ext}");
+        counter += 1;
+    }
+    let final_path = folder.join(&final_name);
+    let temp_path = folder.join(format!(".upload-{final_name}.part"));
+
+    let mut file = match tokio::fs::File::create(&temp_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("create: {e}"))
+                .into_response()
+        }
+    };
+
+    let mut stream = body.into_data_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                if let Err(e) = file.write_all(&bytes).await {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
+                        .into_response();
+                }
+                written += bytes.len() as u64;
+            }
+            Err(e) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return (StatusCode::BAD_REQUEST, format!("stream: {e}")).into_response();
+            }
+        }
+    }
+    if file.flush().await.is_err() || written == 0 {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return (StatusCode::BAD_REQUEST, "empty upload").into_response();
+    }
+    drop(file);
+
+    if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
+    }
+
+    log::info!("Uploaded clip: {final_name} ({written} bytes)");
+    state.actions.lock().await.push(WebAction::RescanLibrary);
+
+    (StatusCode::OK, final_name).into_response()
 }
 
 async fn thumb_handler(

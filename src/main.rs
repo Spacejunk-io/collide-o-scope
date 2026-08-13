@@ -85,6 +85,11 @@ impl App {
             .map(|f| scan_folder(f))
             .unwrap_or_default();
 
+        // The web server needs the folder for clip uploads.
+        if let Ok(mut lf) = web_state.library_folder.write() {
+            *lf = library_folder.clone();
+        }
+
         // Generate thumbnails on background thread
         generate_thumbnails(&library_files, web_state.clone());
 
@@ -169,6 +174,9 @@ impl App {
 
     fn set_library_folder(&mut self, folder: PathBuf) {
         self.library_files = scan_folder(&folder);
+        if let Ok(mut lf) = self.web_state.library_folder.write() {
+            *lf = Some(folder.clone());
+        }
         self.library_folder = Some(folder);
     }
 
@@ -306,6 +314,16 @@ impl App {
                             self.mod_matrix.audio_gain = (n as f32).clamp(0.0, 8.0);
                         }
                     }
+                    "device" => {
+                        if let Some(s) = value.as_str() {
+                            self.mod_matrix.audio_device = s.to_string();
+                            // Restart on the new device if currently running;
+                            // the frame loop re-opens it while enabled.
+                            if self.audio.is_running() {
+                                self.audio.stop();
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -378,6 +396,33 @@ impl App {
             }
             WebAction::SetMorph { value } => {
                 self.morph.t = value.clamp(0.0, 1.0);
+            }
+            WebAction::RescanLibrary => {
+                if let Some(folder) = self.library_folder.clone() {
+                    self.library_files = scan_folder(&folder);
+                    // Thumbnails only for clips the cache hasn't seen.
+                    let new_files: Vec<PathBuf> = self
+                        .library_files
+                        .iter()
+                        .filter(|p| {
+                            let name = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            !self
+                                .web_state
+                                .thumbnails
+                                .read()
+                                .map(|c| c.contains_key(&name))
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !new_files.is_empty() {
+                        log::info!("Library rescan: {} new clip(s)", new_files.len());
+                        generate_thumbnails(&new_files, self.web_state.clone());
+                    }
+                }
             }
             WebAction::SetTemporal { param, value } => {
                 let p = &mut self.temporal_params;
@@ -568,6 +613,8 @@ impl App {
                 noise: self.mod_matrix.audio.noise,
                 device: self.audio.device_name.clone(),
                 error: self.audio.error.clone(),
+                devices: self.audio.devices.clone(),
+                selected: self.mod_matrix.audio_device.clone(),
             },
             midi: MidiSnapshot {
                 enabled: self.mod_matrix.midi_enabled,
@@ -1110,7 +1157,8 @@ impl ApplicationHandler for App {
                     // Sync audio capture with the requested state, then feed
                     // the latest analysis into the matrix as a source.
                     if self.mod_matrix.audio_enabled && !self.audio.is_running() {
-                        self.audio.start();
+                        let device = self.mod_matrix.audio_device.clone();
+                        self.audio.start(&device);
                         if !self.audio.error.is_empty() {
                             // Device failed — flip the switch back off so the
                             // UI reflects reality instead of retrying forever.

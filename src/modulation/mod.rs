@@ -327,6 +327,8 @@ pub struct ModMatrix {
     pub audio_enabled: bool,
     /// Gain applied to normalized audio levels before routing.
     pub audio_gain: f32,
+    /// Preferred input device name; empty = system default.
+    pub audio_device: String,
     /// Latest MIDI slot values 0..1 (pushed by the app from the MIDI engine).
     pub midi: [f32; NUM_MIDI_SLOTS],
     /// Whether MIDI input should be connected (the app syncs the engine).
@@ -355,6 +357,7 @@ impl ModMatrix {
             audio: AudioLevels::default(),
             audio_enabled: false,
             audio_gain: 1.0,
+            audio_device: String::new(),
             midi: [0.0; NUM_MIDI_SLOTS],
             midi_enabled: false,
             // CC1 (mod wheel) and the common first knobs on most controllers.

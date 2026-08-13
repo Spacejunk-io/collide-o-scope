@@ -100,6 +100,8 @@ pub struct AudioAnalyzer {
     smoothed: AudioLevels,
     pub device_name: String,
     pub error: String,
+    /// Input device names, refreshed on every start (for the UI select).
+    pub devices: Vec<String>,
 }
 
 impl AudioAnalyzer {
@@ -111,7 +113,7 @@ impl AudioAnalyzer {
                 0.5 - 0.5 * (std::f32::consts::TAU * x).cos()
             })
             .collect();
-        Self {
+        let mut analyzer = Self {
             shared: Arc::new(SharedAudio {
                 samples: Mutex::new(VecDeque::with_capacity(MAX_BUFFERED)),
                 sample_rate: AtomicU32::new(48000),
@@ -130,23 +132,50 @@ impl AudioAnalyzer {
             smoothed: AudioLevels::default(),
             device_name: String::new(),
             error: String::new(),
-        }
+            devices: Vec::new(),
+        };
+        analyzer.refresh_devices();
+        analyzer
+    }
+
+    /// Enumerate available input devices (names) into the cache.
+    pub fn refresh_devices(&mut self) {
+        let host = cpal::default_host();
+        self.devices = host
+            .input_devices()
+            .map(|iter| iter.filter_map(|d| d.name().ok()).collect())
+            .unwrap_or_default();
     }
 
     pub fn is_running(&self) -> bool {
         self.stream.is_some()
     }
 
-    /// Open the default input device and start capturing. Failure is soft:
+    /// Open an input device and start capturing. `preferred` selects a
+    /// device by name; empty means the system default. Failure is soft:
     /// the error is recorded for the UI and every level reads 0.
-    pub fn start(&mut self) {
+    pub fn start(&mut self, preferred: &str) {
         if self.stream.is_some() {
             return;
         }
         self.error.clear();
+        self.refresh_devices();
 
         let host = cpal::default_host();
-        let Some(device) = host.default_input_device() else {
+        let device = if preferred.is_empty() {
+            host.default_input_device()
+        } else {
+            host.input_devices()
+                .ok()
+                .and_then(|mut iter| {
+                    iter.find(|d| d.name().map(|n| n == preferred).unwrap_or(false))
+                })
+                .or_else(|| {
+                    log::warn!("Audio device '{preferred}' not found; using default");
+                    host.default_input_device()
+                })
+        };
+        let Some(device) = device else {
             self.error = "no audio input device".to_string();
             return;
         };
