@@ -38,8 +38,19 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
     }
 
-    // overlay.rgb is straight-alpha color. Apply its key/source alpha exactly
-    // once here; the effects pass deliberately does not premultiply it.
-    let result = mix(base.rgb, blended, uniforms.opacity * overlay.a);
-    return vec4f(result, max(base.a, overlay.a * uniforms.opacity));
+    // Both inputs carry straight (un-premultiplied) RGB. Composite the blend
+    // result in premultiplied space, then return straight RGB so keyed holes
+    // remain transparent through every layer without acquiring dark fringes.
+    let source_alpha = clamp(uniforms.opacity, 0.0, 1.0) * overlay.a;
+    let output_alpha = source_alpha + base.a * (1.0 - source_alpha);
+    let output_premultiplied =
+        base.rgb * base.a * (1.0 - source_alpha)
+        + overlay.rgb * source_alpha * (1.0 - base.a)
+        + blended * base.a * source_alpha;
+    let output_rgb = select(
+        vec3f(0.0),
+        output_premultiplied / max(output_alpha, 0.000001),
+        output_alpha > 0.000001,
+    );
+    return vec4f(output_rgb, output_alpha);
 }

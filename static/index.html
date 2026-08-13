@@ -14,7 +14,7 @@
       <aside class="col-left">
         <h3 class="panel-title">Library
           <label class="lib-upload-btn" title="Add clips to the library">+
-            <input type="file" id="lib-upload" accept="video/mp4,video/webm,video/quicktime,video/x-msvideo,video/x-matroska,.mp4,.webm,.mov,.avi,.mkv" multiple hidden>
+            <input type="file" id="lib-upload" accept="video/mp4,video/webm,video/quicktime,video/x-msvideo,video/x-matroska,image/png,image/jpeg,image/bmp,image/webp,audio/wav,audio/mpeg,audio/flac,audio/ogg,audio/opus,audio/mp4,audio/aac,.mp4,.webm,.mov,.avi,.mkv,.png,.jpg,.jpeg,.bmp,.webp,.wav,.mp3,.flac,.ogg,.opus,.m4a,.aac" multiple hidden>
           </label>
         </h3>
         <div class="lib-upload-status" id="lib-upload-status"></div>
@@ -47,8 +47,8 @@
       <!-- RIGHT: Transport + Master Effects -->
       <aside class="col-right">
         <div class="transport-row">
-          <button class="transport-btn" id="btn-play-all" title="Play All">&#x25B6;</button>
-          <button class="transport-btn" id="btn-stop" title="Reset FX">&#x21BA;</button>
+          <button class="transport-btn" type="button" id="btn-play-all" title="Play visual program" aria-label="Play visual program">&#x25B6;</button>
+          <button class="transport-btn" type="button" id="btn-revert-master" title="Revert master visual state (layers and transport are preserved)" aria-label="Revert master visual state; layers and transport are preserved">&#x21BA;</button>
           <button class="transport-btn blackout-btn" id="btn-blackout" title="Blackout (B)">BLK</button>
           <span class="beat-light" id="beat-light" title="beat"></span>
           <span class="ws-dot" id="ws-status" title="connecting..."></span>
@@ -56,12 +56,12 @@
         <h3 class="panel-title">Master Effects</h3>
         <div class="fx-scroll" id="master-fx">
           <div class="fx-columns">
-          <div class="fx-col"><!-- video effects -->
+          <div class="fx-col" data-fx-column="video"><!-- video effects -->
           <div class="fx-group" data-group="digital">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
               <span class="group-label">DIGITAL</span>
-              <button class="group-reset" data-group="digital">reset</button>
+              <button class="group-reset" data-group="digital" aria-label="Reset digital effects">reset</button>
             </div>
             <div class="fx-group-body">
               <div class="param-row" data-param="pixelate" data-min="1" data-max="32" data-step="1">
@@ -99,7 +99,7 @@
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
               <span class="group-label">ANALOG</span>
-              <button class="group-reset" data-group="analog">reset</button>
+              <button class="group-reset" data-group="analog" aria-label="Reset analog effects">reset</button>
             </div>
             <div class="fx-group-body">
               <div class="param-row" data-param="grain_intensity" data-min="0" data-max="0.3" data-step="0.005">
@@ -130,47 +130,42 @@
             </div>
           </div>
 
-          <div class="fx-group" data-group="motion">
+          <div class="fx-group" data-group="key" id="key-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
-              <span class="group-label">MOTION</span>
-              <button class="group-reset" data-group="motion">reset</button>
+              <span class="group-label">KEYING</span>
+              <button class="group-reset" data-group="key" aria-label="Reset program keying">reset</button>
             </div>
             <div class="fx-group-body">
-              <div class="param-row" data-param="breathe_scale" data-min="0" data-max="0.05" data-step="0.001">
-                <label>Bth Scale</label><input type="range"><span class="value">0</span>
+              <div class="param-row select-row" data-param="key_mode">
+                <label>Mode</label>
+                <select aria-label="Program key mode">
+                  <option value="0">Off</option>
+                  <option value="1">Keep Bright</option>
+                  <option value="2">Keep Dark</option>
+                  <option value="3">Remove Chroma</option>
+                  <option value="4">Keep Chroma</option>
+                </select>
               </div>
-              <div class="param-row" data-param="breathe_rotation" data-min="0" data-max="2" data-step="0.05">
-                <label>Bth Rotate</label><input type="range"><span class="value">0</span>
+              <div class="param-row" data-param="key_color_r" data-min="0" data-max="1" data-step="0.01">
+                <label>Key Red</label><input type="range"><span class="value">0</span>
               </div>
-              <div class="param-row" data-param="breathe_position" data-min="0" data-max="0.02" data-step="0.001">
-                <label>Bth Drift</label><input type="range"><span class="value">0</span>
+              <div class="param-row" data-param="key_color_g" data-min="0" data-max="1" data-step="0.01">
+                <label>Key Green</label><input type="range"><span class="value">1</span>
               </div>
-            </div>
-          </div>
-
-          <div class="fx-group" data-group="temporal" id="temporal-group">
-            <div class="fx-group-header">
-              <span class="chevron">&#x25BC;</span>
-              <span class="group-label">TEMPORAL</span>
-              <button class="group-reset" data-group="temporal">reset</button>
-            </div>
-            <div class="fx-group-body">
-              <div class="param-row" data-temporal="feedback" data-min="0" data-max="0.95" data-step="0.01">
-                <label>Feedback</label><input type="range"><span class="value">0</span>
+              <div class="param-row" data-param="key_color_b" data-min="0" data-max="1" data-step="0.01">
+                <label>Key Blue</label><input type="range"><span class="value">0</span>
               </div>
-              <div class="param-row" data-temporal="fb_zoom" data-min="0.9" data-max="1.1" data-step="0.005">
-                <label>FB Zoom</label><input type="range"><span class="value">1</span>
+              <div class="param-row" data-param="key_threshold" data-min="0" data-max="1" data-step="0.01">
+                <label>Threshold</label><input type="range"><span class="value">0.5</span>
               </div>
-              <div class="param-row" data-temporal="fb_rotate" data-min="-5" data-max="5" data-step="0.1">
-                <label>FB Rotate</label><input type="range"><span class="value">0</span>
+              <div class="param-row" data-param="key_softness" data-min="0" data-max="0.5" data-step="0.01">
+                <label>Softness</label><input type="range"><span class="value">0.1</span>
               </div>
-              <div class="param-row" data-temporal="slitscan" data-min="0" data-max="1" data-step="0.01">
-                <label>Slit-Scan</label><input type="range"><span class="value">0</span>
+              <div class="param-row" data-param="key_tolerance" data-min="0" data-max="1" data-step="0.01">
+                <label>Chroma Tol.</label><input type="range"><span class="value">0.15</span>
               </div>
-              <div class="param-row" data-temporal="slit_angle" data-min="-180" data-max="180" data-step="1">
-                <label>Slit Angle</label><input type="range"><span class="value">0°</span>
-              </div>
+              <div class="audio-status">Program keying cuts the final flattened image to black. Layer keying instead reveals lower layers.</div>
             </div>
           </div>
 
@@ -178,7 +173,7 @@
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
               <span class="group-label">VHS</span>
-              <button class="group-reset" data-group="vhs">reset</button>
+              <button class="group-reset" data-group="vhs" aria-label="Reset VHS effects">reset</button>
             </div>
             <div class="fx-group-body">
               <div class="audio-status error" id="ntsc-status" role="status" aria-live="polite"></div>
@@ -252,34 +247,7 @@
           </div>
 
           </div>
-          <div class="fx-col"><!-- the morphing hub and its matrix -->
-          <div class="fx-group" data-group="mod" id="mod-group">
-            <div class="fx-group-header">
-              <span class="chevron">&#x25BC;</span>
-              <span class="group-label">MOD MATRIX</span>
-              <button class="group-reset" data-group="mod">reset</button>
-            </div>
-            <div class="fx-group-body">
-              <div class="param-row bpm-row">
-                <label>BPM</label>
-                <input type="number" id="bpm-input" min="30" max="300" step="0.1" value="120">
-                <button id="tap-tempo" class="btn-tap">TAP</button>
-              </div>
-              <div class="param-row toggle-row">
-                <label>Beat latch</label>
-                <label class="toggle"><input type="checkbox" id="beat-quantize"><span class="toggle-slider"></span></label>
-                <span class="audio-status" id="beat-quantize-status"></span>
-              </div>
-              <div id="lfo-list">
-                <!-- LFO rows rendered by JS -->
-              </div>
-              <div id="routing-list">
-                <!-- Routing rows rendered by JS -->
-              </div>
-              <button id="add-routing" class="btn-add-routing">+ routing</button>
-            </div>
-          </div>
-
+          <div class="fx-col" data-fx-column="mod-morph"><!-- morph, time-domain effects, and audio -->
           <div class="fx-group" id="morph-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -287,13 +255,13 @@
             </div>
             <div class="fx-group-body">
               <div class="morph-buttons">
-                <button id="morph-set-a" class="morph-btn">Set A</button>
-                <button id="morph-set-b" class="morph-btn">Set B</button>
+                <button id="morph-set-a" class="morph-btn" aria-pressed="false">Set A</button>
+                <button id="morph-set-b" class="morph-btn" aria-pressed="false">Set B</button>
                 <button id="morph-clear" class="morph-btn">Clear</button>
               </div>
               <div class="morph-fader-row">
                 <span class="morph-end" id="morph-label-a">A</span>
-                <input type="range" id="morph-t" min="0" max="1" step="0.01" value="0">
+                <input type="range" id="morph-t" min="0" max="1" step="0.01" value="0" aria-label="Morph position between A and B">
                 <span class="morph-end" id="morph-label-b">B</span>
               </div>
               <div class="param-row select-row">
@@ -308,11 +276,106 @@
                 <input type="number" id="morph-duration" min="0.25" max="64" step="0.25" value="4" aria-label="Morph glide duration in beats">
                 <button id="morph-glide-b" class="morph-btn">Glide B</button>
               </div>
-              <div class="audio-status" id="morph-status">capture two states, then crossfade</div>
+              <div class="audio-status" id="morph-status" role="status" aria-live="polite">capture two states, then crossfade</div>
             </div>
           </div>
+
+          <div class="fx-group" data-group="cellular">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">CELLULAR</span>
+              <button class="group-reset" data-group="cellular" aria-label="Reset cellular effects">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row" data-param="cellular_amount" data-min="0" data-max="1" data-step="0.05">
+                <label>Amount</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="cellular_scale" data-min="2" data-max="32" data-step="1">
+                <label>Scale</label><input type="range"><span class="value">10</span>
+              </div>
+              <div class="param-row" data-param="cellular_warp" data-min="0" data-max="1" data-step="0.05">
+                <label>Warp</label><input type="range"><span class="value">0.35</span>
+              </div>
+              <div class="param-row" data-param="cellular_speed" data-min="0" data-max="2" data-step="0.05">
+                <label>Drift</label><input type="range"><span class="value">0.25</span>
+              </div>
+              <div class="param-row" data-param="cellular_gap_amount" data-min="0" data-max="1" data-step="0.01">
+                <label>Gap Key</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="cellular_gap_threshold" data-min="0" data-max="1" data-step="0.01">
+                <label>Gap Thresh</label><input type="range"><span class="value">0.65</span>
+              </div>
+              <div class="param-row" data-param="cellular_gap_softness" data-min="0" data-max="0.5" data-step="0.01">
+                <label>Gap Soft</label><input type="range"><span class="value">0.08</span>
+              </div>
+              <div class="audio-status">Amount must be above zero. With per-layer master bypass active, keyed ridges can reveal lower content; otherwise the final program resolves them over black.</div>
+            </div>
           </div>
-          <div class="fx-col"><!-- modulation sources -->
+
+          <div class="fx-group" data-group="motion">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">MOTION</span>
+              <button class="group-reset" data-group="motion" aria-label="Reset motion effects">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row" data-param="breathe_scale" data-min="0" data-max="0.05" data-step="0.001">
+                <label>Bth Scale</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="breathe_rotation" data-min="0" data-max="2" data-step="0.05">
+                <label>Bth Rotate</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="breathe_position" data-min="0" data-max="0.02" data-step="0.001">
+                <label>Bth Drift</label><input type="range"><span class="value">0</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="fx-group" data-group="temporal" id="temporal-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">TEMPORAL</span>
+              <button class="group-reset" data-group="temporal" aria-label="Reset temporal effects">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row" data-temporal="feedback" data-min="0" data-max="0.95" data-step="0.01">
+                <label>Feedback</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="fb_zoom" data-min="0.9" data-max="1.1" data-step="0.005">
+                <label>FB Zoom</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-temporal="fb_rotate" data-min="-5" data-max="5" data-step="0.1">
+                <label>FB Rotate</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="slitscan" data-min="0" data-max="1" data-step="0.01">
+                <label>Slit-Scan</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="slit_angle" data-min="-180" data-max="180" data-step="1">
+                <label>Slit Angle</label><input type="range"><span class="value">0°</span>
+              </div>
+              <div class="param-row select-row" data-temporal="key_mode">
+                <label>History Key</label>
+                <select aria-label="Temporal history key mode">
+                  <option value="0">Off</option>
+                  <option value="1">Keep Motion</option>
+                  <option value="2">Keep Stillness</option>
+                  <option value="3">Keep Brightening</option>
+                  <option value="4">Keep Darkening</option>
+                </select>
+              </div>
+              <div class="param-row" data-temporal="key_threshold" data-min="0" data-max="1" data-step="0.01">
+                <label>Key Thresh</label><input type="range"><span class="value">0.1</span>
+              </div>
+              <div class="param-row" data-temporal="key_softness" data-min="0" data-max="0.5" data-step="0.01">
+                <label>Key Soft</label><input type="range"><span class="value">0.03</span>
+              </div>
+              <div class="param-row" data-temporal="key_history" data-min="1" data-max="23" data-step="1">
+                <label>History</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="audio-status">History key compares the current frame with the selected prior frame, then gates the final temporal output.</div>
+            </div>
+          </div>
+
           <div class="fx-group" id="audio-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -324,9 +387,28 @@
                 <label class="toggle"><input type="checkbox" id="audio-enabled"><span class="toggle-slider"></span></label>
               </div>
               <div class="param-row select-row">
-                <label>Input</label>
+                <label for="audio-source-kind">Source</label>
+                <select id="audio-source-kind">
+                  <option value="live">Live input</option>
+                  <option value="file">Looping file</option>
+                </select>
+              </div>
+              <div class="param-row select-row">
+                <label for="audio-device">Input</label>
                 <select id="audio-device"><option value="">Default</option></select>
               </div>
+              <div class="param-row select-row" id="audio-clip-row" hidden>
+                <label for="audio-clip">File</label>
+                <div class="audio-clip-controls">
+                  <select id="audio-clip" title="Select an imported looping audio clip">
+                    <option value="__import_audio__">Choose imported audio…</option>
+                  </select>
+                  <button type="button" id="audio-import-button" title="Choose imported audio" aria-label="Choose imported audio">Choose…</button>
+                </div>
+                <input type="file" id="audio-import" accept="audio/wav,audio/mpeg,audio/flac,audio/ogg,audio/opus,audio/mp4,audio/aac,.wav,.mp3,.flac,.ogg,.opus,.m4a,.aac" multiple hidden>
+              </div>
+              <div class="audio-status audio-import-status" id="audio-import-status" role="status" aria-live="polite"></div>
+              <div class="audio-status">Live input includes microphones/line inputs and Windows system playback. Looping files drive deterministic analysis; use MOD MATRIX audio sources to map them to visuals. Imports are limited to 512 MiB and 10 decoded minutes, with a 60-second decode deadline.</div>
               <div class="param-row">
                 <label>Gain</label>
                 <input type="range" id="audio-gain" min="0" max="4" step="0.05" value="1">
@@ -361,25 +443,32 @@
             </div>
           </div>
 
-          <div class="fx-group" id="midi-group">
+          </div>
+          <div class="fx-col" data-fx-column="sources"><!-- live modulation controls and sources -->
+          <div class="fx-group" data-group="mod" id="mod-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
-              <span class="group-label">MIDI</span>
+              <span class="group-label">MOD MATRIX</span>
+              <button class="group-reset" data-group="mod" aria-label="Reset modulation routings">reset</button>
             </div>
             <div class="fx-group-body">
-              <div class="param-row toggle-row">
-                <label>Enable</label>
-                <label class="toggle"><input type="checkbox" id="midi-enabled"><span class="toggle-slider"></span></label>
+              <div class="param-row bpm-row">
+                <label>BPM</label>
+                <input type="number" id="bpm-input" min="30" max="300" step="0.1" value="120">
+                <button id="tap-tempo" class="btn-tap">TAP</button>
               </div>
               <div class="param-row toggle-row">
-                <label>Clk Sync</label>
-                <label class="toggle"><input type="checkbox" id="midi-clock-sync"><span class="toggle-slider"></span></label>
-                <span class="clock-indicator" id="midi-clock-indicator"></span>
+                <label>Beat latch</label>
+                <label class="toggle"><input type="checkbox" id="beat-quantize"><span class="toggle-slider"></span></label>
+                <span class="audio-status" id="beat-quantize-status"></span>
               </div>
-              <div id="midi-slots">
-                <!-- 4 slot rows rendered by JS -->
+              <div id="lfo-list">
+                <!-- LFO rows rendered by JS -->
               </div>
-              <div class="audio-status" id="midi-status" role="status" aria-live="polite"></div>
+              <div id="routing-list">
+                <!-- Routing rows rendered by JS -->
+              </div>
+              <button id="add-routing" class="btn-add-routing">+ routing</button>
             </div>
           </div>
 
@@ -431,44 +520,31 @@
             </div>
           </div>
 
-          <div class="fx-group" id="gyro-group">
+          <div class="fx-group" id="midi-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
-              <span class="group-label">GYRO</span>
+              <span class="group-label">MIDI</span>
             </div>
             <div class="fx-group-body">
               <div class="param-row toggle-row">
-                <label>Stream</label>
-                <label class="toggle"><input type="checkbox" id="gyro-enabled"><span class="toggle-slider"></span></label>
+                <label for="midi-enabled">Enable</label>
+                <label class="toggle"><input type="checkbox" id="midi-enabled" aria-label="Enable MIDI input"><span class="toggle-slider"></span></label>
               </div>
-              <button id="gyro-calibrate" class="btn-calibrate">Zero here</button>
-              <div class="axis-config-grid gyro-config-grid">
-                <span class="axis-config-head">Axis</span>
-                <span class="axis-config-head">Range</span>
-                <span class="axis-config-head">Expo</span>
-                <span class="axis-config-head">Inv</span>
-                <label for="gyro-yaw-range">Yaw</label>
-                <input type="number" id="gyro-yaw-range" data-gyro-axis="yaw" data-gyro-param="range" min="5" max="180" step="1" value="180">
-                <input type="range" id="gyro-yaw-expo" data-gyro-axis="yaw" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Yaw expo">
-                <input type="checkbox" id="gyro-yaw-invert" data-gyro-axis="yaw" data-gyro-param="invert" aria-label="Invert yaw">
-                <label for="gyro-pitch-range">Pitch</label>
-                <input type="number" id="gyro-pitch-range" data-gyro-axis="pitch" data-gyro-param="range" min="5" max="180" step="1" value="90">
-                <input type="range" id="gyro-pitch-expo" data-gyro-axis="pitch" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Pitch expo">
-                <input type="checkbox" id="gyro-pitch-invert" data-gyro-axis="pitch" data-gyro-param="invert" aria-label="Invert pitch">
-                <label for="gyro-roll-range">Roll</label>
-                <input type="number" id="gyro-roll-range" data-gyro-axis="roll" data-gyro-param="range" min="5" max="90" step="1" value="90">
-                <input type="range" id="gyro-roll-expo" data-gyro-axis="roll" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Roll expo">
-                <input type="checkbox" id="gyro-roll-invert" data-gyro-axis="roll" data-gyro-param="invert" aria-label="Invert roll">
+              <div class="param-row toggle-row">
+                <label for="midi-clock-sync" title="Follow incoming 24-PPQN MIDI Timing Clock">Clk Sync</label>
+                <label class="toggle"><input type="checkbox" id="midi-clock-sync" aria-label="Follow incoming MIDI Timing Clock"><span class="toggle-slider"></span></label>
+                <span class="clock-indicator" id="midi-clock-indicator" role="status" aria-live="polite">off</span>
               </div>
-              <div class="audio-meter-row"><label>Yaw</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-yaw"></div></div></div>
-              <div class="audio-meter-row"><label>Pitch</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-pitch"></div></div></div>
-              <div class="audio-meter-row"><label>Roll</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-roll"></div></div></div>
-              <div class="audio-status" id="gyro-status" role="status" aria-live="polite">enable on the phone that should steer</div>
+              <div class="midi-help">Learn CC listens only for Control Change; keys and notes are ignored. Clk Sync follows incoming 24-PPQN MIDI Timing Clock. It is not an audible click, and collide-o-scope sends no MIDI.</div>
+              <div id="midi-slots">
+                <!-- 4 slot rows rendered by JS -->
+              </div>
+              <div class="audio-status" id="midi-status" role="status" aria-live="polite"></div>
             </div>
           </div>
 
           </div>
-          <div class="fx-col"><!-- where the work leaves the machine -->
+          <div class="fx-col" data-fx-column="io"><!-- output, remote access, and phone steering -->
           <div class="fx-group" id="output-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -524,6 +600,10 @@
                 <label title="Audio starts at source time zero at 1x; visual pause, speed, modulation, and looping do not alter it.">Audio (1x independent)</label>
                 <select id="export-audio"><option value="">None</option></select>
               </div>
+              <div class="patch-capture-controls">
+                <button id="patch-capture" class="btn-export" type="button">Capture patch</button>
+              </div>
+              <div class="export-status" id="patch-save-status" role="status" aria-live="polite"></div>
               <div class="export-controls">
                 <button id="export-start" class="btn-export">Render</button>
                 <button id="export-cancel" class="btn-export btn-cancel" style="display:none">Cancel</button>
@@ -547,6 +627,42 @@
                 <div class="remote-hint">Scan with a phone on the same network.<br>Accept the certificate warning once — it unlocks tilt sensors.</div>
                 <div class="remote-url" id="remote-url"></div>
               </div>
+            </div>
+          </div>
+
+          <div class="fx-group" id="gyro-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">GYRO</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label>Stream</label>
+                <label class="toggle"><input type="checkbox" id="gyro-enabled"><span class="toggle-slider"></span></label>
+              </div>
+              <button id="gyro-calibrate" class="btn-calibrate">Zero here</button>
+              <div class="axis-config-grid gyro-config-grid">
+                <span class="axis-config-head">Axis</span>
+                <span class="axis-config-head">Range</span>
+                <span class="axis-config-head">Expo</span>
+                <span class="axis-config-head">Inv</span>
+                <label for="gyro-yaw-range">Yaw</label>
+                <input type="number" id="gyro-yaw-range" data-gyro-axis="yaw" data-gyro-param="range" min="5" max="180" step="1" value="180">
+                <input type="range" id="gyro-yaw-expo" data-gyro-axis="yaw" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Yaw expo">
+                <input type="checkbox" id="gyro-yaw-invert" data-gyro-axis="yaw" data-gyro-param="invert" aria-label="Invert yaw">
+                <label for="gyro-pitch-range">Pitch</label>
+                <input type="number" id="gyro-pitch-range" data-gyro-axis="pitch" data-gyro-param="range" min="5" max="180" step="1" value="90">
+                <input type="range" id="gyro-pitch-expo" data-gyro-axis="pitch" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Pitch expo">
+                <input type="checkbox" id="gyro-pitch-invert" data-gyro-axis="pitch" data-gyro-param="invert" aria-label="Invert pitch">
+                <label for="gyro-roll-range">Roll</label>
+                <input type="number" id="gyro-roll-range" data-gyro-axis="roll" data-gyro-param="range" min="5" max="90" step="1" value="90">
+                <input type="range" id="gyro-roll-expo" data-gyro-axis="roll" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Roll expo">
+                <input type="checkbox" id="gyro-roll-invert" data-gyro-axis="roll" data-gyro-param="invert" aria-label="Invert roll">
+              </div>
+              <div class="audio-meter-row"><label>Yaw</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-yaw"></div></div></div>
+              <div class="audio-meter-row"><label>Pitch</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-pitch"></div></div></div>
+              <div class="audio-meter-row"><label>Roll</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-roll"></div></div></div>
+              <div class="audio-status" id="gyro-status" role="status" aria-live="polite">enable on the phone that should steer</div>
             </div>
           </div>
           </div>

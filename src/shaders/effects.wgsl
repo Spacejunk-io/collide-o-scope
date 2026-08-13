@@ -24,9 +24,22 @@ struct Uniforms {
     vignette: f32,
     // Color drift + luma key
     color_drift: f32,
-    key_mode: f32,       // 0=off, 1=keep bright, 2=keep dark
+    key_mode: f32,       // 0=off, 1=keep bright, 2=keep dark, 3=remove color, 4=keep color
     key_threshold: f32,
     key_softness: f32,
+    // Animated cellular / Worley domain warp
+    cellular_amount: f32,
+    cellular_scale: f32,
+    cellular_warp: f32,
+    cellular_speed: f32,
+    // Cellular ridge-to-alpha key
+    cellular_gap_amount: f32,
+    cellular_gap_threshold: f32,
+    cellular_gap_softness: f32,
+    _cellular_pad: f32,
+    // Chroma-key target is supplied in display/sRGB coordinates.
+    key_color: vec3f,
+    key_tolerance: f32,
 };
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -82,6 +95,67 @@ fn blue_noise(uv: vec2f, seed: f32) -> f32 {
     let up = gaussian_noise(uv + vec2f(0.0, 1.0 / uniforms.resolution.y), seed);
     let down = gaussian_noise(uv + vec2f(0.0, -1.0 / uniforms.resolution.y), seed);
     return center - 0.25 * (left + right + up + down);
+}
+
+// Integer avalanche hashing keeps cellular feature points deterministic on
+// every GPU backend without depending on large-argument trigonometry.
+fn cellular_avalanche(value: u32) -> u32 {
+    var x = value;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+fn cellular_hash2(cell: vec2i, epoch: u32) -> vec2f {
+    let cx = bitcast<u32>(cell.x);
+    let cy = bitcast<u32>(cell.y);
+    let seed = cellular_avalanche(
+        cx ^ (cy * 0x9e3779b9u) ^ (epoch * 0x85ebca6bu)
+    );
+    let hx = cellular_avalanche(seed ^ 0x68bc21ebu);
+    let hy = cellular_avalanche(seed ^ 0x02e5be93u);
+    let unit = 1.0 / 16777216.0;
+    return vec2f(
+        f32(hx & 0x00ffffffu) * unit,
+        f32(hy & 0x00ffffffu) * unit,
+    );
+}
+
+// Each feature remains inside the central 60% of its own cell. That bound is
+// what makes a 3x3 neighborhood both sufficient and fixed-cost. Adjacent
+// deterministic targets are smoothly interpolated, producing Brownian-like
+// motion without discontinuities at epoch boundaries.
+fn cellular_feature(cell: vec2i, epoch: u32, epoch_mix: f32) -> vec2f {
+    let current = vec2f(0.2) + cellular_hash2(cell, epoch) * 0.6;
+    let next = vec2f(0.2) + cellular_hash2(cell, epoch + 1u) * 0.6;
+    return mix(current, next, epoch_mix);
+}
+
+// Returns nearest distance, second-nearest distance, and the vector from the
+// sample to its nearest feature point, all in aspect-correct cell space.
+fn cellular_worley(p: vec2f, epoch: u32, epoch_mix: f32) -> vec4f {
+    let base = vec2i(floor(p));
+    var nearest_sq = 1.0e9;
+    var second_sq = 1.0e9;
+    var nearest_offset = vec2f(0.0);
+
+    for (var oy: i32 = -1; oy <= 1; oy += 1) {
+        for (var ox: i32 = -1; ox <= 1; ox += 1) {
+            let cell = base + vec2i(ox, oy);
+            let feature = vec2f(cell) + cellular_feature(cell, epoch, epoch_mix);
+            let offset = feature - p;
+            let distance_sq = dot(offset, offset);
+            if distance_sq < nearest_sq {
+                second_sq = nearest_sq;
+                nearest_sq = distance_sq;
+                nearest_offset = offset;
+            } else if distance_sq < second_sq {
+                second_sq = distance_sq;
+            }
+        }
+    }
+    // Only two square roots per pixel, after the nearest candidates are known.
+    return vec4f(sqrt(nearest_sq), sqrt(second_sq), nearest_offset);
 }
 
 // --- Grain ---
@@ -159,6 +233,35 @@ fn apply_breathing(uv: vec2f) -> vec2f {
 
 // --- Color space helpers ---
 
+// Effect math runs in linear light because the source view is sRGB. Key-color
+// controls, however, use ordinary display/sRGB coordinates. Convert the
+// processed pixel back to display space before comparing Rec.709 Cb/Cr so a
+// picked green remains a green-screen target independent of luminance.
+fn linear_channel_to_srgb(value: f32) -> f32 {
+    let v = clamp(value, 0.0, 1.0);
+    return select(1.055 * pow(v, 1.0 / 2.4) - 0.055, 12.92 * v, v <= 0.0031308);
+}
+
+fn display_chroma(color: vec3f) -> vec2f {
+    let y = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+    return vec2f((color.b - y) / 1.8556, (color.r - y) / 1.5748);
+}
+
+fn processed_chroma(linear_color: vec3f) -> vec2f {
+    let display = vec3f(
+        linear_channel_to_srgb(linear_color.r),
+        linear_channel_to_srgb(linear_color.g),
+        linear_channel_to_srgb(linear_color.b),
+    );
+    return display_chroma(display);
+}
+
+// Rec.709 Cb/Cr spans 1.1913178 between the farthest display-RGB cube
+// vertices (green and magenta). Normalize by that bound so a UI tolerance of
+// one means the complete legal color plane, rather than an arbitrary clipped
+// subset. Equal-neutral colors (including black and white) remain distance 0.
+const MAX_DISPLAY_CHROMA_DISTANCE: f32 = 1.1913178;
+
 fn rgb_to_hsl(c: vec3f) -> vec3f {
     let max_c = max(max(c.r, c.g), c.b);
     let min_c = min(min(c.r, c.g), c.b);
@@ -220,10 +323,37 @@ fn hsl_to_rgb(hsl: vec3f) -> vec3f {
 @fragment
 fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var sample_uv = uv;
+    var cellular_ridge = 0.0;
 
     // --- Breathing (UV distortion before sampling) ---
     if uniforms.breathe_scale > 0.0 || uniforms.breathe_rotation > 0.0 || uniforms.breathe_position > 0.0 {
         sample_uv = apply_breathing(sample_uv);
+    }
+
+    // --- Cellular / Worley domain warp ---
+    // The disabled branch avoids all 3x3 distance work for legacy patches.
+    if uniforms.cellular_amount > 0.0001 {
+        let amount = clamp(uniforms.cellular_amount, 0.0, 1.0);
+        let scale = clamp(uniforms.cellular_scale, 2.0, 32.0);
+        let warp = clamp(uniforms.cellular_warp, 0.0, 1.0);
+        let speed = clamp(uniforms.cellular_speed, 0.0, 2.0);
+        let aspect = max(uniforms.resolution.x / max(uniforms.resolution.y, 1.0), 0.001);
+        let p = vec2f(sample_uv.x * aspect, sample_uv.y) * scale;
+        let motion_time = max(uniforms.time, 0.0) * speed;
+        let epoch_value = floor(motion_time);
+        let phase = fract(motion_time);
+        let epoch_mix = phase * phase * (3.0 - 2.0 * phase);
+        let field = cellular_worley(p, u32(epoch_value), epoch_mix);
+
+        // F2-F1 approaches zero at Voronoi boundaries. The displacement is
+        // capped at 0.14 cell, then converted back from physical cell space.
+        cellular_ridge = 1.0 - smoothstep(0.0, 0.16, max(field.y - field.x, 0.0));
+        var warp_cells = vec2f(0.0);
+        if field.x > 0.00001 {
+            warp_cells = (field.zw / field.x) * min(field.x, 0.5) * (0.28 * warp);
+        }
+        let warp_uv = warp_cells / vec2f(scale * aspect, scale);
+        sample_uv = clamp(sample_uv + warp_uv * amount, vec2f(0.0), vec2f(1.0));
     }
 
     // --- Downsample (lossy video look) ---
@@ -294,6 +424,12 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         rgb = vec3f(1.0) - rgb;
     }
 
+    // A restrained dark ridge makes cell boundaries legible without turning
+    // the source into a binary line drawing.
+    if cellular_ridge > 0.0 {
+        rgb *= 1.0 - cellular_ridge * clamp(uniforms.cellular_amount, 0.0, 1.0) * 0.12;
+    }
+
     // --- Vignette ---
     if uniforms.vignette > 0.0 {
         let centered = uv - 0.5; // use original UV for vignette position
@@ -316,14 +452,41 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     // blending. Premultiplying here as well would square the soft key mask
     // and produce dark fringes.
     var alpha = color.a;
-    if uniforms.key_mode > 0.5 {
-        let luma = dot(rgb, vec3f(0.299, 0.587, 0.114));
-        let soft = max(uniforms.key_softness, 0.001);
+    if uniforms.cellular_gap_amount > 0.0001 && cellular_ridge > 0.0 {
+        let threshold = clamp(uniforms.cellular_gap_threshold, 0.0, 1.0);
+        let softness = max(clamp(uniforms.cellular_gap_softness, 0.0, 0.5), 0.0001);
+        let ridge_mask = smoothstep(threshold - softness, threshold + softness, cellular_ridge);
+        alpha *= 1.0 - ridge_mask * clamp(uniforms.cellular_gap_amount, 0.0, 1.0);
+    }
+    if uniforms.key_mode > 0.5 && uniforms.key_mode < 2.5 {
+        // Bright/dark luminance keys retain their established behavior.
+        // The texture view has already decoded sRGB, so use linear-light
+        // Rec.709 luminance rather than legacy gamma-domain Rec.601 weights.
+        let luma = dot(rgb, vec3f(0.2126, 0.7152, 0.0722));
+        let soft = max(clamp(uniforms.key_softness, 0.0, 0.5), 0.001);
         var k = smoothstep(uniforms.key_threshold - soft, uniforms.key_threshold + soft, luma);
         if uniforms.key_mode > 1.5 {
             k = 1.0 - k;
         }
         alpha *= k;
+    } else if uniforms.key_mode > 2.5 {
+        // Chroma distance ignores luminance, making this a real color key
+        // rather than an RGB-radius selector. Mode 3 removes the selected
+        // chroma; mode 4 retains it. RGB stays straight/un-premultiplied.
+        let source_chroma = processed_chroma(rgb);
+        let target_chroma = display_chroma(clamp(uniforms.key_color, vec3f(0.0), vec3f(1.0)));
+        let distance = clamp(
+            length(source_chroma - target_chroma) / MAX_DISPLAY_CHROMA_DISTANCE,
+            0.0,
+            1.0,
+        );
+        let tolerance = clamp(uniforms.key_tolerance, 0.0, 1.0);
+        let soft = max(clamp(uniforms.key_softness, 0.0, 0.5), 0.001);
+        var outside = smoothstep(tolerance - soft, tolerance + soft, distance);
+        if uniforms.key_mode > 3.5 {
+            outside = 1.0 - outside;
+        }
+        alpha *= outside;
     }
 
     return vec4f(rgb, alpha);

@@ -1,6 +1,7 @@
 pub mod editor;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::effects::params::TemporalParams;
 use crate::effects::EffectUniforms;
@@ -18,6 +19,33 @@ fn one() -> f32 {
 }
 fn default_fps() -> f32 {
     30.0
+}
+fn default_cellular_scale() -> f32 {
+    10.0
+}
+fn default_cellular_warp() -> f32 {
+    0.35
+}
+fn default_cellular_speed() -> f32 {
+    0.25
+}
+fn default_cellular_gap_threshold() -> f32 {
+    0.65
+}
+fn default_cellular_gap_softness() -> f32 {
+    0.08
+}
+fn default_key_color() -> [f32; 3] {
+    [0.0, 1.0, 0.0]
+}
+fn default_key_tolerance() -> f32 {
+    0.15
+}
+fn default_temporal_key_threshold() -> f32 {
+    0.1
+}
+fn default_temporal_key_softness() -> f32 {
+    0.03
 }
 
 // --- Parameter metadata for stepping & comments ---
@@ -79,6 +107,48 @@ pub fn param_meta(name: &str) -> Option<ParamMeta> {
             max: 1.0,
             desc: "render resolution fraction",
         }),
+        "cellular_amount" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "cellular effect mix",
+        }),
+        "cellular_scale" => Some(ParamMeta {
+            step: 1.0,
+            min: 2.0,
+            max: 32.0,
+            desc: "cells across frame height",
+        }),
+        "cellular_warp" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "bounded domain displacement",
+        }),
+        "cellular_speed" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 2.0,
+            desc: "feature target epochs per second",
+        }),
+        "cellular_gap_amount" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "cell ridge transparency",
+        }),
+        "cellular_gap_threshold" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "ridge strength keyed out",
+        }),
+        "cellular_gap_softness" => Some(ParamMeta {
+            step: 0.01,
+            min: 0.0,
+            max: 0.5,
+            desc: "transparent gap edge feather",
+        }),
         "grain_intensity" => Some(ParamMeta {
             step: 0.01,
             min: 0.0,
@@ -126,6 +196,26 @@ pub fn param_meta(name: &str) -> Option<ParamMeta> {
             min: 0.0,
             max: 0.02,
             desc: "chromatic aberration",
+        }),
+        "key_mode" => Some(ParamMeta {
+            step: 1.0,
+            min: 0.0,
+            max: 4.0,
+            desc: "0=off 1=bright 2=dark 3=remove chroma 4=keep chroma",
+        }),
+        "key_threshold" | "key_tolerance" | "key_color_r" | "key_color_g" | "key_color_b" => {
+            Some(ParamMeta {
+                step: 0.01,
+                min: 0.0,
+                max: 1.0,
+                desc: "normalized key control",
+            })
+        }
+        "key_softness" => Some(ParamMeta {
+            step: 0.01,
+            min: 0.0,
+            max: 0.5,
+            desc: "key edge feather",
         }),
         "opacity" => Some(ParamMeta {
             step: 0.05,
@@ -183,6 +273,14 @@ pub struct TemporalConfig {
     /// Arbitrary angle added after the original row/column-only format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slit_angle: Option<f32>,
+    #[serde(default)]
+    pub key_mode: u32,
+    #[serde(default = "default_temporal_key_threshold")]
+    pub key_threshold: f32,
+    #[serde(default = "default_temporal_key_softness")]
+    pub key_softness: f32,
+    #[serde(default = "one")]
+    pub key_history: f32,
 }
 
 impl Default for TemporalConfig {
@@ -200,6 +298,10 @@ impl TemporalConfig {
             slitscan: p.slitscan,
             slit_axis: p.slit_axis,
             slit_angle: Some(p.slit_angle),
+            key_mode: p.key_mode as u32,
+            key_threshold: p.key_threshold,
+            key_softness: p.key_softness,
+            key_history: p.key_history,
         }
     }
 
@@ -214,6 +316,10 @@ impl TemporalConfig {
                 .map(|angle| finite_or(angle, 0.0).clamp(-180.0, 180.0))
                 .unwrap_or_else(|| finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0) * 90.0),
             slit_axis: finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0),
+            key_mode: self.key_mode.min(4) as f32,
+            key_threshold: finite_or(self.key_threshold, 0.1).clamp(0.0, 1.0),
+            key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
+            key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
         }
     }
 }
@@ -233,6 +339,10 @@ pub struct ModConfig {
     pub audio_gain: f32,
     #[serde(default)]
     pub audio_device: String,
+    #[serde(default = "default_audio_source_kind")]
+    pub audio_source_kind: String,
+    #[serde(default)]
+    pub audio_clip_path: String,
     /// Number of routable FFT bands. Older patches omit this and remain at
     /// the historical three-band layout.
     #[serde(default = "default_audio_band_count")]
@@ -279,6 +389,10 @@ fn default_audio_band_edges() -> Vec<f32> {
 
 fn default_audio_band_count() -> usize {
     3
+}
+
+fn default_audio_source_kind() -> String {
+    crate::modulation::AUDIO_SOURCE_LIVE.to_string()
 }
 
 fn four() -> f32 {
@@ -425,7 +539,7 @@ impl ModConfig {
                 .iter()
                 .map(|r| RoutingConfig {
                     source: r.source.as_str().to_string(),
-                    target: r.target.clone(),
+                    target: r.target().to_owned(),
                     depth: r.depth,
                     curve: r.curve.as_str().to_string(),
                     curve_amount: r.curve_amount,
@@ -436,6 +550,9 @@ impl ModConfig {
             audio_enabled: m.audio_enabled,
             audio_gain: m.audio_gain,
             audio_device: m.audio_device.clone(),
+            audio_source_kind: crate::modulation::normalize_audio_source_kind(&m.audio_source_kind)
+                .to_string(),
+            audio_clip_path: m.audio_clip_path.clone(),
             audio_band_count: m.audio_band_config.count(),
             audio_band_edges: m.audio_band_config.crossovers().to_vec(),
             audio_band_ceiling_hz: Some(m.audio_band_config.ceiling_hz()),
@@ -475,27 +592,49 @@ impl ModConfig {
             lfo.set_phase(cfg.phase);
             m.lfos[i] = lfo;
         }
+        // If a transitional patch happens to contain both spellings, the
+        // canonical route wins and the legacy alias is ignored rather than
+        // applying the same semantic destination twice.
+        let canonical_key_targets: HashSet<String> = self
+            .routings
+            .iter()
+            .take(MAX_ROUTINGS)
+            .filter(|routing| {
+                routing.target.starts_with("layer") && routing.target.ends_with("_key_threshold")
+            })
+            .map(|routing| routing.target.clone())
+            .collect();
         m.routings = self
             .routings
             .iter()
             .take(MAX_ROUTINGS)
             .filter_map(|r| {
                 let source = ModSource::try_from_str(&r.source)?;
-                if !crate::modulation::is_valid_target(&r.target) {
+                let target = crate::modulation::canonical_target(&r.target);
+                if target.as_ref() != r.target && canonical_key_targets.contains(target.as_ref()) {
                     return None;
                 }
-                let mut routing =
-                    Routing::new(source, &r.target, finite_or(r.depth, 0.0).clamp(-1.0, 1.0));
+                if !crate::modulation::is_valid_target(target.as_ref()) {
+                    return None;
+                }
+                let mut routing = Routing::new(
+                    source,
+                    target.as_ref(),
+                    finite_or(r.depth, 0.0).clamp(-1.0, 1.0),
+                );
                 routing.curve = Curve::from_str(&r.curve);
                 routing.curve_amount = finite_or(r.curve_amount, 0.0).clamp(-2.0, 2.0);
-                routing.attack = finite_or(r.attack, 0.0).clamp(0.0, 60.0);
-                routing.release = finite_or(r.release, 0.0).clamp(0.0, 60.0);
+                routing.attack = finite_or(r.attack, 0.0).clamp(0.0, 10.0);
+                routing.release = finite_or(r.release, 0.0).clamp(0.0, 10.0);
                 Some(routing)
             })
             .collect();
         m.audio_enabled = self.audio_enabled;
         m.audio_gain = finite_or(self.audio_gain, 1.0).clamp(0.0, 8.0);
         m.audio_device = self.audio_device.clone();
+        m.audio_source_kind =
+            crate::modulation::normalize_audio_source_kind(&self.audio_source_kind).to_string();
+        m.audio_clip_path = self.audio_clip_path.clone();
         let count = self
             .audio_band_count
             .clamp(crate::audio::MIN_AUDIO_BANDS, crate::audio::MAX_AUDIO_BANDS);
@@ -712,6 +851,10 @@ pub struct LayerConfig {
     pub paused: bool,
     #[serde(default = "default_true")]
     pub visible: bool,
+    /// Skip the shared master shader for this layer. Missing in legacy
+    /// patches means the historical behavior: master effects remain active.
+    #[serde(default)]
+    pub bypass_master_fx: bool,
     #[serde(default)]
     pub effects: EffectsConfig,
 }
@@ -767,6 +910,24 @@ pub struct EffectsConfig {
     pub key_threshold: f32,
     #[serde(default = "default_key_softness")]
     pub key_softness: f32,
+    #[serde(default = "default_key_color")]
+    pub key_color: [f32; 3],
+    #[serde(default = "default_key_tolerance")]
+    pub key_tolerance: f32,
+    #[serde(default)]
+    pub cellular_amount: f32,
+    #[serde(default = "default_cellular_scale")]
+    pub cellular_scale: f32,
+    #[serde(default = "default_cellular_warp")]
+    pub cellular_warp: f32,
+    #[serde(default = "default_cellular_speed")]
+    pub cellular_speed: f32,
+    #[serde(default)]
+    pub cellular_gap_amount: f32,
+    #[serde(default = "default_cellular_gap_threshold")]
+    pub cellular_gap_threshold: f32,
+    #[serde(default = "default_cellular_gap_softness")]
+    pub cellular_gap_softness: f32,
 }
 
 fn default_key_threshold() -> f32 {
@@ -800,6 +961,15 @@ impl Default for EffectsConfig {
             key_mode: 0,
             key_threshold: 0.5,
             key_softness: 0.1,
+            key_color: default_key_color(),
+            key_tolerance: default_key_tolerance(),
+            cellular_amount: 0.0,
+            cellular_scale: 10.0,
+            cellular_warp: 0.35,
+            cellular_speed: 0.25,
+            cellular_gap_amount: 0.0,
+            cellular_gap_threshold: 0.65,
+            cellular_gap_softness: 0.08,
         }
     }
 }
@@ -830,6 +1000,15 @@ impl EffectsConfig {
             key_mode: u.key_mode as u32,
             key_threshold: u.key_threshold,
             key_softness: u.key_softness,
+            key_color: u.key_color,
+            key_tolerance: u.key_tolerance,
+            cellular_amount: u.cellular_amount,
+            cellular_scale: u.cellular_scale,
+            cellular_warp: u.cellular_warp,
+            cellular_speed: u.cellular_speed,
+            cellular_gap_amount: u.cellular_gap_amount,
+            cellular_gap_threshold: u.cellular_gap_threshold,
+            cellular_gap_softness: u.cellular_gap_softness,
         }
     }
 
@@ -852,9 +1031,22 @@ impl EffectsConfig {
         u.breathe_position = finite_or(self.breathe_position, 0.0).clamp(0.0, 0.02);
         u.vignette = finite_or(self.vignette, 0.0).clamp(0.0, 1.5);
         u.color_drift = finite_or(self.color_drift, 0.0).clamp(0.0, 0.02);
-        u.key_mode = self.key_mode.min(2) as f32;
+        u.key_mode = self.key_mode.min(4) as f32;
         u.key_threshold = finite_or(self.key_threshold, 0.5).clamp(0.0, 1.0);
         u.key_softness = finite_or(self.key_softness, 0.1).clamp(0.0, 0.5);
+        u.key_color = [
+            finite_or(self.key_color[0], 0.0).clamp(0.0, 1.0),
+            finite_or(self.key_color[1], 1.0).clamp(0.0, 1.0),
+            finite_or(self.key_color[2], 0.0).clamp(0.0, 1.0),
+        ];
+        u.key_tolerance = finite_or(self.key_tolerance, 0.15).clamp(0.0, 1.0);
+        u.cellular_amount = finite_or(self.cellular_amount, 0.0).clamp(0.0, 1.0);
+        u.cellular_scale = finite_or(self.cellular_scale, 10.0).clamp(2.0, 32.0);
+        u.cellular_warp = finite_or(self.cellular_warp, 0.35).clamp(0.0, 1.0);
+        u.cellular_speed = finite_or(self.cellular_speed, 0.25).clamp(0.0, 2.0);
+        u.cellular_gap_amount = finite_or(self.cellular_gap_amount, 0.0).clamp(0.0, 1.0);
+        u.cellular_gap_threshold = finite_or(self.cellular_gap_threshold, 0.65).clamp(0.0, 1.0);
+        u.cellular_gap_softness = finite_or(self.cellular_gap_softness, 0.08).clamp(0.0, 0.5);
     }
 
     /// Get fields organized into groups for display.
@@ -875,6 +1067,27 @@ impl EffectsConfig {
                 ],
             ),
             (
+                "cellular",
+                vec![
+                    ("cellular_amount", format!("{:.2}", self.cellular_amount)),
+                    ("cellular_scale", format!("{:.1}", self.cellular_scale)),
+                    ("cellular_warp", format!("{:.2}", self.cellular_warp)),
+                    ("cellular_speed", format!("{:.2}", self.cellular_speed)),
+                    (
+                        "cellular_gap_amount",
+                        format!("{:.2}", self.cellular_gap_amount),
+                    ),
+                    (
+                        "cellular_gap_threshold",
+                        format!("{:.2}", self.cellular_gap_threshold),
+                    ),
+                    (
+                        "cellular_gap_softness",
+                        format!("{:.2}", self.cellular_gap_softness),
+                    ),
+                ],
+            ),
+            (
                 "analog",
                 vec![
                     ("grain_intensity", format!("{:.2}", self.grain_intensity)),
@@ -891,6 +1104,18 @@ impl EffectsConfig {
                     ("breathe_scale", format!("{:.3}", self.breathe_scale)),
                     ("breathe_rotation", format!("{:.2}", self.breathe_rotation)),
                     ("breathe_position", format!("{:.3}", self.breathe_position)),
+                ],
+            ),
+            (
+                "key",
+                vec![
+                    ("key_mode", format!("{}", self.key_mode)),
+                    ("key_threshold", format!("{:.2}", self.key_threshold)),
+                    ("key_softness", format!("{:.2}", self.key_softness)),
+                    ("key_color_r", format!("{:.3}", self.key_color[0])),
+                    ("key_color_g", format!("{:.3}", self.key_color[1])),
+                    ("key_color_b", format!("{:.3}", self.key_color[2])),
+                    ("key_tolerance", format!("{:.2}", self.key_tolerance)),
                 ],
             ),
         ]
@@ -1007,6 +1232,83 @@ impl EffectsConfig {
                     return true;
                 }
             }
+            "key_mode" => {
+                if let Ok(v) = value.parse() {
+                    self.key_mode = v;
+                    return true;
+                }
+            }
+            "key_threshold" => {
+                if let Ok(v) = value.parse() {
+                    self.key_threshold = v;
+                    return true;
+                }
+            }
+            "key_softness" => {
+                if let Ok(v) = value.parse() {
+                    self.key_softness = v;
+                    return true;
+                }
+            }
+            "key_color_r" | "key_color_g" | "key_color_b" => {
+                if let Ok(v) = value.parse() {
+                    let index = match key {
+                        "key_color_r" => 0,
+                        "key_color_g" => 1,
+                        _ => 2,
+                    };
+                    self.key_color[index] = v;
+                    return true;
+                }
+            }
+            "key_tolerance" => {
+                if let Ok(v) = value.parse() {
+                    self.key_tolerance = v;
+                    return true;
+                }
+            }
+            "cellular_amount" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_amount = v;
+                    return true;
+                }
+            }
+            "cellular_scale" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_scale = v;
+                    return true;
+                }
+            }
+            "cellular_warp" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_warp = v;
+                    return true;
+                }
+            }
+            "cellular_speed" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_speed = v;
+                    return true;
+                }
+            }
+            "cellular_gap_amount" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_gap_amount = v;
+                    return true;
+                }
+            }
+            "cellular_gap_threshold" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_gap_threshold = v;
+                    return true;
+                }
+            }
+            "cellular_gap_softness" => {
+                if let Ok(v) = value.parse() {
+                    self.cellular_gap_softness = v;
+                    return true;
+                }
+            }
             _ => {}
         }
         false
@@ -1026,6 +1328,7 @@ impl LayerConfig {
             fps: layer.fps,
             paused: layer.paused,
             visible: layer.visible,
+            bypass_master_fx: layer.bypass_master_fx,
             effects: EffectsConfig::from_uniforms(&layer.effects),
         }
     }
@@ -1042,6 +1345,7 @@ impl LayerConfig {
         layer.fps = finite_or(self.fps, 30.0).clamp(1.0, 240.0);
         layer.paused = self.paused;
         layer.visible = self.visible;
+        layer.bypass_master_fx = self.bypass_master_fx;
         self.effects.apply_to_uniforms(&mut layer.effects);
     }
 
@@ -1055,6 +1359,7 @@ impl LayerConfig {
             ("fps", format!("{:.1}", self.fps)),
             ("paused", format!("{}", self.paused)),
             ("visible", format!("{}", self.visible)),
+            ("bypass_master_fx", format!("{}", self.bypass_master_fx)),
         ]
     }
 
@@ -1092,6 +1397,12 @@ impl LayerConfig {
             "visible" => {
                 if let Ok(v) = value.parse() {
                     self.visible = v;
+                    return true;
+                }
+            }
+            "bypass_master_fx" => {
+                if let Ok(v) = value.parse() {
+                    self.bypass_master_fx = v;
                     return true;
                 }
             }
@@ -1199,6 +1510,7 @@ mod tests {
                 fps: 30.0,
                 paused: false,
                 visible: true,
+                bypass_master_fx: true,
                 effects: layer_effects,
             }],
             master_paused: false,
@@ -1213,6 +1525,7 @@ mod tests {
         let parsed: PatchState = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.master.downsample, 0.35);
         assert_eq!(parsed.layers[0].effects.downsample, 0.6);
+        assert!(parsed.layers[0].bypass_master_fx);
 
         let mut restored = EffectUniforms::default();
         parsed.master.apply_to_uniforms(&mut restored);
@@ -1224,6 +1537,7 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.master.downsample, 1.0);
         assert_eq!(legacy.layers[0].effects.downsample, 1.0);
+        assert!(!legacy.layers[0].bypass_master_fx);
 
         let mut invalid = EffectsConfig {
             downsample: f32::NAN,
@@ -1246,6 +1560,144 @@ mod tests {
         assert_eq!((metadata.min, metadata.max), (0.05, 1.0));
     }
 
+    #[test]
+    fn layer_master_fx_bypass_round_trips_and_native_editor_exposes_it() {
+        let legacy: LayerConfig = serde_yaml::from_str(
+            "filename: legacy.mp4\nopacity: 1\nblend_mode: normal\neffects: {}\n",
+        )
+        .unwrap();
+        assert!(!legacy.bypass_master_fx);
+
+        let mut edited = legacy;
+        assert!(edited.set_field("bypass_master_fx", "true"));
+        assert!(edited.bypass_master_fx);
+        assert!(edited
+            .top_fields()
+            .iter()
+            .any(|(key, value)| *key == "bypass_master_fx" && value == "true"));
+
+        let yaml = serde_yaml::to_string(&edited).unwrap();
+        let restored: LayerConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(restored.bypass_master_fx);
+    }
+
+    #[test]
+    fn cellular_controls_round_trip_sanitize_and_keep_legacy_defaults() {
+        let configured = EffectsConfig {
+            cellular_amount: 0.8,
+            cellular_scale: 24.0,
+            cellular_warp: 0.65,
+            cellular_speed: 1.5,
+            cellular_gap_amount: 0.9,
+            cellular_gap_threshold: 0.4,
+            cellular_gap_softness: 0.12,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&configured).unwrap();
+        let decoded: EffectsConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut uniforms = EffectUniforms::default();
+        decoded.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.cellular_amount, 0.8);
+        assert_eq!(uniforms.cellular_scale, 24.0);
+        assert_eq!(uniforms.cellular_warp, 0.65);
+        assert_eq!(uniforms.cellular_speed, 1.5);
+        assert_eq!(uniforms.cellular_gap_amount, 0.9);
+        assert_eq!(uniforms.cellular_gap_threshold, 0.4);
+        assert_eq!(uniforms.cellular_gap_softness, 0.12);
+
+        let legacy: EffectsConfig = serde_yaml::from_str("pixelate: 4.0\n").unwrap();
+        assert_eq!(legacy.cellular_amount, 0.0);
+        assert_eq!(legacy.cellular_scale, 10.0);
+        assert_eq!(legacy.cellular_warp, 0.35);
+        assert_eq!(legacy.cellular_speed, 0.25);
+        assert_eq!(legacy.cellular_gap_amount, 0.0);
+        assert_eq!(legacy.cellular_gap_threshold, 0.65);
+        assert_eq!(legacy.cellular_gap_softness, 0.08);
+
+        let invalid: EffectsConfig = serde_yaml::from_str(
+            "cellular_amount: .nan\ncellular_scale: -9\ncellular_warp: 7\ncellular_speed: .inf\ncellular_gap_amount: 9\ncellular_gap_threshold: -4\ncellular_gap_softness: .nan\n",
+        )
+        .unwrap();
+        invalid.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.cellular_amount, 0.0);
+        assert_eq!(uniforms.cellular_scale, 2.0);
+        assert_eq!(uniforms.cellular_warp, 1.0);
+        assert_eq!(uniforms.cellular_speed, 0.25);
+        assert_eq!(uniforms.cellular_gap_amount, 1.0);
+        assert_eq!(uniforms.cellular_gap_threshold, 0.0);
+        assert_eq!(uniforms.cellular_gap_softness, 0.08);
+
+        let mut editable = EffectsConfig::default();
+        for (key, value) in [
+            ("cellular_amount", "0.7"),
+            ("cellular_scale", "18"),
+            ("cellular_warp", "0.4"),
+            ("cellular_speed", "0.9"),
+            ("cellular_gap_amount", "0.8"),
+            ("cellular_gap_threshold", "0.55"),
+            ("cellular_gap_softness", "0.1"),
+        ] {
+            assert!(editable.set_field(key, value));
+            let metadata = param_meta(key).unwrap();
+            assert!(metadata.min < metadata.max);
+            assert!(metadata.step > 0.0);
+        }
+        let cellular_group = editable
+            .grouped_fields()
+            .into_iter()
+            .find(|(name, _)| *name == "cellular")
+            .unwrap();
+        assert_eq!(cellular_group.1.len(), 7);
+    }
+
+    #[test]
+    fn chroma_and_temporal_keys_round_trip_with_safe_legacy_defaults() {
+        let configured = EffectsConfig {
+            key_mode: 3,
+            key_color: [0.1, 0.8, 0.2],
+            key_tolerance: 0.24,
+            key_softness: 0.06,
+            ..Default::default()
+        };
+        let restored: EffectsConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&configured).unwrap()).unwrap();
+        let mut uniforms = EffectUniforms::default();
+        restored.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.key_mode, 3.0);
+        assert_eq!(uniforms.key_color, [0.1, 0.8, 0.2]);
+        assert_eq!(uniforms.key_tolerance, 0.24);
+
+        let legacy: EffectsConfig = serde_yaml::from_str("pixelate: 2\n").unwrap();
+        assert_eq!(legacy.key_mode, 0);
+        assert_eq!(legacy.key_color, [0.0, 1.0, 0.0]);
+        assert_eq!(legacy.key_tolerance, 0.15);
+
+        let invalid: EffectsConfig =
+            serde_yaml::from_str("key_mode: 99\nkey_color: [.nan, .inf, -2]\nkey_tolerance: 9\n")
+                .unwrap();
+        invalid.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.key_mode, 4.0);
+        assert_eq!(uniforms.key_color, [0.0, 1.0, 0.0]);
+        assert_eq!(uniforms.key_tolerance, 1.0);
+
+        let legacy_temporal: TemporalConfig = serde_yaml::from_str("feedback: 0.2\n").unwrap();
+        let temporal = legacy_temporal.to_params();
+        assert_eq!(temporal.key_mode, 0.0);
+        assert_eq!(temporal.key_threshold, 0.1);
+        assert_eq!(temporal.key_softness, 0.03);
+        assert_eq!(temporal.key_history, 1.0);
+
+        let invalid_temporal: TemporalConfig = serde_yaml::from_str(
+            "key_mode: 99\nkey_threshold: .nan\nkey_softness: 8\nkey_history: 99\n",
+        )
+        .unwrap();
+        let temporal = invalid_temporal.to_params();
+        assert_eq!(temporal.key_mode, 4.0);
+        assert_eq!(temporal.key_threshold, 0.1);
+        assert_eq!(temporal.key_softness, 0.5);
+        assert_eq!(temporal.key_history, 23.0);
+    }
+
     /// A patch with modulation state survives a YAML round-trip, and old
     /// patches without a `modulation:` section still parse.
     #[test]
@@ -1257,6 +1709,8 @@ mod tests {
         matrix.lfos[2].phase = 0.25;
         matrix.audio_enabled = true;
         matrix.audio_gain = 1.5;
+        matrix.audio_source_kind = crate::modulation::AUDIO_SOURCE_FILE.to_string();
+        matrix.audio_clip_path = "pulse-loop.wav".to_string();
         matrix.audio_band_config = crate::audio::AudioBandConfig::new(
             6,
             &[120.0, 480.0, 1500.0, 4000.0, 9000.0],
@@ -1313,6 +1767,10 @@ mod tests {
             slitscan: 0.4,
             slit_angle: 37.0,
             slit_axis: 1.0,
+            key_mode: 3.0,
+            key_threshold: 0.22,
+            key_softness: 0.05,
+            key_history: 4.0,
         };
 
         let patch = PatchState::capture(
@@ -1344,6 +1802,10 @@ mod tests {
         assert_eq!(restored_temporal.slitscan, 0.4);
         assert_eq!(restored_temporal.slit_angle, 37.0);
         assert_eq!(restored_temporal.slit_axis, 1.0);
+        assert_eq!(restored_temporal.key_mode, 3.0);
+        assert_eq!(restored_temporal.key_threshold, 0.22);
+        assert_eq!(restored_temporal.key_softness, 0.05);
+        assert_eq!(restored_temporal.key_history, 4.0);
 
         assert_eq!(restored.clock.bpm, 140.0);
         assert_eq!(restored.lfos[1].shape, LfoShape::Saw);
@@ -1351,6 +1813,11 @@ mod tests {
         assert_eq!(restored.lfos[2].phase, 0.25);
         assert!(restored.audio_enabled);
         assert_eq!(restored.audio_gain, 1.5);
+        assert_eq!(
+            restored.audio_source_kind,
+            crate::modulation::AUDIO_SOURCE_FILE
+        );
+        assert_eq!(restored.audio_clip_path, "pulse-loop.wav");
         assert_eq!(restored.audio_band_config.count(), 6);
         assert_eq!(
             restored.audio_band_config.crossovers(),
@@ -1377,13 +1844,13 @@ mod tests {
         assert_eq!(restored.pad_config.spring_rate, 7.0);
         assert_eq!(restored.routings.len(), 5);
         assert_eq!(restored.routings[0].source, ModSource::AudioBright);
-        assert_eq!(restored.routings[0].target, "layer2_opacity");
+        assert_eq!(restored.routings[0].target(), "layer2_opacity");
         assert_eq!(restored.routings[0].curve, Curve::SCurve);
         assert_eq!(restored.routings[0].curve_amount, 0.5);
         assert_eq!(restored.routings[0].attack, 0.08);
         assert_eq!(restored.routings[0].release, 0.4);
         assert_eq!(restored.routings[1].source, ModSource::AudioBass);
-        assert_eq!(restored.routings[1].target, "ntsc_snow");
+        assert_eq!(restored.routings[1].target(), "ntsc_snow");
         assert_eq!(restored.routings[1].depth, -0.8);
         assert_eq!(restored.routings[2].source, ModSource::Midi(2));
         assert_eq!(restored.routings[3].source, ModSource::Lfo(3));
@@ -1392,8 +1859,13 @@ mod tests {
         // Layer modulation math: bright 0.5 at depth 0.6 on layer 2 opacity.
         restored.audio.bright = 0.5;
         restored.update_at_beat(0.0, 1.0);
-        let lm =
-            restored.modulate_layer_full(1, &crate::effects::EffectUniforms::default(), 0.4, 1.0);
+        let lm = restored.modulate_layer_full(
+            1,
+            &crate::effects::EffectUniforms::default(),
+            0.4,
+            1.0,
+            30.0,
+        );
         let expected = 0.4 + crate::modulation::shape(0.5, Curve::SCurve, 0.5) * 0.6 * 0.5;
         assert!((lm.opacity - expected).abs() < 1e-4);
         assert_eq!(lm.speed, 1.0, "untargeted values pass through");
@@ -1471,5 +1943,65 @@ modulation:
         );
         assert_eq!(legacy_audio_matrix.audio_band_config.ceiling_hz(), 8000.0);
         assert_eq!(legacy_audio_matrix.routings[0].source, ModSource::AudioBass);
+
+        let alias_and_canonical: ModConfig = serde_yaml::from_str(
+            r#"
+bpm: 120
+routings:
+  - { source: lfo0, target: layer1_key, depth: 0.9 }
+  - { source: lfo1, target: layer1_key_threshold, depth: 0.4 }
+"#,
+        )
+        .unwrap();
+        let mut normalized = ModMatrix::new();
+        alias_and_canonical.apply_to_matrix(&mut normalized);
+        assert_eq!(normalized.routings.len(), 1);
+        assert_eq!(normalized.routings[0].target(), "layer1_key_threshold");
+        assert_eq!(normalized.routings[0].source, ModSource::Lfo(1));
+
+        // Canonical spellings beyond the accepted route window must not
+        // suppress a legacy alias that is itself inside that window.
+        let mut capped: ModConfig = serde_yaml::from_str("bpm: 120\n").unwrap();
+        capped.routings.push(RoutingConfig {
+            source: "lfo0".to_string(),
+            target: "layer1_key".to_string(),
+            depth: 0.5,
+            curve: "linear".to_string(),
+            curve_amount: 0.0,
+            attack: 30.0,
+            release: 30.0,
+        });
+        for _ in 1..MAX_ROUTINGS {
+            capped.routings.push(RoutingConfig {
+                source: "lfo1".to_string(),
+                target: "brightness".to_string(),
+                depth: 0.25,
+                curve: "linear".to_string(),
+                curve_amount: 0.0,
+                attack: 0.0,
+                release: 0.0,
+            });
+        }
+        capped.routings.push(RoutingConfig {
+            source: "lfo2".to_string(),
+            target: "layer1_key_threshold".to_string(),
+            depth: 0.75,
+            curve: "linear".to_string(),
+            curve_amount: 0.0,
+            attack: 0.0,
+            release: 0.0,
+        });
+        let mut capped_matrix = ModMatrix::new();
+        capped.apply_to_matrix(&mut capped_matrix);
+        assert_eq!(capped_matrix.routings.len(), MAX_ROUTINGS);
+        assert_eq!(capped_matrix.routings[0].target(), "layer1_key_threshold");
+        assert_eq!(capped_matrix.routings[0].source, ModSource::Lfo(0));
+        assert_eq!(capped_matrix.routings[0].attack, 10.0);
+        assert_eq!(capped_matrix.routings[0].release, 10.0);
+        assert_eq!(
+            legacy_audio_matrix.audio_source_kind,
+            crate::modulation::AUDIO_SOURCE_LIVE
+        );
+        assert!(legacy_audio_matrix.audio_clip_path.is_empty());
     }
 }

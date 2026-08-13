@@ -6,9 +6,31 @@ use winit::window::Window;
 use crate::effects::params::{normalized_slit_direction, TemporalParams, TEMPORAL_REFERENCE_FPS};
 use crate::effects::EffectUniforms;
 use crate::layers::Layer;
+use crate::ntsc::{
+    checked_rgba_frame_len, validate_selective_ntsc_gpu_staging_limit,
+    validate_selective_ntsc_live_memory, NtscFrameMetadata, SelectiveNtscBatch,
+    SelectiveNtscGeneration, SelectiveNtscPlan,
+};
 
 /// Frames of output history kept for temporal effects (0.8s at 30fps).
 pub const HISTORY_LEN: u32 = 24;
+
+/// Internal render targets carry sRGB-encoded bytes but are sampled through
+/// sRGB views so all shader math happens in linear light.
+const COMPOSITE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// egui-wgpu performs its own gamma-to-linear conversion. Giving it an sRGB
+/// view would make the hardware decode first and egui decode a second time.
+const EGUI_OUTPUT_VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const EGUI_OUTPUT_VIEW_FORMATS: &[wgpu::TextureFormat] = &[EGUI_OUTPUT_VIEW_FORMAT];
+
+const fn transparent_accumulation_clear() -> wgpu::Color {
+    wgpu::Color {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    }
+}
 
 /// Uniforms for the temporal (feedback/slit-scan) pass.
 #[repr(C)]
@@ -23,15 +45,42 @@ struct TemporalUniforms {
     valid_history: f32,
     feedback_valid: f32,
     slit_direction: [f32; 2],
-    _pad: [f32; 2],
+    key_reference_layer: f32,
+    key_valid: f32,
+    key_mode: f32,
+    key_threshold: f32,
+    key_softness: f32,
+    _pad: f32,
+}
+
+/// Resolve a temporal key reference from the ring as it existed before the
+/// current clean image is recorded. One render can observe several elapsed
+/// 30-Hz clock ticks after a stall, but those ticks are not distinct images and
+/// must never turn duplicate copies of the current image into fake history.
+fn temporal_key_reference_layer(
+    history_write: usize,
+    history_valid: u32,
+    requested_depth: f32,
+) -> Option<usize> {
+    let depth = if requested_depth.is_finite() {
+        requested_depth.round().clamp(1.0, (HISTORY_LEN - 1) as f32) as usize
+    } else {
+        1
+    };
+    let offset = depth.saturating_sub(1);
+    if history_valid == 0 || offset >= history_valid as usize {
+        return None;
+    }
+    Some((history_write + HISTORY_LEN as usize - offset) % HISTORY_LEN as usize)
 }
 
 /// CPU-side lifetime for temporal GPU memories.
 ///
-/// History snapshots advance at a fixed 30 Hz regardless of render cadence,
-/// while `history_valid` and `feedback_valid` prevent the shader from ever
-/// touching an unwritten texture. The texture contents themselves do not need
-/// an eager clear because invalid layers remain unreachable.
+/// History snapshots are gated by a fixed 30 Hz clock and record at most one
+/// distinct observation per render, while `history_valid` and `feedback_valid`
+/// prevent the shader from ever touching an unwritten texture. The texture
+/// contents themselves do not need an eager clear because invalid layers
+/// remain unreachable.
 #[derive(Debug, Clone)]
 pub(crate) struct TemporalState {
     history_write: usize,
@@ -40,6 +89,17 @@ pub(crate) struct TemporalState {
     feedback_valid: bool,
     initialized: bool,
     total_history_frames: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemporalFramePlan {
+    /// No completed program image exists yet; retain this clean image and seed
+    /// the frozen-output memory without advancing clean history.
+    PrimeFrozenOutput,
+    /// Re-present the exact completed program image held in feedback memory.
+    HoldFrozenOutput,
+    /// Render a live program step and optionally record its clean observation.
+    Advance { record_history: bool },
 }
 
 impl Default for TemporalState {
@@ -62,11 +122,11 @@ impl TemporalState {
         *self = Self::default();
     }
 
-    /// Number of 30-Hz history snapshots to record for this render step.
-    /// The first rendered clean frame primes the ring immediately. Long stalls
-    /// are bounded to one complete ring because further copies of the same
-    /// current frame cannot add information.
-    fn history_writes_for_delta(&mut self, delta_seconds: f32) -> u32 {
+    /// Number of 30-Hz clock ticks observed by this render step. The first
+    /// rendered clean frame primes the clock immediately. The encoder records
+    /// the current image at most once even when several ticks elapsed: a render
+    /// supplies one observation, not one new image per missed wall-clock tick.
+    fn history_ticks_for_delta(&mut self, delta_seconds: f32) -> u32 {
         if !self.initialized {
             self.initialized = true;
             return 1;
@@ -88,6 +148,19 @@ impl TemporalState {
         elapsed_steps.min(HISTORY_LEN as u64) as u32
     }
 
+    fn plan_frame(&mut self, delta_seconds: f32, advance_program: bool) -> TemporalFramePlan {
+        if !advance_program {
+            return if self.feedback_valid {
+                TemporalFramePlan::HoldFrozenOutput
+            } else {
+                TemporalFramePlan::PrimeFrozenOutput
+            };
+        }
+        TemporalFramePlan::Advance {
+            record_history: self.history_ticks_for_delta(delta_seconds) > 0,
+        }
+    }
+
     fn record_history_frame(&mut self) {
         if self.history_valid > 0 {
             self.history_write = (self.history_write + 1) % HISTORY_LEN as usize;
@@ -102,11 +175,11 @@ mod temporal_state_tests {
     use super::*;
 
     fn advance(state: &mut TemporalState, delta_seconds: f32) -> u32 {
-        let writes = state.history_writes_for_delta(delta_seconds);
-        for _ in 0..writes {
+        let ticks = state.history_ticks_for_delta(delta_seconds);
+        if ticks > 0 {
             state.record_history_frame();
         }
-        writes
+        ticks
     }
 
     #[test]
@@ -122,9 +195,87 @@ mod temporal_state_tests {
     }
 
     #[test]
+    fn history_cadence_is_bounded_by_both_program_clock_and_real_observations() {
+        for (render_fps, expected_observations) in [(24, 24), (30, 30), (60, 30), (240, 30)] {
+            let mut state = TemporalState::default();
+            for _ in 0..render_fps {
+                advance(&mut state, 1.0 / render_fps as f32);
+            }
+            assert_eq!(
+                state.total_history_frames, expected_observations,
+                "unexpected one-second history cadence at {render_fps} fps"
+            );
+        }
+    }
+
+    #[test]
+    fn paused_startup_holds_clean_output_without_manufacturing_history() {
+        let mut state = TemporalState::default();
+        for _ in 0..120 {
+            assert_eq!(
+                state.plan_frame(0.0, false),
+                TemporalFramePlan::PrimeFrozenOutput
+            );
+        }
+        assert!(!state.initialized);
+        assert_eq!(state.history_valid, 0);
+        assert_eq!(temporal_key_reference_layer(0, 0, 1.0), None);
+
+        // The encoder seeds feedback after the first paused presentation.
+        state.feedback_valid = true;
+        assert_eq!(
+            state.plan_frame(0.0, false),
+            TemporalFramePlan::HoldFrozenOutput
+        );
+        assert_eq!(state.history_valid, 0);
+
+        assert_eq!(
+            state.plan_frame(0.0, true),
+            TemporalFramePlan::Advance {
+                record_history: true
+            },
+            "unpaused frame zero must prime clean history for live/export parity"
+        );
+        assert!(state.initialized);
+        assert_eq!(state.history_valid, 0, "planning precedes the GPU copy");
+    }
+
+    #[test]
+    fn pause_and_resume_never_accrue_history_catch_up_debt() {
+        let mut state = TemporalState::default();
+        assert_eq!(advance(&mut state, 1.0 / 30.0), 1);
+        state.feedback_valid = true;
+        let frozen_write = state.history_write;
+        let frozen_valid = state.history_valid;
+        let frozen_total = state.total_history_frames;
+        let frozen_accumulator = state.history_accumulator;
+
+        for _ in 0..240 {
+            assert_eq!(
+                state.plan_frame(1.0, false),
+                TemporalFramePlan::HoldFrozenOutput
+            );
+        }
+        assert_eq!(state.history_write, frozen_write);
+        assert_eq!(state.history_valid, frozen_valid);
+        assert_eq!(state.total_history_frames, frozen_total);
+        assert_eq!(state.history_accumulator, frozen_accumulator);
+
+        assert_eq!(
+            state.plan_frame(1.0 / 60.0, true),
+            TemporalFramePlan::Advance {
+                record_history: false
+            },
+            "resume uses only post-resume program time"
+        );
+        assert_eq!(state.history_write, frozen_write);
+        assert_eq!(state.history_valid, frozen_valid);
+    }
+
+    #[test]
     fn valid_history_never_exceeds_the_ring() {
         let mut state = TemporalState::default();
-        advance(&mut state, 0.0);
+        advance(&mut state, 1.0 / TEMPORAL_REFERENCE_FPS);
         for _ in 0..(HISTORY_LEN * 2) {
             advance(&mut state, 1.0 / TEMPORAL_REFERENCE_FPS);
         }
@@ -134,14 +285,75 @@ mod temporal_state_tests {
     }
 
     #[test]
-    fn temporal_uniform_layout_matches_three_shader_vec4s() {
-        assert_eq!(std::mem::size_of::<TemporalUniforms>(), 48);
+    fn temporal_uniform_layout_matches_four_shader_vec4s() {
+        assert_eq!(std::mem::size_of::<TemporalUniforms>(), 64);
+    }
+
+    #[test]
+    fn temporal_key_reference_tracks_history_ticks_without_sampling_unwritten_layers() {
+        // The first frame has only the current image in history, so a prior
+        // reference does not exist and the key must pass through.
+        assert_eq!(temporal_key_reference_layer(0, 0, 1.0), None);
+        // At high display rates there can be no history write this frame; the
+        // latest ring slot is then the correct one-frame reference.
+        assert_eq!(temporal_key_reference_layer(0, 1, 1.0), Some(0));
+        // Before a new snapshot lands, depth one still means the newest
+        // genuinely earlier image, independent of the elapsed tick count.
+        assert_eq!(temporal_key_reference_layer(0, 1, 1.0), Some(0));
+        // Deeper requests remain invalid until that many clean snapshots exist.
+        assert_eq!(temporal_key_reference_layer(0, 1, 2.0), None);
+        // Ring wrap is explicit and deterministic.
+        assert_eq!(temporal_key_reference_layer(0, HISTORY_LEN, 3.0), Some(22));
+    }
+
+    #[test]
+    fn catch_up_ticks_record_only_one_real_observation() {
+        let mut state = TemporalState::default();
+        assert_eq!(advance(&mut state, 1.0 / TEMPORAL_REFERENCE_FPS), 1);
+        let prior_write = state.history_write;
+        let prior_valid = state.history_valid;
+
+        assert_eq!(advance(&mut state, 2.0 / TEMPORAL_REFERENCE_FPS), 2);
+        assert_eq!(
+            state.history_write,
+            (prior_write + 1) % HISTORY_LEN as usize
+        );
+        assert_eq!(state.history_valid, prior_valid + 1);
+        assert_eq!(
+            temporal_key_reference_layer(prior_write, prior_valid, 1.0),
+            Some(prior_write),
+            "two elapsed ticks must still reference the prior real image"
+        );
+    }
+
+    #[test]
+    fn a_large_stall_cannot_replace_the_whole_ring_with_one_image() {
+        let mut state = TemporalState::default();
+        for _ in 0..HISTORY_LEN {
+            advance(&mut state, 1.0 / TEMPORAL_REFERENCE_FPS);
+        }
+        let prior_write = state.history_write;
+
+        assert_eq!(advance(&mut state, 30.0), HISTORY_LEN);
+        assert_eq!(state.history_valid, HISTORY_LEN);
+        assert_eq!(
+            state.history_write,
+            (prior_write + 1) % HISTORY_LEN as usize
+        );
+        assert_eq!(
+            temporal_key_reference_layer(prior_write, HISTORY_LEN, 1.0),
+            Some(prior_write)
+        );
+        assert_eq!(
+            temporal_key_reference_layer(prior_write, HISTORY_LEN, 23.0),
+            Some((prior_write + HISTORY_LEN as usize - 22) % HISTORY_LEN as usize)
+        );
     }
 
     #[test]
     fn reset_revokes_all_temporal_validity() {
         let mut state = TemporalState::default();
-        advance(&mut state, 0.0);
+        advance(&mut state, 1.0 / TEMPORAL_REFERENCE_FPS);
         state.feedback_valid = true;
 
         state.reset();
@@ -150,6 +362,75 @@ mod temporal_state_tests {
         assert!(!state.feedback_valid);
         assert!(!state.initialized);
         assert_eq!(state.total_history_frames, 0);
+    }
+
+    #[test]
+    fn temporal_shader_multiplies_straight_alpha_and_never_premultiplies_output_rgb() {
+        let shader = include_str!("../shaders/temporal.wgsl");
+        assert!(shader.contains("color.a *= mask"));
+        assert!(shader.contains("let current_covered = current.rgb * current.a"));
+        assert!(!shader.contains("color.rgb *= mask"));
+        assert!(shader.contains("u.key_valid > 0.5"));
+        let guard = shader
+            .find("if requested_depth >= 1.0 && max_depth >= 1.0")
+            .expect("slit-scan materialized-history guard");
+        let sample = shader
+            .find("let hist = textureSample(history_tex")
+            .expect("slit-scan history sample");
+        assert!(
+            guard < sample,
+            "startup must not even sample an uninitialized history layer"
+        );
+    }
+
+    #[test]
+    fn slitscan_virtual_current_exposes_only_materialized_past_layers() {
+        fn virtual_ring(previous_write: usize, previous_valid: u32) -> (usize, u32) {
+            let write = if previous_valid == 0 {
+                0
+            } else {
+                (previous_write + 1) % HISTORY_LEN as usize
+            };
+            let valid = if previous_valid == 0 {
+                0
+            } else {
+                (previous_valid + 1).min(HISTORY_LEN)
+            };
+            (write, valid)
+        }
+
+        assert_eq!(virtual_ring(0, 0), (0, 0));
+        assert_eq!(virtual_ring(0, 1), (1, 2));
+        assert_eq!(virtual_ring(23, HISTORY_LEN), (0, HISTORY_LEN));
+    }
+
+    #[test]
+    fn effects_shader_exposes_all_static_key_modes_in_straight_alpha() {
+        let shader = include_str!("../shaders/effects.wgsl");
+        assert!(shader.contains("Mode 3 removes the selected"));
+        assert!(shader.contains("mode 4 retains it"));
+        assert!(shader.contains("alpha *= outside"));
+        assert!(!shader.contains("rgb *= outside"));
+        assert!(shader.contains("dot(rgb, vec3f(0.2126, 0.7152, 0.0722))"));
+        assert!(!shader.contains("dot(rgb, vec3f(0.299, 0.587, 0.114))"));
+        assert!(shader.contains("MAX_DISPLAY_CHROMA_DISTANCE: f32 = 1.1913178"));
+        assert!(shader.contains("/ MAX_DISPLAY_CHROMA_DISTANCE"));
+    }
+
+    #[test]
+    fn display_chroma_normalization_spans_the_rgb_cube_and_ignores_neutral_luma() {
+        fn chroma([r, g, b]: [f32; 3]) -> [f32; 2] {
+            let y = r * 0.2126 + g * 0.7152 + b * 0.0722;
+            [(b - y) / 1.8556, (r - y) / 1.5748]
+        }
+        fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+        }
+
+        assert!(distance(chroma([0.0; 3]), chroma([1.0; 3])) < 1.0e-6);
+        let cube_span = distance(chroma([0.0, 1.0, 0.0]), chroma([1.0, 0.0, 1.0]));
+        assert!((cube_span - 1.1913178).abs() < 1.0e-6);
+        assert!((cube_span / 1.1913178 - 1.0).abs() < 1.0e-6);
     }
 
     #[test]
@@ -169,6 +450,249 @@ mod temporal_state_tests {
             Some(wgpu::PresentMode::Fifo)
         );
     }
+
+    #[test]
+    fn live_layer_accumulation_starts_transparent() {
+        let clear = transparent_accumulation_clear();
+        assert_eq!([clear.r, clear.g, clear.b, clear.a], [0.0; 4]);
+    }
+
+    #[test]
+    fn master_bypass_path_only_changes_for_a_visible_bypass() {
+        assert_eq!(
+            master_fx_composition_path([(true, false, 1.0), (true, false, 1.0)]),
+            MasterFxCompositionPath::LegacyPostComposite
+        );
+        assert_eq!(
+            master_fx_composition_path([(true, false, 1.0), (false, true, 1.0)]),
+            MasterFxCompositionPath::LegacyPostComposite,
+            "a hidden bypass must not perturb the legacy frame"
+        );
+        assert_eq!(
+            master_fx_composition_path([(true, false, 1.0), (true, true, 1.0)]),
+            MasterFxCompositionPath::ConditionalPerLayer
+        );
+        for opacity in [0.0, -0.0, -0.5] {
+            assert_eq!(
+                master_fx_composition_path([(true, true, opacity)]),
+                MasterFxCompositionPath::LegacyPostComposite,
+                "finite non-contributing opacity must leave the legacy path unchanged"
+            );
+        }
+        assert_eq!(
+            master_fx_composition_path([(true, true, f32::NAN)]),
+            MasterFxCompositionPath::ConditionalPerLayer
+        );
+        assert_eq!(
+            master_fx_composition_path([(true, true, f32::INFINITY)]),
+            MasterFxCompositionPath::ConditionalPerLayer
+        );
+    }
+
+    #[test]
+    fn conditional_master_path_ping_pongs_without_an_extra_texture() {
+        assert_eq!(
+            conditional_layer_slots(false),
+            ConditionalLayerSlots {
+                master_output: Some(2),
+                composite_output: 1,
+            }
+        );
+        assert_eq!(
+            conditional_layer_slots(true),
+            ConditionalLayerSlots {
+                master_output: None,
+                composite_output: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn conditional_path_preserves_bottom_to_top_visible_stack_order() {
+        assert_eq!(visible_stack_indices([true, false, true, true]), [3, 2, 0]);
+    }
+
+    #[test]
+    fn composite_shader_uses_straight_alpha_source_over() {
+        let shader = include_str!("../shaders/composite.wgsl");
+        assert!(shader.contains("let output_alpha = source_alpha + base.a * (1.0 - source_alpha);"));
+        assert!(shader.contains("output_premultiplied / max(output_alpha, 0.000001)"));
+
+        // Transparent base + half-opacity source must retain straight RGB,
+        // while alpha carries the half coverage. This is the fringe-sensitive
+        // case that the old mix/max equation got wrong.
+        let base_alpha = 0.0_f32;
+        let source_alpha = 0.5_f32;
+        let overlay = [0.8_f32, 0.2, 0.4];
+        let output_alpha = source_alpha + base_alpha * (1.0 - source_alpha);
+        let output_premultiplied = overlay.map(|channel| channel * source_alpha);
+        let output = output_premultiplied.map(|channel| channel / output_alpha);
+        assert_eq!(output, overlay);
+        assert_eq!(output_alpha, 0.5);
+    }
+
+    #[test]
+    fn opaque_output_flattens_once_and_blit_does_not_repeat_it() {
+        let flatten = include_str!("../shaders/opaque_output.wgsl");
+        assert!(flatten.contains("straight.rgb * coverage"));
+        assert!(flatten.contains("vec4f(straight.rgb * coverage, 1.0)"));
+
+        let blit = include_str!("../shaders/blit.wgsl");
+        assert!(blit.contains("return textureSample(tex, samp, uv);"));
+        assert!(!blit.contains("rgb *"));
+    }
+
+    #[test]
+    fn egui_view_is_the_raw_twin_of_the_srgb_audience_view() {
+        assert!(COMPOSITE_FORMAT.is_srgb());
+        assert!(!EGUI_OUTPUT_VIEW_FORMAT.is_srgb());
+        assert_eq!(
+            COMPOSITE_FORMAT.remove_srgb_suffix(),
+            EGUI_OUTPUT_VIEW_FORMAT
+        );
+        assert_eq!(EGUI_OUTPUT_VIEW_FORMATS, &[EGUI_OUTPUT_VIEW_FORMAT]);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_flattens_straight_alpha_in_linear_light_and_supports_raw_egui_view() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Opaque output regression device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device");
+
+        let size = wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        };
+        let source = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Straight-alpha fixture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COMPOSITE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let source_pixel = [200_u8, 100, 50, 128];
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &source,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &source_pixel,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            size,
+        );
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Opaque output fixture"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COMPOSITE_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: EGUI_OUTPUT_VIEW_FORMATS,
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let _egui_raw_view = target.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(EGUI_OUTPUT_VIEW_FORMAT),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let (pipeline, layout) = build_opaque_output_pipeline(&device);
+        let bind_group = build_opaque_output_bind_group(&device, &layout, &source_view, &sampler);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Opaque output fixture readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Opaque output regression encoder"),
+        });
+        encode_opaque_output(&mut encoder, &pipeline, &bind_group, &target_view);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            size,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (send, receive) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = send.send(result);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU wait");
+        receive.recv().expect("map callback").expect("map result");
+        let data = slice.get_mapped_range();
+        let actual = [data[0], data[1], data[2], data[3]];
+
+        fn srgb_to_linear(encoded: f32) -> f32 {
+            if encoded <= 0.04045 {
+                encoded / 12.92
+            } else {
+                ((encoded + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn linear_to_srgb(linear: f32) -> f32 {
+            if linear <= 0.003_130_8 {
+                linear * 12.92
+            } else {
+                1.055 * linear.powf(1.0 / 2.4) - 0.055
+            }
+        }
+        let alpha = source_pixel[3] as f32 / 255.0;
+        let expected_rgb = [source_pixel[0], source_pixel[1], source_pixel[2]].map(|channel| {
+            (linear_to_srgb(srgb_to_linear(channel as f32 / 255.0) * alpha) * 255.0).round() as u8
+        });
+        for (actual, expected) in actual[..3].iter().zip(expected_rgb) {
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "actual={actual}, expected={expected}"
+            );
+        }
+        assert_eq!(actual[3], 255);
+        drop(data);
+        staging.unmap();
+    }
 }
 
 // Readback slot lifecycle for the async NTSC pipeline.
@@ -176,6 +700,7 @@ const SLOT_IDLE: u8 = 0;
 const SLOT_MAP_PENDING: u8 = 1;
 const SLOT_MAPPED: u8 = 2;
 const SLOT_MAP_FAILED: u8 = 3;
+const SLOT_MAP_REQUESTED: u8 = 4;
 const MAX_READBACK_SLOTS: usize = 3;
 
 /// A staging buffer that can have a GPU→CPU copy in flight without
@@ -188,6 +713,17 @@ struct ReadbackSlot {
     /// Application-owned visual generation associated with this copy.
     /// Consumers use it to reject frames captured before a blackout edge.
     epoch: u64,
+    /// Parameters and deterministic phase sampled with this raw frame.
+    /// `None` is used when the readback exists only for Spout output.
+    ntsc_metadata: Option<NtscFrameMetadata>,
+    /// Selective audience sample copied only after that exact sample's
+    /// Temporal and opaque passes were encoded. `None` is the legacy/global
+    /// readback path.
+    selective_sample: Option<SelectiveNtscGeneration>,
+    /// True when this copy rebases Spout to the exact audience image retained
+    /// across a paused selective-path transition. It is deliberately distinct
+    /// from both raw/global NTSC input and a newly processed selective sample.
+    held_audience: bool,
 }
 
 /// A completed asynchronous composite readback.
@@ -198,6 +734,38 @@ struct ReadbackSlot {
 pub struct ReadbackFrame {
     pub pixels: Vec<u8>,
     pub epoch: u64,
+    pub ntsc_metadata: Option<NtscFrameMetadata>,
+    pub selective_sample: Option<SelectiveNtscGeneration>,
+    pub held_audience: bool,
+}
+
+/// Nonblocking readback poll result. A held-audience copy that could not be
+/// harvested is reported explicitly so the application can schedule another
+/// exact copy instead of mistaking a failed GPU map for successful delivery.
+pub struct ReadbackPoll {
+    pub frame: Option<ReadbackFrame>,
+    pub held_audience_not_harvested: bool,
+}
+
+/// One lazy, bounded GPU batch for selective per-layer VHS. A single slot is
+/// intentional: a second full stack at 4K can consume hundreds of MiB and
+/// would only increase CPU post-process latency. New snapshots are skipped
+/// until this slot is harvested, making the path latest-only rather than a
+/// backlog.
+struct SelectiveNtscReadbackSlot {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    status: Arc<AtomicU8>,
+    used_size: u64,
+    padded_row_bytes: u32,
+    slice_stride: u64,
+    plan: Option<SelectiveNtscPlan>,
+}
+
+struct SelectiveNtscGpuState {
+    scratch_textures: [wgpu::Texture; 2],
+    scratch_views: [wgpu::TextureView; 2],
+    slot: SelectiveNtscReadbackSlot,
 }
 
 /// Build the temporal pipeline and its layouts. Shared by the live
@@ -313,6 +881,123 @@ pub(crate) fn build_temporal_pipeline(
     (pipeline, bind_group_layout, uniform_layout)
 }
 
+/// Build the one final pass that turns the engine's straight-alpha image into
+/// the opaque program image shared by every audience-facing consumer.
+pub(crate) fn build_opaque_output_pipeline(
+    device: &wgpu::Device,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Opaque Output BGL"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Opaque Output Vertex"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fullscreen.wgsl").into()),
+    });
+    let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Opaque Output Fragment"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/opaque_output.wgsl").into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Opaque Output Pipeline Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Opaque Output Pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &vertex,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &fragment,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COMPOSITE_FORMAT,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, bind_group_layout)
+}
+
+pub(crate) fn build_opaque_output_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Opaque Output BG"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+pub(crate) fn encode_opaque_output(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    target: &wgpu::TextureView,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("Opaque Output Pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 /// Create the frame-history texture array and its D2Array view.
 pub(crate) fn build_history_texture(
     device: &wgpu::Device,
@@ -358,16 +1043,17 @@ pub(crate) fn build_feedback_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
 }
 
-/// Encode the temporal pass + history recording. `history_write` is the
-/// layer holding the most recent completed frame; returns the new value.
-/// Shared by the live renderer and the offline exporter.
+/// Encode the temporal pass and record at most one clean current image in the
+/// history ring. Shared by the live renderer and the offline exporter.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_temporal_with_dt(
     device: &wgpu::Device,
@@ -385,53 +1071,106 @@ pub(crate) fn encode_temporal_with_dt(
     feedback_view: &wgpu::TextureView,
     state: &mut TemporalState,
     delta_seconds: f32,
+    advance_program: bool,
     width: u32,
     height: u32,
 ) {
-    // Record the CLEAN composite into the ring first — slit-scan must read
-    // real past frames, never its own output (which would self-cannibalize
-    // into black). new_write becomes the ring's "now".
-    let writes = state.history_writes_for_delta(delta_seconds);
-    for _ in 0..writes {
-        state.record_history_frame();
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &composite_textures[0],
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: history_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: state.history_write as u32,
+    let record_current = match state.plan_frame(delta_seconds, advance_program) {
+        TemporalFramePlan::PrimeFrozenOutput => {
+            // There is no completed temporal output to hold yet. Preserve the
+            // clean program already in slot 0 and seed the hold memory once.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &composite_textures[0],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
                 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
+                wgpu::TexelCopyTextureInfo {
+                    texture: feedback_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            state.feedback_valid = true;
+            return;
+        }
+        TemporalFramePlan::HoldFrozenOutput => {
+            // Render-loop state may continue to redraw while paused; always
+            // restore the exact completed program image from the pause edge.
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: feedback_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &composite_textures[0],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            return;
+        }
+        TemporalFramePlan::Advance { record_history } => record_history,
+    };
+
+    // Resolve every history read against the ring *before* recording this
+    // clean image. A slow render can span several 30-Hz ticks, but it still
+    // contributes only one distinct observation. Recording it repeatedly
+    // would erase real history and make a motion key compare the image with
+    // duplicate copies of itself.
+    let previous_write = state.history_write;
+    let previous_valid = state.history_valid;
+
+    // The shader treats `write_index` as the current clean frame and subtracts
+    // one for the newest historical sample. The current frame intentionally
+    // remains in composite slot 0 during the pass, so expose its virtual ring
+    // position one slot beyond the newest materialized history image.
+    let virtual_write = if previous_valid == 0 {
+        0
+    } else {
+        (previous_write + 1) % HISTORY_LEN as usize
+    };
+    let virtual_valid = if previous_valid == 0 {
+        0
+    } else {
+        (previous_valid + 1).min(HISTORY_LEN)
+    };
 
     let frame_params = params.for_frame_delta(delta_seconds);
     if frame_params.is_active() {
+        let key_reference =
+            temporal_key_reference_layer(previous_write, previous_valid, frame_params.key_history);
         let uniforms = TemporalUniforms {
             feedback: frame_params.feedback,
             fb_zoom: frame_params.fb_zoom,
             fb_rotate: frame_params.fb_rotate,
             slitscan: frame_params.slitscan,
             history_len: HISTORY_LEN as f32,
-            write_index: state.history_write as f32,
-            valid_history: state.history_valid as f32,
+            write_index: virtual_write as f32,
+            valid_history: virtual_valid as f32,
             feedback_valid: if state.feedback_valid { 1.0 } else { 0.0 },
             slit_direction: normalized_slit_direction(frame_params.slit_angle, width, height),
-            _pad: [0.0; 2],
+            key_reference_layer: key_reference.unwrap_or(0) as f32,
+            key_valid: if key_reference.is_some() { 1.0 } else { 0.0 },
+            key_mode: frame_params.key_mode,
+            key_threshold: frame_params.key_threshold,
+            key_softness: frame_params.key_softness,
+            _pad: 0.0,
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Temporal Uniforms"),
@@ -491,6 +1230,36 @@ pub(crate) fn encode_temporal_with_dt(
             pass.draw(0..3, 0..1);
         }
 
+        // Preserve the clean pre-temporal image only after the shader has
+        // finished reading the old ring, and before slot 0 is replaced with
+        // the temporal result below.
+        if record_current {
+            state.record_history_frame();
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &composite_textures[0],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: history_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: state.history_write as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &composite_textures[2],
@@ -502,6 +1271,33 @@ pub(crate) fn encode_temporal_with_dt(
                 texture: &composite_textures[0],
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    } else if record_current {
+        // Even with temporal processing disabled, maintain clean history so
+        // enabling a key/slit-scan later starts from real prior observations.
+        state.record_history_frame();
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: history_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: state.history_write as u32,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::Extent3d {
@@ -544,6 +1340,82 @@ struct CompositeUniforms {
     _pad: [f32; 2],
 }
 
+/// How the direct master shader is scheduled for one rendered frame.
+///
+/// The legacy post-composite path is deliberately retained whenever every
+/// visible layer inherits the master. Besides avoiding extra work, that keeps
+/// existing patches byte/order compatible with the renderer they were built
+/// against. A single visible bypass requires conditional per-layer master
+/// passes so the ordinary stack can still occlude and blend in its original
+/// order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MasterFxCompositionPath {
+    LegacyPostComposite,
+    ConditionalPerLayer,
+}
+
+pub(crate) fn master_fx_composition_path<I>(layers: I) -> MasterFxCompositionPath
+where
+    I: IntoIterator<Item = (bool, bool, f32)>,
+{
+    let has_contributing_bypass =
+        layers
+            .into_iter()
+            .any(|(visible, bypass_master_fx, effective_opacity)| {
+                // The compositor clamps finite opacity to [0, 1]. A bypassed
+                // layer that contributes no pixels must not perturb the legacy
+                // master law for every other layer. Invalid values take the
+                // conservative conditional path.
+                let opacity_contributes = effective_opacity > 0.0 || !effective_opacity.is_finite();
+                visible && bypass_master_fx && opacity_contributes
+            });
+    if has_contributing_bypass {
+        MasterFxCompositionPath::ConditionalPerLayer
+    } else {
+        MasterFxCompositionPath::LegacyPostComposite
+    }
+}
+
+/// Return visible source indices in compositor execution order: bottom to
+/// top. Source/UI index zero is the top layer, so execution reverses the
+/// visible subset without moving bypassed layers into a separate overlay.
+pub(crate) fn visible_stack_indices<I>(visibility: I) -> Vec<usize>
+where
+    I: IntoIterator<Item = bool>,
+{
+    let mut indices: Vec<usize> = visibility
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, visible)| visible.then_some(index))
+        .collect();
+    indices.reverse();
+    indices
+}
+
+/// Scratch-slot plan for one layer in the conditional path. Local layer FX
+/// always write slot 1. An inherited master writes 1 -> 2 and therefore
+/// composites 0 + 2 -> 1; a bypass composites 0 + 1 -> 2 directly. This is
+/// what preserves order with the renderer's original three full-frame slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConditionalLayerSlots {
+    pub master_output: Option<usize>,
+    pub composite_output: usize,
+}
+
+pub(crate) const fn conditional_layer_slots(bypass_master_fx: bool) -> ConditionalLayerSlots {
+    if bypass_master_fx {
+        ConditionalLayerSlots {
+            master_output: None,
+            composite_output: 2,
+        }
+    } else {
+        ConditionalLayerSlots {
+            master_output: Some(2),
+            composite_output: 1,
+        }
+    }
+}
+
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -560,17 +1432,29 @@ pub struct Renderer {
     composite_bind_group_layout: wgpu::BindGroupLayout,
     composite_uniform_layout: wgpu::BindGroupLayout,
 
+    // Final straight-alpha -> opaque-black conversion. It writes into
+    // composite slot 2 only after all engine effects have finished.
+    opaque_output_pipeline: wgpu::RenderPipeline,
+    opaque_output_bind_group: wgpu::BindGroup,
+
     // Shared sampler
     sampler: wgpu::Sampler,
 
     // Three textures for compositing:
     // [0] = accumulated result (base)
     // [1] = current layer after effects (overlay)
-    // [2] = composite output (becomes new base)
+    // [2] = scratch during engine passes, then final opaque audience output
     pub composite_textures: [wgpu::Texture; 3],
     pub composite_views: [wgpu::TextureView; 3],
 
-    // The view egui displays (always points at the final accumulated result)
+    // Baseline exact opaque audience snapshot retained by the global
+    // Pause/blackout contract and reused across selective/VHS path changes.
+    // This texture is never sampled as an effect input; it is only copied
+    // to/from final audience slot 2.
+    held_audience_texture: wgpu::Texture,
+
+    // Raw (non-sRGB-decoding) view of slot 2 for egui-wgpu, whose shader
+    // performs the gamma-to-linear conversion itself.
     pub output_view: wgpu::TextureView,
 
     pub output_width: u32,
@@ -580,6 +1464,7 @@ pub struct Renderer {
     readback_slots: Vec<ReadbackSlot>,
     next_readback_sequence: u64,
     last_harvested_readback_sequence: u64,
+    selective_ntsc_gpu: Option<SelectiveNtscGpuState>,
 
     // Temporal effects: ring buffer of past output frames (texture array)
     temporal_pipeline: wgpu::RenderPipeline,
@@ -895,9 +1780,16 @@ impl Renderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: COMPOSITE_FORMAT,
                 usage: tex_usage,
-                view_formats: &[],
+                // Slot 2 is the opaque audience image. egui-wgpu expects a
+                // raw/gamma texture and performs its own decode, so permit a
+                // non-sRGB twin view of exactly this texture.
+                view_formats: if i == 2 {
+                    EGUI_OUTPUT_VIEW_FORMATS
+                } else {
+                    &[]
+                },
             })
         });
 
@@ -905,8 +1797,33 @@ impl Renderer {
             composite_textures[i].create_view(&wgpu::TextureViewDescriptor::default())
         });
 
-        let output_view =
-            composite_textures[0].create_view(&wgpu::TextureViewDescriptor::default());
+        let output_view = composite_textures[2].create_view(&wgpu::TextureViewDescriptor {
+            label: Some("egui opaque output (raw gamma view)"),
+            format: Some(EGUI_OUTPUT_VIEW_FORMAT),
+            ..Default::default()
+        });
+        let held_audience_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Held opaque audience"),
+            size: wgpu::Extent3d {
+                width: output_width,
+                height: output_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COMPOSITE_FORMAT,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let (opaque_output_pipeline, opaque_output_bind_group_layout) =
+            build_opaque_output_pipeline(&device);
+        let opaque_output_bind_group = build_opaque_output_bind_group(
+            &device,
+            &opaque_output_bind_group_layout,
+            &composite_views[0],
+            &sampler,
+        );
 
         Ok(Self {
             surface,
@@ -919,15 +1836,19 @@ impl Renderer {
             composite_pipeline,
             composite_bind_group_layout,
             composite_uniform_layout,
+            opaque_output_pipeline,
+            opaque_output_bind_group,
             sampler,
             composite_textures,
             composite_views,
+            held_audience_texture,
             output_view,
             output_width,
             output_height,
             readback_slots: Vec::new(),
             next_readback_sequence: 1,
             last_harvested_readback_sequence: 0,
+            selective_ntsc_gpu: None,
             temporal_pipeline,
             temporal_bind_group_layout,
             temporal_uniform_layout,
@@ -1058,13 +1979,20 @@ impl Renderer {
                 cache: None,
             });
 
+        // An sRGB surface needs the sRGB view (hardware decode + encode). A
+        // rare non-sRGB fallback surface needs the raw gamma view instead.
+        let source_view = if format.is_srgb() {
+            &self.composite_views[2]
+        } else {
+            &self.output_view
+        };
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blit BG"),
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                    resource: wgpu::BindingResource::TextureView(source_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1095,6 +2023,60 @@ impl Renderer {
         self.last_harvested_readback_sequence = self
             .last_harvested_readback_sequence
             .max(self.next_readback_sequence.saturating_sub(1));
+        // A pending map cannot be cancelled portably. Revoking its plan makes
+        // the callback harmless; poll will unmap/recycle it without exposing
+        // pixels to the CPU worker.
+        if let Some(state) = self.selective_ntsc_gpu.as_mut() {
+            state.slot.plan = None;
+        }
+    }
+
+    /// Snapshot the exact opaque audience image without involving temporal,
+    /// effects, CPU processing, or readback. Used when Pause must survive a
+    /// selective/VHS path transition (including a temporary blackout).
+    pub fn capture_held_audience(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.held_audience_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.output_width,
+                height: self.output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Restore a previously captured audience snapshot to final slot 2.
+    pub fn restore_held_audience(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.held_audience_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.output_width,
+                height: self.output_height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Blackout: clear the final composite to black. Everything downstream
@@ -1102,15 +2084,26 @@ impl Renderer {
     pub fn clear_composite(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blackout"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.composite_views[0],
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.composite_views[0],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &self.composite_views[2],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+            ],
             depth_stencil_attachment: None,
             ..Default::default()
         });
@@ -1200,6 +2193,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         params: &TemporalParams,
         delta_seconds: f32,
+        advance_program: bool,
     ) {
         encode_temporal_with_dt(
             &self.device,
@@ -1217,8 +2211,21 @@ impl Renderer {
             &self.feedback_view,
             &mut self.temporal_state,
             delta_seconds,
+            advance_program,
             self.output_width,
             self.output_height,
+        );
+    }
+
+    /// Resolve the straight-alpha engine image into one opaque audience image.
+    /// This runs exactly once after layer, master, and temporal rendering and
+    /// before preview, projector, readback, NTSC, Spout, or export consumes it.
+    pub fn render_opaque_output(&self, encoder: &mut wgpu::CommandEncoder) {
+        encode_opaque_output(
+            encoder,
+            &self.opaque_output_pipeline,
+            &self.opaque_output_bind_group,
+            &self.composite_views[2],
         );
     }
 
@@ -1263,7 +2270,7 @@ impl Renderer {
                     view: &self.composite_views[0],
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1275,7 +2282,10 @@ impl Renderer {
         }
 
         for (i, (layer, (uniforms, opacity))) in visible_layers.iter().enumerate() {
-            let uniforms = *uniforms;
+            // The effects pass writes an output-sized composite even when its
+            // source layer has different dimensions. Spatial effects therefore
+            // need the composite resolution, not the source texture resolution.
+            let uniforms = uniforms.for_render_target(self.output_width, self.output_height);
 
             // Each pass needs its own buffer because queue.write_buffer writes
             // all execute before the encoder's render passes run on the GPU.
@@ -1345,7 +2355,7 @@ impl Renderer {
                         view: &self.composite_views[0],
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
                             store: wgpu::StoreOp::Store,
                         },
                         depth_slice: None,
@@ -1443,6 +2453,278 @@ impl Renderer {
         }
     }
 
+    /// Render the complete direct-effects portion of the program.
+    ///
+    /// With no visible bypass this calls the two established passes verbatim:
+    /// all layers composite first and the master shader runs exactly once on
+    /// the result. If any visible layer bypasses master FX, every layer keeps
+    /// its original stack position, local FX, opacity, and blend mode, while
+    /// inherited layers receive the master shader immediately before their
+    /// composite pass. Temporal and NTSC/VHS remain downstream global stages.
+    pub fn render_layers_and_master(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: &[Layer],
+        mods: &[(EffectUniforms, f32)],
+        master_uniforms: &EffectUniforms,
+    ) {
+        let path = master_fx_composition_path(
+            layers
+                .iter()
+                .zip(mods.iter())
+                .map(|(layer, (_, opacity))| (layer.visible, layer.bypass_master_fx, *opacity)),
+        );
+        match path {
+            MasterFxCompositionPath::LegacyPostComposite => {
+                // Keep this sequence exactly equivalent to the pre-bypass
+                // renderer for old patches and all-inherited performances.
+                self.render_layers(encoder, layers, mods);
+                self.render_master_effects(encoder, master_uniforms);
+            }
+            MasterFxCompositionPath::ConditionalPerLayer => {
+                self.render_layers_with_conditional_master(encoder, layers, mods, master_uniforms);
+            }
+        }
+    }
+
+    fn render_layers_with_conditional_master(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: &[Layer],
+        mods: &[(EffectUniforms, f32)],
+        master_uniforms: &EffectUniforms,
+    ) {
+        // Preserve the established stack law: the last vector element is the
+        // bottom and UI Layer 1 (index 0) is composited last, on top.
+        let visible_layers: Vec<(&Layer, &(EffectUniforms, f32))> = visible_stack_indices(
+            layers
+                .iter()
+                .zip(mods.iter())
+                .map(|(layer, _)| layer.visible),
+        )
+        .into_iter()
+        .map(|index| (&layers[index], &mods[index]))
+        .collect();
+
+        debug_assert!(visible_layers
+            .iter()
+            .any(|(layer, _)| layer.bypass_master_fx));
+
+        // Every inherited layer reads the local-FX image from slot 1. Reuse
+        // one immutable master uniform buffer and bind groups for all of them.
+        let master_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Conditional Master FX Uniforms"),
+                contents: bytemuck::cast_slice(&[*master_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let master_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Conditional Master FX Input"),
+            layout: &self.effects_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let master_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Conditional Master FX Uniforms BG"),
+            layout: &self.effects_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: master_buffer.as_entire_binding(),
+            }],
+        });
+
+        for (stack_index, (layer, (uniforms, opacity))) in visible_layers.iter().enumerate() {
+            let uniforms = uniforms.for_render_target(self.output_width, self.output_height);
+            let fx_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Conditional Layer FX Uniforms"),
+                    contents: bytemuck::cast_slice(&[uniforms]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let layer_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Conditional Layer FX Input"),
+                layout: &self.effects_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&layer.texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            let layer_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Conditional Layer FX Uniforms BG"),
+                layout: &self.effects_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fx_buffer.as_entire_binding(),
+                }],
+            });
+
+            // Source -> local layer FX -> slot 1.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Conditional Layer FX Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[1],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &layer_tex_bg, &[]);
+                pass.set_bind_group(1, &layer_uniform_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            let slots = conditional_layer_slots(layer.bypass_master_fx);
+            if let Some(master_output) = slots.master_output {
+                debug_assert_eq!(master_output, 2);
+                // Local output slot 1 -> modulated master FX -> slot 2.
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Conditional Master FX Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[master_output],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &master_tex_bg, &[]);
+                pass.set_bind_group(1, &master_uniform_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            if stack_index == 0 {
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Conditional Clear Base"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[0],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+            }
+
+            let overlay_slot = slots.master_output.unwrap_or(1);
+            let comp_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Conditional Composite Uniforms"),
+                    contents: bytemuck::cast_slice(&[CompositeUniforms {
+                        opacity: *opacity,
+                        blend_mode: if stack_index == 0 {
+                            0
+                        } else {
+                            layer.blend_mode.as_u32()
+                        },
+                        _pad: [0.0; 2],
+                    }]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let composite_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Conditional Composite Textures BG"),
+                layout: &self.composite_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.composite_views[0]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(
+                            &self.composite_views[overlay_slot],
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            let composite_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Conditional Composite Uniform BG"),
+                layout: &self.composite_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: comp_buffer.as_entire_binding(),
+                }],
+            });
+
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Conditional Composite Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[slots.composite_output],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.composite_pipeline);
+                pass.set_bind_group(0, &composite_tex_bg, &[]);
+                pass.set_bind_group(1, &composite_uniform_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.composite_textures[slots.composite_output],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.composite_textures[0],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.output_width,
+                    height: self.output_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
     /// Apply master effects to the final composite (already in [0]).
     /// Reads [0], applies effects → [2], copies back to [0].
     pub fn render_master_effects(
@@ -1526,12 +2808,386 @@ impl Renderer {
         );
     }
 
+    fn selective_batch_layout(&self, layer_count: usize) -> Result<(u32, u64, u64), String> {
+        let memory = validate_selective_ntsc_live_memory(
+            self.output_width,
+            self.output_height,
+            layer_count,
+        )?;
+        let memory = validate_selective_ntsc_gpu_staging_limit(
+            memory,
+            self.device.limits().max_buffer_size,
+        )?;
+        Ok((
+            memory.padded_row_bytes,
+            memory.slice_stride,
+            memory.gpu_staging_bytes,
+        ))
+    }
+
+    fn ensure_selective_ntsc_gpu(&mut self, required_capacity: u64) {
+        let needs_state = self.selective_ntsc_gpu.is_none();
+        if needs_state {
+            let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC;
+            let scratch_textures: [wgpu::Texture; 2] = std::array::from_fn(|index| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("Selective NTSC Scratch {index}")),
+                    size: wgpu::Extent3d {
+                        width: self.output_width,
+                        height: self.output_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: COMPOSITE_FORMAT,
+                    usage,
+                    view_formats: &[],
+                })
+            });
+            let scratch_views = std::array::from_fn(|index| {
+                scratch_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+            });
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Selective NTSC Readback Batch"),
+                size: required_capacity,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.selective_ntsc_gpu = Some(SelectiveNtscGpuState {
+                scratch_textures,
+                scratch_views,
+                slot: SelectiveNtscReadbackSlot {
+                    buffer,
+                    capacity: required_capacity,
+                    status: Arc::new(AtomicU8::new(SLOT_IDLE)),
+                    used_size: 0,
+                    padded_row_bytes: 0,
+                    slice_stride: 0,
+                    plan: None,
+                },
+            });
+            return;
+        }
+
+        let state = self.selective_ntsc_gpu.as_mut().unwrap();
+        if state.slot.capacity < required_capacity {
+            debug_assert_eq!(state.slot.status.load(Ordering::Acquire), SLOT_IDLE);
+            state.slot.buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Selective NTSC Readback Batch"),
+                size: required_capacity,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            state.slot.capacity = required_capacity;
+        }
+    }
+
+    /// Encode one generation-coherent selective-VHS batch. Every contributing
+    /// layer is rendered through local FX and, unless bypassed, direct master
+    /// FX into dedicated scratch textures. All slices are then copied into one
+    /// aligned staging allocation in this same command stream.
+    pub fn begin_selective_ntsc_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        layers: &[Layer],
+        mods: &[(EffectUniforms, f32)],
+        master_uniforms: &EffectUniforms,
+        plan: SelectiveNtscPlan,
+    ) -> Result<bool, String> {
+        if plan.generation.width != self.output_width
+            || plan.generation.height != self.output_height
+        {
+            return Err("selective NTSC plan dimensions do not match the renderer".into());
+        }
+        if layers.len() != mods.len() {
+            return Err("selective NTSC layer/modulation alignment mismatch".into());
+        }
+        if self
+            .selective_ntsc_gpu
+            .as_ref()
+            .is_some_and(|state| state.slot.status.load(Ordering::Acquire) != SLOT_IDLE)
+        {
+            return Ok(false);
+        }
+
+        let (padded_row_bytes, slice_stride, used_size) =
+            self.selective_batch_layout(plan.layers.len())?;
+        self.ensure_selective_ntsc_gpu(used_size);
+
+        let state = self.selective_ntsc_gpu.as_ref().unwrap();
+        let master_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Selective NTSC Master FX Uniforms"),
+                contents: bytemuck::cast_slice(&[*master_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let master_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Selective NTSC Master FX Input"),
+            layout: &self.effects_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&state.scratch_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let master_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Selective NTSC Master FX Uniforms BG"),
+            layout: &self.effects_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: master_buffer.as_entire_binding(),
+            }],
+        });
+
+        for (slice_index, planned_layer) in plan.layers.iter().enumerate() {
+            let source_index = layers
+                .iter()
+                .position(|layer| layer.layer_id() == planned_layer.layer_id)
+                .ok_or_else(|| {
+                    format!(
+                        "selective NTSC layer {} disappeared before encoding",
+                        planned_layer.layer_id
+                    )
+                })?;
+            let layer = &layers[source_index];
+            if !layer.visible || layer.bypass_master_fx != planned_layer.bypass_master_fx {
+                return Err(format!(
+                    "selective NTSC layer {} changed before encoding",
+                    planned_layer.layer_id
+                ));
+            }
+            let uniforms = mods[source_index]
+                .0
+                .for_render_target(self.output_width, self.output_height);
+            let fx_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Selective NTSC Layer FX Uniforms"),
+                    contents: bytemuck::cast_slice(&[uniforms]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let layer_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Selective NTSC Layer FX Input"),
+                layout: &self.effects_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&layer.texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            let layer_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Selective NTSC Layer FX Uniforms BG"),
+                layout: &self.effects_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fx_buffer.as_entire_binding(),
+                }],
+            });
+
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Selective NTSC Layer FX Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &state.scratch_views[0],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &layer_tex_bg, &[]);
+                pass.set_bind_group(1, &layer_uniform_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            let output_index = if planned_layer.bypass_master_fx {
+                0
+            } else {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Selective NTSC Direct Master FX Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &state.scratch_views[1],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &master_tex_bg, &[]);
+                pass.set_bind_group(1, &master_uniform_bg, &[]);
+                pass.draw(0..3, 0..1);
+                1
+            };
+
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &state.scratch_textures[output_index],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &state.slot.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: slice_stride * slice_index as u64,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(self.output_height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.output_width,
+                    height: self.output_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        let slot = &mut self.selective_ntsc_gpu.as_mut().unwrap().slot;
+        slot.used_size = used_size;
+        slot.padded_row_bytes = padded_row_bytes;
+        slot.slice_stride = slice_stride;
+        slot.plan = Some(plan);
+        slot.status.store(SLOT_MAP_PENDING, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Request the asynchronous map after the encoder containing the batch
+    /// copy has been submitted.
+    pub fn map_selective_ntsc_readback(&self) {
+        let Some(state) = self.selective_ntsc_gpu.as_ref() else {
+            return;
+        };
+        if state.slot.status.load(Ordering::Acquire) != SLOT_MAP_PENDING {
+            return;
+        }
+        // Mark the request before handing control to wgpu. The render loop
+        // may call this method again before the callback fires; a distinct
+        // state prevents a second map_async on the same buffer range.
+        state
+            .slot
+            .status
+            .store(SLOT_MAP_REQUESTED, Ordering::Release);
+        let status = state.slot.status.clone();
+        state.slot.buffer.slice(0..state.slot.used_size).map_async(
+            wgpu::MapMode::Read,
+            move |result| {
+                status.store(
+                    if result.is_ok() {
+                        SLOT_MAPPED
+                    } else {
+                        SLOT_MAP_FAILED
+                    },
+                    Ordering::Release,
+                );
+            },
+        );
+    }
+
+    /// Harvest the single newest mapped selective batch without blocking.
+    pub fn poll_selective_ntsc_readback(&mut self) -> Option<SelectiveNtscBatch> {
+        let state = self.selective_ntsc_gpu.as_mut()?;
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        match state.slot.status.load(Ordering::Acquire) {
+            SLOT_MAPPED => {
+                let plan = state.slot.plan.take();
+                let data = state
+                    .slot
+                    .buffer
+                    .slice(0..state.slot.used_size)
+                    .get_mapped_range();
+                let batch = plan.and_then(|plan| {
+                    let row_bytes = (plan.generation.width as usize).checked_mul(4)?;
+                    let height = plan.generation.height as usize;
+                    let mut slices = Vec::with_capacity(plan.layers.len());
+                    for index in 0..plan.layers.len() {
+                        let slice_start = state.slot.slice_stride as usize * index;
+                        let mut pixels = Vec::with_capacity(row_bytes.checked_mul(height)?);
+                        for row in 0..height {
+                            let start = slice_start + row * state.slot.padded_row_bytes as usize;
+                            pixels.extend_from_slice(&data[start..start + row_bytes]);
+                        }
+                        slices.push(pixels);
+                    }
+                    Some(SelectiveNtscBatch { plan, slices })
+                });
+                drop(data);
+                state.slot.buffer.unmap();
+                state.slot.status.store(SLOT_IDLE, Ordering::Release);
+                batch
+            }
+            SLOT_MAP_FAILED => {
+                state.slot.plan = None;
+                state.slot.status.store(SLOT_IDLE, Ordering::Release);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Upload a finished selective straight-alpha composite as the input to
+    /// the shared temporal stage.
+    pub fn write_engine_composite(&self, pixels: &[u8]) -> Result<(), String> {
+        let expected = checked_rgba_frame_len(self.output_width, self.output_height)
+            .ok_or_else(|| "engine composite dimensions overflow".to_string())?;
+        if pixels.len() != expected {
+            return Err(format!(
+                "engine composite has {} bytes; expected {expected}",
+                pixels.len()
+            ));
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(self.output_width * 4),
+                rows_per_image: Some(self.output_height),
+            },
+            wgpu::Extent3d {
+                width: self.output_width,
+                height: self.output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(())
+    }
+
     /// Row stride aligned to wgpu's 256-byte copy requirement.
     fn readback_bytes_per_row(&self) -> u32 {
         (self.output_width * 4 + 255) & !255
     }
 
-    /// Phase 1 of async readback: encode a copy of composite_textures[0]
+    /// Phase 1 of async readback: encode a copy of the final opaque audience
+    /// image in composite_textures[2]
     /// into a free staging buffer. Returns the slot index to pass to
     /// `map_readback` after the encoder is submitted, or None if every
     /// slot still has a copy in flight.
@@ -1539,6 +3195,41 @@ impl Renderer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
+        ntsc_metadata: Option<NtscFrameMetadata>,
+    ) -> Option<usize> {
+        self.begin_readback_tagged(encoder, epoch, ntsc_metadata, None, false)
+    }
+
+    /// Encode a readback of one exact selectively processed audience sample.
+    /// The tag is retained with its pixels across asynchronous map completion,
+    /// so Spout can reject a pre-transition result rather than inferring its
+    /// identity from whichever frame happens to be displayed later.
+    pub fn begin_selective_audience_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        sample: SelectiveNtscGeneration,
+    ) -> Option<usize> {
+        self.begin_readback_tagged(encoder, sample.visual_epoch, None, Some(sample), false)
+    }
+
+    /// Read back the already materialized audience image retained by Pause.
+    /// The explicit tag prevents it from being mistaken for raw global-NTSC
+    /// input or for a newly processed selective generation.
+    pub fn begin_held_audience_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        epoch: u64,
+    ) -> Option<usize> {
+        self.begin_readback_tagged(encoder, epoch, None, None, true)
+    }
+
+    fn begin_readback_tagged(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        epoch: u64,
+        ntsc_metadata: Option<NtscFrameMetadata>,
+        selective_sample: Option<SelectiveNtscGeneration>,
+        held_audience: bool,
     ) -> Option<usize> {
         let buffer_size = (self.readback_bytes_per_row() * self.output_height) as u64;
 
@@ -1559,6 +3250,9 @@ impl Renderer {
                     status: Arc::new(AtomicU8::new(SLOT_IDLE)),
                     sequence: 0,
                     epoch,
+                    ntsc_metadata: None,
+                    selective_sample: None,
+                    held_audience: false,
                 });
                 self.readback_slots.len() - 1
             }
@@ -1569,10 +3263,13 @@ impl Renderer {
         self.next_readback_sequence = self.next_readback_sequence.saturating_add(1);
         self.readback_slots[idx].sequence = sequence;
         self.readback_slots[idx].epoch = epoch;
+        self.readback_slots[idx].ntsc_metadata = ntsc_metadata;
+        self.readback_slots[idx].selective_sample = selective_sample;
+        self.readback_slots[idx].held_audience = held_audience;
         let slot = &self.readback_slots[idx];
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_textures[0],
+                texture: &self.composite_textures[2],
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1599,6 +3296,10 @@ impl Renderer {
     /// from `begin_readback` has been submitted. Never blocks.
     pub fn map_readback(&self, idx: usize) {
         let slot = &self.readback_slots[idx];
+        if slot.status.load(Ordering::Acquire) != SLOT_MAP_PENDING {
+            return;
+        }
+        slot.status.store(SLOT_MAP_REQUESTED, Ordering::Release);
         let status = slot.status.clone();
         slot.buffer
             .slice(..)
@@ -1616,9 +3317,12 @@ impl Renderer {
     /// the freshest completed frame. Completed or subsequently completing
     /// older slots are discarded, so callback reordering can never make an
     /// old NTSC/Spout frame overwrite a newer composite.
-    pub fn poll_readback(&mut self) -> Option<ReadbackFrame> {
+    pub fn poll_readback(&mut self) -> ReadbackPoll {
         if self.readback_slots.is_empty() {
-            return None;
+            return ReadbackPoll {
+                frame: None,
+                held_audience_not_harvested: false,
+            };
         }
         // Drive map callbacks without waiting.
         let _ = self.device.poll(wgpu::PollType::Poll);
@@ -1639,7 +3343,8 @@ impl Renderer {
         let padded_row = self.readback_bytes_per_row() as usize;
         let h = self.output_height as usize;
         let mut harvested: Option<ReadbackFrame> = None;
-        for (idx, slot) in self.readback_slots.iter().enumerate() {
+        let mut held_audience_not_harvested = false;
+        for (idx, slot) in self.readback_slots.iter_mut().enumerate() {
             match slot.status.load(Ordering::Acquire) {
                 SLOT_MAPPED if Some(idx) == newest_idx => {
                     let data = slot.buffer.slice(..).get_mapped_range();
@@ -1654,16 +3359,25 @@ impl Renderer {
                     harvested = Some(ReadbackFrame {
                         pixels,
                         epoch: slot.epoch,
+                        ntsc_metadata: slot.ntsc_metadata.take(),
+                        selective_sample: slot.selective_sample.take(),
+                        held_audience: std::mem::take(&mut slot.held_audience),
                     });
                 }
                 SLOT_MAPPED => {
                     // This completed map is older than the freshest mapped
                     // frame (or than one already returned on an earlier poll).
                     slot.buffer.unmap();
+                    slot.ntsc_metadata = None;
+                    slot.selective_sample = None;
+                    held_audience_not_harvested |= std::mem::take(&mut slot.held_audience);
                     slot.status.store(SLOT_IDLE, Ordering::Release);
                 }
                 SLOT_MAP_FAILED => {
                     // Device hiccup (e.g. surface loss); recycle the slot.
+                    slot.ntsc_metadata = None;
+                    slot.selective_sample = None;
+                    held_audience_not_harvested |= std::mem::take(&mut slot.held_audience);
                     slot.status.store(SLOT_IDLE, Ordering::Release);
                 }
                 _ => {}
@@ -1672,16 +3386,20 @@ impl Renderer {
         if let Some(sequence) = newest_sequence {
             self.last_harvested_readback_sequence = sequence;
         }
-        harvested
+        ReadbackPoll {
+            frame: harvested,
+            held_audience_not_harvested,
+        }
     }
 
-    /// Write RGBA pixels back to composite_textures[0].
+    /// Write processed opaque RGBA pixels back to the audience image. The
+    /// straight-alpha engine accumulation in slot 0 remains untouched.
     pub fn write_composite(&self, pixels: &[u8]) {
         let w = self.output_width;
         let h = self.output_height;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.composite_textures[0],
+                texture: &self.composite_textures[2],
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,

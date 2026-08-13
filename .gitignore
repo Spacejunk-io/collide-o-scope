@@ -2,12 +2,17 @@
 experiments/*/target
 .DS_Store
 
-# Local planning notes, not part of the upload
-CS feedback.md
+# Root-level working notes stay local; only the two public guides are tracked.
+/*.md
+!/README.md
+!/CLAUDE.md
 
 # Local clip library (created on first launch; performance media stays local)
 /videos/
 
 # Offline render output
 /renders/
-HANDOVER.md
+
+# Patch captures and generated variants may retain local source paths.
+/patches/
+/generated/

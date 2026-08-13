@@ -1,7 +1,7 @@
 # collide-o-scope
 
 A native VDJ (video DJ) instrument for live visual performance. It composites
-video and live Spout sources with GPU effects, then lets LFOs, audio analysis,
+video, still-image, and live Spout sources with GPU effects, then lets LFOs, audio analysis,
 MIDI, and a phone's touch and tilt modulate the performance from a browser
 control panel.
 
@@ -14,13 +14,16 @@ control panel.
 
 ## What it does
 
-- Composites up to 16 video or live Spout layers with normal, screen,
+- Composites up to 16 video, PNG/JPEG/BMP/WebP still, or live Spout layers with normal, screen,
   multiply, and difference blending.
 - Applies per-layer and master pixelation, RGB split, hue, saturation,
   brightness, contrast, posterize, invert, film grain, vignette, color drift,
-  breathing motion, and luma keying.
-- Runs [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) VHS simulation on a
-  nonblocking worker.
+  breathing motion, luminance/chroma keying, and bounded animated
+  cellular/Worley warping with a separately feathered cell-gap key.
+- Runs [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) VHS simulation without
+  blocking the render thread. Existing all-inherited stacks keep the global
+  post-composite path; a contributing **Bypass Master FX** layer selects an
+  exact per-layer path so VHS touches inherited layers only.
 - Provides feedback trails and arbitrary-angle slit-scan from a 24-sample
   temporal history. History advances at a fixed 30 Hz, so its approximately
   0.8-second span does not change with display or export frame rate.
@@ -32,8 +35,9 @@ control panel.
   completed image through a one-frame overwrite slot. A first-frame seed is
   decoded at open time, so a clip added or restored while paused still has a
   defined image.
-- Renders MP4 files through a frame-indexed offline path with repeatability,
-  cancellation, and stream-contract regression coverage.
+- Renders MP4 files through a deterministic frame-indexed offline path; real
+  MIDI, phone, Spout, audio-device, and multi-GPU output still require the
+  corresponding hardware for end-to-end validation.
 
 ## The modulation matrix
 
@@ -45,14 +49,33 @@ unchanged.
 | Sources | Detail |
 |---|---|
 | 4 LFOs | Sine, triangle, saw, square, or deterministic sample-and-hold; musical divisions; tap-tempo or MIDI clock |
-| Audio | Level; 3–8 configurable bands; legacy bass/mid/high aliases; onset, spectral brightness, noisiness; and a 32-bin display spectrum |
+| Audio | Live input, Windows system-playback loopback, or deterministic looping WAV/MP3/FLAC/Ogg/Opus/M4A/AAC analysis; level; 3–8 configurable bands; onset, brightness, noisiness; and a 32-bin display spectrum |
 | MIDI | Four MIDI-learn CC slots plus 24-PPQN clock/start handling |
 | Phone | Calibrated yaw/pitch/roll and a multitouch XY pad |
 
 Each routing supports signed depth, Linear/Exp/Log/SCurve/Steps response, curve
-amount, and separate attack/release slew. The matrix exposes every continuous
-master, NTSC, and temporal parameter; morph position; and opacity, speed, key,
-and all continuous effects for each of 16 layers.
+amount, and separate attack/release slew. A route meter—centered for bipolar
+sources—shows the shaped and slewed value before depth is applied. Each row
+also carries a stable runtime ID, so a delayed browser edit or remove remains
+attached to the intended route even when another controller changes the matrix
+first. Runtime IDs are intentionally recreated when a patch is loaded; the
+route settings, not process-local identifiers, are what patches preserve.
+
+The engine resolves route destinations ahead of the render hot path and builds
+one immutable modulation result per rendered frame. Morph position, master
+targets, transport, and every layer target reuse that same sample; source,
+curve, and slew work is not repeated for each consumer. Offline rendering uses
+the same frame-indexed ordering.
+
+The matrix exposes every continuous master and NTSC value, temporal feedback,
+slit-scan and history-key values, morph position, and each layer's opacity,
+speed, target FPS, key controls, and continuous effects. This includes RGB
+chroma targets/tolerance, key thresholds and softness, temporal key history,
+and VHS edge-wave speed, tracking wave, composite/chroma noise, luma smear,
+and sharpening. Selector choices such as static/temporal key mode, blend mode,
+and grain algorithm remain deliberate discrete controls and are not modulation
+targets. The legacy patch target `layerN_key` is read as the canonical
+`layerN_key_threshold`; if both spellings occur, the canonical route wins.
 
 Phone input is configurable at the engine rather than being a one-off browser
 effect:
@@ -61,6 +84,13 @@ effect:
   invert controls.
 - XY axes have independent curves and step quantization. Optional spring
   return moves the released pad back to center at a configurable rate.
+
+Gyro and XY-pad routing is bipolar: the calibrated or physical center produces
+zero, with travel on either side producing negative or positive modulation.
+When layers move, their positional modulation targets are remapped through the
+same permutation so routes follow the same logical sources. Removing a layer
+drops routes aimed at that layer and shifts targets above it to match the new
+stack.
 
 For pad quantization, a value of N from 2 through 64 means exactly N evenly
 spaced positions, including both endpoints; 0 or 1 disables quantization.
@@ -71,10 +101,31 @@ default fallback because a named device disappeared. A failed or stalled
 stream is stopped, its modulation sources return to zero, and the enable state
 returns to off instead of retrying every frame.
 
+Imported audio is a different source mode. In **Looping file**, **Choose
+imported audio…** opens the native multi-file chooser filtered to WAV, MP3,
+FLAC, Ogg, Opus, M4A, and AAC. Each audio upload is limited to 512 MiB; FFmpeg
+decodes at most 10 minutes and abandons a decode that has not completed within
+60 seconds. A successful clip is decoded once, then program time selects a
+circular analysis window. It does not need to play through the speakers. The
+same clip, gain, band layout, and timestamp produce the same routing values
+live and offline; Pause holds that timestamp exactly.
+
 The optional beat latch coalesces eligible control changes and releases them
 on the next four-beat downbeat. The morph section supports linear or
-equal-power interpolation plus beat-duration glides to A or B; slots, blend
-law, position, and any remaining glide are patch-persistent.
+equal-power interpolation plus beat-duration glides to A or B. A capture is an
+ordering barrier: it first materializes the current Morph result, including a
+Morph-target routing offset, then records the bases at the current layer-stack
+revision. Stale captures are rejected. Manual fader and law edits still apply
+to the materialized bases while Pause holds automatic glide and clock motion.
+Pause also snapshots the exact audience across a blackout: the cut remains
+absolutely black while active, then releasing it while still paused restores
+the pre-cut image. A paused selective-VHS transition remains held until Resume
+can produce a complete replacement. Hue and slit angle take the shortest wrapped arc,
+discrete choices switch at the midpoint, and stored layer slots follow
+reorder/removal while a newly appended layer remains untouched.
+Slots, law, position, and the exact remaining glide—even below the UI's
+quarter-beat minimum—are patch-persistent. Other modulation offsets remain
+frame-local and do not rewrite the captured bases.
 
 ## Browser control
 
@@ -91,8 +142,48 @@ The panel is mobile-first below 900 px. Touch controls include pointer-safe XY
 input, layer drag-to-reorder, group resets, and double-tap/double-click reset
 for individual sliders. Layer cards expose direct transport, target decode
 FPS, keying, and the complete per-layer effect set, including downsample; those
-effect values are also modulation targets. All connected panels receive the
-same engine state.
+effect values are also modulation targets. The **Layer effects** disclosure and
+its nested **CELLULAR** disclosure start closed for each new layer card and
+remember their state by layer identity while that layer remains present. All
+connected panels receive the same engine state.
+
+Each layer can independently enable **Bypass Master FX**. This skips inherited
+Digital, Analog, Cellular, Motion, and VHS processing for that layer while its
+own Layer FX, opacity, key, and blend remain active. Temporal remains a
+program-wide history stage. With VHS enabled and a visible, positive-opacity
+bypass layer contributing, the engine renders coherent per-layer slices,
+applies direct master effects and VHS only to inherited slices, recomposites in
+stack order, and then runs Temporal. Hidden or non-positive-opacity layers do
+not allocate selective work. Live selective processing is latest-only and has a
+320 MiB incremental safety budget. If a resolution/layer combination exceeds
+that budget or processing fails, the engine holds the prior exact audience
+frame and reports the VHS error; it never falls back to applying global VHS to
+a bypassed layer. The bypass is non-destructive: neither **Reset FX** on the
+layer nor master **Revert** changes it.
+
+Every slider's displayed value is also an editable numeric field. Select it,
+type any in-range value, and press Enter or leave the field to commit through
+the slider's normal action path; Escape restores the engine value. Inputs are
+clamped and quantized to the control's advertised range and step. Each layer
+card's Cellular controls additionally expose Gap Key, Gap Threshold, and Gap
+Softness so its Voronoi boundaries can reveal lower layers without dark
+fringes. The master Cellular panel exposes the same controls. In an ordinary
+post-stack master pass its keyed gaps resolve over black; when per-layer master
+bypass makes master processing conditional, inherited-layer gaps can reveal
+content beneath them.
+
+Static keying has five modes at both layer and program scope: Off, Keep Bright,
+Keep Dark, Remove Chroma, and Keep Chroma. Luminance modes use threshold and
+softness; chroma modes use an RGB target, tolerance, and softness. A layer key
+changes that layer's alpha and reveals the stack below. A program key runs on
+the flattened image, so removed pixels become black rather than exposing a
+nonexistent lower program layer.
+
+Temporal history keying compares the current clean composite with a selected
+prior sample in the fixed 30 Hz history. It can retain motion, stillness,
+brightening, or darkening, with threshold, softness, and a selectable history
+depth of 1–23 samples. Its mask gates the temporal output after feedback and
+slit-scan processing; Off preserves the established temporal path.
 
 Browser input is bounded and coalesced before the render thread consumes it:
 new absolute values replace older pending values for the same control, while
@@ -124,8 +215,13 @@ that now occupies the old index. See
 ## Offline render and audio
 
 The exporter derives clock-driven modulation, slew, pad spring, temporal
-history, and morph glide from frame number and the selected FPS. Audio and MIDI
-input sources read zero offline; live Spout layers render as black placeholders.
+history, and morph glide from frame number and the selected FPS. Live audio and
+MIDI input sources read zero offline; a selected imported analysis clip is
+sampled at that exact frame time. Live Spout layers render as black placeholders.
+For selective VHS, export uses the same contributing-layer plan, conditional
+master processing, inherited-only VHS, straight-alpha stack composition, and
+post-composite Temporal order as live rendering, but evaluates it synchronously
+for each output frame. The legacy no-bypass and VHS-off paths remain unchanged.
 
 An optional video layer can supply its first audio stream. That audio starts at
 source time zero, plays once at 1×, and is independent of visual pause, speed,
@@ -140,7 +236,7 @@ parameter editor; the saved file itself is ordinary YAML and may also be
 edited in a text editor. Current patches include:
 
 - master, per-layer, NTSC, and temporal values;
-- layer order, visibility, pause, speed, blend, keying, and stable source path;
+- layer order, visibility, pause, speed, blend, keying, master-FX bypass, and stable source path;
 - master pause and complete modulation state;
 - routing curves/slew, audio band count/crossovers/ceiling, gyro calibration/configuration, and XY
   configuration/current position;
@@ -149,11 +245,38 @@ edited in a text editor. Current patches include:
 Old patches remain accepted through serde defaults and legacy filename/slit
 axis fallbacks.
 
+The browser's **Capture patch** control writes a unique YAML snapshot under
+`patches/` through a bounded background writer. Existing captures are never
+overwritten and the render loop does not wait for disk I/O.
+
 A successful patch load starts new topology and visual generations. Immediate
 browser work and downbeat-latched actions from the prior patch are cleared;
 temporal history, retained NTSC output, and pending asynchronous readbacks are
 invalidated so neither an old command nor an old frame can bleed into the
 restored world.
+
+## Procedural patch generation
+
+The patch-only generator creates a deterministic, reviewable sequence without
+starting GPU exports:
+
+```powershell
+target\release\collide-o-scope.exe generate `
+  --anchor patches\anchor.yaml `
+  --output generated `
+  --count 10 `
+  --temperature 0.5 `
+  --seed 424242
+```
+
+Each new piece directory contains `patch.yaml` and `manifest.json`. Generation
+uses typed, reflected, mean-reverting mutations; preserves source/layer/routing
+topology; rejects active two-slot morphs and in-flight glides; and requires explicit
+`--allow-black-sources` before accepting live Spout layers. Output directories
+are committed atomically and never overwritten. See
+[procedural video generation](docs/blogs/procedural-video-generation.md) for
+the mathematical design, cellular effect, reproducibility boundary, and
+deliberately deferred clip-analysis/audio-DSP work.
 
 ## Build
 
@@ -208,11 +331,10 @@ The control panel opens in the default browser.
 
 ## Validation boundary
 
-Software tests cover the browser, GPU, export, media, and protocol paths.
-Physical MIDI controllers and MIDI clock, real phone sensors, venue audio
-hardware, external Spout applications, and multi-monitor stage output still
-require tests on the corresponding equipment; do not treat a successful build
-as hardware proof.
+Software checks do not replace physical validation. MIDI controllers and MIDI
+clock, real phone sensors, venue audio hardware, external Spout applications,
+and multi-monitor stage output require tests on the corresponding equipment.
+Do not treat a successful build as hardware proof.
 
 ## Publication and license boundary
 

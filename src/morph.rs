@@ -33,6 +33,15 @@ impl MorphBlendLaw {
     /// Non-finite values are treated as A and finite values are clamped.
     pub fn weights(self, t: f32) -> [f32; 2] {
         let t = normalized_position(t);
+        // Endpoints are state recalls, not merely limiting cases. Return
+        // exact weights so a zero channel/key value cannot inherit the tiny
+        // cosine residue produced by finite-precision PI/2 evaluation.
+        if t <= 0.0 {
+            return [1.0, 0.0];
+        }
+        if t >= 1.0 {
+            return [0.0, 1.0];
+        }
         match self {
             Self::Linear => [1.0 - t, t],
             Self::EqualPower => {
@@ -58,19 +67,28 @@ pub struct MorphGlide {
 }
 
 impl MorphGlide {
+    /// Construct an operator-requested glide. Positive durations follow the
+    /// control panel's quarter-beat minimum; zero is the explicit snap.
     pub fn new(start: f32, target: f32, start_beat: f64, duration_beats: f64) -> Self {
+        let duration_beats = finite_f64_or(duration_beats, 0.0);
+        let duration_beats = if duration_beats <= 0.0 {
+            0.0
+        } else {
+            duration_beats.clamp(0.25, 64.0)
+        };
+        Self::with_remaining(start, target, start_beat, duration_beats)
+    }
+
+    /// Construct internal/persisted remaining movement. A glide saved less
+    /// than a quarter beat before its endpoint must not be stretched back to
+    /// the UI's minimum duration on recall.
+    fn with_remaining(start: f32, target: f32, start_beat: f64, duration_beats: f64) -> Self {
         let duration_beats = finite_f64_or(duration_beats, 0.0);
         Self {
             start: normalized_position(start),
             target: normalized_position(target),
             start_beat: finite_f64_or(start_beat, 0.0),
-            // Zero remains the explicit snap operation. Positive movement
-            // follows the control panel's quarter-beat to 64-beat range.
-            duration_beats: if duration_beats <= 0.0 {
-                0.0
-            } else {
-                duration_beats.clamp(0.25, 64.0)
-            },
+            duration_beats: duration_beats.clamp(0.0, 64.0),
         }
     }
 
@@ -93,7 +111,7 @@ impl MorphGlide {
     }
 
     fn sanitized(self) -> Self {
-        Self::new(
+        Self::with_remaining(
             self.start,
             self.target,
             self.start_beat,
@@ -128,6 +146,15 @@ pub struct MorphMasterSnapshot {
     pub key_mode: f32,
     pub key_threshold: f32,
     pub key_softness: f32,
+    pub key_color: [f32; 3],
+    pub key_tolerance: f32,
+    pub cellular_amount: f32,
+    pub cellular_scale: f32,
+    pub cellular_warp: f32,
+    pub cellular_speed: f32,
+    pub cellular_gap_amount: f32,
+    pub cellular_gap_threshold: f32,
+    pub cellular_gap_softness: f32,
 }
 
 impl Default for MorphMasterSnapshot {
@@ -160,6 +187,15 @@ impl MorphMasterSnapshot {
             key_mode: value.key_mode,
             key_threshold: value.key_threshold,
             key_softness: value.key_softness,
+            key_color: value.key_color,
+            key_tolerance: value.key_tolerance,
+            cellular_amount: value.cellular_amount,
+            cellular_scale: value.cellular_scale,
+            cellular_warp: value.cellular_warp,
+            cellular_speed: value.cellular_speed,
+            cellular_gap_amount: value.cellular_gap_amount,
+            cellular_gap_threshold: value.cellular_gap_threshold,
+            cellular_gap_softness: value.cellular_gap_softness,
         }
         .sanitized()
     }
@@ -187,9 +223,22 @@ impl MorphMasterSnapshot {
             breathe_position: finite_clamp(self.breathe_position, 0.0, 0.0, 0.02),
             vignette: finite_clamp(self.vignette, 0.0, 0.0, 1.5),
             color_drift: finite_clamp(self.color_drift, 0.0, 0.0, 0.02),
-            key_mode: discrete_f32(self.key_mode, 0.0, 2.0),
+            key_mode: discrete_f32(self.key_mode, 0.0, 4.0),
             key_threshold: finite_clamp(self.key_threshold, 0.5, 0.0, 1.0),
             key_softness: finite_clamp(self.key_softness, 0.1, 0.0, 0.5),
+            key_color: [
+                finite_clamp(self.key_color[0], 0.0, 0.0, 1.0),
+                finite_clamp(self.key_color[1], 1.0, 0.0, 1.0),
+                finite_clamp(self.key_color[2], 0.0, 0.0, 1.0),
+            ],
+            key_tolerance: finite_clamp(self.key_tolerance, 0.15, 0.0, 1.0),
+            cellular_amount: finite_clamp(self.cellular_amount, 0.0, 0.0, 1.0),
+            cellular_scale: finite_clamp(self.cellular_scale, 10.0, 2.0, 32.0),
+            cellular_warp: finite_clamp(self.cellular_warp, 0.35, 0.0, 1.0),
+            cellular_speed: finite_clamp(self.cellular_speed, 0.25, 0.0, 2.0),
+            cellular_gap_amount: finite_clamp(self.cellular_gap_amount, 0.0, 0.0, 1.0),
+            cellular_gap_threshold: finite_clamp(self.cellular_gap_threshold, 0.65, 0.0, 1.0),
+            cellular_gap_softness: finite_clamp(self.cellular_gap_softness, 0.08, 0.0, 0.5),
         }
     }
 
@@ -218,6 +267,15 @@ impl MorphMasterSnapshot {
         value.key_mode = clean.key_mode;
         value.key_threshold = clean.key_threshold;
         value.key_softness = clean.key_softness;
+        value.key_color = clean.key_color;
+        value.key_tolerance = clean.key_tolerance;
+        value.cellular_amount = clean.cellular_amount;
+        value.cellular_scale = clean.cellular_scale;
+        value.cellular_warp = clean.cellular_warp;
+        value.cellular_speed = clean.cellular_speed;
+        value.cellular_gap_amount = clean.cellular_gap_amount;
+        value.cellular_gap_threshold = clean.cellular_gap_threshold;
+        value.cellular_gap_softness = clean.cellular_gap_softness;
     }
 
     fn interpolate(a: &Self, b: &Self, weights: [f32; 2], choose_b: bool) -> Self {
@@ -226,7 +284,7 @@ impl MorphMasterSnapshot {
         Self {
             pixelate_size: blend_finite(a.pixelate_size, b.pixelate_size, weights),
             rgb_split: blend_finite(a.rgb_split, b.rgb_split, weights),
-            hue_shift: blend_finite(a.hue_shift, b.hue_shift, weights),
+            hue_shift: blend_wrapped_degrees(a.hue_shift, b.hue_shift, weights),
             saturation: blend_finite(a.saturation, b.saturation, weights),
             brightness: blend_finite(a.brightness, b.brightness, weights),
             contrast: blend_finite(a.contrast, b.contrast, weights),
@@ -245,6 +303,31 @@ impl MorphMasterSnapshot {
             key_mode: pick_finite(a.key_mode, b.key_mode, choose_b),
             key_threshold: blend_finite(a.key_threshold, b.key_threshold, weights),
             key_softness: blend_finite(a.key_softness, b.key_softness, weights),
+            key_color: [
+                blend_finite(a.key_color[0], b.key_color[0], weights),
+                blend_finite(a.key_color[1], b.key_color[1], weights),
+                blend_finite(a.key_color[2], b.key_color[2], weights),
+            ],
+            key_tolerance: blend_finite(a.key_tolerance, b.key_tolerance, weights),
+            cellular_amount: blend_finite(a.cellular_amount, b.cellular_amount, weights),
+            cellular_scale: blend_finite(a.cellular_scale, b.cellular_scale, weights),
+            cellular_warp: blend_finite(a.cellular_warp, b.cellular_warp, weights),
+            cellular_speed: blend_finite(a.cellular_speed, b.cellular_speed, weights),
+            cellular_gap_amount: blend_finite(
+                a.cellular_gap_amount,
+                b.cellular_gap_amount,
+                weights,
+            ),
+            cellular_gap_threshold: blend_finite(
+                a.cellular_gap_threshold,
+                b.cellular_gap_threshold,
+                weights,
+            ),
+            cellular_gap_softness: blend_finite(
+                a.cellular_gap_softness,
+                b.cellular_gap_softness,
+                weights,
+            ),
         }
         .sanitized()
     }
@@ -442,6 +525,10 @@ pub struct MorphTemporalSnapshot {
     pub slitscan: f32,
     pub slit_axis: f32,
     pub slit_angle: f32,
+    pub key_mode: f32,
+    pub key_threshold: f32,
+    pub key_softness: f32,
+    pub key_history: f32,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -459,6 +546,10 @@ impl MorphTemporalSnapshot {
             slitscan: value.slitscan,
             slit_axis: value.slit_axis,
             slit_angle: value.slit_angle,
+            key_mode: value.key_mode,
+            key_threshold: value.key_threshold,
+            key_softness: value.key_softness,
+            key_history: value.key_history,
         }
         .sanitized()
     }
@@ -471,6 +562,10 @@ impl MorphTemporalSnapshot {
             slitscan: finite_clamp(self.slitscan, 0.0, 0.0, 1.0),
             slit_axis: finite_clamp(self.slit_axis, 0.0, 0.0, 1.0),
             slit_angle: finite_clamp(self.slit_angle, 0.0, -180.0, 180.0),
+            key_mode: discrete_f32(self.key_mode, 0.0, 4.0),
+            key_threshold: finite_clamp(self.key_threshold, 0.1, 0.0, 1.0),
+            key_softness: finite_clamp(self.key_softness, 0.03, 0.0, 0.5),
+            key_history: finite_clamp(self.key_history, 1.0, 1.0, 23.0).round(),
         }
     }
 
@@ -483,6 +578,10 @@ impl MorphTemporalSnapshot {
             slitscan: clean.slitscan,
             slit_axis: clean.slit_axis,
             slit_angle: clean.slit_angle,
+            key_mode: clean.key_mode,
+            key_threshold: clean.key_threshold,
+            key_softness: clean.key_softness,
+            key_history: clean.key_history,
         }
     }
 
@@ -495,7 +594,11 @@ impl MorphTemporalSnapshot {
             fb_rotate: blend_finite(a.fb_rotate, b.fb_rotate, weights),
             slitscan: blend_finite(a.slitscan, b.slitscan, weights),
             slit_axis: pick_finite(a.slit_axis, b.slit_axis, choose_b),
-            slit_angle: blend_finite(a.slit_angle, b.slit_angle, weights),
+            slit_angle: blend_wrapped_degrees(a.slit_angle, b.slit_angle, weights),
+            key_mode: pick_finite(a.key_mode, b.key_mode, choose_b),
+            key_threshold: blend_finite(a.key_threshold, b.key_threshold, weights),
+            key_softness: blend_finite(a.key_softness, b.key_softness, weights),
+            key_history: blend_finite(a.key_history, b.key_history, weights),
         }
         .sanitized()
     }
@@ -555,6 +658,10 @@ pub struct LayerMorphSnapshot {
     pub visible: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
+    /// Discrete per-layer master-shader bypass. Optional so morph slots
+    /// captured by older builds leave the live value untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_master_fx: Option<bool>,
     /// Compatibility field for pre-full-state snapshots. Newly captured
     /// snapshots store this value inside `effects` and omit this duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,6 +679,7 @@ impl Default for LayerMorphSnapshot {
             blend_mode: None,
             visible: None,
             paused: None,
+            bypass_master_fx: None,
             key_threshold: None,
         }
     }
@@ -588,6 +696,7 @@ impl LayerMorphSnapshot {
             blend_mode: Some(MorphLayerBlendMode::capture(layer.blend_mode)),
             visible: Some(layer.visible),
             paused: Some(layer.paused),
+            bypass_master_fx: Some(layer.bypass_master_fx),
             key_threshold: None,
         }
         .sanitized()
@@ -611,6 +720,7 @@ impl LayerMorphSnapshot {
             blend_mode: self.blend_mode,
             visible: self.visible,
             paused: self.paused,
+            bypass_master_fx: self.bypass_master_fx,
             key_threshold: if has_effects { None } else { legacy_key },
         }
     }
@@ -660,6 +770,10 @@ impl LayerMorphSnapshot {
                 (Some(a), Some(b)) => Some(pick(a, b, choose_b)),
                 _ => None,
             },
+            bypass_master_fx: match (a.bypass_master_fx, b.bypass_master_fx) {
+                (Some(a), Some(b)) => Some(pick(a, b, choose_b)),
+                _ => None,
+            },
             key_threshold,
         }
     }
@@ -685,6 +799,9 @@ impl LayerMorphSnapshot {
         }
         if let Some(paused) = clean.paused {
             layer.paused = paused;
+        }
+        if let Some(bypass_master_fx) = clean.bypass_master_fx {
+            layer.bypass_master_fx = bypass_master_fx;
         }
     }
 }
@@ -737,6 +854,38 @@ impl MorphSlot {
             ntsc: self.ntsc.sanitized(),
             temporal: self.temporal.sanitized(),
             layers,
+        }
+    }
+
+    /// Keep positional snapshots aligned after removing one live layer while
+    /// preserving the independent master/NTSC/temporal worlds.
+    fn remap_layers_after_remove(&mut self, removed: usize) {
+        self.layers.retain_mut(|layer| {
+            if layer.position == removed {
+                return false;
+            }
+            if layer.position > removed {
+                layer.position -= 1;
+            }
+            true
+        });
+    }
+
+    /// Apply the same stable stack permutation as the live layer move.
+    fn remap_layers_after_move(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        for layer in &mut self.layers {
+            layer.position = if layer.position == from {
+                to
+            } else if from < to && layer.position > from && layer.position <= to {
+                layer.position - 1
+            } else if to < from && layer.position >= to && layer.position < from {
+                layer.position + 1
+            } else {
+                layer.position
+            };
         }
     }
 }
@@ -798,7 +947,8 @@ impl MorphStateSnapshot {
                 let end_beat = glide.start_beat + glide.duration_beats;
                 let sampled_beat = beat.clamp(glide.start_beat, end_beat);
                 let remaining = (end_beat - sampled_beat).max(0.0);
-                (remaining > 0.0).then(|| MorphGlide::new(t, glide.target, 0.0, remaining))
+                (remaining > 0.0)
+                    .then(|| MorphGlide::with_remaining(t, glide.target, 0.0, remaining))
             }
         });
         Self {
@@ -864,6 +1014,26 @@ impl Morph {
         self.a = None;
         self.b = None;
         self.glide = None;
+    }
+
+    /// Adding at the end leaves every captured position valid; no slot change
+    /// is required. The new layer is deliberately untouched by the morph.
+    pub fn remap_layers_after_remove(&mut self, removed: usize) {
+        if let Some(slot) = &mut self.a {
+            slot.remap_layers_after_remove(removed);
+        }
+        if let Some(slot) = &mut self.b {
+            slot.remap_layers_after_remove(removed);
+        }
+    }
+
+    pub fn remap_layers_after_move(&mut self, from: usize, to: usize) {
+        if let Some(slot) = &mut self.a {
+            slot.remap_layers_after_move(from, to);
+        }
+        if let Some(slot) = &mut self.b {
+            slot.remap_layers_after_move(from, to);
+        }
     }
 
     /// Set a manual position and cancel any automatic movement.
@@ -1016,7 +1186,8 @@ fn rebase_glide_from_position(
     } else {
         0.0
     };
-    (remaining > 0.0).then(|| MorphGlide::new(position, glide.target, new_start_beat, remaining))
+    (remaining > 0.0)
+        .then(|| MorphGlide::with_remaining(position, glide.target, new_start_beat, remaining))
 }
 
 fn lerp(a: f32, b: f32, weights: [f32; 2]) -> f32 {
@@ -1030,6 +1201,38 @@ fn blend_finite(a: f32, b: f32, weights: [f32; 2]) -> f32 {
         (false, true) => b,
         (false, false) => 0.0,
     }
+}
+
+/// Interpolate an orientation in degrees over the shortest signed arc. Exact
+/// endpoint selection preserves the captured representation at A and B.
+fn blend_wrapped_degrees(a: f32, b: f32, weights: [f32; 2]) -> f32 {
+    if weights[1] <= 0.0 {
+        return a;
+    }
+    if weights[0] <= 0.0 {
+        return b;
+    }
+    if !a.is_finite() || !b.is_finite() {
+        return blend_finite(a, b, weights);
+    }
+    let direct_delta = b - a;
+    // At the exactly-opposite 180-degree tie, retain the direction encoded by
+    // the captured endpoints. This is deterministic and avoids surprising a
+    // legacy 0 -> 180 morph by sending it through -90 at its midpoint.
+    let delta = if direct_delta.abs() <= 180.0 {
+        direct_delta
+    } else {
+        (direct_delta + 180.0).rem_euclid(360.0) - 180.0
+    };
+    // `weights` are complementary but EqualPower is nonlinear in t. Recover
+    // B's normalized share explicitly so the wrap path honors either law.
+    let sum = weights[0] + weights[1];
+    let progress = if sum.is_finite() && sum > f32::EPSILON {
+        weights[1] / sum
+    } else {
+        0.0
+    };
+    (a + delta * progress + 180.0).rem_euclid(360.0) - 180.0
 }
 
 fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
@@ -1114,6 +1317,15 @@ mod tests {
                 key_mode: 2.0,
                 key_threshold: 1.0,
                 key_softness: 0.5,
+                key_color: [1.0, 0.0, 1.0],
+                key_tolerance: 1.0,
+                cellular_amount: 1.0,
+                cellular_scale: 32.0,
+                cellular_warp: 1.0,
+                cellular_speed: 2.0,
+                cellular_gap_amount: 1.0,
+                cellular_gap_threshold: 1.0,
+                cellular_gap_softness: 0.5,
             }
         } else {
             MorphMasterSnapshot::default()
@@ -1131,6 +1343,7 @@ mod tests {
             }),
             visible: Some(high),
             paused: Some(high),
+            bypass_master_fx: Some(high),
             key_threshold: None,
         }
     }
@@ -1246,6 +1459,7 @@ mod tests {
         assert_eq!(before.blend_mode, Some(MorphLayerBlendMode::Multiply));
         assert_eq!(before.visible, Some(false));
         assert_eq!(before.paused, Some(false));
+        assert_eq!(before.bypass_master_fx, Some(false));
 
         let midpoint = morph.sample(0.5).unwrap().layers.remove(0);
         close(midpoint.opacity, 0.5);
@@ -1254,6 +1468,7 @@ mod tests {
         assert_eq!(midpoint.blend_mode, Some(MorphLayerBlendMode::Difference));
         assert_eq!(midpoint.visible, Some(true));
         assert_eq!(midpoint.paused, Some(true));
+        assert_eq!(midpoint.bypass_master_fx, Some(true));
         let effects = midpoint.effects.unwrap();
         close(effects.pixelate_size, 16.5);
         close(effects.rgb_split, 15.0);
@@ -1276,6 +1491,13 @@ mod tests {
         assert_eq!(effects.key_mode, 2.0);
         close(effects.key_threshold, 0.75);
         close(effects.key_softness, 0.3);
+        close(effects.cellular_amount, 0.5);
+        close(effects.cellular_scale, 21.0);
+        close(effects.cellular_warp, 0.675);
+        close(effects.cellular_speed, 1.125);
+        close(effects.cellular_gap_amount, 0.5);
+        close(effects.cellular_gap_threshold, 0.825);
+        close(effects.cellular_gap_softness, 0.29);
 
         assert_eq!(morph.sample(0.0).unwrap().layers[0], full_layer(2, false));
         assert_eq!(morph.sample(1.0).unwrap().layers[0], full_layer(2, true));
@@ -1295,6 +1517,7 @@ key_threshold: 0.2
         assert_eq!(legacy.blend_mode, None);
         assert_eq!(legacy.visible, None);
         assert_eq!(legacy.paused, None);
+        assert_eq!(legacy.bypass_master_fx, None);
         assert_eq!(legacy.key_threshold, Some(0.2));
 
         let mut other = legacy;
@@ -1349,6 +1572,111 @@ key_threshold: 0.2
     }
 
     #[test]
+    fn persisted_sub_quarter_beat_remainder_is_not_stretched() {
+        let mut morph = Morph::default();
+        morph.start_glide(1.0, 4.0, 10.0);
+
+        let snapshot = morph.snapshot_at_beat(13.9);
+        let glide = snapshot.glide.expect("a tenth-beat remainder");
+        assert!((glide.duration_beats - 0.1).abs() < 1.0e-9);
+
+        let restored = Morph::from_snapshot_at_beat(snapshot, 20.0);
+        close(restored.position_at_beat(20.0), 0.975);
+        close(restored.position_at_beat(20.05), 0.9875);
+        close(restored.position_at_beat(20.1), 1.0);
+    }
+
+    #[test]
+    fn hue_and_slit_orientations_take_the_shortest_wrapped_arc() {
+        let mut a = MorphSlot::default();
+        a.master.hue_shift = 179.0;
+        a.temporal.slit_angle = 179.0;
+        let mut b = MorphSlot::default();
+        b.master.hue_shift = -179.0;
+        b.temporal.slit_angle = -179.0;
+        let morph = Morph {
+            a: Some(a),
+            b: Some(b),
+            ..Default::default()
+        };
+
+        let midpoint = morph.sample(0.5).unwrap();
+        close(midpoint.master.hue_shift.abs(), 180.0);
+        close(midpoint.temporal.slit_angle.abs(), 180.0);
+        close(morph.sample(0.0).unwrap().master.hue_shift, 179.0);
+        close(morph.sample(1.0).unwrap().master.hue_shift, -179.0);
+
+        let equal_power = Morph {
+            blend_law: MorphBlendLaw::EqualPower,
+            ..morph
+        };
+        let quarter = equal_power.sample(0.25).unwrap();
+        assert!(quarter.master.hue_shift.abs() > 179.0);
+        assert!(quarter.temporal.slit_angle.abs() > 179.0);
+    }
+
+    #[test]
+    fn layer_stack_remaps_preserve_master_world_and_surviving_identity() {
+        let make_layers = |high| {
+            (0..4)
+                .map(|position| {
+                    let mut layer = full_layer(position, high);
+                    layer.opacity = position as f32 / 4.0;
+                    layer
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut a = MorphSlot::default();
+        a.master.brightness = 0.25;
+        a.layers = make_layers(false);
+        let mut b = MorphSlot::default();
+        b.master.brightness = 0.75;
+        b.layers = make_layers(true);
+        let mut morph = Morph {
+            a: Some(a),
+            b: Some(b),
+            ..Default::default()
+        };
+
+        morph.remap_layers_after_remove(1);
+        assert_eq!(
+            morph
+                .a
+                .as_ref()
+                .unwrap()
+                .layers
+                .iter()
+                .map(|layer| layer.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        close(morph.a.as_ref().unwrap().master.brightness, 0.25);
+        close(morph.b.as_ref().unwrap().master.brightness, 0.75);
+
+        morph.remap_layers_after_move(2, 0);
+        let sampled = morph.sample(0.5).unwrap();
+        let mut positions = sampled
+            .layers
+            .iter()
+            .map(|layer| layer.position)
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        assert_eq!(positions, vec![0, 1, 2]);
+        // Original layer 3 survived removal of 1 (becoming 2), then moved to
+        // 0. Its distinctive value follows that identity/permutation.
+        close(
+            sampled
+                .layers
+                .iter()
+                .find(|layer| layer.position == 0)
+                .unwrap()
+                .opacity,
+            0.75,
+        );
+        close(sampled.master.brightness, 0.5);
+    }
+
+    #[test]
     fn runtime_fields_survive_sample_application() {
         let morph = Morph {
             a: Some(slot(2.0, 0.0, 0.0)),
@@ -1366,6 +1694,148 @@ key_threshold: 0.2
         assert_eq!(master.resolution, [3840.0, 2160.0]);
         assert_eq!(master.time, 99.0);
         close(master.pixelate_size, 6.0);
+    }
+
+    #[test]
+    fn cellular_morph_capture_sanitize_apply_and_interpolate_are_complete() {
+        let a_uniforms = EffectUniforms {
+            cellular_amount: 0.2,
+            cellular_scale: 4.0,
+            cellular_warp: 0.1,
+            cellular_speed: 0.5,
+            cellular_gap_amount: 0.2,
+            cellular_gap_threshold: 0.3,
+            cellular_gap_softness: 0.04,
+            ..Default::default()
+        };
+        let b_uniforms = EffectUniforms {
+            cellular_amount: 1.0,
+            cellular_scale: 28.0,
+            cellular_warp: 0.9,
+            cellular_speed: 1.5,
+            cellular_gap_amount: 1.0,
+            cellular_gap_threshold: 0.9,
+            cellular_gap_softness: 0.2,
+            ..Default::default()
+        };
+        let a = MorphMasterSnapshot::capture(&a_uniforms);
+        let b = MorphMasterSnapshot::capture(&b_uniforms);
+        close(a.cellular_amount, 0.2);
+        close(a.cellular_scale, 4.0);
+        close(a.cellular_warp, 0.1);
+        close(a.cellular_speed, 0.5);
+        close(a.cellular_gap_amount, 0.2);
+        close(a.cellular_gap_threshold, 0.3);
+        close(a.cellular_gap_softness, 0.04);
+
+        let midpoint = MorphMasterSnapshot::interpolate(&a, &b, [0.5, 0.5], true);
+        close(midpoint.cellular_amount, 0.6);
+        close(midpoint.cellular_scale, 16.0);
+        close(midpoint.cellular_warp, 0.5);
+        close(midpoint.cellular_speed, 1.0);
+        close(midpoint.cellular_gap_amount, 0.6);
+        close(midpoint.cellular_gap_threshold, 0.6);
+        close(midpoint.cellular_gap_softness, 0.12);
+
+        let mut applied = EffectUniforms {
+            resolution: [1920.0, 1080.0],
+            time: 42.0,
+            ..Default::default()
+        };
+        midpoint.apply_to(&mut applied);
+        close(applied.cellular_amount, 0.6);
+        close(applied.cellular_scale, 16.0);
+        close(applied.cellular_warp, 0.5);
+        close(applied.cellular_speed, 1.0);
+        close(applied.cellular_gap_amount, 0.6);
+        close(applied.cellular_gap_threshold, 0.6);
+        close(applied.cellular_gap_softness, 0.12);
+        assert_eq!(applied.resolution, [1920.0, 1080.0]);
+        close(applied.time, 42.0);
+
+        let invalid = MorphMasterSnapshot {
+            cellular_amount: f32::NAN,
+            cellular_scale: 99.0,
+            cellular_warp: -4.0,
+            cellular_speed: f32::INFINITY,
+            cellular_gap_amount: 4.0,
+            cellular_gap_threshold: f32::NAN,
+            cellular_gap_softness: 3.0,
+            ..Default::default()
+        }
+        .sanitized();
+        close(invalid.cellular_amount, 0.0);
+        close(invalid.cellular_scale, 32.0);
+        close(invalid.cellular_warp, 0.0);
+        close(invalid.cellular_speed, 0.25);
+        close(invalid.cellular_gap_amount, 1.0);
+        close(invalid.cellular_gap_threshold, 0.65);
+        close(invalid.cellular_gap_softness, 0.5);
+
+        let legacy: MorphMasterSnapshot = serde_yaml::from_str("pixelate_size: 2\n").unwrap();
+        close(legacy.cellular_amount, 0.0);
+        close(legacy.cellular_scale, 10.0);
+        close(legacy.cellular_warp, 0.35);
+        close(legacy.cellular_speed, 0.25);
+        close(legacy.cellular_gap_amount, 0.0);
+        close(legacy.cellular_gap_threshold, 0.65);
+        close(legacy.cellular_gap_softness, 0.08);
+    }
+
+    #[test]
+    fn chroma_and_temporal_key_morphing_is_bounded_and_discrete_where_required() {
+        let a = MorphMasterSnapshot::capture(&EffectUniforms {
+            key_mode: 3.0,
+            key_color: [0.0, 1.0, 0.0],
+            key_tolerance: 0.1,
+            key_softness: 0.02,
+            ..Default::default()
+        });
+        let b = MorphMasterSnapshot::capture(&EffectUniforms {
+            key_mode: 4.0,
+            key_color: [1.0, 0.0, 0.5],
+            key_tolerance: 0.5,
+            key_softness: 0.1,
+            ..Default::default()
+        });
+        let midpoint = MorphMasterSnapshot::interpolate(&a, &b, [0.5, 0.5], true);
+        close(midpoint.key_mode, 4.0);
+        assert_eq!(midpoint.key_color, [0.5, 0.5, 0.25]);
+        close(midpoint.key_tolerance, 0.3);
+        close(midpoint.key_softness, 0.06);
+
+        let temporal_a = MorphTemporalSnapshot::capture(&TemporalParams {
+            key_mode: 1.0,
+            key_threshold: 0.08,
+            key_softness: 0.02,
+            key_history: 1.0,
+            ..Default::default()
+        });
+        let temporal_b = MorphTemporalSnapshot::capture(&TemporalParams {
+            key_mode: 4.0,
+            key_threshold: 0.48,
+            key_softness: 0.1,
+            key_history: 9.0,
+            ..Default::default()
+        });
+        let temporal =
+            MorphTemporalSnapshot::interpolate(&temporal_a, &temporal_b, [0.5, 0.5], true);
+        close(temporal.key_mode, 4.0);
+        close(temporal.key_threshold, 0.28);
+        close(temporal.key_softness, 0.06);
+        close(temporal.key_history, 5.0);
+
+        let legacy_master: MorphMasterSnapshot =
+            serde_yaml::from_str("pixelate_size: 2\n").unwrap();
+        assert_eq!(legacy_master.key_mode, 0.0);
+        assert_eq!(legacy_master.key_color, [0.0, 1.0, 0.0]);
+        close(legacy_master.key_tolerance, 0.15);
+        let legacy_temporal: MorphTemporalSnapshot =
+            serde_yaml::from_str("feedback: 0.2\n").unwrap();
+        assert_eq!(legacy_temporal.key_mode, 0.0);
+        close(legacy_temporal.key_threshold, 0.1);
+        close(legacy_temporal.key_softness, 0.03);
+        close(legacy_temporal.key_history, 1.0);
     }
 
     #[test]
@@ -1423,6 +1893,10 @@ a:
     invert: -5
     downsample: .inf
     grain_algo: 9.7
+    cellular_amount: .nan
+    cellular_scale: 999
+    cellular_warp: -3
+    cellular_speed: .inf
   ntsc:
     tape_speed: 99
     chroma_loss: 1
@@ -1466,6 +1940,10 @@ glide:
         close(slot.master.invert, 0.0);
         close(slot.master.downsample, 1.0);
         close(slot.master.grain_algo, 3.0);
+        close(slot.master.cellular_amount, 0.0);
+        close(slot.master.cellular_scale, 32.0);
+        close(slot.master.cellular_warp, 0.0);
+        close(slot.master.cellular_speed, 0.25);
         assert_eq!(slot.ntsc.tape_speed, 2);
         close(slot.ntsc.chroma_loss, 0.01);
         close(slot.ntsc.edge_wave_speed, 0.5);

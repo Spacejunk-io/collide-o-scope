@@ -1,7 +1,9 @@
 //! Shared state between the web control panel and the render engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -27,6 +29,72 @@ pub struct WebState {
     pub access_token: String,
     /// Full remote URL (LAN address + token), set by the server at startup.
     pub lan_url: std::sync::RwLock<String>,
+    /// Server-owned phone-stream membership and monotonic sample freshness.
+    gyro_streams: std::sync::Mutex<GyroStreamRegistry>,
+    next_client_id: AtomicU64,
+}
+
+/// A phone normally publishes at roughly 30 Hz. This allows substantial
+/// mobile scheduling jitter without permitting a vanished pose to remain
+/// applied indefinitely.
+pub const GYRO_SAMPLE_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+#[derive(Default)]
+struct GyroStreamRegistry {
+    /// Clients which have used the explicit start/stop protocol.
+    declared_clients: HashSet<u64>,
+    /// Clients currently claiming ownership of a live sensor stream.
+    streamers: HashSet<u64>,
+    last_sample: Option<Instant>,
+    ever_enabled: bool,
+}
+
+impl GyroStreamRegistry {
+    fn set_stream(&mut self, client_id: u64, enabled: bool) {
+        self.declared_clients.insert(client_id);
+        if enabled {
+            self.ever_enabled = true;
+            self.streamers.insert(client_id);
+        } else {
+            self.streamers.remove(&client_id);
+        }
+    }
+
+    fn note_sample_at(&mut self, client_id: u64, now: Instant) {
+        // Older panels have no gyro_stream action. Their first valid sample
+        // implicitly starts a stream, while an explicitly stopped new panel
+        // cannot be reactivated by a late in-flight sample.
+        if !self.declared_clients.contains(&client_id) {
+            self.ever_enabled = true;
+            self.streamers.insert(client_id);
+        }
+        if self.streamers.contains(&client_id) {
+            self.last_sample = Some(now);
+        }
+    }
+
+    fn disconnect(&mut self, client_id: u64) {
+        self.streamers.remove(&client_id);
+        self.declared_clients.remove(&client_id);
+    }
+
+    fn status_at(&self, now: Instant) -> GyroStatusSnapshot {
+        let sample_age_ms = self.last_sample.map(|sample| {
+            now.saturating_duration_since(sample)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        });
+        let active = !self.streamers.is_empty()
+            && self
+                .last_sample
+                .is_some_and(|sample| now.saturating_duration_since(sample) <= GYRO_SAMPLE_TIMEOUT);
+        GyroStatusSnapshot {
+            active,
+            stale: self.ever_enabled && !active,
+            streamers: self.streamers.len(),
+            sample_age_ms,
+        }
+    }
 }
 
 /// Keep browser input bounded even if a client produces controls faster than
@@ -96,6 +164,10 @@ pub struct AppSnapshot {
     /// idle | running | cancelling | succeeded | failed | cancelled.
     #[serde(default)]
     pub export_status: String,
+    /// Result of the most recent frictionless patch capture. The engine owns
+    /// this text so clients never manufacture a successful-save indication.
+    #[serde(default)]
+    pub patch_save_status: String,
     /// Number of coalesced actions waiting for the next downbeat.
     #[serde(default)]
     pub quantized_pending: usize,
@@ -124,6 +196,7 @@ impl Default for AppSnapshot {
             export_progress: 0.0,
             export_error: String::new(),
             export_status: "idle".to_string(),
+            patch_save_status: String::new(),
             quantized_pending: 0,
         }
     }
@@ -150,6 +223,66 @@ pub struct EffectsSnapshot {
     pub breathe_scale: f32,
     pub breathe_rotation: f32,
     pub breathe_position: f32,
+    #[serde(default)]
+    pub key_mode: u32,
+    #[serde(default = "default_key_color")]
+    pub key_color: [f32; 3],
+    #[serde(default = "default_key_threshold")]
+    pub key_threshold: f32,
+    #[serde(default = "default_key_softness")]
+    pub key_softness: f32,
+    #[serde(default = "default_key_tolerance")]
+    pub key_tolerance: f32,
+    #[serde(default)]
+    pub cellular_amount: f32,
+    #[serde(default = "default_cellular_scale")]
+    pub cellular_scale: f32,
+    #[serde(default = "default_cellular_warp")]
+    pub cellular_warp: f32,
+    #[serde(default = "default_cellular_speed")]
+    pub cellular_speed: f32,
+    #[serde(default)]
+    pub cellular_gap_amount: f32,
+    #[serde(default = "default_cellular_gap_threshold")]
+    pub cellular_gap_threshold: f32,
+    #[serde(default = "default_cellular_gap_softness")]
+    pub cellular_gap_softness: f32,
+}
+
+fn default_cellular_scale() -> f32 {
+    10.0
+}
+
+fn default_key_color() -> [f32; 3] {
+    [0.0, 1.0, 0.0]
+}
+
+fn default_key_threshold() -> f32 {
+    0.5
+}
+
+fn default_key_softness() -> f32 {
+    0.1
+}
+
+fn default_key_tolerance() -> f32 {
+    0.15
+}
+
+fn default_cellular_warp() -> f32 {
+    0.35
+}
+
+fn default_cellular_speed() -> f32 {
+    0.25
+}
+
+fn default_cellular_gap_threshold() -> f32 {
+    0.65
+}
+
+fn default_cellular_gap_softness() -> f32 {
+    0.08
 }
 
 impl Default for EffectsSnapshot {
@@ -173,6 +306,18 @@ impl Default for EffectsSnapshot {
             breathe_scale: 0.0,
             breathe_rotation: 0.0,
             breathe_position: 0.0,
+            key_mode: 0,
+            key_color: default_key_color(),
+            key_threshold: default_key_threshold(),
+            key_softness: default_key_softness(),
+            key_tolerance: default_key_tolerance(),
+            cellular_amount: 0.0,
+            cellular_scale: default_cellular_scale(),
+            cellular_warp: default_cellular_warp(),
+            cellular_speed: default_cellular_speed(),
+            cellular_gap_amount: 0.0,
+            cellular_gap_threshold: default_cellular_gap_threshold(),
+            cellular_gap_softness: default_cellular_gap_softness(),
         }
     }
 }
@@ -276,9 +421,28 @@ pub struct ModSnapshot {
     /// Engine-owned response settings for each orientation axis.
     #[serde(default)]
     pub gyro_config: GyroConfigSnapshot,
+    /// Authoritative server view of phone stream ownership and freshness.
+    #[serde(default)]
+    pub gyro_status: GyroStatusSnapshot,
     /// Engine-owned response, quantize, and spring settings for the XY pad.
     #[serde(default)]
     pub pad_config: PadConfigSnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GyroStatusSnapshot {
+    /// At least one declared/legacy streamer has supplied a recent sample.
+    #[serde(default)]
+    pub active: bool,
+    /// A stream existed or was requested, but no sample is currently fresh.
+    #[serde(default)]
+    pub stale: bool,
+    /// Number of connected clients currently claiming an enabled stream.
+    #[serde(default)]
+    pub streamers: usize,
+    /// Monotonic age of the most recently accepted sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +456,9 @@ pub struct LfoSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingSnapshot {
+    /// Stable runtime identity. It is deliberately not persisted in patches.
+    #[serde(default)]
+    pub route_id: String,
     pub source: String,
     pub target: String,
     pub depth: f32,
@@ -305,6 +472,9 @@ pub struct RoutingSnapshot {
     /// Fall time in seconds (zero is immediate).
     #[serde(default)]
     pub release: f32,
+    /// Cached shaped/slewed source value before route depth, in -1..1.
+    #[serde(default)]
+    pub value: f32,
 }
 
 fn default_curve() -> String {
@@ -402,6 +572,10 @@ impl Default for PadConfigSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSnapshot {
     pub enabled: bool,
+    /// `live` for device/Windows playback capture, `file` for deterministic
+    /// circular analysis of an imported clip.
+    #[serde(default = "default_audio_source_kind")]
+    pub source_kind: String,
     pub gain: f32,
     pub level: f32,
     pub bass: f32,
@@ -419,6 +593,9 @@ pub struct AudioSnapshot {
     /// Available input device names, for the device select.
     #[serde(default)]
     pub devices: Vec<String>,
+    /// Windows output endpoints available through WASAPI loopback capture.
+    #[serde(default)]
+    pub system_playback_devices: Vec<String>,
     /// Preferred device name ("" = system default).
     #[serde(default)]
     pub selected: String,
@@ -428,6 +605,16 @@ pub struct AudioSnapshot {
     /// True when `active_device` differs from the requested `selected` device.
     #[serde(default)]
     pub using_fallback: bool,
+    /// Audio-only files in the active library.
+    #[serde(default)]
+    pub clip_files: Vec<String>,
+    /// Persisted/selected clip source identity.
+    #[serde(default)]
+    pub clip_path: String,
+    #[serde(default)]
+    pub clip_loading: bool,
+    #[serde(default)]
+    pub clip_duration_secs: f64,
     #[serde(default = "default_audio_band_count")]
     pub band_count: usize,
     /// The active count - 1 ordered crossovers.
@@ -446,6 +633,10 @@ fn default_audio_band_count() -> usize {
     3
 }
 
+fn default_audio_source_kind() -> String {
+    crate::modulation::AUDIO_SOURCE_LIVE.to_string()
+}
+
 fn default_audio_band_ceiling() -> f32 {
     8000.0
 }
@@ -454,6 +645,7 @@ impl Default for AudioSnapshot {
     fn default() -> Self {
         Self {
             enabled: false,
+            source_kind: default_audio_source_kind(),
             gain: 0.0,
             level: 0.0,
             bass: 0.0,
@@ -465,9 +657,14 @@ impl Default for AudioSnapshot {
             device: String::new(),
             error: String::new(),
             devices: Vec::new(),
+            system_playback_devices: Vec::new(),
             selected: String::new(),
             active_device: String::new(),
             using_fallback: false,
+            clip_files: Vec::new(),
+            clip_path: String::new(),
+            clip_loading: false,
+            clip_duration_secs: 0.0,
             band_count: default_audio_band_count(),
             band_edges: vec![250.0, 2000.0],
             band_ceiling_hz: default_audio_band_ceiling(),
@@ -497,13 +694,15 @@ impl ModSnapshot {
                 .routings
                 .iter()
                 .map(|r| RoutingSnapshot {
+                    route_id: r.route_id().to_string(),
                     source: r.source.as_str().to_string(),
-                    target: r.target.clone(),
+                    target: r.target().to_owned(),
                     depth: r.depth,
                     curve: r.curve.as_str().to_string(),
                     curve_amount: r.curve_amount,
                     attack: r.attack,
                     release: r.release,
+                    value: r.cached_value(),
                 })
                 .collect(),
             gyro: m.gyro,
@@ -525,6 +724,7 @@ impl ModSnapshot {
                     invert: m.gyro_config[2].invert,
                 },
             },
+            gyro_status: GyroStatusSnapshot::default(),
             pad_config: PadConfigSnapshot {
                 x: PadAxisConfigSnapshot {
                     curve: m.pad_config.axes[0].curve.as_str().to_string(),
@@ -544,7 +744,7 @@ impl ModSnapshot {
 }
 
 /// Temporal (frame-history) effect parameters sent to the browser.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalSnapshot {
     pub feedback: f32,
     pub fb_zoom: f32,
@@ -553,6 +753,43 @@ pub struct TemporalSnapshot {
     #[serde(default)]
     pub slit_angle: f32,
     pub slit_axis: f32,
+    #[serde(default)]
+    pub key_mode: u32,
+    #[serde(default = "default_temporal_key_threshold")]
+    pub key_threshold: f32,
+    #[serde(default = "default_temporal_key_softness")]
+    pub key_softness: f32,
+    #[serde(default = "default_temporal_key_history")]
+    pub key_history: f32,
+}
+
+fn default_temporal_key_threshold() -> f32 {
+    0.1
+}
+
+fn default_temporal_key_softness() -> f32 {
+    0.03
+}
+
+fn default_temporal_key_history() -> f32 {
+    1.0
+}
+
+impl Default for TemporalSnapshot {
+    fn default() -> Self {
+        Self {
+            feedback: 0.0,
+            fb_zoom: 1.0,
+            fb_rotate: 0.0,
+            slitscan: 0.0,
+            slit_angle: 0.0,
+            slit_axis: 0.0,
+            key_mode: 0,
+            key_threshold: default_temporal_key_threshold(),
+            key_softness: default_temporal_key_softness(),
+            key_history: default_temporal_key_history(),
+        }
+    }
 }
 
 impl TemporalSnapshot {
@@ -564,6 +801,10 @@ impl TemporalSnapshot {
             slitscan: p.slitscan,
             slit_angle: p.slit_angle,
             slit_axis: p.slit_axis,
+            key_mode: p.key_mode.round().clamp(0.0, 4.0) as u32,
+            key_threshold: p.key_threshold,
+            key_softness: p.key_softness,
+            key_history: p.key_history,
         }
     }
 }
@@ -591,6 +832,7 @@ pub struct MorphSnapshot {
     pub gliding: bool,
     #[serde(default)]
     pub glide_target: f32,
+    /// Remaining beat duration at the published authoritative clock.
     #[serde(default)]
     pub glide_duration_beats: f64,
 }
@@ -608,6 +850,9 @@ pub struct MidiSnapshot {
     /// True while external clock pulses are actively driving the beat.
     #[serde(default)]
     pub clock_active: bool,
+    /// Current tempo estimate while the external clock is active.
+    #[serde(default)]
+    pub clock_bpm: f32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub port: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -630,6 +875,10 @@ pub struct LayerSnapshot {
     pub layer_id: String,
     pub filename: String,
     pub visible: bool,
+    /// True when the layer skips Digital/Analog/Cellular/Motion/VHS master
+    /// processing. The later program-wide Temporal stage still applies.
+    #[serde(default)]
+    pub bypass_master_fx: bool,
     pub paused: bool,
     pub opacity: f32,
     pub speed: f32,
@@ -643,6 +892,10 @@ pub struct LayerSnapshot {
     pub key_threshold: f32,
     #[serde(default)]
     pub key_softness: f32,
+    #[serde(default = "default_key_color")]
+    pub key_color: [f32; 3],
+    #[serde(default = "default_key_tolerance")]
+    pub key_tolerance: f32,
     #[serde(default)]
     pub effects: EffectsSnapshot,
     /// `video` for ordinary decoded clips or `spout` for a live receiver.
@@ -715,7 +968,8 @@ pub enum WebAction {
     /// Toggle master play/pause
     #[serde(rename = "toggle_master_pause")]
     ToggleMasterPause,
-    /// Reset all master effects
+    /// Revert the complete master visual state. Layers, transport, BPM, and
+    /// input/device selections are preserved.
     #[serde(rename = "reset_fx")]
     ResetFx,
     /// Reset a specific effect group (digital, analog, motion)
@@ -790,11 +1044,27 @@ pub enum WebAction {
     AddRouting,
     /// Remove a modulation routing by index
     #[serde(rename = "remove_routing")]
-    RemoveRouting { index: usize },
+    RemoveRouting {
+        index: usize,
+        #[serde(default)]
+        route_id: Option<String>,
+    },
     /// Set a routing parameter ("source" | "target" | "depth")
     #[serde(rename = "set_routing")]
     SetRouting {
         index: usize,
+        #[serde(default)]
+        route_id: Option<String>,
+        /// Stable identity of a positional `layerN_*` target. Bundled clients
+        /// include this when changing a route target so an intervening stack
+        /// edit cannot silently retarget the route to a different layer.
+        #[serde(default)]
+        target_layer_id: Option<String>,
+        /// Stack generation observed when `target_layer_id` was captured.
+        /// The stable ID remains authoritative across harmless index drift;
+        /// this revision is diagnostic/precondition metadata for receivers.
+        #[serde(default)]
+        layer_stack_revision: Option<u64>,
         param: String,
         value: serde_json::Value,
     },
@@ -814,6 +1084,11 @@ pub enum WebAction {
     /// Phone orientation sample (degrees, DeviceOrientation convention)
     #[serde(rename = "gyro")]
     Gyro { alpha: f32, beta: f32, gamma: f32 },
+    /// Declare this WebSocket as an enabled/disabled phone sensor streamer.
+    /// Older clients remain compatible: their first gyro sample implicitly
+    /// enables their connection until it disconnects.
+    #[serde(rename = "gyro_stream")]
+    GyroStream { enabled: bool },
     /// Store the latest raw orientation as the centered (0.5) pose.
     #[serde(rename = "gyro_calibrate")]
     GyroCalibrate,
@@ -845,7 +1120,13 @@ pub enum WebAction {
     ToggleOutputWindow,
     /// Capture current parameters into morph slot "a" or "b"
     #[serde(rename = "morph_capture")]
-    MorphCapture { slot: String },
+    MorphCapture {
+        slot: String,
+        /// Optional stack generation supplied by current clients. A capture
+        /// queued against an older topology is rejected at execution time.
+        #[serde(default)]
+        stack_revision: Option<u64>,
+    },
     /// Clear both morph slots (crossfader disengages)
     #[serde(rename = "morph_clear")]
     MorphClear,
@@ -873,6 +1154,10 @@ pub enum WebAction {
     /// Enable/disable the Spout output sender
     #[serde(rename = "set_spout")]
     SetSpout { enabled: bool },
+    /// Capture the complete current performance state into the local patch
+    /// corpus without opening a native file dialog.
+    #[serde(rename = "quick_save_patch")]
+    QuickSavePatch,
     /// Start an offline render export
     #[serde(rename = "start_export")]
     StartExport {
@@ -897,6 +1182,13 @@ fn bool_true() -> bool {
 impl WebAction {
     fn layer_key(index: usize, layer_id: &Option<String>) -> String {
         layer_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map_or_else(|| format!("index:{index}"), |id| format!("id:{id}"))
+    }
+
+    fn routing_key(index: usize, route_id: &Option<String>) -> String {
+        route_id
             .as_deref()
             .filter(|id| !id.is_empty())
             .map_or_else(|| format!("index:{index}"), |id| format!("id:{id}"))
@@ -944,7 +1236,15 @@ impl WebAction {
             Self::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
             Self::SetBpm { .. } => Some("mod:bpm".into()),
             Self::SetLfo { index, param, .. } => Some(format!("lfo:{index}:{param}")),
-            Self::SetRouting { index, param, .. } => Some(format!("routing:{index}:{param}")),
+            Self::SetRouting {
+                index,
+                route_id,
+                param,
+                ..
+            } => Some(format!(
+                "routing:{}:{param}",
+                Self::routing_key(*index, route_id)
+            )),
             Self::SetAudio { param, .. } => Some(format!("audio:{param}")),
             Self::SetMidi { param, .. } => Some(format!("midi:{param}")),
             Self::Gyro { .. } => Some("gyro:sample".into()),
@@ -955,6 +1255,7 @@ impl WebAction {
             Self::SetMorphLaw { .. } => Some("morph:law".into()),
             Self::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
             Self::SetSpout { .. } => Some("spout:enabled".into()),
+            Self::QuickSavePatch => Some("patch:quick-save".into()),
             Self::CancelExport => Some("export:cancel".into()),
             Self::RescanLibrary => Some("library:rescan".into()),
             _ => None,
@@ -967,8 +1268,10 @@ impl WebAction {
             | Self::ToggleBlackout
             | Self::SetBlackout { .. }
             | Self::SetMasterPaused { .. }
+            | Self::ResetFx
             | Self::SetLayerPaused { .. }
             | Self::SetLayerVisibility { .. }
+            | Self::QuickSavePatch
             | Self::RescanLibrary => true,
             Self::Pad { active, .. } => !active,
             Self::Quantized { inner } => inner.is_priority(),
@@ -978,10 +1281,27 @@ impl WebAction {
 }
 
 fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutcome {
+    // A rescan has no payload. Keep the earliest pending barrier in place so
+    // later uploads cannot move it behind a clip-selection action.
+    if matches!(action, WebAction::RescanLibrary)
+        && queue
+            .iter()
+            .any(|candidate| matches!(candidate, WebAction::RescanLibrary))
+    {
+        return EnqueueOutcome::Coalesced;
+    }
     if let Some(key) = action.coalesce_key() {
-        if let Some(position) = queue
+        // Captures, resets, saves, topology changes, and other uncoalesced
+        // commands observe ordered state. Never move a later absolute value
+        // across one of those semantic barriers.
+        let barrier = queue
+            .iter()
+            .rposition(|candidate| candidate.coalesce_key().is_none())
+            .map_or(0, |position| position + 1);
+        if let Some(position) = queue[barrier..]
             .iter()
             .rposition(|candidate| candidate.coalesce_key().as_deref() == Some(key.as_str()))
+            .map(|position| barrier + position)
         {
             queue.remove(position);
             queue.push(action);
@@ -1026,6 +1346,18 @@ impl EffectsSnapshot {
             breathe_scale: u.breathe_scale,
             breathe_rotation: u.breathe_rotation,
             breathe_position: u.breathe_position,
+            key_mode: u.key_mode.round().clamp(0.0, 4.0) as u32,
+            key_color: u.key_color,
+            key_threshold: u.key_threshold,
+            key_softness: u.key_softness,
+            key_tolerance: u.key_tolerance,
+            cellular_amount: u.cellular_amount,
+            cellular_scale: u.cellular_scale,
+            cellular_warp: u.cellular_warp,
+            cellular_speed: u.cellular_speed,
+            cellular_gap_amount: u.cellular_gap_amount,
+            cellular_gap_threshold: u.cellular_gap_threshold,
+            cellular_gap_softness: u.cellular_gap_softness,
         }
     }
 
@@ -1048,6 +1380,18 @@ impl EffectsSnapshot {
         u.breathe_scale = self.breathe_scale.clamp(0.0, 0.05);
         u.breathe_rotation = self.breathe_rotation.clamp(0.0, 2.0);
         u.breathe_position = self.breathe_position.clamp(0.0, 0.02);
+        u.key_mode = self.key_mode.min(4) as f32;
+        u.key_color = self.key_color.map(|channel| channel.clamp(0.0, 1.0));
+        u.key_threshold = self.key_threshold.clamp(0.0, 1.0);
+        u.key_softness = self.key_softness.clamp(0.0, 0.5);
+        u.key_tolerance = self.key_tolerance.clamp(0.0, 1.0);
+        u.cellular_amount = self.cellular_amount.clamp(0.0, 1.0);
+        u.cellular_scale = self.cellular_scale.clamp(2.0, 32.0);
+        u.cellular_warp = self.cellular_warp.clamp(0.0, 1.0);
+        u.cellular_speed = self.cellular_speed.clamp(0.0, 2.0);
+        u.cellular_gap_amount = self.cellular_gap_amount.clamp(0.0, 1.0);
+        u.cellular_gap_threshold = self.cellular_gap_threshold.clamp(0.0, 1.0);
+        u.cellular_gap_softness = self.cellular_gap_softness.clamp(0.0, 0.5);
     }
 
     pub fn apply_param(&mut self, param: &str, value: &serde_json::Value) {
@@ -1143,6 +1487,71 @@ impl EffectsSnapshot {
                     self.breathe_position = n as f32;
                 }
             }
+            "key_mode" => {
+                if let Some(n) = v.as_u64() {
+                    self.key_mode = (n as u32).min(4);
+                }
+            }
+            "key_color_r" | "key_color_g" | "key_color_b" => {
+                if let Some(n) = v.as_f64() {
+                    let index = match param {
+                        "key_color_r" => 0,
+                        "key_color_g" => 1,
+                        _ => 2,
+                    };
+                    self.key_color[index] = n as f32;
+                }
+            }
+            "key_threshold" => {
+                if let Some(n) = v.as_f64() {
+                    self.key_threshold = n as f32;
+                }
+            }
+            "key_softness" => {
+                if let Some(n) = v.as_f64() {
+                    self.key_softness = n as f32;
+                }
+            }
+            "key_tolerance" => {
+                if let Some(n) = v.as_f64() {
+                    self.key_tolerance = n as f32;
+                }
+            }
+            "cellular_amount" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_amount = n as f32;
+                }
+            }
+            "cellular_scale" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_scale = n as f32;
+                }
+            }
+            "cellular_warp" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_warp = n as f32;
+                }
+            }
+            "cellular_speed" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_speed = n as f32;
+                }
+            }
+            "cellular_gap_amount" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_gap_amount = n as f32;
+                }
+            }
+            "cellular_gap_threshold" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_gap_threshold = n as f32;
+                }
+            }
+            "cellular_gap_softness" => {
+                if let Some(n) = v.as_f64() {
+                    self.cellular_gap_softness = n as f32;
+                }
+            }
             _ => {}
         }
     }
@@ -1169,12 +1578,46 @@ impl WebState {
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
             lan_url: std::sync::RwLock::new(String::new()),
+            gyro_streams: std::sync::Mutex::new(GyroStreamRegistry::default()),
+            next_client_id: AtomicU64::new(1),
         }))
     }
 
     pub async fn enqueue_action(&self, action: WebAction) -> EnqueueOutcome {
         let mut queue = self.actions.lock().await;
         enqueue_bounded(&mut queue, action)
+    }
+
+    pub fn allocate_client_id(&self) -> u64 {
+        self.next_client_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn set_gyro_stream(&self, client_id: u64, enabled: bool) {
+        self.gyro_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_stream(client_id, enabled);
+    }
+
+    pub fn note_gyro_sample(&self, client_id: u64) {
+        self.gyro_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .note_sample_at(client_id, Instant::now());
+    }
+
+    pub fn disconnect_gyro_client(&self, client_id: u64) {
+        self.gyro_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .disconnect(client_id);
+    }
+
+    pub fn gyro_status(&self) -> GyroStatusSnapshot {
+        self.gyro_streams
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status_at(Instant::now())
     }
 }
 
@@ -1225,6 +1668,39 @@ mod protocol_tests {
     }
 
     #[test]
+    fn morph_capture_is_an_ordering_barrier_for_fader_coalescing() {
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut queue, WebAction::SetMorph { value: 0.2 }),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::MorphCapture {
+                    slot: "a".into(),
+                    stack_revision: Some(7),
+                },
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut queue, WebAction::SetMorph { value: 0.8 }),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(queue.len(), 3);
+        assert!(matches!(queue[0], WebAction::SetMorph { value } if value == 0.2));
+        assert!(matches!(
+            queue[1],
+            WebAction::MorphCapture {
+                stack_revision: Some(7),
+                ..
+            }
+        ));
+        assert!(matches!(queue[2], WebAction::SetMorph { value } if value == 0.8));
+    }
+
+    #[test]
     fn layer_identity_and_direct_effect_protocol_round_trip() {
         let effect: WebAction = serde_json::from_str(
             r#"{"action":"set_layer_effect","index":2,"layer_id":"layer-abc","param":"downsample","value":0.5}"#,
@@ -1232,6 +1708,15 @@ mod protocol_tests {
         .unwrap();
         assert!(
             matches!(effect, WebAction::SetLayerEffect { index: 2, layer_id: Some(id), param, .. } if id == "layer-abc" && param == "downsample")
+        );
+
+        let bypass: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_param","index":2,"layer_id":"layer-abc","param":"bypass_master_fx","value":true}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(bypass, WebAction::SetLayerParam { index: 2, layer_id: Some(id), param, value }
+                if id == "layer-abc" && param == "bypass_master_fx" && value == serde_json::json!(true))
         );
 
         let reorder: WebAction = serde_json::from_str(
@@ -1256,6 +1741,40 @@ mod protocol_tests {
     }
 
     #[test]
+    fn legacy_layer_snapshot_defaults_master_fx_bypass_to_off() {
+        let current = LayerSnapshot {
+            layer_id: "17".into(),
+            filename: "plate.png".into(),
+            visible: true,
+            bypass_master_fx: true,
+            paused: false,
+            opacity: 1.0,
+            speed: 1.0,
+            fps: 30.0,
+            blend_mode: "normal".into(),
+            progress: 0.0,
+            key_mode: 0,
+            key_threshold: 0.5,
+            key_softness: 0.1,
+            key_color: default_key_color(),
+            key_tolerance: default_key_tolerance(),
+            effects: EffectsSnapshot::default(),
+            source_kind: "image".into(),
+            source_name: String::new(),
+            source_active: true,
+            source_width: 1920,
+            source_height: 1080,
+            source_sequence: 0,
+            source_error: String::new(),
+            offline_export_policy: String::new(),
+        };
+        let mut value = serde_json::to_value(current).unwrap();
+        value.as_object_mut().unwrap().remove("bypass_master_fx");
+        let legacy: LayerSnapshot = serde_json::from_value(value).unwrap();
+        assert!(!legacy.bypass_master_fx);
+    }
+
+    #[test]
     fn downsample_snapshot_and_browser_control_are_complete() {
         let mut uniforms = EffectUniforms {
             downsample: 0.42,
@@ -1272,6 +1791,177 @@ mod protocol_tests {
     }
 
     #[test]
+    fn cellular_snapshot_controls_and_modulation_targets_are_complete() {
+        let mut uniforms = EffectUniforms {
+            cellular_amount: 0.7,
+            cellular_scale: 18.0,
+            cellular_warp: 0.6,
+            cellular_speed: 1.25,
+            cellular_gap_amount: 0.85,
+            cellular_gap_threshold: 0.45,
+            cellular_gap_softness: 0.14,
+            ..EffectUniforms::default()
+        };
+        let snapshot = EffectsSnapshot::from_uniforms(&uniforms);
+        assert!((snapshot.cellular_amount - 0.7).abs() < f32::EPSILON);
+        assert!((snapshot.cellular_scale - 18.0).abs() < f32::EPSILON);
+        assert!((snapshot.cellular_warp - 0.6).abs() < f32::EPSILON);
+        assert!((snapshot.cellular_speed - 1.25).abs() < f32::EPSILON);
+        assert!((snapshot.cellular_gap_amount - 0.85).abs() < f32::EPSILON);
+        assert!((snapshot.cellular_gap_threshold - 0.45).abs() < f32::EPSILON);
+        assert!((snapshot.cellular_gap_softness - 0.14).abs() < f32::EPSILON);
+
+        let mut changed = EffectsSnapshot::default();
+        for (param, value) in [
+            ("cellular_amount", 0.5),
+            ("cellular_scale", 24.0),
+            ("cellular_warp", 0.8),
+            ("cellular_speed", 1.5),
+            ("cellular_gap_amount", 0.75),
+            ("cellular_gap_threshold", 0.6),
+            ("cellular_gap_softness", 0.11),
+        ] {
+            changed.apply_param(param, &serde_json::json!(value));
+        }
+        changed.apply_to_uniforms(&mut uniforms);
+        assert!((uniforms.cellular_amount - 0.5).abs() < f32::EPSILON);
+        assert!((uniforms.cellular_scale - 24.0).abs() < f32::EPSILON);
+        assert!((uniforms.cellular_warp - 0.8).abs() < f32::EPSILON);
+        assert!((uniforms.cellular_speed - 1.5).abs() < f32::EPSILON);
+        assert!((uniforms.cellular_gap_amount - 0.75).abs() < f32::EPSILON);
+        assert!((uniforms.cellular_gap_threshold - 0.6).abs() < f32::EPSILON);
+        assert!((uniforms.cellular_gap_softness - 0.11).abs() < f32::EPSILON);
+
+        let mut legacy_json = serde_json::to_value(EffectsSnapshot::default()).unwrap();
+        let legacy_object = legacy_json.as_object_mut().unwrap();
+        legacy_object.remove("cellular_gap_amount");
+        legacy_object.remove("cellular_gap_threshold");
+        legacy_object.remove("cellular_gap_softness");
+        let legacy: EffectsSnapshot = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.cellular_gap_amount, 0.0);
+        assert_eq!(legacy.cellular_gap_threshold, 0.65);
+        assert_eq!(legacy.cellular_gap_softness, 0.08);
+
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        for field in [
+            "cellular_amount",
+            "cellular_scale",
+            "cellular_warp",
+            "cellular_speed",
+        ] {
+            assert!(html.contains(&format!("data-param=\"{field}\"")));
+            assert!(js.contains(&format!("'{field}'")));
+        }
+        for field in [
+            "cellular_gap_amount",
+            "cellular_gap_threshold",
+            "cellular_gap_softness",
+        ] {
+            assert!(html.contains(&format!("data-param=\"{field}\"")));
+            assert!(js.contains(&format!("['{field}',")));
+        }
+        assert!(html.contains("keyed ridges can reveal lower content"));
+        assert!(js.contains("'Master Cell Gap Key'"));
+        assert!(html.contains("data-group=\"cellular\""));
+        assert!(js.contains("class=\"layer-cellular-toggle\""));
+        assert!(js.contains("aria-controls=\"layer-cellular-body-${index}\""));
+        assert!(js.contains("class=\"layer-cellular-body\""));
+        for contract in [
+            "const MASTER_MOD_TARGETS = MOD_TARGETS.slice()",
+            "Math.min(MAX_MOD_LAYERS, latestLayerIdentities.length)",
+            "targets.push([`layer${layer}_${suffix}`, `L${layer} ${label}`])",
+            "groups.push([`Layer ${layer}`, targets])",
+            "routes: routings.map((routing, index)",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing bounded target menu contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn master_control_groups_stay_in_their_intended_columns() {
+        let html = include_str!("../../static/index.html");
+        let video = html.find("data-fx-column=\"video\"").unwrap();
+        let mod_morph = html.find("data-fx-column=\"mod-morph\"").unwrap();
+        let sources = html.find("data-fx-column=\"sources\"").unwrap();
+        let io = html.find("data-fx-column=\"io\"").unwrap();
+        assert!(video < mod_morph && mod_morph < sources && sources < io);
+
+        let video_column = &html[video..mod_morph];
+        assert!(video_column.contains("data-group=\"digital\""));
+        assert!(video_column.contains("data-group=\"analog\""));
+        assert!(video_column.contains("id=\"vhs-group\""));
+        assert!(!video_column.contains("data-group=\"cellular\""));
+
+        let second_column = &html[mod_morph..sources];
+        let ordered = [
+            "id=\"morph-group\"",
+            "class=\"fx-group\" data-group=\"cellular\"",
+            "class=\"fx-group\" data-group=\"motion\"",
+            "id=\"temporal-group\"",
+            "id=\"audio-group\"",
+        ];
+        let mut previous = 0;
+        for marker in ordered {
+            let position = second_column.find(marker).unwrap();
+            assert!(position >= previous, "{marker} is out of column order");
+            previous = position;
+        }
+        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 5);
+        assert!(!second_column.contains("id=\"mod-group\""));
+        assert!(!second_column.contains("id=\"pad-group\""));
+        assert!(!second_column.contains("id=\"midi-group\""));
+
+        let third_column = &html[sources..io];
+        let ordered = ["id=\"mod-group\"", "id=\"pad-group\"", "id=\"midi-group\""];
+        let mut previous = 0;
+        for marker in ordered {
+            let position = third_column.find(marker).unwrap();
+            assert!(position >= previous, "{marker} is out of column order");
+            previous = position;
+        }
+        assert_eq!(third_column.matches("<div class=\"fx-group\"").count(), 3);
+        assert!(!third_column.contains("id=\"audio-group\""));
+        assert!(!third_column.contains("id=\"gyro-group\""));
+
+        assert!(html.contains(
+            "data-fx-column=\"mod-morph\"><!-- morph, time-domain effects, and audio -->"
+        ));
+        assert!(html
+            .contains("data-fx-column=\"sources\"><!-- live modulation controls and sources -->"));
+        for group in ["mod", "pad", "midi", "audio"] {
+            assert_eq!(html.matches(&format!("id=\"{group}-group\"")).count(), 1);
+        }
+
+        let io_column = &html[io..];
+        let remote = io_column.find("id=\"remote-group\"").unwrap();
+        let gyro = io_column.find("id=\"gyro-group\"").unwrap();
+        assert!(remote < gyro);
+        assert_eq!(html.matches("id=\"gyro-group\"").count(), 1);
+        assert_eq!(html.matches("id=\"temporal-group\"").count(), 1);
+    }
+
+    #[test]
+    fn quick_patch_capture_uses_an_authoritative_snapshot_status() {
+        let action: WebAction = serde_json::from_str(r#"{"action":"quick_save_patch"}"#).unwrap();
+        assert!(matches!(action, WebAction::QuickSavePatch));
+        let value = serde_json::to_value(WebAction::QuickSavePatch).unwrap();
+        assert_eq!(value["action"], "quick_save_patch");
+
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        assert!(html.contains("id=\"patch-capture\""));
+        assert!(html.contains("id=\"patch-save-status\" role=\"status\" aria-live=\"polite\""));
+        assert!(js.contains("sendAction({ action: 'quick_save_patch' })"));
+        assert!(js.contains("syncPatchSave(msg.patch_save_status || '')"));
+        assert!(js.contains("text.startsWith('Saving')"));
+        assert!(!js.contains("setTimeout(() => patchCaptureButton"));
+    }
+
+    #[test]
     fn browser_scrubs_bootstrap_key_and_reports_every_layer_source_error() {
         let js = include_str!("../../static/app.js");
         let html = include_str!("../../static/index.html");
@@ -1279,12 +1969,150 @@ mod protocol_tests {
         assert!(js.contains("window.history.replaceState"));
         assert!(js.contains("<div class=\"layer-source-status\" role=\"status\""));
         assert!(js.contains("video decoder: ${layer.source_error}"));
-        assert!(js.contains("header.setAttribute('aria-expanded'"));
+        assert!(js.contains("chevron?.setAttribute('aria-expanded'"));
         assert!(js.contains("aria-keyshortcuts=\"ArrowUp ArrowDown Home End\""));
         assert!(js.contains("item.setAttribute('role', 'button')"));
         assert!(js.contains("window.confirm"));
         assert!(html.contains("id=\"output-status\" role=\"status\" aria-live=\"polite\""));
         assert!(js.contains("syncOutputWindow(msg.output_window, msg.output_error)"));
+    }
+
+    #[test]
+    fn every_range_control_has_a_complete_editable_numeric_contract() {
+        fn assert_range_tags_are_bounded(source: &str, allow_row_metadata: bool) -> usize {
+            let marker = "<input type=\"range\"";
+            let mut cursor = 0;
+            let mut count = 0;
+            while let Some(relative) = source[cursor..].find(marker) {
+                let start = cursor + relative;
+                let end = start
+                    + source[start..]
+                        .find('>')
+                        .expect("range input must have a closing bracket");
+                let tag = &source[start..=end];
+                let context_start = if allow_row_metadata {
+                    source[..start].rfind("<div").unwrap_or(start)
+                } else {
+                    start
+                };
+                let context = &source[context_start..=end];
+                for attribute in ["min", "max", "step"] {
+                    assert!(
+                        tag.contains(&format!("{attribute}=\""))
+                            || context.contains(&format!("data-{attribute}=\"")),
+                        "range #{count} is missing {attribute}: {tag}"
+                    );
+                }
+                count += 1;
+                cursor = end + 1;
+            }
+            count
+        }
+
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+
+        // Exact declaration counts keep every currently shipped static and
+        // generated range under this universal contract.
+        assert_eq!(assert_range_tags_are_bounded(html, true), 58);
+        assert_eq!(assert_range_tags_are_bounded(js, false), 12);
+
+        for contract in [
+            "function normalizeRangeValue(slider, rawValue)",
+            "Math.min(max, Math.max(min, value))",
+            "Math.round((value - base) / step) * step",
+            "binding.slider.dispatchEvent(new Event('input', { bubbles: true }))",
+            "event.key === 'Enter'",
+            "event.key === 'Escape'",
+            "editor.addEventListener('blur'",
+            "input,select,[data-range-editor]",
+            "if (document.activeElement === el) return true;",
+            "if (binding.editor.textContent !== textValue)",
+            "binding.editor.getAttribute('aria-valuenow') !== ariaValue",
+            "if (binding.disabled === disabled) return;",
+            "const activeRangeBindings = new Set();",
+            "if (!slider.isConnected)",
+            "const peer = rangeControlPeers.get(el)",
+            "syncRangeEditors(document)",
+            "bindRangeEditors(card)",
+            "bindRangeEditors(row)",
+            "new MutationObserver",
+            "editor.setAttribute('contenteditable'",
+            "editor.setAttribute('role', 'spinbutton')",
+            "editor.setAttribute('inputmode', min < 0 ? 'text' : 'decimal')",
+            "event.key === 'ArrowUp'",
+            "event.key === 'PageUp'",
+            "editor.addEventListener('paste'",
+            "event.clipboardData?.getData('text/plain')",
+            "editor.setAttribute('aria-valuemin'",
+            "editor.setAttribute('aria-valuemax'",
+            "editor.setAttribute('aria-valuenow'",
+            "editor.setAttribute('aria-invalid'",
+        ] {
+            assert!(js.contains(contract), "missing range contract: {contract}");
+        }
+
+        for coverage in [
+            "data-param=\"pixelate\"",
+            "data-param=\"cellular_speed\"",
+            "data-ntsc=\"snow_intensity\"",
+            "data-temporal=\"feedback\"",
+            "id=\"audio-gain\"",
+            "id=\"morph-t\"",
+            "id=\"pad-x-curve-amount\"",
+            "id=\"gyro-yaw-expo\"",
+        ] {
+            assert!(html.contains(coverage), "missing static range: {coverage}");
+        }
+        for coverage in [
+            "const LAYER_EFFECT_CONTROLS",
+            "data-layer-effect=\"${param}\"",
+            "data-param=\"opacity\"",
+            "class=\"routing-depth\"",
+            "class=\"routing-curve-amount\"",
+        ] {
+            assert!(js.contains(coverage), "missing generated range: {coverage}");
+        }
+        for contract in [
+            ".range-value[contenteditable=\"true\"]",
+            ".range-value[contenteditable=\"true\"]:focus",
+            ".range-value.range-value-invalid",
+            ".range-editor-wrap",
+            "touch-action: manipulation",
+            "min-height: 24px",
+        ] {
+            assert!(css.contains(contract), "missing range styling: {contract}");
+        }
+
+        assert!(html.contains("id=\"btn-revert-master\""));
+        assert!(html.contains("Revert master visual state"));
+        assert!(js.contains(
+            "title=\"Reset layer effects (opacity and transport unchanged)\" aria-label=\"Reset layer effects (opacity and transport unchanged)\""
+        ));
+    }
+
+    #[test]
+    fn windows_run_helper_restarts_only_the_exact_executable_with_bounded_waits() {
+        let script = include_str!("../../scripts/build-windows.ps1");
+        for contract in [
+            "function Test-ExactExecutableProcess",
+            "[System.StringComparer]::OrdinalIgnoreCase.Equals",
+            "$process.CloseMainWindow()",
+            "$process.Kill()",
+            "[DateTime]::UtcNow.AddSeconds(5)",
+            "[DateTime]::UtcNow.AddSeconds(10)",
+            "$remainingExactCopies",
+            "Close it manually and retry",
+        ] {
+            assert!(
+                script.contains(contract),
+                "missing restart contract: {contract}"
+            );
+        }
+        assert!(!script.contains("Wait-Process"));
+        assert!(!script.contains("Stop-Process -Id"));
+        assert!(!script.contains("Get-Process -Id"));
     }
 
     #[test]
@@ -1294,6 +2122,52 @@ mod protocol_tests {
         assert!(js.contains("const current = card._layerState || layer;"));
         assert!(js.contains("paused: !current.paused"));
         assert!(js.contains("visible: !current.visible"));
+    }
+
+    #[test]
+    fn layer_master_fx_bypass_ui_is_stable_id_accessible_and_explicitly_scoped() {
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "<label>Bypass Master FX</label>",
+            "aria-label=\"Bypass Master FX for layer ${index + 1}\"",
+            "aria-describedby=\"layer-master-bypass-help-${index}\"",
+            "param: 'bypass_master_fx'",
+            "...layerSelector(layer, index)",
+            "bypassMasterFx.checked = !!layer.bypass_master_fx",
+            "Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.",
+        ] {
+            assert!(js.contains(contract), "missing bypass UI contract: {contract}");
+        }
+    }
+
+    #[test]
+    fn master_transport_uses_absolute_pending_state_and_priority_revert() {
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "let transportAuthoritativePaused = false",
+            "let transportPendingPaused = null",
+            "let transportRequestSequence = 0",
+            "if (transportPendingPaused !== null) return",
+            "sendAction({ action: 'set_master_paused', paused: target })",
+            "transportPendingPaused === transportAuthoritativePaused",
+            "renderMasterTransport(target, true)",
+            "btn.toggleAttribute('aria-busy', pending)",
+            "window.setTimeout(() =>",
+            "transportRequestSequence === requestSequence",
+            "sendAction({ action: 'reset_fx' })",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing transport contract: {contract}"
+            );
+        }
+
+        let mut queue = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
+        assert_ne!(
+            enqueue_bounded(&mut queue, WebAction::ResetFx),
+            EnqueueOutcome::Dropped
+        );
+        assert!(matches!(queue.last(), Some(WebAction::ResetFx)));
     }
 
     #[test]
@@ -1383,8 +2257,11 @@ mod protocol_tests {
         assert_eq!(legacy.curve_amount, 0.0);
         assert_eq!(legacy.attack, 0.0);
         assert_eq!(legacy.release, 0.0);
+        assert!(legacy.route_id.is_empty());
+        assert_eq!(legacy.value, 0.0);
 
         let routing = RoutingSnapshot {
+            route_id: "42".into(),
             source: "pad_x".into(),
             target: "morph".into(),
             depth: -0.75,
@@ -1392,12 +2269,108 @@ mod protocol_tests {
             curve_amount: 0.4,
             attack: 0.12,
             release: 1.5,
+            value: -0.25,
         };
         let value = serde_json::to_value(&routing).unwrap();
         assert_eq!(value["curve"], "s_curve");
         assert_json_number_near(&value["curve_amount"], 0.4);
         assert_json_number_near(&value["attack"], 0.12);
         assert_json_number_near(&value["release"], 1.5);
+        assert_eq!(value["route_id"], "42");
+        assert_json_number_near(&value["value"], -0.25);
+    }
+
+    #[test]
+    fn routing_actions_accept_stable_ids_and_rescan_keeps_its_barrier_position() {
+        let action: WebAction = serde_json::from_str(
+            r#"{"action":"set_routing","index":7,"route_id":"42","param":"depth","value":0.5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            action,
+            WebAction::SetRouting {
+                index: 7,
+                route_id: Some(id),
+                target_layer_id: None,
+                layer_stack_revision: None,
+                ..
+            } if id == "42"
+        ));
+
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut queue, WebAction::RescanLibrary),
+            EnqueueOutcome::Added
+        );
+        let clip = WebAction::SetAudio {
+            param: "clip".into(),
+            value: serde_json::json!("second.wav"),
+        };
+        assert_eq!(enqueue_bounded(&mut queue, clip), EnqueueOutcome::Added);
+        assert_eq!(
+            enqueue_bounded(&mut queue, WebAction::RescanLibrary),
+            EnqueueOutcome::Coalesced
+        );
+        assert!(matches!(queue.first(), Some(WebAction::RescanLibrary)));
+        assert!(matches!(
+            queue.get(1),
+            Some(WebAction::SetAudio { param, .. }) if param == "clip"
+        ));
+    }
+
+    #[test]
+    fn routing_target_identity_is_backward_compatible_and_coalesces_latest_metadata() {
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "latestLayerIdentities = layers.map((layer) => String(layer.layer_id || ''))",
+            "const targetLayerId = latestLayerIdentities[Number(layerMatch[1]) - 1]",
+            "targetIdentity = { target_layer_id: targetLayerId }",
+            "targetIdentity.layer_stack_revision = layerStackRevision",
+            "...selector(), ...targetIdentity, param: 'target', value: target",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing target identity contract: {contract}"
+            );
+        }
+
+        let legacy: WebAction = serde_json::from_str(
+            r#"{"action":"set_routing","index":2,"param":"target","value":"layer2_opacity"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            WebAction::SetRouting {
+                target_layer_id: None,
+                layer_stack_revision: None,
+                ..
+            }
+        ));
+
+        let first: WebAction = serde_json::from_str(
+            r#"{"action":"set_routing","index":2,"route_id":"42","target_layer_id":"20","layer_stack_revision":7,"param":"target","value":"layer2_opacity"}"#,
+        )
+        .unwrap();
+        let latest: WebAction = serde_json::from_str(
+            r#"{"action":"set_routing","index":0,"route_id":"42","target_layer_id":"20","layer_stack_revision":8,"param":"target","value":"layer1_opacity"}"#,
+        )
+        .unwrap();
+        let mut queue = Vec::new();
+        assert_eq!(enqueue_bounded(&mut queue, first), EnqueueOutcome::Added);
+        assert_eq!(
+            enqueue_bounded(&mut queue, latest),
+            EnqueueOutcome::Coalesced
+        );
+        assert!(matches!(
+            queue.as_slice(),
+            [WebAction::SetRouting {
+                route_id: Some(route_id),
+                target_layer_id: Some(layer_id),
+                layer_stack_revision: Some(8),
+                value,
+                ..
+            }] if route_id == "42" && layer_id == "20" && value == "layer1_opacity"
+        ));
     }
 
     #[test]
@@ -1419,7 +2392,7 @@ mod protocol_tests {
     }
 
     #[test]
-    fn audio_band_protocol_round_trips_and_defaults_legacy_snapshots() {
+    fn audio_protocol_round_trips_and_defaults_legacy_snapshots() {
         let legacy: AudioSnapshot = serde_json::from_str(
             r#"{"enabled":false,"gain":1.0,"level":0.0,"bass":0.1,"mid":0.2,"high":0.3,"onset":0.0}"#,
         )
@@ -1427,12 +2400,24 @@ mod protocol_tests {
         assert_eq!(legacy.band_count, 3);
         assert_eq!(legacy.band_ceiling_hz, 8000.0);
         assert!(legacy.bands.is_empty());
+        assert_eq!(legacy.source_kind, "live");
+        assert!(legacy.system_playback_devices.is_empty());
+        assert!(legacy.clip_files.is_empty());
+        assert!(legacy.clip_path.is_empty());
+        assert!(!legacy.clip_loading);
+        assert_eq!(legacy.clip_duration_secs, 0.0);
 
         let current = AudioSnapshot {
             band_count: 8,
             band_edges: vec![100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0, 6400.0],
             band_ceiling_hz: 12_800.0,
             bands: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            source_kind: "file".into(),
+            system_playback_devices: vec!["Speakers".into()],
+            clip_files: vec!["pulse-loop.wav".into()],
+            clip_path: "pulse-loop.wav".into(),
+            clip_loading: true,
+            clip_duration_secs: 2.5,
             ..AudioSnapshot::default()
         };
         let value = serde_json::to_value(current).unwrap();
@@ -1440,10 +2425,18 @@ mod protocol_tests {
         assert_eq!(value["band_edges"].as_array().unwrap().len(), 7);
         assert_eq!(value["bands"].as_array().unwrap().len(), 8);
         assert_json_number_near(&value["band_ceiling_hz"], 12_800.0);
+        assert_eq!(value["source_kind"], "file");
+        assert_eq!(value["system_playback_devices"][0], "Speakers");
+        assert_eq!(value["clip_files"][0], "pulse-loop.wav");
+        assert_eq!(value["clip_path"], "pulse-loop.wav");
+        assert_eq!(value["clip_loading"], true);
+        assert_json_number_near(&value["clip_duration_secs"], 2.5);
 
         for raw in [
             r#"{"action":"set_audio","param":"band_count","value":6}"#,
             r#"{"action":"set_audio","param":"band_edges","value":{"count":6,"edges":[120,480,1500,4000,9000],"ceiling":16000}}"#,
+            r#"{"action":"set_audio","param":"source_kind","value":"file"}"#,
+            r#"{"action":"set_audio","param":"clip","value":"pulse-loop.wav"}"#,
         ] {
             let action: WebAction = serde_json::from_str(raw).unwrap();
             assert!(matches!(action, WebAction::SetAudio { .. }));
@@ -1458,7 +2451,29 @@ mod protocol_tests {
         assert!(html.contains("id=\"audio-band-edges\""));
         assert!(html.contains("id=\"audio-high-edge\""));
         assert!(html.contains("id=\"audio-extra-band-meters\""));
+        assert!(html.contains("id=\"audio-source-kind\""));
+        assert!(html.contains("id=\"audio-clip\""));
+        assert!(html.contains("id=\"audio-import\""));
+        assert!(html.contains(".wav,.mp3,.flac,.ogg,.opus,.m4a,.aac"));
+        assert!(html.contains("Windows system playback"));
         assert!(js.contains("param: 'band_count'"));
+        assert!(js.contains("param: 'source_kind'"));
+        assert!(js.contains("param: 'clip'"));
+        assert!(js.contains("MAX_AUDIO_IMPORT_BYTES = 512 * 1024 * 1024"));
+        assert!(
+            js.contains("slider.value = Number.isFinite(declaredDefault) ? declaredDefault : min")
+        );
+        assert!(js.contains("const fileMode = audioSourceKind.value === 'file'"));
+        assert!(js.contains("audioClipRow.hidden = !fileMode"));
+        assert!(js.contains("audioDevice.closest('.param-row').hidden = fileMode"));
+        assert!(include_str!("../../static/style.css").contains(".param-row[hidden]"));
+        assert!(js.contains("class=\"layer-fx-body\""));
+        assert!(js.contains("class=\"layer-cellular-body\""));
+        assert!(js.contains("role=\"region\" aria-label=\"Layer ${index + 1} effects\" hidden"));
+        assert!(js.contains("system-playback:default"));
+        assert!(js.contains("deterministic program-time analysis"));
+        assert!(js.contains(".filter(({ layer }) => layer.source_kind === 'video')"));
+        assert!(js.contains("const hasAnimatedPreview = /\\.(mp4|webm|mov|avi|mkv)$/i"));
         assert!(js.contains("value: { count, edges, ceiling }"));
         for index in 1..=crate::audio::MAX_AUDIO_BANDS {
             assert!(
@@ -1523,7 +2538,70 @@ mod protocol_tests {
     fn legacy_app_snapshot_defaults_export_status() {
         let mut value = serde_json::to_value(AppSnapshot::default()).unwrap();
         value.as_object_mut().unwrap().remove("export_status");
+        value.as_object_mut().unwrap().remove("patch_save_status");
         let restored: AppSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(restored.export_status, "");
+        assert_eq!(restored.patch_save_status, "");
+    }
+
+    #[test]
+    fn gyro_registry_tracks_explicit_legacy_timeout_and_disconnect_states() {
+        let start = Instant::now();
+        let mut registry = GyroStreamRegistry::default();
+        assert_eq!(registry.status_at(start), GyroStatusSnapshot::default());
+
+        registry.set_stream(7, true);
+        let waiting = registry.status_at(start);
+        assert!(!waiting.active);
+        assert!(waiting.stale);
+        assert_eq!(waiting.streamers, 1);
+        assert_eq!(waiting.sample_age_ms, None);
+
+        registry.note_sample_at(7, start);
+        let live = registry.status_at(start + Duration::from_millis(250));
+        assert!(live.active);
+        assert!(!live.stale);
+        assert_eq!(live.sample_age_ms, Some(250));
+
+        let timed_out = registry.status_at(start + GYRO_SAMPLE_TIMEOUT + Duration::from_millis(1));
+        assert!(!timed_out.active);
+        assert!(timed_out.stale);
+
+        registry.disconnect(7);
+        let stopped = registry.status_at(start + Duration::from_secs(2));
+        assert!(!stopped.active);
+        assert!(stopped.stale);
+        assert_eq!(stopped.streamers, 0);
+
+        let mut legacy = GyroStreamRegistry::default();
+        legacy.note_sample_at(42, start);
+        assert!(legacy.status_at(start).active);
+        legacy.disconnect(42);
+        assert!(legacy.status_at(start).stale);
+
+        let mut explicitly_stopped = GyroStreamRegistry::default();
+        explicitly_stopped.set_stream(9, true);
+        explicitly_stopped.set_stream(9, false);
+        explicitly_stopped.note_sample_at(9, start);
+        assert_eq!(explicitly_stopped.status_at(start).streamers, 0);
+    }
+
+    #[test]
+    fn gyro_stream_protocol_and_telemetry_are_backward_compatible() {
+        let action: WebAction =
+            serde_json::from_str(r#"{"action":"gyro_stream","enabled":true}"#).unwrap();
+        assert!(matches!(action, WebAction::GyroStream { enabled: true }));
+
+        let mut legacy = serde_json::to_value(ModSnapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("gyro_status");
+        let restored: ModSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.gyro_status, GyroStatusSnapshot::default());
+
+        let js = include_str!("../../static/app.js");
+        assert!(js.contains("sendAction({ action: 'gyro_stream', enabled: true })"));
+        assert!(js.contains("sendAction({ action: 'gyro_stream', enabled: false })"));
+        assert!(js.contains("syncGyroStatus(m.gyro_status)"));
+        assert!(js.contains("sensor data stale"));
+        assert!(js.contains("output centered"));
     }
 }

@@ -45,6 +45,10 @@ let padLastPosition = [0.5, 0.5];
 let padNeedsReconcile = false;
 let beatQuantizeEnabled = false;
 let layerStackRevision = 0;
+let latestLayerIdentities = [];
+let transportAuthoritativePaused = false;
+let transportPendingPaused = null;
+let transportRequestSequence = 0;
 
 const QUANTIZABLE_ACTIONS = new Set([
   'set_param', 'set_layer_param', 'set_layer_effect', 'set_ntsc_param', 'set_temporal',
@@ -68,6 +72,7 @@ function connect() {
         padNeedsReconcile = false;
       }
     }
+    reconcileGyroStreamConnection();
   };
 
   ws.onclose = () => {
@@ -77,6 +82,10 @@ function connect() {
     statusEl.classList.remove('connected');
     statusEl.classList.add('disconnected');
     statusEl.title = 'disconnected';
+    transportRequestSequence += 1;
+    transportPendingPaused = null;
+    renderMasterTransport(transportAuthoritativePaused, false);
+    showGyroDisconnected();
     setTimeout(connect, 2000);
   };
 
@@ -93,6 +102,7 @@ function connect() {
         syncLibrary(msg.library);
         syncTransport(msg.paused);
         syncExport(msg.export_progress, msg.export_error, msg.export_status);
+        syncPatchSave(msg.patch_save_status || '');
         syncModulation(msg.modulation);
         syncAudio(msg.audio);
         syncMidi(msg.midi);
@@ -103,6 +113,7 @@ function connect() {
         syncOutputWindow(msg.output_window, msg.output_error);
         syncBlackout(msg.blackout);
         syncQuantize(msg.quantized_pending || 0);
+        syncRangeEditors(document);
       }
     } catch (err) {
       console.warn('[ws] parse error:', err);
@@ -118,8 +129,9 @@ connect();
 // edited controls explicitly; sync code asks canSync() before writing.
 
 const touchedControls = new Map(); // element -> Set(pointerId) | last-edit ms
+const rangeControlPeers = new WeakMap(); // slider <-> editable numeric display
 document.addEventListener('pointerdown', (e) => {
-  const el = e.target.closest('input,select');
+  const el = e.target.closest('input,select,[data-range-editor]');
   if (el) {
     const current = touchedControls.get(el);
     const held = current instanceof Set ? current : new Set();
@@ -153,11 +165,17 @@ document.addEventListener('input', (e) => {
   }
 }, true);
 
-function canSync(el) {
+function controlIsBusy(el) {
   if (!el) return false;
-  if (document.activeElement === el) return false;
+  if (document.activeElement === el) return true;
   const t = touchedControls.get(el);
-  return !(t instanceof Set || (typeof t === 'number' && performance.now() - t < 800));
+  return t instanceof Set || (typeof t === 'number' && performance.now() - t < 800);
+}
+
+function canSync(el) {
+  if (!el || controlIsBusy(el)) return false;
+  const peer = rangeControlPeers.get(el);
+  return !peer || !controlIsBusy(peer);
 }
 
 function sendAction(action) {
@@ -189,10 +207,293 @@ function layerSelector(layer, index) {
 document.querySelectorAll('.param-row').forEach((row) => {
   const label = row.querySelector(':scope > label');
   if (!label) return;
+  const groupLabel = row.closest('.fx-group')?.querySelector(':scope > .fx-group-header .group-label')?.textContent?.trim();
   row.querySelectorAll('input:not([aria-label]),select:not([aria-label])').forEach((control) => {
-    control.setAttribute('aria-label', label.textContent.trim());
+    control.setAttribute('aria-label', [groupLabel, label.textContent.trim()].filter(Boolean).join(' '));
   });
 });
+
+// --- Universal range numeric entry ------------------------------------
+// Every range keeps its native slider for performance gestures and gains an
+// editable value beside it. Committing the editor dispatches the slider's
+// existing input event, so there is exactly one action path per control.
+
+const rangeBindings = new WeakMap();
+const activeRangeBindings = new Set();
+let rangeEditorSequence = 0;
+
+function decimalPlaces(value) {
+  const text = String(value).toLowerCase();
+  const [coefficient, exponentText] = text.split('e');
+  const exponent = Number(exponentText || 0);
+  const fraction = (coefficient.split('.')[1] || '').length;
+  return Math.max(0, fraction - exponent);
+}
+
+function rangeBounds(slider) {
+  const min = Number.parseFloat(slider.min);
+  const max = Number.parseFloat(slider.max);
+  const step = slider.step === 'any' ? NaN : Number.parseFloat(slider.step);
+  return {
+    min: Number.isFinite(min) ? min : -Infinity,
+    max: Number.isFinite(max) ? max : Infinity,
+    step: Number.isFinite(step) && step > 0 ? step : NaN,
+  };
+}
+
+function parseRangeDraft(text) {
+  const canonical = String(text)
+    .trim()
+    .replace(/\u2212/g, '-')
+    .replace(',', '.');
+  if (!canonical) return NaN;
+  return Number(canonical);
+}
+
+function normalizeRangeValue(slider, rawValue) {
+  let value = typeof rawValue === 'number' ? rawValue : parseRangeDraft(rawValue);
+  if (!Number.isFinite(value)) return null;
+  const { min, max, step } = rangeBounds(slider);
+  value = Math.min(max, Math.max(min, value));
+  if (Number.isFinite(step)) {
+    const base = Number.isFinite(min) ? min : 0;
+    value = base + Math.round((value - base) / step) * step;
+    value = Math.min(max, Math.max(min, value));
+    const precision = Math.min(12, Math.max(decimalPlaces(step), decimalPlaces(base)));
+    value = Number(value.toFixed(precision));
+  }
+  return Number.isFinite(value) ? value : null;
+}
+
+function formatRangeValue(slider, rawValue) {
+  const value = normalizeRangeValue(slider, rawValue);
+  if (value === null) return '';
+  const { step } = rangeBounds(slider);
+  const precision = Number.isFinite(step) ? Math.min(6, decimalPlaces(step)) : 3;
+  return value.toFixed(precision);
+}
+
+function rangeControlLabel(slider) {
+  const explicit = slider.getAttribute('aria-label');
+  if (explicit) return explicit;
+  const row = slider.closest('.param-row');
+  const label = row?.querySelector(':scope > label')?.textContent?.trim();
+  const layer = slider.closest('.layer-card')?.querySelector('.layer-title')?.textContent?.trim();
+  const group = slider.closest('.fx-group')?.querySelector(':scope > .fx-group-header .group-label')?.textContent?.trim();
+  return [layer || group, label, 'value'].filter(Boolean).join(' ') || 'Range value';
+}
+
+function setRangeValidation(binding, message = '') {
+  binding.editor.classList.toggle('range-value-invalid', !!message);
+  binding.editor.setAttribute('aria-invalid', String(!!message));
+  binding.editor.title = message || binding.help;
+}
+
+function writeRangeEditor(binding, rawValue) {
+  const value = normalizeRangeValue(binding.slider, rawValue);
+  if (value === null) return;
+  const textValue = formatRangeValue(binding.slider, value);
+  const ariaValue = String(value);
+  if (binding.editor.textContent !== textValue) binding.editor.textContent = textValue;
+  if (binding.editor.getAttribute('aria-valuenow') !== ariaValue) {
+    binding.editor.setAttribute('aria-valuenow', ariaValue);
+  }
+  if (binding.editor.getAttribute('aria-valuetext') !== textValue) {
+    binding.editor.setAttribute('aria-valuetext', textValue);
+  }
+}
+
+function syncRangeEditorState(slider) {
+  const binding = rangeBindings.get(slider);
+  if (!binding) return;
+  const disabled = !!slider.disabled;
+  if (binding.disabled === disabled) return;
+  binding.disabled = disabled;
+  binding.editor.setAttribute('contenteditable', String(!disabled));
+  binding.editor.setAttribute('aria-disabled', String(disabled));
+  binding.editor.tabIndex = disabled ? -1 : 0;
+  binding.editor.classList.toggle('disabled', disabled);
+}
+
+function commitRangeEditor(binding) {
+  if (binding.slider.disabled) return false;
+  const value = normalizeRangeValue(binding.slider, binding.editor.textContent);
+  if (value === null) {
+    const { min, max, step } = rangeBounds(binding.slider);
+    const lowerLimit = Number.isFinite(min) ? `minimum ${min}` : 'no minimum';
+    const upperLimit = Number.isFinite(max) ? `maximum ${max}` : 'no maximum';
+    const limits = `${lowerLimit}; ${upperLimit}`;
+    const increment = Number.isFinite(step) ? ` in steps of ${step}` : '';
+    writeRangeEditor(binding, binding.slider.value);
+    setRangeValidation(binding, `Invalid number; enter ${limits}${increment}. Previous value restored.`);
+    return false;
+  }
+  setRangeValidation(binding);
+  binding.slider.value = String(value);
+  binding.committing = true;
+  binding.slider.dispatchEvent(new Event('input', { bubbles: true }));
+  binding.committing = false;
+  // Existing handlers may use a coarser visual formatter. Restore the exact
+  // step precision after they have dispatched their normal action.
+  writeRangeEditor(binding, value);
+  return true;
+}
+
+function cancelRangeEditor(binding) {
+  setRangeValidation(binding);
+  writeRangeEditor(binding, binding.slider.value);
+}
+
+function bindRangeEditor(slider) {
+  if (!slider || rangeBindings.has(slider)) return rangeBindings.get(slider);
+
+  let editor = slider.nextElementSibling;
+  if (!editor?.matches('.value, .routing-depth-val, [data-range-editor]')) {
+    editor = document.createElement('span');
+    const wrapper = document.createElement('span');
+    wrapper.className = 'range-editor-wrap';
+    slider.before(wrapper);
+    wrapper.append(slider, editor);
+  }
+
+  editor.classList.add('value', 'range-value');
+  editor.dataset.rangeEditor = 'true';
+  editor.id ||= `range-value-${++rangeEditorSequence}`;
+  editor.setAttribute('role', 'spinbutton');
+  const { min, max, step } = rangeBounds(slider);
+  // Some mobile decimal keyboards omit a minus key. Preserve direct signed
+  // entry for controls whose declared range crosses below zero.
+  editor.setAttribute('inputmode', min < 0 ? 'text' : 'decimal');
+  editor.setAttribute('enterkeyhint', 'done');
+  editor.setAttribute('spellcheck', 'false');
+  editor.setAttribute('aria-keyshortcuts', 'ArrowUp ArrowDown PageUp PageDown Enter Escape');
+  const label = rangeControlLabel(slider);
+  if (!slider.hasAttribute('aria-label')) slider.setAttribute('aria-label', label);
+  editor.setAttribute('aria-label', `${label} numeric entry`);
+  slider.setAttribute('aria-controls', editor.id);
+
+  if (Number.isFinite(min)) editor.setAttribute('aria-valuemin', String(min));
+  if (Number.isFinite(max)) editor.setAttribute('aria-valuemax', String(max));
+  const help = [
+    Number.isFinite(min) && Number.isFinite(max) ? `${min} to ${max}` : '',
+    Number.isFinite(step) ? `step ${step}` : '',
+    'Enter or blur commits; Escape cancels',
+  ].filter(Boolean).join('; ');
+  const binding = { slider, editor, help, committing: false, suppressBlurCommit: false, disabled: null };
+  rangeBindings.set(slider, binding);
+  activeRangeBindings.add(binding);
+  rangeControlPeers.set(slider, editor);
+  rangeControlPeers.set(editor, slider);
+  setRangeValidation(binding);
+  writeRangeEditor(binding, slider.value);
+  syncRangeEditorState(slider);
+
+  slider.addEventListener('input', () => {
+    if (document.activeElement !== editor || binding.committing) {
+      setRangeValidation(binding);
+      writeRangeEditor(binding, slider.value);
+    }
+  });
+  editor.addEventListener('focus', () => {
+    setRangeValidation(binding);
+    requestAnimationFrame(() => {
+      if (document.activeElement !== editor) return;
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+  });
+  editor.addEventListener('input', () => setRangeValidation(binding));
+  editor.addEventListener('paste', (event) => {
+    // contenteditable otherwise accepts rich HTML. Insert only the clipboard's
+    // plain-text representation so pasted markup can never become live DOM.
+    event.preventDefault();
+    const plainText = event.clipboardData?.getData('text/plain') || '';
+    const selection = window.getSelection();
+    if (!selection?.rangeCount) {
+      editor.textContent += plainText;
+    } else {
+      const range = selection.getRangeAt(0);
+      range.deleteContents();
+      const textNode = document.createTextNode(plainText);
+      range.insertNode(textNode);
+      range.setStartAfter(textNode);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    setRangeValidation(binding);
+  });
+  editor.addEventListener('keydown', (event) => {
+    const direction = event.key === 'ArrowUp' || event.key === 'PageUp'
+      ? 1
+      : event.key === 'ArrowDown' || event.key === 'PageDown'
+        ? -1
+        : 0;
+    if (direction) {
+      event.preventDefault();
+      const { step } = rangeBounds(slider);
+      const increment = Number.isFinite(step) ? step : 1;
+      const multiplier = event.key.startsWith('Page') ? 10 : 1;
+      const draft = normalizeRangeValue(slider, editor.textContent);
+      const current = draft ?? normalizeRangeValue(slider, slider.value) ?? 0;
+      const next = normalizeRangeValue(slider, current + direction * increment * multiplier);
+      if (next !== null) {
+        editor.textContent = String(next);
+        commitRangeEditor(binding);
+      }
+    } else if (event.key === 'Enter') {
+      event.preventDefault();
+      if (commitRangeEditor(binding)) {
+        binding.suppressBlurCommit = true;
+        editor.blur();
+      }
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelRangeEditor(binding);
+      binding.suppressBlurCommit = true;
+      editor.blur();
+    }
+  });
+  editor.addEventListener('blur', () => {
+    if (binding.suppressBlurCommit) {
+      binding.suppressBlurCommit = false;
+      return;
+    }
+    commitRangeEditor(binding);
+  });
+  return binding;
+}
+
+function rangesWithin(root) {
+  const ranges = [];
+  if (root?.matches?.('input[type="range"]')) ranges.push(root);
+  root?.querySelectorAll?.('input[type="range"]').forEach((slider) => ranges.push(slider));
+  return ranges;
+}
+
+function bindRangeEditors(root = document) {
+  rangesWithin(root).forEach(bindRangeEditor);
+}
+
+function syncRangeEditors(root = document) {
+  // Newly inserted controls are normally bound by the observer. Bind an
+  // explicitly scoped root for callers that need same-turn availability,
+  // then walk the persistent bindings instead of querying hundreds of DOM
+  // nodes on every 30 Hz state packet.
+  if (root !== document) bindRangeEditors(root);
+  for (const binding of activeRangeBindings) {
+    const { slider } = binding;
+    if (!slider.isConnected) {
+      activeRangeBindings.delete(binding);
+      continue;
+    }
+    syncRangeEditorState(slider);
+    if (canSync(slider)) writeRangeEditor(binding, slider.value);
+  }
+}
 
 function resetRangeOnDoubleActivation(el, fallback) {
   const reset = () => {
@@ -242,7 +543,8 @@ document.querySelectorAll('.param-row[data-param]').forEach((row) => {
     slider.min = min;
     slider.max = max;
     slider.step = step;
-    slider.value = min;
+    const declaredDefault = Number(valueEl?.textContent);
+    slider.value = Number.isFinite(declaredDefault) ? declaredDefault : min;
 
     slider.addEventListener('input', () => {
       const v = parseFloat(slider.value);
@@ -255,6 +557,11 @@ document.querySelectorAll('.param-row[data-param]').forEach((row) => {
       brightness: 0, contrast: 0, posterize: 0, grain_intensity: 0,
       grain_size: 1, vignette: 0, color_drift: 0, breathe_scale: 0,
       breathe_rotation: 0, breathe_position: 0,
+      cellular_amount: 0, cellular_scale: 10, cellular_warp: 0.35,
+      cellular_speed: 0.25, cellular_gap_amount: 0,
+      cellular_gap_threshold: 0.65, cellular_gap_softness: 0.08,
+      key_color_r: 0, key_color_g: 1, key_color_b: 0,
+      key_threshold: 0.5, key_softness: 0.1, key_tolerance: 0.15,
     };
     resetRangeOnDoubleActivation(slider, defaults[param] ?? min);
   }
@@ -332,14 +639,20 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
     slider.min = min;
     slider.max = max;
     slider.step = step;
-    slider.value = param === 'fb_zoom' ? 1 : min;
+    const defaults = {
+      fb_zoom: 1,
+      key_threshold: 0.1,
+      key_softness: 0.03,
+      key_history: 1,
+    };
+    slider.value = defaults[param] ?? min;
 
     slider.addEventListener('input', () => {
       const v = parseFloat(slider.value);
       valueEl.textContent = formatValue(v, min, max, step);
       sendAction({ action: 'set_temporal', param, value: v });
     });
-    resetRangeOnDoubleActivation(slider, param === 'fb_zoom' ? 1 : 0);
+    resetRangeOnDoubleActivation(slider, defaults[param] ?? 0);
   }
 
   if (select) {
@@ -397,12 +710,22 @@ document.querySelectorAll('.fx-group-header').forEach((header) => {
   const body = group.querySelector(':scope > .fx-group-body');
   const key = groupKey(group) || `fx-group-${Array.from(document.querySelectorAll('.fx-group-header')).indexOf(header)}`;
   if (body && !body.id) body.id = `${key.replace(/[^a-zA-Z0-9_-]/g, '-')}-body`;
-  header.setAttribute('role', 'button');
-  header.tabIndex = 0;
-  if (body) header.setAttribute('aria-controls', body.id);
+  const label = header.querySelector('.group-label')?.textContent?.trim() || 'effects';
+  const labelElement = header.querySelector('.group-label');
+  if (labelElement && !labelElement.id) labelElement.id = `${key.replace(/[^a-zA-Z0-9_-]/g, '-')}-label`;
+  group.setAttribute('role', 'group');
+  if (labelElement) group.setAttribute('aria-labelledby', labelElement.id);
+  else group.setAttribute('aria-label', `${label} controls`);
+  const chevron = header.querySelector('.chevron');
+  if (chevron) {
+    chevron.setAttribute('role', 'button');
+    chevron.tabIndex = 0;
+    chevron.setAttribute('aria-label', `Toggle ${label} controls`);
+    if (body) chevron.setAttribute('aria-controls', body.id);
+  }
 
   const syncExpanded = () => {
-    header.setAttribute('aria-expanded', String(!group.classList.contains('collapsed')));
+    chevron?.setAttribute('aria-expanded', String(!group.classList.contains('collapsed')));
   };
   const toggle = () => {
     const group = header.closest('.fx-group');
@@ -420,8 +743,8 @@ document.querySelectorAll('.fx-group-header').forEach((header) => {
     if (e.target.closest('.group-reset')) return;
     toggle();
   });
-  header.addEventListener('keydown', (e) => {
-    if (e.target !== header || (e.key !== 'Enter' && e.key !== ' ')) return;
+  chevron?.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
     e.preventDefault();
     toggle();
   });
@@ -439,11 +762,25 @@ document.querySelectorAll('.group-reset').forEach((btn) => {
 // --- Transport buttons ---
 
 document.getElementById('btn-play-all').addEventListener('click', () => {
-  const paused = document.getElementById('btn-play-all').dataset.paused === 'true';
-  sendAction({ action: 'set_master_paused', paused: !paused });
+  if (transportPendingPaused !== null) return;
+  const target = !transportAuthoritativePaused;
+  if (sendAction({ action: 'set_master_paused', paused: target })) {
+    const requestSequence = ++transportRequestSequence;
+    transportPendingPaused = target;
+    renderMasterTransport(target, true);
+    // A state snapshot can be lost during reconnect. Do not leave the only
+    // transport control disabled forever; after a bounded grace period,
+    // return it to the last authoritative snapshot and permit a retry.
+    window.setTimeout(() => {
+      if (transportPendingPaused !== null && transportRequestSequence === requestSequence) {
+        transportPendingPaused = null;
+        renderMasterTransport(transportAuthoritativePaused, false);
+      }
+    }, 2000);
+  }
 });
 
-document.getElementById('btn-stop').addEventListener('click', () => {
+document.getElementById('btn-revert-master').addEventListener('click', () => {
   sendAction({ action: 'reset_fx' });
 });
 
@@ -459,7 +796,11 @@ function syncBlackout(on) {
 
 function syncEffects(effects) {
   if (!effects) return;
-  for (const [param, value] of Object.entries(effects)) {
+  const values = { ...effects };
+  if (Array.isArray(effects.key_color)) {
+    [values.key_color_r, values.key_color_g, values.key_color_b] = effects.key_color;
+  }
+  for (const [param, value] of Object.entries(values)) {
     const row = document.querySelector(`.param-row[data-param="${param}"]`);
     if (!row) continue;
 
@@ -523,6 +864,11 @@ function syncNtsc(ntsc) {
 
 function syncLayers(layers) {
   if (!layers) return;
+  latestLayerIdentities = layers.map((layer) => String(layer.layer_id || ''));
+  const liveDisclosureKeys = new Set(layers.map(layerDisclosureKey));
+  for (const key of layerDisclosureState.keys()) {
+    if (!liveDisclosureKeys.has(key)) layerDisclosureState.delete(key);
+  }
   syncExportAudioLayers(layers);
   layersEmpty.style.display = layers.length === 0 ? 'block' : 'none';
 
@@ -550,7 +896,7 @@ function syncExportAudioLayers(layers) {
   select.dataset.layerKey = key;
   select.innerHTML = '<option value="">None</option>' + layers
     .map((layer, index) => ({ layer, index }))
-    .filter(({ layer }) => layer.source_kind !== 'spout')
+    .filter(({ layer }) => layer.source_kind === 'video')
     .map(({ layer, index }) => `<option value="${escapeHtml(layer.layer_id || `legacy-index:${index}`)}" data-index="${index}">Layer ${index + 1}: ${escapeHtml(layer.filename)}</option>`)
     .join('');
   if (Array.from(select.options).some((option) => option.value === previous)) {
@@ -600,10 +946,17 @@ const LAYER_EFFECT_CONTROLS = [
   ['breathe_scale', 'Bth Scale', 'range', 0, 0.05, 0.001, 0],
   ['breathe_rotation', 'Bth Rotate', 'range', 0, 2, 0.05, 0],
   ['breathe_position', 'Bth Drift', 'range', 0, 0.02, 0.001, 0],
+  ['cellular_amount', 'Amount', 'range', 0, 1, 0.05, 0],
+  ['cellular_scale', 'Scale', 'range', 2, 32, 1, 10],
+  ['cellular_warp', 'Warp', 'range', 0, 1, 0.05, 0.35],
+  ['cellular_speed', 'Drift', 'range', 0, 2, 0.05, 0.25],
+  ['cellular_gap_amount', 'Gap Key', 'range', 0, 1, 0.01, 0],
+  ['cellular_gap_threshold', 'Gap Thresh', 'range', 0, 1, 0.01, 0.65],
+  ['cellular_gap_softness', 'Gap Soft', 'range', 0, 0.5, 0.01, 0.08],
 ];
 
 function layerEffectsHtml(effects, index) {
-  return LAYER_EFFECT_CONTROLS.map(([param, label, kind, min, max, step, fallback]) => {
+  const rowHtml = ([param, label, kind, min, max, step, fallback]) => {
     const value = effects[param] ?? fallback;
     if (kind === 'checkbox') {
       return `<div class="param-row toggle-row layer-effect-row" data-layer-effect="${param}"><label>${label}</label><label class="toggle"><input type="checkbox" ${value ? 'checked' : ''} aria-label="Layer ${index + 1} ${label}"><span class="toggle-slider"></span></label></div>`;
@@ -612,7 +965,49 @@ function layerEffectsHtml(effects, index) {
       return `<div class="param-row select-row layer-effect-row" data-layer-effect="${param}"><label>${label}</label><select aria-label="Layer ${index + 1} ${label}"><option value="0">Gaussian</option><option value="1">Perlin</option><option value="2">Salt &amp; Pepper</option><option value="3">Blue</option></select></div>`;
     }
     return `<div class="param-row layer-effect-row" data-layer-effect="${param}" data-min="${min}" data-max="${max}" data-step="${step}"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-label="Layer ${index + 1} ${label}"><span class="value">${formatValue(Number(value), min, max, step)}</span></div>`;
-  }).join('');
+  };
+  const cellularIndex = LAYER_EFFECT_CONTROLS.findIndex(([param]) => param === 'cellular_amount');
+  const ordinary = LAYER_EFFECT_CONTROLS.slice(0, cellularIndex).map(rowHtml).join('');
+  const cellular = LAYER_EFFECT_CONTROLS.slice(cellularIndex).map(rowHtml).join('');
+  return `${ordinary}
+    <div class="layer-cellular-disclosure">
+      <button class="layer-cellular-toggle" type="button" aria-expanded="false" aria-controls="layer-cellular-body-${index}">
+        <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>CELLULAR</span>
+      </button>
+      <div class="layer-cellular-body" id="layer-cellular-body-${index}" role="region" aria-label="Layer ${index + 1} cellular effects" hidden>${cellular}</div>
+    </div>`;
+}
+
+const layerDisclosureState = new Map();
+
+function layerDisclosureKey(layer, index) {
+  return layer.layer_id || `${layer.source_kind || 'video'}:${layer.filename || 'untitled'}:${index}`;
+}
+
+function setLayerDisclosure(button, body, expanded) {
+  button.setAttribute('aria-expanded', String(expanded));
+  body.hidden = !expanded;
+}
+
+function wireLayerDisclosures(card, layer, index) {
+  const key = layerDisclosureKey(layer, index);
+  const remembered = layerDisclosureState.get(key) || { effects: false, cellular: false };
+  const effectsButton = card.querySelector('.layer-fx-toggle');
+  const effectsBody = card.querySelector('.layer-fx-body');
+  const cellularButton = card.querySelector('.layer-cellular-toggle');
+  const cellularBody = card.querySelector('.layer-cellular-body');
+  setLayerDisclosure(effectsButton, effectsBody, remembered.effects);
+  setLayerDisclosure(cellularButton, cellularBody, remembered.cellular);
+  effectsButton.addEventListener('click', () => {
+    remembered.effects = effectsButton.getAttribute('aria-expanded') !== 'true';
+    layerDisclosureState.set(key, remembered);
+    setLayerDisclosure(effectsButton, effectsBody, remembered.effects);
+  });
+  cellularButton.addEventListener('click', () => {
+    remembered.cellular = cellularButton.getAttribute('aria-expanded') !== 'true';
+    layerDisclosureState.set(key, remembered);
+    setLayerDisclosure(cellularButton, cellularBody, remembered.cellular);
+  });
 }
 
 function wireLayerEffects(card, layer, index) {
@@ -681,8 +1076,10 @@ function createLayerCard(layer, index) {
         <label>Key</label>
         <select>
           <option value="0" ${layer.key_mode === 0 ? 'selected' : ''}>Off</option>
-          <option value="1" ${layer.key_mode === 1 ? 'selected' : ''}>Bright</option>
-          <option value="2" ${layer.key_mode === 2 ? 'selected' : ''}>Dark</option>
+          <option value="1" ${layer.key_mode === 1 ? 'selected' : ''}>Keep Bright</option>
+          <option value="2" ${layer.key_mode === 2 ? 'selected' : ''}>Keep Dark</option>
+          <option value="3" ${layer.key_mode === 3 ? 'selected' : ''}>Remove Chroma</option>
+          <option value="4" ${layer.key_mode === 4 ? 'selected' : ''}>Keep Chroma</option>
         </select>
       </div>
       <div class="param-row" data-layer="${index}" data-param="key_threshold">
@@ -695,8 +1092,42 @@ function createLayerCard(layer, index) {
         <input type="range" min="0" max="0.5" step="0.01" value="${layer.key_softness}">
         <span class="value">${layer.key_softness.toFixed(2)}</span>
       </div>
-      <div class="layer-fx-heading"><span>Layer effects</span><button class="layer-reset-fx" type="button">Reset FX</button></div>
-      ${layerEffectsHtml(layer.effects || {}, index)}
+      <div class="param-row" data-layer="${index}" data-param="key_color_r">
+        <label>Key Red</label>
+        <input type="range" min="0" max="1" step="0.01" value="${layer.key_color?.[0] ?? layer.effects?.key_color?.[0] ?? 0}">
+        <span class="value">${Number(layer.key_color?.[0] ?? layer.effects?.key_color?.[0] ?? 0).toFixed(2)}</span>
+      </div>
+      <div class="param-row" data-layer="${index}" data-param="key_color_g">
+        <label>Key Green</label>
+        <input type="range" min="0" max="1" step="0.01" value="${layer.key_color?.[1] ?? layer.effects?.key_color?.[1] ?? 1}">
+        <span class="value">${Number(layer.key_color?.[1] ?? layer.effects?.key_color?.[1] ?? 1).toFixed(2)}</span>
+      </div>
+      <div class="param-row" data-layer="${index}" data-param="key_color_b">
+        <label>Key Blue</label>
+        <input type="range" min="0" max="1" step="0.01" value="${layer.key_color?.[2] ?? layer.effects?.key_color?.[2] ?? 0}">
+        <span class="value">${Number(layer.key_color?.[2] ?? layer.effects?.key_color?.[2] ?? 0).toFixed(2)}</span>
+      </div>
+      <div class="param-row" data-layer="${index}" data-param="key_tolerance">
+        <label>Chroma Tol.</label>
+        <input type="range" min="0" max="1" step="0.01" value="${layer.key_tolerance ?? layer.effects?.key_tolerance ?? 0.15}">
+        <span class="value">${Number(layer.key_tolerance ?? layer.effects?.key_tolerance ?? 0.15).toFixed(2)}</span>
+      </div>
+      <div class="audio-status">This layer's key reveals layers beneath it. Chroma modes use the RGB target and tolerance.</div>
+      <div class="param-row toggle-row layer-master-bypass" title="Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.">
+        <label>Bypass Master FX</label>
+        <label class="toggle">
+          <input type="checkbox" ${layer.bypass_master_fx ? 'checked' : ''} aria-label="Bypass Master FX for layer ${index + 1}" aria-describedby="layer-master-bypass-help-${index}">
+          <span class="toggle-slider"></span>
+        </label>
+        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.</span>
+      </div>
+      <div class="layer-fx-heading">
+        <button class="layer-fx-toggle" type="button" aria-expanded="false" aria-controls="layer-fx-body-${index}">
+          <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Layer effects</span>
+        </button>
+        <button class="layer-reset-fx" type="button" title="Reset layer effects (opacity and transport unchanged)" aria-label="Reset layer effects (opacity and transport unchanged)">Reset FX</button>
+      </div>
+      <div class="layer-fx-body" id="layer-fx-body-${index}" role="region" aria-label="Layer ${index + 1} effects" hidden>${layerEffectsHtml(layer.effects || {}, index)}</div>
     </div>
   `;
 
@@ -783,7 +1214,10 @@ function createLayerCard(layer, index) {
         if (valueEl) valueEl.textContent = v.toFixed(2);
         sendAction({ action: 'set_layer_param', ...layerSelector(layer, index), param, value: v });
       });
-      const defaults = { opacity: 1, speed: 1, fps: 30, key_threshold: 0.5, key_softness: 0.1 };
+      const defaults = {
+        opacity: 1, speed: 1, fps: 30, key_threshold: 0.5, key_softness: 0.1,
+        key_color_r: 0, key_color_g: 1, key_color_b: 0, key_tolerance: 0.15,
+      };
       resetRangeOnDoubleActivation(slider, defaults[param] ?? parseFloat(slider.min));
     }
 
@@ -797,7 +1231,12 @@ function createLayerCard(layer, index) {
   card.querySelector('.layer-reset-fx').addEventListener('click', () => {
     sendAction({ action: 'reset_layer_fx', ...layerSelector(layer, index) });
   });
+  card.querySelector('.layer-master-bypass input').addEventListener('change', (event) => {
+    sendAction({ action: 'set_layer_param', ...layerSelector(layer, index), param: 'bypass_master_fx', value: event.currentTarget.checked });
+  });
+  wireLayerDisclosures(card, layer, index);
   wireLayerEffects(card, layer, index);
+  bindRangeEditors(card);
 
   updateLayerCard(card, layer, index);
   return card;
@@ -889,16 +1328,28 @@ function updateLayerCard(card, layer, index) {
     }
   }
 
-  for (const param of ['key_threshold', 'key_softness']) {
+  const directKeyValues = {
+    key_threshold: layer.key_threshold,
+    key_softness: layer.key_softness,
+    key_color_r: layer.key_color?.[0] ?? layer.effects?.key_color?.[0] ?? 0,
+    key_color_g: layer.key_color?.[1] ?? layer.effects?.key_color?.[1] ?? 1,
+    key_color_b: layer.key_color?.[2] ?? layer.effects?.key_color?.[2] ?? 0,
+    key_tolerance: layer.key_tolerance ?? layer.effects?.key_tolerance ?? 0.15,
+  };
+  for (const [param, value] of Object.entries(directKeyValues)) {
     const row = card.querySelector(`.param-row[data-param="${param}"]`);
     if (row) {
       const slider = row.querySelector('input[type="range"]');
       const valEl = row.querySelector('.value');
       if (slider && canSync(slider)) {
-        slider.value = layer[param];
-        if (valEl) valEl.textContent = layer[param].toFixed(2);
+        slider.value = value;
+        if (valEl) valEl.textContent = Number(value).toFixed(2);
       }
     }
+  }
+  const bypassMasterFx = card.querySelector('.layer-master-bypass input');
+  if (bypassMasterFx && canSync(bypassMasterFx)) {
+    bypassMasterFx.checked = !!layer.bypass_master_fx;
   }
   for (const [param, , kind, min, max, step, fallback] of LAYER_EFFECT_CONTROLS) {
     const row = card.querySelector(`[data-layer-effect="${param}"]`);
@@ -913,8 +1364,6 @@ function updateLayerCard(card, layer, index) {
 
 // --- Sync library ---
 
-// Cache for preview frame availability: filename → frame count (0 = not checked, -1 = unavailable)
-const previewCache = new Map();
 const activePreviewIntervals = new Set();
 
 function syncLibrary(files) {
@@ -930,7 +1379,7 @@ function syncLibrary(files) {
   libraryGrid.innerHTML = '';
 
   if (files.length === 0) {
-    libraryGrid.innerHTML = '<p class="dim" style="grid-column:1/-1;text-align:center;padding:12px;">No video files</p>';
+    libraryGrid.innerHTML = '<p class="dim" style="grid-column:1/-1;text-align:center;padding:12px;">No visual files</p>';
     return;
   }
 
@@ -975,33 +1424,37 @@ function syncLibrary(files) {
     };
     item.appendChild(img);
 
-    // Hover preview animation
+    // Hover preview animation is video-only. Stills already have their exact
+    // thumbnail; probing nonexistent preview strips would otherwise issue a
+    // perpetual stream of 404s and flash the image while hovered.
     let hoverInterval = null;
     let hoverFrame = 0;
+    const hasAnimatedPreview = /\.(mp4|webm|mov|avi|mkv)$/i.test(filename);
+    if (hasAnimatedPreview) {
+      item.addEventListener('mouseenter', () => {
+        const enc = encodeURIComponent(filename);
+        // Start cycling through preview frames
+        hoverFrame = 0;
+        hoverInterval = setInterval(() => {
+          hoverFrame = (hoverFrame + 1) % 8;
+          img.dataset.previewing = 'true';
+          img.src = `/preview/${enc}/${hoverFrame}`;
+        }, 250);
+        activePreviewIntervals.add(hoverInterval);
+      });
 
-    item.addEventListener('mouseenter', () => {
-      const enc = encodeURIComponent(filename);
-      // Start cycling through preview frames
-      hoverFrame = 0;
-      hoverInterval = setInterval(() => {
-        hoverFrame = (hoverFrame + 1) % 8;
-        img.dataset.previewing = 'true';
-        img.src = `/preview/${enc}/${hoverFrame}`;
-      }, 250);
-      activePreviewIntervals.add(hoverInterval);
-    });
-
-    item.addEventListener('mouseleave', () => {
-      if (hoverInterval) {
-        clearInterval(hoverInterval);
-        activePreviewIntervals.delete(hoverInterval);
-        hoverInterval = null;
-      }
-      // Restore static thumbnail
-      img.dataset.previewing = 'false';
-      img.dataset.retries = '0';
-      img.src = thumbUrl;
-    });
+      item.addEventListener('mouseleave', () => {
+        if (hoverInterval) {
+          clearInterval(hoverInterval);
+          activePreviewIntervals.delete(hoverInterval);
+          hoverInterval = null;
+        }
+        // Restore static thumbnail
+        img.dataset.previewing = 'false';
+        img.dataset.retries = '0';
+        img.src = thumbUrl;
+      });
+    }
 
     // Filename label on hover
     const label = document.createElement('span');
@@ -1080,42 +1533,104 @@ libUpload.addEventListener('change', async () => {
   setTimeout(() => { libUploadStatus.textContent = ''; }, 4000);
 });
 
-function uploadClip(file) {
+function uploadClip(file, statusElement = libUploadStatus) {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
     xhr.open('POST', `/upload?name=${encodeURIComponent(file.name)}`);
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) {
-        libUploadStatus.textContent = `${file.name} — ${Math.round((e.loaded / e.total) * 100)}%`;
+        statusElement.textContent = `${file.name} — ${Math.round((e.loaded / e.total) * 100)}%`;
       }
     };
     xhr.onload = () => {
-      libUploadStatus.textContent = xhr.status === 200
-        ? `${xhr.responseText} added`
-        : `${file.name}: ${xhr.responseText || 'upload failed'}`;
-      resolve();
+      const response = xhr.responseText.trim();
+      const ok = xhr.status === 200;
+      statusElement.textContent = ok
+        ? `${response} added`
+        : `${file.name}: ${response || 'upload failed'}`;
+      statusElement.classList.toggle('error', !ok);
+      finish({ ok, filename: ok ? response : '', error: ok ? '' : response });
     };
     xhr.onerror = () => {
-      libUploadStatus.textContent = `${file.name}: upload failed`;
-      resolve();
+      statusElement.textContent = `${file.name}: upload failed`;
+      statusElement.classList.add('error');
+      finish({ ok: false, filename: '', error: 'upload failed' });
     };
-    libUploadStatus.textContent = `${file.name} — 0%`;
+    xhr.onabort = () => {
+      statusElement.textContent = `${file.name}: upload cancelled`;
+      statusElement.classList.add('error');
+      finish({ ok: false, filename: '', error: 'upload cancelled' });
+    };
+    xhr.ontimeout = () => {
+      statusElement.textContent = `${file.name}: upload timed out`;
+      statusElement.classList.add('error');
+      finish({ ok: false, filename: '', error: 'upload timed out' });
+    };
+    statusElement.classList.remove('error');
+    statusElement.textContent = `${file.name} — 0%`;
     xhr.send(file);
   });
 }
 
 // --- Sync transport ---
 
-function syncTransport(paused) {
+function renderMasterTransport(paused, pending) {
   const btn = document.getElementById('btn-play-all');
   btn.textContent = paused ? '\u25B6' : '\u23F8';
-  btn.title = paused ? 'Play All' : 'Pause All';
-  btn.dataset.paused = String(!!paused);
+  btn.title = paused ? 'Resume visual program' : 'Pause visual program';
+  btn.dataset.paused = String(paused);
+  btn.disabled = pending;
+  btn.toggleAttribute('aria-busy', pending);
   btn.setAttribute('aria-label', btn.title);
+}
+
+function syncTransport(paused) {
+  transportAuthoritativePaused = !!paused;
+  if (transportPendingPaused === transportAuthoritativePaused) {
+    transportRequestSequence += 1;
+    transportPendingPaused = null;
+  }
+  renderMasterTransport(
+    transportPendingPaused ?? transportAuthoritativePaused,
+    transportPendingPaused !== null,
+  );
 }
 
 
 // --- Export / Render ---
+
+const patchCaptureButton = document.getElementById('patch-capture');
+const patchSaveStatus = document.getElementById('patch-save-status');
+
+patchCaptureButton.addEventListener('click', () => {
+  if (patchCaptureButton.disabled) return;
+  if (sendAction({ action: 'quick_save_patch' })) {
+    // Prevent an accidental double activation until the engine's next
+    // snapshot takes authoritative ownership of button and status state.
+    patchCaptureButton.disabled = true;
+  } else {
+    patchSaveStatus.textContent = 'Not connected';
+    patchSaveStatus.className = 'export-status error';
+  }
+});
+
+function syncPatchSave(status = '') {
+  const text = String(status || '');
+  const saving = text.startsWith('Saving');
+  patchCaptureButton.disabled = saving;
+  patchSaveStatus.textContent = text;
+  patchSaveStatus.className = text.startsWith('Error:')
+    ? 'export-status error'
+    : text.startsWith('Saved ')
+      ? 'export-status success'
+      : 'export-status';
+}
 
 let exportActive = false;
 
@@ -1235,25 +1750,49 @@ const MOD_TARGETS = [
   ['breathe_scale', 'Bth Scale'],
   ['breathe_rotation', 'Bth Rotate'],
   ['breathe_position', 'Bth Drift'],
+  ['cellular_amount', 'Cell Amount'],
+  ['cellular_scale', 'Cell Scale'],
+  ['cellular_warp', 'Cell Warp'],
+  ['cellular_speed', 'Cell Drift'],
+  ['cellular_gap_amount', 'Master Cell Gap Key'],
+  ['cellular_gap_threshold', 'Master Cell Gap Threshold'],
+  ['cellular_gap_softness', 'Master Cell Gap Softness'],
   ['key_threshold', 'Key Threshold'],
   ['key_softness', 'Key Softness'],
+  ['key_color_r', 'Key Color Red'],
+  ['key_color_g', 'Key Color Green'],
+  ['key_color_b', 'Key Color Blue'],
+  ['key_tolerance', 'Key Chroma Tolerance'],
   ['ntsc_snow', 'VHS Snow'],
   ['ntsc_tracking_snow', 'VHS Track Snow'],
   ['ntsc_edge_wave', 'VHS Edge Wave'],
+  ['ntsc_edge_wave_speed', 'VHS Edge Wave Speed'],
   ['ntsc_head_shift', 'VHS Head Shift'],
+  ['ntsc_tracking_wave', 'VHS Tracking Wave'],
   ['ntsc_chroma_loss', 'VHS Chroma Loss'],
+  ['ntsc_composite_noise', 'VHS Composite Noise'],
   ['ntsc_luma_noise', 'VHS Luma Noise'],
+  ['ntsc_chroma_noise', 'VHS Chroma Noise'],
+  ['ntsc_luma_smear', 'VHS Luma Smear'],
+  ['ntsc_sharpening', 'VHS Sharpening'],
   ['temporal_feedback', 'Temporal Feedback'],
   ['temporal_slitscan', 'Temporal Slit-Scan'],
   ['temporal_fb_zoom', 'Temporal FB Zoom'],
   ['temporal_fb_rotate', 'Temporal FB Rotate'],
   ['temporal_slit_angle', 'Temporal Slit Angle'],
+  ['temporal_key_threshold', 'Temporal Key Threshold'],
+  ['temporal_key_softness', 'Temporal Key Softness'],
+  ['temporal_key_history', 'Temporal Key History'],
   ['morph', 'Morph'],
 ];
+const MASTER_MOD_TARGETS = MOD_TARGETS.slice();
 
 const MAX_MOD_LAYERS = 16;
 const LAYER_FX_TARGETS = [
-  ['opacity', 'Opacity'], ['speed', 'Speed'], ['key', 'Key'],
+  ['opacity', 'Opacity'], ['speed', 'Speed'], ['fps', 'FPS'],
+  ['key_threshold', 'Key Threshold'],
+  ['key_color_r', 'Key Color Red'], ['key_color_g', 'Key Color Green'],
+  ['key_color_b', 'Key Color Blue'], ['key_tolerance', 'Key Chroma Tolerance'],
   ['pixelate', 'Pixelate'], ['rgb_split', 'RGB Split'],
   ['hue_shift', 'Hue'], ['saturation', 'Saturation'],
   ['brightness', 'Brightness'], ['contrast', 'Contrast'],
@@ -1261,13 +1800,13 @@ const LAYER_FX_TARGETS = [
   ['grain_size', 'Grain Size'], ['vignette', 'Vignette'],
   ['color_drift', 'Drift'], ['breathe_scale', 'Bth Scale'],
   ['breathe_rotation', 'Bth Rotate'], ['breathe_position', 'Bth Drift'],
+  ['cellular_amount', 'Cell Amount'], ['cellular_scale', 'Cell Scale'],
+  ['cellular_warp', 'Cell Warp'], ['cellular_speed', 'Cell Drift'],
+  ['cellular_gap_amount', 'Cell Gap Key'],
+  ['cellular_gap_threshold', 'Cell Gap Thresh'],
+  ['cellular_gap_softness', 'Cell Gap Soft'],
   ['key_softness', 'Key Soft'], ['downsample', 'Downsample'],
 ];
-for (let layer = 1; layer <= MAX_MOD_LAYERS; layer++) {
-  for (const [suffix, label] of LAYER_FX_TARGETS) {
-    MOD_TARGETS.push([`layer${layer}_${suffix}`, `L${layer} ${label}`]);
-  }
-}
 
 const ROUTING_CURVES = [
   ['linear', 'Linear'],
@@ -1285,6 +1824,7 @@ function syncCurveAmountState(curveSelect, amountInput) {
   const enabled = curveUsesAmount(curveSelect.value);
   amountInput.disabled = !enabled;
   amountInput.title = enabled ? '' : `${curveSelect.options[curveSelect.selectedIndex]?.text || 'This curve'} has a fixed response`;
+  syncRangeEditorState(amountInput);
 }
 
 const LFO_SHAPES = [
@@ -1337,7 +1877,12 @@ document.getElementById('add-routing').addEventListener('click', () => {
   sendAction({ action: 'add_routing' });
 });
 
-function optionsHtml(pairs, selected) {
+function optionsHtml(pairs, selected, groups = null) {
+  if (groups) {
+    return groups
+      .map(([label, values]) => `<optgroup label="${escapeHtml(label)}">${optionsHtml(values, selected)}</optgroup>`)
+      .join('');
+  }
   return pairs
     .map(([v, label]) => `<option value="${escapeHtml(v)}" ${String(v) === String(selected) ? 'selected' : ''}>${escapeHtml(label)}</option>`)
     .join('');
@@ -1394,17 +1939,42 @@ const MOD_SOURCES = [
   ['pad_y', 'Pad Y'],
 ];
 
+function currentModTargets(selected = '') {
+  const groups = [['Master / Program', MASTER_MOD_TARGETS.slice()]];
+  const liveLayerCount = Math.min(MAX_MOD_LAYERS, latestLayerIdentities.length);
+  for (let layer = 1; layer <= liveLayerCount; layer++) {
+    const targets = [];
+    for (const [suffix, label] of LAYER_FX_TARGETS) {
+      targets.push([`layer${layer}_${suffix}`, `L${layer} ${label}`]);
+    }
+    groups.push([`Layer ${layer}`, targets]);
+  }
+  // Preserve visibility for a legacy/out-of-range selection until the engine
+  // publishes its authoritative replacement instead of showing a blank menu.
+  if (selected && !groups.some(([, values]) => values.some(([value]) => value === selected))) {
+    groups.push(['Unavailable', [[selected, `${selected} (unavailable)`]]]);
+  }
+  return groups;
+}
+
 function createRoutingRow(routing, index) {
   const row = document.createElement('div');
   row.className = 'routing-row';
   row.dataset.index = index;
+  row.dataset.routeId = routing.route_id || '';
+  const selector = () => ({ index: Number(row.dataset.index), route_id: row.dataset.routeId || null });
   row.innerHTML = `
     <select class="routing-source" aria-label="Modulation source">${optionsHtml(MOD_SOURCES, routing.source)}</select>
     <span class="routing-arrow">&#x2192;</span>
-    <select class="routing-target" aria-label="Modulation target">${optionsHtml(MOD_TARGETS, routing.target)}</select>
+    <select class="routing-target" aria-label="Modulation target">${optionsHtml([], routing.target, currentModTargets(routing.target))}</select>
     <input type="range" class="routing-depth" min="-1" max="1" step="0.01" value="${routing.depth}" aria-label="Modulation depth">
     <span class="routing-depth-val">${routing.depth.toFixed(2)}</span>
-    <button class="routing-remove" title="Remove">&#xD7;</button>
+    <button class="routing-remove" title="Remove routing" aria-label="Remove modulation routing">&#xD7;</button>
+    <div class="routing-activity" role="meter" aria-label="Shaped and slewed modulation source value" aria-valuemin="-1" aria-valuemax="1" aria-valuenow="0">
+      <span class="routing-activity-center" aria-hidden="true"></span>
+      <span class="routing-activity-fill" aria-hidden="true"></span>
+      <span class="routing-activity-value">0.00</span>
+    </div>
     <div class="routing-response">
       <select class="routing-curve" aria-label="Response curve">${optionsHtml(ROUTING_CURVES, routing.curve || 'linear')}</select>
       <input type="range" class="routing-curve-amount" min="-2" max="2" step="0.05" value="${routing.curve_amount || 0}" aria-label="Curve amount">
@@ -1413,37 +1983,52 @@ function createRoutingRow(routing, index) {
     </div>
   `;
   row.querySelector('.routing-source').addEventListener('change', (e) => {
-    sendAction({ action: 'set_routing', index, param: 'source', value: e.target.value });
+    sendAction({ action: 'set_routing', ...selector(), param: 'source', value: e.target.value });
   });
   row.querySelector('.routing-target').addEventListener('change', (e) => {
-    sendAction({ action: 'set_routing', index, param: 'target', value: e.target.value });
+    const target = e.target.value;
+    const layerMatch = /^layer([1-9]|1[0-6])_/.exec(target);
+    let targetIdentity = {};
+    if (layerMatch) {
+      const targetLayerId = latestLayerIdentities[Number(layerMatch[1]) - 1];
+      if (!targetLayerId) {
+        // A positional layer target without a corresponding current identity
+        // is unsafe: a concurrent add/remove could bind it to another clip.
+        e.target.value = routing.target;
+        return;
+      }
+      targetIdentity = { target_layer_id: targetLayerId };
+      if (layerStackRevision > 0) targetIdentity.layer_stack_revision = layerStackRevision;
+    }
+    sendAction({ action: 'set_routing', ...selector(), ...targetIdentity, param: 'target', value: target });
   });
   row.querySelector('.routing-depth').addEventListener('input', (e) => {
     const v = parseFloat(e.target.value);
     row.querySelector('.routing-depth-val').textContent = v.toFixed(2);
-    sendAction({ action: 'set_routing', index, param: 'depth', value: v });
+    sendAction({ action: 'set_routing', ...selector(), param: 'depth', value: v });
   });
   resetRangeOnDoubleActivation(row.querySelector('.routing-depth'), 0);
   const curveSelect = row.querySelector('.routing-curve');
   const curveAmount = row.querySelector('.routing-curve-amount');
   curveSelect.addEventListener('change', (e) => {
     syncCurveAmountState(curveSelect, curveAmount);
-    sendAction({ action: 'set_routing', index, param: 'curve', value: e.target.value });
+    sendAction({ action: 'set_routing', ...selector(), param: 'curve', value: e.target.value });
   });
   curveAmount.addEventListener('input', (e) => {
-    sendAction({ action: 'set_routing', index, param: 'curve_amount', value: parseFloat(e.target.value) });
+    sendAction({ action: 'set_routing', ...selector(), param: 'curve_amount', value: parseFloat(e.target.value) });
   });
   resetRangeOnDoubleActivation(curveAmount, 0);
   syncCurveAmountState(curveSelect, curveAmount);
   for (const param of ['attack', 'release']) {
     row.querySelector(`.routing-${param}`).addEventListener('change', (e) => {
       const value = parseFloat(e.target.value);
-      if (Number.isFinite(value)) sendAction({ action: 'set_routing', index, param, value });
+      if (Number.isFinite(value)) sendAction({ action: 'set_routing', ...selector(), param, value });
     });
   }
   row.querySelector('.routing-remove').addEventListener('click', () => {
-    sendAction({ action: 'remove_routing', index });
+    sendAction({ action: 'remove_routing', ...selector() });
   });
+  bindRangeEditors(row);
   return row;
 }
 
@@ -1478,6 +2063,7 @@ function syncModulation(m) {
   syncPad(m.pad);
   syncPadConfig(m.pad_config);
   syncGyroConfig(m.gyro_config);
+  syncGyroStatus(m.gyro_status);
 
   // Gyro meters (values come from whichever device is streaming).
   if (m.gyro) {
@@ -1488,8 +2074,16 @@ function syncModulation(m) {
   }
 
   const routings = m.routings || [];
-  if (routingList.children.length !== routings.length) {
+  const routingKey = JSON.stringify({
+    layers: latestLayerIdentities,
+    routes: routings.map((routing, index) => [
+      routing.route_id || `legacy-index:${index}`,
+      routing.target || '',
+    ]),
+  });
+  if (routingList.children.length !== routings.length || routingList.dataset.routingKey !== routingKey) {
     routingList.innerHTML = '';
+    routingList.dataset.routingKey = routingKey;
     routings.forEach((r, i) => routingList.appendChild(createRoutingRow(r, i)));
   } else {
     routings.forEach((r, i) => {
@@ -1502,6 +2096,8 @@ function syncModulation(m) {
       const curveAmount = row.querySelector('.routing-curve-amount');
       const attack = row.querySelector('.routing-attack');
       const release = row.querySelector('.routing-release');
+      row.dataset.index = i;
+      row.dataset.routeId = r.route_id || '';
       if (canSync(sourceSel)) sourceSel.value = r.source;
       if (canSync(targetSel)) targetSel.value = r.target;
       if (canSync(depthSlider)) {
@@ -1513,6 +2109,24 @@ function syncModulation(m) {
       syncCurveAmountState(curveSel, curveAmount);
       if (canSync(attack)) attack.value = r.attack || 0;
       if (canSync(release)) release.value = r.release || 0;
+      const activity = row.querySelector('.routing-activity');
+      const fill = row.querySelector('.routing-activity-fill');
+      const activityValue = row.querySelector('.routing-activity-value');
+      const value = Math.min(1, Math.max(-1, Number(r.value) || 0));
+      const bipolar = /^(lfo\d|gyro_|pad_)/.test(r.source || '');
+      const meterMin = bipolar ? -1 : 0;
+      const bounded = Math.max(meterMin, value);
+      const left = bipolar ? (bounded < 0 ? 50 + bounded * 50 : 50) : 0;
+      const width = bipolar ? Math.abs(bounded) * 50 : bounded * 100;
+      fill.style.left = `${left.toFixed(1)}%`;
+      fill.style.width = `${width.toFixed(1)}%`;
+      fill.classList.toggle('negative', bounded < 0);
+      activity.classList.toggle('unipolar', !bipolar);
+      activityValue.textContent = bounded.toFixed(2);
+      activity.setAttribute('aria-valuemin', String(meterMin));
+      activity.setAttribute('aria-valuenow', bounded.toFixed(3));
+      activity.setAttribute('aria-valuetext', `${bipolar ? 'bipolar' : 'unipolar'} shaped and slewed value ${bounded.toFixed(2)}`);
+      activity.setAttribute('aria-label', `${MOD_SOURCES.find(([source]) => source === r.source)?.[1] || r.source} shaped and slewed modulation value`);
     });
   }
 }
@@ -1520,6 +2134,12 @@ function syncModulation(m) {
 // --- Audio input ---
 
 const audioEnabled = document.getElementById('audio-enabled');
+const audioSourceKind = document.getElementById('audio-source-kind');
+const audioClip = document.getElementById('audio-clip');
+const audioClipRow = document.getElementById('audio-clip-row');
+const audioImport = document.getElementById('audio-import');
+const audioImportButton = document.getElementById('audio-import-button');
+const audioImportStatus = document.getElementById('audio-import-status');
 const audioGain = document.getElementById('audio-gain');
 const audioGainVal = document.getElementById('audio-gain-val');
 const audioStatus = document.getElementById('audio-status');
@@ -1584,6 +2204,80 @@ audioEnabled.addEventListener('change', () => {
   sendAction({ action: 'set_audio', param: 'enabled', value: audioEnabled.checked });
 });
 
+audioSourceKind.addEventListener('change', () => {
+  const fileMode = audioSourceKind.value === 'file';
+  audioClipRow.hidden = !fileMode;
+  audioDevice.closest('.param-row').hidden = fileMode;
+  sendAction({ action: 'set_audio', param: 'source_kind', value: audioSourceKind.value });
+});
+
+const AUDIO_IMPORT_ACTION = '__import_audio__';
+const MAX_AUDIO_IMPORT_BYTES = 512 * 1024 * 1024;
+const SUPPORTED_AUDIO_FILE = /\.(wav|mp3|flac|ogg|opus|m4a|aac)$/i;
+let selectedAudioClip = '';
+let audioImportBusy = false;
+
+function openAudioImportPicker() {
+  audioImport.click();
+}
+
+audioClip.addEventListener('change', () => {
+  if (audioClip.value === AUDIO_IMPORT_ACTION) {
+    // Restore the authoritative selection immediately. A canceled native
+    // chooser therefore cannot clear or replace the running clip.
+    audioClip.value = selectedAudioClip || AUDIO_IMPORT_ACTION;
+    openAudioImportPicker();
+    return;
+  }
+  sendAction({ action: 'set_audio', param: 'clip', value: audioClip.value });
+});
+audioImportButton.addEventListener('click', openAudioImportPicker);
+
+audioImport.addEventListener('change', async () => {
+  if (audioImportBusy) return;
+  audioImportBusy = true;
+  audioImportButton.disabled = true;
+  audioClip.disabled = true;
+  audioImport.disabled = true;
+  try {
+  const files = [...audioImport.files];
+  audioImport.value = '';
+  let lastImported = '';
+  for (const file of files) {
+    if (!SUPPORTED_AUDIO_FILE.test(file.name)) {
+      audioImportStatus.textContent = `${file.name}: choose WAV, MP3, FLAC, OGG, Opus, M4A, or AAC`;
+      audioImportStatus.classList.add('error');
+      continue;
+    }
+    if (file.size === 0) {
+      audioImportStatus.textContent = `${file.name}: the file is empty`;
+      audioImportStatus.classList.add('error');
+      continue;
+    }
+    if (file.size > MAX_AUDIO_IMPORT_BYTES) {
+      audioImportStatus.textContent = `${file.name}: exceeds the 512 MiB audio import limit`;
+      audioImportStatus.classList.add('error');
+      continue;
+    }
+    const result = await uploadClip(file, audioImportStatus);
+    if (result.ok) lastImported = result.filename;
+  }
+  if (lastImported) {
+    selectedAudioClip = lastImported;
+    sendAction({ action: 'set_audio', param: 'source_kind', value: 'file' });
+    sendAction({ action: 'set_audio', param: 'clip', value: lastImported });
+    audioImportStatus.textContent = `${lastImported} added — loading deterministic analysis…`;
+    audioImportStatus.classList.remove('error');
+  }
+  audioClip.value = selectedAudioClip || AUDIO_IMPORT_ACTION;
+  } finally {
+    audioImportBusy = false;
+    audioImportButton.disabled = false;
+    audioClip.disabled = false;
+    audioImport.disabled = false;
+  }
+});
+
 audioGain.addEventListener('input', () => {
   const v = parseFloat(audioGain.value);
   audioGainVal.textContent = v.toFixed(2);
@@ -1597,20 +2291,41 @@ audioDevice.addEventListener('change', () => {
 });
 
 let knownDevices = '';
-function syncAudioDevices(devices, selected) {
-  const key = (devices || []).join('|');
+function syncAudioDevices(devices, playbackDevices, selected) {
+  const key = `${(devices || []).join('|')}::${(playbackDevices || []).join('|')}`;
   if (key !== knownDevices) {
     knownDevices = key;
-    audioDevice.innerHTML = '<option value="">Default</option>' +
-      (devices || []).map(d => `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`).join('');
+    audioDevice.replaceChildren(new Option('Default input', ''));
+    for (const device of devices || []) audioDevice.add(new Option(device, device));
+    audioDevice.add(new Option('[System playback] Default output', 'system-playback:default'));
+    for (const device of playbackDevices || []) {
+      audioDevice.add(new Option(`[System playback] ${device}`, `system-playback:${device}`));
+    }
   }
   if (canSync(audioDevice)) audioDevice.value = selected || '';
+}
+
+let knownAudioClips = '';
+function syncAudioClips(files, selected) {
+  const key = (files || []).join('|');
+  if (key !== knownAudioClips) {
+    knownAudioClips = key;
+    audioClip.replaceChildren(new Option('Choose imported audio…', AUDIO_IMPORT_ACTION));
+    for (const file of files || []) audioClip.add(new Option(file, file));
+  }
+  selectedAudioClip = selected || '';
+  if (canSync(audioClip)) audioClip.value = selectedAudioClip || AUDIO_IMPORT_ACTION;
 }
 
 function syncAudio(a) {
   if (!a) return;
   if (canSync(audioEnabled)) audioEnabled.checked = a.enabled;
-  syncAudioDevices(a.devices, a.selected);
+  if (canSync(audioSourceKind)) audioSourceKind.value = a.source_kind || 'live';
+  const fileMode = (a.source_kind || 'live') === 'file';
+  audioClipRow.hidden = !fileMode;
+  audioDevice.closest('.param-row').hidden = fileMode;
+  syncAudioDevices(a.devices, a.system_playback_devices, a.selected);
+  syncAudioClips(a.clip_files, a.clip_path);
   if (canSync(audioGain)) {
     audioGain.value = a.gain;
     audioGainVal.textContent = a.gain.toFixed(2);
@@ -1649,6 +2364,21 @@ function syncAudio(a) {
   if (a.error) {
     audioStatus.textContent = a.error;
     audioStatus.className = 'audio-status error';
+    if (fileMode && (a.clip_path || audioImportStatus.textContent)) {
+      audioImportStatus.textContent = a.clip_path ? `${a.clip_path}: ${a.error}` : a.error;
+      audioImportStatus.classList.add('error');
+    }
+  } else if (fileMode && a.clip_loading) {
+    audioStatus.textContent = `loading ${a.clip_path || 'audio clip'}…`;
+    audioStatus.className = 'audio-status';
+  } else if (fileMode && a.clip_path) {
+    const duration = Number(a.clip_duration_secs) > 0 ? ` · ${Number(a.clip_duration_secs).toFixed(2)} s loop` : '';
+    audioStatus.textContent = `${a.clip_path}${duration} · deterministic program-time analysis`;
+    audioStatus.className = 'audio-status';
+    if (audioImportStatus.textContent.includes(a.clip_path)) {
+      audioImportStatus.textContent = '';
+      audioImportStatus.classList.remove('error');
+    }
   } else if (a.enabled && (a.active_device || a.device)) {
     const activeDevice = a.active_device || a.device;
     audioStatus.textContent = a.using_fallback
@@ -1684,8 +2414,8 @@ for (let i = 0; i < 4; i++) {
   row.innerHTML = `
     <span class="lfo-name">${MIDI_SLOT_NAMES[i]}</span>
     <span class="midi-cc-label">CC</span>
-    <input type="number" class="midi-cc" min="0" max="127" step="1" value="${i + 1}">
-    <button class="midi-learn" title="Twist a knob to bind">Learn</button>
+    <input type="number" class="midi-cc" min="0" max="127" step="1" value="${i + 1}" aria-label="MIDI ${MIDI_SLOT_NAMES[i]} Control Change number">
+    <button type="button" class="midi-learn" title="Bind the next incoming Control Change; keys and notes are ignored" aria-pressed="false">Learn CC</button>
     <div class="lfo-meter"><div class="lfo-meter-fill"></div></div>
   `;
   row.querySelector('.midi-cc').addEventListener('change', (e) => {
@@ -1706,13 +2436,20 @@ function syncMidi(m) {
   if (canSync(midiClockSync)) midiClockSync.checked = !!m.clock_sync;
   const clockInd = document.getElementById('midi-clock-indicator');
   if (m.clock_active) {
-    clockInd.textContent = '◉ ext clock';
+    const bpm = Number.isFinite(m.clock_bpm) ? `${m.clock_bpm.toFixed(1)} BPM` : 'active';
+    clockInd.textContent = `24 PPQN | ${bpm}`;
+    clockInd.title = 'Following incoming MIDI Timing Clock';
     clockInd.className = 'clock-indicator active';
   } else if (m.clock_sync) {
-    clockInd.textContent = 'waiting…';
+    clockInd.textContent = m.enabled ? 'waiting for 24 PPQN' : 'enable MIDI';
+    clockInd.title = m.enabled
+      ? 'Waiting for incoming 24-PPQN MIDI Timing Clock'
+      : 'MIDI input must be enabled before clock can be received';
     clockInd.className = 'clock-indicator';
   } else {
-    clockInd.textContent = '';
+    clockInd.textContent = 'off';
+    clockInd.title = 'External MIDI Timing Clock sync is off';
+    clockInd.className = 'clock-indicator';
   }
 
   (m.slots || []).forEach((slot, i) => {
@@ -1724,17 +2461,28 @@ function syncMidi(m) {
     const learnBtn = row.querySelector('.midi-learn');
     const isLearning = m.learning === i;
     learnBtn.classList.toggle('learning', isLearning);
-    learnBtn.textContent = isLearning ? '...' : 'Learn';
+    learnBtn.textContent = isLearning ? 'Cancel' : 'Learn CC';
+    learnBtn.setAttribute('aria-pressed', String(isLearning));
+    learnBtn.title = isLearning
+      ? `MIDI ${MIDI_SLOT_NAMES[i]} is waiting for a Control Change; click to cancel`
+      : 'Bind the next incoming Control Change; keys and notes are ignored';
   });
 
   if (m.error) {
     midiStatus.textContent = m.error;
     midiStatus.className = 'audio-status error';
-  } else if (m.enabled && m.port) {
-    midiStatus.textContent = m.port;
-    midiStatus.className = 'audio-status';
   } else {
-    midiStatus.textContent = '';
+    const status = [];
+    if (m.enabled && m.port) status.push(`Input: ${m.port}`);
+    else if (m.enabled) status.push('MIDI input starting');
+    else status.push('MIDI input off');
+    if (Number.isInteger(m.learning) && m.learning >= 0 && m.learning < MIDI_SLOT_NAMES.length) {
+      status.push(m.enabled
+        ? `Learn ${MIDI_SLOT_NAMES[m.learning]}: waiting for CC (keys ignored)`
+        : `Learn ${MIDI_SLOT_NAMES[m.learning]} armed; enable MIDI to receive CC`);
+    }
+    midiStatus.textContent = status.join(' | ');
+    midiStatus.className = 'audio-status';
   }
 }
 
@@ -1890,9 +2638,56 @@ const gyroEnabled = document.getElementById('gyro-enabled');
 const gyroStatus = document.getElementById('gyro-status');
 let gyroLastSend = 0;
 let gyroSeenEvent = false;
+let gyroLocalError = '';
+
+function setGyroLocalError(message) {
+  gyroLocalError = message;
+  gyroStatus.textContent = message;
+  gyroStatus.className = 'audio-status error';
+}
+
+function syncGyroStatus(status) {
+  if (!status) return; // Remain compatible with snapshots from older servers.
+  if (gyroLocalError) {
+    setGyroLocalError(gyroLocalError);
+    return;
+  }
+
+  const streamers = Math.max(0, Number(status.streamers) || 0);
+  const age = Number.isFinite(status.sample_age_ms)
+    ? ` · ${Math.max(0, Math.round(status.sample_age_ms))} ms`
+    : '';
+  if (status.active) {
+    gyroStatus.textContent = `live · ${streamers} streamer${streamers === 1 ? '' : 's'}${age}`;
+    gyroStatus.className = 'audio-status';
+  } else if (status.stale) {
+    gyroStatus.textContent = streamers > 0
+      ? `sensor data stale · output centered${age}`
+      : `stream stopped · output centered${age}`;
+    gyroStatus.className = 'audio-status error';
+  } else {
+    gyroStatus.textContent = 'no active phone stream';
+    gyroStatus.className = 'audio-status';
+  }
+}
+
+function reconcileGyroStreamConnection() {
+  if (!gyroEnabled?.checked) return;
+  gyroLocalError = '';
+  if (!sendAction({ action: 'gyro_stream', enabled: true })) {
+    setGyroLocalError('control connection offline');
+  }
+}
+
+function showGyroDisconnected() {
+  if (!document.getElementById('gyro-enabled')?.checked) return;
+  setGyroLocalError('control connection offline · output will center');
+}
 
 function gyroHandler(e) {
+  if (![e.alpha, e.beta, e.gamma].some(Number.isFinite)) return;
   gyroSeenEvent = true;
+  gyroLocalError = '';
   const now = performance.now();
   if (now - gyroLastSend < 33) return; // ~30Hz
   gyroLastSend = now;
@@ -1905,19 +2700,21 @@ function gyroHandler(e) {
   // Express pitch/roll in the visible screen's axes, not fixed device axes.
   const pitch = beta * Math.cos(radians) + gamma * Math.sin(radians);
   const roll = gamma * Math.cos(radians) - beta * Math.sin(radians);
-  sendAction({
+  if (!sendAction({
     action: 'gyro',
     alpha: alpha + screenAngle,
     beta: pitch,
     gamma: roll,
-  });
+  })) {
+    setGyroLocalError('control connection offline · output will center');
+  }
 }
 
 gyroEnabled.addEventListener('change', async () => {
   if (gyroEnabled.checked) {
+    gyroLocalError = '';
     if (typeof DeviceOrientationEvent === 'undefined') {
-      gyroStatus.textContent = 'no orientation sensor in this browser';
-      gyroStatus.className = 'audio-status error';
+      setGyroLocalError('no orientation sensor in this browser');
       gyroEnabled.checked = false;
       return;
     }
@@ -1926,31 +2723,36 @@ gyroEnabled.addEventListener('change', async () => {
       try {
         const perm = await DeviceOrientationEvent.requestPermission();
         if (perm !== 'granted') {
-          gyroStatus.textContent = 'permission denied';
-          gyroStatus.className = 'audio-status error';
+          setGyroLocalError('permission denied');
           gyroEnabled.checked = false;
           return;
         }
       } catch (err) {
-        gyroStatus.textContent = 'sensor needs HTTPS on iOS';
-        gyroStatus.className = 'audio-status error';
+        setGyroLocalError('sensor needs HTTPS on iOS');
         gyroEnabled.checked = false;
         return;
       }
     }
     gyroSeenEvent = false;
     window.addEventListener('deviceorientation', gyroHandler);
-    gyroStatus.textContent = 'streaming…';
+    if (!sendAction({ action: 'gyro_stream', enabled: true })) {
+      window.removeEventListener('deviceorientation', gyroHandler);
+      gyroEnabled.checked = false;
+      setGyroLocalError('control connection offline');
+      return;
+    }
+    gyroStatus.textContent = 'waiting for fresh sensor data…';
     gyroStatus.className = 'audio-status';
     setTimeout(() => {
       if (gyroEnabled.checked && !gyroSeenEvent) {
-        gyroStatus.textContent = 'no sensor data (desktop browser?)';
-        gyroStatus.className = 'audio-status error';
+        setGyroLocalError('no sensor data (desktop browser?)');
       }
     }, 2000);
   } else {
     window.removeEventListener('deviceorientation', gyroHandler);
-    gyroStatus.textContent = 'enable on the phone that should steer';
+    sendAction({ action: 'gyro_stream', enabled: false });
+    gyroLocalError = '';
+    gyroStatus.textContent = 'stopping stream…';
     gyroStatus.className = 'audio-status';
   }
 });
@@ -2030,13 +2832,19 @@ const morphLaw = document.getElementById('morph-law');
 const morphDuration = document.getElementById('morph-duration');
 
 document.getElementById('morph-set-a').addEventListener('click', () => {
-  sendAction({ action: 'morph_capture', slot: 'a' });
+  if (!sendAction({ action: 'morph_capture', slot: 'a', stack_revision: layerStackRevision })) {
+    morphStatus.textContent = 'Control connection is offline; A was not captured.';
+  }
 });
 document.getElementById('morph-set-b').addEventListener('click', () => {
-  sendAction({ action: 'morph_capture', slot: 'b' });
+  if (!sendAction({ action: 'morph_capture', slot: 'b', stack_revision: layerStackRevision })) {
+    morphStatus.textContent = 'Control connection is offline; B was not captured.';
+  }
 });
 document.getElementById('morph-clear').addEventListener('click', () => {
-  sendAction({ action: 'morph_clear' });
+  if (!sendAction({ action: 'morph_clear' })) {
+    morphStatus.textContent = 'Control connection is offline; slots were not cleared.';
+  }
 });
 morphT.addEventListener('input', () => {
   sendAction({ action: 'set_morph', value: parseFloat(morphT.value) });
@@ -2048,7 +2856,9 @@ for (const [id, target] of [['morph-glide-a', 0], ['morph-glide-b', 1]]) {
   document.getElementById(id).addEventListener('click', () => {
     const duration = Math.min(64, Math.max(0.25, parseFloat(morphDuration.value) || 4));
     morphDuration.value = duration;
-    sendAction({ action: 'morph_glide', target, duration_beats: duration });
+    if (!sendAction({ action: 'morph_glide', target, duration_beats: duration })) {
+      morphStatus.textContent = 'Control connection is offline; glide was not started.';
+    }
   });
 }
 resetRangeOnDoubleActivation(morphT, 0);
@@ -2057,12 +2867,16 @@ function syncMorph(m) {
   if (!m) return;
   if (canSync(morphT)) morphT.value = m.t;
   if (canSync(morphLaw)) morphLaw.value = m.blend_law || 'linear';
-  document.getElementById('morph-set-a').classList.toggle('set', m.has_a);
-  document.getElementById('morph-set-b').classList.toggle('set', m.has_b);
+  const setA = document.getElementById('morph-set-a');
+  const setB = document.getElementById('morph-set-b');
+  setA.classList.toggle('set', m.has_a);
+  setB.classList.toggle('set', m.has_b);
+  setA.setAttribute('aria-pressed', String(!!m.has_a));
+  setB.setAttribute('aria-pressed', String(!!m.has_b));
   document.getElementById('morph-label-a').classList.toggle('active', m.active && m.t < 0.5);
   document.getElementById('morph-label-b').classList.toggle('active', m.active && m.t >= 0.5);
   if (m.gliding) {
-    morphStatus.textContent = `gliding to ${m.glide_target >= 0.5 ? 'B' : 'A'} over ${Number(m.glide_duration_beats).toFixed(2)} beats`;
+    morphStatus.textContent = `gliding to ${m.glide_target >= 0.5 ? 'B' : 'A'} — ${Number(m.glide_duration_beats).toFixed(2)} beats remaining`;
   } else if (m.active) {
     morphStatus.textContent = 'morphing — sliders follow the crossfade';
   } else if (m.has_a || m.has_b) {
@@ -2103,3 +2917,15 @@ function formatValue(v, min, max, step) {
   if (step >= 0.01) return v.toFixed(1);
   return v.toFixed(3);
 }
+
+// Bind the static panel after all of its native input handlers exist. The
+// observer is a future-proof fallback for any later generated range control.
+bindRangeEditors(document);
+const rangeEditorObserver = new MutationObserver((records) => {
+  for (const record of records) {
+    record.addedNodes.forEach((node) => {
+      if (node.nodeType === Node.ELEMENT_NODE) bindRangeEditors(node);
+    });
+  }
+});
+rangeEditorObserver.observe(document.body, { childList: true, subtree: true });

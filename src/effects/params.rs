@@ -15,6 +15,16 @@ pub struct TemporalParams {
     pub slit_angle: f32,
     /// Legacy 0/1 axis retained for old patches and protocol clients.
     pub slit_axis: f32,
+    /// 0=off, 1=keep motion, 2=keep stillness, 3=keep brightening,
+    /// 4=keep darkening. The mask compares the clean current program with a
+    /// frame from the fixed-rate history ring.
+    pub key_mode: f32,
+    /// Normalized color/luminance delta at which the temporal mask opens.
+    pub key_threshold: f32,
+    /// Feather around [`Self::key_threshold`].
+    pub key_softness: f32,
+    /// Age of the reference image in 30 Hz history frames (1..23).
+    pub key_history: f32,
 }
 
 /// Return an aspect-correct, normalized scan direction for shader use.
@@ -45,13 +55,27 @@ impl Default for TemporalParams {
             slitscan: 0.0,
             slit_angle: 0.0,
             slit_axis: 0.0,
+            key_mode: 0.0,
+            key_threshold: 0.1,
+            key_softness: 0.03,
+            key_history: 1.0,
         }
     }
 }
 
 impl TemporalParams {
     pub fn is_active(&self) -> bool {
-        self.feedback > 0.0 || self.slitscan > 0.0
+        self.feedback > 0.0 || self.slitscan > 0.0 || self.key_mode > 0.0
+    }
+
+    /// Reset only temporal-domain keying while preserving trails/slit-scan.
+    #[allow(dead_code)]
+    pub fn reset_key(&mut self) {
+        let defaults = Self::default();
+        self.key_mode = defaults.key_mode;
+        self.key_threshold = defaults.key_threshold;
+        self.key_softness = defaults.key_softness;
+        self.key_history = defaults.key_history;
     }
 
     /// Convert the 30-fps-authored controls into values for one render step.
@@ -87,6 +111,10 @@ impl TemporalParams {
             slitscan: finite_or(self.slitscan, 0.0).clamp(0.0, 1.0),
             slit_angle: finite_or(self.slit_angle, 0.0).clamp(-180.0, 180.0),
             slit_axis: finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0),
+            key_mode: finite_or(self.key_mode, 0.0).round().clamp(0.0, 4.0),
+            key_threshold: finite_or(self.key_threshold, 0.1).clamp(0.0, 1.0),
+            key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
+            key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
         }
     }
 }
@@ -116,6 +144,10 @@ mod temporal_tests {
             slitscan: 0.7,
             slit_angle: 42.0,
             slit_axis: 1.0,
+            key_mode: 3.0,
+            key_threshold: 0.2,
+            key_softness: 0.04,
+            key_history: 7.0,
         };
         let half = params.for_frame_delta(1.0 / 60.0);
 
@@ -123,6 +155,10 @@ mod temporal_tests {
         close(half.fb_zoom * half.fb_zoom, params.fb_zoom);
         close(half.fb_rotate + half.fb_rotate, params.fb_rotate);
         close(half.slitscan, params.slitscan);
+        close(half.key_mode, params.key_mode);
+        close(half.key_threshold, params.key_threshold);
+        close(half.key_softness, params.key_softness);
+        close(half.key_history, params.key_history);
     }
 
     #[test]
@@ -134,6 +170,10 @@ mod temporal_tests {
             slitscan: f32::NAN,
             slit_angle: f32::INFINITY,
             slit_axis: 8.0,
+            key_mode: f32::INFINITY,
+            key_threshold: f32::NAN,
+            key_softness: f32::NEG_INFINITY,
+            key_history: 999.0,
         };
         let normalized = params.for_frame_delta(f32::NAN);
 
@@ -143,6 +183,30 @@ mod temporal_tests {
         assert_eq!(normalized.slitscan, 0.0);
         assert_eq!(normalized.slit_angle, 0.0);
         assert_eq!(normalized.slit_axis, 1.0);
+        assert_eq!(normalized.key_mode, 0.0);
+        assert_eq!(normalized.key_threshold, 0.1);
+        assert_eq!(normalized.key_softness, 0.03);
+        assert_eq!(normalized.key_history, 23.0);
+    }
+
+    #[test]
+    fn key_reset_preserves_other_temporal_effects() {
+        let mut params = TemporalParams {
+            feedback: 0.7,
+            slitscan: 0.4,
+            key_mode: 4.0,
+            key_threshold: 0.8,
+            key_softness: 0.2,
+            key_history: 12.0,
+            ..Default::default()
+        };
+        params.reset_key();
+        assert_eq!(params.feedback, 0.7);
+        assert_eq!(params.slitscan, 0.4);
+        assert_eq!(params.key_mode, 0.0);
+        assert_eq!(params.key_threshold, 0.1);
+        assert_eq!(params.key_softness, 0.03);
+        assert_eq!(params.key_history, 1.0);
     }
 
     #[test]
@@ -166,7 +230,7 @@ mod temporal_tests {
 }
 
 /// GPU-side effect parameters, uploaded as a uniform buffer each frame.
-/// Must be 16-byte aligned (96 bytes total = 6 × vec4).
+/// Must be 16-byte aligned (144 bytes total = 9 x vec4).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EffectUniforms {
@@ -196,9 +260,22 @@ pub struct EffectUniforms {
     pub vignette: f32,         // 0.0 = off, 0.0..1.5
     // vec4 #6 — color drift + luma key
     pub color_drift: f32,   // 0.0 = off, 0.0..0.02 (per-frame random aberration)
-    pub key_mode: f32,      // 0=off, 1=keep bright, 2=keep dark
+    pub key_mode: f32,      // 0=off, 1=keep bright, 2=keep dark, 3=remove color, 4=keep color
     pub key_threshold: f32, // 0..1 luminance cut point
     pub key_softness: f32,  // 0..0.5 smoothstep half-width around threshold
+    // vec4 #7 — animated cellular / Worley domain warp
+    pub cellular_amount: f32, // 0.0 = off, 0.0..1.0 blend and ridge strength
+    pub cellular_scale: f32,  // 2.0..32.0 cells across the frame height
+    pub cellular_warp: f32,   // 0.0..1.0 bounded displacement within a cell
+    pub cellular_speed: f32,  // 0.0..2.0 deterministic target epochs per second
+    // vec4 #8 — cellular ridge-to-alpha key
+    pub cellular_gap_amount: f32, // 0.0 = opaque/back-compatible, 1.0 = fully key ridges
+    pub cellular_gap_threshold: f32, // 0.0..1.0 ridge strength where the key opens
+    pub cellular_gap_softness: f32, // 0.0..0.5 feather around the threshold
+    pub _cellular_pad: f32,
+    // vec4 #9 — chroma key target in display/sRGB coordinates
+    pub key_color: [f32; 3], // 0.0..1.0, default green-screen green
+    pub key_tolerance: f32,  // 0.0..1.0 chroma-plane distance
 }
 
 impl Default for EffectUniforms {
@@ -227,11 +304,34 @@ impl Default for EffectUniforms {
             key_mode: 0.0,
             key_threshold: 0.5,
             key_softness: 0.1,
+            cellular_amount: 0.0,
+            cellular_scale: 10.0,
+            cellular_warp: 0.35,
+            cellular_speed: 0.25,
+            cellular_gap_amount: 0.0,
+            cellular_gap_threshold: 0.65,
+            cellular_gap_softness: 0.08,
+            _cellular_pad: 0.0,
+            key_color: [0.0, 1.0, 0.0],
+            key_tolerance: 0.15,
         }
     }
 }
 
 impl EffectUniforms {
+    /// Return a frame-local copy whose pixel and aspect calculations match the
+    /// render target that the effects shader writes into.
+    ///
+    /// Layer textures can have a different size and aspect ratio from the
+    /// composite. The shader operates in output UV space, so using the source
+    /// texture dimensions here would stretch spatial effects such as the
+    /// cellular field. Keeping this as a copy also leaves patch/modulation
+    /// state independent from runtime output dimensions.
+    pub(crate) fn for_render_target(mut self, width: u32, height: u32) -> Self {
+        self.resolution = [width.max(1) as f32, height.max(1) as f32];
+        self
+    }
+
     pub fn increase_pixelate(&mut self) {
         let doubled = self.pixelate_size * 2.0;
         self.pixelate_size = if doubled.is_nan() {
@@ -257,5 +357,146 @@ impl EffectUniforms {
         let res = self.resolution;
         *self = Self::default();
         self.resolution = res;
+    }
+
+    /// Reset every alpha-key control without disturbing color/spatial effects.
+    #[allow(dead_code)]
+    pub fn reset_key(&mut self) {
+        let defaults = Self::default();
+        self.key_mode = defaults.key_mode;
+        self.key_threshold = defaults.key_threshold;
+        self.key_softness = defaults.key_softness;
+        self.key_color = defaults.key_color;
+        self.key_tolerance = defaults.key_tolerance;
+        self.cellular_gap_amount = defaults.cellular_gap_amount;
+        self.cellular_gap_threshold = defaults.cellular_gap_threshold;
+        self.cellular_gap_softness = defaults.cellular_gap_softness;
+    }
+}
+
+#[cfg(test)]
+mod uniform_tests {
+    use super::*;
+
+    #[test]
+    fn effect_uniform_layout_is_nine_vec4s() {
+        assert_eq!(std::mem::size_of::<EffectUniforms>(), 144);
+        assert!(std::mem::size_of::<EffectUniforms>().is_multiple_of(16));
+        assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_amount), 96);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_scale), 100);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_warp), 104);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_speed), 108);
+        assert_eq!(
+            std::mem::offset_of!(EffectUniforms, cellular_gap_amount),
+            112
+        );
+        assert_eq!(
+            std::mem::offset_of!(EffectUniforms, cellular_gap_threshold),
+            116
+        );
+        assert_eq!(
+            std::mem::offset_of!(EffectUniforms, cellular_gap_softness),
+            120
+        );
+        assert_eq!(std::mem::offset_of!(EffectUniforms, _cellular_pad), 124);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, key_color), 128);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, key_tolerance), 140);
+
+        let shader = include_str!("../shaders/effects.wgsl");
+        let amount = shader.find("cellular_gap_amount: f32").unwrap();
+        let threshold = shader.find("cellular_gap_threshold: f32").unwrap();
+        let softness = shader.find("cellular_gap_softness: f32").unwrap();
+        let pad = shader.find("_cellular_pad: f32").unwrap();
+        let color = shader.find("key_color: vec3f").unwrap();
+        let tolerance = shader.find("key_tolerance: f32").unwrap();
+        assert!(
+            amount < threshold
+                && threshold < softness
+                && softness < pad
+                && pad < color
+                && color < tolerance
+        );
+    }
+
+    #[test]
+    fn cellular_defaults_are_bounded_and_disabled() {
+        let defaults = EffectUniforms::default();
+        assert_eq!(defaults.cellular_amount, 0.0);
+        assert_eq!(defaults.cellular_scale, 10.0);
+        assert_eq!(defaults.cellular_warp, 0.35);
+        assert_eq!(defaults.cellular_speed, 0.25);
+        assert_eq!(defaults.cellular_gap_amount, 0.0);
+        assert_eq!(defaults.cellular_gap_threshold, 0.65);
+        assert_eq!(defaults.cellular_gap_softness, 0.08);
+        assert_eq!(defaults.key_color, [0.0, 1.0, 0.0]);
+        assert_eq!(defaults.key_tolerance, 0.15);
+
+        let mut changed = defaults;
+        changed.cellular_amount = 1.0;
+        changed.cellular_scale = 32.0;
+        changed.cellular_warp = 1.0;
+        changed.cellular_speed = 2.0;
+        changed.cellular_gap_amount = 1.0;
+        changed.cellular_gap_threshold = 0.0;
+        changed.cellular_gap_softness = 0.5;
+        changed.key_color = [1.0, 0.0, 1.0];
+        changed.key_tolerance = 0.9;
+        changed.reset();
+        assert_eq!(changed.cellular_amount, 0.0);
+        assert_eq!(changed.cellular_scale, 10.0);
+        assert_eq!(changed.cellular_warp, 0.35);
+        assert_eq!(changed.cellular_speed, 0.25);
+        assert_eq!(changed.cellular_gap_amount, 0.0);
+        assert_eq!(changed.cellular_gap_threshold, 0.65);
+        assert_eq!(changed.cellular_gap_softness, 0.08);
+        assert_eq!(changed.key_color, [0.0, 1.0, 0.0]);
+        assert_eq!(changed.key_tolerance, 0.15);
+    }
+
+    #[test]
+    fn key_reset_preserves_non_key_effects_and_resets_all_alpha_masks() {
+        let mut effects = EffectUniforms {
+            brightness: 0.4,
+            key_mode: 4.0,
+            key_threshold: 0.8,
+            key_softness: 0.3,
+            key_color: [1.0, 0.2, 0.5],
+            key_tolerance: 0.6,
+            cellular_gap_amount: 1.0,
+            cellular_gap_threshold: 0.2,
+            cellular_gap_softness: 0.4,
+            ..Default::default()
+        };
+        effects.reset_key();
+        assert_eq!(effects.brightness, 0.4);
+        assert_eq!(effects.key_mode, 0.0);
+        assert_eq!(effects.key_threshold, 0.5);
+        assert_eq!(effects.key_softness, 0.1);
+        assert_eq!(effects.key_color, [0.0, 1.0, 0.0]);
+        assert_eq!(effects.key_tolerance, 0.15);
+        assert_eq!(effects.cellular_gap_amount, 0.0);
+        assert_eq!(effects.cellular_gap_threshold, 0.65);
+        assert_eq!(effects.cellular_gap_softness, 0.08);
+    }
+
+    #[test]
+    fn render_target_resolution_controls_spatial_effect_aspect_without_mutating_base() {
+        let base = EffectUniforms {
+            resolution: [640.0, 480.0],
+            cellular_amount: 0.8,
+            cellular_scale: 18.0,
+            ..Default::default()
+        };
+
+        let frame = base.for_render_target(1920, 1080);
+
+        assert_eq!(frame.resolution, [1920.0, 1080.0]);
+        assert_eq!(frame.cellular_amount, base.cellular_amount);
+        assert_eq!(frame.cellular_scale, base.cellular_scale);
+        assert_eq!(base.resolution, [640.0, 480.0]);
+
+        // Defensive normalization keeps malformed/transitionary target sizes
+        // from introducing division by zero into the shader.
+        assert_eq!(base.for_render_target(0, 0).resolution, [1.0, 1.0]);
     }
 }

@@ -24,7 +24,7 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["fs"] }
 futures = "0.3"
 open = "5"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 ntsc-rs = { git = "https://github.com/ntsc-rs/ntsc-rs", package = "ntsc-rs", features = ["rayon"] }
 cpal = "0.16"
 rustfft = "6"
@@ -37,6 +37,10 @@ rcgen = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 spout2-rs = { version = "0.1", default-features = false, features = ["dx"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # ntsc-rs is CPU-intensive; always optimize it even in debug builds
 [profile.dev.package.ntsc-rs]

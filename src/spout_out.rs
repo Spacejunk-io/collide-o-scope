@@ -139,6 +139,28 @@ impl FrameMailbox {
         true
     }
 
+    /// Advance the authoritative colour generation without sending a frame.
+    ///
+    /// This is the non-black counterpart to `queue_black`: a paused renderer
+    /// may need to retain the receiver's last texture while invalidating every
+    /// pending or already-dequeued frame from an older visual generation. The
+    /// send barrier guarantees that, once this returns, no old frame can be
+    /// submitted to Spout. A separately tagged readback may then publish the
+    /// exact held audience pixels under `epoch`.
+    fn hold_colour_epoch(&self, epoch: u64) -> bool {
+        let _barrier = lock_unpoison(&self.send_barrier);
+        let mut state = lock_unpoison(&self.state);
+        if state.shutdown || epoch < state.intent.epoch {
+            return false;
+        }
+        state.intent = OutputIntent {
+            epoch,
+            blackout: false,
+        };
+        state.pending = None;
+        true
+    }
+
     fn recv(&self) -> Option<QueuedFrame> {
         let mut state = lock_unpoison(&self.state);
         loop {
@@ -238,6 +260,18 @@ impl SpoutOut {
             return false;
         };
         worker.mailbox.queue_black(width, height, epoch)
+    }
+
+    /// Hold the receiver's last delivered texture while advancing the
+    /// authoritative colour generation. This transition may briefly wait for
+    /// the one send already in progress, exactly like blackout, so no queued
+    /// frame from an older epoch can escape after it returns.
+    pub fn hold_colour_epoch(&mut self, epoch: u64) -> bool {
+        self.reap_finished_worker();
+        let Some(worker) = &self.worker else {
+            return false;
+        };
+        worker.mailbox.hold_colour_epoch(epoch)
     }
 
     #[cfg(windows)]
@@ -448,6 +482,44 @@ mod tests {
         let black = mailbox.recv().expect("replacement black queued");
         assert_eq!(black.kind, FrameKind::Black);
         assert!(mailbox.is_current(&black));
+    }
+
+    #[test]
+    fn held_colour_epoch_drops_pending_and_invalidates_dequeued_old_frames() {
+        let mailbox = FrameMailbox::default();
+        assert!(mailbox.try_queue_regular(regular(6, 0x66)));
+        let dequeued = mailbox.recv().expect("old colour frame queued");
+        assert!(mailbox.is_current(&dequeued));
+
+        assert!(mailbox.try_queue_regular(regular(6, 0x77)));
+        assert!(mailbox.hold_colour_epoch(7));
+        assert!(!mailbox.is_current(&dequeued));
+
+        let state = lock_unpoison(&mailbox.state);
+        assert_eq!(state.intent.epoch, 7);
+        assert!(!state.intent.blackout);
+        assert!(state.pending.is_none());
+        drop(state);
+
+        assert!(!mailbox.try_queue_regular(regular(6, 0x88)));
+        assert!(mailbox.try_queue_regular(regular(7, 0x99)));
+        let held = mailbox.recv().expect("held-generation frame queued");
+        assert_eq!(held.epoch, 7);
+        assert!(mailbox.is_current(&held));
+    }
+
+    #[test]
+    fn held_colour_epoch_cannot_move_generation_backwards() {
+        let mailbox = FrameMailbox::default();
+        assert!(mailbox.queue_black(1, 1, 9));
+        assert!(!mailbox.hold_colour_epoch(8));
+        let state = lock_unpoison(&mailbox.state);
+        assert_eq!(state.intent.epoch, 9);
+        assert!(state.intent.blackout);
+        assert!(matches!(
+            state.pending.as_ref().map(|frame| frame.kind),
+            Some(FrameKind::Black)
+        ));
     }
 
     #[test]

@@ -14,10 +14,18 @@ use wgpu::util::DeviceExt;
 
 use crate::effects::EffectUniforms;
 use crate::layers::BlendMode;
-use crate::ntsc::NtscState;
+use crate::ntsc::{
+    plan_selective_ntsc, process_selective_ntsc_batch_with_state, reference_frame_for_output,
+    NtscFrameMetadata, NtscState, SelectiveNtscBatch, SelectiveNtscGeneration,
+    SelectiveNtscLayerDescriptor, SelectiveNtscPlan,
+};
 use crate::patch::PatchState;
+use crate::renderer::state::{
+    conditional_layer_slots, master_fx_composition_path, visible_stack_indices,
+    MasterFxCompositionPath,
+};
 use crate::video::decoder::{validate_media_dimensions, MAX_MEDIA_PIXELS};
-use crate::video::VideoDecoder;
+use crate::video::{DecodedStillImage, VideoDecoder};
 
 /// App shutdown must not wait forever on a wedged graphics backend. By the
 /// time this expires ExportJob::cancel has already killed/reaped ffmpeg,
@@ -31,6 +39,15 @@ const OUTCOME_CANCEL_REQUESTED: u8 = 1;
 const OUTCOME_SUCCEEDED: u8 = 2;
 const OUTCOME_FAILED: u8 = 3;
 const OUTCOME_CANCELLED: u8 = 4;
+
+const fn transparent_accumulation_clear() -> wgpu::Color {
+    wgpu::Color {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 0.0,
+    }
+}
 
 /// Configuration for an offline render job.
 #[derive(Debug, Clone)]
@@ -698,12 +715,43 @@ struct ExportLayer {
     effects: EffectUniforms,
     opacity: f32,
     blend_mode: BlendMode,
+    bypass_master_fx: bool,
     speed: f32,
     visible: bool,
     paused: bool,
     fps: f32,
     width: u32,
     height: u32,
+}
+
+/// Frame-local, morphable render values detached from decoder/GPU ownership.
+/// Keeping these values named prevents positional mistakes as the persisted
+/// layer state grows.
+#[derive(Clone, Copy)]
+struct ExportFrameLayerBase {
+    effects: EffectUniforms,
+    opacity: f32,
+    speed: f32,
+    fps: f32,
+    blend_mode: BlendMode,
+    visible: bool,
+    paused: bool,
+    bypass_master_fx: bool,
+}
+
+impl From<&ExportLayer> for ExportFrameLayerBase {
+    fn from(layer: &ExportLayer) -> Self {
+        Self {
+            effects: layer.effects,
+            opacity: layer.opacity,
+            speed: layer.speed,
+            fps: layer.fps,
+            blend_mode: layer.blend_mode,
+            visible: layer.visible,
+            paused: layer.paused,
+            bypass_master_fx: layer.bypass_master_fx,
+        }
+    }
 }
 
 fn configured_blend_mode(value: &str) -> BlendMode {
@@ -774,9 +822,84 @@ fn black_placeholder_layer(
         effects,
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
+        bypass_master_fx: layer_cfg.bypass_master_fx,
         speed: layer_cfg.speed,
         visible: layer_cfg.visible,
         paused: true,
+        fps: if layer_cfg.fps.is_finite() && layer_cfg.fps > 0.0 {
+            layer_cfg.fps.clamp(1.0, 240.0)
+        } else {
+            30.0
+        },
+        width,
+        height,
+    }
+}
+
+/// Upload an immutable source exactly once. With no decoder handle, the frame
+/// loop can never advance or reopen this source; time-varying effects still
+/// evaluate normally against these identical input pixels on every frame.
+fn still_export_layer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source_index: usize,
+    layer_cfg: &crate::patch::LayerConfig,
+    decoded: DecodedStillImage,
+) -> ExportLayer {
+    let width = decoded.width;
+    let height = decoded.height;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Export Still Layer"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &decoded.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let mut effects = EffectUniforms {
+        resolution: [width as f32, height as f32],
+        ..Default::default()
+    };
+    layer_cfg.effects.apply_to_uniforms(&mut effects);
+    ExportLayer {
+        source_index,
+        decoder: None,
+        texture,
+        texture_view,
+        effects,
+        opacity: layer_cfg.opacity,
+        blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
+        bypass_master_fx: layer_cfg.bypass_master_fx,
+        speed: layer_cfg.speed,
+        visible: layer_cfg.visible,
+        paused: layer_cfg.paused,
         fps: if layer_cfg.fps.is_finite() && layer_cfg.fps > 0.0 {
             layer_cfg.fps.clamp(1.0, 240.0)
         } else {
@@ -890,6 +1013,149 @@ fn export_frame_count(fps: u32, duration_secs: f32) -> u64 {
     (fps as f64 * duration_secs as f64).ceil() as u64
 }
 
+/// Frame-indexed program transport. A patch saved under global Pause exports
+/// its held program state for the complete requested duration; decoder frames,
+/// shader time, modulation/audio, morph, temporal history, and NTSC therefore
+/// share the same frozen timestamp.
+fn export_program_transport(frame_num: u64, frame_interval: f32, paused: bool) -> (f32, f32) {
+    if paused {
+        (0.0, 0.0)
+    } else {
+        (
+            frame_num as f32 * frame_interval,
+            if frame_num == 0 { 0.0 } else { frame_interval },
+        )
+    }
+}
+
+/// Mirror live pause semantics for transient modulation state. Routing caches
+/// are runtime state rather than patch data, so a recalled paused patch holds
+/// their deterministic reconstructed value (zero) instead of sampling an LFO,
+/// pad, or imported-audio source only in the offline renderer.
+fn update_export_modulation(
+    matrix: &mut crate::modulation::ModMatrix,
+    beat: f64,
+    delta_seconds: f32,
+    paused: bool,
+) {
+    if paused {
+        matrix.reset_update_timing();
+    } else {
+        matrix.update_at_beat(beat, delta_seconds);
+    }
+}
+
+/// Live Pause holds the materialized patch bases. Re-sampling an active morph
+/// only in export would produce a different held frame, especially when the
+/// morph target has transient routing state.
+fn export_morph_sample(
+    morph: Option<&crate::morph::Morph>,
+    beat: f64,
+    offset: f32,
+    paused: bool,
+) -> Option<crate::morph::MorphSample> {
+    if paused {
+        return None;
+    }
+    let morph = morph.filter(|morph| morph.active())?;
+    morph.sample((morph.position_at_beat(beat) + offset).clamp(0.0, 1.0))
+}
+
+/// The export stack has no live layer IDs, but patch source positions are
+/// stable for the lifetime of one job. Offset by one so every planned ID is
+/// nonzero and can be mapped back without a sentinel collision.
+fn export_selective_layer_id(source_index: usize) -> u64 {
+    source_index as u64 + 1
+}
+
+/// Reproduce the live planner input from frame-local, post-morph/post-Mod
+/// values. `layers` remains in UI order (top to bottom); the shared planner is
+/// the sole authority that reverses contributing entries into compositor
+/// order and forces only the bottom contribution to Normal.
+#[allow(clippy::too_many_arguments)]
+fn plan_export_selective_ntsc(
+    frame_num: u64,
+    width: u32,
+    height: u32,
+    fps: u32,
+    paused: bool,
+    params: &crate::ntsc::NtscParams,
+    layers: &[ExportLayer],
+    layer_mods: &[(EffectUniforms, f32)],
+    master: &EffectUniforms,
+) -> Option<SelectiveNtscPlan> {
+    if layers.len() != layer_mods.len() {
+        return None;
+    }
+    plan_selective_ntsc(
+        SelectiveNtscGeneration {
+            visual_epoch: 1,
+            topology_generation: 1,
+            width,
+            height,
+            sample_sequence: frame_num,
+        },
+        NtscFrameMetadata {
+            params: params.clone(),
+            reference_frame: export_ntsc_reference_frame(frame_num, fps, paused),
+        },
+        layers
+            .iter()
+            .zip(layer_mods)
+            .map(|(layer, (effects, opacity))| SelectiveNtscLayerDescriptor {
+                layer_id: export_selective_layer_id(layer.source_index),
+                visible: layer.visible,
+                bypass_master_fx: layer.bypass_master_fx,
+                opacity: *opacity,
+                blend_mode: layer.blend_mode.as_u32(),
+                // Export consumes every generated batch synchronously, so no
+                // stale-control comparison is needed. Keep a deterministic
+                // value in the shared plan nevertheless.
+                transform_fingerprint: export_selective_transform_fingerprint(
+                    effects,
+                    (!layer.bypass_master_fx).then_some(master),
+                ),
+            }),
+    )
+}
+
+fn export_selective_transform_fingerprint(
+    effects: &EffectUniforms,
+    master: Option<&EffectUniforms>,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytemuck::bytes_of(effects)
+        .iter()
+        .chain(master.into_iter().flat_map(bytemuck::bytes_of))
+    {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn export_ntsc_reference_frame(frame_num: u64, fps: u32, paused: bool) -> usize {
+    if paused {
+        0
+    } else {
+        reference_frame_for_output(frame_num, fps)
+    }
+}
+
+fn export_selective_topology_signature(plan: &SelectiveNtscPlan) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |value: u64| {
+        hash ^= value;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    };
+    mix(plan.layers.len() as u64);
+    for layer in &plan.layers {
+        mix(layer.layer_id);
+        mix(layer.bypass_master_fx as u64);
+    }
+    hash
+}
+
 fn run_export(
     patch: &PatchState,
     config: &ExportConfig,
@@ -906,6 +1172,13 @@ fn run_export(
     }
     if config.fps == 0 || config.fps > 240 {
         return Err("export FPS must be between 1 and 240".to_string());
+    }
+    if patch.layers.len() > crate::modulation::MAX_MOD_LAYERS {
+        return Err(format!(
+            "export patch has {} layers; maximum is {}",
+            patch.layers.len(),
+            crate::modulation::MAX_MOD_LAYERS
+        ));
     }
     if !config.duration_secs.is_finite()
         || config.duration_secs <= 0.0
@@ -1166,6 +1439,14 @@ fn run_export(
     let composite_views: [wgpu::TextureView; 3] = std::array::from_fn(|i| {
         composite_textures[i].create_view(&wgpu::TextureViewDescriptor::default())
     });
+    let (opaque_output_pipeline, opaque_output_bind_group_layout) =
+        crate::renderer::state::build_opaque_output_pipeline(&device);
+    let opaque_output_bind_group = crate::renderer::state::build_opaque_output_bind_group(
+        &device,
+        &opaque_output_bind_group_layout,
+        &composite_views[0],
+        &sampler,
+    );
 
     // --- Open video decoders for each layer ---
     let mut layers: Vec<ExportLayer> = Vec::new();
@@ -1193,6 +1474,33 @@ fn run_export(
             library_path
         };
         let path_text = path.to_string_lossy();
+        if crate::layers::is_still_image_file(&path) {
+            match crate::video::decode_still_image(&path, Some(max_dimension)) {
+                Ok(decoded) => {
+                    layers.push(still_export_layer(
+                        &device,
+                        &queue,
+                        source_index,
+                        layer_cfg,
+                        decoded,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Export: still layer '{}' could not be opened ({error}); rendering deterministic black at source index {source_index}",
+                        layer_cfg.filename
+                    );
+                    layers.push(black_placeholder_layer(
+                        &device,
+                        &queue,
+                        source_index,
+                        layer_cfg,
+                    ));
+                    continue;
+                }
+            }
+        }
         let mut decoder = match VideoDecoder::open_with_cancel(&path_text, progress.cancel.clone())
         {
             Ok(d) => d,
@@ -1307,6 +1615,7 @@ fn run_export(
             effects,
             opacity: layer_cfg.opacity,
             blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
+            bypass_master_fx: layer_cfg.bypass_master_fx,
             speed: layer_cfg.speed,
             visible: layer_cfg.visible,
             paused: layer_cfg.paused,
@@ -1329,14 +1638,46 @@ fn run_export(
         ntsc_state.params = ntsc_cfg.to_params();
     }
     let base_ntsc = ntsc_state.params.clone();
+    // Live global and selective workers own independent ntsc-rs state. Keep
+    // those processors distinct offline as well, especially when a morph
+    // crosses the discrete bypass boundary during one export.
+    let mut selective_ntsc_state = NtscState::new();
 
     // --- Modulation matrix (deterministic: beat derived from frame index) ---
-    // Audio and MIDI sources read 0 offline; LFO motion renders identically
-    // for the same patch every time.
+    // Imported audio is sampled from frame-indexed program time. Live capture,
+    // MIDI, and other hardware sources read 0 offline; LFO motion renders
+    // identically for the same patch every time.
     let mut mod_matrix = crate::modulation::ModMatrix::new();
     if let Some(ref mod_cfg) = patch.modulation {
         mod_cfg.apply_to_matrix(&mut mod_matrix);
     }
+    let analysis_clip = if mod_matrix.audio_enabled
+        && mod_matrix.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
+    {
+        let requested = std::path::PathBuf::from(&mod_matrix.audio_clip_path);
+        let resolved = if requested.is_file() {
+            requested
+        } else {
+            let basename = requested
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new(&mod_matrix.audio_clip_path));
+            std::path::Path::new(library_folder).join(basename)
+        };
+        if !resolved.is_file() {
+            return Err(format!(
+                "deterministic audio-analysis clip not found: {}",
+                mod_matrix.audio_clip_path
+            ));
+        }
+        Some(crate::audio::AudioClip::open(&resolved).map_err(|error| {
+            format!(
+                "cannot load deterministic audio-analysis clip {}: {error}",
+                resolved.display()
+            )
+        })?)
+    } else {
+        None
+    };
     let export_morph = patch.morph.clone().map(crate::morph::Morph::from_snapshot);
 
     // --- Temporal effects (feedback/slit-scan), same pass as live ---
@@ -1352,6 +1693,8 @@ fn run_export(
     let (feedback_texture, feedback_view) =
         crate::renderer::state::build_feedback_texture(&device, w, h);
     let mut temporal_state = crate::renderer::state::TemporalState::default();
+    let mut previous_selective_frame: Option<bool> = None;
+    let mut previous_selective_topology: Option<u64> = None;
 
     // --- Readback staging buffer ---
     let bytes_per_row = (w * 4 + 255) & !255;
@@ -1362,6 +1705,12 @@ fn run_export(
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
+    // Selective VHS reads one straight-alpha slice per contributing layer.
+    // Reuse a single staging allocation sequentially so peak host/GPU memory
+    // stays one frame plus the final CPU batch rather than N padded frames.
+    // This is allocated lazily on the first selective frame, preserving the
+    // established resource profile for every legacy/all-inherited export.
+    let mut selective_staging: Option<wgpu::Buffer> = None;
 
     // --- Spawn ffmpeg ---
     // Ensure output directory exists
@@ -1416,93 +1765,106 @@ fn run_export(
         }
 
         // Update time uniform for effects (breathe, grain seed, etc.)
-        let time = frame_num as f32 * frame_interval;
+        let (time, program_dt) =
+            export_program_transport(frame_num, frame_interval, patch.master_paused);
         master_effects.time = time;
 
         // Sample the modulation matrix at this frame's beat position and
         // derive the modulated params for this frame (bases untouched).
         let beat = time as f64 * (mod_matrix.clock.bpm as f64 / 60.0);
-        mod_matrix.update_at_beat(beat, if frame_num == 0 { 0.0 } else { frame_interval });
+        if let Some(clip) = &analysis_clip {
+            mod_matrix.audio = clip
+                .analyze_at_time(
+                    time as f64,
+                    mod_matrix.audio_gain,
+                    mod_matrix.audio_band_config,
+                )
+                .levels;
+        } else {
+            // Live capture and hardware sources are deliberately unavailable
+            // offline; their zero value makes exports repeatable.
+            mod_matrix.audio = crate::audio::AudioLevels::default();
+        }
+        update_export_modulation(&mut mod_matrix, beat, program_dt, patch.master_paused);
+        let modulation_frame = mod_matrix.frame();
         let mut frame_master = master_effects;
         let mut frame_ntsc = base_ntsc.clone();
         let mut frame_temporal = base_temporal;
         // Keep render parameters detached from decoder/runtime handles. A
         // full morph sample can then drive exactly the same layer world as
         // live rendering without mutating the saved patch bases.
-        let mut frame_layer_bases: Vec<(EffectUniforms, f32, f32, f32, BlendMode, bool, bool)> =
-            layers
-                .iter()
-                .map(|layer| {
-                    (
-                        layer.effects,
-                        layer.opacity,
-                        layer.speed,
-                        layer.fps,
-                        layer.blend_mode,
-                        layer.visible,
-                        layer.paused,
-                    )
-                })
-                .collect();
+        let mut frame_layer_bases: Vec<ExportFrameLayerBase> =
+            layers.iter().map(ExportFrameLayerBase::from).collect();
 
-        if let Some(morph) = export_morph.as_ref().filter(|morph| morph.active()) {
-            let t =
-                (morph.position_at_beat(beat) + mod_matrix.target_offset("morph")).clamp(0.0, 1.0);
-            if let Some(sample) = morph.sample(t) {
-                sample.master.apply_to(&mut frame_master);
-                frame_ntsc = sample.ntsc.to_params();
-                frame_temporal = sample.temporal.to_params();
-                for sampled in sample.layers {
-                    if let Some((position, _)) = layers
-                        .iter()
-                        .enumerate()
-                        .find(|(_, layer)| layer.source_index == sampled.position)
-                    {
-                        frame_layer_bases[position].1 = sampled.opacity;
-                        frame_layer_bases[position].2 = sampled.speed;
-                        if let Some(fps) = sampled.fps {
-                            frame_layer_bases[position].3 = fps;
-                        }
-                        if let Some(effects) = sampled.effects {
-                            effects.apply_to(&mut frame_layer_bases[position].0);
-                        }
-                        if let Some(key_threshold) = sampled.key_threshold {
-                            frame_layer_bases[position].0.key_threshold = key_threshold;
-                        }
-                        if let Some(blend_mode) = sampled.blend_mode {
-                            frame_layer_bases[position].4 = blend_mode.to_blend_mode();
-                        }
-                        if let Some(visible) = sampled.visible {
-                            frame_layer_bases[position].5 = visible;
-                        }
-                        if let Some(paused) = sampled.paused {
-                            frame_layer_bases[position].6 = paused;
-                        }
+        // Live Pause holds the already-materialized patch bases and does not
+        // re-apply a morph. Mirror that exact held-state contract offline.
+        if let Some(sample) = export_morph_sample(
+            export_morph.as_ref(),
+            beat,
+            modulation_frame.morph_offset(),
+            patch.master_paused,
+        ) {
+            sample.master.apply_to(&mut frame_master);
+            frame_ntsc = sample.ntsc.to_params();
+            frame_temporal = sample.temporal.to_params();
+            for sampled in sample.layers {
+                if let Some((position, _)) = layers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, layer)| layer.source_index == sampled.position)
+                {
+                    frame_layer_bases[position].opacity = sampled.opacity;
+                    frame_layer_bases[position].speed = sampled.speed;
+                    if let Some(fps) = sampled.fps {
+                        frame_layer_bases[position].fps = fps;
+                    }
+                    if let Some(effects) = sampled.effects {
+                        effects.apply_to(&mut frame_layer_bases[position].effects);
+                    }
+                    if let Some(key_threshold) = sampled.key_threshold {
+                        frame_layer_bases[position].effects.key_threshold = key_threshold;
+                    }
+                    if let Some(blend_mode) = sampled.blend_mode {
+                        frame_layer_bases[position].blend_mode = blend_mode.to_blend_mode();
+                    }
+                    if let Some(visible) = sampled.visible {
+                        frame_layer_bases[position].visible = visible;
+                    }
+                    if let Some(paused) = sampled.paused {
+                        frame_layer_bases[position].paused = paused;
+                    }
+                    if let Some(bypass_master_fx) = sampled.bypass_master_fx {
+                        frame_layer_bases[position].bypass_master_fx = bypass_master_fx;
                     }
                 }
             }
         }
         frame_master.time = time;
         let (mod_master, mod_ntsc, mod_temporal) =
-            mod_matrix.modulate(&frame_master, &frame_ntsc, &frame_temporal);
+            modulation_frame.modulate(&frame_master, &frame_ntsc, &frame_temporal);
 
         // Per-layer modulated values for this frame (bases untouched).
         let mut layer_mods: Vec<(EffectUniforms, f32)> = Vec::with_capacity(layers.len());
         let mut frame_speeds = Vec::with_capacity(layers.len());
-        for (l, (effects, opacity, speed, _, _, _, _)) in
-            layers.iter().zip(frame_layer_bases.iter())
-        {
-            let lm = mod_matrix.modulate_layer_full(l.source_index, effects, *opacity, *speed);
+        let mut frame_fps = Vec::with_capacity(layers.len());
+        // Keep placeholder slots in the batch so positional layer targets stay
+        // attached to their saved source identity even when media is missing.
+        let frame_modulations = modulation_frame.modulate_layers(
+            frame_layer_bases
+                .iter()
+                .map(|base| (&base.effects, base.opacity, base.speed, base.fps)),
+        );
+        for lm in frame_modulations {
             let mut fx = lm.effects;
             fx.time = time;
             frame_speeds.push(lm.speed);
+            frame_fps.push(lm.fps);
             layer_mods.push((fx, lm.opacity));
         }
-        for (layer, (_, _, _, _, blend_mode, visible, _)) in
-            layers.iter_mut().zip(frame_layer_bases.iter())
-        {
-            layer.blend_mode = *blend_mode;
-            layer.visible = *visible;
+        for (layer, base) in layers.iter_mut().zip(frame_layer_bases.iter()) {
+            layer.blend_mode = base.blend_mode;
+            layer.visible = base.visible;
+            layer.bypass_master_fx = base.bypass_master_fx;
         }
 
         // --- GPU render ---
@@ -1510,39 +1872,128 @@ fn run_export(
             label: Some("Export Frame Encoder"),
         });
 
-        // Render layers composited
-        render_layers_export(
-            &device,
-            &mut encoder,
+        let selective_plan = plan_export_selective_ntsc(
+            frame_num,
+            w,
+            h,
+            config.fps,
+            patch.master_paused,
+            &mod_ntsc,
             &layers,
             &layer_mods,
-            &composite_textures,
-            &composite_views,
-            &effects_pipeline,
-            &effects_bind_group_layout,
-            &effects_uniform_layout,
-            &composite_pipeline,
-            &composite_bind_group_layout,
-            &composite_uniform_layout,
-            &sampler,
-            w,
-            h,
-        );
-
-        // Master effects
-        render_master_effects_export(
-            &device,
-            &mut encoder,
             &mod_master,
-            &composite_textures,
-            &composite_views,
-            &effects_pipeline,
-            &effects_bind_group_layout,
-            &effects_uniform_layout,
-            &sampler,
-            w,
-            h,
         );
+        let selective_frame = selective_plan.is_some();
+        let selective_topology = selective_plan
+            .as_ref()
+            .map(export_selective_topology_signature);
+        let selective_edge =
+            previous_selective_frame.is_some_and(|previous| previous != selective_frame);
+        let selective_topology_changed = selective_frame
+            && previous_selective_topology
+                .is_some_and(|previous| Some(previous) != selective_topology);
+        if selective_edge || selective_topology_changed {
+            // Match live `reset_visual_generation`: no pre-switch feedback or
+            // slit history may cross a selective-VHS topology/path edge.
+            temporal_state = crate::renderer::state::TemporalState::default();
+        }
+        previous_selective_frame = Some(selective_frame);
+        previous_selective_topology = selective_topology;
+        if let Some(plan) = selective_plan {
+            let selective_staging = selective_staging.get_or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Export Selective NTSC Readback"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            });
+            // Each slice is rendered through local FX and conditional direct
+            // master FX in one coherent command stream. Composite/VHS stays
+            // on the CPU, so no unprocessed intermediate reaches Temporal.
+            let slices = match render_and_readback_selective_ntsc_slices_export(
+                &device,
+                &queue,
+                &mut encoder,
+                &layers,
+                &layer_mods,
+                &mod_master,
+                &plan,
+                &composite_textures,
+                &composite_views,
+                &effects_pipeline,
+                &effects_bind_group_layout,
+                &effects_uniform_layout,
+                &sampler,
+                selective_staging,
+                w,
+                h,
+                bytes_per_row,
+                &progress.cancel,
+            ) {
+                Ok(slices) => slices,
+                Err(error) => {
+                    write_error = Some(error);
+                    break;
+                }
+            };
+            if progress.cancel.load(Ordering::Acquire) {
+                write_error = Some("export cancelled before selective NTSC processing".into());
+                break;
+            }
+            let processed = match process_selective_ntsc_batch_with_state(
+                &mut selective_ntsc_state,
+                SelectiveNtscBatch { plan, slices },
+            ) {
+                Ok(processed) => processed,
+                Err(error) => {
+                    write_error = Some(format!("selective NTSC export failed: {error}"));
+                    break;
+                }
+            };
+            if progress.cancel.load(Ordering::Acquire) {
+                write_error = Some("export cancelled during selective NTSC processing".into());
+                break;
+            }
+            if let Err(error) = upload_engine_composite_export(
+                &queue,
+                &composite_textures[0],
+                &processed.pixels,
+                w,
+                h,
+            ) {
+                write_error = Some(error);
+                break;
+            }
+            // CPU processing and queue upload are complete before Temporal is
+            // encoded. A fresh command stream prevents the earlier layer
+            // passes from overwriting the returned straight-alpha composite.
+            encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Export Selective Post-NTSC Encoder"),
+            });
+        } else {
+            // Byte-for-byte legacy path: VHS-off and all-inherited stacks keep
+            // the established direct render -> Temporal -> opaque -> global
+            // NTSC order without any selective slice allocation or composite.
+            render_layers_and_master_export(
+                &device,
+                &mut encoder,
+                &layers,
+                &layer_mods,
+                &mod_master,
+                &composite_textures,
+                &composite_views,
+                &effects_pipeline,
+                &effects_bind_group_layout,
+                &effects_uniform_layout,
+                &composite_pipeline,
+                &composite_bind_group_layout,
+                &composite_uniform_layout,
+                &sampler,
+                w,
+                h,
+            );
+        }
 
         // Temporal effects + history recording (identical pass to live)
         crate::renderer::state::encode_temporal_with_dt(
@@ -1560,9 +2011,20 @@ fn run_export(
             &feedback_texture,
             &feedback_view,
             &mut temporal_state,
-            if frame_num == 0 { 0.0 } else { frame_interval },
+            program_dt,
+            !patch.master_paused,
             w,
             h,
+        );
+
+        // Export consumes the same opaque SDR program image as live preview,
+        // projector, Spout, and NTSC. Keep key alpha inside the engine and
+        // flatten it over black exactly once at this boundary.
+        crate::renderer::state::encode_opaque_output(
+            &mut encoder,
+            &opaque_output_pipeline,
+            &opaque_output_bind_group,
+            &composite_views[2],
         );
 
         // Submit GPU work
@@ -1572,7 +2034,7 @@ fn run_export(
         let mut pixels = match readback_pixels(
             &device,
             &queue,
-            &composite_textures[0],
+            &composite_textures[2],
             &staging,
             w,
             h,
@@ -1585,8 +2047,18 @@ fn run_export(
                 break;
             }
         };
-        ntsc_state.params = mod_ntsc;
-        ntsc_state.apply(&mut pixels, w, h);
+        // Selective mode has already applied VHS to inherited slices before
+        // Temporal. Every other frame retains the established global
+        // post-composite VHS call exactly once.
+        if !selective_frame {
+            ntsc_state.params = mod_ntsc;
+            ntsc_state.apply_at_reference_frame(
+                &mut pixels,
+                w,
+                h,
+                export_ntsc_reference_frame(frame_num, config.fps, patch.master_paused),
+            );
+        }
 
         // Write to ffmpeg
         if let Err(error) = ffmpeg_stdin.write_all(&pixels) {
@@ -1599,7 +2071,9 @@ fn run_export(
         // source and export frame rates differ.
         if frame_num + 1 < total_frames {
             for (i, layer) in layers.iter_mut().enumerate() {
-                let (_, _, _, fps, _, _, paused) = frame_layer_bases[i];
+                let base = frame_layer_bases[i];
+                let fps = frame_fps[i];
+                let paused = base.paused;
                 if patch.master_paused || paused {
                     // Live transport resets fractional debt while paused, so
                     // a morph-driven pause/unpause must resume from a fresh
@@ -1686,10 +2160,14 @@ fn run_export(
         publish_cancelled_terminal(progress, Some(&config.output_path));
         drop(layers);
         drop(staging);
+        drop(selective_staging);
         drop(history_view);
         drop(history_texture);
         drop(feedback_view);
         drop(feedback_texture);
+        drop(opaque_output_bind_group);
+        drop(opaque_output_bind_group_layout);
+        drop(opaque_output_pipeline);
         drop(composite_views);
         drop(composite_textures);
         drop(temporal_pipeline);
@@ -1710,6 +2188,7 @@ fn run_export(
         drop(queue);
         drop(device);
         drop(ntsc_state);
+        drop(selective_ntsc_state);
         drop(mod_matrix);
         drop(export_morph);
         drop(layer_accumulators);
@@ -1839,6 +2318,613 @@ fn readback_pixels(
     Ok(pixels)
 }
 
+fn upload_engine_composite_export(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "selective NTSC export dimensions overflow".to_string())?;
+    if pixels.len() != expected {
+        return Err(format!(
+            "selective NTSC export composite has {} bytes; expected {expected}",
+            pixels.len()
+        ));
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    Ok(())
+}
+
+/// Render all planned straight-alpha slices and synchronously collect them in
+/// the shared plan's bottom-to-top order. Export is intentionally synchronous:
+/// it must write each exact requested frame to ffmpeg, unlike live preview's
+/// bounded delayed worker.
+#[allow(clippy::too_many_arguments)]
+fn render_and_readback_selective_ntsc_slices_export(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    layer_mods: &[(EffectUniforms, f32)],
+    master_uniforms: &EffectUniforms,
+    plan: &SelectiveNtscPlan,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    staging: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    cancel: &AtomicBool,
+) -> Result<Vec<Vec<u8>>, String> {
+    if layers.len() != layer_mods.len() {
+        return Err("selective NTSC export layer/modulation alignment mismatch".into());
+    }
+    if plan.generation.width != width || plan.generation.height != height {
+        return Err("selective NTSC export plan dimensions changed before rendering".into());
+    }
+
+    let master_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Export Selective NTSC Master FX Uniforms"),
+        contents: bytemuck::cast_slice(&[*master_uniforms]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let master_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Export Selective NTSC Master FX Input"),
+        layout: effects_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&composite_views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    let master_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Export Selective NTSC Master FX Uniforms BG"),
+        layout: effects_uniform_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: master_buffer.as_entire_binding(),
+        }],
+    });
+
+    let mut slices = Vec::with_capacity(plan.layers.len());
+    for planned_layer in &plan.layers {
+        if cancel.load(Ordering::Acquire) {
+            return Err("export cancelled before selective NTSC slice".to_string());
+        }
+        let source_index = layers
+            .iter()
+            .position(|layer| {
+                export_selective_layer_id(layer.source_index) == planned_layer.layer_id
+            })
+            .ok_or_else(|| {
+                format!(
+                    "selective NTSC export layer {} disappeared before rendering",
+                    planned_layer.layer_id
+                )
+            })?;
+        let layer = &layers[source_index];
+        if !layer.visible || layer.bypass_master_fx != planned_layer.bypass_master_fx {
+            return Err(format!(
+                "selective NTSC export layer {} changed before rendering",
+                planned_layer.layer_id
+            ));
+        }
+
+        let frame_fx = layer_mods[source_index].0.for_render_target(width, height);
+        let fx_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Export Selective NTSC Layer FX Uniforms"),
+            contents: bytemuck::cast_slice(&[frame_fx]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layer_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Selective NTSC Layer FX Input"),
+            layout: effects_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&layer.texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        let layer_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Selective NTSC Layer FX Uniforms BG"),
+            layout: effects_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: fx_buffer.as_entire_binding(),
+            }],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Selective NTSC Layer FX"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[1],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(effects_pipeline);
+            pass.set_bind_group(0, &layer_tex_bg, &[]);
+            pass.set_bind_group(1, &layer_uniform_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let output_slot = if planned_layer.bypass_master_fx {
+            1
+        } else {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Selective NTSC Direct Master FX"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[2],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(effects_pipeline);
+            pass.set_bind_group(0, &master_tex_bg, &[]);
+            pass.set_bind_group(1, &master_uniform_bg, &[]);
+            pass.draw(0..3, 0..1);
+            2
+        };
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[output_slot],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        // One coherent slice must complete before the shared staging buffer is
+        // reused. This is bounded and deterministic for the offline path.
+        let finished = std::mem::replace(
+            encoder,
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Export Selective NTSC Slice Encoder"),
+            }),
+        );
+        queue.submit(std::iter::once(finished.finish()));
+        slices.push(map_export_readback(
+            device,
+            staging,
+            width,
+            height,
+            bytes_per_row,
+            cancel,
+            "selective NTSC slice",
+        )?);
+    }
+    Ok(slices)
+}
+
+fn map_export_readback(
+    device: &wgpu::Device,
+    staging: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    cancel: &AtomicBool,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            staging.unmap();
+            return Err(format!("export cancelled during GPU {label} readback"));
+        }
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_millis(100)),
+        });
+        match rx.try_recv() {
+            Ok(Ok(())) => break,
+            Ok(Err(error)) => {
+                staging.unmap();
+                return Err(format!("GPU {label} readback map failed: {error}"));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                staging.unmap();
+                return Err(format!("GPU {label} readback callback disconnected"));
+            }
+        }
+    }
+    let data = slice.get_mapped_range();
+    let row_bytes = (width * 4) as usize;
+    let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+    for row in 0..height as usize {
+        let start = row * bytes_per_row as usize;
+        pixels.extend_from_slice(&data[start..start + row_bytes]);
+    }
+    drop(data);
+    staging.unmap();
+    Ok(pixels)
+}
+
+/// Mirror [`crate::renderer::state::Renderer::render_layers_and_master`].
+/// The legacy branch deliberately delegates to the two pre-existing export
+/// passes unchanged; only a visible bypass enters the conditional path.
+#[allow(clippy::too_many_arguments)]
+fn render_layers_and_master_export(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    layer_mods: &[(EffectUniforms, f32)],
+    master_uniforms: &EffectUniforms,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    composite_pipeline: &wgpu::RenderPipeline,
+    composite_bind_group_layout: &wgpu::BindGroupLayout,
+    composite_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    output_width: u32,
+    output_height: u32,
+) {
+    let path = master_fx_composition_path(
+        layers
+            .iter()
+            .zip(layer_mods.iter())
+            .map(|(layer, (_, opacity))| (layer.visible, layer.bypass_master_fx, *opacity)),
+    );
+    match path {
+        MasterFxCompositionPath::LegacyPostComposite => {
+            render_layers_export(
+                device,
+                encoder,
+                layers,
+                layer_mods,
+                composite_textures,
+                composite_views,
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                composite_pipeline,
+                composite_bind_group_layout,
+                composite_uniform_layout,
+                sampler,
+                output_width,
+                output_height,
+            );
+            render_master_effects_export(
+                device,
+                encoder,
+                master_uniforms,
+                composite_textures,
+                composite_views,
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                sampler,
+                output_width,
+                output_height,
+            );
+        }
+        MasterFxCompositionPath::ConditionalPerLayer => {
+            render_layers_with_conditional_master_export(
+                device,
+                encoder,
+                layers,
+                layer_mods,
+                master_uniforms,
+                composite_textures,
+                composite_views,
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                composite_pipeline,
+                composite_bind_group_layout,
+                composite_uniform_layout,
+                sampler,
+                output_width,
+                output_height,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_layers_with_conditional_master_export(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    layer_mods: &[(EffectUniforms, f32)],
+    master_uniforms: &EffectUniforms,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    composite_pipeline: &wgpu::RenderPipeline,
+    composite_bind_group_layout: &wgpu::BindGroupLayout,
+    composite_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    output_width: u32,
+    output_height: u32,
+) {
+    let visible_layers: Vec<(&ExportLayer, &(EffectUniforms, f32))> = visible_stack_indices(
+        layers
+            .iter()
+            .zip(layer_mods.iter())
+            .map(|(layer, _)| layer.visible),
+    )
+    .into_iter()
+    .map(|index| (&layers[index], &layer_mods[index]))
+    .collect();
+    debug_assert!(visible_layers
+        .iter()
+        .any(|(layer, _)| layer.bypass_master_fx));
+
+    let master_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Export Conditional Master FX Uniforms"),
+        contents: bytemuck::cast_slice(&[*master_uniforms]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let master_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Export Conditional Master FX Input"),
+        layout: effects_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&composite_views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    });
+    let master_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Export Conditional Master FX Uniforms BG"),
+        layout: effects_uniform_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: master_buffer.as_entire_binding(),
+        }],
+    });
+
+    for (stack_index, (layer, (mod_fx, mod_opacity))) in visible_layers.iter().enumerate() {
+        let frame_fx = mod_fx.for_render_target(output_width, output_height);
+        let layer_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Export Conditional Layer FX Uniforms"),
+            contents: bytemuck::cast_slice(&[frame_fx]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let layer_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Conditional Layer FX Input"),
+            layout: effects_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&layer.texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        let layer_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Conditional Layer FX Uniforms BG"),
+            layout: effects_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: layer_buffer.as_entire_binding(),
+            }],
+        });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Conditional Layer FX"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[1],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(effects_pipeline);
+            pass.set_bind_group(0, &layer_tex_bg, &[]);
+            pass.set_bind_group(1, &layer_uniform_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        let slots = conditional_layer_slots(layer.bypass_master_fx);
+        if let Some(master_output) = slots.master_output {
+            debug_assert_eq!(master_output, 2);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Conditional Master FX"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[master_output],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(effects_pipeline);
+            pass.set_bind_group(0, &master_tex_bg, &[]);
+            pass.set_bind_group(1, &master_uniform_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        if stack_index == 0 {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Conditional Clear Base"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[0],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+
+        let overlay_slot = slots.master_output.unwrap_or(1);
+        let comp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Export Conditional Composite Uniforms"),
+            contents: bytemuck::cast_slice(&[CompositeUniforms {
+                opacity: *mod_opacity,
+                blend_mode: if stack_index == 0 {
+                    0
+                } else {
+                    layer.blend_mode.as_u32()
+                },
+                _pad: [0.0; 2],
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let composite_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Conditional Composite Textures BG"),
+            layout: composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&composite_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&composite_views[overlay_slot]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        let composite_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Conditional Composite Uniform BG"),
+            layout: composite_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: comp_buffer.as_entire_binding(),
+            }],
+        });
+
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Conditional Composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[slots.composite_output],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(composite_pipeline);
+            pass.set_bind_group(0, &composite_tex_bg, &[]);
+            pass.set_bind_group(1, &composite_uniform_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[slots.composite_output],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: output_width,
+                height: output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
 /// Render all visible layers composited (mirrors Renderer::render_layers).
 // Keep the GPU resources explicit so their render-pass lifetimes remain clear.
 #[allow(clippy::too_many_arguments)]
@@ -1873,7 +2959,7 @@ fn render_layers_export(
                 view: &composite_views[0],
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -1885,9 +2971,13 @@ fn render_layers_export(
     }
 
     for (i, (layer, (mod_fx, mod_opacity))) in visible_layers.iter().enumerate() {
+        // Mirror the live renderer: this pass maps source UVs into an
+        // output-sized composite, so spatial effects use the export target's
+        // resolution and aspect rather than the decoded source's.
+        let frame_fx = mod_fx.for_render_target(output_width, output_height);
         let fx_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Export Layer FX"),
-            contents: bytemuck::cast_slice(&[*mod_fx]),
+            contents: bytemuck::cast_slice(&[frame_fx]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
@@ -1945,7 +3035,7 @@ fn render_layers_export(
                     view: &composite_views[0],
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -2140,6 +3230,92 @@ mod tests {
         }
     }
 
+    #[test]
+    fn export_layer_accumulation_starts_transparent() {
+        let clear = transparent_accumulation_clear();
+        assert_eq!([clear.r, clear.g, clear.b, clear.a], [0.0; 4]);
+    }
+
+    #[test]
+    fn selective_export_uses_shared_order_opacity_and_reference_clock() {
+        let params = crate::ntsc::NtscParams {
+            enabled: true,
+            ..Default::default()
+        };
+        let plan = plan_selective_ntsc(
+            SelectiveNtscGeneration {
+                visual_epoch: 1,
+                topology_generation: 1,
+                width: 2,
+                height: 2,
+                sample_sequence: 17,
+            },
+            NtscFrameMetadata {
+                params,
+                reference_frame: reference_frame_for_output(17, 60),
+            },
+            [
+                SelectiveNtscLayerDescriptor {
+                    layer_id: export_selective_layer_id(0),
+                    visible: true,
+                    bypass_master_fx: true,
+                    opacity: 0.4,
+                    blend_mode: BlendMode::Difference.as_u32(),
+                    transform_fingerprint: 10,
+                },
+                SelectiveNtscLayerDescriptor {
+                    layer_id: export_selective_layer_id(1),
+                    visible: false,
+                    bypass_master_fx: false,
+                    opacity: 1.0,
+                    blend_mode: BlendMode::Screen.as_u32(),
+                    transform_fingerprint: 20,
+                },
+                SelectiveNtscLayerDescriptor {
+                    layer_id: export_selective_layer_id(2),
+                    visible: true,
+                    bypass_master_fx: false,
+                    opacity: 0.8,
+                    blend_mode: BlendMode::Multiply.as_u32(),
+                    transform_fingerprint: 30,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.generation.sample_sequence, 17);
+        assert_eq!(plan.metadata.reference_frame, 8);
+        assert_eq!(
+            plan.layers
+                .iter()
+                .map(|layer| layer.layer_id)
+                .collect::<Vec<_>>(),
+            [3, 1]
+        );
+        assert_eq!(plan.layers[0].blend_mode, 0);
+        assert_eq!(plan.layers[1].blend_mode, BlendMode::Difference.as_u32());
+        assert_eq!(plan.layers[0].opacity, 0.8);
+        assert_eq!(plan.layers[1].opacity, 0.4);
+        assert!(!plan.layers[0].bypass_master_fx);
+        assert!(plan.layers[1].bypass_master_fx);
+
+        let signature = export_selective_topology_signature(&plan);
+        let mut continuous_change = plan.clone();
+        continuous_change.layers[0].opacity = 0.2;
+        continuous_change.layers[0].transform_fingerprint ^= 1;
+        assert_eq!(
+            export_selective_topology_signature(&continuous_change),
+            signature,
+            "ordinary modulation must not erase Temporal history"
+        );
+        let mut bypass_change = plan.clone();
+        bypass_change.layers[0].bypass_master_fx = true;
+        assert_ne!(
+            export_selective_topology_signature(&bypass_change),
+            signature
+        );
+    }
+
     fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         args.windows(2)
             .find(|window| window[0] == flag)
@@ -2178,6 +3354,62 @@ mod tests {
         assert_eq!(export_frame_count(30, 1.0), 30);
         assert_eq!(export_frame_count(30, 1.001), 31);
         assert_eq!(export_frame_count(24, 1.25), 30);
+    }
+
+    #[test]
+    fn master_pause_freezes_every_export_program_frame_at_zero() {
+        for frame in [0, 1, 29, 300] {
+            assert_eq!(
+                export_program_transport(frame, 1.0 / 30.0, true),
+                (0.0, 0.0)
+            );
+        }
+        assert_eq!(export_program_transport(0, 1.0 / 30.0, false), (0.0, 0.0));
+        let (time, dt) = export_program_transport(30, 1.0 / 30.0, false);
+        assert!((time - 1.0).abs() < 1e-6);
+        assert!((dt - 1.0 / 30.0).abs() < 1e-6);
+        assert_eq!(export_ntsc_reference_frame(300, 60, true), 0);
+        assert_eq!(export_ntsc_reference_frame(300, 60, false), 150);
+    }
+
+    #[test]
+    fn master_pause_does_not_initialize_transient_modulation_only_offline() {
+        use crate::modulation::{ModMatrix, ModSource, Routing};
+
+        fn matrix_with_positive_lfo() -> ModMatrix {
+            let mut matrix = ModMatrix::new();
+            matrix.lfos[0].set_phase(0.25);
+            matrix
+                .routings
+                .push(Routing::new(ModSource::Lfo(0), "brightness", 1.0));
+            matrix
+        }
+
+        let mut paused = matrix_with_positive_lfo();
+        update_export_modulation(&mut paused, 0.0, 0.0, true);
+        assert_eq!(paused.routings[0].cached_value(), 0.0);
+
+        let mut running = matrix_with_positive_lfo();
+        update_export_modulation(&mut running, 0.0, 0.0, false);
+        assert!(running.routings[0].cached_value() > 0.99);
+    }
+
+    #[test]
+    fn master_pause_holds_materialized_bases_instead_of_resampling_morph() {
+        let mut a = crate::morph::MorphSlot::default();
+        a.master.brightness = -1.0;
+        let mut b = crate::morph::MorphSlot::default();
+        b.master.brightness = 1.0;
+        let morph = crate::morph::Morph {
+            a: Some(a),
+            b: Some(b),
+            t: 1.0,
+            ..Default::default()
+        };
+
+        assert!(export_morph_sample(Some(&morph), 0.0, 0.0, true).is_none());
+        let running = export_morph_sample(Some(&morph), 0.0, 0.0, false).unwrap();
+        assert_eq!(running.master.brightness, 1.0);
     }
 
     #[test]
@@ -2426,6 +3658,7 @@ mod tests {
                 source_path: String::new(),
                 opacity: 1.0,
                 blend_mode: "normal".to_string(),
+                bypass_master_fx: false,
                 speed: 1.0,
                 fps: 30.0,
                 paused: false,
@@ -2517,6 +3750,7 @@ mod effects_audit {
                 source_path: String::new(),
                 opacity: 1.0,
                 blend_mode: "normal".to_string(),
+                bypass_master_fx: false,
                 speed: 1.0,
                 fps: 30.0,
                 paused: false,
@@ -2552,6 +3786,30 @@ mod effects_audit {
     /// (ffprobe signalstats/entropy). Needs a GPU, ffmpeg on PATH, and
     /// videos/audit.mp4 — run explicitly:
     ///   cargo test --release effects_audit -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_selective_vhs_bypass_pipeline() {
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        let mut patch = base_patch();
+        let mut bottom = patch.layers[0].clone();
+        bottom.opacity = 0.75;
+        bottom.blend_mode = "multiply".into();
+        patch.layers.push(bottom);
+        patch.layers[0].bypass_master_fx = true;
+        patch.layers[0].opacity = 0.6;
+        patch.layers[0].blend_mode = "difference".into();
+        patch.master.hue_shift = 75.0;
+        let ntsc = patch.ntsc.as_mut().unwrap();
+        ntsc.enabled = true;
+        ntsc.snow_intensity = 0.45;
+        ntsc.edge_wave_enabled = true;
+        ntsc.edge_wave_intensity = 4.0;
+        render("selective_vhs_bypass", patch);
+    }
+
     #[test]
     #[ignore = "renders the full effects audit matrix; run explicitly"]
     fn render_effects_matrix() {
@@ -2608,6 +3866,13 @@ mod effects_audit {
         p.master.color_drift = 0.02;
         p.master.breathe_scale = 0.05;
         render("drift_breathe", p);
+
+        let mut p = base_patch();
+        p.master.cellular_amount = 0.85;
+        p.master.cellular_scale = 12.0;
+        p.master.cellular_warp = 0.6;
+        p.master.cellular_speed = 0.75;
+        render("cellular", p);
 
         let mut p = base_patch();
         p.layers[0].effects.key_mode = 1;

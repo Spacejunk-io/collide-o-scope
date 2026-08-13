@@ -19,6 +19,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_SENDER_NAME_BYTES: usize = 255;
+// Spout's default shared-texture format. `receive_image` returns the texture's
+// native four-byte channel order, while our wgpu layer texture is RGBA8.
+const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 
 /// A complete RGBA8 frame received from a Spout sender.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +241,7 @@ fn receive_worker(
         // The first receive establishes the real sender dimensions.
         let (mut width, mut height) = (16u32, 16u32);
         let mut pixels = vec![0u8; 16 * 16 * 4];
+        let mut sender_format = 0;
         let retry_error = loop {
             if should_stop(stop_rx, running) {
                 return;
@@ -250,6 +254,7 @@ fn receive_worker(
 
             if receiver.is_updated() {
                 let (new_width, new_height) = receiver.sender_size();
+                sender_format = receiver.sender_format();
                 if new_width == 0 || new_height == 0 {
                     update_status(status, |current| {
                         current.active = false;
@@ -286,7 +291,7 @@ fn receive_worker(
 
                 if receiver.is_frame_new() {
                     if let Some(sequence) =
-                        publish_latest(latest, &pixels, width, height, next_sequence)
+                        publish_latest(latest, &pixels, width, height, sender_format, next_sequence)
                     {
                         update_status(status, |current| current.sequence = sequence);
                     }
@@ -382,6 +387,7 @@ fn publish_latest(
     pixels: &[u8],
     width: u32,
     height: u32,
+    sender_format: u32,
     next_sequence: &AtomicU64,
 ) -> Option<u64> {
     let expected_len = frame_byte_len(width, height).ok()?;
@@ -400,19 +406,44 @@ fn publish_latest(
         .as_mut()
         .filter(|frame| frame.pixels.len() == pixels.len())
     {
-        frame.pixels.copy_from_slice(pixels);
+        copy_received_pixels_to_rgba(&mut frame.pixels, pixels, sender_format);
         frame.width = width;
         frame.height = height;
         frame.sequence = sequence;
     } else {
+        let mut rgba = vec![0; pixels.len()];
+        copy_received_pixels_to_rgba(&mut rgba, pixels, sender_format);
         *slot = Some(SpoutFrame {
-            pixels: pixels.to_vec(),
+            pixels: rgba,
             width,
             height,
             sequence,
         });
     }
     Some(sequence)
+}
+
+/// Copy a native Spout pixel buffer into the RGBA8 layout used by wgpu.
+///
+/// Format 87 is Spout's documented default and is byte-ordered BGRA. Known
+/// RGBA formats and unrecognized format codes are copied unchanged: guessing
+/// at an unknown layout would be more destructive than preserving the SDK's
+/// legacy byte-for-byte behavior. Conversion happens during the mandatory
+/// copy into the one-frame slot, so it adds neither a second full-frame pass
+/// nor another allocation in steady state.
+fn copy_received_pixels_to_rgba(destination: &mut [u8], source: &[u8], sender_format: u32) {
+    debug_assert_eq!(destination.len(), source.len());
+    if sender_format != DXGI_FORMAT_B8G8R8A8_UNORM {
+        destination.copy_from_slice(source);
+        return;
+    }
+
+    for (rgba, bgra) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+        rgba[0] = bgra[2];
+        rgba[1] = bgra[1];
+        rgba[2] = bgra[0];
+        rgba[3] = bgra[3];
+    }
 }
 
 fn increment_sequence(counter: &AtomicU64) -> u64 {
@@ -477,8 +508,14 @@ mod tests {
     fn newest_frame_overwrites_an_unconsumed_frame() {
         let latest = Mutex::new(None);
         let sequence = AtomicU64::new(0);
-        assert_eq!(publish_latest(&latest, &[1; 8], 2, 1, &sequence), Some(1));
-        assert_eq!(publish_latest(&latest, &[7; 8], 2, 1, &sequence), Some(2));
+        assert_eq!(
+            publish_latest(&latest, &[1; 8], 2, 1, 28, &sequence),
+            Some(1)
+        );
+        assert_eq!(
+            publish_latest(&latest, &[7; 8], 2, 1, 28, &sequence),
+            Some(2)
+        );
 
         let frame = take_latest(&latest).expect("latest frame");
         assert_eq!(frame.pixels, vec![7; 8]);
@@ -492,12 +529,70 @@ mod tests {
         let sequence = AtomicU64::new(0);
         let guard = latest.lock().expect("lock test slot");
 
-        assert_eq!(publish_latest(&latest, &[1; 4], 1, 1, &sequence), None);
+        assert_eq!(publish_latest(&latest, &[1; 4], 1, 1, 28, &sequence), None);
         assert_eq!(take_latest(&latest), None);
         assert_eq!(sequence.load(Ordering::Relaxed), 0);
 
         drop(guard);
-        assert_eq!(publish_latest(&latest, &[1; 4], 1, 1, &sequence), Some(1));
+        assert_eq!(
+            publish_latest(&latest, &[1; 4], 1, 1, 28, &sequence),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn bgra_sender_pixels_are_normalized_to_rgba() {
+        let source = [10, 20, 30, 40, 1, 2, 3, 4];
+        let mut destination = [0; 8];
+
+        copy_received_pixels_to_rgba(&mut destination, &source, DXGI_FORMAT_B8G8R8A8_UNORM);
+
+        assert_eq!(destination, [30, 20, 10, 40, 3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn rgba_and_unknown_sender_formats_remain_byte_exact() {
+        let source = [10, 20, 30, 40, 1, 2, 3, 4];
+        for format in [28, 29, 0, u32::MAX] {
+            let mut destination = [0; 8];
+            copy_received_pixels_to_rgba(&mut destination, &source, format);
+            assert_eq!(destination, source, "format {format}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the standard Spout Sender demo to be running"]
+    fn live_demo_sender_delivers_a_coloured_frame() {
+        let mut input = SpoutIn::new("Spout Sender");
+        input.start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut received = None;
+
+        while std::time::Instant::now() < deadline {
+            if let Some(frame) = input.try_recv() {
+                let has_colour = frame
+                    .pixels
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[..3].iter().any(|channel| *channel != 0));
+                if has_colour {
+                    received = Some((input.status(), frame));
+                    break;
+                }
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        input.stop();
+        let (status, frame) = received.expect("a non-black frame from 'Spout Sender'");
+        assert!(status.active);
+        assert_eq!(status.sender_name, "Spout Sender");
+        assert_eq!((frame.width, frame.height), (status.width, status.height));
+        assert!(frame.sequence > 0);
+        eprintln!(
+            "received '{}' at {}x{}, frame {}",
+            status.sender_name, frame.width, frame.height, frame.sequence
+        );
     }
 
     #[test]

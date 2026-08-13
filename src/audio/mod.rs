@@ -19,12 +19,62 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+pub mod clip;
+pub use clip::{
+    is_supported_audio_extension, is_supported_audio_file, AudioClip, AudioClipLoadState,
+    AudioClipLoader,
+};
+
 const FFT_SIZE: usize = 1024;
 /// Keep a little more than one FFT window buffered.
 const MAX_BUFFERED: usize = FFT_SIZE * 4;
 /// A live CPAL stream should deliver callbacks continuously, including for
 /// digital silence. Treat a longer gap as a disconnected/stalled device.
 const STALE_STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn sample_stall_is_terminal(system_playback_capture: bool, elapsed: Duration) -> bool {
+    // WASAPI loopback is event-driven and may emit no packets while its output
+    // endpoint is silent. A quiet computer is therefore a valid zero signal,
+    // not evidence that the capture stream died.
+    !system_playback_capture && elapsed >= STALE_STREAM_TIMEOUT
+}
+/// Stable protocol prefix for WASAPI system-playback loopback sources.
+/// A device name is never interpreted as loopback unless it has this prefix.
+pub const SYSTEM_PLAYBACK_PREFIX: &str = "system-playback:";
+pub const DEFAULT_SYSTEM_PLAYBACK_SOURCE: &str = "system-playback:default";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSelection<'a> {
+    DefaultInput,
+    NamedInput(&'a str),
+    DefaultSystemPlayback,
+    NamedSystemPlayback(&'a str),
+}
+
+fn parse_capture_selection(value: &str) -> CaptureSelection<'_> {
+    if value.is_empty() {
+        CaptureSelection::DefaultInput
+    } else if value == DEFAULT_SYSTEM_PLAYBACK_SOURCE {
+        CaptureSelection::DefaultSystemPlayback
+    } else if let Some(name) = value.strip_prefix(SYSTEM_PLAYBACK_PREFIX) {
+        CaptureSelection::NamedSystemPlayback(name)
+    } else {
+        CaptureSelection::NamedInput(value)
+    }
+}
+
+#[cfg(test)]
+pub fn is_system_playback_source(value: &str) -> bool {
+    matches!(
+        parse_capture_selection(value),
+        CaptureSelection::DefaultSystemPlayback | CaptureSelection::NamedSystemPlayback(_)
+    )
+}
+
+#[cfg(test)]
+pub fn system_playback_source(device_name: &str) -> String {
+    format!("{SYSTEM_PLAYBACK_PREFIX}{device_name}")
+}
 
 pub const AUDIO_SPECTRUM_BINS: usize = 32;
 pub const MIN_AUDIO_BANDS: usize = 3;
@@ -245,7 +295,7 @@ impl AudioBandEdges {
 }
 
 /// Normalized audio levels, all 0..1.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct AudioLevels {
     pub level: f32,
     /// Configurable band outputs. Entries at or above the active band count
@@ -378,6 +428,7 @@ pub struct AudioAnalyzer {
     spectrum_peak: f32,
     last_sample_count: u64,
     last_sample_at: Instant,
+    system_playback_capture: bool,
     /// Preference used to open the current/most recently attempted stream.
     /// Empty means the system default, matching `ModMatrix::audio_device`.
     requested_device: String,
@@ -388,6 +439,9 @@ pub struct AudioAnalyzer {
     pub error: String,
     /// Input device names, refreshed on every start (for the UI select).
     pub devices: Vec<String>,
+    /// Selectable WASAPI system-playback sources, encoded with
+    /// `SYSTEM_PLAYBACK_PREFIX` to avoid colliding with input device names.
+    pub system_playback_devices: Vec<String>,
 }
 
 impl AudioAnalyzer {
@@ -420,11 +474,13 @@ impl AudioAnalyzer {
             spectrum_peak: 1e-9,
             last_sample_count: 0,
             last_sample_at: Instant::now(),
+            system_playback_capture: false,
             requested_device: String::new(),
             using_device_fallback: false,
             device_name: String::new(),
             error: String::new(),
             devices: Vec::new(),
+            system_playback_devices: Vec::new(),
         };
         analyzer.refresh_devices();
         analyzer
@@ -437,6 +493,17 @@ impl AudioAnalyzer {
             .input_devices()
             .map(|iter| iter.filter_map(|d| d.name().ok()).collect())
             .unwrap_or_default();
+        #[cfg(windows)]
+        {
+            self.system_playback_devices = host
+                .output_devices()
+                .map(|iter| iter.filter_map(|device| device.name().ok()).collect())
+                .unwrap_or_default();
+        }
+        #[cfg(not(windows))]
+        {
+            self.system_playback_devices.clear();
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -531,6 +598,7 @@ impl AudioAnalyzer {
         self.requested_device.push_str(preferred);
         self.device_name.clear();
         self.using_device_fallback = false;
+        self.system_playback_capture = false;
         self.error.clear();
         self.reset_analysis();
         if let Ok(mut error) = self.shared.stream_error.lock() {
@@ -539,27 +607,69 @@ impl AudioAnalyzer {
         self.refresh_devices();
 
         let host = cpal::default_host();
-        let (device, using_fallback) = if preferred.is_empty() {
-            (host.default_input_device(), false)
-        } else {
-            let selected = host.input_devices().ok().and_then(|mut iter| {
-                iter.find(|d| d.name().map(|n| n == preferred).unwrap_or(false))
-            });
-            match selected {
-                Some(device) => (Some(device), false),
-                None => {
-                    log::warn!("Audio device '{preferred}' not found; using default");
-                    (host.default_input_device(), true)
+        let selection = parse_capture_selection(preferred);
+        let (device, using_fallback, loopback) = match selection {
+            CaptureSelection::DefaultInput => (host.default_input_device(), false, false),
+            CaptureSelection::NamedInput(name) => {
+                let selected = host.input_devices().ok().and_then(|mut iter| {
+                    iter.find(|device| device.name().is_ok_and(|found| found == name))
+                });
+                match selected {
+                    Some(device) => (Some(device), false, false),
+                    None => {
+                        log::warn!("Audio input '{name}' not found; using default input");
+                        (host.default_input_device(), true, false)
+                    }
+                }
+            }
+            CaptureSelection::DefaultSystemPlayback => {
+                #[cfg(windows)]
+                {
+                    (host.default_output_device(), false, true)
+                }
+                #[cfg(not(windows))]
+                {
+                    self.error = "system playback capture is available on Windows/WASAPI".into();
+                    return;
+                }
+            }
+            CaptureSelection::NamedSystemPlayback(name) => {
+                #[cfg(windows)]
+                {
+                    let selected = host.output_devices().ok().and_then(|mut iter| {
+                        iter.find(|device| device.name().is_ok_and(|found| found == name))
+                    });
+                    match selected {
+                        Some(device) => (Some(device), false, true),
+                        None => {
+                            log::warn!("System playback '{name}' not found; using default output");
+                            (host.default_output_device(), true, true)
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = name;
+                    self.error = "system playback capture is available on Windows/WASAPI".into();
+                    return;
                 }
             }
         };
         let Some(device) = device else {
-            self.error = "no audio input device".to_string();
+            self.error = if loopback {
+                "no system playback output device".to_string()
+            } else {
+                "no audio input device".to_string()
+            };
             return;
         };
         let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
 
-        let config = match device.default_input_config() {
+        let config = match if loopback {
+            device.default_output_config()
+        } else {
+            device.default_input_config()
+        } {
             Ok(c) => c,
             Err(e) => {
                 self.error = format!("input config: {e}");
@@ -644,9 +754,14 @@ impl AudioAnalyzer {
                     self.error = format!("stream play: {e}");
                     return;
                 }
-                log::info!("Audio input: {device_name} @ {} Hz", sample_rate.0);
+                log::info!(
+                    "Audio {}: {device_name} @ {} Hz",
+                    if loopback { "system playback" } else { "input" },
+                    sample_rate.0
+                );
                 self.device_name = device_name;
                 self.using_device_fallback = using_fallback;
+                self.system_playback_capture = loopback;
                 self.stream = Some(stream);
             }
             Err(e) => {
@@ -659,6 +774,7 @@ impl AudioAnalyzer {
         self.stream = None;
         self.device_name.clear();
         self.using_device_fallback = false;
+        self.system_playback_capture = false;
         self.reset_analysis();
     }
 
@@ -682,17 +798,20 @@ impl AudioAnalyzer {
             self.stream = None;
             self.device_name.clear();
             self.using_device_fallback = false;
+            self.system_playback_capture = false;
             self.reset_analysis();
             return AudioLevels::default();
         }
 
         let sample_count = self.shared.sample_count.load(Ordering::Relaxed);
         if sample_count == self.last_sample_count {
-            if self.last_sample_at.elapsed() >= STALE_STREAM_TIMEOUT {
+            if sample_stall_is_terminal(self.system_playback_capture, self.last_sample_at.elapsed())
+            {
                 self.error = "audio input stopped delivering samples".to_string();
                 self.stream = None;
                 self.device_name.clear();
                 self.using_device_fallback = false;
+                self.system_playback_capture = false;
                 self.reset_analysis();
                 return AudioLevels::default();
             }
@@ -893,6 +1012,37 @@ fn brightness_from_centroid(centroid_hz: f32, ceiling_hz: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_playback_source_encoding_is_unambiguous() {
+        assert_eq!(parse_capture_selection(""), CaptureSelection::DefaultInput);
+        assert_eq!(
+            parse_capture_selection("Microphone"),
+            CaptureSelection::NamedInput("Microphone")
+        );
+        assert_eq!(
+            parse_capture_selection(DEFAULT_SYSTEM_PLAYBACK_SOURCE),
+            CaptureSelection::DefaultSystemPlayback
+        );
+        let encoded = system_playback_source("Speakers (USB)");
+        assert_eq!(
+            parse_capture_selection(&encoded),
+            CaptureSelection::NamedSystemPlayback("Speakers (USB)")
+        );
+        assert!(is_system_playback_source(&encoded));
+        assert!(!is_system_playback_source("Speakers (USB)"));
+    }
+
+    #[test]
+    fn silent_loopback_remains_armed_while_a_stalled_input_fails_closed() {
+        let long_silence = STALE_STREAM_TIMEOUT + Duration::from_secs(30);
+        assert!(!sample_stall_is_terminal(true, long_silence));
+        assert!(sample_stall_is_terminal(false, long_silence));
+        assert!(!sample_stall_is_terminal(
+            false,
+            STALE_STREAM_TIMEOUT - Duration::from_millis(1)
+        ));
+    }
 
     fn accumulate(mags: &[(f32, f32)]) -> (f32, f32, f32, u32) {
         // mags: (hz, magnitude) pairs standing in for FFT bins.

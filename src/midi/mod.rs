@@ -28,6 +28,58 @@ struct MidiShared {
     clock_prev_ts: std::sync::atomic::AtomicU64,
 }
 
+impl MidiShared {
+    fn new() -> Self {
+        Self {
+            cc_values: std::array::from_fn(|_| AtomicU32::new(0)),
+            last_cc: AtomicU32::new(0),
+            clock_pulses: std::sync::atomic::AtomicU64::new(0),
+            clock_interval_us: std::sync::atomic::AtomicU64::new(0),
+            clock_prev_ts: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Parse one complete MIDI message from the input callback.
+    ///
+    /// MIDI Learn deliberately observes Control Change messages only. Notes,
+    /// pitch bend, aftertouch, and transport messages must never overwrite an
+    /// armed CC binding.
+    fn handle_message(&self, timestamp: u64, message: &[u8]) {
+        let Some(&status) = message.first() else {
+            return;
+        };
+        match status {
+            // Control Change on any channel: [0xBn, cc, value]
+            s if s & 0xF0 == 0xB0 && message.len() >= 3 => {
+                let cc = (message[1] & 0x7F) as usize;
+                let value = (message[2] & 0x7F) as f32 / 127.0;
+                self.cc_values[cc].store(value.to_bits(), Ordering::Relaxed);
+                self.last_cc.store(cc as u32 + 1, Ordering::Relaxed);
+            }
+            // Timing Clock: 24 pulses per quarter note.
+            0xF8 => {
+                let prev = self.clock_prev_ts.swap(timestamp, Ordering::Relaxed);
+                if prev > 0 && timestamp > prev {
+                    let dt = (timestamp - prev) as f64;
+                    if (2_000.0..=100_000.0).contains(&dt) {
+                        let old = f64::from_bits(self.clock_interval_us.load(Ordering::Relaxed));
+                        let ema = if old > 0.0 { old * 0.9 + dt * 0.1 } else { dt };
+                        self.clock_interval_us
+                            .store(ema.to_bits(), Ordering::Relaxed);
+                    }
+                }
+                self.clock_pulses.fetch_add(1, Ordering::Relaxed);
+            }
+            // Start: rewind to beat zero. (Continue 0xFB resumes without reset.)
+            0xFA => {
+                self.clock_pulses.store(0, Ordering::Relaxed);
+                self.clock_prev_ts.store(0, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct MidiEngine {
     conn: Option<MidiInputConnection<()>>,
     shared: Arc<MidiShared>,
@@ -43,13 +95,7 @@ impl MidiEngine {
     pub fn new() -> Self {
         Self {
             conn: None,
-            shared: Arc::new(MidiShared {
-                cc_values: std::array::from_fn(|_| AtomicU32::new(0)),
-                last_cc: AtomicU32::new(0),
-                clock_pulses: std::sync::atomic::AtomicU64::new(0),
-                clock_interval_us: std::sync::atomic::AtomicU64::new(0),
-                clock_prev_ts: std::sync::atomic::AtomicU64::new(0),
-            }),
+            shared: Arc::new(MidiShared::new()),
             port_name: String::new(),
             error: String::new(),
             seen_pulses: 0,
@@ -92,42 +138,7 @@ impl MidiEngine {
             port,
             "collide-in",
             move |timestamp, message, _| {
-                let Some(&status) = message.first() else {
-                    return;
-                };
-                match status {
-                    // Control Change on any channel: [0xBn, cc, value]
-                    s if s & 0xF0 == 0xB0 && message.len() >= 3 => {
-                        let cc = (message[1] & 0x7F) as usize;
-                        let value = (message[2] & 0x7F) as f32 / 127.0;
-                        shared.cc_values[cc].store(value.to_bits(), Ordering::Relaxed);
-                        shared.last_cc.store(cc as u32 + 1, Ordering::Relaxed);
-                    }
-                    // Timing Clock: 24 pulses per quarter note
-                    0xF8 => {
-                        let prev = shared.clock_prev_ts.swap(timestamp, Ordering::Relaxed);
-                        if prev > 0 && timestamp > prev {
-                            let dt = (timestamp - prev) as f64;
-                            // Sane pulse interval: 8.3ms (300bpm) .. 83ms (30bpm)
-                            if (2_000.0..=100_000.0).contains(&dt) {
-                                let old = f64::from_bits(
-                                    shared.clock_interval_us.load(Ordering::Relaxed),
-                                );
-                                let ema = if old > 0.0 { old * 0.9 + dt * 0.1 } else { dt };
-                                shared
-                                    .clock_interval_us
-                                    .store(ema.to_bits(), Ordering::Relaxed);
-                            }
-                        }
-                        shared.clock_pulses.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Start: rewind to beat zero. (Continue 0xFB resumes without reset.)
-                    0xFA => {
-                        shared.clock_pulses.store(0, Ordering::Relaxed);
-                        shared.clock_prev_ts.store(0, Ordering::Relaxed);
-                    }
-                    _ => {}
-                }
+                shared.handle_message(timestamp, message);
             },
             (),
         ) {
@@ -157,8 +168,11 @@ impl MidiEngine {
     /// (bpm, beat position in quarter notes). Call once per frame — activity
     /// is judged by whether the pulse count advanced within the last second.
     pub fn clock_state(&mut self) -> Option<(f32, f64)> {
+        self.clock_state_at(std::time::Instant::now())
+    }
+
+    fn clock_state_at(&mut self, now: std::time::Instant) -> Option<(f32, f64)> {
         let pulses = self.shared.clock_pulses.load(Ordering::Relaxed);
-        let now = std::time::Instant::now();
         if pulses != self.seen_pulses {
             self.seen_pulses = pulses;
             self.last_advance = now;
@@ -188,5 +202,102 @@ impl MidiEngine {
         } else {
             Some((v - 1) as u8)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const PULSE_US_120_BPM: u64 = 20_833;
+
+    fn feed_120_bpm_quarter(engine: &MidiEngine) {
+        let first_timestamp = 1_000_000;
+        for pulse in 0..24 {
+            engine
+                .shared
+                .handle_message(first_timestamp + pulse * PULSE_US_120_BPM, &[0xF8]);
+        }
+    }
+
+    #[test]
+    fn learn_accepts_control_change_on_any_channel() {
+        let engine = MidiEngine::new();
+
+        engine.shared.handle_message(0, &[0xB7, 74, 100]);
+
+        assert_eq!(engine.take_last_cc(), Some(74));
+        assert!((engine.cc_value(74) - 100.0 / 127.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn learn_ignores_notes_and_keys() {
+        let engine = MidiEngine::new();
+
+        engine.shared.handle_message(0, &[0x90, 60, 127]);
+        engine.shared.handle_message(1, &[0x80, 60, 0]);
+        engine.shared.handle_message(2, &[0xA4, 60, 64]);
+
+        assert_eq!(engine.take_last_cc(), None);
+    }
+
+    #[test]
+    fn timing_clock_uses_24_ppqn_for_bpm_and_beat() {
+        let mut engine = MidiEngine::new();
+        let sampled_at = Instant::now();
+        engine.last_advance = sampled_at;
+        feed_120_bpm_quarter(&engine);
+
+        let (bpm, beat) = engine
+            .clock_state_at(sampled_at)
+            .expect("24 timing pulses should establish an external clock");
+
+        assert!((bpm - 120.0).abs() < 0.01, "estimated BPM was {bpm}");
+        assert!((beat - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn midi_start_resets_clock_position() {
+        let mut engine = MidiEngine::new();
+        let sampled_at = Instant::now();
+        engine.last_advance = sampled_at;
+        feed_120_bpm_quarter(&engine);
+        assert!(engine.clock_state_at(sampled_at).is_some());
+
+        engine.shared.handle_message(2_000_000, &[0xFA]);
+
+        assert_eq!(engine.shared.clock_pulses.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.shared.clock_prev_ts.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.clock_state_at(sampled_at), None);
+    }
+
+    #[test]
+    fn external_clock_remains_active_for_one_second_then_falls_back_continuously() {
+        let mut clock = crate::modulation::Clock::new();
+        let mut engine = MidiEngine::new();
+        let sampled_at = Instant::now();
+        engine.last_advance = sampled_at;
+        feed_120_bpm_quarter(&engine);
+        let active = engine
+            .clock_state_at(sampled_at)
+            .expect("clock should become active");
+
+        assert_eq!(
+            engine.clock_state_at(sampled_at + Duration::from_secs(1)),
+            Some(active)
+        );
+        assert_eq!(
+            engine.clock_state_at(sampled_at + Duration::from_millis(1_001)),
+            None
+        );
+
+        let fallback_at = sampled_at + Duration::from_millis(1_001);
+        clock.set_bpm_at(active.0, sampled_at);
+        clock.set_external_beat(Some(active.1), sampled_at);
+        let before_fallback = clock.beat(fallback_at);
+        clock.set_external_beat(None, fallback_at);
+        assert!((clock.beat(fallback_at) - before_fallback).abs() < 1.0e-6);
+        assert!(clock.beat(fallback_at + Duration::from_millis(10)) > before_fallback);
     }
 }

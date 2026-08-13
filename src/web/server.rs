@@ -27,7 +27,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::error::RecvError;
 
-use super::state::{WebAction, WebState};
+use super::state::{EnqueueOutcome, WebAction, WebState};
 use super::static_files;
 
 const AUTH_COOKIE: &str = "cos_key";
@@ -36,10 +36,18 @@ const MAX_LOGGED_MESSAGE_CHARS: usize = 256;
 const MAX_ACTION_VALUE_DEPTH: usize = 8;
 const MAX_ACTION_VALUE_NODES: usize = 512;
 const MAX_ACTION_VALUE_STRING_BYTES: usize = 2048;
+/// Audio is decoded to at most ten minutes of canonical mono PCM. Bound the
+/// upload itself as well so a malformed or accidental multi-gigabyte file
+/// cannot consume library storage before FFmpeg gets a chance to reject it.
+const MAX_AUDIO_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 // Leave room for the atomic reservation prefix and the largest numbered
 // collision suffix while staying below Windows' 255 UTF-16-code-unit
 // component limit.
 const MAX_LIBRARY_FILENAME_UTF16: usize = 220;
+
+fn exceeds_upload_limit(extension: &str, bytes: u64) -> bool {
+    crate::audio::is_supported_audio_extension(extension) && bytes > MAX_AUDIO_UPLOAD_BYTES
+}
 
 /// Start the web server on a background thread. Returns the local URL.
 pub fn spawn(state: Arc<WebState>, port: u16) -> String {
@@ -348,10 +356,8 @@ fn validate_library_filename(input: &str) -> Option<ValidatedLibraryFilename> {
 
     let (stem, extension) = input.rsplit_once('.')?;
     if stem.is_empty()
-        || !matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "mp4" | "webm" | "mov" | "avi" | "mkv"
-        )
+        || !(crate::layers::is_supported_visual_extension(extension)
+            || crate::audio::is_supported_audio_extension(extension))
     {
         return None;
     }
@@ -464,11 +470,13 @@ async fn create_unique_upload_temp(
 /// Streamed clip upload into the library folder. The body is written in
 /// chunks to a temp file (never buffered whole in memory), renamed into
 /// place on success, and the render thread is asked to rescan. Names are
-/// accepted only as a single Windows-safe component carrying a known video
+/// accepted only as a single Windows-safe component carrying a known visual
+/// or audio
 /// extension; collisions get a numbered suffix rather than overwriting.
 async fn upload_handler(
     State(state): State<Arc<WebState>>,
     Query(query): Query<UploadQuery>,
+    headers: HeaderMap,
     body: axum::body::Body,
 ) -> Response {
     let Some(validated) = validate_library_filename(&query.name) else {
@@ -479,6 +487,18 @@ async fn upload_handler(
         stem,
         extension: ext,
     } = validated;
+
+    let declared_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared_length.is_some_and(|length| exceeds_upload_limit(&ext, length)) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "audio upload exceeds the 512 MiB limit",
+        )
+            .into_response();
+    }
 
     let Some(folder) = state.library_folder.read().ok().and_then(|f| f.clone()) else {
         return (
@@ -510,6 +530,16 @@ async fn upload_handler(
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(bytes) => {
+                if exceeds_upload_limit(&ext, written.saturating_add(bytes.len() as u64)) {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    let _ = tokio::fs::remove_file(&reservation_path).await;
+                    return (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "audio upload exceeds the 512 MiB limit",
+                    )
+                        .into_response();
+                }
                 if let Err(e) = file.write_all(&bytes).await {
                     drop(file);
                     let _ = tokio::fs::remove_file(&temp_path).await;
@@ -661,6 +691,31 @@ fn valid_optional_layer_id(layer_id: &Option<String>) -> bool {
         .is_none_or(|value| valid_identifier(value, 128))
 }
 
+fn valid_optional_stable_id(stable_id: &Option<String>) -> bool {
+    stable_id.as_deref().is_none_or(|value| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && value.parse::<u64>().is_ok_and(|id| id != 0)
+    })
+}
+
+fn is_layer_routing_target(value: &serde_json::Value) -> bool {
+    let Some(target) = value.as_str() else {
+        return false;
+    };
+    let target = crate::modulation::canonical_target(target);
+    let Some(rest) = target.strip_prefix("layer") else {
+        return false;
+    };
+    let Some((number, _suffix)) = rest.split_once('_') else {
+        return false;
+    };
+    number
+        .parse::<usize>()
+        .is_ok_and(|layer| (1..=crate::modulation::MAX_MOD_LAYERS).contains(&layer))
+        && crate::modulation::is_valid_target(target.as_ref())
+}
+
 fn valid_json_value(value: &serde_json::Value) -> bool {
     fn visit(value: &serde_json::Value, depth: usize, remaining: &mut usize) -> bool {
         if depth > MAX_ACTION_VALUE_DEPTH || *remaining == 0 {
@@ -732,9 +787,28 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         | WebAction::SetTemporal { param, value } => {
             valid_identifier(param, 64) && valid_json_value(value)
         }
-        WebAction::SetLfo { param, value, .. } | WebAction::SetRouting { param, value, .. } => {
+        WebAction::SetLfo { param, value, .. } => {
             valid_identifier(param, 64) && valid_json_value(value)
         }
+        WebAction::SetRouting {
+            route_id,
+            target_layer_id,
+            layer_stack_revision,
+            param,
+            value,
+            ..
+        } => {
+            valid_optional_stable_id(route_id)
+                && valid_optional_stable_id(target_layer_id)
+                && layer_stack_revision.is_none_or(|revision| revision != 0)
+                && match target_layer_id {
+                    Some(_) => param == "target" && is_layer_routing_target(value),
+                    None => layer_stack_revision.is_none(),
+                }
+                && valid_identifier(param, 64)
+                && valid_json_value(value)
+        }
+        WebAction::RemoveRouting { route_id, .. } => valid_optional_stable_id(route_id),
         WebAction::SetGyroConfig {
             axis, param, value, ..
         }
@@ -750,8 +824,14 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             target,
             duration_beats,
         } => valid_f32(*target) && valid_f64_for_f32(*duration_beats),
-        WebAction::MorphCapture { slot } => valid_identifier(slot, 8),
-        WebAction::SetMorphLaw { law } => valid_identifier(law, 32),
+        WebAction::MorphCapture {
+            slot,
+            stack_revision,
+        } => {
+            matches!(slot.as_str(), "a" | "b")
+                && stack_revision.is_none_or(|revision| revision != 0)
+        }
+        WebAction::SetMorphLaw { law } => matches!(law.as_str(), "linear" | "equal_power"),
         WebAction::ResetGroup { group } => valid_identifier(group, 32),
         WebAction::StartExport {
             width,
@@ -785,6 +865,7 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) ->
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
+    let client_id = state.allocate_client_id();
     let (mut sender, mut receiver) = socket.split();
 
     // Send current state on connect
@@ -833,9 +914,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
             if let Message::Text(text) = msg {
                 // Try to parse as a WebAction
                 match serde_json::from_str::<WebAction>(&text) {
-                    Ok(action) if valid_action(&action, 0) => {
-                        let _ = state_clone.enqueue_action(action).await;
-                    }
+                    Ok(action) if valid_action(&action, 0) => match action {
+                        WebAction::GyroStream { enabled } => {
+                            state_clone.set_gyro_stream(client_id, enabled);
+                        }
+                        action @ WebAction::Gyro { .. } => {
+                            let outcome = state_clone.enqueue_action(action).await;
+                            if outcome != EnqueueOutcome::Dropped {
+                                state_clone.note_gyro_sample(client_id);
+                            }
+                        }
+                        action => {
+                            let _ = state_clone.enqueue_action(action).await;
+                        }
+                    },
                     Ok(_) => log::warn!("Rejected invalid WebAction payload"),
                     Err(error) => log::warn!(
                         "Failed to parse WebAction: {error} - excerpt: {}",
@@ -850,6 +942,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
     }
+    state.disconnect_gyro_client(client_id);
 }
 
 #[cfg(test)]
@@ -858,7 +951,7 @@ mod tests {
     use axum::http::HeaderValue;
 
     #[test]
-    fn library_filename_validator_accepts_only_exact_safe_video_components() {
+    fn library_filename_validator_accepts_only_exact_safe_media_components() {
         let valid = validate_library_filename("set.final.MP4").unwrap();
         assert_eq!(valid.name, "set.final.MP4");
         assert_eq!(valid.stem, "set.final");
@@ -866,6 +959,20 @@ mod tests {
         assert!(validate_library_filename("telescope-\u{00e9}t\u{00e9}.mov").is_some());
         assert!(validate_library_filename("COM10.mp4").is_some());
         assert!(validate_library_filename("LPT0.webm").is_some());
+        for name in [
+            "frame.png",
+            "frame.JPEG",
+            "frame.webp",
+            "score.wav",
+            "score.MP3",
+            "score.flac",
+            "score.ogg",
+            "score.opus",
+            "score.m4a",
+            "score.aac",
+        ] {
+            assert!(validate_library_filename(name).is_some(), "rejected {name}");
+        }
 
         for invalid in [
             "",
@@ -968,6 +1075,17 @@ mod tests {
     }
 
     #[test]
+    fn audio_upload_limit_matches_the_picker_contract() {
+        assert_eq!(MAX_AUDIO_UPLOAD_BYTES, 536_870_912);
+        for extension in ["wav", "mp3", "flac", "ogg", "opus", "m4a", "aac"] {
+            assert!(crate::audio::is_supported_audio_extension(extension));
+            assert!(!exceeds_upload_limit(extension, MAX_AUDIO_UPLOAD_BYTES));
+            assert!(exceeds_upload_limit(extension, MAX_AUDIO_UPLOAD_BYTES + 1));
+        }
+        assert!(!exceeds_upload_limit("mp4", u64::MAX));
+    }
+
+    #[test]
     fn origin_must_match_host_exactly() {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3030"));
@@ -1026,6 +1144,69 @@ mod tests {
     }
 
     #[test]
+    fn routing_target_identity_validation_rejects_malformed_or_mismatched_ids() {
+        let valid = WebAction::SetRouting {
+            index: 0,
+            route_id: Some("7".into()),
+            target_layer_id: Some("22".into()),
+            layer_stack_revision: Some(9),
+            param: "target".into(),
+            value: serde_json::json!("layer2_opacity"),
+        };
+        assert!(valid_action(&valid, 0));
+
+        let malformed_route = WebAction::SetRouting {
+            index: 0,
+            route_id: Some("route-7".into()),
+            target_layer_id: Some("22".into()),
+            layer_stack_revision: Some(9),
+            param: "target".into(),
+            value: serde_json::json!("layer2_opacity"),
+        };
+        assert!(!valid_action(&malformed_route, 0));
+
+        let malformed = WebAction::SetRouting {
+            index: 0,
+            route_id: Some("7".into()),
+            target_layer_id: Some("layer-22".into()),
+            layer_stack_revision: Some(9),
+            param: "target".into(),
+            value: serde_json::json!("layer2_opacity"),
+        };
+        assert!(!valid_action(&malformed, 0));
+
+        let master_with_layer_identity = WebAction::SetRouting {
+            index: 0,
+            route_id: Some("7".into()),
+            target_layer_id: Some("22".into()),
+            layer_stack_revision: Some(9),
+            param: "target".into(),
+            value: serde_json::json!("brightness"),
+        };
+        assert!(!valid_action(&master_with_layer_identity, 0));
+
+        let identity_on_depth = WebAction::SetRouting {
+            index: 0,
+            route_id: Some("7".into()),
+            target_layer_id: Some("22".into()),
+            layer_stack_revision: Some(9),
+            param: "depth".into(),
+            value: serde_json::json!(0.5),
+        };
+        assert!(!valid_action(&identity_on_depth, 0));
+
+        let legacy_master = WebAction::SetRouting {
+            index: 0,
+            route_id: None,
+            target_layer_id: None,
+            layer_stack_revision: None,
+            param: "target".into(),
+            value: serde_json::json!("brightness"),
+        };
+        assert!(valid_action(&legacy_master, 0));
+    }
+
+    #[test]
     fn oversized_or_nonfinite_action_numbers_are_rejected() {
         let overflow: WebAction =
             serde_json::from_str(r#"{"action":"set_param","param":"brightness","value":1e308}"#)
@@ -1048,6 +1229,43 @@ mod tests {
             &WebAction::MorphGlide {
                 target: 0.5,
                 duration_beats: f64::MAX,
+            },
+            0,
+        ));
+    }
+
+    #[test]
+    fn morph_enums_and_capture_revision_are_strictly_validated() {
+        assert!(valid_action(
+            &WebAction::MorphCapture {
+                slot: "a".into(),
+                stack_revision: Some(9),
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::MorphCapture {
+                slot: "typo".into(),
+                stack_revision: Some(9),
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::MorphCapture {
+                slot: "b".into(),
+                stack_revision: Some(0),
+            },
+            0,
+        ));
+        assert!(valid_action(
+            &WebAction::SetMorphLaw {
+                law: "equal_power".into(),
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::SetMorphLaw {
+                law: "equal".into()
             },
             0,
         ));
