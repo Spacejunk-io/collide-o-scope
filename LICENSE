@@ -1,0 +1,31 @@
+MIT License — applying to the modifications and additions in this fork
+
+Copyright (c) 2026 Spacejunk-io
+
+This repository is a fork of collide-o-scope by Luis Queral
+(https://github.com/luismqueral/collide-o-scope). At the time of forking,
+the original repository carries no license; the original work therefore
+remains Copyright (c) Luis Queral, all rights reserved, and is carried in
+this fork with attribution and in the spirit of the enduring link between
+the original author and this fork's maintainer. Should the original author
+grant a license upstream (MIT is warmly suggested), that grant governs the
+original portions; the terms below govern the modifications and additions
+made in this fork.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

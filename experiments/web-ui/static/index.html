@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>collide-o-scope — control panel</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="panel">
+    <header class="panel-header">
+      <div class="tabs">
+        <button class="tab active" data-tab="master">Master</button>
+        <button class="tab" data-tab="layer1">Layer 1</button>
+      </div>
+    </header>
+
+    <div class="tab-content active" id="tab-master">
+      <section class="group">
+        <h3 class="group-label">DIGITAL</h3>
+        <div class="param-row" data-param="pixelate" data-min="1" data-max="32" data-step="1">
+          <label>Pixelate</label>
+          <input type="range"><span class="value">1</span>
+        </div>
+        <div class="param-row" data-param="rgb_split" data-min="0" data-max="30" data-step="0.5">
+          <label>RGB Split</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="hue_shift" data-min="-180" data-max="180" data-step="1">
+          <label>Hue</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="saturation" data-min="-1" data-max="1" data-step="0.01">
+          <label>Saturation</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="brightness" data-min="-1" data-max="1" data-step="0.01">
+          <label>Brightness</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="contrast" data-min="-1" data-max="1" data-step="0.01">
+          <label>Contrast</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="posterize" data-min="0" data-max="16" data-step="1">
+          <label>Posterize</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row toggle-row" data-param="invert">
+          <label>Invert</label>
+          <label class="toggle"><input type="checkbox"><span class="toggle-slider"></span></label>
+        </div>
+      </section>
+
+      <section class="group">
+        <h3 class="group-label">ANALOG</h3>
+        <div class="param-row" data-param="grain_intensity" data-min="0" data-max="0.3" data-step="0.005">
+          <label>Grain</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="grain_size" data-min="1" data-max="4" data-step="0.25">
+          <label>Size</label>
+          <input type="range"><span class="value">1</span>
+        </div>
+        <div class="param-row select-row" data-param="grain_algo">
+          <label>Algorithm</label>
+          <select>
+            <option value="0">Gaussian</option>
+            <option value="1">Perlin</option>
+            <option value="2">Salt&amp;Pepper</option>
+            <option value="3">Blue</option>
+          </select>
+        </div>
+        <div class="param-row toggle-row" data-param="color_grain">
+          <label>Color Grain</label>
+          <label class="toggle"><input type="checkbox"><span class="toggle-slider"></span></label>
+        </div>
+        <div class="param-row" data-param="vignette" data-min="0" data-max="1.5" data-step="0.01">
+          <label>Vignette</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="color_drift" data-min="0" data-max="0.02" data-step="0.001">
+          <label>Drift</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+      </section>
+
+      <section class="group">
+        <h3 class="group-label">MOTION</h3>
+        <div class="param-row" data-param="breathe_scale" data-min="0" data-max="0.05" data-step="0.001">
+          <label>Bth Scale</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="breathe_rotation" data-min="0" data-max="2" data-step="0.05">
+          <label>Bth Rotate</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+        <div class="param-row" data-param="breathe_position" data-min="0" data-max="0.02" data-step="0.001">
+          <label>Bth Drift</label>
+          <input type="range"><span class="value">0</span>
+        </div>
+      </section>
+    </div>
+
+    <div class="tab-content" id="tab-layer1">
+      <section class="group">
+        <h3 class="group-label">LAYER</h3>
+        <p class="placeholder">Layer controls would go here</p>
+      </section>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

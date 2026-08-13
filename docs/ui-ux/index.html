@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Collide-o-Scope UI Wireframe</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <div class="three-col">
+      <!-- Left Column: Settings -->
+      <div class="col-left" id="col-left">
+        <div class="col-header">
+          <span>Settings</span>
+          <div class="kebab-menu">
+            <button class="icon-btn" id="kebab-btn" title="Menu">&#x22EE;</button>
+            <div class="kebab-dropdown" id="kebab-dropdown">
+              <button onclick="alert('Patches manager')">Patches</button>
+              <button onclick="alert('Fullscreen toggle')">Fullscreen</button>
+              <button onclick="alert('Open in new window')">Open in new window</button>
+            </div>
+          </div>
+        </div>
+        <div class="col-scroll" id="settings-panel"></div>
+      </div>
+
+      <div class="resize-handle-v" id="resize-left"></div>
+
+      <!-- Center Column: Canvas -->
+      <div class="col-center" id="col-center">
+        <div class="canvas-placeholder" id="canvas-area">
+          <span class="no-video-msg" id="no-video-msg">click a video to add a layer</span>
+          <canvas id="preview-canvas" width="1280" height="720" style="display:none;"></canvas>
+        </div>
+      </div>
+
+      <div class="resize-handle-v" id="resize-right"></div>
+
+      <!-- Right Column: Files -->
+      <div class="col-right" id="col-right">
+        <div class="col-header"><span>Files</span></div>
+        <div class="col-scroll" id="file-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="wireframe.js"></script>
+</body>
+</html>

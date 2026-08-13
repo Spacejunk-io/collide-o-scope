@@ -1,0 +1,44 @@
+[package]
+name = "collide-o-scope"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30"
+wgpu = "29"
+pollster = "0.4"
+ffmpeg-next = "8"
+env_logger = "0.11"
+log = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+egui = "0.34"
+egui-wgpu = "0.34"
+egui-winit = "0.34"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs"] }
+futures = "0.3"
+open = "5"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+ntsc-rs = { git = "https://github.com/ntsc-rs/ntsc-rs", package = "ntsc-rs", features = ["rayon"] }
+cpal = "0.16"
+rustfft = "6"
+midir = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+getrandom = "0.3"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+spout2-rs = { version = "0.1", default-features = false, features = ["dx"] }
+
+# ntsc-rs is CPU-intensive; always optimize it even in debug builds
+[profile.dev.package.ntsc-rs]
+opt-level = 3
+
+[profile.dev.package.fearless_simd]
+opt-level = 3
