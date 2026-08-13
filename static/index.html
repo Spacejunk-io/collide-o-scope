@@ -18,6 +18,14 @@
           </label>
         </h3>
         <div class="lib-upload-status" id="lib-upload-status"></div>
+        <form class="spout-in-form" id="spout-in-form">
+          <label for="spout-in-name">Spout input</label>
+          <div class="spout-in-row">
+            <input id="spout-in-name" type="text" maxlength="255" autocomplete="off" spellcheck="false" placeholder="Sender name">
+            <button type="submit" title="Add live Spout receiver layer">Add live</button>
+          </div>
+          <div class="lib-upload-status" id="spout-in-status"></div>
+        </form>
         <div class="library-grid" id="library-grid">
           <!-- Library items rendered by JS -->
         </div>
@@ -58,6 +66,9 @@
             <div class="fx-group-body">
               <div class="param-row" data-param="pixelate" data-min="1" data-max="32" data-step="1">
                 <label>Pixelate</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-param="downsample" data-min="0.05" data-max="1" data-step="0.01">
+                <label>Downsample</label><input type="range" aria-label="Master downsample scale"><span class="value">1</span>
               </div>
               <div class="param-row" data-param="rgb_split" data-min="0" data-max="30" data-step="0.5">
                 <label>RGB Split</label><input type="range"><span class="value">0</span>
@@ -157,12 +168,8 @@
               <div class="param-row" data-temporal="slitscan" data-min="0" data-max="1" data-step="0.01">
                 <label>Slit-Scan</label><input type="range"><span class="value">0</span>
               </div>
-              <div class="param-row select-row" data-temporal="slit_axis">
-                <label>Slit Axis</label>
-                <select>
-                  <option value="0">Rows</option>
-                  <option value="1">Columns</option>
-                </select>
+              <div class="param-row" data-temporal="slit_angle" data-min="-180" data-max="180" data-step="1">
+                <label>Slit Angle</label><input type="range"><span class="value">0°</span>
               </div>
             </div>
           </div>
@@ -174,6 +181,7 @@
               <button class="group-reset" data-group="vhs">reset</button>
             </div>
             <div class="fx-group-body">
+              <div class="audio-status error" id="ntsc-status" role="status" aria-live="polite"></div>
               <div class="param-row toggle-row" data-ntsc="enabled">
                 <label>Enable</label>
                 <label class="toggle"><input type="checkbox"><span class="toggle-slider"></span></label>
@@ -257,6 +265,11 @@
                 <input type="number" id="bpm-input" min="30" max="300" step="0.1" value="120">
                 <button id="tap-tempo" class="btn-tap">TAP</button>
               </div>
+              <div class="param-row toggle-row">
+                <label>Beat latch</label>
+                <label class="toggle"><input type="checkbox" id="beat-quantize"><span class="toggle-slider"></span></label>
+                <span class="audio-status" id="beat-quantize-status"></span>
+              </div>
               <div id="lfo-list">
                 <!-- LFO rows rendered by JS -->
               </div>
@@ -283,6 +296,18 @@
                 <input type="range" id="morph-t" min="0" max="1" step="0.01" value="0">
                 <span class="morph-end" id="morph-label-b">B</span>
               </div>
+              <div class="param-row select-row">
+                <label>Law</label>
+                <select id="morph-law">
+                  <option value="linear">Linear</option>
+                  <option value="equal_power">Equal power</option>
+                </select>
+              </div>
+              <div class="morph-buttons">
+                <button id="morph-glide-a" class="morph-btn">Glide A</button>
+                <input type="number" id="morph-duration" min="0.25" max="64" step="0.25" value="4" aria-label="Morph glide duration in beats">
+                <button id="morph-glide-b" class="morph-btn">Glide B</button>
+              </div>
               <div class="audio-status" id="morph-status">capture two states, then crossfade</div>
             </div>
           </div>
@@ -307,14 +332,32 @@
                 <input type="range" id="audio-gain" min="0" max="4" step="0.05" value="1">
                 <span class="value" id="audio-gain-val">1.00</span>
               </div>
+              <div class="param-row select-row">
+                <label for="audio-band-count">Bands</label>
+                <select id="audio-band-count" title="Routable FFT bands">
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                  <option value="6">6</option>
+                  <option value="7">7</option>
+                  <option value="8">8</option>
+                </select>
+              </div>
+              <div class="audio-band-grid" id="audio-band-edges" aria-label="Audio band crossovers"></div>
+              <div class="audio-band-grid audio-band-ceiling">
+                <label for="audio-high-edge">Analysis ceiling</label>
+                <input type="number" id="audio-high-edge" min="50" max="20000" step="10" value="8000">
+              </div>
+              <div class="audio-spectrum" id="audio-spectrum" aria-label="Live audio spectrum"></div>
               <div class="audio-meter-row"><label>Level</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-level"></div></div></div>
-              <div class="audio-meter-row"><label>Bass</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bass"></div></div></div>
-              <div class="audio-meter-row"><label>Mid</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-mid"></div></div></div>
-              <div class="audio-meter-row"><label>High</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-high"></div></div></div>
+              <div class="audio-meter-row"><label>Bass · B1</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bass"></div></div></div>
+              <div class="audio-meter-row"><label>Mid · B2</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-mid"></div></div></div>
+              <div class="audio-meter-row"><label>High · B3</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-high"></div></div></div>
+              <div id="audio-extra-band-meters"></div>
               <div class="audio-meter-row"><label>Onset</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-onset"></div></div></div>
               <div class="audio-meter-row"><label>Bright</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bright"></div></div></div>
               <div class="audio-meter-row"><label>Noise</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-noise"></div></div></div>
-              <div class="audio-status" id="audio-status"></div>
+              <div class="audio-status" id="audio-status" role="status" aria-live="polite"></div>
             </div>
           </div>
 
@@ -336,7 +379,7 @@
               <div id="midi-slots">
                 <!-- 4 slot rows rendered by JS -->
               </div>
-              <div class="audio-status" id="midi-status"></div>
+              <div class="audio-status" id="midi-status" role="status" aria-live="polite"></div>
             </div>
           </div>
 
@@ -346,8 +389,43 @@
               <span class="group-label">XY PAD</span>
             </div>
             <div class="fx-group-body">
-              <div class="xy-pad" id="xy-pad">
+              <div class="xy-pad" id="xy-pad" role="slider" tabindex="0" aria-label="XY performance pad" aria-valuetext="X 0.50, Y 0.50">
                 <div class="xy-pad-dot" id="xy-pad-dot"></div>
+              </div>
+              <div class="axis-config-grid pad-config-grid">
+                <span class="axis-config-head">Axis</span>
+                <span class="axis-config-head">Curve</span>
+                <span class="axis-config-head">Amount</span>
+                <span class="axis-config-head">Steps</span>
+                <label for="pad-x-curve">X</label>
+                <select id="pad-x-curve" data-pad-axis="x" data-pad-param="curve">
+                  <option value="linear">Linear</option>
+                  <option value="exp">Exp</option>
+                  <option value="log">Log</option>
+                  <option value="s_curve">S-Curve</option>
+                  <option value="steps">Steps</option>
+                </select>
+                <input type="range" id="pad-x-curve-amount" data-pad-axis="x" data-pad-param="curve_amount" min="-2" max="2" step="0.05" value="0" aria-label="Pad X curve amount">
+                <input type="number" id="pad-x-quantize" data-pad-axis="x" data-pad-param="quantize" min="0" max="64" step="1" value="0" aria-label="Pad X quantize steps">
+                <label for="pad-y-curve">Y</label>
+                <select id="pad-y-curve" data-pad-axis="y" data-pad-param="curve">
+                  <option value="linear">Linear</option>
+                  <option value="exp">Exp</option>
+                  <option value="log">Log</option>
+                  <option value="s_curve">S-Curve</option>
+                  <option value="steps">Steps</option>
+                </select>
+                <input type="range" id="pad-y-curve-amount" data-pad-axis="y" data-pad-param="curve_amount" min="-2" max="2" step="0.05" value="0" aria-label="Pad Y curve amount">
+                <input type="number" id="pad-y-quantize" data-pad-axis="y" data-pad-param="quantize" min="0" max="64" step="1" value="0" aria-label="Pad Y quantize steps">
+              </div>
+              <div class="param-row toggle-row compact-config-row">
+                <label>Spring</label>
+                <label class="toggle"><input type="checkbox" id="pad-spring-enabled"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row compact-config-row">
+                <label>Return</label>
+                <input type="range" id="pad-spring-rate" min="0.1" max="20" step="0.1" value="4">
+                <span class="value" id="pad-spring-rate-val">4.0</span>
               </div>
               <div class="audio-status">route Pad X / Pad Y in the mod matrix</div>
             </div>
@@ -363,10 +441,29 @@
                 <label>Stream</label>
                 <label class="toggle"><input type="checkbox" id="gyro-enabled"><span class="toggle-slider"></span></label>
               </div>
+              <button id="gyro-calibrate" class="btn-calibrate">Zero here</button>
+              <div class="axis-config-grid gyro-config-grid">
+                <span class="axis-config-head">Axis</span>
+                <span class="axis-config-head">Range</span>
+                <span class="axis-config-head">Expo</span>
+                <span class="axis-config-head">Inv</span>
+                <label for="gyro-yaw-range">Yaw</label>
+                <input type="number" id="gyro-yaw-range" data-gyro-axis="yaw" data-gyro-param="range" min="5" max="180" step="1" value="180">
+                <input type="range" id="gyro-yaw-expo" data-gyro-axis="yaw" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Yaw expo">
+                <input type="checkbox" id="gyro-yaw-invert" data-gyro-axis="yaw" data-gyro-param="invert" aria-label="Invert yaw">
+                <label for="gyro-pitch-range">Pitch</label>
+                <input type="number" id="gyro-pitch-range" data-gyro-axis="pitch" data-gyro-param="range" min="5" max="180" step="1" value="90">
+                <input type="range" id="gyro-pitch-expo" data-gyro-axis="pitch" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Pitch expo">
+                <input type="checkbox" id="gyro-pitch-invert" data-gyro-axis="pitch" data-gyro-param="invert" aria-label="Invert pitch">
+                <label for="gyro-roll-range">Roll</label>
+                <input type="number" id="gyro-roll-range" data-gyro-axis="roll" data-gyro-param="range" min="5" max="90" step="1" value="90">
+                <input type="range" id="gyro-roll-expo" data-gyro-axis="roll" data-gyro-param="expo" min="-2" max="2" step="0.05" value="0" aria-label="Roll expo">
+                <input type="checkbox" id="gyro-roll-invert" data-gyro-axis="roll" data-gyro-param="invert" aria-label="Invert roll">
+              </div>
               <div class="audio-meter-row"><label>Yaw</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-yaw"></div></div></div>
               <div class="audio-meter-row"><label>Pitch</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-pitch"></div></div></div>
               <div class="audio-meter-row"><label>Roll</label><div class="lfo-meter"><div class="lfo-meter-fill" id="gm-roll"></div></div></div>
-              <div class="audio-status" id="gyro-status">enable on the phone that should steer</div>
+              <div class="audio-status" id="gyro-status" role="status" aria-live="polite">enable on the phone that should steer</div>
             </div>
           </div>
 
@@ -388,16 +485,18 @@
                 <label class="toggle"><input type="checkbox" id="spout-enabled"><span class="toggle-slider"></span></label>
                 <span class="clock-indicator" id="spout-indicator"></span>
               </div>
+              <div class="audio-status error" id="output-status" role="status" aria-live="polite"></div>
               <div class="audio-status" id="spout-status"></div>
             </div>
           </div>
 
           <!-- RENDER EXPORT -->
           <div class="fx-group" id="export-group">
-            <div class="group-header">
-              <span class="group-label">Render</span>
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">RENDER</span>
             </div>
-            <div class="group-params">
+            <div class="fx-group-body">
               <div class="param-row select-row">
                 <label>Resolution</label>
                 <select id="export-resolution">
@@ -417,17 +516,23 @@
                   <option value="24">24</option>
                   <option value="30" selected>30</option>
                   <option value="60">60</option>
+                  <option value="120">120</option>
+                  <option value="240">240</option>
                 </select>
+              </div>
+              <div class="param-row select-row">
+                <label title="Audio starts at source time zero at 1x; visual pause, speed, modulation, and looping do not alter it.">Audio (1x independent)</label>
+                <select id="export-audio"><option value="">None</option></select>
               </div>
               <div class="export-controls">
                 <button id="export-start" class="btn-export">Render</button>
                 <button id="export-cancel" class="btn-export btn-cancel" style="display:none">Cancel</button>
               </div>
-              <div class="export-progress" id="export-progress" style="display:none">
+              <div class="export-progress" id="export-progress" style="display:none" role="progressbar" aria-label="Render progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
                 <div class="progress-bar"><div class="progress-fill" id="export-fill"></div></div>
                 <span class="progress-text" id="export-text">0%</span>
               </div>
-              <div class="export-status" id="export-status"></div>
+              <div class="export-status" id="export-status" role="status" aria-live="polite"></div>
             </div>
           </div>
 

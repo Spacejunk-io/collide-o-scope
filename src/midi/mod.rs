@@ -92,7 +92,9 @@ impl MidiEngine {
             port,
             "collide-in",
             move |timestamp, message, _| {
-                let Some(&status) = message.first() else { return };
+                let Some(&status) = message.first() else {
+                    return;
+                };
                 match status {
                     // Control Change on any channel: [0xBn, cc, value]
                     s if s & 0xF0 == 0xB0 && message.len() >= 3 => {
@@ -108,8 +110,9 @@ impl MidiEngine {
                             let dt = (timestamp - prev) as f64;
                             // Sane pulse interval: 8.3ms (300bpm) .. 83ms (30bpm)
                             if (2_000.0..=100_000.0).contains(&dt) {
-                                let old =
-                                    f64::from_bits(shared.clock_interval_us.load(Ordering::Relaxed));
+                                let old = f64::from_bits(
+                                    shared.clock_interval_us.load(Ordering::Relaxed),
+                                );
                                 let ema = if old > 0.0 { old * 0.9 + dt * 0.1 } else { dt };
                                 shared
                                     .clock_interval_us

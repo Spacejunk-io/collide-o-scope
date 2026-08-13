@@ -11,8 +11,8 @@
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 
 use ntsc_rs::settings::standard::*;
-use ntsc_rs::{Context, NtscEffect};
 use ntsc_rs::yiq_fielding::Rgbx;
+use ntsc_rs::{Context, NtscEffect};
 
 /// User-facing VHS parameters (mirrored in the web UI).
 #[derive(Debug, Clone)]
@@ -104,30 +104,26 @@ impl NtscState {
             return false;
         }
 
-        self.sync_effect_from_params();
-
         let w = width as usize;
         let h = height as usize;
-        let half_w = w / 2;
-        let half_h = h / 2;
-
-        // Downscale 2x with box filter (average 2x2 blocks)
-        let mut small = vec![0u8; half_w * half_h * 4];
-        for sy in 0..half_h {
-            for sx in 0..half_w {
-                let dst = (sy * half_w + sx) * 4;
-                let s00 = ((sy * 2) * w + sx * 2) * 4;
-                let s10 = ((sy * 2) * w + sx * 2 + 1) * 4;
-                let s01 = ((sy * 2 + 1) * w + sx * 2) * 4;
-                let s11 = ((sy * 2 + 1) * w + sx * 2 + 1) * 4;
-                for c in 0..4 {
-                    small[dst + c] = ((pixels[s00 + c] as u16
-                        + pixels[s10 + c] as u16
-                        + pixels[s01 + c] as u16
-                        + pixels[s11 + c] as u16) / 4) as u8;
-                }
-            }
+        let Some(expected_len) = w.checked_mul(h).and_then(|n| n.checked_mul(4)) else {
+            log::warn!("NTSC frame dimensions overflow: {width}x{height}");
+            return false;
+        };
+        if w == 0 || h == 0 || pixels.len() < expected_len {
+            log::warn!(
+                "NTSC frame buffer is invalid: {width}x{height}, {} bytes",
+                pixels.len()
+            );
+            return false;
         }
+
+        self.sync_effect_from_params();
+
+        // Ceil division keeps a real sample for an odd final row/column.
+        let half_w = w.div_ceil(2);
+        let half_h = h.div_ceil(2);
+        let mut small = downscale_rgba_2x(pixels, w, h);
 
         // Apply ntsc-rs at half resolution
         self.effect.apply_effect_to_buffer::<Rgbx, u8>(
@@ -138,39 +134,8 @@ impl NtscState {
             [1.0, 1.0],
         );
 
-        // Upscale back with nearest-neighbor (VHS doesn't need bilinear)
-        for y in 0..h {
-            for x in 0..w {
-                let sx = x / 2;
-                let sy = y / 2;
-                let src = (sy * half_w + sx) * 4;
-                let dst = (y * w + x) * 4;
-                pixels[dst..dst + 4].copy_from_slice(&small[src..src + 4]);
-            }
-        }
-
-        self.frame_num = self.frame_num.wrapping_add(1);
-        true
-    }
-
-    /// Apply VHS effects at full (native) resolution. For offline rendering.
-    pub fn apply_full_res(&mut self, pixels: &mut [u8], width: u32, height: u32) -> bool {
-        if !self.params.enabled {
-            return false;
-        }
-
-        self.sync_effect_from_params();
-
-        let w = width as usize;
-        let h = height as usize;
-
-        self.effect.apply_effect_to_buffer::<Rgbx, u8>(
-            &self.ctx,
-            (w, h),
-            pixels,
-            self.frame_num,
-            [1.0, 1.0],
-        );
+        // Upscale back with nearest-neighbor (VHS doesn't need bilinear).
+        upscale_rgba_2x(&small, half_w, pixels, w, h);
 
         self.frame_num = self.frame_num.wrapping_add(1);
         true
@@ -191,7 +156,12 @@ impl NtscState {
 
         // Edge wave
         self.effect.vhs_settings.settings.edge_wave.enabled = p.edge_wave_enabled;
-        self.effect.vhs_settings.settings.edge_wave.settings.intensity = p.edge_wave_intensity;
+        self.effect
+            .vhs_settings
+            .settings
+            .edge_wave
+            .settings
+            .intensity = p.edge_wave_intensity;
         self.effect.vhs_settings.settings.edge_wave.settings.speed = p.edge_wave_speed;
 
         // Head switching
@@ -220,69 +190,139 @@ impl NtscState {
         self.effect.luma_smear = p.luma_smear;
         self.effect.composite_sharpening = p.composite_sharpening;
     }
+}
 
+/// Box-filter a frame to ceil(width / 2) × ceil(height / 2). At odd edges,
+/// clamp the missing neighbour to the last real pixel rather than indexing
+/// beyond the source buffer.
+fn downscale_rgba_2x(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let out_w = width.div_ceil(2);
+    let out_h = height.div_ceil(2);
+    let mut out = vec![0u8; out_w * out_h * 4];
+
+    for oy in 0..out_h {
+        let y0 = oy * 2;
+        let y1 = (y0 + 1).min(height - 1);
+        for ox in 0..out_w {
+            let x0 = ox * 2;
+            let x1 = (x0 + 1).min(width - 1);
+            let dst = (oy * out_w + ox) * 4;
+            let src = [
+                (y0 * width + x0) * 4,
+                (y0 * width + x1) * 4,
+                (y1 * width + x0) * 4,
+                (y1 * width + x1) * 4,
+            ];
+            for channel in 0..4 {
+                let sum: u32 = src
+                    .iter()
+                    .map(|&index| pixels[index + channel] as u32)
+                    .sum();
+                out[dst + channel] = (sum / 4) as u8;
+            }
+        }
+    }
+    out
+}
+
+fn upscale_rgba_2x(
+    small: &[u8],
+    small_width: usize,
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let src = ((y / 2) * small_width + x / 2) * 4;
+            let dst = (y * width + x) * 4;
+            pixels[dst..dst + 4].copy_from_slice(&small[src..src + 4]);
+        }
+    }
 }
 
 impl NtscParams {
     /// Apply a named parameter from a JSON value.
     pub fn set_param(&mut self, param: &str, value: &serde_json::Value) {
+        let finite = |fallback: f32| {
+            value
+                .as_f64()
+                .map(|number| number as f32)
+                .filter(|number| number.is_finite())
+                .unwrap_or(fallback)
+        };
         match param {
             "enabled" => {
-                if let Some(b) = value.as_bool() { self.enabled = b; }
+                if let Some(b) = value.as_bool() {
+                    self.enabled = b;
+                }
             }
             "tape_speed" => {
-                if let Some(n) = value.as_u64() { self.tape_speed = n as u32; }
+                if let Some(n) = value.as_u64() {
+                    self.tape_speed = n.min(2) as u32;
+                }
             }
             "chroma_loss" => {
-                if let Some(n) = value.as_f64() { self.chroma_loss = n as f32; }
+                self.chroma_loss = finite(self.chroma_loss).clamp(0.0, 0.01);
             }
             "edge_wave_enabled" => {
-                if let Some(b) = value.as_bool() { self.edge_wave_enabled = b; }
+                if let Some(b) = value.as_bool() {
+                    self.edge_wave_enabled = b;
+                }
             }
             "edge_wave_intensity" => {
-                if let Some(n) = value.as_f64() { self.edge_wave_intensity = n as f32; }
+                self.edge_wave_intensity = finite(self.edge_wave_intensity).clamp(0.0, 20.0);
             }
             "edge_wave_speed" => {
-                if let Some(n) = value.as_f64() { self.edge_wave_speed = n as f32; }
+                self.edge_wave_speed = finite(self.edge_wave_speed).clamp(0.0, 10.0);
             }
             "head_switching_enabled" => {
-                if let Some(b) = value.as_bool() { self.head_switching_enabled = b; }
+                if let Some(b) = value.as_bool() {
+                    self.head_switching_enabled = b;
+                }
             }
             "head_switching_height" => {
-                if let Some(n) = value.as_i64() { self.head_switching_height = n as i32; }
+                if let Some(n) = value.as_i64() {
+                    self.head_switching_height = n.clamp(0, 24) as i32;
+                }
             }
             "head_switching_shift" => {
-                if let Some(n) = value.as_f64() { self.head_switching_shift = n as f32; }
+                self.head_switching_shift = finite(self.head_switching_shift).clamp(-100.0, 100.0);
             }
             "tracking_noise_enabled" => {
-                if let Some(b) = value.as_bool() { self.tracking_noise_enabled = b; }
+                if let Some(b) = value.as_bool() {
+                    self.tracking_noise_enabled = b;
+                }
             }
             "tracking_noise_height" => {
-                if let Some(n) = value.as_i64() { self.tracking_noise_height = n as i32; }
+                if let Some(n) = value.as_i64() {
+                    self.tracking_noise_height = n.clamp(0, 120) as i32;
+                }
             }
             "tracking_noise_wave" => {
-                if let Some(n) = value.as_f64() { self.tracking_noise_wave = n as f32; }
+                self.tracking_noise_wave = finite(self.tracking_noise_wave).clamp(0.0, 50.0);
             }
             "tracking_noise_snow" => {
-                if let Some(n) = value.as_f64() { self.tracking_noise_snow = n as f32; }
+                self.tracking_noise_snow = finite(self.tracking_noise_snow).clamp(0.0, 1.0);
             }
             "snow_intensity" => {
-                if let Some(n) = value.as_f64() { self.snow_intensity = n as f32; }
+                self.snow_intensity = finite(self.snow_intensity).clamp(0.0, 1.0);
             }
             "composite_noise_intensity" => {
-                if let Some(n) = value.as_f64() { self.composite_noise_intensity = n as f32; }
+                self.composite_noise_intensity =
+                    finite(self.composite_noise_intensity).clamp(0.0, 0.5);
             }
             "luma_noise_intensity" => {
-                if let Some(n) = value.as_f64() { self.luma_noise_intensity = n as f32; }
+                self.luma_noise_intensity = finite(self.luma_noise_intensity).clamp(0.0, 0.2);
             }
             "chroma_noise_intensity" => {
-                if let Some(n) = value.as_f64() { self.chroma_noise_intensity = n as f32; }
+                self.chroma_noise_intensity = finite(self.chroma_noise_intensity).clamp(0.0, 0.5);
             }
             "luma_smear" => {
-                if let Some(n) = value.as_f64() { self.luma_smear = n as f32; }
+                self.luma_smear = finite(self.luma_smear).clamp(0.0, 1.0);
             }
             "composite_sharpening" => {
-                if let Some(n) = value.as_f64() { self.composite_sharpening = n as f32; }
+                self.composite_sharpening = finite(self.composite_sharpening).clamp(-1.0, 2.0);
             }
             _ => {}
         }
@@ -295,6 +335,14 @@ struct NtscJob {
     width: u32,
     height: u32,
     params: NtscParams,
+    epoch: u64,
+}
+
+/// A processed frame tagged with the visual generation from which it came.
+/// The caller must discard it when that generation is no longer current.
+pub struct NtscProcessedFrame {
+    pub pixels: Vec<u8>,
+    pub epoch: u64,
 }
 
 /// Runs ntsc-rs on a dedicated thread. The render loop submits composite
@@ -305,34 +353,62 @@ struct NtscJob {
 /// than the render loop tolerates a stall).
 pub struct NtscWorker {
     job_tx: SyncSender<NtscJob>,
-    result_rx: Receiver<Vec<u8>>,
+    result_rx: Receiver<Result<NtscProcessedFrame, String>>,
     in_flight: usize,
+    failed: bool,
+    last_error: String,
 }
 
 impl NtscWorker {
     pub fn new() -> Self {
         let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<NtscJob>(1);
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let (result_tx, result_rx) =
+            std::sync::mpsc::sync_channel::<Result<NtscProcessedFrame, String>>(1);
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("ntsc-worker".into())
             .spawn(move || {
                 let mut state = NtscState::new();
                 while let Ok(job) = job_rx.recv() {
-                    let mut pixels = job.pixels;
-                    state.params = job.params;
-                    state.apply(&mut pixels, job.width, job.height);
-                    if result_tx.send(pixels).is_err() {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut pixels = job.pixels;
+                        state.params = job.params;
+                        if state.apply(&mut pixels, job.width, job.height) {
+                            Ok(NtscProcessedFrame {
+                                pixels,
+                                epoch: job.epoch,
+                            })
+                        } else {
+                            Err(format!(
+                                "NTSC rejected frame {}x{} (invalid buffer or disabled effect)",
+                                job.width, job.height
+                            ))
+                        }
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err("NTSC worker panicked while processing a frame".into())
+                    });
+                    if result_tx.send(result).is_err() {
                         return;
                     }
                 }
-            })
-            .expect("Failed to spawn ntsc-worker thread");
+            });
+
+        let (failed, last_error) = match spawn_result {
+            Ok(_) => (false, String::new()),
+            Err(error) => {
+                let message = format!("Failed to spawn NTSC worker: {error}");
+                log::error!("{message}");
+                (true, message)
+            }
+        };
 
         Self {
             job_tx,
             result_rx,
             in_flight: 0,
+            failed,
+            last_error,
         }
     }
 
@@ -344,28 +420,86 @@ impl NtscWorker {
         width: u32,
         height: u32,
         params: NtscParams,
+        epoch: u64,
     ) -> bool {
-        if self.in_flight > 0 {
+        if self.failed || self.in_flight > 0 {
             return false;
         }
-        let job = NtscJob { pixels, width, height, params };
+        let job = NtscJob {
+            pixels,
+            width,
+            height,
+            params,
+            epoch,
+        };
         match self.job_tx.try_send(job) {
             Ok(()) => {
                 self.in_flight += 1;
                 true
             }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Disconnected(_)) => {
+                self.mark_failed("NTSC worker input disconnected");
+                false
+            }
         }
     }
 
     /// Collect a processed frame if one is ready.
-    pub fn try_recv(&mut self) -> Option<Vec<u8>> {
+    pub fn try_recv(&mut self) -> Option<NtscProcessedFrame> {
         match self.result_rx.try_recv() {
-            Ok(pixels) => {
+            Ok(Ok(pixels)) => {
                 self.in_flight = self.in_flight.saturating_sub(1);
                 Some(pixels)
             }
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+            Ok(Err(error)) => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.last_error = error;
+                log::error!("{}", self.last_error);
+                None
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.mark_failed("NTSC worker output disconnected");
+                None
+            }
         }
+    }
+
+    pub fn error(&self) -> &str {
+        &self.last_error
+    }
+
+    fn mark_failed(&mut self, message: &str) {
+        self.failed = true;
+        self.in_flight = 0;
+        if self.last_error.is_empty() {
+            self.last_error = message.to_string();
+            log::error!("{message}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{downscale_rgba_2x, upscale_rgba_2x};
+
+    #[test]
+    fn half_resolution_round_trip_handles_odd_dimensions() {
+        let width = 3usize;
+        let height = 3usize;
+        let mut source = Vec::new();
+        for pixel in 0..width * height {
+            source.extend_from_slice(&[pixel as u8, 0, 0, 255]);
+        }
+
+        let small = downscale_rgba_2x(&source, width, height);
+        assert_eq!(small.len(), 2 * 2 * 4);
+        // The bottom-right output sample clamps to source pixel 8.
+        assert_eq!(&small[12..16], &[8, 0, 0, 255]);
+
+        let mut restored = vec![0u8; source.len()];
+        upscale_rgba_2x(&small, 2, &mut restored, width, height);
+        assert_eq!(&restored[(8 * 4)..(9 * 4)], &[8, 0, 0, 255]);
     }
 }

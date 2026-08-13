@@ -7,10 +7,10 @@
 //! persisted under %LOCALAPPDATA%, so a phone that accepted it once stays
 //! trusted across restarts; it regenerates only when the LAN IP changes.
 //!
-//! Access control: loopback clients pass freely; every other client must
-//! present the per-session token — normally by scanning the QR code, whose
-//! URL carries `?key=…` — after which a cookie keeps them authenticated
-//! for the session. Unknown LAN clients get 403.
+//! Access control: every client must present the per-session token — normally
+//! through the app-opened URL or QR code — after which a strict cookie keeps
+//! it authenticated. WebSockets and mutation POSTs also require an exact
+//! same-origin Origin header. Unknown and cross-origin clients get 403.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -18,22 +18,32 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::broadcast::error::RecvError;
 
 use super::state::{WebAction, WebState};
 use super::static_files;
 
 const AUTH_COOKIE: &str = "cos_key";
+const MAX_WS_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_LOGGED_MESSAGE_CHARS: usize = 256;
+const MAX_ACTION_VALUE_DEPTH: usize = 8;
+const MAX_ACTION_VALUE_NODES: usize = 512;
+const MAX_ACTION_VALUE_STRING_BYTES: usize = 2048;
+// Leave room for the atomic reservation prefix and the largest numbered
+// collision suffix while staying below Windows' 255 UTF-16-code-unit
+// component limit.
+const MAX_LIBRARY_FILENAME_UTF16: usize = 220;
 
 /// Start the web server on a background thread. Returns the local URL.
 pub fn spawn(state: Arc<WebState>, port: u16) -> String {
-    let local_url = format!("http://127.0.0.1:{port}");
+    let local_url = format!("http://127.0.0.1:{port}/?key={}", state.access_token);
     let https_port = port + 1;
     let lan_ip = detect_lan_ip();
 
@@ -80,16 +90,14 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
             if let Ok((cert_chain, key_der)) = tls {
                 let https_app = app.clone();
                 tokio::spawn(async move {
-                    match axum_server::tls_rustls::RustlsConfig::from_der(cert_chain, key_der)
-                        .await
+                    match axum_server::tls_rustls::RustlsConfig::from_der(cert_chain, key_der).await
                     {
                         Ok(config) => {
                             let addr = SocketAddr::from(([0, 0, 0, 0], https_port));
                             log::info!("HTTPS control panel listening on {addr}");
                             if let Err(e) = axum_server::bind_rustls(addr, config)
                                 .serve(
-                                    https_app
-                                        .into_make_service_with_connect_info::<SocketAddr>(),
+                                    https_app.into_make_service_with_connect_info::<SocketAddr>(),
                                 )
                                 .await
                             {
@@ -191,18 +199,49 @@ fn detect_lan_ip() -> Option<IpAddr> {
     }
 }
 
-/// Gate: loopback passes; LAN needs the session token via cookie or the
-/// `?key=` query param (which then sets the cookie).
+/// Browser mutation routes must come from the exact host serving the panel.
+/// `Origin` is intentionally required for WebSockets and POSTs: ordinary page
+/// navigation has no Origin header, while browser script mutations always do.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let origin = origin.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    origin == format!("http://{host}") || origin == format!("https://{host}")
+}
+
+fn requires_same_origin(method: &Method, path: &str) -> bool {
+    *method == Method::POST || path == "/ws"
+}
+
+fn forbidden(message: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        message,
+    )
+        .into_response()
+}
+
+/// Gate every client, including loopback, with a high-entropy session token.
+/// The tokenized startup/QR navigation mints a strict session cookie; all
+/// browser mutations additionally require an exact same-origin Origin header.
 async fn auth(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<WebState>>,
     req: Request,
     next: Next,
 ) -> Response {
-    if addr.ip().is_loopback() {
-        return next.run(req).await;
-    }
-
     let token = &state.access_token;
 
     let cookie_ok = req
@@ -228,35 +267,32 @@ async fn auth(
         })
         .unwrap_or(false);
 
-    if cookie_ok {
-        return next.run(req).await;
+    if !cookie_ok && !query_ok {
+        log::warn!("Rejected unauthenticated control client: {}", addr.ip());
+        return forbidden(
+            "<h3>collide-o-scope</h3><p>Access denied. Open the control panel from the app or scan its QR code.</p>",
+        );
     }
-    if query_ok {
-        let mut response = next.run(req).await;
+
+    if requires_same_origin(req.method(), req.uri().path()) && !same_origin(req.headers()) {
+        log::warn!("Rejected cross-origin control mutation from {}", addr.ip());
+        return forbidden("<h3>collide-o-scope</h3><p>Cross-origin control request denied.</p>");
+    }
+
+    let mut response = next.run(req).await;
+    if query_ok && !cookie_ok {
         if let Ok(cookie) = header::HeaderValue::from_str(&format!(
-            "{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax"
+            "{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict"
         )) {
             response.headers_mut().append(header::SET_COOKIE, cookie);
         }
-        return response;
     }
-
-    log::warn!("Rejected unauthenticated LAN client: {}", addr.ip());
-    (
-        StatusCode::FORBIDDEN,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        "<h3>collide-o-scope</h3><p>Access denied. Scan the QR code in the control panel to connect.</p>",
-    )
-        .into_response()
+    response
 }
 
 /// QR code (SVG) of the remote URL, rendered on demand.
 async fn qr_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
-    let url = state
-        .lan_url
-        .read()
-        .map(|s| s.clone())
-        .unwrap_or_default();
+    let url = state.lan_url.read().map(|s| s.clone()).unwrap_or_default();
 
     match qrcode::QrCode::new(url.as_bytes()) {
         Ok(code) => {
@@ -285,30 +321,164 @@ struct UploadQuery {
     name: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatedLibraryFilename {
+    name: String,
+    stem: String,
+    extension: String,
+}
+
+/// Accept one portable Windows filename, exactly as supplied by the client.
+///
+/// In particular, do not reduce an untrusted path to its final component:
+/// accepting `../clip.mp4` as `clip.mp4` hides a malformed request and makes
+/// the boundary dependent on platform path-parsing rules. Windows device
+/// names and alternate-data-stream syntax are rejected before any join.
+fn validate_library_filename(input: &str) -> Option<ValidatedLibraryFilename> {
+    if input.is_empty()
+        || input.starts_with('.')
+        || input.ends_with([' ', '.'])
+        || input.encode_utf16().count() > MAX_LIBRARY_FILENAME_UTF16
+        || input.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+    {
+        return None;
+    }
+
+    let (stem, extension) = input.rsplit_once('.')?;
+    if stem.is_empty()
+        || !matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "mp4" | "webm" | "mov" | "avi" | "mkv"
+        )
+    {
+        return None;
+    }
+
+    // Win32 treats these DOS device identifiers as reserved even when an
+    // extension (or another extension) follows. Superscript 1/2/3 are also
+    // recognized as COM/LPT digits by Windows.
+    let device_stem = input
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
+        .to_ascii_uppercase();
+    let numbered_device = device_stem
+        .strip_prefix("COM")
+        .or_else(|| device_stem.strip_prefix("LPT"))
+        .is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{00b9}"
+                    | "\u{00b2}"
+                    | "\u{00b3}"
+            )
+        });
+    if matches!(
+        device_stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || numbered_device
+    {
+        return None;
+    }
+
+    Some(ValidatedLibraryFilename {
+        name: input.to_string(),
+        stem: stem.to_string(),
+        extension: extension.to_ascii_lowercase(),
+    })
+}
+
+async fn reserve_upload_destination(
+    folder: &std::path::Path,
+    original_name: &str,
+    stem: &str,
+    ext: &str,
+) -> Result<(String, PathBuf, PathBuf), String> {
+    for counter in 0_u32.. {
+        let candidate = if counter == 0 {
+            original_name.to_string()
+        } else {
+            format!("{stem} ({counter}).{ext}")
+        };
+        let final_path = folder.join(&candidate);
+        if final_path.exists() {
+            continue;
+        }
+        let reservation_path = folder.join(format!(".upload-reserve-{candidate}"));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&reservation_path)
+            .await
+        {
+            Ok(file) => {
+                drop(file);
+                // Cover files created by another process between our first
+                // existence check and reservation.
+                if final_path.exists() {
+                    let _ = tokio::fs::remove_file(&reservation_path).await;
+                    continue;
+                }
+                return Ok((candidate, final_path, reservation_path));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("reserve destination: {error}")),
+        }
+    }
+    unreachable!("u32 upload suffix space exhausted")
+}
+
+async fn create_unique_upload_temp(
+    folder: &std::path::Path,
+) -> Result<(PathBuf, tokio::fs::File), String> {
+    for _ in 0..8 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|error| format!("upload entropy: {error}"))?;
+        let suffix: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        let path = folder.join(format!(".upload-{suffix}.part"));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create upload temp: {error}")),
+        }
+    }
+    Err("could not allocate a unique upload temp file".to_string())
+}
+
 /// Streamed clip upload into the library folder. The body is written in
 /// chunks to a temp file (never buffered whole in memory), renamed into
 /// place on success, and the render thread is asked to rescan. Names are
-/// reduced to their final path component and must carry a known video
+/// accepted only as a single Windows-safe component carrying a known video
 /// extension; collisions get a numbered suffix rather than overwriting.
 async fn upload_handler(
     State(state): State<Arc<WebState>>,
     Query(query): Query<UploadQuery>,
     body: axum::body::Body,
 ) -> Response {
-    // Sanitize: no directory components, no hidden files.
-    let name = std::path::Path::new(&query.name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let ext = std::path::Path::new(&name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    if name.is_empty() || name.starts_with('.')
-        || !matches!(ext.as_str(), "mp4" | "webm" | "mov" | "avi" | "mkv")
-    {
-        return (StatusCode::BAD_REQUEST, "unsupported file type").into_response();
-    }
+    let Some(validated) = validate_library_filename(&query.name) else {
+        return (StatusCode::BAD_REQUEST, "unsupported or unsafe filename").into_response();
+    };
+    let ValidatedLibraryFilename {
+        name,
+        stem,
+        extension: ext,
+    } = validated;
 
     let Some(folder) = state.library_folder.read().ok().and_then(|f| f.clone()) else {
         return (
@@ -318,25 +488,20 @@ async fn upload_handler(
             .into_response();
     };
 
-    // Collisions get " (n)" suffixes instead of overwriting.
-    let stem = std::path::Path::new(&name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "clip".to_string());
-    let mut final_name = name.clone();
-    let mut counter = 1;
-    while folder.join(&final_name).exists() {
-        final_name = format!("{stem} ({counter}).{ext}");
-        counter += 1;
-    }
-    let final_path = folder.join(&final_name);
-    let temp_path = folder.join(format!(".upload-{final_name}.part"));
-
-    let mut file = match tokio::fs::File::create(&temp_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("create: {e}"))
-                .into_response()
+    // Atomically reserve a collision-free destination. This prevents two
+    // simultaneous same-name uploads from sharing either output or temp data.
+    let (final_name, final_path, reservation_path) =
+        match reserve_upload_destination(&folder, &name, &stem, &ext).await {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+            }
+        };
+    let (temp_path, mut file) = match create_unique_upload_temp(&folder).await {
+        Ok(temp) => temp,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&reservation_path).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
         }
     };
 
@@ -348,6 +513,7 @@ async fn upload_handler(
                 if let Err(e) = file.write_all(&bytes).await {
                     drop(file);
                     let _ = tokio::fs::remove_file(&temp_path).await;
+                    let _ = tokio::fs::remove_file(&reservation_path).await;
                     return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
                         .into_response();
                 }
@@ -356,6 +522,7 @@ async fn upload_handler(
             Err(e) => {
                 drop(file);
                 let _ = tokio::fs::remove_file(&temp_path).await;
+                let _ = tokio::fs::remove_file(&reservation_path).await;
                 return (StatusCode::BAD_REQUEST, format!("stream: {e}")).into_response();
             }
         }
@@ -363,17 +530,20 @@ async fn upload_handler(
     if file.flush().await.is_err() || written == 0 {
         drop(file);
         let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = tokio::fs::remove_file(&reservation_path).await;
         return (StatusCode::BAD_REQUEST, "empty upload").into_response();
     }
     drop(file);
 
     if let Err(e) = tokio::fs::rename(&temp_path, &final_path).await {
         let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = tokio::fs::remove_file(&reservation_path).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")).into_response();
     }
+    let _ = tokio::fs::remove_file(&reservation_path).await;
 
     log::info!("Uploaded clip: {final_name} ({written} bytes)");
-    state.actions.lock().await.push(WebAction::RescanLibrary);
+    let _ = state.enqueue_action(WebAction::RescanLibrary).await;
 
     (StatusCode::OK, final_name).into_response()
 }
@@ -391,17 +561,10 @@ async fn delete_handler(
     State(state): State<Arc<WebState>>,
     Query(query): Query<DeleteQuery>,
 ) -> Response {
-    let name = std::path::Path::new(&query.name)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let ext = std::path::Path::new(&name)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    if name.is_empty() || !matches!(ext.as_str(), "mp4" | "webm" | "mov" | "avi" | "mkv") {
+    let Some(validated) = validate_library_filename(&query.name) else {
         return (StatusCode::BAD_REQUEST, "not a library clip").into_response();
-    }
+    };
+    let name = validated.name;
 
     let Some(folder) = state.library_folder.read().ok().and_then(|f| f.clone()) else {
         return (StatusCode::CONFLICT, "no library folder open").into_response();
@@ -420,7 +583,7 @@ async fn delete_handler(
                 cache.remove(&name);
             }
             log::info!("Clip moved to Recycle Bin: {name}");
-            state.actions.lock().await.push(WebAction::RescanLibrary);
+            let _ = state.enqueue_action(WebAction::RescanLibrary).await;
             (StatusCode::OK, name).into_response()
         }
         Ok(Err(e)) => (
@@ -468,11 +631,157 @@ async fn preview_handler(
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<WebState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+fn safe_log_excerpt(text: &str) -> String {
+    let mut excerpt = String::new();
+    let mut truncated = false;
+    for (index, character) in text.chars().enumerate() {
+        if index >= MAX_LOGGED_MESSAGE_CHARS {
+            truncated = true;
+            break;
+        }
+        excerpt.push(if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        });
+    }
+    if truncated {
+        excerpt.push('\u{2026}');
+    }
+    excerpt
+}
+
+fn valid_identifier(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len && !value.chars().any(char::is_control)
+}
+
+fn valid_optional_layer_id(layer_id: &Option<String>) -> bool {
+    layer_id
+        .as_deref()
+        .is_none_or(|value| valid_identifier(value, 128))
+}
+
+fn valid_json_value(value: &serde_json::Value) -> bool {
+    fn visit(value: &serde_json::Value, depth: usize, remaining: &mut usize) -> bool {
+        if depth > MAX_ACTION_VALUE_DEPTH || *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) => true,
+            serde_json::Value::Number(number) => number
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && number.abs() <= f64::from(f32::MAX)),
+            serde_json::Value::String(value) => {
+                value.len() <= MAX_ACTION_VALUE_STRING_BYTES && !value.chars().any(char::is_control)
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .all(|value| visit(value, depth + 1, remaining)),
+            serde_json::Value::Object(values) => values.iter().all(|(key, value)| {
+                valid_identifier(key, 128) && visit(value, depth + 1, remaining)
+            }),
+        }
+    }
+
+    let mut remaining = MAX_ACTION_VALUE_NODES;
+    visit(value, 0, &mut remaining)
+}
+
+fn valid_f32(value: f32) -> bool {
+    value.is_finite()
+}
+
+fn valid_f64_for_f32(value: f64) -> bool {
+    value.is_finite() && value.abs() <= f64::from(f32::MAX)
+}
+
+fn valid_action(action: &WebAction, depth: usize) -> bool {
+    if depth > 2 {
+        return false;
+    }
+    match action {
+        WebAction::Quantized { inner } => valid_action(inner, depth + 1),
+        WebAction::AddLayer { filename } => valid_identifier(filename, 1024),
+        WebAction::AddSpoutLayer { sender } => valid_identifier(sender, 255),
+        WebAction::SetLayerParam {
+            layer_id,
+            param,
+            value,
+            ..
+        }
+        | WebAction::SetLayerEffect {
+            layer_id,
+            param,
+            value,
+            ..
+        } => {
+            valid_optional_layer_id(layer_id)
+                && valid_identifier(param, 64)
+                && valid_json_value(value)
+        }
+        WebAction::RemoveLayer { layer_id, .. }
+        | WebAction::ResetLayerFx { layer_id, .. }
+        | WebAction::SetLayerVisibility { layer_id, .. }
+        | WebAction::SetLayerPaused { layer_id, .. }
+        | WebAction::MoveLayer { layer_id, .. } => valid_optional_layer_id(layer_id),
+        WebAction::SetParam { param, value }
+        | WebAction::SetNtscParam { param, value }
+        | WebAction::SetAudio { param, value }
+        | WebAction::SetMidi { param, value }
+        | WebAction::SetTemporal { param, value } => {
+            valid_identifier(param, 64) && valid_json_value(value)
+        }
+        WebAction::SetLfo { param, value, .. } | WebAction::SetRouting { param, value, .. } => {
+            valid_identifier(param, 64) && valid_json_value(value)
+        }
+        WebAction::SetGyroConfig {
+            axis, param, value, ..
+        }
+        | WebAction::SetPadConfig {
+            axis, param, value, ..
+        } => valid_identifier(axis, 16) && valid_identifier(param, 64) && valid_json_value(value),
+        WebAction::SetBpm { value } | WebAction::SetMorph { value } => valid_f32(*value),
+        WebAction::Gyro { alpha, beta, gamma } => {
+            valid_f32(*alpha) && valid_f32(*beta) && valid_f32(*gamma)
+        }
+        WebAction::Pad { x, y, .. } => valid_f32(*x) && valid_f32(*y),
+        WebAction::MorphGlide {
+            target,
+            duration_beats,
+        } => valid_f32(*target) && valid_f64_for_f32(*duration_beats),
+        WebAction::MorphCapture { slot } => valid_identifier(slot, 8),
+        WebAction::SetMorphLaw { law } => valid_identifier(law, 32),
+        WebAction::ResetGroup { group } => valid_identifier(group, 32),
+        WebAction::StartExport {
+            width,
+            height,
+            fps,
+            duration_secs,
+            audio_layer_id,
+            ..
+        } => {
+            *width > 0
+                && *height > 0
+                && *width <= 8192
+                && *height <= 8192
+                && width
+                    .checked_mul(*height)
+                    .is_some_and(|pixels| pixels <= 33_177_600)
+                && (1..=240).contains(fps)
+                && duration_secs.is_finite()
+                && *duration_secs > 0.0
+                && *duration_secs <= 3600.0
+                && valid_optional_layer_id(audio_layer_id)
+        }
+        _ => true,
+    }
+}
+
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(|socket| handle_socket(socket, state))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
@@ -482,15 +791,36 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
     let current = state.app.read().await;
     let init_msg = serde_json::to_string(&*current).unwrap();
     drop(current);
-    let _ = sender.send(Message::Text(init_msg.into())).await;
+    let _ = sender.send(Message::Text(init_msg)).await;
 
     // Subscribe to broadcast updates (state JSON)
     let mut rx = state.tx.subscribe();
+    let send_state = state.clone();
 
     // Forward broadcasts to this client
     let mut send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg.into())).await.is_err() {
+        loop {
+            let msg = match rx.recv().await {
+                Ok(msg) => msg,
+                Err(RecvError::Lagged(_)) => {
+                    // A temporarily slow socket does not need every stale
+                    // 30 Hz snapshot. Jump to the live edge and send one
+                    // fresh state instead of disconnecting/reconnecting.
+                    let current = send_state.app.read().await;
+                    let fresh = match serde_json::to_string(&*current) {
+                        Ok(fresh) => fresh,
+                        Err(error) => {
+                            log::warn!("Failed to serialize lag recovery state: {error}");
+                            continue;
+                        }
+                    };
+                    drop(current);
+                    rx = rx.resubscribe();
+                    fresh
+                }
+                Err(RecvError::Closed) => break,
+            };
+            if sender.send(Message::Text(msg)).await.is_err() {
                 break;
             }
         }
@@ -503,12 +833,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
             if let Message::Text(text) = msg {
                 // Try to parse as a WebAction
                 match serde_json::from_str::<WebAction>(&text) {
-                    Ok(action) => {
-                        state_clone.actions.lock().await.push(action);
+                    Ok(action) if valid_action(&action, 0) => {
+                        let _ = state_clone.enqueue_action(action).await;
                     }
-                    Err(e) => {
-                        log::warn!("Failed to parse WebAction: {e} — raw: {text}");
-                    }
+                    Ok(_) => log::warn!("Rejected invalid WebAction payload"),
+                    Err(error) => log::warn!(
+                        "Failed to parse WebAction: {error} - excerpt: {}",
+                        safe_log_excerpt(&text)
+                    ),
                 }
             }
         }
@@ -517,5 +849,219 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
     tokio::select! {
         _ = &mut send_task => recv_task.abort(),
         _ = &mut recv_task => send_task.abort(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn library_filename_validator_accepts_only_exact_safe_video_components() {
+        let valid = validate_library_filename("set.final.MP4").unwrap();
+        assert_eq!(valid.name, "set.final.MP4");
+        assert_eq!(valid.stem, "set.final");
+        assert_eq!(valid.extension, "mp4");
+        assert!(validate_library_filename("telescope-\u{00e9}t\u{00e9}.mov").is_some());
+        assert!(validate_library_filename("COM10.mp4").is_some());
+        assert!(validate_library_filename("LPT0.webm").is_some());
+
+        for invalid in [
+            "",
+            ".hidden.mp4",
+            ".",
+            "..",
+            "../clip.mp4",
+            "..\\clip.mp4",
+            "folder/clip.mp4",
+            "folder\\clip.mp4",
+            "C:\\clip.mp4",
+            "clip:stream.mp4",
+            "clip.mp4 ",
+            "clip.mp4.",
+            "clip.txt",
+            "clip\n.mp4",
+            "clip\u{0000}.mp4",
+        ] {
+            assert!(
+                validate_library_filename(invalid).is_none(),
+                "accepted unsafe name {invalid:?}"
+            );
+        }
+
+        for invalid_character in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            let name = format!("clip{invalid_character}name.mp4");
+            assert!(
+                validate_library_filename(&name).is_none(),
+                "accepted Windows-invalid character {invalid_character:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn library_filename_validator_rejects_windows_device_names() {
+        for device in [
+            "CON",
+            "PRN",
+            "AUX",
+            "NUL",
+            "CONIN$",
+            "CONOUT$",
+            "CLOCK$",
+            "COM1",
+            "COM2",
+            "COM3",
+            "COM4",
+            "COM5",
+            "COM6",
+            "COM7",
+            "COM8",
+            "COM9",
+            "LPT1",
+            "LPT2",
+            "LPT3",
+            "LPT4",
+            "LPT5",
+            "LPT6",
+            "LPT7",
+            "LPT8",
+            "LPT9",
+            "COM\u{00b9}",
+            "COM\u{00b2}",
+            "COM\u{00b3}",
+            "LPT\u{00b9}",
+            "LPT\u{00b2}",
+            "LPT\u{00b3}",
+        ] {
+            for name in [format!("{device}.mp4"), format!("{device}.backup.MOV")] {
+                assert!(
+                    validate_library_filename(&name).is_none(),
+                    "accepted reserved device name {name:?}"
+                );
+            }
+        }
+        assert!(validate_library_filename("con .mp4").is_none());
+        assert!(validate_library_filename("PrN.mkv").is_none());
+    }
+
+    #[test]
+    fn library_filename_limit_leaves_room_for_atomic_reservation_suffixes() {
+        let maximum = format!("{}.mp4", "a".repeat(MAX_LIBRARY_FILENAME_UTF16 - 4));
+        assert_eq!(maximum.encode_utf16().count(), MAX_LIBRARY_FILENAME_UTF16);
+        assert!(validate_library_filename(&maximum).is_some());
+
+        let excessive = format!("a{maximum}");
+        assert!(validate_library_filename(&excessive).is_none());
+
+        let maximum_stem = maximum.strip_suffix(".mp4").unwrap();
+        let longest_reservation = format!(".upload-reserve-{maximum_stem} (4294967295).mp4");
+        assert!(longest_reservation.encode_utf16().count() <= 255);
+
+        let emoji_maximum = format!("{}.mp4", "\u{1f52d}".repeat(108));
+        assert_eq!(
+            emoji_maximum.encode_utf16().count(),
+            MAX_LIBRARY_FILENAME_UTF16
+        );
+        assert!(validate_library_filename(&emoji_maximum).is_some());
+        assert!(validate_library_filename(&format!("\u{1f52d}{emoji_maximum}")).is_none());
+    }
+
+    #[test]
+    fn origin_must_match_host_exactly() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3030"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:3030"),
+        );
+        assert!(same_origin(&headers));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        assert!(!same_origin(&headers));
+        headers.remove(header::ORIGIN);
+        assert!(!same_origin(&headers));
+    }
+
+    #[test]
+    fn malformed_log_excerpt_is_bounded_and_control_safe() {
+        let raw = format!("bad\r\n{}", "x".repeat(1000));
+        let excerpt = safe_log_excerpt(&raw);
+        assert!(!excerpt.contains('\r'));
+        assert!(!excerpt.contains('\n'));
+        assert!(excerpt.chars().count() <= MAX_LOGGED_MESSAGE_CHARS + 1);
+        assert!(excerpt.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn invalid_exports_and_recursive_wrappers_are_rejected() {
+        let huge = WebAction::StartExport {
+            width: 8192,
+            height: 8192,
+            fps: 240,
+            duration_secs: 1.0,
+            audio_layer: None,
+            audio_layer_id: None,
+        };
+        assert!(!valid_action(&huge, 0));
+        let zero_duration = WebAction::StartExport {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            duration_secs: 0.0,
+            audio_layer: None,
+            audio_layer_id: None,
+        };
+        assert!(!valid_action(&zero_duration, 0));
+        let nested = WebAction::Quantized {
+            inner: Box::new(WebAction::Quantized {
+                inner: Box::new(WebAction::Quantized {
+                    inner: Box::new(WebAction::CancelExport),
+                }),
+            }),
+        };
+        assert!(!valid_action(&nested, 0));
+    }
+
+    #[test]
+    fn oversized_or_nonfinite_action_numbers_are_rejected() {
+        let overflow: WebAction =
+            serde_json::from_str(r#"{"action":"set_param","param":"brightness","value":1e308}"#)
+                .unwrap();
+        assert!(!valid_action(&overflow, 0));
+
+        let nested_overflow: WebAction = serde_json::from_str(
+            r#"{"action":"set_audio","param":"band_edges","value":{"edges":[100,1e308]}}"#,
+        )
+        .unwrap();
+        assert!(!valid_action(&nested_overflow, 0));
+
+        assert!(!valid_action(
+            &WebAction::SetBpm {
+                value: f32::INFINITY,
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::MorphGlide {
+                target: 0.5,
+                duration_beats: f64::MAX,
+            },
+            0,
+        ));
+    }
+
+    #[tokio::test]
+    async fn lagged_broadcast_receiver_can_jump_to_live_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(2);
+        for value in 0..3 {
+            tx.send(value).unwrap();
+        }
+        assert!(matches!(rx.recv().await, Err(RecvError::Lagged(_))));
+        rx = rx.resubscribe();
+        tx.send(3).unwrap();
+        assert_eq!(rx.recv().await.unwrap(), 3);
     }
 }

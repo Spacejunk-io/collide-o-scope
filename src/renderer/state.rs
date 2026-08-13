@@ -3,7 +3,7 @@ use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
-use crate::effects::params::TemporalParams;
+use crate::effects::params::{normalized_slit_direction, TemporalParams, TEMPORAL_REFERENCE_FPS};
 use crate::effects::EffectUniforms;
 use crate::layers::Layer;
 
@@ -20,8 +20,155 @@ struct TemporalUniforms {
     slitscan: f32,
     history_len: f32,
     write_index: f32,
-    slit_axis: f32,
-    _pad: f32,
+    valid_history: f32,
+    feedback_valid: f32,
+    slit_direction: [f32; 2],
+    _pad: [f32; 2],
+}
+
+/// CPU-side lifetime for temporal GPU memories.
+///
+/// History snapshots advance at a fixed 30 Hz regardless of render cadence,
+/// while `history_valid` and `feedback_valid` prevent the shader from ever
+/// touching an unwritten texture. The texture contents themselves do not need
+/// an eager clear because invalid layers remain unreachable.
+#[derive(Debug, Clone)]
+pub(crate) struct TemporalState {
+    history_write: usize,
+    history_valid: u32,
+    history_accumulator: f64,
+    feedback_valid: bool,
+    initialized: bool,
+    total_history_frames: usize,
+}
+
+impl Default for TemporalState {
+    fn default() -> Self {
+        Self {
+            history_write: 0,
+            history_valid: 0,
+            history_accumulator: 0.0,
+            feedback_valid: false,
+            initialized: false,
+            total_history_frames: 0,
+        }
+    }
+}
+
+impl TemporalState {
+    /// Reset validity immediately. Stale GPU pixels can remain allocated: the
+    /// shader cannot sample them until fresh frames make them valid again.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Number of 30-Hz history snapshots to record for this render step.
+    /// The first rendered clean frame primes the ring immediately. Long stalls
+    /// are bounded to one complete ring because further copies of the same
+    /// current frame cannot add information.
+    fn history_writes_for_delta(&mut self, delta_seconds: f32) -> u32 {
+        if !self.initialized {
+            self.initialized = true;
+            return 1;
+        }
+
+        let reference_delta = 1.0 / TEMPORAL_REFERENCE_FPS as f64;
+        let delta = if delta_seconds.is_finite() {
+            delta_seconds.max(0.0) as f64
+        } else {
+            reference_delta
+        };
+        self.history_accumulator += delta;
+
+        let elapsed_steps = (self.history_accumulator / reference_delta).floor() as u64;
+        if elapsed_steps == 0 {
+            return 0;
+        }
+        self.history_accumulator -= elapsed_steps as f64 * reference_delta;
+        elapsed_steps.min(HISTORY_LEN as u64) as u32
+    }
+
+    fn record_history_frame(&mut self) {
+        if self.history_valid > 0 {
+            self.history_write = (self.history_write + 1) % HISTORY_LEN as usize;
+        }
+        self.history_valid = (self.history_valid + 1).min(HISTORY_LEN);
+        self.total_history_frames = self.total_history_frames.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+mod temporal_state_tests {
+    use super::*;
+
+    fn advance(state: &mut TemporalState, delta_seconds: f32) -> u32 {
+        let writes = state.history_writes_for_delta(delta_seconds);
+        for _ in 0..writes {
+            state.record_history_frame();
+        }
+        writes
+    }
+
+    #[test]
+    fn history_is_primed_then_advances_at_thirty_hz() {
+        let mut state = TemporalState::default();
+
+        assert_eq!(advance(&mut state, 1.0 / 60.0), 1);
+        assert_eq!(state.history_valid, 1);
+        assert_eq!(advance(&mut state, 1.0 / 60.0), 0);
+        assert_eq!(advance(&mut state, 1.0 / 60.0), 1);
+        assert_eq!(state.history_valid, 2);
+        assert_eq!(state.history_write, 1);
+    }
+
+    #[test]
+    fn valid_history_never_exceeds_the_ring() {
+        let mut state = TemporalState::default();
+        advance(&mut state, 0.0);
+        for _ in 0..(HISTORY_LEN * 2) {
+            advance(&mut state, 1.0 / TEMPORAL_REFERENCE_FPS);
+        }
+
+        assert_eq!(state.history_valid, HISTORY_LEN);
+        assert!(state.history_write < HISTORY_LEN as usize);
+    }
+
+    #[test]
+    fn temporal_uniform_layout_matches_three_shader_vec4s() {
+        assert_eq!(std::mem::size_of::<TemporalUniforms>(), 48);
+    }
+
+    #[test]
+    fn reset_revokes_all_temporal_validity() {
+        let mut state = TemporalState::default();
+        advance(&mut state, 0.0);
+        state.feedback_valid = true;
+
+        state.reset();
+
+        assert_eq!(state.history_valid, 0);
+        assert!(!state.feedback_valid);
+        assert!(!state.initialized);
+        assert_eq!(state.total_history_frames, 0);
+    }
+
+    #[test]
+    fn output_capability_selection_handles_empty_and_fallback_lists() {
+        assert_eq!(preferred_surface_format(&[]), None);
+        assert_eq!(preferred_present_mode(&[]), None);
+        assert_eq!(
+            preferred_surface_format(&[wgpu::TextureFormat::Rgba8Unorm]),
+            Some(wgpu::TextureFormat::Rgba8Unorm)
+        );
+        assert_eq!(
+            preferred_present_mode(&[wgpu::PresentMode::Immediate]),
+            Some(wgpu::PresentMode::Immediate)
+        );
+        assert_eq!(
+            preferred_present_mode(&[wgpu::PresentMode::Immediate, wgpu::PresentMode::Fifo]),
+            Some(wgpu::PresentMode::Fifo)
+        );
+    }
 }
 
 // Readback slot lifecycle for the async NTSC pipeline.
@@ -36,13 +183,32 @@ const MAX_READBACK_SLOTS: usize = 3;
 struct ReadbackSlot {
     buffer: wgpu::Buffer,
     status: Arc<AtomicU8>,
+    /// Monotonic order in which the GPU copy was submitted.
+    sequence: u64,
+    /// Application-owned visual generation associated with this copy.
+    /// Consumers use it to reject frames captured before a blackout edge.
+    epoch: u64,
+}
+
+/// A completed asynchronous composite readback.
+///
+/// `epoch` is opaque to the renderer. The live application advances it at
+/// blackout transitions so delayed GPU/CPU work can never reveal an older
+/// visual generation.
+pub struct ReadbackFrame {
+    pub pixels: Vec<u8>,
+    pub epoch: u64,
 }
 
 /// Build the temporal pipeline and its layouts. Shared by the live
 /// renderer and the offline exporter so both apply identical passes.
 pub(crate) fn build_temporal_pipeline(
     device: &wgpu::Device,
-) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+) {
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Temporal BGL"),
         entries: &[
@@ -203,7 +369,7 @@ pub(crate) fn build_feedback_texture(
 /// layer holding the most recent completed frame; returns the new value.
 /// Shared by the live renderer and the offline exporter.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_temporal(
+pub(crate) fn encode_temporal_with_dt(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
     params: &TemporalParams,
@@ -217,48 +383,55 @@ pub(crate) fn encode_temporal(
     history_view: &wgpu::TextureView,
     feedback_texture: &wgpu::Texture,
     feedback_view: &wgpu::TextureView,
-    history_write: usize,
+    state: &mut TemporalState,
+    delta_seconds: f32,
     width: u32,
     height: u32,
-) -> usize {
+) {
     // Record the CLEAN composite into the ring first — slit-scan must read
     // real past frames, never its own output (which would self-cannibalize
     // into black). new_write becomes the ring's "now".
-    let new_write = (history_write + 1) % HISTORY_LEN as usize;
-    encoder.copy_texture_to_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &composite_textures[0],
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyTextureInfo {
-            texture: history_texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y: 0,
-                z: new_write as u32,
+    let writes = state.history_writes_for_delta(delta_seconds);
+    for _ in 0..writes {
+        state.record_history_frame();
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
             },
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+            wgpu::TexelCopyTextureInfo {
+                texture: history_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: state.history_write as u32,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
 
-    if params.is_active() {
+    let frame_params = params.for_frame_delta(delta_seconds);
+    if frame_params.is_active() {
         let uniforms = TemporalUniforms {
-            feedback: params.feedback.clamp(0.0, 0.98),
-            fb_zoom: params.fb_zoom.clamp(0.5, 2.0),
-            fb_rotate: params.fb_rotate,
-            slitscan: params.slitscan.clamp(0.0, 1.0),
+            feedback: frame_params.feedback,
+            fb_zoom: frame_params.fb_zoom,
+            fb_rotate: frame_params.fb_rotate,
+            slitscan: frame_params.slitscan,
             history_len: HISTORY_LEN as f32,
-            write_index: new_write as f32,
-            slit_axis: params.slit_axis,
-            _pad: 0.0,
+            write_index: state.history_write as f32,
+            valid_history: state.history_valid as f32,
+            feedback_valid: if state.feedback_valid { 1.0 } else { 0.0 },
+            slit_direction: normalized_slit_direction(frame_params.slit_angle, width, height),
+            _pad: [0.0; 2],
         };
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Temporal Uniforms"),
@@ -359,7 +532,7 @@ pub(crate) fn encode_temporal(
             depth_or_array_layers: 1,
         },
     );
-    new_write
+    state.feedback_valid = true;
 }
 
 /// Uniforms for the composite shader.
@@ -405,6 +578,8 @@ pub struct Renderer {
 
     // Staging buffers for async NTSC readback (created lazily, reused)
     readback_slots: Vec<ReadbackSlot>,
+    next_readback_sequence: u64,
+    last_harvested_readback_sequence: u64,
 
     // Temporal effects: ring buffer of past output frames (texture array)
     temporal_pipeline: wgpu::RenderPipeline,
@@ -414,8 +589,8 @@ pub struct Renderer {
     history_view: wgpu::TextureView,
     feedback_texture: wgpu::Texture,
     feedback_view: wgpu::TextureView,
-    /// Ring layer holding the current clean frame.
-    history_write: usize,
+    /// Fixed-rate history clock and validity for temporal GPU memories.
+    temporal_state: TemporalState,
 
     // Instance + adapter kept for creating additional surfaces (output
     // window). Capabilities must be queried against the SAME adapter the
@@ -437,28 +612,56 @@ struct OutputTarget {
     bind_group: wgpu::BindGroup,
 }
 
+fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .find(|format| format.is_srgb())
+        .copied()
+        .or_else(|| formats.first().copied())
+}
+
+fn preferred_present_mode(modes: &[wgpu::PresentMode]) -> Option<wgpu::PresentMode> {
+    if modes.contains(&wgpu::PresentMode::Fifo) {
+        Some(wgpu::PresentMode::Fifo)
+    } else {
+        modes.first().copied()
+    }
+}
+
 impl Renderer {
-    pub fn new(window: Arc<Window>, output_width: u32, output_height: u32) -> Self {
+    pub fn new(window: Arc<Window>, output_width: u32, output_height: u32) -> Result<Self, String> {
+        // Reject corrupt/hostile initial dimensions before constructing any
+        // full-frame GPU resource. Adapter limits remain an additional check,
+        // never the sole memory-safety boundary.
+        crate::video::decoder::validate_media_dimensions(output_width, output_height, None)
+            .map_err(|error| format!("invalid renderer output dimensions: {error}"))?;
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window).unwrap();
+        let surface = instance
+            .create_surface(window)
+            .map_err(|error| format!("failed to create renderer surface: {error}"))?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
-        .expect("No suitable GPU adapter found");
+        .map_err(|error| format!("no suitable GPU adapter found: {error}"))?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("Device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            },
-        ))
-        .expect("Failed to create device");
+        crate::video::decoder::validate_media_dimensions(
+            output_width,
+            output_height,
+            Some(adapter.limits().max_texture_dimension_2d),
+        )
+        .map_err(|error| format!("unsupported renderer output dimensions: {error}"))?;
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .map_err(|error| format!("failed to create renderer device: {error}"))?;
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -524,7 +727,6 @@ impl Renderer {
                     count: None,
                 }],
             });
-
 
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Vertex Shader"),
@@ -624,7 +826,6 @@ impl Renderer {
                 }],
             });
 
-
         let composite_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Composite Fragment"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/composite.wgsl").into()),
@@ -678,8 +879,10 @@ impl Renderer {
             build_feedback_texture(&device, output_width, output_height);
 
         // --- Three composite textures ---
-        let tex_usage =
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST;
+        let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
 
         let composite_textures: [wgpu::Texture; 3] = std::array::from_fn(|i| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -705,7 +908,7 @@ impl Renderer {
         let output_view =
             composite_textures[0].create_view(&wgpu::TextureViewDescriptor::default());
 
-        Self {
+        Ok(Self {
             surface,
             device,
             queue,
@@ -723,6 +926,8 @@ impl Renderer {
             output_width,
             output_height,
             readback_slots: Vec::new(),
+            next_readback_sequence: 1,
+            last_harvested_readback_sequence: 0,
             temporal_pipeline,
             temporal_bind_group_layout,
             temporal_uniform_layout,
@@ -730,39 +935,47 @@ impl Renderer {
             history_view,
             feedback_texture,
             feedback_view,
-            history_write: 0,
+            temporal_state: TemporalState::default(),
             instance,
             adapter,
             output: None,
-        }
+        })
     }
 
     /// Open the fullscreen output window's rendering surface.
-    pub fn create_output(&mut self, window: Arc<Window>) {
+    pub fn create_output(&mut self, window: Arc<Window>) -> Result<(), String> {
         let size = window.inner_size();
-        let surface = match self.instance.create_surface(window.clone()) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("Output window surface: {e}");
-                return;
-            }
-        };
+        let surface = self
+            .instance
+            .create_surface(window.clone())
+            .map_err(|error| format!("failed to create output-window surface: {error}"))?;
 
         let caps = surface.get_capabilities(&self.adapter);
-        let format = caps
-            .formats
-            .iter()
-            .find(|f| f.is_srgb())
-            .copied()
-            .unwrap_or(caps.formats[0]);
+        if !caps.usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
+            return Err(
+                "output-window surface does not support render attachments on the active GPU"
+                    .to_string(),
+            );
+        }
+        let format = preferred_surface_format(&caps.formats).ok_or_else(|| {
+            "output-window surface is incompatible with the active GPU (no texture formats)"
+                .to_string()
+        })?;
+        let alpha_mode = caps.alpha_modes.first().copied().ok_or_else(|| {
+            "output-window surface is incompatible with the active GPU (no alpha modes)".to_string()
+        })?;
+        let present_mode = preferred_present_mode(&caps.present_modes).ok_or_else(|| {
+            "output-window surface is incompatible with the active GPU (no present modes)"
+                .to_string()
+        })?;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes[0],
+            present_mode,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -793,14 +1006,18 @@ impl Renderer {
                 ],
             });
 
-        let vertex = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blit Vertex"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fullscreen.wgsl").into()),
-        });
-        let fragment = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blit Fragment"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
-        });
+        let vertex = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blit Vertex"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fullscreen.wgsl").into()),
+            });
+        let fragment = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blit Fragment"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
+            });
 
         let layout = self
             .device
@@ -863,6 +1080,21 @@ impl Renderer {
             pipeline,
             bind_group,
         });
+        Ok(())
+    }
+
+    /// Start a new patch/visual generation without sampling any temporal or
+    /// asynchronous readback data produced by the prior generation.
+    ///
+    /// The application must also advance its external visual epoch and clear
+    /// any CPU-side NTSC-presented frame. Pending map callbacks may complete,
+    /// but their sequence numbers are at or below this invalidation watermark
+    /// and `poll_readback` will recycle them without returning their pixels.
+    pub fn reset_visual_generation(&mut self) {
+        self.temporal_state.reset();
+        self.last_harvested_readback_sequence = self
+            .last_harvested_readback_sequence
+            .max(self.next_readback_sequence.saturating_sub(1));
     }
 
     /// Blackout: clear the final composite to black. Everything downstream
@@ -961,12 +1193,15 @@ impl Renderer {
         Some(surface_texture)
     }
 
-    /// Temporal pass: applies feedback/slit-scan using the frame-history
-    /// ring, then records the final frame into the ring. Recording happens
-    /// even when the effects are off, so history is warm the moment a
-    /// performer sweeps the slit-scan fader.
-    pub fn render_temporal(&mut self, encoder: &mut wgpu::CommandEncoder, params: &TemporalParams) {
-        self.history_write = encode_temporal(
+    /// Temporal pass driven by a real elapsed time. Live rendering should pass
+    /// its measured frame delta; deterministic export should pass `1.0 / fps`.
+    pub fn render_temporal_with_dt(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &TemporalParams,
+        delta_seconds: f32,
+    ) {
+        encode_temporal_with_dt(
             &self.device,
             encoder,
             params,
@@ -980,7 +1215,8 @@ impl Renderer {
             &self.history_view,
             &self.feedback_texture,
             &self.feedback_view,
-            self.history_write,
+            &mut self.temporal_state,
+            delta_seconds,
             self.output_width,
             self.output_height,
         );
@@ -1008,8 +1244,19 @@ impl Renderer {
         layers: &[Layer],
         mods: &[(EffectUniforms, f32)],
     ) {
-        if layers.is_empty() {
-            // Clear to black
+        // Render in reverse order: last layer in the vec is the bottom,
+        // first layer (index 0, "Layer 1" in UI) ends up on top.
+        let visible_layers: Vec<(&Layer, &(EffectUniforms, f32))> = layers
+            .iter()
+            .zip(mods.iter())
+            .filter(|(l, _)| l.visible)
+            .rev()
+            .collect();
+
+        // Visibility is a transport control, not just a compositing hint. If
+        // every layer is hidden, clear the prior accumulation instead of
+        // leaving the last visible frame latched on every output.
+        if visible_layers.is_empty() {
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1027,25 +1274,18 @@ impl Renderer {
             return;
         }
 
-        // Render in reverse order: last layer in the vec is the bottom,
-        // first layer (index 0, "Layer 1" in UI) ends up on top.
-        let visible_layers: Vec<(&Layer, &(EffectUniforms, f32))> = layers
-            .iter()
-            .zip(mods.iter())
-            .filter(|(l, _)| l.visible)
-            .rev()
-            .collect();
-
         for (i, (layer, (uniforms, opacity))) in visible_layers.iter().enumerate() {
             let uniforms = *uniforms;
 
             // Each pass needs its own buffer because queue.write_buffer writes
             // all execute before the encoder's render passes run on the GPU.
-            let fx_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Layer FX Uniforms"),
-                contents: bytemuck::cast_slice(&[uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+            let fx_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Layer FX Uniforms"),
+                    contents: bytemuck::cast_slice(&[uniforms]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
 
             let tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -1117,39 +1357,35 @@ impl Renderer {
             {
                 // Composite base[0] + overlay[1] → temp[2]
                 let comp_buffer =
-                    self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Composite Uniforms"),
-                        contents: bytemuck::cast_slice(&[CompositeUniforms {
-                            opacity: *opacity,
-                            blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
-                            _pad: [0.0; 2],
-                        }]),
-                        usage: wgpu::BufferUsages::UNIFORM,
-                    });
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Composite Uniforms"),
+                            contents: bytemuck::cast_slice(&[CompositeUniforms {
+                                opacity: *opacity,
+                                blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
+                                _pad: [0.0; 2],
+                            }]),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
 
-                let composite_tex_bg =
-                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Composite Textures BG"),
-                        layout: &self.composite_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.composite_views[0],
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(
-                                    &self.composite_views[1],
-                                ),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::Sampler(&self.sampler),
-                            },
-                        ],
-                    });
+                let composite_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Composite Textures BG"),
+                    layout: &self.composite_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&self.composite_views[0]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
 
                 let composite_uniform_bg =
                     self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1214,11 +1450,13 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         master_uniforms: &EffectUniforms,
     ) {
-        let fx_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Master FX Uniforms"),
-            contents: bytemuck::cast_slice(&[*master_uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let fx_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Master FX Uniforms"),
+                contents: bytemuck::cast_slice(&[*master_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Master FX Input"),
@@ -1297,7 +1535,11 @@ impl Renderer {
     /// into a free staging buffer. Returns the slot index to pass to
     /// `map_readback` after the encoder is submitted, or None if every
     /// slot still has a copy in flight.
-    pub fn begin_readback(&mut self, encoder: &mut wgpu::CommandEncoder) -> Option<usize> {
+    pub fn begin_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        epoch: u64,
+    ) -> Option<usize> {
         let buffer_size = (self.readback_bytes_per_row() * self.output_height) as u64;
 
         let idx = match self
@@ -1315,12 +1557,18 @@ impl Renderer {
                         mapped_at_creation: false,
                     }),
                     status: Arc::new(AtomicU8::new(SLOT_IDLE)),
+                    sequence: 0,
+                    epoch,
                 });
                 self.readback_slots.len() - 1
             }
             None => return None,
         };
 
+        let sequence = self.next_readback_sequence;
+        self.next_readback_sequence = self.next_readback_sequence.saturating_add(1);
+        self.readback_slots[idx].sequence = sequence;
+        self.readback_slots[idx].epoch = epoch;
         let slot = &self.readback_slots[idx];
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -1352,29 +1600,49 @@ impl Renderer {
     pub fn map_readback(&self, idx: usize) {
         let slot = &self.readback_slots[idx];
         let status = slot.status.clone();
-        slot.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let new = if result.is_ok() { SLOT_MAPPED } else { SLOT_MAP_FAILED };
-            status.store(new, Ordering::Release);
-        });
+        slot.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let new = if result.is_ok() {
+                    SLOT_MAPPED
+                } else {
+                    SLOT_MAP_FAILED
+                };
+                status.store(new, Ordering::Release);
+            });
     }
 
     /// Phase 3: harvest a completed readback if any. Non-blocking; returns
-    /// the depadded RGBA pixels of the oldest completed slot, or None.
-    pub fn poll_readback(&mut self) -> Option<Vec<u8>> {
+    /// the freshest completed frame. Completed or subsequently completing
+    /// older slots are discarded, so callback reordering can never make an
+    /// old NTSC/Spout frame overwrite a newer composite.
+    pub fn poll_readback(&mut self) -> Option<ReadbackFrame> {
         if self.readback_slots.is_empty() {
             return None;
         }
         // Drive map callbacks without waiting.
         let _ = self.device.poll(wgpu::PollType::Poll);
 
-        let mut harvested: Option<Vec<u8>> = None;
-        for slot in &self.readback_slots {
+        let newest_idx = self
+            .readback_slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                slot.status.load(Ordering::Acquire) == SLOT_MAPPED
+                    && slot.sequence > self.last_harvested_readback_sequence
+            })
+            .max_by_key(|(_, slot)| slot.sequence)
+            .map(|(idx, _)| idx);
+        let newest_sequence = newest_idx.map(|idx| self.readback_slots[idx].sequence);
+
+        let row_bytes = (self.output_width * 4) as usize;
+        let padded_row = self.readback_bytes_per_row() as usize;
+        let h = self.output_height as usize;
+        let mut harvested: Option<ReadbackFrame> = None;
+        for (idx, slot) in self.readback_slots.iter().enumerate() {
             match slot.status.load(Ordering::Acquire) {
-                SLOT_MAPPED if harvested.is_none() => {
+                SLOT_MAPPED if Some(idx) == newest_idx => {
                     let data = slot.buffer.slice(..).get_mapped_range();
-                    let row_bytes = (self.output_width * 4) as usize;
-                    let padded_row = self.readback_bytes_per_row() as usize;
-                    let h = self.output_height as usize;
                     let mut pixels = Vec::with_capacity(row_bytes * h);
                     for row in 0..h {
                         let start = row * padded_row;
@@ -1383,7 +1651,16 @@ impl Renderer {
                     drop(data);
                     slot.buffer.unmap();
                     slot.status.store(SLOT_IDLE, Ordering::Release);
-                    harvested = Some(pixels);
+                    harvested = Some(ReadbackFrame {
+                        pixels,
+                        epoch: slot.epoch,
+                    });
+                }
+                SLOT_MAPPED => {
+                    // This completed map is older than the freshest mapped
+                    // frame (or than one already returned on an earlier poll).
+                    slot.buffer.unmap();
+                    slot.status.store(SLOT_IDLE, Ordering::Release);
                 }
                 SLOT_MAP_FAILED => {
                     // Device hiccup (e.g. surface loss); recycle the slot.
@@ -1391,6 +1668,9 @@ impl Renderer {
                 }
                 _ => {}
             }
+        }
+        if let Some(sequence) = newest_sequence {
+            self.last_harvested_readback_sequence = sequence;
         }
         harvested
     }

@@ -34,12 +34,7 @@ fn main() {
                         pixels = vec![0u8; (w * h * 4) as usize];
                         if !connected {
                             connected = true;
-                            println!(
-                                "connected: sender='{}' {}x{}",
-                                receiver.sender_name(),
-                                w,
-                                h
-                            );
+                            println!("connected: sender='{}' {}x{}", receiver.sender_name(), w, h);
                         }
                     }
                     continue;

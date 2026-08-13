@@ -6,10 +6,10 @@ use super::{param_meta, EffectsConfig, LayerConfig, PatchState};
 
 pub struct EditorState {
     pub active: bool,
-    pub tab: usize,              // 0 = Master, 1+ = layer index + 1
+    pub tab: usize,                   // 0 = Master, 1+ = layer index + 1
     pub active_field: Option<String>, // which param key is being edited
-    pub field_buffer: String,    // text in the active pill input
-    pub request_focus: bool,     // request focus on next frame
+    pub field_buffer: String,         // text in the active pill input
+    pub request_focus: bool,          // request focus on next frame
 }
 
 impl Default for EditorState {
@@ -96,10 +96,12 @@ fn param_row(
                 response.request_focus();
                 // Select all text
                 if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
-                    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                        egui::text::CCursor::new(0),
-                        egui::text::CCursor::new(editor.field_buffer.len()),
-                    )));
+                    state
+                        .cursor
+                        .set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(editor.field_buffer.len()),
+                        )));
                     state.store(ui.ctx(), id);
                 }
                 editor.request_focus = false;
@@ -108,8 +110,7 @@ fn param_row(
             // Up/Down stepping
             let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-            if (up || down) && meta.is_some() {
-                let m = meta.as_ref().unwrap();
+            if let Some(m) = meta.as_ref().filter(|_| up || down) {
                 if let Ok(current) = editor.field_buffer.parse::<f32>() {
                     let delta = if up { m.step } else { -m.step };
                     let stepped = (current + delta).clamp(m.min, m.max);
@@ -195,17 +196,13 @@ fn format_value(v: f32, step: f32) -> String {
 /// Build the YAML editor content (rendered inside the shared left panel).
 pub fn build_yaml_editor_content(
     ui: &mut egui::Ui,
-    layers: &mut Vec<Layer>,
+    layers: &mut [Layer],
     master_effects: &mut EffectUniforms,
     editor: &mut EditorState,
 ) {
     // Tab bar: Master + per-layer tabs
     ui.horizontal(|ui| {
-        if ui
-            .selectable_label(editor.tab == 0, "Master")
-            .clicked()
-            && editor.tab != 0
-        {
+        if ui.selectable_label(editor.tab == 0, "Master").clicked() && editor.tab != 0 {
             editor.tab = 0;
             editor.active_field = None;
         }
@@ -213,11 +210,7 @@ pub fn build_yaml_editor_content(
         for i in 0..layers.len() {
             let tab_id = i + 1;
             let label = format!("Layer {}", i + 1);
-            if ui
-                .selectable_label(editor.tab == tab_id, &label)
-                .clicked()
-                && editor.tab != tab_id
-            {
+            if ui.selectable_label(editor.tab == tab_id, &label).clicked() && editor.tab != tab_id {
                 editor.tab = tab_id;
                 editor.active_field = None;
             }
@@ -247,7 +240,8 @@ pub fn build_yaml_editor_content(
                                 .color(GROUP_COLOR),
                         );
                         for (key, value) in fields {
-                            if let Some(new_val) = param_row(ui, key, value, editor, KEY_COL_WIDTH) {
+                            if let Some(new_val) = param_row(ui, key, value, editor, KEY_COL_WIDTH)
+                            {
                                 if updated_config.set_field(key, &new_val) {
                                     changed = true;
                                 }
@@ -296,7 +290,8 @@ pub fn build_yaml_editor_content(
                                 });
                                 continue;
                             }
-                            if let Some(new_val) = param_row(ui, key, value, editor, KEY_COL_WIDTH) {
+                            if let Some(new_val) = param_row(ui, key, value, editor, KEY_COL_WIDTH)
+                            {
                                 if updated_config.set_field(key, &new_val) {
                                     changed = true;
                                 }
@@ -321,7 +316,9 @@ pub fn build_yaml_editor_content(
                                     .color(GROUP_COLOR),
                             );
                             for (key, value) in fields {
-                                if let Some(new_val) = param_row(ui, key, value, editor, KEY_COL_WIDTH) {
+                                if let Some(new_val) =
+                                    param_row(ui, key, value, editor, KEY_COL_WIDTH)
+                                {
                                     if updated_config.effects.set_field(key, &new_val) {
                                         changed = true;
                                     }
@@ -350,8 +347,18 @@ pub fn save_patch(
     ntsc_params: &NtscParams,
     mod_matrix: &crate::modulation::ModMatrix,
     temporal: &crate::effects::params::TemporalParams,
+    master_paused: bool,
+    morph: &crate::morph::Morph,
 ) {
-    let patch = PatchState::capture(master, layers, ntsc_params, mod_matrix, temporal);
+    let patch = PatchState::capture(
+        master,
+        layers,
+        ntsc_params,
+        mod_matrix,
+        temporal,
+        master_paused,
+        morph,
+    );
     let yaml = serde_yaml::to_string(&patch).unwrap_or_default();
 
     if let Some(path) = rfd::FileDialog::new()
@@ -365,30 +372,24 @@ pub fn save_patch(
     }
 }
 
-/// Load a patch from a YAML file via native dialog.
-pub fn load_patch(
-    master: &mut EffectUniforms,
-    layers: &mut Vec<Layer>,
-    ntsc_params: &mut NtscParams,
-    mod_matrix: &mut crate::modulation::ModMatrix,
-    temporal: &mut crate::effects::params::TemporalParams,
-) {
-    if let Some(path) = rfd::FileDialog::new()
+/// Pick and parse a patch via the native dialog. Layer reconstruction needs
+/// the renderer device and is therefore performed by `App`; returning the
+/// source path also lets it resolve clips stored beside the patch.
+pub fn load_patch() -> Option<(PatchState, std::path::PathBuf)> {
+    let path = rfd::FileDialog::new()
         .add_filter("YAML", &["yaml", "yml"])
-        .pick_file()
-    {
-        match std::fs::read_to_string(&path) {
-            Ok(yaml) => match serde_yaml::from_str::<PatchState>(&yaml) {
-                Ok(patch) => {
-                    patch.apply(master, layers, ntsc_params, mod_matrix, temporal);
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse patch: {e}");
-                }
-            },
+        .pick_file()?;
+    match std::fs::read_to_string(&path) {
+        Ok(yaml) => match serde_yaml::from_str::<PatchState>(&yaml) {
+            Ok(patch) => Some((patch, path)),
             Err(e) => {
-                eprintln!("Failed to read file: {e}");
+                eprintln!("Failed to parse patch: {e}");
+                None
             }
+        },
+        Err(e) => {
+            eprintln!("Failed to read file: {e}");
+            None
         }
     }
 }

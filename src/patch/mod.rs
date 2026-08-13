@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub mod editor;
 
 use serde::{Deserialize, Serialize};
@@ -6,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::effects::params::TemporalParams;
 use crate::effects::EffectUniforms;
 use crate::layers::{BlendMode, Layer};
-use crate::modulation::{Lfo, LfoShape, ModMatrix, ModSource, Routing, MAX_ROUTINGS, NUM_LFOS};
+use crate::modulation::{
+    Curve, GyroAxisConfig, Lfo, LfoShape, ModMatrix, ModSource, PadAxisConfig, PadConfig, Routing,
+    MAX_ROUTINGS, NUM_LFOS,
+};
 use crate::ntsc::NtscParams;
 
 // --- Helpers for serde defaults ---
@@ -29,28 +31,123 @@ pub struct ParamMeta {
 
 pub fn param_meta(name: &str) -> Option<ParamMeta> {
     match name {
-        "pixelate" => Some(ParamMeta { step: 1.0, min: 1.0, max: 32.0, desc: "pixel block size" }),
-        "rgb_split" => Some(ParamMeta { step: 0.5, min: 0.0, max: 30.0, desc: "chromatic split px" }),
-        "hue_shift" => Some(ParamMeta { step: 5.0, min: -180.0, max: 180.0, desc: "degrees" }),
-        "saturation" => Some(ParamMeta { step: 0.05, min: -1.0, max: 1.0, desc: "color intensity" }),
-        "brightness" => Some(ParamMeta { step: 0.05, min: -1.0, max: 1.0, desc: "exposure" }),
-        "contrast" => Some(ParamMeta { step: 0.05, min: -1.0, max: 1.0, desc: "dynamic range" }),
-        "posterize" => Some(ParamMeta { step: 1.0, min: 0.0, max: 16.0, desc: "color levels (0=off)" }),
-        "grain_intensity" => Some(ParamMeta { step: 0.01, min: 0.0, max: 0.3, desc: "film grain amount" }),
-        "grain_size" => Some(ParamMeta { step: 0.25, min: 1.0, max: 4.0, desc: "grain particle scale" }),
-        "grain_algo" => Some(ParamMeta { step: 1.0, min: 0.0, max: 3.0, desc: "0=value 1=perlin 2=gaussian 3=salt&pepper" }),
-        "breathe_scale" => Some(ParamMeta { step: 0.005, min: 0.0, max: 0.05, desc: "zoom oscillation" }),
-        "breathe_rotation" => Some(ParamMeta { step: 0.1, min: 0.0, max: 2.0, desc: "rotation oscillation deg" }),
-        "breathe_position" => Some(ParamMeta { step: 0.002, min: 0.0, max: 0.02, desc: "position drift" }),
-        "vignette" => Some(ParamMeta { step: 0.05, min: 0.0, max: 1.5, desc: "edge darkening" }),
-        "color_drift" => Some(ParamMeta { step: 0.002, min: 0.0, max: 0.02, desc: "chromatic aberration" }),
-        "opacity" => Some(ParamMeta { step: 0.05, min: 0.0, max: 1.0, desc: "layer transparency" }),
-        "speed" => Some(ParamMeta { step: 0.25, min: 0.25, max: 4.0, desc: "playback multiplier" }),
-        "fps" => Some(ParamMeta { step: 1.0, min: 1.0, max: 60.0, desc: "decode frame rate" }),
+        "pixelate" => Some(ParamMeta {
+            step: 1.0,
+            min: 1.0,
+            max: 32.0,
+            desc: "pixel block size",
+        }),
+        "rgb_split" => Some(ParamMeta {
+            step: 0.5,
+            min: 0.0,
+            max: 30.0,
+            desc: "chromatic split px",
+        }),
+        "hue_shift" => Some(ParamMeta {
+            step: 5.0,
+            min: -180.0,
+            max: 180.0,
+            desc: "degrees",
+        }),
+        "saturation" => Some(ParamMeta {
+            step: 0.05,
+            min: -1.0,
+            max: 1.0,
+            desc: "color intensity",
+        }),
+        "brightness" => Some(ParamMeta {
+            step: 0.05,
+            min: -1.0,
+            max: 1.0,
+            desc: "exposure",
+        }),
+        "contrast" => Some(ParamMeta {
+            step: 0.05,
+            min: -1.0,
+            max: 1.0,
+            desc: "dynamic range",
+        }),
+        "posterize" => Some(ParamMeta {
+            step: 1.0,
+            min: 0.0,
+            max: 16.0,
+            desc: "color levels (0=off)",
+        }),
+        "downsample" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.05,
+            max: 1.0,
+            desc: "render resolution fraction",
+        }),
+        "grain_intensity" => Some(ParamMeta {
+            step: 0.01,
+            min: 0.0,
+            max: 0.3,
+            desc: "film grain amount",
+        }),
+        "grain_size" => Some(ParamMeta {
+            step: 0.25,
+            min: 1.0,
+            max: 4.0,
+            desc: "grain particle scale",
+        }),
+        "grain_algo" => Some(ParamMeta {
+            step: 1.0,
+            min: 0.0,
+            max: 3.0,
+            desc: "0=value 1=perlin 2=gaussian 3=salt&pepper",
+        }),
+        "breathe_scale" => Some(ParamMeta {
+            step: 0.005,
+            min: 0.0,
+            max: 0.05,
+            desc: "zoom oscillation",
+        }),
+        "breathe_rotation" => Some(ParamMeta {
+            step: 0.1,
+            min: 0.0,
+            max: 2.0,
+            desc: "rotation oscillation deg",
+        }),
+        "breathe_position" => Some(ParamMeta {
+            step: 0.002,
+            min: 0.0,
+            max: 0.02,
+            desc: "position drift",
+        }),
+        "vignette" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.5,
+            desc: "edge darkening",
+        }),
+        "color_drift" => Some(ParamMeta {
+            step: 0.002,
+            min: 0.0,
+            max: 0.02,
+            desc: "chromatic aberration",
+        }),
+        "opacity" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "layer transparency",
+        }),
+        "speed" => Some(ParamMeta {
+            step: 0.25,
+            min: 0.25,
+            max: 4.0,
+            desc: "playback multiplier",
+        }),
+        "fps" => Some(ParamMeta {
+            step: 1.0,
+            min: 1.0,
+            max: 240.0,
+            desc: "decode frame rate",
+        }),
         _ => None,
     }
 }
-
 
 // --- Serializable patch state ---
 
@@ -59,11 +156,15 @@ pub struct PatchState {
     pub master: EffectsConfig,
     pub layers: Vec<LayerConfig>,
     #[serde(default)]
+    pub master_paused: bool,
+    #[serde(default)]
     pub ntsc: Option<NtscConfig>,
     #[serde(default)]
     pub modulation: Option<ModConfig>,
     #[serde(default)]
     pub temporal: Option<TemporalConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub morph: Option<crate::morph::MorphStateSnapshot>,
 }
 
 /// Serializable temporal (feedback/slit-scan) parameters for patch files.
@@ -79,6 +180,9 @@ pub struct TemporalConfig {
     pub slitscan: f32,
     #[serde(default)]
     pub slit_axis: f32,
+    /// Arbitrary angle added after the original row/column-only format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slit_angle: Option<f32>,
 }
 
 impl Default for TemporalConfig {
@@ -95,16 +199,21 @@ impl TemporalConfig {
             fb_rotate: p.fb_rotate,
             slitscan: p.slitscan,
             slit_axis: p.slit_axis,
+            slit_angle: Some(p.slit_angle),
         }
     }
 
     pub fn to_params(&self) -> TemporalParams {
         TemporalParams {
-            feedback: self.feedback.clamp(0.0, 0.95),
-            fb_zoom: self.fb_zoom.clamp(0.9, 1.1),
-            fb_rotate: self.fb_rotate.clamp(-5.0, 5.0),
-            slitscan: self.slitscan.clamp(0.0, 1.0),
-            slit_axis: self.slit_axis.clamp(0.0, 1.0),
+            feedback: finite_or(self.feedback, 0.0).clamp(0.0, 0.95),
+            fb_zoom: finite_or(self.fb_zoom, 1.0).clamp(0.9, 1.1),
+            fb_rotate: finite_or(self.fb_rotate, 0.0).clamp(-5.0, 5.0),
+            slitscan: finite_or(self.slitscan, 0.0).clamp(0.0, 1.0),
+            slit_angle: self
+                .slit_angle
+                .map(|angle| finite_or(angle, 0.0).clamp(-180.0, 180.0))
+                .unwrap_or_else(|| finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0) * 90.0),
+            slit_axis: finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0),
         }
     }
 }
@@ -124,12 +233,36 @@ pub struct ModConfig {
     pub audio_gain: f32,
     #[serde(default)]
     pub audio_device: String,
+    /// Number of routable FFT bands. Older patches omit this and remain at
+    /// the historical three-band layout.
+    #[serde(default = "default_audio_band_count")]
+    pub audio_band_count: usize,
+    /// Ordered crossovers. Current patches store exactly count - 1 entries.
+    /// Legacy patches stored `[bass, mid, analysis_ceiling]`; application
+    /// migrates that third value into `audio_band_ceiling_hz`.
+    #[serde(default = "default_audio_band_edges")]
+    pub audio_band_edges: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_band_ceiling_hz: Option<f32>,
     #[serde(default)]
     pub midi_enabled: bool,
     #[serde(default = "default_midi_ccs")]
     pub midi_ccs: Vec<u8>,
     #[serde(default)]
     pub midi_clock_sync: bool,
+    #[serde(default = "default_gyro_axes")]
+    pub gyro: Vec<GyroAxisPatchConfig>,
+    /// Latest DeviceOrientation sample in degrees. Older patches omit this;
+    /// those load centered on their saved calibration instead of inventing
+    /// an offset from a zero-valued sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gyro_raw: Option<Vec<f32>>,
+    #[serde(default)]
+    pub pad: PadPatchConfig,
+    /// Saved XY gesture position. A loaded/exported patch owns no live
+    /// pointer, so spring return (when enabled) resumes from this position.
+    #[serde(default = "default_pad_position")]
+    pub pad_position: Vec<f32>,
 }
 
 fn default_midi_ccs() -> Vec<u8> {
@@ -138,6 +271,37 @@ fn default_midi_ccs() -> Vec<u8> {
 
 fn default_bpm() -> f32 {
     120.0
+}
+
+fn default_audio_band_edges() -> Vec<f32> {
+    vec![250.0, 2000.0, 8000.0]
+}
+
+fn default_audio_band_count() -> usize {
+    3
+}
+
+fn four() -> f32 {
+    4.0
+}
+
+fn default_gyro_range() -> f32 {
+    90.0
+}
+
+fn default_gyro_axes() -> Vec<GyroAxisPatchConfig> {
+    vec![
+        GyroAxisPatchConfig {
+            range_degrees: 180.0,
+            ..Default::default()
+        },
+        GyroAxisPatchConfig::default(),
+        GyroAxisPatchConfig::default(),
+    ]
+}
+
+fn default_pad_position() -> Vec<f32> {
+    vec![0.5, 0.5]
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -163,6 +327,84 @@ pub struct RoutingConfig {
     pub target: String,
     #[serde(default)]
     pub depth: f32,
+    #[serde(default = "default_curve")]
+    pub curve: String,
+    #[serde(default)]
+    pub curve_amount: f32,
+    #[serde(default)]
+    pub attack: f32,
+    #[serde(default)]
+    pub release: f32,
+}
+
+fn default_curve() -> String {
+    "linear".to_string()
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GyroAxisPatchConfig {
+    #[serde(default)]
+    pub center_degrees: f32,
+    #[serde(default = "default_gyro_range")]
+    pub range_degrees: f32,
+    #[serde(default)]
+    pub expo: f32,
+    #[serde(default)]
+    pub invert: bool,
+}
+
+impl Default for GyroAxisPatchConfig {
+    fn default() -> Self {
+        Self {
+            center_degrees: 0.0,
+            range_degrees: 90.0,
+            expo: 0.0,
+            invert: false,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PadAxisPatchConfig {
+    #[serde(default = "default_curve")]
+    pub curve: String,
+    #[serde(default)]
+    pub curve_amount: f32,
+    #[serde(default)]
+    pub quantize: u32,
+}
+
+impl Default for PadAxisPatchConfig {
+    fn default() -> Self {
+        Self {
+            curve: default_curve(),
+            curve_amount: 0.0,
+            quantize: 0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PadPatchConfig {
+    #[serde(default)]
+    pub x: PadAxisPatchConfig,
+    #[serde(default)]
+    pub y: PadAxisPatchConfig,
+    #[serde(default)]
+    pub spring_enabled: bool,
+    #[serde(default = "four")]
+    pub spring_rate: f32,
+}
+
+impl Default for PadPatchConfig {
+    fn default() -> Self {
+        Self {
+            x: PadAxisPatchConfig::default(),
+            y: PadAxisPatchConfig::default(),
+            spring_enabled: false,
+            spring_rate: 4.0,
+        }
+    }
 }
 
 impl ModConfig {
@@ -175,7 +417,7 @@ impl ModConfig {
                 .map(|l| LfoConfig {
                     shape: l.shape.as_str().to_string(),
                     beats: l.beats,
-                    phase: l.phase,
+                    phase: l.normalized_phase(),
                 })
                 .collect(),
             routings: m
@@ -185,44 +427,157 @@ impl ModConfig {
                     source: r.source.as_str().to_string(),
                     target: r.target.clone(),
                     depth: r.depth,
+                    curve: r.curve.as_str().to_string(),
+                    curve_amount: r.curve_amount,
+                    attack: r.attack,
+                    release: r.release,
                 })
                 .collect(),
             audio_enabled: m.audio_enabled,
             audio_gain: m.audio_gain,
             audio_device: m.audio_device.clone(),
+            audio_band_count: m.audio_band_config.count(),
+            audio_band_edges: m.audio_band_config.crossovers().to_vec(),
+            audio_band_ceiling_hz: Some(m.audio_band_config.ceiling_hz()),
             midi_enabled: m.midi_enabled,
             midi_ccs: m.midi_ccs.to_vec(),
             midi_clock_sync: m.midi_clock_sync,
+            gyro: m
+                .gyro_config
+                .iter()
+                .map(|cfg| GyroAxisPatchConfig {
+                    center_degrees: cfg.center_degrees,
+                    range_degrees: cfg.range_degrees,
+                    expo: cfg.expo,
+                    invert: cfg.invert,
+                })
+                .collect(),
+            gyro_raw: Some(m.gyro_raw.to_vec()),
+            pad: PadPatchConfig {
+                x: PadAxisPatchConfig::from_axis(m.pad_config.axes[0]),
+                y: PadAxisPatchConfig::from_axis(m.pad_config.axes[1]),
+                spring_enabled: m.pad_config.spring_enabled,
+                spring_rate: m.pad_config.spring_rate,
+            },
+            pad_position: m.pad.to_vec(),
         }
     }
 
     pub fn apply_to_matrix(&self, m: &mut ModMatrix) {
-        m.clock.set_bpm(self.bpm);
+        m.clock.set_bpm(finite_or(self.bpm, 120.0));
+        m.lfos = std::array::from_fn(|_| Lfo::default());
         for (i, cfg) in self.lfos.iter().take(NUM_LFOS).enumerate() {
-            m.lfos[i] = Lfo {
+            let mut lfo = Lfo {
                 shape: LfoShape::from_str(&cfg.shape),
-                beats: cfg.beats.clamp(0.0625, 64.0),
-                phase: cfg.phase.rem_euclid(1.0),
+                beats: finite_or(cfg.beats, 4.0).clamp(0.0625, 64.0),
+                phase: 0.0,
             };
+            lfo.set_phase(cfg.phase);
+            m.lfos[i] = lfo;
         }
         m.routings = self
             .routings
             .iter()
             .take(MAX_ROUTINGS)
-            .map(|r| Routing {
-                source: ModSource::from_str(&r.source),
-                target: r.target.clone(),
-                depth: r.depth.clamp(-1.0, 1.0),
+            .filter_map(|r| {
+                let source = ModSource::try_from_str(&r.source)?;
+                if !crate::modulation::is_valid_target(&r.target) {
+                    return None;
+                }
+                let mut routing =
+                    Routing::new(source, &r.target, finite_or(r.depth, 0.0).clamp(-1.0, 1.0));
+                routing.curve = Curve::from_str(&r.curve);
+                routing.curve_amount = finite_or(r.curve_amount, 0.0).clamp(-2.0, 2.0);
+                routing.attack = finite_or(r.attack, 0.0).clamp(0.0, 60.0);
+                routing.release = finite_or(r.release, 0.0).clamp(0.0, 60.0);
+                Some(routing)
             })
             .collect();
         m.audio_enabled = self.audio_enabled;
-        m.audio_gain = self.audio_gain.clamp(0.0, 8.0);
+        m.audio_gain = finite_or(self.audio_gain, 1.0).clamp(0.0, 8.0);
         m.audio_device = self.audio_device.clone();
+        let count = self
+            .audio_band_count
+            .clamp(crate::audio::MIN_AUDIO_BANDS, crate::audio::MAX_AUDIO_BANDS);
+        let (crossovers, ceiling_hz) = match self.audio_band_ceiling_hz {
+            Some(ceiling) => (self.audio_band_edges.as_slice(), ceiling),
+            None if self.audio_band_edges.len() >= count => (
+                &self.audio_band_edges[..count - 1],
+                self.audio_band_edges[count - 1],
+            ),
+            None => (self.audio_band_edges.as_slice(), 8000.0),
+        };
+        m.audio_band_config = crate::audio::AudioBandConfig::new(count, crossovers, ceiling_hz);
         m.midi_enabled = self.midi_enabled;
+        m.midi_ccs = [1, 2, 3, 4];
         for (i, &cc) in self.midi_ccs.iter().take(m.midi_ccs.len()).enumerate() {
             m.midi_ccs[i] = cc & 0x7F;
         }
         m.midi_clock_sync = self.midi_clock_sync;
+
+        let defaults = default_gyro_axes();
+        for i in 0..3 {
+            let cfg = self.gyro.get(i).or_else(|| defaults.get(i)).unwrap();
+            m.gyro_config[i] = GyroAxisConfig {
+                center_degrees: finite_or(cfg.center_degrees, 0.0),
+                range_degrees: finite_or(cfg.range_degrees, 90.0).abs().clamp(1.0, 360.0),
+                expo: finite_or(cfg.expo, 0.0).clamp(-2.0, 2.0),
+                invert: cfg.invert,
+            };
+        }
+        for i in 0..3 {
+            m.gyro_raw[i] = self
+                .gyro_raw
+                .as_ref()
+                .and_then(|values| values.get(i))
+                .copied()
+                .filter(|value| value.is_finite())
+                .unwrap_or(m.gyro_config[i].center_degrees);
+        }
+        m.pad_config = PadConfig {
+            axes: [self.pad.x.to_axis(), self.pad.y.to_axis()],
+            spring_enabled: self.pad.spring_enabled,
+            spring_rate: finite_or(self.pad.spring_rate, 4.0).clamp(0.1, 20.0),
+        };
+        for i in 0..2 {
+            m.pad[i] = self
+                .pad_position
+                .get(i)
+                .copied()
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+        }
+        // A saved patch has no owning browser pointer. Marking it released is
+        // what lets deterministic spring return advance in live and export.
+        m.pad_active = false;
+        m.recompute_gyro();
+    }
+}
+
+fn finite_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
+impl PadAxisPatchConfig {
+    fn from_axis(axis: PadAxisConfig) -> Self {
+        Self {
+            curve: axis.curve.as_str().to_string(),
+            curve_amount: axis.curve_amount,
+            quantize: axis.quantize,
+        }
+    }
+
+    fn to_axis(&self) -> PadAxisConfig {
+        PadAxisConfig {
+            curve: Curve::from_str(&self.curve),
+            curve_amount: finite_or(self.curve_amount, 0.0).clamp(-2.0, 2.0),
+            quantize: self.quantize.min(64),
+        }
     }
 }
 
@@ -269,9 +624,15 @@ pub struct NtscConfig {
     pub composite_sharpening: f32,
 }
 
-fn default_edge_wave_speed() -> f32 { 0.5 }
-fn default_head_height() -> i32 { 8 }
-fn default_tracking_height() -> i32 { 24 }
+fn default_edge_wave_speed() -> f32 {
+    0.5
+}
+fn default_head_height() -> i32 {
+    8
+}
+fn default_tracking_height() -> i32 {
+    24
+}
 
 impl NtscConfig {
     pub fn from_params(p: &NtscParams) -> Self {
@@ -299,26 +660,33 @@ impl NtscConfig {
     }
 
     pub fn to_params(&self) -> NtscParams {
+        let finite = |value: f32, fallback: f32| {
+            if value.is_finite() {
+                value
+            } else {
+                fallback
+            }
+        };
         NtscParams {
             enabled: self.enabled,
-            tape_speed: self.tape_speed,
-            chroma_loss: self.chroma_loss,
+            tape_speed: self.tape_speed.min(2),
+            chroma_loss: finite(self.chroma_loss, 0.0).clamp(0.0, 0.01),
             edge_wave_enabled: self.edge_wave_enabled,
-            edge_wave_intensity: self.edge_wave_intensity,
-            edge_wave_speed: self.edge_wave_speed,
+            edge_wave_intensity: finite(self.edge_wave_intensity, 0.0).clamp(0.0, 20.0),
+            edge_wave_speed: finite(self.edge_wave_speed, 0.5).clamp(0.0, 10.0),
             head_switching_enabled: self.head_switching_enabled,
-            head_switching_height: self.head_switching_height,
-            head_switching_shift: self.head_switching_shift,
+            head_switching_height: self.head_switching_height.clamp(0, 24),
+            head_switching_shift: finite(self.head_switching_shift, 0.0).clamp(-100.0, 100.0),
             tracking_noise_enabled: self.tracking_noise_enabled,
-            tracking_noise_height: self.tracking_noise_height,
-            tracking_noise_wave: self.tracking_noise_wave,
-            tracking_noise_snow: self.tracking_noise_snow,
-            snow_intensity: self.snow_intensity,
-            composite_noise_intensity: self.composite_noise_intensity,
-            luma_noise_intensity: self.luma_noise_intensity,
-            chroma_noise_intensity: self.chroma_noise_intensity,
-            luma_smear: self.luma_smear,
-            composite_sharpening: self.composite_sharpening,
+            tracking_noise_height: self.tracking_noise_height.clamp(0, 120),
+            tracking_noise_wave: finite(self.tracking_noise_wave, 0.0).clamp(0.0, 50.0),
+            tracking_noise_snow: finite(self.tracking_noise_snow, 0.0).clamp(0.0, 1.0),
+            snow_intensity: finite(self.snow_intensity, 0.0).clamp(0.0, 1.0),
+            composite_noise_intensity: finite(self.composite_noise_intensity, 0.0).clamp(0.0, 0.5),
+            luma_noise_intensity: finite(self.luma_noise_intensity, 0.0).clamp(0.0, 0.2),
+            chroma_noise_intensity: finite(self.chroma_noise_intensity, 0.0).clamp(0.0, 0.5),
+            luma_smear: finite(self.luma_smear, 0.0).clamp(0.0, 1.0),
+            composite_sharpening: finite(self.composite_sharpening, 0.0).clamp(-1.0, 2.0),
         }
     }
 }
@@ -326,6 +694,12 @@ impl NtscConfig {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LayerConfig {
     pub filename: String,
+    /// Stable identity for sources loaded outside the current library. File
+    /// layers store their canonical path; live receivers use
+    /// `spout://<sender-name>`. Old patches omit this and continue resolving
+    /// video sources by filename.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_path: String,
     #[serde(default = "one")]
     pub opacity: f32,
     #[serde(default = "default_blend")]
@@ -366,6 +740,9 @@ pub struct EffectsConfig {
     pub posterize: f32,
     #[serde(default)]
     pub invert: bool,
+    /// Fraction of full render resolution (1.0 = full resolution).
+    #[serde(default = "one")]
+    pub downsample: f32,
     #[serde(default)]
     pub grain_intensity: f32,
     #[serde(default = "one")]
@@ -392,8 +769,12 @@ pub struct EffectsConfig {
     pub key_softness: f32,
 }
 
-fn default_key_threshold() -> f32 { 0.5 }
-fn default_key_softness() -> f32 { 0.1 }
+fn default_key_threshold() -> f32 {
+    0.5
+}
+fn default_key_softness() -> f32 {
+    0.1
+}
 
 impl Default for EffectsConfig {
     fn default() -> Self {
@@ -406,6 +787,7 @@ impl Default for EffectsConfig {
             contrast: 0.0,
             posterize: 0.0,
             invert: false,
+            downsample: 1.0,
             grain_intensity: 0.0,
             grain_size: 1.0,
             grain_algo: 0,
@@ -435,6 +817,7 @@ impl EffectsConfig {
             contrast: u.contrast,
             posterize: u.posterize,
             invert: u.invert > 0.5,
+            downsample: u.downsample,
             grain_intensity: u.grain_intensity,
             grain_size: u.grain_size,
             grain_algo: u.grain_algo as u32,
@@ -451,77 +834,179 @@ impl EffectsConfig {
     }
 
     pub fn apply_to_uniforms(&self, u: &mut EffectUniforms) {
-        u.pixelate_size = self.pixelate.clamp(1.0, 32.0);
-        u.rgb_split = self.rgb_split.clamp(0.0, 30.0);
-        u.hue_shift = self.hue_shift.clamp(-180.0, 180.0);
-        u.saturation = self.saturation.clamp(-1.0, 1.0);
-        u.brightness = self.brightness.clamp(-1.0, 1.0);
-        u.contrast = self.contrast.clamp(-1.0, 1.0);
-        u.posterize = self.posterize.clamp(0.0, 16.0);
+        u.pixelate_size = finite_or(self.pixelate, 1.0).clamp(1.0, 32.0);
+        u.rgb_split = finite_or(self.rgb_split, 0.0).clamp(0.0, 30.0);
+        u.hue_shift = finite_or(self.hue_shift, 0.0).clamp(-180.0, 180.0);
+        u.saturation = finite_or(self.saturation, 0.0).clamp(-1.0, 1.0);
+        u.brightness = finite_or(self.brightness, 0.0).clamp(-1.0, 1.0);
+        u.contrast = finite_or(self.contrast, 0.0).clamp(-1.0, 1.0);
+        u.posterize = finite_or(self.posterize, 0.0).clamp(0.0, 16.0);
         u.invert = if self.invert { 1.0 } else { 0.0 };
-        u.grain_intensity = self.grain_intensity.clamp(0.0, 0.3);
-        u.grain_size = self.grain_size.clamp(1.0, 4.0);
+        u.downsample = finite_or(self.downsample, 1.0).clamp(0.05, 1.0);
+        u.grain_intensity = finite_or(self.grain_intensity, 0.0).clamp(0.0, 0.3);
+        u.grain_size = finite_or(self.grain_size, 1.0).clamp(1.0, 4.0);
         u.grain_algo = (self.grain_algo.min(3)) as f32;
         u.color_grain = if self.color_grain { 1.0 } else { 0.0 };
-        u.breathe_scale = self.breathe_scale.clamp(0.0, 0.05);
-        u.breathe_rotation = self.breathe_rotation.clamp(0.0, 2.0);
-        u.breathe_position = self.breathe_position.clamp(0.0, 0.02);
-        u.vignette = self.vignette.clamp(0.0, 1.5);
-        u.color_drift = self.color_drift.clamp(0.0, 0.02);
+        u.breathe_scale = finite_or(self.breathe_scale, 0.0).clamp(0.0, 0.05);
+        u.breathe_rotation = finite_or(self.breathe_rotation, 0.0).clamp(0.0, 2.0);
+        u.breathe_position = finite_or(self.breathe_position, 0.0).clamp(0.0, 0.02);
+        u.vignette = finite_or(self.vignette, 0.0).clamp(0.0, 1.5);
+        u.color_drift = finite_or(self.color_drift, 0.0).clamp(0.0, 0.02);
         u.key_mode = self.key_mode.min(2) as f32;
-        u.key_threshold = self.key_threshold.clamp(0.0, 1.0);
-        u.key_softness = self.key_softness.clamp(0.0, 0.5);
+        u.key_threshold = finite_or(self.key_threshold, 0.5).clamp(0.0, 1.0);
+        u.key_softness = finite_or(self.key_softness, 0.1).clamp(0.0, 0.5);
     }
 
     /// Get fields organized into groups for display.
     pub fn grouped_fields(&self) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
         vec![
-            ("digital", vec![
-                ("pixelate", format!("{:.1}", self.pixelate)),
-                ("rgb_split", format!("{:.1}", self.rgb_split)),
-                ("hue_shift", format!("{:.1}", self.hue_shift)),
-                ("saturation", format!("{:.2}", self.saturation)),
-                ("brightness", format!("{:.2}", self.brightness)),
-                ("contrast", format!("{:.2}", self.contrast)),
-                ("posterize", format!("{:.1}", self.posterize)),
-                ("invert", format!("{}", self.invert)),
-            ]),
-            ("analog", vec![
-                ("grain_intensity", format!("{:.2}", self.grain_intensity)),
-                ("grain_size", format!("{:.2}", self.grain_size)),
-                ("grain_algo", format!("{}", self.grain_algo)),
-                ("color_grain", format!("{}", self.color_grain)),
-                ("vignette", format!("{:.2}", self.vignette)),
-                ("color_drift", format!("{:.3}", self.color_drift)),
-            ]),
-            ("motion", vec![
-                ("breathe_scale", format!("{:.3}", self.breathe_scale)),
-                ("breathe_rotation", format!("{:.2}", self.breathe_rotation)),
-                ("breathe_position", format!("{:.3}", self.breathe_position)),
-            ]),
+            (
+                "digital",
+                vec![
+                    ("pixelate", format!("{:.1}", self.pixelate)),
+                    ("rgb_split", format!("{:.1}", self.rgb_split)),
+                    ("hue_shift", format!("{:.1}", self.hue_shift)),
+                    ("saturation", format!("{:.2}", self.saturation)),
+                    ("brightness", format!("{:.2}", self.brightness)),
+                    ("contrast", format!("{:.2}", self.contrast)),
+                    ("posterize", format!("{:.1}", self.posterize)),
+                    ("invert", format!("{}", self.invert)),
+                    ("downsample", format!("{:.2}", self.downsample)),
+                ],
+            ),
+            (
+                "analog",
+                vec![
+                    ("grain_intensity", format!("{:.2}", self.grain_intensity)),
+                    ("grain_size", format!("{:.2}", self.grain_size)),
+                    ("grain_algo", format!("{}", self.grain_algo)),
+                    ("color_grain", format!("{}", self.color_grain)),
+                    ("vignette", format!("{:.2}", self.vignette)),
+                    ("color_drift", format!("{:.3}", self.color_drift)),
+                ],
+            ),
+            (
+                "motion",
+                vec![
+                    ("breathe_scale", format!("{:.3}", self.breathe_scale)),
+                    ("breathe_rotation", format!("{:.2}", self.breathe_rotation)),
+                    ("breathe_position", format!("{:.3}", self.breathe_position)),
+                ],
+            ),
         ]
     }
 
     /// Set a single field by key name. Returns true if the key was recognized.
     pub fn set_field(&mut self, key: &str, value: &str) -> bool {
         match key {
-            "pixelate" => { if let Ok(v) = value.parse() { self.pixelate = v; return true; } }
-            "rgb_split" => { if let Ok(v) = value.parse() { self.rgb_split = v; return true; } }
-            "hue_shift" => { if let Ok(v) = value.parse() { self.hue_shift = v; return true; } }
-            "saturation" => { if let Ok(v) = value.parse() { self.saturation = v; return true; } }
-            "brightness" => { if let Ok(v) = value.parse() { self.brightness = v; return true; } }
-            "contrast" => { if let Ok(v) = value.parse() { self.contrast = v; return true; } }
-            "posterize" => { if let Ok(v) = value.parse() { self.posterize = v; return true; } }
-            "invert" => { if let Ok(v) = value.parse() { self.invert = v; return true; } }
-            "grain_intensity" => { if let Ok(v) = value.parse() { self.grain_intensity = v; return true; } }
-            "grain_size" => { if let Ok(v) = value.parse() { self.grain_size = v; return true; } }
-            "grain_algo" => { if let Ok(v) = value.parse() { self.grain_algo = v; return true; } }
-            "color_grain" => { if let Ok(v) = value.parse() { self.color_grain = v; return true; } }
-            "breathe_scale" => { if let Ok(v) = value.parse() { self.breathe_scale = v; return true; } }
-            "breathe_rotation" => { if let Ok(v) = value.parse() { self.breathe_rotation = v; return true; } }
-            "breathe_position" => { if let Ok(v) = value.parse() { self.breathe_position = v; return true; } }
-            "vignette" => { if let Ok(v) = value.parse() { self.vignette = v; return true; } }
-            "color_drift" => { if let Ok(v) = value.parse() { self.color_drift = v; return true; } }
+            "pixelate" => {
+                if let Ok(v) = value.parse() {
+                    self.pixelate = v;
+                    return true;
+                }
+            }
+            "rgb_split" => {
+                if let Ok(v) = value.parse() {
+                    self.rgb_split = v;
+                    return true;
+                }
+            }
+            "hue_shift" => {
+                if let Ok(v) = value.parse() {
+                    self.hue_shift = v;
+                    return true;
+                }
+            }
+            "saturation" => {
+                if let Ok(v) = value.parse() {
+                    self.saturation = v;
+                    return true;
+                }
+            }
+            "brightness" => {
+                if let Ok(v) = value.parse() {
+                    self.brightness = v;
+                    return true;
+                }
+            }
+            "contrast" => {
+                if let Ok(v) = value.parse() {
+                    self.contrast = v;
+                    return true;
+                }
+            }
+            "posterize" => {
+                if let Ok(v) = value.parse() {
+                    self.posterize = v;
+                    return true;
+                }
+            }
+            "invert" => {
+                if let Ok(v) = value.parse() {
+                    self.invert = v;
+                    return true;
+                }
+            }
+            "downsample" => {
+                if let Ok(v) = value.parse() {
+                    self.downsample = v;
+                    return true;
+                }
+            }
+            "grain_intensity" => {
+                if let Ok(v) = value.parse() {
+                    self.grain_intensity = v;
+                    return true;
+                }
+            }
+            "grain_size" => {
+                if let Ok(v) = value.parse() {
+                    self.grain_size = v;
+                    return true;
+                }
+            }
+            "grain_algo" => {
+                if let Ok(v) = value.parse() {
+                    self.grain_algo = v;
+                    return true;
+                }
+            }
+            "color_grain" => {
+                if let Ok(v) = value.parse() {
+                    self.color_grain = v;
+                    return true;
+                }
+            }
+            "breathe_scale" => {
+                if let Ok(v) = value.parse() {
+                    self.breathe_scale = v;
+                    return true;
+                }
+            }
+            "breathe_rotation" => {
+                if let Ok(v) = value.parse() {
+                    self.breathe_rotation = v;
+                    return true;
+                }
+            }
+            "breathe_position" => {
+                if let Ok(v) = value.parse() {
+                    self.breathe_position = v;
+                    return true;
+                }
+            }
+            "vignette" => {
+                if let Ok(v) = value.parse() {
+                    self.vignette = v;
+                    return true;
+                }
+            }
+            "color_drift" => {
+                if let Ok(v) = value.parse() {
+                    self.color_drift = v;
+                    return true;
+                }
+            }
             _ => {}
         }
         false
@@ -534,14 +1019,9 @@ impl LayerConfig {
     pub fn from_layer(layer: &Layer) -> Self {
         Self {
             filename: layer.filename.clone(),
+            source_path: layer.source_path.clone(),
             opacity: layer.opacity,
-            blend_mode: match layer.blend_mode {
-                BlendMode::Normal => "normal",
-                BlendMode::Screen => "screen",
-                BlendMode::Multiply => "multiply",
-                BlendMode::Difference => "difference",
-            }
-            .to_string(),
+            blend_mode: layer.blend_mode.key().to_string(),
             speed: layer.speed,
             fps: layer.fps,
             paused: layer.paused,
@@ -551,15 +1031,15 @@ impl LayerConfig {
     }
 
     pub fn apply_to_layer(&self, layer: &mut Layer) {
-        layer.opacity = self.opacity.clamp(0.0, 1.0);
+        layer.opacity = finite_or(self.opacity, 1.0).clamp(0.0, 1.0);
         layer.blend_mode = match self.blend_mode.as_str() {
             "screen" => BlendMode::Screen,
             "multiply" => BlendMode::Multiply,
             "difference" => BlendMode::Difference,
             _ => BlendMode::Normal,
         };
-        layer.speed = self.speed.clamp(0.25, 4.0);
-        layer.fps = self.fps.clamp(1.0, 60.0);
+        layer.speed = finite_or(self.speed, 1.0).clamp(0.25, 4.0);
+        layer.fps = finite_or(self.fps, 30.0).clamp(1.0, 240.0);
         layer.paused = self.paused;
         layer.visible = self.visible;
         self.effects.apply_to_uniforms(&mut layer.effects);
@@ -581,12 +1061,40 @@ impl LayerConfig {
     /// Set a top-level field by key name. Returns true if recognized.
     pub fn set_field(&mut self, key: &str, value: &str) -> bool {
         match key {
-            "opacity" => { if let Ok(v) = value.parse() { self.opacity = v; return true; } }
-            "blend_mode" => { self.blend_mode = value.to_string(); return true; }
-            "speed" => { if let Ok(v) = value.parse() { self.speed = v; return true; } }
-            "fps" => { if let Ok(v) = value.parse() { self.fps = v; return true; } }
-            "paused" => { if let Ok(v) = value.parse() { self.paused = v; return true; } }
-            "visible" => { if let Ok(v) = value.parse() { self.visible = v; return true; } }
+            "opacity" => {
+                if let Ok(v) = value.parse() {
+                    self.opacity = v;
+                    return true;
+                }
+            }
+            "blend_mode" => {
+                self.blend_mode = value.to_string();
+                return true;
+            }
+            "speed" => {
+                if let Ok(v) = value.parse() {
+                    self.speed = v;
+                    return true;
+                }
+            }
+            "fps" => {
+                if let Ok(v) = value.parse() {
+                    self.fps = v;
+                    return true;
+                }
+            }
+            "paused" => {
+                if let Ok(v) = value.parse() {
+                    self.paused = v;
+                    return true;
+                }
+            }
+            "visible" => {
+                if let Ok(v) = value.parse() {
+                    self.visible = v;
+                    return true;
+                }
+            }
             _ => {}
         }
         false
@@ -602,13 +1110,17 @@ impl PatchState {
         ntsc_params: &NtscParams,
         mod_matrix: &ModMatrix,
         temporal: &TemporalParams,
+        master_paused: bool,
+        morph: &crate::morph::Morph,
     ) -> Self {
         Self {
             master: EffectsConfig::from_uniforms(master),
             layers: layers.iter().map(LayerConfig::from_layer).collect(),
+            master_paused,
             ntsc: Some(NtscConfig::from_params(ntsc_params)),
             modulation: Some(ModConfig::from_matrix(mod_matrix)),
             temporal: Some(TemporalConfig::from_params(temporal)),
+            morph: Some(morph.snapshot_at_beat(mod_matrix.current_beat)),
         }
     }
 
@@ -640,6 +1152,100 @@ impl PatchState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn patch_capture_rebases_in_flight_morph_to_remaining_beats() {
+        let mut matrix = ModMatrix::new();
+        matrix.update_at_beat(103.0, 0.0);
+        let mut morph = crate::morph::Morph::default();
+        morph.start_glide(1.0, 8.0, 100.0);
+
+        let patch = PatchState::capture(
+            &EffectUniforms::default(),
+            &[],
+            &NtscParams::default(),
+            &matrix,
+            &TemporalParams::default(),
+            false,
+            &morph,
+        );
+        let snapshot = patch.morph.unwrap();
+        assert!((snapshot.t - 0.375).abs() < 1e-6);
+        let glide = snapshot.glide.unwrap();
+        assert_eq!(glide.start_beat, 0.0);
+        assert_eq!(glide.duration_beats, 5.0);
+        let restored = crate::morph::Morph::from_snapshot(snapshot);
+        assert!((restored.position_at_beat(0.0) - 0.375).abs() < 1e-6);
+        assert!((restored.position_at_beat(5.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn downsample_persists_for_master_and_layers_with_legacy_default() {
+        let master = EffectUniforms {
+            downsample: 0.35,
+            ..Default::default()
+        };
+        let layer_effects = EffectsConfig {
+            downsample: 0.6,
+            ..Default::default()
+        };
+        let patch = PatchState {
+            master: EffectsConfig::from_uniforms(&master),
+            layers: vec![LayerConfig {
+                filename: "clip.mp4".to_string(),
+                source_path: String::new(),
+                opacity: 1.0,
+                blend_mode: "normal".to_string(),
+                speed: 1.0,
+                fps: 30.0,
+                paused: false,
+                visible: true,
+                effects: layer_effects,
+            }],
+            master_paused: false,
+            ntsc: None,
+            modulation: None,
+            temporal: None,
+            morph: None,
+        };
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(yaml.contains("downsample: 0.35"));
+        let parsed: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.master.downsample, 0.35);
+        assert_eq!(parsed.layers[0].effects.downsample, 0.6);
+
+        let mut restored = EffectUniforms::default();
+        parsed.master.apply_to_uniforms(&mut restored);
+        assert_eq!(restored.downsample, 0.35);
+
+        let legacy: PatchState = serde_yaml::from_str(
+            "master: {}\nlayers:\n  - filename: legacy.mp4\n    effects: {}\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.master.downsample, 1.0);
+        assert_eq!(legacy.layers[0].effects.downsample, 1.0);
+
+        let mut invalid = EffectsConfig {
+            downsample: f32::NAN,
+            ..Default::default()
+        };
+        invalid.apply_to_uniforms(&mut restored);
+        assert_eq!(restored.downsample, 1.0);
+        invalid.downsample = -10.0;
+        invalid.apply_to_uniforms(&mut restored);
+        assert_eq!(restored.downsample, 0.05);
+
+        assert!(invalid.set_field("downsample", "0.4"));
+        assert_eq!(invalid.downsample, 0.4);
+        assert!(invalid
+            .grouped_fields()
+            .iter()
+            .flat_map(|(_, fields)| fields)
+            .any(|(key, _)| *key == "downsample"));
+        let metadata = param_meta("downsample").unwrap();
+        assert_eq!((metadata.min, metadata.max), (0.05, 1.0));
+    }
+
     /// A patch with modulation state survives a YAML round-trip, and old
     /// patches without a `modulation:` section still parse.
     #[test]
@@ -651,35 +1257,61 @@ mod tests {
         matrix.lfos[2].phase = 0.25;
         matrix.audio_enabled = true;
         matrix.audio_gain = 1.5;
+        matrix.audio_band_config = crate::audio::AudioBandConfig::new(
+            6,
+            &[120.0, 480.0, 1500.0, 4000.0, 9000.0],
+            16_000.0,
+        );
         matrix.midi_enabled = true;
         matrix.midi_ccs = [21, 22, 23, 24];
         matrix.midi_clock_sync = true;
-        matrix.routings.push(Routing {
-            source: ModSource::AudioBright,
-            target: "layer2_opacity".to_string(),
-            depth: 0.6,
-        });
-        matrix.routings.push(Routing {
-            source: ModSource::AudioBass,
-            target: "ntsc_snow".to_string(),
-            depth: -0.8,
-        });
-        matrix.routings.push(Routing {
-            source: ModSource::Midi(2),
-            target: "vignette".to_string(),
-            depth: 1.0,
-        });
-        matrix.routings.push(Routing {
-            source: ModSource::Lfo(3),
-            target: "rgb_split".to_string(),
-            depth: 0.5,
-        });
+        matrix.set_gyro_degrees(355.0, 12.0, -18.0);
+        matrix.gyro_config[0] = GyroAxisConfig {
+            center_degrees: 350.0,
+            range_degrees: 30.0,
+            expo: 0.75,
+            invert: true,
+        };
+        matrix.gyro_config[1].center_degrees = 5.0;
+        matrix.recompute_gyro();
+        matrix.set_pad(0.8, 0.2, false);
+        matrix.pad_config.axes[0] = PadAxisConfig {
+            curve: Curve::Exp,
+            curve_amount: 0.75,
+            quantize: 8,
+        };
+        matrix.pad_config.axes[1] = PadAxisConfig {
+            curve: Curve::Steps,
+            curve_amount: -0.5,
+            quantize: 16,
+        };
+        matrix.pad_config.spring_enabled = true;
+        matrix.pad_config.spring_rate = 7.0;
+        let mut expressive = Routing::new(ModSource::AudioBright, "layer2_opacity", 0.6);
+        expressive.curve = Curve::SCurve;
+        expressive.curve_amount = 0.5;
+        expressive.attack = 0.08;
+        expressive.release = 0.4;
+        matrix.routings.push(expressive);
+        matrix
+            .routings
+            .push(Routing::new(ModSource::AudioBass, "ntsc_snow", -0.8));
+        matrix
+            .routings
+            .push(Routing::new(ModSource::Midi(2), "vignette", 1.0));
+        matrix
+            .routings
+            .push(Routing::new(ModSource::Lfo(3), "rgb_split", 0.5));
+        matrix
+            .routings
+            .push(Routing::new(ModSource::AudioBand(5), "contrast", 0.25));
 
         let temporal = TemporalParams {
             feedback: 0.7,
             fb_zoom: 1.02,
             fb_rotate: -1.5,
             slitscan: 0.4,
+            slit_angle: 37.0,
             slit_axis: 1.0,
         };
 
@@ -689,9 +1321,12 @@ mod tests {
             &NtscParams::default(),
             &matrix,
             &temporal,
+            true,
+            &crate::morph::Morph::default(),
         );
         let yaml = serde_yaml::to_string(&patch).unwrap();
         let parsed: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.master_paused);
 
         let mut restored = ModMatrix::new();
         let mut restored_temporal = TemporalParams::default();
@@ -707,6 +1342,7 @@ mod tests {
         assert_eq!(restored_temporal.fb_zoom, 1.02);
         assert_eq!(restored_temporal.fb_rotate, -1.5);
         assert_eq!(restored_temporal.slitscan, 0.4);
+        assert_eq!(restored_temporal.slit_angle, 37.0);
         assert_eq!(restored_temporal.slit_axis, 1.0);
 
         assert_eq!(restored.clock.bpm, 140.0);
@@ -715,27 +1351,57 @@ mod tests {
         assert_eq!(restored.lfos[2].phase, 0.25);
         assert!(restored.audio_enabled);
         assert_eq!(restored.audio_gain, 1.5);
+        assert_eq!(restored.audio_band_config.count(), 6);
+        assert_eq!(
+            restored.audio_band_config.crossovers(),
+            &[120.0, 480.0, 1500.0, 4000.0, 9000.0]
+        );
+        assert_eq!(restored.audio_band_config.ceiling_hz(), 16_000.0);
         assert!(restored.midi_enabled);
         assert_eq!(restored.midi_ccs, [21, 22, 23, 24]);
         assert!(restored.midi_clock_sync);
-        assert_eq!(restored.routings.len(), 4);
+        assert_eq!(restored.gyro_raw, [355.0, 12.0, -18.0]);
+        assert_eq!(restored.gyro_config[0].center_degrees, 350.0);
+        assert_eq!(restored.gyro_config[0].range_degrees, 30.0);
+        assert_eq!(restored.gyro_config[0].expo, 0.75);
+        assert!(restored.gyro_config[0].invert);
+        assert_eq!(restored.gyro_config[1].center_degrees, 5.0);
+        assert_eq!(restored.pad, [0.8, 0.2]);
+        assert!(!restored.pad_active);
+        assert_eq!(restored.pad_config.axes[0].curve, Curve::Exp);
+        assert_eq!(restored.pad_config.axes[0].curve_amount, 0.75);
+        assert_eq!(restored.pad_config.axes[0].quantize, 8);
+        assert_eq!(restored.pad_config.axes[1].curve, Curve::Steps);
+        assert_eq!(restored.pad_config.axes[1].quantize, 16);
+        assert!(restored.pad_config.spring_enabled);
+        assert_eq!(restored.pad_config.spring_rate, 7.0);
+        assert_eq!(restored.routings.len(), 5);
         assert_eq!(restored.routings[0].source, ModSource::AudioBright);
         assert_eq!(restored.routings[0].target, "layer2_opacity");
+        assert_eq!(restored.routings[0].curve, Curve::SCurve);
+        assert_eq!(restored.routings[0].curve_amount, 0.5);
+        assert_eq!(restored.routings[0].attack, 0.08);
+        assert_eq!(restored.routings[0].release, 0.4);
         assert_eq!(restored.routings[1].source, ModSource::AudioBass);
         assert_eq!(restored.routings[1].target, "ntsc_snow");
         assert_eq!(restored.routings[1].depth, -0.8);
         assert_eq!(restored.routings[2].source, ModSource::Midi(2));
         assert_eq!(restored.routings[3].source, ModSource::Lfo(3));
+        assert_eq!(restored.routings[4].source, ModSource::AudioBand(5));
 
         // Layer modulation math: bright 0.5 at depth 0.6 on layer 2 opacity.
         restored.audio.bright = 0.5;
-        let lm = restored.modulate_layer(1, 0.4, 1.0, 0.5);
-        assert!((lm.opacity - (0.4 + 0.5 * 0.6 * 0.5)).abs() < 1e-6);
+        restored.update_at_beat(0.0, 1.0);
+        let lm =
+            restored.modulate_layer_full(1, &crate::effects::EffectUniforms::default(), 0.4, 1.0);
+        let expected = 0.4 + crate::modulation::shape(0.5, Curve::SCurve, 0.5) * 0.6 * 0.5;
+        assert!((lm.opacity - expected).abs() < 1e-4);
         assert_eq!(lm.speed, 1.0, "untargeted values pass through");
 
         // Legacy patch without modulation section parses and applies cleanly.
         let legacy = "master:\n  pixelate: 4.0\nlayers: []\n";
         let parsed: PatchState = serde_yaml::from_str(legacy).unwrap();
+        assert!(!parsed.master_paused);
         assert!(parsed.modulation.is_none());
         assert!(parsed.temporal.is_none());
         let mut untouched = ModMatrix::new();
@@ -751,7 +1417,59 @@ mod tests {
             &mut untouched,
             &mut untouched_temporal,
         );
-        assert_eq!(untouched.clock.bpm, 99.0, "absent section must not reset matrix");
-        assert_eq!(untouched_temporal.feedback, 0.3, "absent section must not reset temporal");
+        assert_eq!(
+            untouched.clock.bpm, 99.0,
+            "absent section must not reset matrix"
+        );
+        assert_eq!(
+            untouched_temporal.feedback, 0.3,
+            "absent section must not reset temporal"
+        );
+
+        // Legacy modulation sections had no current motion samples. They
+        // restore gyro axes at their saved centers and the pad at center.
+        let legacy_mod = r#"
+master: {}
+layers: []
+modulation:
+  gyro:
+    - { center_degrees: 90.0, range_degrees: 20.0 }
+    - { center_degrees: 10.0, range_degrees: 30.0 }
+    - { center_degrees: -5.0, range_degrees: 40.0 }
+"#;
+        let parsed: PatchState = serde_yaml::from_str(legacy_mod).unwrap();
+        let mut legacy_matrix = ModMatrix::new();
+        parsed
+            .modulation
+            .unwrap()
+            .apply_to_matrix(&mut legacy_matrix);
+        assert_eq!(legacy_matrix.gyro, [0.5; 3]);
+        assert_eq!(legacy_matrix.pad, [0.5; 2]);
+        assert!(!legacy_matrix.pad_active);
+
+        // The historical three-entry list encoded two crossovers plus the
+        // analysis ceiling. It must load exactly as it did before the band
+        // count became configurable.
+        let legacy_audio = r#"
+master: {}
+layers: []
+modulation:
+  audio_band_edges: [250.0, 2000.0, 8000.0]
+  routings:
+    - { source: audio_bass, target: brightness, depth: 0.5 }
+"#;
+        let parsed: PatchState = serde_yaml::from_str(legacy_audio).unwrap();
+        let mut legacy_audio_matrix = ModMatrix::new();
+        parsed
+            .modulation
+            .unwrap()
+            .apply_to_matrix(&mut legacy_audio_matrix);
+        assert_eq!(legacy_audio_matrix.audio_band_config.count(), 3);
+        assert_eq!(
+            legacy_audio_matrix.audio_band_config.crossovers(),
+            &[250.0, 2000.0]
+        );
+        assert_eq!(legacy_audio_matrix.audio_band_config.ceiling_hz(), 8000.0);
+        assert_eq!(legacy_audio_matrix.routings[0].source, ModSource::AudioBass);
     }
 }

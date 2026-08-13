@@ -18,8 +18,10 @@ struct TemporalUniforms {
     slitscan: f32,     // 0 = off, 1 = deepest reach into history
     history_len: f32,  // ring size
     write_index: f32,  // most recent layer
-    slit_axis: f32,    // 0 = rows (y scans time), 1 = columns (x scans time)
-    _pad: f32,
+    valid_history: f32,// number of initialized layers, oldest..current
+    feedback_valid: f32,
+    slit_direction: vec2f, // aspect-correct and normalized to span the frame
+    _pad0: vec2f,
 };
 
 @group(0) @binding(0) var current_tex: texture_2d<f32>;
@@ -38,12 +40,17 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var color = textureSample(current_tex, samp, uv);
 
     // --- Slit-scan: each row (or column) samples a different past frame.
-    if u.slitscan > 0.001 {
-        let coord = select(uv.y, uv.x, u.slit_axis > 0.5);
-        let depth = coord * u.slitscan * (u.history_len - 1.0);
+    if u.slitscan > 0.001 && u.valid_history > 0.5 {
+        let coord = clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
+        // Clamp reach to the portion of the ring that has actually been
+        // written. This keeps startup deterministic without sampling the
+        // undefined contents of freshly allocated GPU textures.
+        let max_depth = max(u.valid_history - 1.0, 0.0);
+        let requested_depth = coord * u.slitscan * (u.history_len - 1.0);
+        let depth = min(requested_depth, max_depth);
         let layer = wrap_layer(u.write_index - floor(depth));
         let hist = textureSample(history_tex, samp, uv, layer);
-        if depth >= 1.0 {
+        if requested_depth >= 1.0 {
             // Rows at depth < 1 stay live; deeper rows come from history.
             color = hist;
         }
@@ -51,7 +58,7 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
     // --- Feedback: blend last frame's output back in, zoomed and rotated.
     // max() gives decaying light trails rather than muddy averaging.
-    if u.feedback > 0.001 {
+    if u.feedback > 0.001 && u.feedback_valid > 0.5 {
         let angle = u.fb_rotate * 0.0174533;
         let c = cos(angle);
         let s = sin(angle);

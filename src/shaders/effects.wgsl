@@ -311,8 +311,10 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     rgb = clamp(rgb, vec3f(0.0), vec3f(1.0));
 
     // --- Luma key (per-layer): carve shapes out of the frame by luminance.
-    // Alpha carries the mask into the composite pass; rgb is premultiplied
-    // so a keyed bottom layer correctly fades to black.
+    // Alpha carries the mask into the composite pass. Keep RGB straight
+    // (un-premultiplied): composite.wgsl multiplies it by overlay alpha when
+    // blending. Premultiplying here as well would square the soft key mask
+    // and produce dark fringes.
     var alpha = color.a;
     if uniforms.key_mode > 0.5 {
         let luma = dot(rgb, vec3f(0.299, 0.587, 0.114));
@@ -322,7 +324,6 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             k = 1.0 - k;
         }
         alpha *= k;
-        rgb *= k;
     }
 
     return vec4f(rgb, alpha);

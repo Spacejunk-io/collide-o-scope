@@ -38,7 +38,8 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
     }
 
-    // Mix based on opacity
+    // overlay.rgb is straight-alpha color. Apply its key/source alpha exactly
+    // once here; the effects pass deliberately does not premultiply it.
     let result = mix(base.rgb, blended, uniforms.opacity * overlay.a);
     return vec4f(result, max(base.a, overlay.a * uniforms.opacity));
 }
