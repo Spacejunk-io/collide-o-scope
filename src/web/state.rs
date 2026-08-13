@@ -55,6 +55,12 @@ pub struct AppSnapshot {
     /// Remote control URL (LAN address with access token) for the QR code
     #[serde(default)]
     pub remote_url: String,
+    /// Whether the fullscreen output window is open
+    #[serde(default)]
+    pub output_window: bool,
+    /// Patch morph crossfader state
+    #[serde(default)]
+    pub morph: MorphSnapshot,
     /// Export progress: 0.0 = idle, 0.0..1.0 = rendering, 1.0 = done
     #[serde(default)]
     pub export_progress: f32,
@@ -78,6 +84,8 @@ impl Default for AppSnapshot {
             temporal: TemporalSnapshot::default(),
             spout: SpoutSnapshot::default(),
             remote_url: String::new(),
+            output_window: false,
+            morph: MorphSnapshot::default(),
             export_progress: 0.0,
             export_error: String::new(),
         }
@@ -317,6 +325,16 @@ pub struct SpoutSnapshot {
     pub error: String,
 }
 
+/// Patch morph crossfader state sent to the browser.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MorphSnapshot {
+    pub has_a: bool,
+    pub has_b: bool,
+    /// True while both slots are set (crossfader engaged).
+    pub active: bool,
+    pub t: f32,
+}
+
 /// MIDI input state sent to the browser.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MidiSnapshot {
@@ -425,6 +443,18 @@ pub enum WebAction {
     /// XY performance pad position (0..1 each)
     #[serde(rename = "pad")]
     Pad { x: f32, y: f32 },
+    /// Open/close the fullscreen output window (second display)
+    #[serde(rename = "toggle_output_window")]
+    ToggleOutputWindow,
+    /// Capture current parameters into morph slot "a" or "b"
+    #[serde(rename = "morph_capture")]
+    MorphCapture { slot: String },
+    /// Clear both morph slots (crossfader disengages)
+    #[serde(rename = "morph_clear")]
+    MorphClear,
+    /// Set the morph crossfader position (0 = A, 1 = B)
+    #[serde(rename = "set_morph")]
+    SetMorph { value: f32 },
     /// Set a temporal effect parameter
     #[serde(rename = "set_temporal")]
     SetTemporal { param: String, value: serde_json::Value },

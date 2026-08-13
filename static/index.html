@@ -39,7 +39,8 @@
         </div>
         <h3 class="panel-title">Master Effects</h3>
         <div class="fx-scroll" id="master-fx">
-          <div class="fx-masonry">
+          <div class="fx-columns">
+          <div class="fx-col"><!-- video effects -->
           <div class="fx-group" data-group="digital">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -234,6 +235,8 @@
             </div>
           </div>
 
+          </div>
+          <div class="fx-col"><!-- the morphing hub and its matrix -->
           <div class="fx-group" data-group="mod" id="mod-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -256,6 +259,27 @@
             </div>
           </div>
 
+          <div class="fx-group" id="morph-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">MORPH</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="morph-buttons">
+                <button id="morph-set-a" class="morph-btn">Set A</button>
+                <button id="morph-set-b" class="morph-btn">Set B</button>
+                <button id="morph-clear" class="morph-btn">Clear</button>
+              </div>
+              <div class="morph-fader-row">
+                <span class="morph-end" id="morph-label-a">A</span>
+                <input type="range" id="morph-t" min="0" max="1" step="0.01" value="0">
+                <span class="morph-end" id="morph-label-b">B</span>
+              </div>
+              <div class="audio-status" id="morph-status">capture two states, then crossfade</div>
+            </div>
+          </div>
+          </div>
+          <div class="fx-col"><!-- modulation sources -->
           <div class="fx-group" id="audio-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -334,12 +358,19 @@
             </div>
           </div>
 
+          </div>
+          <div class="fx-col"><!-- where the work leaves the machine -->
           <div class="fx-group" id="output-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
               <span class="group-label">OUTPUT</span>
             </div>
             <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label>Fullscreen</label>
+                <label class="toggle"><input type="checkbox" id="output-window"><span class="toggle-slider"></span></label>
+                <span class="clock-indicator" id="output-window-hint"></span>
+              </div>
               <div class="param-row toggle-row">
                 <label>Spout</label>
                 <label class="toggle"><input type="checkbox" id="spout-enabled"><span class="toggle-slider"></span></label>
@@ -400,6 +431,7 @@
                 <div class="remote-url" id="remote-url"></div>
               </div>
             </div>
+          </div>
           </div>
           </div>
         </div>

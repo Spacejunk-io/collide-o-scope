@@ -7,6 +7,7 @@ mod input;
 mod layers;
 mod midi;
 mod modulation;
+mod morph;
 mod ntsc;
 mod patch;
 mod render_export;
@@ -60,6 +61,8 @@ struct App {
     ntsc_worker: ntsc::NtscWorker,
     // Modulation matrix (BPM clock, LFOs, routings)
     mod_matrix: modulation::ModMatrix,
+    // Patch morphing crossfader (A/B slots + t)
+    morph: morph::Morph,
     // Audio input analysis (modulation source)
     audio: audio::AudioAnalyzer,
     // MIDI input (modulation source)
@@ -106,6 +109,7 @@ impl App {
             ntsc_params: ntsc::NtscParams::default(),
             ntsc_worker: ntsc::NtscWorker::new(),
             mod_matrix: modulation::ModMatrix::new(),
+            morph: morph::Morph::default(),
             audio: audio::AudioAnalyzer::new(),
             midi: midi::MidiEngine::new(),
             temporal_params: effects::params::TemporalParams::default(),
@@ -126,6 +130,40 @@ impl App {
             Err(e) => {
                 eprintln!("Failed to open video: {e}");
             }
+        }
+    }
+
+    /// Open or close the dedicated fullscreen output window. When a second
+    /// monitor exists, the output goes fullscreen there and the main window
+    /// stays with the performer; on a single monitor it takes that one
+    /// (Escape or O closes it; the web panel keeps working regardless).
+    fn toggle_output_window(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        if renderer.has_output() {
+            renderer.close_output();
+            log::info!("Output window closed");
+            return;
+        }
+
+        let main_monitor = self.window.as_ref().and_then(|w| w.current_monitor());
+        let target_monitor = event_loop
+            .available_monitors()
+            .find(|m| Some(m) != main_monitor.as_ref())
+            .or(main_monitor);
+
+        let attrs = WindowAttributes::default()
+            .with_title("collide-o-scope — output")
+            .with_fullscreen(Some(Fullscreen::Borderless(target_monitor)));
+
+        match event_loop.create_window(attrs) {
+            Ok(window) => {
+                let window = Arc::new(window);
+                renderer.create_output(window);
+                log::info!("Output window opened");
+            }
+            Err(e) => log::error!("Output window: {e}"),
         }
     }
 
@@ -319,6 +357,28 @@ impl App {
             WebAction::Pad { x, y } => {
                 self.mod_matrix.pad = [x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)];
             }
+            WebAction::ToggleOutputWindow => {
+                // Handled in the action drain loop, which has the event
+                // loop needed for window creation. Never reaches here.
+            }
+            WebAction::MorphCapture { slot } => {
+                let snap = morph::MorphSlot::capture(
+                    &self.master_effects,
+                    &self.ntsc_params,
+                    &self.temporal_params,
+                    &self.layers,
+                );
+                match slot.as_str() {
+                    "b" => self.morph.b = Some(snap),
+                    _ => self.morph.a = Some(snap),
+                }
+            }
+            WebAction::MorphClear => {
+                self.morph.clear();
+            }
+            WebAction::SetMorph { value } => {
+                self.morph.t = value.clamp(0.0, 1.0);
+            }
             WebAction::SetTemporal { param, value } => {
                 let p = &mut self.temporal_params;
                 match param.as_str() {
@@ -471,7 +531,8 @@ impl App {
     fn push_web_state(&self) {
         use web::state::{
             AppSnapshot, AudioSnapshot, EffectsSnapshot, LayerSnapshot, MidiSlotSnapshot,
-            MidiSnapshot, ModSnapshot, NtscSnapshot, SpoutSnapshot, TemporalSnapshot,
+            MidiSnapshot, ModSnapshot, MorphSnapshot, NtscSnapshot, SpoutSnapshot,
+            TemporalSnapshot,
         };
 
         let snapshot = AppSnapshot {
@@ -532,6 +593,13 @@ impl App {
                 }
             },
             remote_url: self.web_state.lan_url.read().map(|s| s.clone()).unwrap_or_default(),
+            output_window: self.renderer.as_ref().map(|r| r.has_output()).unwrap_or(false),
+            morph: MorphSnapshot {
+                has_a: self.morph.a.is_some(),
+                has_b: self.morph.b.is_some(),
+                active: self.morph.active(),
+                t: self.morph.t,
+            },
             export_progress: self.export_job.as_ref()
                 .map(|j| if j.is_done() { 1.0 } else { j.progress.progress_f32() })
                 .unwrap_or(0.0),
@@ -778,9 +846,42 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Events for the dedicated output window: it only needs to close,
+        // resize, and yield to Escape/O — everything else stays with the
+        // main window and never reaches egui.
+        if let Some(renderer) = self.renderer.as_mut() {
+            if renderer.output_window_id() == Some(window_id) {
+                match event {
+                    WindowEvent::CloseRequested => renderer.close_output(),
+                    WindowEvent::Resized(size) => {
+                        renderer.resize_output(size.width, size.height)
+                    }
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key,
+                                state: winit::event::ElementState::Pressed,
+                                ..
+                            },
+                        ..
+                    } => {
+                        use winit::keyboard::{KeyCode, PhysicalKey};
+                        if matches!(
+                            physical_key,
+                            PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyO)
+                        ) {
+                            renderer.close_output();
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+        }
+
         if let Some(egui_winit) = &mut self.egui_winit {
             let response =
                 egui_winit.on_window_event(self.window.as_ref().unwrap(), &event);
@@ -884,6 +985,9 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
+                            ControlFlow::ToggleOutputWindow => {
+                                self.toggle_output_window(event_loop)
+                            }
                             ControlFlow::Continue => {}
                         }
                     }
@@ -901,6 +1005,7 @@ impl ApplicationHandler for App {
                                 }
                             }
                         }
+                        ControlFlow::ToggleOutputWindow => self.toggle_output_window(event_loop),
                         _ => {}
                     }
                 }
@@ -946,7 +1051,14 @@ impl ApplicationHandler for App {
                         .map(|mut a| a.drain(..).collect())
                         .unwrap_or_default();
                     for action in pending_actions {
-                        self.handle_web_action(action);
+                        // Output-window toggling needs the event loop for
+                        // window creation; everything else is plain state.
+                        match action {
+                            web::state::WebAction::ToggleOutputWindow => {
+                                self.toggle_output_window(event_loop)
+                            }
+                            other => self.handle_web_action(other),
+                        }
                     }
 
                     // Build minimal egui frame (video display only, no UI panels)
@@ -1051,6 +1163,24 @@ impl ApplicationHandler for App {
                     // Base values (what the UI edits) stay untouched; LFOs
                     // breathe around them.
                     self.mod_matrix.update(Instant::now());
+
+                    // Patch morph: while A and B are both set, the crossfader
+                    // (plus any "morph" routings — an LFO can sweep worlds)
+                    // writes the base parameters as their interpolation. The
+                    // matrix then breathes on top of the morphed bases.
+                    if self.morph.active() {
+                        let t_eff = (self.morph.t
+                            + self.mod_matrix.target_offset("morph"))
+                        .clamp(0.0, 1.0);
+                        self.morph.apply(
+                            t_eff,
+                            &mut self.master_effects,
+                            &mut self.ntsc_params,
+                            &mut self.temporal_params,
+                            &mut self.layers,
+                        );
+                    }
+
                     let (mod_master, mod_ntsc, mod_temporal) = self.mod_matrix.modulate(
                         &self.master_effects,
                         &self.ntsc_params,
@@ -1240,8 +1370,15 @@ impl ApplicationHandler for App {
                         egui_renderer.free_texture(id);
                     }
 
+                    // Blit the final composite to the fullscreen output
+                    // window (if open) in the same submission.
+                    let output_present = renderer.render_output(&mut encoder);
+
                     renderer.queue.submit(std::iter::once(encoder.finish()));
                     surface_texture.present();
+                    if let Some(t) = output_present {
+                        t.present();
+                    }
                 }
 
                 if let Some(window) = &self.window {

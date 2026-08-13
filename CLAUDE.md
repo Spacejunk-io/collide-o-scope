@@ -169,6 +169,22 @@ egui's built-ins — never a build error.
   when off, so the effects are warm instantly. Params are mod targets
   (temporal_*), persist in patches, and render identically in export via
   shared helpers (renderer::state::{build_temporal_pipeline, encode_temporal}).
+- Output window (keyboard O, panel OUTPUT group, or web action): a second
+  winit window blits the final composite fullscreen — on the second
+  monitor when one exists, letterboxed, Escape/O closes. Surface
+  capabilities MUST be queried against the stored adapter (Renderer keeps
+  instance + adapter); a freshly requested adapter handle invalidates the
+  device.
+- Patch morph (panel MORPH group): slots A/B capture the continuous
+  performance state (master fx, NTSC, temporal, per-layer
+  opacity/speed/key); while both are set the crossfader writes the BASE
+  params as their interpolation each frame — sliders visibly follow, and
+  the mod matrix breathes on top. Discrete values switch at t=0.5. The
+  "morph" mod target lets an LFO/knob sweep between worlds
+  (ModMatrix::target_offset).
+- Panel layout: fixed cluster columns (.fx-columns/.fx-col — video
+  effects | matrix+morph | sources | I/O), NOT CSS masonry: expanding a
+  group must never reflow other columns mid-performance.
 - Spout output (spout_out.rs, spout2-rs crate): a worker thread owns a DX11
   sender named "collide-o-scope"; frames come from the same async readback
   the NTSC path uses (raw composite, or NTSC-processed when VHS is on — 

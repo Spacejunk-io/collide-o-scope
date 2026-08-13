@@ -60,6 +60,8 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("temporal_slitscan", 0.0, 1.0),
     ("temporal_fb_zoom", 0.9, 1.1),
     ("temporal_fb_rotate", -5.0, 5.0),
+    // The patch-morph crossfader; applied by the app, not apply_offset.
+    ("morph", 0.0, 1.0),
 ];
 
 /// Per-layer values after modulation, aligned with the layers vec.
@@ -462,6 +464,20 @@ impl ModMatrix {
             *slot = (*slot + offset).clamp(min, max);
         }
         result
+    }
+
+    /// Summed modulation offset for one named target — for values the app
+    /// applies itself (e.g. the morph crossfader) rather than via
+    /// `modulate`. Uses the same depth × half-range scaling.
+    pub fn target_offset(&self, target: &str) -> f32 {
+        let Some(&(_, min, max)) = TARGETS.iter().find(|(k, _, _)| *k == target) else {
+            return 0.0;
+        };
+        self.routings
+            .iter()
+            .filter(|r| r.target == target && r.depth != 0.0)
+            .map(|r| self.source_value(r.source) * r.depth * (max - min) * 0.5)
+            .sum()
     }
 
     pub fn add_routing(&mut self) {

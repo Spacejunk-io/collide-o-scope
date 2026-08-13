@@ -349,6 +349,25 @@ pub struct Renderer {
     history_view: wgpu::TextureView,
     /// Layer holding the most recent completed frame.
     history_write: usize,
+
+    // Instance + adapter kept for creating additional surfaces (output
+    // window). Capabilities must be queried against the SAME adapter the
+    // device came from — a freshly requested adapter handle invalidates
+    // the device when its capabilities disagree.
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    // Dedicated fullscreen output window (projector), when open
+    output: Option<OutputTarget>,
+}
+
+/// A second window showing the final composite, letterboxed — the face the
+/// audience sees while the main window and web panel stay with the performer.
+struct OutputTarget {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
 }
 
 impl Renderer {
@@ -641,7 +660,215 @@ impl Renderer {
             history_texture,
             history_view,
             history_write: 0,
+            instance,
+            adapter,
+            output: None,
         }
+    }
+
+    /// Open the fullscreen output window's rendering surface.
+    pub fn create_output(&mut self, window: Arc<Window>) {
+        let size = window.inner_size();
+        let surface = match self.instance.create_surface(window.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Output window surface: {e}");
+                return;
+            }
+        };
+
+        let caps = surface.get_capabilities(&self.adapter);
+        let format = caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&self.device, &config);
+
+        // Blit pipeline targeting this surface's format.
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Blit BGL"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let vertex = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blit Vertex"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/fullscreen.wgsl").into()),
+        });
+        let fragment = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blit Fragment"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/blit.wgsl").into()),
+        });
+
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Blit PL"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Blit Pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &vertex,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blit BG"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        self.output = Some(OutputTarget {
+            window,
+            surface,
+            config,
+            pipeline,
+            bind_group,
+        });
+    }
+
+    pub fn close_output(&mut self) {
+        self.output = None;
+    }
+
+    pub fn has_output(&self) -> bool {
+        self.output.is_some()
+    }
+
+    pub fn output_window_id(&self) -> Option<winit::window::WindowId> {
+        self.output.as_ref().map(|o| o.window.id())
+    }
+
+    pub fn resize_output(&mut self, width: u32, height: u32) {
+        if let Some(out) = self.output.as_mut() {
+            if width > 0 && height > 0 {
+                out.config.width = width;
+                out.config.height = height;
+                out.surface.configure(&self.device, &out.config);
+            }
+        }
+    }
+
+    /// Encode the letterboxed blit onto the output window's surface.
+    /// Returns the surface texture to present after the encoder is
+    /// submitted; None if the surface wasn't ready this frame.
+    pub fn render_output(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Option<wgpu::SurfaceTexture> {
+        let out = self.output.as_mut()?;
+
+        let surface_texture = match out.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                out.surface.configure(&self.device, &out.config);
+                return None;
+            }
+            _ => return None,
+        };
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Letterbox: fit the composite's aspect into the window.
+        let (sw, sh) = (out.config.width as f32, out.config.height as f32);
+        let aspect = self.output_width as f32 / self.output_height as f32;
+        let (vw, vh) = if sw / sh > aspect {
+            (sh * aspect, sh)
+        } else {
+            (sw, sw / aspect)
+        };
+        let (vx, vy) = ((sw - vw) * 0.5, (sh - vh) * 0.5);
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Output Blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        pass.set_pipeline(&out.pipeline);
+        pass.set_bind_group(0, &out.bind_group, &[]);
+        pass.set_viewport(vx, vy, vw.max(1.0), vh.max(1.0), 0.0, 1.0);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+
+        Some(surface_texture)
     }
 
     /// Temporal pass: applies feedback/slit-scan using the frame-history

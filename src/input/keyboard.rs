@@ -12,6 +12,7 @@ pub enum Action {
     ResetEffects,
     TogglePause,
     ToggleFullscreen,
+    ToggleOutputWindow,
     Quit,
     None,
 }
@@ -40,6 +41,7 @@ pub fn map_key(key: PhysicalKey, state: ElementState, shift: bool) -> Action {
         PhysicalKey::Code(KeyCode::Digit0) => Action::ResetEffects,
         PhysicalKey::Code(KeyCode::Space) => Action::TogglePause,
         PhysicalKey::Code(KeyCode::KeyF) => Action::ToggleFullscreen,
+        PhysicalKey::Code(KeyCode::KeyO) => Action::ToggleOutputWindow,
         PhysicalKey::Code(KeyCode::Escape) => Action::Quit,
         _ => Action::None,
     }
@@ -55,6 +57,7 @@ pub fn apply_action(action: Action, uniforms: &mut EffectUniforms) -> ControlFlo
         Action::ResetEffects => uniforms.reset(),
         Action::TogglePause => return ControlFlow::TogglePause,
         Action::ToggleFullscreen => return ControlFlow::ToggleFullscreen,
+        Action::ToggleOutputWindow => return ControlFlow::ToggleOutputWindow,
         Action::Quit => return ControlFlow::Quit,
         Action::None => {}
     }
@@ -65,5 +68,6 @@ pub enum ControlFlow {
     Continue,
     TogglePause,
     ToggleFullscreen,
+    ToggleOutputWindow,
     Quit,
 }

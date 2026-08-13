@@ -325,13 +325,20 @@ body {
   flex: 1;
 }
 
-/* Masonry: groups flow into 260px columns, as many as the width holds.
-   Lives on an auto-height child of the scroll container so the columns
-   balance within the width and overflow vertically (scrolling), never
-   sideways into clipped space. */
-.fx-masonry {
-  columns: 260px;
-  column-gap: 10px;
+/* Fixed cluster columns: video effects | matrix & morph | sources | I/O.
+   Unlike CSS masonry, expanding a group only pushes its own column down —
+   nothing ever leaps to another column mid-performance. Columns wrap on
+   narrower windows and stack on phones. */
+.fx-columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 10px;
+  align-items: flex-start;
+}
+
+.fx-col {
+  flex: 1 1 250px;
+  min-width: 250px;
 }
 
 /* === FX GROUPS (collapsible) === */
@@ -909,3 +916,46 @@ input[type="range"]::-webkit-slider-thumb:hover {
 @media (max-width: 900px) {
   .xy-pad { max-height: 45vh; }
 }
+
+/* === MORPH === */
+
+.morph-buttons {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.morph-btn {
+  flex: 1;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font: inherit;
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.morph-btn:hover { border-color: var(--accent); }
+.morph-btn.set {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.morph-fader-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+}
+
+.morph-fader-row input[type="range"] { flex: 1; height: 28px; }
+
+.morph-end {
+  color: var(--text-dim);
+  font-weight: 600;
+  width: 14px;
+  text-align: center;
+}
+
+.morph-end.active { color: var(--accent); }

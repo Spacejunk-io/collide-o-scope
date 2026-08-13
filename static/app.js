@@ -43,6 +43,8 @@ function connect() {
         syncTemporal(msg.temporal);
         syncSpout(msg.spout);
         syncRemote(msg.remote_url);
+        syncMorph(msg.morph);
+        syncOutputWindow(msg.output_window);
       }
     } catch (err) {
       console.warn('[ws] parse error:', err);
@@ -1091,6 +1093,53 @@ function syncSpout(s) {
   } else {
     spoutStatus.textContent = '';
   }
+}
+
+// --- Patch morph crossfader ---
+
+const morphT = document.getElementById('morph-t');
+const morphStatus = document.getElementById('morph-status');
+
+document.getElementById('morph-set-a').addEventListener('click', () => {
+  sendAction({ action: 'morph_capture', slot: 'a' });
+});
+document.getElementById('morph-set-b').addEventListener('click', () => {
+  sendAction({ action: 'morph_capture', slot: 'b' });
+});
+document.getElementById('morph-clear').addEventListener('click', () => {
+  sendAction({ action: 'morph_clear' });
+});
+morphT.addEventListener('input', () => {
+  sendAction({ action: 'set_morph', value: parseFloat(morphT.value) });
+});
+
+function syncMorph(m) {
+  if (!m) return;
+  if (document.activeElement !== morphT) morphT.value = m.t;
+  document.getElementById('morph-set-a').classList.toggle('set', m.has_a);
+  document.getElementById('morph-set-b').classList.toggle('set', m.has_b);
+  document.getElementById('morph-label-a').classList.toggle('active', m.active && m.t < 0.5);
+  document.getElementById('morph-label-b').classList.toggle('active', m.active && m.t >= 0.5);
+  if (m.active) {
+    morphStatus.textContent = 'morphing — sliders follow the crossfade';
+  } else if (m.has_a || m.has_b) {
+    morphStatus.textContent = m.has_a ? 'A set — capture B to engage' : 'B set — capture A to engage';
+  } else {
+    morphStatus.textContent = 'capture two states, then crossfade';
+  }
+}
+
+// --- Fullscreen output window ---
+
+const outputWindow = document.getElementById('output-window');
+outputWindow.addEventListener('change', () => {
+  sendAction({ action: 'toggle_output_window' });
+});
+
+function syncOutputWindow(open) {
+  if (document.activeElement !== outputWindow) outputWindow.checked = !!open;
+  document.getElementById('output-window-hint').textContent =
+    open ? 'O or Esc closes' : '';
 }
 
 // --- Remote / QR ---
