@@ -45,6 +45,7 @@ function connect() {
         syncRemote(msg.remote_url);
         syncMorph(msg.morph);
         syncOutputWindow(msg.output_window);
+        syncBlackout(msg.blackout);
       }
     } catch (err) {
       console.warn('[ws] parse error:', err);
@@ -195,13 +196,37 @@ function syncTemporal(t) {
   }
 }
 
-// --- Collapsible FX groups ---
+// --- Collapsible FX groups (state remembered across reloads) ---
+
+const groupKey = (g) => g.id || g.dataset.group || '';
+
+function loadCollapsedState() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem('cos-collapsed') || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+
+const collapsedState = loadCollapsedState();
+if (localStorage.getItem('cos-collapsed') !== null) {
+  // A saved layout exists: apply it (overriding HTML defaults).
+  document.querySelectorAll('.fx-group').forEach((g) => {
+    g.classList.toggle('collapsed', collapsedState.has(groupKey(g)));
+  });
+}
 
 document.querySelectorAll('.fx-group-header').forEach((header) => {
   header.addEventListener('click', (e) => {
     if (e.target.classList.contains('group-reset')) return;
     const group = header.closest('.fx-group');
     group.classList.toggle('collapsed');
+    const key = groupKey(group);
+    if (key) {
+      if (group.classList.contains('collapsed')) collapsedState.add(key);
+      else collapsedState.delete(key);
+      localStorage.setItem('cos-collapsed', JSON.stringify([...collapsedState]));
+    }
   });
 });
 
@@ -223,6 +248,14 @@ document.getElementById('btn-play-all').addEventListener('click', () => {
 document.getElementById('btn-stop').addEventListener('click', () => {
   sendAction({ action: 'reset_fx' });
 });
+
+document.getElementById('btn-blackout').addEventListener('click', () => {
+  sendAction({ action: 'toggle_blackout' });
+});
+
+function syncBlackout(on) {
+  document.getElementById('btn-blackout').classList.toggle('active', !!on);
+}
 
 // --- Sync effects UI from server ---
 
@@ -819,6 +852,15 @@ function syncModulation(m) {
 
   if (document.activeElement !== bpmInput) {
     bpmInput.value = m.bpm.toFixed(1);
+  }
+
+  // Beat light: bright on the beat, fading through it; strong on downbeats.
+  const light = document.getElementById('beat-light');
+  if (light && typeof m.beat === 'number') {
+    const phase = m.beat - Math.floor(m.beat);
+    const downbeat = Math.floor(m.beat) % 4 === 0;
+    light.style.opacity = (1 - phase * 0.85).toFixed(2);
+    light.classList.toggle('downbeat', downbeat);
   }
 
   (m.lfos || []).forEach((lfo, i) => {

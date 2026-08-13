@@ -113,6 +113,8 @@ egui's built-ins — never a build error.
 - 0 — reset all effects
 - Space — pause/resume
 - F — toggle fullscreen
+- O — toggle the fullscreen output window (second display)
+- B — blackout (cut output to black; also a panel button)
 - Ctrl+E — toggle YAML editor · Ctrl+S — save patch · Ctrl+O — load patch
 - Escape — quit
 

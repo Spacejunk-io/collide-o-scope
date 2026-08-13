@@ -794,6 +794,25 @@ impl Renderer {
         });
     }
 
+    /// Blackout: clear the final composite to black. Everything downstream
+    /// — panel preview, output window, Spout, NTSC — goes dark together.
+    pub fn clear_composite(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Blackout"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.composite_views[0],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+    }
+
     pub fn close_output(&mut self) {
         self.output = None;
     }

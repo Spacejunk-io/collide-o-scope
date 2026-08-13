@@ -321,6 +321,8 @@ pub struct ModMatrix {
     pub routings: Vec<Routing>,
     /// Latest sampled LFO values (refreshed by `update`), for UI meters.
     pub lfo_values: [f32; NUM_LFOS],
+    /// Beat position at the last update, for the panel's beat light.
+    pub current_beat: f64,
     /// Latest audio levels (pushed by the app each frame from the analyzer).
     pub audio: AudioLevels,
     /// Whether audio capture should be running (the app syncs the analyzer).
@@ -354,6 +356,7 @@ impl ModMatrix {
             lfos: std::array::from_fn(|_| Lfo::default()),
             routings: Vec::new(),
             lfo_values: [0.0; NUM_LFOS],
+            current_beat: 0.0,
             audio: AudioLevels::default(),
             audio_enabled: false,
             audio_gain: 1.0,
@@ -378,6 +381,7 @@ impl ModMatrix {
     /// offline exporter, where the beat is derived from the frame index so
     /// the same patch renders the same file every time.
     pub fn update_at_beat(&mut self, beat: f64) {
+        self.current_beat = beat;
         for (i, lfo) in self.lfos.iter().enumerate() {
             self.lfo_values[i] = lfo.value(beat, i);
         }

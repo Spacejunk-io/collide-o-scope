@@ -63,6 +63,8 @@ struct App {
     mod_matrix: modulation::ModMatrix,
     // Patch morphing crossfader (A/B slots + t)
     morph: morph::Morph,
+    // Blackout: output cut to black (B key / panel button)
+    blackout: bool,
     // Audio input analysis (modulation source)
     audio: audio::AudioAnalyzer,
     // MIDI input (modulation source)
@@ -115,6 +117,7 @@ impl App {
             ntsc_worker: ntsc::NtscWorker::new(),
             mod_matrix: modulation::ModMatrix::new(),
             morph: morph::Morph::default(),
+            blackout: false,
             audio: audio::AudioAnalyzer::new(),
             midi: midi::MidiEngine::new(),
             temporal_params: effects::params::TemporalParams::default(),
@@ -397,6 +400,9 @@ impl App {
             WebAction::SetMorph { value } => {
                 self.morph.t = value.clamp(0.0, 1.0);
             }
+            WebAction::ToggleBlackout => {
+                self.blackout = !self.blackout;
+            }
             WebAction::RescanLibrary => {
                 if let Some(folder) = self.library_folder.clone() {
                     self.library_files = scan_folder(&folder);
@@ -641,6 +647,7 @@ impl App {
             },
             remote_url: self.web_state.lan_url.read().map(|s| s.clone()).unwrap_or_default(),
             output_window: self.renderer.as_ref().map(|r| r.has_output()).unwrap_or(false),
+            blackout: self.blackout,
             morph: MorphSnapshot {
                 has_a: self.morph.a.is_some(),
                 has_b: self.morph.b.is_some(),
@@ -1035,6 +1042,7 @@ impl ApplicationHandler for App {
                             ControlFlow::ToggleOutputWindow => {
                                 self.toggle_output_window(event_loop)
                             }
+                            ControlFlow::ToggleBlackout => self.blackout = !self.blackout,
                             ControlFlow::Continue => {}
                         }
                     }
@@ -1053,6 +1061,7 @@ impl ApplicationHandler for App {
                             }
                         }
                         ControlFlow::ToggleOutputWindow => self.toggle_output_window(event_loop),
+                        ControlFlow::ToggleBlackout => self.blackout = !self.blackout,
                         _ => {}
                     }
                 }
@@ -1264,6 +1273,12 @@ impl ApplicationHandler for App {
                     renderer.render_master_effects(&mut encoder, &mod_master);
                     // Temporal effects (feedback/slit-scan) + history recording.
                     renderer.render_temporal(&mut encoder, &mod_temporal);
+
+                    // Blackout cuts everything downstream — panel preview,
+                    // output window, Spout, NTSC — to black at once.
+                    if self.blackout {
+                        renderer.clear_composite(&mut encoder);
+                    }
 
                     // Sync the Spout output worker with its toggle.
                     if self.spout_enabled && !self.spout.is_running() {

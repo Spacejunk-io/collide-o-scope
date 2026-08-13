@@ -13,6 +13,7 @@ pub enum Action {
     TogglePause,
     ToggleFullscreen,
     ToggleOutputWindow,
+    ToggleBlackout,
     Quit,
     None,
 }
@@ -42,6 +43,7 @@ pub fn map_key(key: PhysicalKey, state: ElementState, shift: bool) -> Action {
         PhysicalKey::Code(KeyCode::Space) => Action::TogglePause,
         PhysicalKey::Code(KeyCode::KeyF) => Action::ToggleFullscreen,
         PhysicalKey::Code(KeyCode::KeyO) => Action::ToggleOutputWindow,
+        PhysicalKey::Code(KeyCode::KeyB) => Action::ToggleBlackout,
         PhysicalKey::Code(KeyCode::Escape) => Action::Quit,
         _ => Action::None,
     }
@@ -58,6 +60,7 @@ pub fn apply_action(action: Action, uniforms: &mut EffectUniforms) -> ControlFlo
         Action::TogglePause => return ControlFlow::TogglePause,
         Action::ToggleFullscreen => return ControlFlow::ToggleFullscreen,
         Action::ToggleOutputWindow => return ControlFlow::ToggleOutputWindow,
+        Action::ToggleBlackout => return ControlFlow::ToggleBlackout,
         Action::Quit => return ControlFlow::Quit,
         Action::None => {}
     }
@@ -69,5 +72,6 @@ pub enum ControlFlow {
     TogglePause,
     ToggleFullscreen,
     ToggleOutputWindow,
+    ToggleBlackout,
     Quit,
 }

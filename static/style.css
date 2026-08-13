@@ -992,3 +992,32 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .lib-upload-status:empty { display: none; }
+
+/* === BLACKOUT + BEAT LIGHT === */
+
+.blackout-btn {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  width: auto;
+  padding: 0 8px;
+}
+
+.blackout-btn.active {
+  background: #1a0505;
+  border-color: #e65a5a;
+  color: #e65a5a;
+}
+
+.beat-light {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: 4px;
+  opacity: 0.15;
+}
+
+.beat-light.downbeat {
+  box-shadow: 0 0 8px var(--accent);
+}

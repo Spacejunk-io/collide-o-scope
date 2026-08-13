@@ -63,6 +63,9 @@ pub struct AppSnapshot {
     /// Patch morph crossfader state
     #[serde(default)]
     pub morph: MorphSnapshot,
+    /// Output is currently cut to black
+    #[serde(default)]
+    pub blackout: bool,
     /// Export progress: 0.0 = idle, 0.0..1.0 = rendering, 1.0 = done
     #[serde(default)]
     pub export_progress: f32,
@@ -88,6 +91,7 @@ impl Default for AppSnapshot {
             remote_url: String::new(),
             output_window: false,
             morph: MorphSnapshot::default(),
+            blackout: false,
             export_progress: 0.0,
             export_error: String::new(),
         }
@@ -220,6 +224,9 @@ impl NtscSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModSnapshot {
     pub bpm: f32,
+    /// Beat position (quarter notes); the panel's beat light pulses on it.
+    #[serde(default)]
+    pub beat: f64,
     pub lfos: Vec<LfoSnapshot>,
     pub routings: Vec<RoutingSnapshot>,
     /// Phone orientation [yaw, pitch, roll], 0..1 (0.5 = level).
@@ -276,6 +283,7 @@ impl ModSnapshot {
     pub fn from_matrix(m: &crate::modulation::ModMatrix) -> Self {
         Self {
             bpm: m.clock.bpm,
+            beat: m.current_beat,
             lfos: m
                 .lfos
                 .iter()
@@ -466,6 +474,9 @@ pub enum WebAction {
     /// Rescan the library folder (pushed internally after an upload)
     #[serde(rename = "rescan_library")]
     RescanLibrary,
+    /// Cut the output to black (toggle)
+    #[serde(rename = "toggle_blackout")]
+    ToggleBlackout,
     /// Set a temporal effect parameter
     #[serde(rename = "set_temporal")]
     SetTemporal { param: String, value: serde_json::Value },
