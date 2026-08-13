@@ -51,6 +51,7 @@ section carries a per-session access token — scan it with a phone on the
 same network, accept the certificate warning once, and the panel opens
 mobile-first with touch-sized controls, the XY pad, and gyroscope streaming
 (HTTPS is what unlocks iOS motion sensors). Unknown LAN clients get 403.
+Full walkthrough and troubleshooting: [docs/remote-control.md](docs/remote-control.md).
 
 ## Output
 
