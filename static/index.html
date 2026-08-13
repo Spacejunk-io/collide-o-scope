@@ -158,76 +158,6 @@
             </div>
           </div>
 
-          <div class="fx-group" data-group="mod" id="mod-group">
-            <div class="fx-group-header">
-              <span class="chevron">&#x25BC;</span>
-              <span class="group-label">MOD MATRIX</span>
-              <button class="group-reset" data-group="mod">reset</button>
-            </div>
-            <div class="fx-group-body">
-              <div class="param-row bpm-row">
-                <label>BPM</label>
-                <input type="number" id="bpm-input" min="30" max="300" step="0.1" value="120">
-                <button id="tap-tempo" class="btn-tap">TAP</button>
-              </div>
-              <div id="lfo-list">
-                <!-- LFO rows rendered by JS -->
-              </div>
-              <div id="routing-list">
-                <!-- Routing rows rendered by JS -->
-              </div>
-              <button id="add-routing" class="btn-add-routing">+ routing</button>
-            </div>
-          </div>
-
-          <div class="fx-group" id="audio-group">
-            <div class="fx-group-header">
-              <span class="chevron">&#x25BC;</span>
-              <span class="group-label">AUDIO</span>
-            </div>
-            <div class="fx-group-body">
-              <div class="param-row toggle-row">
-                <label>Enable</label>
-                <label class="toggle"><input type="checkbox" id="audio-enabled"><span class="toggle-slider"></span></label>
-              </div>
-              <div class="param-row">
-                <label>Gain</label>
-                <input type="range" id="audio-gain" min="0" max="4" step="0.05" value="1">
-                <span class="value" id="audio-gain-val">1.00</span>
-              </div>
-              <div class="audio-meter-row"><label>Level</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-level"></div></div></div>
-              <div class="audio-meter-row"><label>Bass</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bass"></div></div></div>
-              <div class="audio-meter-row"><label>Mid</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-mid"></div></div></div>
-              <div class="audio-meter-row"><label>High</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-high"></div></div></div>
-              <div class="audio-meter-row"><label>Onset</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-onset"></div></div></div>
-              <div class="audio-meter-row"><label>Bright</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bright"></div></div></div>
-              <div class="audio-meter-row"><label>Noise</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-noise"></div></div></div>
-              <div class="audio-status" id="audio-status"></div>
-            </div>
-          </div>
-
-          <div class="fx-group" id="midi-group">
-            <div class="fx-group-header">
-              <span class="chevron">&#x25BC;</span>
-              <span class="group-label">MIDI</span>
-            </div>
-            <div class="fx-group-body">
-              <div class="param-row toggle-row">
-                <label>Enable</label>
-                <label class="toggle"><input type="checkbox" id="midi-enabled"><span class="toggle-slider"></span></label>
-              </div>
-              <div class="param-row toggle-row">
-                <label>Clk Sync</label>
-                <label class="toggle"><input type="checkbox" id="midi-clock-sync"><span class="toggle-slider"></span></label>
-                <span class="clock-indicator" id="midi-clock-indicator"></span>
-              </div>
-              <div id="midi-slots">
-                <!-- 4 slot rows rendered by JS -->
-              </div>
-              <div class="audio-status" id="midi-status"></div>
-            </div>
-          </div>
-
           <div class="fx-group" data-group="vhs" id="vhs-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -304,6 +234,76 @@
             </div>
           </div>
 
+          <div class="fx-group" data-group="mod" id="mod-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">MOD MATRIX</span>
+              <button class="group-reset" data-group="mod">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row bpm-row">
+                <label>BPM</label>
+                <input type="number" id="bpm-input" min="30" max="300" step="0.1" value="120">
+                <button id="tap-tempo" class="btn-tap">TAP</button>
+              </div>
+              <div id="lfo-list">
+                <!-- LFO rows rendered by JS -->
+              </div>
+              <div id="routing-list">
+                <!-- Routing rows rendered by JS -->
+              </div>
+              <button id="add-routing" class="btn-add-routing">+ routing</button>
+            </div>
+          </div>
+
+          <div class="fx-group" id="audio-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">AUDIO</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label>Enable</label>
+                <label class="toggle"><input type="checkbox" id="audio-enabled"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row">
+                <label>Gain</label>
+                <input type="range" id="audio-gain" min="0" max="4" step="0.05" value="1">
+                <span class="value" id="audio-gain-val">1.00</span>
+              </div>
+              <div class="audio-meter-row"><label>Level</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-level"></div></div></div>
+              <div class="audio-meter-row"><label>Bass</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bass"></div></div></div>
+              <div class="audio-meter-row"><label>Mid</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-mid"></div></div></div>
+              <div class="audio-meter-row"><label>High</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-high"></div></div></div>
+              <div class="audio-meter-row"><label>Onset</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-onset"></div></div></div>
+              <div class="audio-meter-row"><label>Bright</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-bright"></div></div></div>
+              <div class="audio-meter-row"><label>Noise</label><div class="lfo-meter"><div class="lfo-meter-fill" id="am-noise"></div></div></div>
+              <div class="audio-status" id="audio-status"></div>
+            </div>
+          </div>
+
+          <div class="fx-group" id="midi-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">MIDI</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label>Enable</label>
+                <label class="toggle"><input type="checkbox" id="midi-enabled"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row">
+                <label>Clk Sync</label>
+                <label class="toggle"><input type="checkbox" id="midi-clock-sync"><span class="toggle-slider"></span></label>
+                <span class="clock-indicator" id="midi-clock-indicator"></span>
+              </div>
+              <div id="midi-slots">
+                <!-- 4 slot rows rendered by JS -->
+              </div>
+              <div class="audio-status" id="midi-status"></div>
+            </div>
+          </div>
+
           <div class="fx-group" id="pad-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -349,20 +349,6 @@
             </div>
           </div>
 
-          <div class="fx-group collapsed" id="remote-group">
-            <div class="fx-group-header">
-              <span class="chevron">&#x25BC;</span>
-              <span class="group-label">REMOTE</span>
-            </div>
-            <div class="fx-group-body">
-              <div class="remote-body">
-                <img id="qr-img" src="/qr.svg" alt="Scan to control from your phone">
-                <div class="remote-hint">Scan with a phone on the same network.<br>Accept the certificate warning once — it unlocks tilt sensors.</div>
-                <div class="remote-url" id="remote-url"></div>
-              </div>
-            </div>
-          </div>
-
           <!-- RENDER EXPORT -->
           <div class="fx-group" id="export-group">
             <div class="group-header">
@@ -399,6 +385,20 @@
                 <span class="progress-text" id="export-text">0%</span>
               </div>
               <div class="export-status" id="export-status"></div>
+            </div>
+          </div>
+
+          <div class="fx-group collapsed" id="remote-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">REMOTE</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="remote-body">
+                <img id="qr-img" src="/qr.svg" alt="Scan to control from your phone">
+                <div class="remote-hint">Scan with a phone on the same network.<br>Accept the certificate warning once — it unlocks tilt sensors.</div>
+                <div class="remote-url" id="remote-url"></div>
+              </div>
             </div>
           </div>
           </div>
