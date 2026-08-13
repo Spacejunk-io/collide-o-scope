@@ -4,3 +4,6 @@ experiments/*/target
 
 # Local planning notes, not part of the upload
 CS feedback.md
+
+# Local clip library (created on first launch; performance media stays local)
+/videos/

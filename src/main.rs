@@ -1934,8 +1934,14 @@ fn main() {
             }
         }
         None => {
-            // Default: use ./videos/ if it exists
+            // Default library: ./videos/ — created if absent, so uploads
+            // and drag-drop always have a home even on a bare launch.
             let default_lib = PathBuf::from("videos");
+            if !default_lib.is_dir() {
+                if let Err(e) = std::fs::create_dir_all(&default_lib) {
+                    log::warn!("Could not create default library folder: {e}");
+                }
+            }
             if default_lib.is_dir() {
                 (None, Some(default_lib))
             } else {
