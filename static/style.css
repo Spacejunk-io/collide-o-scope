@@ -1021,3 +1021,26 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .beat-light.downbeat {
   box-shadow: 0 0 8px var(--accent);
 }
+
+/* === LIBRARY DELETE === */
+
+.lib-delete-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  border: none;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.65);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 2;
+}
+
+.library-item:hover .lib-delete-btn { opacity: 1; }
+.lib-delete-btn:hover { color: #e65a5a; }

@@ -71,6 +71,7 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
                     "/upload",
                     post(upload_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)),
                 )
+                .route("/delete", post(delete_handler))
                 .fallback(get(static_files::serve))
                 .layer(middleware::from_fn_with_state(state.clone(), auth))
                 .with_state(state);
@@ -102,9 +103,16 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
 
             // HTTP listener (desktop convenience, unchanged behavior).
             let addr = format!("0.0.0.0:{port}");
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .expect("Failed to bind web server");
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!(
+                        "Cannot bind port {port} ({e}) — is another collide-o-scope \
+                         already running? This instance continues without a control panel."
+                    );
+                    return;
+                }
+            };
             log::info!("Web control panel listening on {addr}");
             axum::serve(
                 listener,
@@ -368,6 +376,60 @@ async fn upload_handler(
     state.actions.lock().await.push(WebAction::RescanLibrary);
 
     (StatusCode::OK, final_name).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteQuery {
+    name: String,
+}
+
+/// Remove a clip from the library — to the OS Recycle Bin, never a hard
+/// delete, so a mid-set mistake is recoverable. A clip currently loaded
+/// in a layer has its file held open by the decoder; that delete fails
+/// with a clear message instead of corrupting playback.
+async fn delete_handler(
+    State(state): State<Arc<WebState>>,
+    Query(query): Query<DeleteQuery>,
+) -> Response {
+    let name = std::path::Path::new(&query.name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = std::path::Path::new(&name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if name.is_empty() || !matches!(ext.as_str(), "mp4" | "webm" | "mov" | "avi" | "mkv") {
+        return (StatusCode::BAD_REQUEST, "not a library clip").into_response();
+    }
+
+    let Some(folder) = state.library_folder.read().ok().and_then(|f| f.clone()) else {
+        return (StatusCode::CONFLICT, "no library folder open").into_response();
+    };
+    let path = folder.join(&name);
+    if !path.is_file() {
+        return (StatusCode::NOT_FOUND, "clip not found").into_response();
+    }
+
+    match tokio::task::spawn_blocking(move || trash::delete(&path)).await {
+        Ok(Ok(())) => {
+            if let Ok(mut cache) = state.thumbnails.write() {
+                cache.remove(&name);
+            }
+            if let Ok(mut cache) = state.preview_frames.write() {
+                cache.remove(&name);
+            }
+            log::info!("Clip moved to Recycle Bin: {name}");
+            state.actions.lock().await.push(WebAction::RescanLibrary);
+            (StatusCode::OK, name).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::CONFLICT,
+            format!("cannot remove (in use by a layer?): {e}"),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+    }
 }
 
 async fn thumb_handler(

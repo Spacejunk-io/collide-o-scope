@@ -1,9 +1,15 @@
-// Temporal effects: feedback trails and slit-scan, fed by a ring buffer
-// of past output frames stored as a texture array.
+// Temporal effects: feedback trails and slit-scan.
 //
-// Layer semantics: `write_index` is the layer holding the MOST RECENT
-// completed frame (last frame's final output). Deeper history is at
-// write_index - n (wrapping).
+// Two distinct memories serve two distinct needs:
+// - history_tex (ring of CLEAN pre-temporal composites): slit-scan reads
+//   real past frames here. Recording post-effect output instead would make
+//   the effect consume itself — cold black gets recorded, sampled, and
+//   re-recorded forever.
+// - feedback_tex (last frame's POST-temporal output): trails must compound
+//   on themselves, so feedback reads the finished previous frame.
+//
+// `write_index` is the ring layer holding the CURRENT clean frame; depth n
+// of history is at write_index - n (wrapping).
 
 struct TemporalUniforms {
     feedback: f32,     // 0 = off, up to 0.95
@@ -19,6 +25,7 @@ struct TemporalUniforms {
 @group(0) @binding(0) var current_tex: texture_2d<f32>;
 @group(0) @binding(1) var history_tex: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
+@group(0) @binding(3) var feedback_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> u: TemporalUniforms;
 
 fn wrap_layer(idx: f32) -> i32 {
@@ -34,9 +41,9 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     if u.slitscan > 0.001 {
         let coord = select(uv.y, uv.x, u.slit_axis > 0.5);
         let depth = coord * u.slitscan * (u.history_len - 1.0);
+        let layer = wrap_layer(u.write_index - floor(depth));
+        let hist = textureSample(history_tex, samp, uv, layer);
         if depth >= 1.0 {
-            let layer = wrap_layer(u.write_index - floor(depth) + 1.0);
-            let hist = textureSample(history_tex, samp, uv, layer);
             // Rows at depth < 1 stay live; deeper rows come from history.
             color = hist;
         }
@@ -51,7 +58,7 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         var p = uv - 0.5;
         p = vec2f(p.x * c - p.y * s, p.x * s + p.y * c) / max(u.fb_zoom, 0.01);
         p += 0.5;
-        let prev = textureSample(history_tex, samp, p, wrap_layer(u.write_index));
+        let prev = textureSample(feedback_tex, samp, p);
         let inside = select(0.0, 1.0,
             p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0);
         color = vec4f(max(color.rgb, prev.rgb * u.feedback * inside), color.a);

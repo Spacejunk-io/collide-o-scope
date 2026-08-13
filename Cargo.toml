@@ -31,6 +31,7 @@ rustfft = "6"
 midir = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 getrandom = "0.3"
+trash = "5"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = "0.13"
 

@@ -72,6 +72,17 @@ pub(crate) fn build_temporal_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // Last frame's post-temporal output — feedback compounds on this.
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -163,6 +174,31 @@ pub(crate) fn build_history_texture(
     (texture, view)
 }
 
+/// Single texture holding last frame's post-temporal output, for
+/// compounding feedback trails.
+pub(crate) fn build_feedback_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Feedback Frame"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
 /// Encode the temporal pass + history recording. `history_write` is the
 /// layer holding the most recent completed frame; returns the new value.
 /// Shared by the live renderer and the offline exporter.
@@ -179,10 +215,40 @@ pub(crate) fn encode_temporal(
     composite_views: &[wgpu::TextureView; 3],
     history_texture: &wgpu::Texture,
     history_view: &wgpu::TextureView,
+    feedback_texture: &wgpu::Texture,
+    feedback_view: &wgpu::TextureView,
     history_write: usize,
     width: u32,
     height: u32,
 ) -> usize {
+    // Record the CLEAN composite into the ring first — slit-scan must read
+    // real past frames, never its own output (which would self-cannibalize
+    // into black). new_write becomes the ring's "now".
+    let new_write = (history_write + 1) % HISTORY_LEN as usize;
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &composite_textures[0],
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: history_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: new_write as u32,
+            },
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
     if params.is_active() {
         let uniforms = TemporalUniforms {
             feedback: params.feedback.clamp(0.0, 0.98),
@@ -190,7 +256,7 @@ pub(crate) fn encode_temporal(
             fb_rotate: params.fb_rotate,
             slitscan: params.slitscan.clamp(0.0, 1.0),
             history_len: HISTORY_LEN as f32,
-            write_index: history_write as f32,
+            write_index: new_write as f32,
             slit_axis: params.slit_axis,
             _pad: 0.0,
         };
@@ -215,6 +281,10 @@ pub(crate) fn encode_temporal(
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(feedback_view),
                 },
             ],
         });
@@ -269,8 +339,7 @@ pub(crate) fn encode_temporal(
         );
     }
 
-    // Record the finished frame into the next ring slot.
-    let new_write = (history_write + 1) % HISTORY_LEN as usize;
+    // Record the finished (post-temporal) frame for next frame's trails.
     encoder.copy_texture_to_texture(
         wgpu::TexelCopyTextureInfo {
             texture: &composite_textures[0],
@@ -279,13 +348,9 @@ pub(crate) fn encode_temporal(
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyTextureInfo {
-            texture: history_texture,
+            texture: feedback_texture,
             mip_level: 0,
-            origin: wgpu::Origin3d {
-                x: 0,
-                y: 0,
-                z: new_write as u32,
-            },
+            origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::Extent3d {
@@ -347,7 +412,9 @@ pub struct Renderer {
     temporal_uniform_layout: wgpu::BindGroupLayout,
     history_texture: wgpu::Texture,
     history_view: wgpu::TextureView,
-    /// Layer holding the most recent completed frame.
+    feedback_texture: wgpu::Texture,
+    feedback_view: wgpu::TextureView,
+    /// Ring layer holding the current clean frame.
     history_write: usize,
 
     // Instance + adapter kept for creating additional surfaces (output
@@ -607,6 +674,8 @@ impl Renderer {
             build_temporal_pipeline(&device);
         let (history_texture, history_view) =
             build_history_texture(&device, output_width, output_height);
+        let (feedback_texture, feedback_view) =
+            build_feedback_texture(&device, output_width, output_height);
 
         // --- Three composite textures ---
         let tex_usage =
@@ -659,6 +728,8 @@ impl Renderer {
             temporal_uniform_layout,
             history_texture,
             history_view,
+            feedback_texture,
+            feedback_view,
             history_write: 0,
             instance,
             adapter,
@@ -907,6 +978,8 @@ impl Renderer {
             &self.composite_views,
             &self.history_texture,
             &self.history_view,
+            &self.feedback_texture,
+            &self.feedback_view,
             self.history_write,
             self.output_width,
             self.output_height,
@@ -1019,36 +1092,36 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
 
-            // Step 2: Composite layer onto accumulated result
+            // Step 2: Composite layer onto accumulated result.
+            // The bottom layer composites onto a cleared black base with its
+            // (modulated) opacity — it was previously copied raw, which
+            // silently ignored opacity whenever only one layer was visible.
+            // Its blend mode is forced to Normal: screen against black is
+            // identity and multiply is a black frame — only surprises.
             if i == 0 {
-                // First layer: copy effects result directly to accumulator [0]
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.composite_textures[1],
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.composite_textures[0],
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: self.output_width,
-                        height: self.output_height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            } else {
-                // Subsequent layers: composite base[0] + overlay[1] → temp[2]
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Clear Base"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[0],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+            }
+            {
+                // Composite base[0] + overlay[1] → temp[2]
                 let comp_buffer =
                     self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("Composite Uniforms"),
                         contents: bytemuck::cast_slice(&[CompositeUniforms {
                             opacity: *opacity,
-                            blend_mode: layer.blend_mode.as_u32(),
+                            blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
                             _pad: [0.0; 2],
                         }]),
                         usage: wgpu::BufferUsages::UNIFORM,

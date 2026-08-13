@@ -164,13 +164,21 @@ egui's built-ins — never a build error.
   original code is © Luis Queral, all rights reserved. LICENSE here grants
   MIT over this fork's additions only and says so explicitly. Do not claim
   MIT over the original portions unless Luis licenses upstream.
-- Temporal effects (renderer + shaders/temporal.wgsl): a 24-frame ring of
-  output history (texture array) drives feedback trails (max-blend with
-  per-frame zoom/rotate of the previous output) and slit-scan (each row or
-  column samples a different past frame). History records every frame even
+- Temporal effects (renderer + shaders/temporal.wgsl): TWO memories, not
+  one. The 24-frame ring records CLEAN pre-temporal composites — slit-scan
+  reads real past frames there (recording post-effect output made it eat
+  its own black). A separate feedback texture holds last frame's
+  post-temporal output so trails compound. Both record every frame even
   when off, so the effects are warm instantly. Params are mod targets
   (temporal_*), persist in patches, and render identically in export via
-  shared helpers (renderer::state::{build_temporal_pipeline, encode_temporal}).
+  shared helpers (renderer::state::{build_temporal_pipeline,
+  encode_temporal, build_history_texture, build_feedback_texture}).
+- Effects audit harness: `cargo test effects_audit -- --ignored` renders
+  every effect (17 labeled clips) through the real export path into
+  renders/audit_*.mp4 for objective ffprobe verification (needs GPU,
+  ffmpeg on PATH, and videos/audit.mp4 — any short colorful clip).
+  This audit caught the slit-scan self-cannibalization and proved the
+  bottom-layer opacity fix (0.3 opacity → exact 0.3 in linear light).
 - Output window (keyboard O, panel OUTPUT group, or web action): a second
   winit window blits the final composite fullscreen — on the second
   monitor when one exists, letterboxed, Escape/O closes. Surface

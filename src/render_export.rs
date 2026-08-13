@@ -446,6 +446,8 @@ fn run_export(
         crate::renderer::state::build_temporal_pipeline(&device);
     let (history_texture, history_view) =
         crate::renderer::state::build_history_texture(&device, w, h);
+    let (feedback_texture, feedback_view) =
+        crate::renderer::state::build_feedback_texture(&device, w, h);
     let mut history_write: usize = 0;
 
     // --- Readback staging buffer ---
@@ -617,6 +619,8 @@ fn run_export(
             &composite_views,
             &history_texture,
             &history_view,
+            &feedback_texture,
+            &feedback_view,
             history_write,
             w,
             h,
@@ -811,32 +815,30 @@ fn render_layers_export(
             pass.draw(0..3, 0..1);
         }
 
+        // Bottom layer: cleared base + Normal blend with real opacity
+        // (mirrors Renderer::render_layers).
         if i == 0 {
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &composite_textures[1],
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &composite_textures[0],
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width: output_width,
-                    height: output_height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        } else {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Clear Base"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[0],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+        {
             let comp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Export Composite Uniforms"),
                 contents: bytemuck::cast_slice(&[CompositeUniforms {
                     opacity: *mod_opacity,
-                    blend_mode: layer.blend_mode.as_u32(),
+                    blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
                     _pad: [0.0; 2],
                 }]),
                 usage: wgpu::BufferUsages::UNIFORM,
@@ -998,4 +1000,136 @@ fn render_master_effects_export(
             depth_or_array_layers: 1,
         },
     );
+}
+
+#[cfg(test)]
+mod effects_audit {
+    use super::*;
+    use crate::patch::{EffectsConfig, LayerConfig, NtscConfig, PatchState, TemporalConfig};
+
+    fn base_patch() -> PatchState {
+        PatchState {
+            master: EffectsConfig::default(),
+            layers: vec![LayerConfig {
+                filename: "audit.mp4".to_string(),
+                opacity: 1.0,
+                blend_mode: "normal".to_string(),
+                speed: 1.0,
+                fps: 30.0,
+                paused: false,
+                visible: true,
+                effects: EffectsConfig::default(),
+            }],
+            ntsc: Some(NtscConfig::default()),
+            modulation: None,
+            temporal: Some(TemporalConfig::default()),
+        }
+    }
+
+    fn render(label: &str, patch: PatchState) {
+        let config = ExportConfig {
+            width: 320,
+            height: 180,
+            fps: 24,
+            duration_secs: 1.0,
+            output_path: format!("renders/audit_{label}.mp4"),
+        };
+        let job = ExportJob::start(patch, config, "videos");
+        while !job.is_done() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let err = job.progress.error.lock().unwrap().clone();
+        assert!(err.is_empty(), "{label}: export failed: {err}");
+    }
+
+    /// Renders every effect through the real shader chain into labeled
+    /// files under renders/, for objective pixel-level verification
+    /// (ffprobe signalstats/entropy). Needs a GPU, ffmpeg on PATH, and
+    /// videos/audit.mp4 — run explicitly:
+    ///   cargo test --release effects_audit -- --ignored --nocapture
+    #[test]
+    #[ignore = "renders the full effects audit matrix; run explicitly"]
+    fn render_effects_matrix() {
+        std::fs::create_dir_all("renders").ok();
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first (any short clip)"
+        );
+
+        render("baseline", base_patch());
+
+        let mut p = base_patch();
+        p.master.brightness = 0.4;
+        render("brightness", p);
+
+        let mut p = base_patch();
+        p.master.invert = true;
+        render("invert", p);
+
+        let mut p = base_patch();
+        p.master.posterize = 2.0;
+        render("posterize", p);
+
+        let mut p = base_patch();
+        p.master.pixelate = 32.0;
+        render("pixelate", p);
+
+        let mut p = base_patch();
+        p.master.vignette = 1.4;
+        render("vignette", p);
+
+        let mut p = base_patch();
+        p.master.hue_shift = 120.0;
+        render("hue", p);
+
+        let mut p = base_patch();
+        p.master.contrast = 0.8;
+        render("contrast", p);
+
+        let mut p = base_patch();
+        p.master.saturation = -1.0;
+        render("saturation", p);
+
+        let mut p = base_patch();
+        p.master.grain_intensity = 0.28;
+        p.master.color_grain = true;
+        render("grain", p);
+
+        let mut p = base_patch();
+        p.master.rgb_split = 25.0;
+        render("rgbsplit", p);
+
+        let mut p = base_patch();
+        p.master.color_drift = 0.02;
+        p.master.breathe_scale = 0.05;
+        render("drift_breathe", p);
+
+        let mut p = base_patch();
+        p.layers[0].effects.key_mode = 1;
+        p.layers[0].effects.key_threshold = 0.55;
+        render("key", p);
+
+        let mut p = base_patch();
+        p.temporal.as_mut().unwrap().feedback = 0.92;
+        p.temporal.as_mut().unwrap().fb_zoom = 1.05;
+        render("temporal_fb", p);
+
+        let mut p = base_patch();
+        p.temporal.as_mut().unwrap().slitscan = 0.85;
+        render("slitscan", p);
+
+        let mut p = base_patch();
+        {
+            let n = p.ntsc.as_mut().unwrap();
+            n.enabled = true;
+            n.snow_intensity = 0.9;
+            n.tracking_noise_enabled = true;
+            n.tracking_noise_snow = 0.7;
+        }
+        render("ntsc", p);
+
+        let mut p = base_patch();
+        p.layers[0].opacity = 0.3;
+        render("opacity", p);
+    }
 }

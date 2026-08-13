@@ -47,6 +47,17 @@ rest of the session — but the **token rotates every app launch**, so when
 you restart collide-o-scope, re-scan the fresh QR (an old bookmark will
 answer 403).
 
+## The library, from any device
+
+- **Add clips**: the **+** beside the Library title uploads videos from the
+  device you're holding — a phone's camera roll included. Files stream to
+  the engine's `videos/` folder (created automatically on first launch)
+  and thumbnail in moments. Name collisions get numbered suffixes.
+- **Remove clips**: hover (or tap) a library tile and press its **×** —
+  the file moves to the OS **Recycle Bin**, never hard-deleted, so a
+  mid-set mistake is recoverable. A clip currently loaded in a layer
+  refuses removal until the layer is removed first.
+
 ## Performing from the phone
 
 - **XY PAD** — drag anywhere on the square; the position streams at

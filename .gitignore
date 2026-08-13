@@ -7,3 +7,6 @@ CS feedback.md
 
 # Local clip library (created on first launch; performance media stays local)
 /videos/
+
+# Offline render output
+/renders/

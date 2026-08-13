@@ -81,6 +81,12 @@ pub struct TemporalConfig {
     pub slit_axis: f32,
 }
 
+impl Default for TemporalConfig {
+    fn default() -> Self {
+        Self::from_params(&TemporalParams::default())
+    }
+}
+
 impl TemporalConfig {
     pub fn from_params(p: &TemporalParams) -> Self {
         Self {

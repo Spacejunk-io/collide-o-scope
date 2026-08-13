@@ -54,6 +54,37 @@ function connect() {
 }
 connect();
 
+// --- Interaction guard -------------------------------------------------
+// The 30Hz state broadcast must never overwrite a control the performer's
+// hand is on. Desktop focus (activeElement) isn't enough: on touch,
+// dragging a slider never focuses it. Track pointer-held and recently-
+// edited controls explicitly; sync code asks canSync() before writing.
+
+const touchedControls = new Map(); // element → Infinity (held) | last-edit ms
+document.addEventListener('pointerdown', (e) => {
+  const el = e.target.closest('input,select');
+  if (el) touchedControls.set(el, Infinity);
+}, true);
+const releaseControls = () => {
+  for (const [el, t] of touchedControls) {
+    if (t === Infinity) touchedControls.set(el, performance.now());
+  }
+};
+document.addEventListener('pointerup', releaseControls, true);
+document.addEventListener('pointercancel', releaseControls, true);
+document.addEventListener('input', (e) => {
+  if (touchedControls.get(e.target) !== Infinity) {
+    touchedControls.set(e.target, performance.now());
+  }
+}, true);
+
+function canSync(el) {
+  if (!el) return false;
+  if (document.activeElement === el) return false;
+  const t = touchedControls.get(el);
+  return !(t === Infinity || (t !== undefined && performance.now() - t < 800));
+}
+
 function sendAction(action) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     console.log('[ws] send:', JSON.stringify(action));
@@ -181,7 +212,7 @@ function syncTemporal(t) {
     const slider = row.querySelector('input[type="range"]');
     const valueEl = row.querySelector('.value');
     const select = row.querySelector('select');
-    if (slider && valueEl && document.activeElement !== slider) {
+    if (slider && valueEl && canSync(slider)) {
       slider.value = value;
       valueEl.textContent = formatValue(
         value,
@@ -190,7 +221,7 @@ function syncTemporal(t) {
         parseFloat(row.dataset.step)
       );
     }
-    if (select && document.activeElement !== select) {
+    if (select && canSync(select)) {
       select.value = Math.round(value);
     }
   }
@@ -270,7 +301,7 @@ function syncEffects(effects) {
     const checkbox = row.querySelector('input[type="checkbox"]');
     const select = row.querySelector('select');
 
-    if (slider && valueEl && document.activeElement !== slider) {
+    if (slider && valueEl && canSync(slider)) {
       slider.value = value;
       const min = parseFloat(row.dataset.min);
       const max = parseFloat(row.dataset.max);
@@ -301,7 +332,7 @@ function syncNtsc(ntsc) {
     const checkbox = row.querySelector('input[type="checkbox"]');
     const select = row.querySelector('select');
 
-    if (slider && valueEl && document.activeElement !== slider) {
+    if (slider && valueEl && canSync(slider)) {
       slider.value = value;
       const min = parseFloat(row.dataset.min);
       const max = parseFloat(row.dataset.max);
@@ -313,7 +344,7 @@ function syncNtsc(ntsc) {
       checkbox.checked = !!value;
     }
 
-    if (select && document.activeElement !== select) {
+    if (select && canSync(select)) {
       select.value = value;
     }
   }
@@ -468,7 +499,7 @@ function updateLayerCard(card, layer, index) {
   if (opacityRow) {
     const slider = opacityRow.querySelector('input[type="range"]');
     const valEl = opacityRow.querySelector('.value');
-    if (slider && document.activeElement !== slider) {
+    if (slider && canSync(slider)) {
       slider.value = layer.opacity;
       if (valEl) valEl.textContent = layer.opacity.toFixed(2);
     }
@@ -478,7 +509,7 @@ function updateLayerCard(card, layer, index) {
   if (speedRow) {
     const slider = speedRow.querySelector('input[type="range"]');
     const valEl = speedRow.querySelector('.value');
-    if (slider && document.activeElement !== slider) {
+    if (slider && canSync(slider)) {
       slider.value = layer.speed;
       if (valEl) valEl.textContent = layer.speed.toFixed(2);
     }
@@ -487,7 +518,7 @@ function updateLayerCard(card, layer, index) {
   const blendRow = card.querySelector('.param-row[data-param="blend_mode"]');
   if (blendRow) {
     const select = blendRow.querySelector('select');
-    if (select && document.activeElement !== select) {
+    if (select && canSync(select)) {
       select.value = layer.blend_mode;
     }
   }
@@ -495,7 +526,7 @@ function updateLayerCard(card, layer, index) {
   const keyModeRow = card.querySelector('.param-row[data-param="key_mode"]');
   if (keyModeRow) {
     const select = keyModeRow.querySelector('select');
-    if (select && document.activeElement !== select) {
+    if (select && canSync(select)) {
       select.value = layer.key_mode;
     }
   }
@@ -505,7 +536,7 @@ function updateLayerCard(card, layer, index) {
     if (row) {
       const slider = row.querySelector('input[type="range"]');
       const valEl = row.querySelector('.value');
-      if (slider && document.activeElement !== slider) {
+      if (slider && canSync(slider)) {
         slider.value = layer[param];
         if (valEl) valEl.textContent = layer[param].toFixed(2);
       }
@@ -585,6 +616,24 @@ function syncLibrary(files) {
     label.className = 'lib-label';
     label.textContent = filename.replace(/\.[^.]+$/, '');
     item.appendChild(label);
+
+    // Remove from library (to the Recycle Bin — recoverable)
+    const del = document.createElement('button');
+    del.className = 'lib-delete-btn';
+    del.textContent = '×';
+    del.title = 'Remove from library (moves to Recycle Bin)';
+    del.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        const r = await fetch(`/delete?name=${encodeURIComponent(filename)}`, { method: 'POST' });
+        const text = await r.text();
+        libUploadStatus.textContent = r.ok ? `${text} → Recycle Bin` : `${filename}: ${text}`;
+      } catch {
+        libUploadStatus.textContent = `${filename}: remove failed`;
+      }
+      setTimeout(() => { libUploadStatus.textContent = ''; }, 4000);
+    });
+    item.appendChild(del);
 
     item.addEventListener('dblclick', () => {
       sendAction({ action: 'add_layer', filename });
@@ -850,7 +899,7 @@ function createRoutingRow(routing, index) {
 function syncModulation(m) {
   if (!m) return;
 
-  if (document.activeElement !== bpmInput) {
+  if (canSync(bpmInput)) {
     bpmInput.value = m.bpm.toFixed(1);
   }
 
@@ -868,8 +917,8 @@ function syncModulation(m) {
     if (!row) return;
     const shapeSel = row.querySelector('.lfo-shape');
     const rateSel = row.querySelector('.lfo-rate');
-    if (document.activeElement !== shapeSel) shapeSel.value = lfo.shape;
-    if (document.activeElement !== rateSel) rateSel.value = lfo.beats;
+    if (canSync(shapeSel)) shapeSel.value = lfo.shape;
+    if (canSync(rateSel)) rateSel.value = lfo.beats;
     // Live meter: map [-1, 1] → [0%, 100%]
     const fill = row.querySelector('.lfo-meter-fill');
     fill.style.width = `${((lfo.value + 1) * 50).toFixed(1)}%`;
@@ -896,9 +945,9 @@ function syncModulation(m) {
       const targetSel = row.querySelector('.routing-target');
       const depthSlider = row.querySelector('.routing-depth');
       const depthVal = row.querySelector('.routing-depth-val');
-      if (document.activeElement !== sourceSel) sourceSel.value = r.source;
-      if (document.activeElement !== targetSel) targetSel.value = r.target;
-      if (document.activeElement !== depthSlider) {
+      if (canSync(sourceSel)) sourceSel.value = r.source;
+      if (canSync(targetSel)) targetSel.value = r.target;
+      if (canSync(depthSlider)) {
         depthSlider.value = r.depth;
         depthVal.textContent = r.depth.toFixed(2);
       }
@@ -936,14 +985,14 @@ function syncAudioDevices(devices, selected) {
     audioDevice.innerHTML = '<option value="">Default</option>' +
       (devices || []).map(d => `<option value="${d.replace(/"/g, '&quot;')}">${d}</option>`).join('');
   }
-  if (document.activeElement !== audioDevice) audioDevice.value = selected || '';
+  if (canSync(audioDevice)) audioDevice.value = selected || '';
 }
 
 function syncAudio(a) {
   if (!a) return;
-  if (document.activeElement !== audioEnabled) audioEnabled.checked = a.enabled;
+  if (canSync(audioEnabled)) audioEnabled.checked = a.enabled;
   syncAudioDevices(a.devices, a.selected);
-  if (document.activeElement !== audioGain) {
+  if (canSync(audioGain)) {
     audioGain.value = a.gain;
     audioGainVal.textContent = a.gain.toFixed(2);
   }
@@ -1011,8 +1060,8 @@ for (let i = 0; i < 4; i++) {
 
 function syncMidi(m) {
   if (!m) return;
-  if (document.activeElement !== midiEnabled) midiEnabled.checked = m.enabled;
-  if (document.activeElement !== midiClockSync) midiClockSync.checked = !!m.clock_sync;
+  if (canSync(midiEnabled)) midiEnabled.checked = m.enabled;
+  if (canSync(midiClockSync)) midiClockSync.checked = !!m.clock_sync;
   const clockInd = document.getElementById('midi-clock-indicator');
   if (m.clock_active) {
     clockInd.textContent = '◉ ext clock';
@@ -1028,7 +1077,7 @@ function syncMidi(m) {
     const row = midiSlots.children[i];
     if (!row) return;
     const ccInput = row.querySelector('.midi-cc');
-    if (document.activeElement !== ccInput) ccInput.value = slot.cc;
+    if (canSync(ccInput)) ccInput.value = slot.cc;
     row.querySelector('.lfo-meter-fill').style.width = `${(slot.value * 100).toFixed(1)}%`;
     const learnBtn = row.querySelector('.midi-learn');
     const isLearning = m.learning === i;
@@ -1170,7 +1219,7 @@ spoutEnabled.addEventListener('change', () => {
 
 function syncSpout(s) {
   if (!s) return;
-  if (document.activeElement !== spoutEnabled) spoutEnabled.checked = s.enabled;
+  if (canSync(spoutEnabled)) spoutEnabled.checked = s.enabled;
   const ind = document.getElementById('spout-indicator');
   if (s.active) {
     ind.textContent = '◉ sending';
@@ -1212,7 +1261,7 @@ morphT.addEventListener('input', () => {
 
 function syncMorph(m) {
   if (!m) return;
-  if (document.activeElement !== morphT) morphT.value = m.t;
+  if (canSync(morphT)) morphT.value = m.t;
   document.getElementById('morph-set-a').classList.toggle('set', m.has_a);
   document.getElementById('morph-set-b').classList.toggle('set', m.has_b);
   document.getElementById('morph-label-a').classList.toggle('active', m.active && m.t < 0.5);
@@ -1234,7 +1283,7 @@ outputWindow.addEventListener('change', () => {
 });
 
 function syncOutputWindow(open) {
-  if (document.activeElement !== outputWindow) outputWindow.checked = !!open;
+  if (canSync(outputWindow)) outputWindow.checked = !!open;
   document.getElementById('output-window-hint').textContent =
     open ? 'O or Esc closes' : '';
 }
