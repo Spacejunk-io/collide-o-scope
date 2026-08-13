@@ -18,6 +18,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# --- Run from the project root, wherever the script was invoked from ---
+$projectRoot = Split-Path -Parent $PSScriptRoot
+Set-Location $projectRoot
+Write-Host "Project root  = $projectRoot"
+
 # --- Locate ffmpeg shared dev libs (winget install location) ---
 $ffmpegPkg = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages" -Filter "Gyan.FFmpeg.Shared_*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($null -eq $ffmpegPkg) {
