@@ -246,8 +246,10 @@ returns to zero, and the error remains visible.
 ## Output and render controls
 
 - **Output window** opens a fullscreen audience window, preferring a second
-  monitor when one exists. If window or GPU-surface creation fails, the switch
-  returns to the actual closed state and the panel shows the error.
+  monitor when one exists. On a single-monitor system it instead promotes the
+  existing main preview to a clean fullscreen audience surface. If window or
+  GPU-surface creation fails, the switch returns to the actual closed state and
+  the panel shows the error.
 - **Blackout** cuts the shared final output, including preview/output-window
   and Spout/readback consumers.
 - **Spout output** (Windows) publishes the named `collide-o-scope` sender.

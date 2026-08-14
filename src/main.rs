@@ -25,7 +25,7 @@ use egui_wgpu::ScreenDescriptor;
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 use input::{apply_action, map_key, ControlFlow};
@@ -35,6 +35,89 @@ use web::state::WebState;
 
 const TARGET_FPS: u64 = 30;
 const FRAME_DURATION: Duration = Duration::from_millis(1000 / TARGET_FPS);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputWindowCommand {
+    Set(bool),
+    Toggle,
+}
+
+/// A dedicated swapchain is useful only when it can live on a genuinely
+/// separate display. Creating a second borderless swapchain on the same HDR
+/// monitor is both redundant and fragile on some Windows display drivers.
+const fn use_dedicated_output(main_monitor_is_known: bool, has_distinct_monitor: bool) -> bool {
+    main_monitor_is_known && has_distinct_monitor
+}
+
+const fn resolve_output_window_command(current: bool, command: OutputWindowCommand) -> bool {
+    match command {
+        OutputWindowCommand::Set(enabled) => enabled,
+        OutputWindowCommand::Toggle => !current,
+    }
+}
+
+fn is_discrete_window_key(key: PhysicalKey) -> bool {
+    matches!(
+        key,
+        PhysicalKey::Code(KeyCode::Escape)
+            | PhysicalKey::Code(KeyCode::KeyF)
+            | PhysicalKey::Code(KeyCode::KeyO)
+    )
+}
+
+fn ignore_discrete_window_key_repeat(key: PhysicalKey, repeat: bool) -> bool {
+    repeat && is_discrete_window_key(key)
+}
+
+const fn show_editor_panel(output_on_main: bool, editor_active: bool) -> bool {
+    editor_active && !output_on_main
+}
+
+#[derive(Debug)]
+struct OutputRenderFailure {
+    message: String,
+    device_lost: bool,
+}
+
+/// Encode the dedicated output and classify failures before callers submit
+/// the frame encoder. A surface-only failure closes that output and leaves the
+/// main preview alive; device loss is terminal because every GPU handle owned
+/// by the application has become invalid.
+fn render_output_checked(
+    renderer: &mut Renderer,
+    encoder: &mut wgpu::CommandEncoder,
+) -> Result<Option<wgpu::SurfaceTexture>, OutputRenderFailure> {
+    let output = renderer.render_output(encoder).map_err(|message| {
+        let device_lost = renderer.device_error().is_some();
+        renderer.close_output();
+        OutputRenderFailure {
+            message,
+            device_lost,
+        }
+    })?;
+    // Never turn a successful call into a health error here: if `output` owns
+    // a texture, it must escape this helper and be presented. Every caller
+    // checks the health latch after consuming all acquired textures.
+    Ok(output)
+}
+
+/// Stop at the first GPU submission/poll boundary that reports device loss.
+/// In particular, do not let the same frame continue into wgpu helpers that
+/// allocate mapped-at-creation buffers, because an invalid fallback handle
+/// would turn the original device loss into a misleading mapping panic.
+fn exit_on_renderer_device_loss(
+    renderer: &Renderer,
+    output_error: &mut String,
+    event_loop: &ActiveEventLoop,
+) -> bool {
+    let Some(error) = renderer.device_error() else {
+        return false;
+    };
+    *output_error = format!("GPU device lost: {error}. Restart collide-o-scope.");
+    log::error!("{output_error}");
+    event_loop.exit();
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveNtscPath {
@@ -386,6 +469,10 @@ struct App {
     // Spout texture-sharing output
     spout: spout_out::SpoutOut,
     spout_enabled: bool,
+    /// True when audience Output reuses the main window's existing surface on
+    /// a single-monitor system instead of creating a second same-display
+    /// swapchain.
+    output_on_main: bool,
     output_error: String,
     // Web control panel
     web_state: Arc<WebState>,
@@ -466,6 +553,7 @@ impl App {
             temporal_params: effects::params::TemporalParams::default(),
             spout: spout_out::SpoutOut::new(),
             spout_enabled: false,
+            output_on_main: false,
             output_error: String::new(),
             web_state,
             patch_collector: procedural::PatchCollector::new(),
@@ -605,30 +693,20 @@ impl App {
         )
     }
 
-    /// Open or close the dedicated fullscreen output window. When a second
-    /// monitor exists, the output goes fullscreen there and the main window
-    /// stays with the performer; on a single monitor it takes that one
-    /// (Escape or O closes it; the web panel keeps working regardless).
-    fn toggle_output_window(&mut self, event_loop: &ActiveEventLoop) {
+    /// Open the separate-monitor audience window. The caller has already
+    /// proved `target_monitor` differs from the main window's monitor.
+    fn open_dedicated_output_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        target_monitor: winit::monitor::MonitorHandle,
+    ) {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        if renderer.has_output() {
-            renderer.close_output();
-            self.output_error.clear();
-            log::info!("Output window closed");
-            return;
-        }
-
-        let main_monitor = self.window.as_ref().and_then(|w| w.current_monitor());
-        let target_monitor = event_loop
-            .available_monitors()
-            .find(|m| Some(m) != main_monitor.as_ref())
-            .or(main_monitor);
 
         let attrs = WindowAttributes::default()
             .with_title("collide-o-scope — output")
-            .with_fullscreen(Some(Fullscreen::Borderless(target_monitor)));
+            .with_fullscreen(Some(Fullscreen::Borderless(Some(target_monitor))));
 
         match event_loop.create_window(attrs) {
             Ok(window) => {
@@ -652,6 +730,107 @@ impl App {
                 log::error!("Output window: {e}");
             }
         }
+    }
+
+    fn output_window_open(&self) -> bool {
+        self.output_on_main || self.renderer.as_ref().is_some_and(Renderer::has_output)
+    }
+
+    /// Close either form of audience Output. On one monitor this restores the
+    /// ordinary main window; on two or more it drops only the dedicated
+    /// projector window and its surface.
+    fn close_output_window(&mut self) {
+        if self.output_on_main {
+            if let Some(window) = self.window.as_ref() {
+                window.set_fullscreen(None);
+                window.set_cursor_visible(true);
+            }
+            self.output_on_main = false;
+        }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.close_output();
+        }
+        self.output_error.clear();
+        log::info!("Output window closed");
+    }
+
+    fn toggle_preview_fullscreen(&mut self) {
+        // In single-monitor Output mode the preview and audience are the same
+        // window, so F is also an authoritative Output close.
+        if self.output_on_main {
+            self.close_output_window();
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            let fullscreen = if window.fullscreen().is_some() {
+                None
+            } else {
+                Some(Fullscreen::Borderless(None))
+            };
+            window.set_fullscreen(fullscreen);
+        }
+    }
+
+    /// Set audience Output explicitly. A real second monitor receives a
+    /// dedicated fullscreen surface so the performer keeps the editor. With
+    /// only one monitor, reuse the main window's already-proven surface and
+    /// make that window borderless instead of creating a second HDR swapchain
+    /// on the same display.
+    fn set_output_window(&mut self, event_loop: &ActiveEventLoop, enabled: bool) {
+        if self.output_window_open() == enabled {
+            return;
+        }
+        if !enabled {
+            self.close_output_window();
+            return;
+        }
+
+        let main_monitor = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor());
+        // A transiently unknown main monitor is not proof that another one is
+        // distinct. Fail closed to the existing surface in that case.
+        let distinct_monitor = main_monitor.as_ref().and_then(|main| {
+            event_loop
+                .available_monitors()
+                .find(|monitor| monitor != main)
+        });
+
+        if !use_dedicated_output(main_monitor.is_some(), distinct_monitor.is_some()) {
+            let Some(window) = self.window.as_ref() else {
+                self.output_error = "main output window is not ready".to_string();
+                return;
+            };
+            window.set_fullscreen(Some(Fullscreen::Borderless(main_monitor)));
+            window.set_cursor_visible(false);
+            self.output_on_main = true;
+            self.output_error.clear();
+            log::info!("Output opened on the main window (single-monitor mode)");
+            return;
+        }
+
+        self.open_dedicated_output_window(event_loop, distinct_monitor.unwrap());
+    }
+
+    fn apply_output_window_command(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        command: OutputWindowCommand,
+    ) {
+        let enabled = resolve_output_window_command(self.output_window_open(), command);
+        self.set_output_window(event_loop, enabled);
+        self.exit_if_device_lost(event_loop);
+    }
+
+    /// Device loss invalidates every resource owned by this Renderer. Stop at
+    /// the event-loop boundary before another mapped-at-creation helper can
+    /// touch an invalid handle and panic with an unrelated buffer label.
+    fn exit_if_device_lost(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return false;
+        };
+        exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop)
     }
 
     fn set_library_folder(&mut self, folder: PathBuf) {
@@ -904,11 +1083,14 @@ impl App {
     /// Output-window creation needs the event loop and therefore cannot be
     /// delegated to the plain state-action handler. Treat it as immediate even
     /// if an old or hand-authored client wrapped it in one or more latches.
-    fn is_output_window_action(action: &web::state::WebAction) -> bool {
+    fn output_window_command(action: &web::state::WebAction) -> Option<OutputWindowCommand> {
         match action {
-            web::state::WebAction::ToggleOutputWindow => true,
-            web::state::WebAction::Quantized { inner } => Self::is_output_window_action(inner),
-            _ => false,
+            web::state::WebAction::SetOutputWindow { enabled } => {
+                Some(OutputWindowCommand::Set(*enabled))
+            }
+            web::state::WebAction::ToggleOutputWindow => Some(OutputWindowCommand::Toggle),
+            web::state::WebAction::Quantized { inner } => Self::output_window_command(inner),
+            _ => None,
         }
     }
 
@@ -1612,7 +1794,7 @@ impl App {
                     }
                 }
             },
-            WebAction::ToggleOutputWindow => {
+            WebAction::SetOutputWindow { .. } | WebAction::ToggleOutputWindow => {
                 // Handled in the action drain loop, which has the event
                 // loop needed for window creation. Never reaches here.
             }
@@ -2272,11 +2454,7 @@ impl App {
                 .read()
                 .map(|s| s.clone())
                 .unwrap_or_default(),
-            output_window: self
-                .renderer
-                .as_ref()
-                .map(|r| r.has_output())
-                .unwrap_or(false),
+            output_window: self.output_window_open(),
             output_error: self.output_error.clone(),
             blackout: self.blackout,
             morph: MorphSnapshot {
@@ -2620,30 +2798,80 @@ impl ApplicationHandler for App {
         // Events for the dedicated output window: it only needs to close,
         // resize, and yield to Escape/O — everything else stays with the
         // main window and never reaches egui.
-        if let Some(renderer) = self.renderer.as_mut() {
-            if renderer.output_window_id() == Some(window_id) {
-                match event {
-                    WindowEvent::CloseRequested => renderer.close_output(),
-                    WindowEvent::Resized(size) => renderer.resize_output(size.width, size.height),
-                    WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                physical_key,
-                                state: winit::event::ElementState::Pressed,
-                                ..
-                            },
-                        ..
-                    } => {
-                        use winit::keyboard::{KeyCode, PhysicalKey};
-                        if matches!(
-                            physical_key,
-                            PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyO)
-                        ) {
-                            renderer.close_output();
-                        }
+        let output_window_id = self.renderer.as_ref().and_then(Renderer::output_window_id);
+        if output_window_id == Some(window_id) {
+            match event {
+                WindowEvent::CloseRequested => self.close_output_window(),
+                WindowEvent::Resized(size) => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        renderer.resize_output(size.width, size.height);
                     }
-                    _ => {}
                 }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    let size = self
+                        .renderer
+                        .as_ref()
+                        .and_then(Renderer::output_window_size);
+                    if let (Some(renderer), Some(size)) = (self.renderer.as_mut(), size) {
+                        renderer.resize_output(size.width, size.height);
+                    }
+                }
+                WindowEvent::KeyboardInput {
+                    event:
+                        KeyEvent {
+                            physical_key,
+                            state: winit::event::ElementState::Pressed,
+                            repeat: false,
+                            ..
+                        },
+                    ..
+                } => {
+                    if matches!(
+                        physical_key,
+                        PhysicalKey::Code(KeyCode::Escape) | PhysicalKey::Code(KeyCode::KeyO)
+                    ) {
+                        self.close_output_window();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Winit can deliver a final queued event after a dedicated output
+        // window has been dropped. Never reinterpret that stale WindowId as
+        // an event for the main preview (which could otherwise resize or close
+        // the entire application).
+        if self
+            .window
+            .as_ref()
+            .is_none_or(|window| window.id() != window_id)
+        {
+            return;
+        }
+
+        // Discrete window commands execute once per physical press. In
+        // particular, an Escape repeat delivered to the main window after
+        // closing single-monitor Output must not become an application quit.
+        if let WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key,
+                    state,
+                    repeat,
+                    ..
+                },
+            ..
+        } = &event
+        {
+            if ignore_discrete_window_key_repeat(*physical_key, *repeat) {
+                return;
+            }
+            if self.output_on_main
+                && *state == winit::event::ElementState::Pressed
+                && is_discrete_window_key(*physical_key)
+            {
+                self.close_output_window();
                 return;
             }
         }
@@ -2697,8 +2925,6 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                use winit::keyboard::{KeyCode, PhysicalKey};
-
                 // Ctrl+key shortcuts (editor toggle, save, load)
                 if state == winit::event::ElementState::Pressed && self.modifiers.control_key() {
                     match physical_key {
@@ -2747,19 +2973,11 @@ impl ApplicationHandler for App {
                                 layer.paused = !layer.paused;
                                 layer.reset_transport_timing();
                             }
-                            ControlFlow::ToggleFullscreen => {
-                                if let Some(window) = &self.window {
-                                    let current = window.fullscreen();
-                                    if current.is_some() {
-                                        window.set_fullscreen(None);
-                                    } else {
-                                        window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-                                    }
-                                }
-                            }
-                            ControlFlow::ToggleOutputWindow => {
-                                self.toggle_output_window(event_loop)
-                            }
+                            ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
+                            ControlFlow::ToggleOutputWindow => self.apply_output_window_command(
+                                event_loop,
+                                OutputWindowCommand::Toggle,
+                            ),
                             ControlFlow::ToggleBlackout => self.toggle_blackout(),
                             ControlFlow::Continue => {}
                         }
@@ -2768,17 +2986,9 @@ impl ApplicationHandler for App {
                     let mut dummy = effects::EffectUniforms::default();
                     match apply_action(action, &mut dummy) {
                         ControlFlow::Quit => event_loop.exit(),
-                        ControlFlow::ToggleFullscreen => {
-                            if let Some(window) = &self.window {
-                                let current = window.fullscreen();
-                                if current.is_some() {
-                                    window.set_fullscreen(None);
-                                } else {
-                                    window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-                                }
-                            }
-                        }
-                        ControlFlow::ToggleOutputWindow => self.toggle_output_window(event_loop),
+                        ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
+                        ControlFlow::ToggleOutputWindow => self
+                            .apply_output_window_command(event_loop, OutputWindowCommand::Toggle),
                         ControlFlow::ToggleBlackout => self.toggle_blackout(),
                         ControlFlow::TogglePause => self.set_master_paused(!self.master_paused),
                         _ => {}
@@ -2787,11 +2997,9 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let win_size = self.window.as_ref().unwrap().inner_size();
-                // Windows may report a zero-sized surface while the preview
-                // is minimized. The engine and dedicated output must keep
-                // running; only presentation to this surface is skipped.
-                let preview_surface_available = win_size.width > 0 && win_size.height > 0;
+                if self.exit_if_device_lost(event_loop) {
+                    return;
+                }
 
                 let now = Instant::now();
                 if now - self.last_frame_time >= FRAME_DURATION {
@@ -2805,15 +3013,25 @@ impl ApplicationHandler for App {
                         .try_lock()
                         .map(|mut a| a.drain(..).collect())
                         .unwrap_or_default();
+                    let mut requested_output = None;
                     for action in pending_actions {
-                        // Output-window toggling needs the event loop for
-                        // window creation; everything else is plain state.
-                        // Peel any legacy quantized wrapper so it cannot turn
-                        // this immediate window command into a silent no-op.
-                        if Self::is_output_window_action(&action) {
-                            self.toggle_output_window(event_loop);
+                        // Output-window creation needs the event loop. Fold all
+                        // requests in this packet batch into one final state so
+                        // retries or multiple clients cannot churn swapchains
+                        // several times in a single frame.
+                        if let Some(command) = Self::output_window_command(&action) {
+                            let current =
+                                requested_output.unwrap_or_else(|| self.output_window_open());
+                            requested_output =
+                                Some(resolve_output_window_command(current, command));
                         } else {
                             self.handle_web_action(action);
+                        }
+                    }
+                    if let Some(enabled) = requested_output {
+                        self.set_output_window(event_loop, enabled);
+                        if self.exit_if_device_lost(event_loop) {
+                            return;
                         }
                     }
                     let audio_load_completed = self.poll_audio_clip_loader();
@@ -2834,6 +3052,7 @@ impl ApplicationHandler for App {
                     let raw_input = egui_winit.take_egui_input(window);
 
                     let video_egui_texture_id = self.video_egui_texture_id;
+                    let output_on_main = self.output_on_main;
                     let output_width = self.renderer.as_ref().unwrap().output_width;
                     let output_height = self.renderer.as_ref().unwrap().output_height;
 
@@ -2842,7 +3061,7 @@ impl ApplicationHandler for App {
                     let layers = &mut self.layers;
                     let master_effects = &mut self.master_effects;
                     let full_output = egui_context.run_ui(raw_input, |ctx| {
-                        if yaml_editor.active {
+                        if show_editor_panel(output_on_main, yaml_editor.active) {
                             egui::SidePanel::left("yaml_editor_panel")
                                 .default_width(360.0)
                                 .resizable(true)
@@ -3331,6 +3550,13 @@ impl ApplicationHandler for App {
                                     worker.try_submit(batch);
                                 }
                             }
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
                         }
 
                         // A finished generation becomes the sole input to the
@@ -3442,6 +3668,9 @@ impl ApplicationHandler for App {
                         });
 
                     renderer.queue.submit(std::iter::once(encoder.finish()));
+                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
+                        return;
+                    }
                     if selective_required {
                         renderer.map_selective_ntsc_readback();
                     }
@@ -3450,6 +3679,9 @@ impl ApplicationHandler for App {
                     }
                     if let Some(index) = held_audience_readback {
                         renderer.map_readback(index);
+                    }
+                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
+                        return;
                     }
                     encoder =
                         renderer
@@ -3504,6 +3736,9 @@ impl ApplicationHandler for App {
                     // rejects both pre-blackout content and delayed blackout
                     // frames that finish after the cut is released.
                     let readback_poll = renderer.poll_readback();
+                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
+                        return;
+                    }
                     if readback_poll.held_audience_not_harvested
                         && self.selective_transition_holding
                     {
@@ -3627,8 +3862,22 @@ impl ApplicationHandler for App {
                         let slot =
                             renderer.begin_readback(&mut encoder, self.visual_epoch, ntsc_metadata);
                         renderer.queue.submit(std::iter::once(encoder.finish()));
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            return;
+                        }
                         if let Some(idx) = slot {
                             renderer.map_readback(idx);
+                        }
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            return;
                         }
                         encoder = renderer.device.create_command_encoder(
                             &wgpu::CommandEncoderDescriptor {
@@ -3652,6 +3901,13 @@ impl ApplicationHandler for App {
                     if self.blackout {
                         renderer.clear_composite(&mut encoder);
                         renderer.queue.submit(std::iter::once(encoder.finish()));
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            return;
+                        }
                         self.blackout_presented = true;
                         encoder = renderer.device.create_command_encoder(
                             &wgpu::CommandEncoderDescriptor {
@@ -3659,6 +3915,34 @@ impl ApplicationHandler for App {
                             },
                         );
                     }
+
+                    // Surface configuration is intentionally inside the
+                    // accepted 30 Hz frame and after resize events have been
+                    // coalesced. This prevents fullscreen/WM_SIZE storms from
+                    // repeatedly forcing the DX12 queue idle between frames.
+                    // A minimized preview skips only this presentation target;
+                    // the engine and dedicated output continue to run.
+                    let win_size = window.inner_size();
+                    let preview_surface_available = if win_size.width == 0 || win_size.height == 0 {
+                        renderer.resize(0, 0);
+                        false
+                    } else {
+                        match renderer.prepare_main_surface() {
+                            Ok(ready) => ready,
+                            Err(error) => {
+                                self.output_error = format!("Main output surface: {error}");
+                                log::error!("{}", self.output_error);
+                                if exit_on_renderer_device_loss(
+                                    renderer,
+                                    &mut self.output_error,
+                                    event_loop,
+                                ) {
+                                    return;
+                                }
+                                false
+                            }
+                        }
+                    };
 
                     let egui_renderer = self.egui_renderer.as_mut().unwrap();
                     for (id, image_delta) in &full_output.textures_delta.set {
@@ -3687,10 +3971,31 @@ impl ApplicationHandler for App {
                         for id in &full_output.textures_delta.free {
                             egui_renderer.free_texture(id);
                         }
-                        let output_present = renderer.render_output(&mut encoder);
+                        let output_present = match render_output_checked(renderer, &mut encoder) {
+                            Ok(texture) => texture,
+                            Err(failure) => {
+                                self.output_error = failure.message;
+                                log::error!("Output presentation failed: {}", self.output_error);
+                                if failure.device_lost {
+                                    event_loop.exit();
+                                    return;
+                                }
+                                None
+                            }
+                        };
                         renderer.queue.submit(std::iter::once(encoder.finish()));
+                        // Once acquired, always consume a surface texture with
+                        // present before honoring device loss. Dropping it
+                        // would ask wgpu to discard through the invalid device.
                         if let Some(t) = output_present {
                             t.present();
+                        }
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            return;
                         }
                         if let Some(w) = &self.window {
                             w.request_redraw();
@@ -3699,10 +4004,15 @@ impl ApplicationHandler for App {
                     }
 
                     let surface_texture = match renderer.surface.get_current_texture() {
-                        wgpu::CurrentSurfaceTexture::Success(t)
-                        | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                        wgpu::CurrentSurfaceTexture::Outdated
-                        | wgpu::CurrentSurfaceTexture::Lost => {
+                        wgpu::CurrentSurfaceTexture::Success(t) => t,
+                        wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                            // Present this usable texture, then repair the
+                            // swapchain once at the next render boundary.
+                            renderer.reconfigure_surface();
+                            t
+                        }
+                        status @ (wgpu::CurrentSurfaceTexture::Outdated
+                        | wgpu::CurrentSurfaceTexture::Lost) => {
                             // The engine frame (including temporal history and
                             // dedicated output) is independent of the preview
                             // swapchain. Commit it before repairing the preview
@@ -3710,17 +4020,60 @@ impl ApplicationHandler for App {
                             for id in &full_output.textures_delta.free {
                                 egui_renderer.free_texture(id);
                             }
-                            let output_present = renderer.render_output(&mut encoder);
+                            let output_present = match render_output_checked(renderer, &mut encoder)
+                            {
+                                Ok(texture) => texture,
+                                Err(failure) => {
+                                    self.output_error = failure.message;
+                                    log::error!(
+                                        "Output presentation failed: {}",
+                                        self.output_error
+                                    );
+                                    if failure.device_lost {
+                                        event_loop.exit();
+                                        return;
+                                    }
+                                    None
+                                }
+                            };
                             renderer.queue.submit(std::iter::once(encoder.finish()));
                             if let Some(texture) = output_present {
                                 texture.present();
                             }
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
                             let size = window.inner_size();
                             let r = self.renderer.as_mut().unwrap();
-                            if size.width > 0 && size.height > 0 {
-                                r.resize(size.width, size.height);
-                            } else {
-                                r.reconfigure_surface();
+                            let repaired = match status {
+                                wgpu::CurrentSurfaceTexture::Lost => {
+                                    r.recreate_main_surface(window.clone())
+                                }
+                                wgpu::CurrentSurfaceTexture::Outdated
+                                    if size.width > 0 && size.height > 0 =>
+                                {
+                                    r.resize(size.width, size.height);
+                                    // Outdated can be reported without an
+                                    // extent change, so resize alone is not a
+                                    // sufficient liveness signal.
+                                    r.reconfigure_surface();
+                                    Ok(())
+                                }
+                                _ => {
+                                    r.resize(0, 0);
+                                    Ok(())
+                                }
+                            };
+                            if let Err(error) = repaired {
+                                self.output_error = format!("Main output surface: {error}");
+                                log::error!("{}", self.output_error);
+                                if r.device_error().is_some() {
+                                    event_loop.exit();
+                                }
                             }
                             if let Some(w) = &self.window {
                                 w.request_redraw();
@@ -3731,10 +4084,32 @@ impl ApplicationHandler for App {
                             for id in &full_output.textures_delta.free {
                                 egui_renderer.free_texture(id);
                             }
-                            let output_present = renderer.render_output(&mut encoder);
+                            let output_present = match render_output_checked(renderer, &mut encoder)
+                            {
+                                Ok(texture) => texture,
+                                Err(failure) => {
+                                    self.output_error = failure.message;
+                                    log::error!(
+                                        "Output presentation failed: {}",
+                                        self.output_error
+                                    );
+                                    if failure.device_lost {
+                                        event_loop.exit();
+                                        return;
+                                    }
+                                    None
+                                }
+                            };
                             renderer.queue.submit(std::iter::once(encoder.finish()));
                             if let Some(texture) = output_present {
                                 texture.present();
+                            }
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
                             }
                             if let Some(w) = &self.window {
                                 w.request_redraw();
@@ -3778,12 +4153,36 @@ impl ApplicationHandler for App {
 
                     // Blit the final composite to the fullscreen output
                     // window (if open) in the same submission.
-                    let output_present = renderer.render_output(&mut encoder);
+                    let mut output_device_lost = false;
+                    let output_present = match render_output_checked(renderer, &mut encoder) {
+                        Ok(texture) => texture,
+                        Err(failure) => {
+                            self.output_error = failure.message;
+                            log::error!("Output presentation failed: {}", self.output_error);
+                            if failure.device_lost {
+                                event_loop.exit();
+                                output_device_lost = true;
+                            }
+                            None
+                        }
+                    };
 
+                    if output_device_lost {
+                        // The main texture was acquired before Output reported
+                        // the terminal error. Consume it without submitting
+                        // more work so Drop cannot attempt an invalid discard.
+                        surface_texture.present();
+                        return;
+                    }
                     renderer.queue.submit(std::iter::once(encoder.finish()));
+                    // Both API textures must be marked consumed even when the
+                    // first present or submission latches device loss.
                     surface_texture.present();
                     if let Some(t) = output_present {
                         t.present();
+                    }
+                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
+                        return;
                     }
                 }
 
@@ -4002,6 +4401,64 @@ fn main() {
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
+
+    #[test]
+    fn output_policy_reuses_main_surface_without_a_distinct_monitor() {
+        assert!(!use_dedicated_output(false, false));
+        assert!(
+            !use_dedicated_output(false, true),
+            "an unknown main monitor is not proof of a distinct display"
+        );
+        assert!(!use_dedicated_output(true, false));
+        assert!(use_dedicated_output(true, true));
+    }
+
+    #[test]
+    fn absolute_output_commands_are_idempotent_and_legacy_toggle_is_parity() {
+        assert!(resolve_output_window_command(
+            false,
+            OutputWindowCommand::Set(true)
+        ));
+        assert!(resolve_output_window_command(
+            true,
+            OutputWindowCommand::Set(true)
+        ));
+        assert!(!resolve_output_window_command(
+            true,
+            OutputWindowCommand::Set(false)
+        ));
+        assert!(resolve_output_window_command(
+            false,
+            OutputWindowCommand::Toggle
+        ));
+        assert!(!resolve_output_window_command(
+            true,
+            OutputWindowCommand::Toggle
+        ));
+    }
+
+    #[test]
+    fn held_discrete_window_keys_do_not_repeat_actions() {
+        for key in [
+            PhysicalKey::Code(KeyCode::Escape),
+            PhysicalKey::Code(KeyCode::KeyF),
+            PhysicalKey::Code(KeyCode::KeyO),
+        ] {
+            assert!(ignore_discrete_window_key_repeat(key, true));
+            assert!(!ignore_discrete_window_key_repeat(key, false));
+        }
+        assert!(!ignore_discrete_window_key_repeat(
+            PhysicalKey::Code(KeyCode::KeyP),
+            true
+        ));
+    }
+
+    #[test]
+    fn single_monitor_output_suppresses_editor_panel() {
+        assert!(show_editor_panel(false, true));
+        assert!(!show_editor_panel(true, true));
+        assert!(!show_editor_panel(false, false));
+    }
 
     #[test]
     fn selective_rebuild_holds_paused_audience_until_resume() {

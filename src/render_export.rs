@@ -10,8 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use wgpu::util::DeviceExt;
-
 use crate::effects::EffectUniforms;
 use crate::layers::BlendMode;
 use crate::ntsc::{
@@ -700,6 +698,29 @@ struct CompositeUniforms {
     opacity: f32,
     blend_mode: u32,
     _pad: [f32; 2],
+}
+
+/// Upload one small export uniform without mapping the new buffer.
+///
+/// `DeviceExt::create_buffer_init` maps at creation and immediately accesses
+/// the mapped range. A queue upload preserves the exact bytes while allowing
+/// device-loss validation to remain recoverable instead of panicking in the
+/// mapped-range accessor.
+fn create_uploaded_uniform<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    value: &T,
+) -> wgpu::Buffer {
+    let bytes = bytemuck::bytes_of(value);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.len() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytes);
+    buffer
 }
 
 /// Internal layer state for offline rendering.
@@ -1977,6 +1998,7 @@ fn run_export(
             // NTSC order without any selective slice allocation or composite.
             render_layers_and_master_export(
                 &device,
+                &queue,
                 &mut encoder,
                 &layers,
                 &layer_mods,
@@ -1998,6 +2020,7 @@ fn run_export(
         // Temporal effects + history recording (identical pass to live)
         crate::renderer::state::encode_temporal_with_dt(
             &device,
+            &queue,
             &mut encoder,
             &mod_temporal,
             &temporal_pipeline,
@@ -2389,11 +2412,12 @@ fn render_and_readback_selective_ntsc_slices_export(
         return Err("selective NTSC export plan dimensions changed before rendering".into());
     }
 
-    let master_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Export Selective NTSC Master FX Uniforms"),
-        contents: bytemuck::cast_slice(&[*master_uniforms]),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let master_buffer = create_uploaded_uniform(
+        device,
+        queue,
+        "Export Selective NTSC Master FX Uniforms",
+        master_uniforms,
+    );
     let master_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Export Selective NTSC Master FX Input"),
         layout: effects_bind_group_layout,
@@ -2442,11 +2466,12 @@ fn render_and_readback_selective_ntsc_slices_export(
         }
 
         let frame_fx = layer_mods[source_index].0.for_render_target(width, height);
-        let fx_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Export Selective NTSC Layer FX Uniforms"),
-            contents: bytemuck::cast_slice(&[frame_fx]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let fx_buffer = create_uploaded_uniform(
+            device,
+            queue,
+            "Export Selective NTSC Layer FX Uniforms",
+            &frame_fx,
+        );
         let layer_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Export Selective NTSC Layer FX Input"),
             layout: effects_bind_group_layout,
@@ -2612,6 +2637,7 @@ fn map_export_readback(
 #[allow(clippy::too_many_arguments)]
 fn render_layers_and_master_export(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
     layer_mods: &[(EffectUniforms, f32)],
@@ -2638,6 +2664,7 @@ fn render_layers_and_master_export(
         MasterFxCompositionPath::LegacyPostComposite => {
             render_layers_export(
                 device,
+                queue,
                 encoder,
                 layers,
                 layer_mods,
@@ -2655,6 +2682,7 @@ fn render_layers_and_master_export(
             );
             render_master_effects_export(
                 device,
+                queue,
                 encoder,
                 master_uniforms,
                 composite_textures,
@@ -2670,6 +2698,7 @@ fn render_layers_and_master_export(
         MasterFxCompositionPath::ConditionalPerLayer => {
             render_layers_with_conditional_master_export(
                 device,
+                queue,
                 encoder,
                 layers,
                 layer_mods,
@@ -2693,6 +2722,7 @@ fn render_layers_and_master_export(
 #[allow(clippy::too_many_arguments)]
 fn render_layers_with_conditional_master_export(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
     layer_mods: &[(EffectUniforms, f32)],
@@ -2722,11 +2752,12 @@ fn render_layers_with_conditional_master_export(
         .iter()
         .any(|(layer, _)| layer.bypass_master_fx));
 
-    let master_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Export Conditional Master FX Uniforms"),
-        contents: bytemuck::cast_slice(&[*master_uniforms]),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let master_buffer = create_uploaded_uniform(
+        device,
+        queue,
+        "Export Conditional Master FX Uniforms",
+        master_uniforms,
+    );
     let master_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Export Conditional Master FX Input"),
         layout: effects_bind_group_layout,
@@ -2752,11 +2783,12 @@ fn render_layers_with_conditional_master_export(
 
     for (stack_index, (layer, (mod_fx, mod_opacity))) in visible_layers.iter().enumerate() {
         let frame_fx = mod_fx.for_render_target(output_width, output_height);
-        let layer_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Export Conditional Layer FX Uniforms"),
-            contents: bytemuck::cast_slice(&[frame_fx]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let layer_buffer = create_uploaded_uniform(
+            device,
+            queue,
+            "Export Conditional Layer FX Uniforms",
+            &frame_fx,
+        );
         let layer_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Export Conditional Layer FX Input"),
             layout: effects_bind_group_layout,
@@ -2842,19 +2874,21 @@ fn render_layers_with_conditional_master_export(
         }
 
         let overlay_slot = slots.master_output.unwrap_or(1);
-        let comp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Export Conditional Composite Uniforms"),
-            contents: bytemuck::cast_slice(&[CompositeUniforms {
-                opacity: *mod_opacity,
-                blend_mode: if stack_index == 0 {
-                    0
-                } else {
-                    layer.blend_mode.as_u32()
-                },
-                _pad: [0.0; 2],
-            }]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let comp_uniforms = CompositeUniforms {
+            opacity: *mod_opacity,
+            blend_mode: if stack_index == 0 {
+                0
+            } else {
+                layer.blend_mode.as_u32()
+            },
+            _pad: [0.0; 2],
+        };
+        let comp_buffer = create_uploaded_uniform(
+            device,
+            queue,
+            "Export Conditional Composite Uniforms",
+            &comp_uniforms,
+        );
         let composite_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Export Conditional Composite Textures BG"),
             layout: composite_bind_group_layout,
@@ -2930,6 +2964,7 @@ fn render_layers_with_conditional_master_export(
 #[allow(clippy::too_many_arguments)]
 fn render_layers_export(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
     layer_mods: &[(EffectUniforms, f32)],
@@ -2975,11 +3010,7 @@ fn render_layers_export(
         // output-sized composite, so spatial effects use the export target's
         // resolution and aspect rather than the decoded source's.
         let frame_fx = mod_fx.for_render_target(output_width, output_height);
-        let fx_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Export Layer FX"),
-            contents: bytemuck::cast_slice(&[frame_fx]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let fx_buffer = create_uploaded_uniform(device, queue, "Export Layer FX", &frame_fx);
 
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -3045,15 +3076,13 @@ fn render_layers_export(
             });
         }
         {
-            let comp_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Export Composite Uniforms"),
-                contents: bytemuck::cast_slice(&[CompositeUniforms {
-                    opacity: *mod_opacity,
-                    blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
-                    _pad: [0.0; 2],
-                }]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+            let comp_uniforms = CompositeUniforms {
+                opacity: *mod_opacity,
+                blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
+                _pad: [0.0; 2],
+            };
+            let comp_buffer =
+                create_uploaded_uniform(device, queue, "Export Composite Uniforms", &comp_uniforms);
 
             let composite_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -3132,6 +3161,7 @@ fn render_layers_export(
 #[allow(clippy::too_many_arguments)]
 fn render_master_effects_export(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     master_uniforms: &EffectUniforms,
     composite_textures: &[wgpu::Texture; 3],
@@ -3143,11 +3173,7 @@ fn render_master_effects_export(
     output_width: u32,
     output_height: u32,
 ) {
-    let fx_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Export Master FX"),
-        contents: bytemuck::cast_slice(&[*master_uniforms]),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
+    let fx_buffer = create_uploaded_uniform(device, queue, "Export Master FX", master_uniforms);
 
     let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,

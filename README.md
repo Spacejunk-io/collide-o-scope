@@ -207,8 +207,10 @@ that now occupies the old index. See
   Resolume, MadMapper, or another Spout host. `cargo run --bin spout_probe`
   exercises the output receiver path when a real sender is running.
 - **Fullscreen output:** press `O` or use the OUTPUT control. A second monitor
-  is preferred when available. Window/surface creation failures are returned
-  to the panel instead of leaving its switch in a false-open state.
+  is preferred when available; on a single-monitor system, Output promotes the
+  existing main preview to a clean fullscreen audience surface. Window/surface
+  creation failures are returned to the panel instead of leaving its switch in
+  a false-open state.
 - **Blackout:** press `B` or use the panel button. Preview, output window,
   Spout, and NTSC/readback consumers receive the same black frame.
 

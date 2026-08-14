@@ -49,6 +49,9 @@ let latestLayerIdentities = [];
 let transportAuthoritativePaused = false;
 let transportPendingPaused = null;
 let transportRequestSequence = 0;
+let outputAuthoritativeOpen = false;
+let outputPendingOpen = null;
+let outputRequestSequence = 0;
 
 const QUANTIZABLE_ACTIONS = new Set([
   'set_param', 'set_layer_param', 'set_layer_effect', 'set_ntsc_param', 'set_temporal',
@@ -85,6 +88,9 @@ function connect() {
     transportRequestSequence += 1;
     transportPendingPaused = null;
     renderMasterTransport(transportAuthoritativePaused, false);
+    outputRequestSequence += 1;
+    outputPendingOpen = null;
+    renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
     showGyroDisconnected();
     setTimeout(connect, 2000);
   };
@@ -2890,14 +2896,45 @@ function syncMorph(m) {
 
 const outputWindow = document.getElementById('output-window');
 outputWindow.addEventListener('change', () => {
-  sendAction({ action: 'toggle_output_window' });
+  if (outputPendingOpen !== null) return;
+  const enabled = outputWindow.checked;
+  if (sendAction({ action: 'set_output_window', enabled })) {
+    const requestSequence = ++outputRequestSequence;
+    outputPendingOpen = enabled;
+    renderOutputWindow(enabled, true, '');
+    window.setTimeout(() => {
+      if (outputPendingOpen !== null && outputRequestSequence === requestSequence) {
+        outputPendingOpen = null;
+        renderOutputWindow(outputAuthoritativeOpen, false, 'Output request timed out; try again.');
+      }
+    }, 2000);
+  } else {
+    outputWindow.checked = outputAuthoritativeOpen;
+    renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
+  }
 });
 
-function syncOutputWindow(open, error = '') {
-  if (canSync(outputWindow)) outputWindow.checked = !!open;
-  document.getElementById('output-window-hint').textContent =
-    open ? 'O or Esc closes' : '';
+function renderOutputWindow(open, pending, error = '') {
+  if (canSync(outputWindow) || pending) outputWindow.checked = !!open;
+  outputWindow.disabled = !!pending;
+  outputWindow.setAttribute('aria-busy', String(!!pending));
+  document.getElementById('output-window-hint').textContent = pending
+    ? (open ? 'opening…' : 'closing…')
+    : (open ? 'O or Esc closes' : '');
   document.getElementById('output-status').textContent = error || '';
+}
+
+function syncOutputWindow(open, error = '') {
+  outputAuthoritativeOpen = !!open;
+  if (outputPendingOpen === outputAuthoritativeOpen || error) {
+    outputRequestSequence += 1;
+    outputPendingOpen = null;
+  }
+  renderOutputWindow(
+    outputPendingOpen ?? outputAuthoritativeOpen,
+    outputPendingOpen !== null,
+    error,
+  );
 }
 
 // --- Remote / QR ---

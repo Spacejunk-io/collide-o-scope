@@ -1115,7 +1115,12 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
-    /// Open/close the fullscreen output window (second display)
+    /// Set fullscreen audience output explicitly. Current clients use this
+    /// idempotent command so a delayed/retried packet cannot invert the
+    /// performer's requested state.
+    #[serde(rename = "set_output_window")]
+    SetOutputWindow { enabled: bool },
+    /// Legacy open/close command retained for older control panels.
     #[serde(rename = "toggle_output_window")]
     ToggleOutputWindow,
     /// Capture current parameters into morph slot "a" or "b"
@@ -1233,6 +1238,7 @@ impl WebAction {
             )),
             Self::SetMasterPaused { .. } => Some("master:paused".into()),
             Self::SetBlackout { .. } => Some("master:blackout".into()),
+            Self::SetOutputWindow { .. } => Some("output:enabled".into()),
             Self::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
             Self::SetBpm { .. } => Some("mod:bpm".into()),
             Self::SetLfo { index, param, .. } => Some(format!("lfo:{index}:{param}")),
@@ -1267,6 +1273,8 @@ impl WebAction {
             Self::CancelExport
             | Self::ToggleBlackout
             | Self::SetBlackout { .. }
+            | Self::SetOutputWindow { .. }
+            | Self::ToggleOutputWindow
             | Self::SetMasterPaused { .. }
             | Self::ResetFx
             | Self::SetLayerPaused { .. }
@@ -1668,6 +1676,39 @@ mod protocol_tests {
     }
 
     #[test]
+    fn output_window_absolute_state_is_priority_and_coalesces() {
+        let enabled: WebAction =
+            serde_json::from_str(r#"{"action":"set_output_window","enabled":true}"#).unwrap();
+        assert!(matches!(
+            enabled,
+            WebAction::SetOutputWindow { enabled: true }
+        ));
+        assert_eq!(enabled.coalesce_key().as_deref(), Some("output:enabled"));
+        assert!(enabled.is_priority());
+
+        let mut queue = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
+        assert_eq!(enqueue_bounded(&mut queue, enabled), EnqueueOutcome::Added);
+        assert!(matches!(
+            queue.last(),
+            Some(WebAction::SetOutputWindow { enabled: true })
+        ));
+        assert_eq!(
+            enqueue_bounded(&mut queue, WebAction::SetOutputWindow { enabled: false },),
+            EnqueueOutcome::Coalesced
+        );
+        assert!(matches!(
+            queue.last(),
+            Some(WebAction::SetOutputWindow { enabled: false })
+        ));
+
+        let legacy: WebAction =
+            serde_json::from_str(r#"{"action":"toggle_output_window"}"#).unwrap();
+        assert!(matches!(legacy, WebAction::ToggleOutputWindow));
+        assert!(legacy.is_priority());
+        assert!(legacy.coalesce_key().is_none());
+    }
+
+    #[test]
     fn morph_capture_is_an_ordering_barrier_for_fader_coalescing() {
         let mut queue = Vec::new();
         assert_eq!(
@@ -1975,6 +2016,9 @@ mod protocol_tests {
         assert!(js.contains("window.confirm"));
         assert!(html.contains("id=\"output-status\" role=\"status\" aria-live=\"polite\""));
         assert!(js.contains("syncOutputWindow(msg.output_window, msg.output_error)"));
+        assert!(js.contains("sendAction({ action: 'set_output_window', enabled })"));
+        assert!(js.contains("outputPendingOpen"));
+        assert!(!js.contains("sendAction({ action: 'toggle_output_window' })"));
     }
 
     #[test]

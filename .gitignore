@@ -16,3 +16,6 @@ experiments/*/target
 # Patch captures and generated variants may retain local source paths.
 /patches/
 /generated/
+
+# Fallback LAN certificates and private keys are runtime-only.
+/.tls/

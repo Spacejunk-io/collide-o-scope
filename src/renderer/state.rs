@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use wgpu::util::DeviceExt;
+use std::sync::{Arc, Mutex};
 use winit::window::Window;
 
 use crate::effects::params::{normalized_slit_direction, TemporalParams, TEMPORAL_REFERENCE_FPS};
@@ -30,6 +29,31 @@ const fn transparent_accumulation_clear() -> wgpu::Color {
         b: 0.0,
         a: 0.0,
     }
+}
+
+/// Upload one small uniform without `DeviceExt::create_buffer_init`.
+///
+/// That convenience helper creates a mapped-at-creation buffer and immediately
+/// calls `get_mapped_range_mut`. If the device was lost moments earlier, wgpu
+/// represents the allocation as an invalid labeled resource and the mapping
+/// accessor is deliberately fatal. Queue upload keeps validation recoverable
+/// through the renderer's health latch instead of turning device loss into an
+/// unrelated mapped-range panic.
+fn create_uploaded_uniform<T: bytemuck::Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    value: &T,
+) -> wgpu::Buffer {
+    let bytes = bytemuck::bytes_of(value);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.len() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytes);
+    buffer
 }
 
 /// Uniforms for the temporal (feedback/slit-scan) pass.
@@ -173,6 +197,18 @@ impl TemporalState {
 #[cfg(test)]
 mod temporal_state_tests {
     use super::*;
+
+    #[test]
+    fn gpu_health_latches_the_first_terminal_error() {
+        let health = GpuHealth::default();
+        assert_eq!(health.error(), None);
+        health.record("device lost during output configure".to_string());
+        health.record("later validation noise".to_string());
+        assert_eq!(
+            health.error().as_deref(),
+            Some("device lost during output configure")
+        );
+    }
 
     fn advance(state: &mut TemporalState, delta_seconds: f32) -> u32 {
         let ticks = state.history_ticks_for_delta(delta_seconds);
@@ -1057,6 +1093,7 @@ pub(crate) fn build_feedback_texture(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_temporal_with_dt(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     params: &TemporalParams,
     pipeline: &wgpu::RenderPipeline,
@@ -1172,11 +1209,7 @@ pub(crate) fn encode_temporal_with_dt(
             key_softness: frame_params.key_softness,
             _pad: 0.0,
         };
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Temporal Uniforms"),
-            contents: bytemuck::cast_slice(&[uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let uniform_buffer = create_uploaded_uniform(device, queue, "Temporal Uniforms", &uniforms);
 
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Temporal Textures BG"),
@@ -1416,11 +1449,71 @@ pub(crate) const fn conditional_layer_slots(bypass_master_fx: bool) -> Condition
     }
 }
 
+/// Terminal health latch for the wgpu device. Wgpu reports device loss only
+/// through a callback; without this latch a failed `Surface::configure` can
+/// return to the caller and the next `create_buffer_init` fatally maps the
+/// invalid placeholder buffer produced for the lost device.
+#[derive(Clone, Default)]
+struct GpuHealth {
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl GpuHealth {
+    fn record(&self, error: String) {
+        if let Ok(mut stored) = self.error.lock() {
+            if stored.is_none() {
+                *stored = Some(error);
+            }
+        }
+    }
+
+    fn error(&self) -> Option<String> {
+        match self.error.lock() {
+            Ok(stored) => stored.clone(),
+            Err(_) => Some("GPU health state is unavailable".to_string()),
+        }
+    }
+}
+
+/// Configure a surface under explicit scopes because wgpu's public configure
+/// API returns `()`. Invalid/outdated surface errors remain local and
+/// recoverable; actual device loss is reported independently by `GpuHealth`.
+fn configure_surface_checked(
+    device: &wgpu::Device,
+    surface: &wgpu::Surface<'_>,
+    config: &wgpu::SurfaceConfiguration,
+    health: &GpuHealth,
+) -> Result<(), String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    surface.configure(device, config);
+
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ];
+    if let Some(error) = errors.into_iter().flatten().next() {
+        return Err(format!("surface configuration failed: {error}"));
+    }
+    health.error().map_or(Ok(()), Err)
+}
+
 pub struct Renderer {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
+    main_surface_suspended: bool,
+    main_needs_reconfigure: bool,
+
+    // Device loss is terminal for this renderer. Surface validation failures
+    // are scoped at the configure call and remain recoverable; other
+    // uncaptured GPU errors are logged without being mislabeled as device loss.
+    // The app checks this latch before issuing further GPU calls and exits
+    // cleanly instead of allowing wgpu's invalid-resource fallback to panic.
+    gpu_health: GpuHealth,
 
     // Effects pipeline (per-layer: applies pixelate/rgb_split/color to a single layer)
     effects_pipeline: wgpu::RenderPipeline,
@@ -1495,6 +1588,11 @@ struct OutputTarget {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    /// Resize/fullscreen events can arrive in bursts. Coalesce them and
+    /// configure once at the render boundary, after the prior surface texture
+    /// has been presented or dropped.
+    needs_reconfigure: bool,
+    suspended: bool,
 }
 
 fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
@@ -1548,6 +1646,23 @@ impl Renderer {
         }))
         .map_err(|error| format!("failed to create renderer device: {error}"))?;
 
+        let gpu_health = GpuHealth::default();
+        let device_loss_health = gpu_health.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            let detail = if message.trim().is_empty() {
+                format!("GPU device lost ({reason:?})")
+            } else {
+                format!("GPU device lost ({reason:?}): {message}")
+            };
+            device_loss_health.record(detail);
+        });
+        device.on_uncaptured_error(Arc::new(move |error| {
+            // Avoid wgpu's default panic while preserving diagnostics. Device
+            // loss has a separate callback/latch and is the only condition
+            // that makes every resource in this Renderer invalid.
+            log::error!("Uncaptured GPU error: {error}");
+        }));
+
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
             .formats
@@ -1566,7 +1681,7 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &config);
+        configure_surface_checked(&device, &surface, &config, &gpu_health)?;
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -1830,6 +1945,9 @@ impl Renderer {
             device,
             queue,
             config,
+            main_surface_suspended: false,
+            main_needs_reconfigure: false,
+            gpu_health,
             effects_pipeline,
             effects_bind_group_layout,
             effects_uniform_layout,
@@ -1865,6 +1983,7 @@ impl Renderer {
 
     /// Open the fullscreen output window's rendering surface.
     pub fn create_output(&mut self, window: Arc<Window>) -> Result<(), String> {
+        self.ensure_device_healthy()?;
         let size = window.inner_size();
         let surface = self
             .instance
@@ -1900,7 +2019,14 @@ impl Renderer {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&self.device, &config);
+        // A just-created Windows fullscreen window may transiently report a
+        // zero client extent. Do not configure a synthetic 1x1 swapchain:
+        // keep the target suspended and let its first nonzero resize schedule
+        // one real configuration at the render boundary.
+        let suspended = size.width == 0 || size.height == 0;
+        if !suspended {
+            configure_surface_checked(&self.device, &surface, &config, &self.gpu_health)?;
+        }
 
         // Blit pipeline targeting this surface's format.
         let bgl = self
@@ -2007,8 +2133,22 @@ impl Renderer {
             config,
             pipeline,
             bind_group,
+            needs_reconfigure: suspended,
+            suspended,
         });
         Ok(())
+    }
+
+    /// Return the first terminal GPU/device error, if one has occurred.
+    pub fn device_error(&self) -> Option<String> {
+        self.gpu_health.error()
+    }
+
+    /// Fail closed before issuing more GPU work after device loss. Recovering
+    /// in place would require rebuilding the renderer, egui renderer, and all
+    /// layer textures; using any old resource is invalid by definition.
+    pub fn ensure_device_healthy(&self) -> Result<(), String> {
+        self.device_error().map_or(Ok(()), Err)
     }
 
     /// Start a new patch/visual generation without sampling any temporal or
@@ -2121,12 +2261,26 @@ impl Renderer {
         self.output.as_ref().map(|o| o.window.id())
     }
 
+    pub fn output_window_size(&self) -> Option<winit::dpi::PhysicalSize<u32>> {
+        self.output
+            .as_ref()
+            .map(|output| output.window.inner_size())
+    }
+
     pub fn resize_output(&mut self, width: u32, height: u32) {
         if let Some(out) = self.output.as_mut() {
-            if width > 0 && height > 0 {
+            if width == 0 || height == 0 {
+                out.suspended = true;
+                return;
+            }
+            let resumed = std::mem::replace(&mut out.suspended, false);
+            if width > 0 && height > 0 && (out.config.width != width || out.config.height != height)
+            {
                 out.config.width = width;
                 out.config.height = height;
-                out.surface.configure(&self.device, &out.config);
+                out.needs_reconfigure = true;
+            } else if resumed {
+                out.needs_reconfigure = true;
             }
         }
     }
@@ -2137,17 +2291,44 @@ impl Renderer {
     pub fn render_output(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-    ) -> Option<wgpu::SurfaceTexture> {
-        let out = self.output.as_mut()?;
+    ) -> Result<Option<wgpu::SurfaceTexture>, String> {
+        self.ensure_device_healthy()?;
+        let Some(out) = self.output.as_mut() else {
+            return Ok(None);
+        };
+        if out.suspended {
+            return Ok(None);
+        }
+
+        if out.needs_reconfigure {
+            configure_surface_checked(&self.device, &out.surface, &out.config, &self.gpu_health)?;
+            out.needs_reconfigure = false;
+        }
 
         let surface_texture = match out.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                out.surface.configure(&self.device, &out.config);
-                return None;
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                out.needs_reconfigure = true;
+                texture
             }
-            _ => return None,
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                configure_surface_checked(
+                    &self.device,
+                    &out.surface,
+                    &out.config,
+                    &self.gpu_health,
+                )?;
+                return Ok(None);
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err("output surface was lost; close and reopen Output".to_string());
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(None);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err("output surface validation failed".to_string());
+            }
         };
         let view = surface_texture
             .texture
@@ -2183,7 +2364,7 @@ impl Renderer {
         pass.draw(0..3, 0..1);
         drop(pass);
 
-        Some(surface_texture)
+        Ok(Some(surface_texture))
     }
 
     /// Temporal pass driven by a real elapsed time. Live rendering should pass
@@ -2197,6 +2378,7 @@ impl Renderer {
     ) {
         encode_temporal_with_dt(
             &self.device,
+            &self.queue,
             encoder,
             params,
             &self.temporal_pipeline,
@@ -2230,16 +2412,80 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, new_width: u32, new_height: u32) {
-        if new_width > 0 && new_height > 0 {
+        if new_width == 0 || new_height == 0 {
+            self.main_surface_suspended = true;
+            return;
+        }
+        let resumed = std::mem::replace(&mut self.main_surface_suspended, false);
+        if self.config.width != new_width || self.config.height != new_height {
             self.config.width = new_width;
             self.config.height = new_height;
-            self.surface.configure(&self.device, &self.config);
+            self.main_needs_reconfigure = true;
+        } else if resumed {
+            self.main_needs_reconfigure = true;
         }
     }
 
-    /// Force reconfigure the surface (e.g. after Lost/Outdated during fullscreen transition).
-    pub fn reconfigure_surface(&self) {
-        self.surface.configure(&self.device, &self.config);
+    /// Apply the newest coalesced resize once at the render boundary, after
+    /// every surface texture from the previous frame has been released.
+    pub fn prepare_main_surface(&mut self) -> Result<bool, String> {
+        self.ensure_device_healthy()?;
+        if self.main_surface_suspended {
+            return Ok(false);
+        }
+        if self.main_needs_reconfigure {
+            configure_surface_checked(&self.device, &self.surface, &self.config, &self.gpu_health)?;
+            self.main_needs_reconfigure = false;
+        }
+        Ok(true)
+    }
+
+    /// Recreate the main presentation surface after wgpu reports `Lost`.
+    /// Reconfiguring the old surface is explicitly insufficient in wgpu 29.
+    pub fn recreate_main_surface(&mut self, window: Arc<Window>) -> Result<(), String> {
+        self.ensure_device_healthy()?;
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Err("main window surface is suspended at zero size".to_string());
+        }
+        let surface = self
+            .instance
+            .create_surface(window)
+            .map_err(|error| format!("failed to recreate main surface: {error}"))?;
+        let caps = surface.get_capabilities(&self.adapter);
+        if !caps.usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT) {
+            return Err("recreated main surface does not support render attachments".to_string());
+        }
+        if !caps.formats.contains(&self.config.format) {
+            return Err(format!(
+                "recreated main surface no longer supports {:?}",
+                self.config.format
+            ));
+        }
+        if !caps.present_modes.contains(&self.config.present_mode) {
+            self.config.present_mode = preferred_present_mode(&caps.present_modes)
+                .ok_or_else(|| "recreated main surface has no present modes".to_string())?;
+        }
+        if !caps.alpha_modes.contains(&self.config.alpha_mode) {
+            self.config.alpha_mode = caps
+                .alpha_modes
+                .first()
+                .copied()
+                .ok_or_else(|| "recreated main surface has no alpha modes".to_string())?;
+        }
+        self.config.width = size.width;
+        self.config.height = size.height;
+        configure_surface_checked(&self.device, &surface, &self.config, &self.gpu_health)?;
+        self.surface = surface;
+        self.main_surface_suspended = false;
+        self.main_needs_reconfigure = false;
+        Ok(())
+    }
+
+    /// Reconfigure an existing but outdated main surface. A `Lost` surface
+    /// must instead go through `recreate_main_surface`.
+    pub fn reconfigure_surface(&mut self) {
+        self.main_needs_reconfigure = true;
     }
 
     /// Render all layers composited together. Final result ends up in composite_views[0].
@@ -2289,13 +2535,8 @@ impl Renderer {
 
             // Each pass needs its own buffer because queue.write_buffer writes
             // all execute before the encoder's render passes run on the GPU.
-            let fx_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Layer FX Uniforms"),
-                    contents: bytemuck::cast_slice(&[uniforms]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+            let fx_buffer =
+                create_uploaded_uniform(&self.device, &self.queue, "Layer FX Uniforms", &uniforms);
 
             let tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -2366,17 +2607,17 @@ impl Renderer {
             }
             {
                 // Composite base[0] + overlay[1] → temp[2]
-                let comp_buffer =
-                    self.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("Composite Uniforms"),
-                            contents: bytemuck::cast_slice(&[CompositeUniforms {
-                                opacity: *opacity,
-                                blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
-                                _pad: [0.0; 2],
-                            }]),
-                            usage: wgpu::BufferUsages::UNIFORM,
-                        });
+                let composite_uniforms = CompositeUniforms {
+                    opacity: *opacity,
+                    blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
+                    _pad: [0.0; 2],
+                };
+                let comp_buffer = create_uploaded_uniform(
+                    &self.device,
+                    &self.queue,
+                    "Composite Uniforms",
+                    &composite_uniforms,
+                );
 
                 let composite_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Composite Textures BG"),
@@ -2512,13 +2753,12 @@ impl Renderer {
 
         // Every inherited layer reads the local-FX image from slot 1. Reuse
         // one immutable master uniform buffer and bind groups for all of them.
-        let master_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Conditional Master FX Uniforms"),
-                contents: bytemuck::cast_slice(&[*master_uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let master_buffer = create_uploaded_uniform(
+            &self.device,
+            &self.queue,
+            "Conditional Master FX Uniforms",
+            master_uniforms,
+        );
         let master_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Conditional Master FX Input"),
             layout: &self.effects_bind_group_layout,
@@ -2544,13 +2784,12 @@ impl Renderer {
 
         for (stack_index, (layer, (uniforms, opacity))) in visible_layers.iter().enumerate() {
             let uniforms = uniforms.for_render_target(self.output_width, self.output_height);
-            let fx_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Conditional Layer FX Uniforms"),
-                    contents: bytemuck::cast_slice(&[uniforms]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+            let fx_buffer = create_uploaded_uniform(
+                &self.device,
+                &self.queue,
+                "Conditional Layer FX Uniforms",
+                &uniforms,
+            );
             let layer_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Conditional Layer FX Input"),
                 layout: &self.effects_bind_group_layout,
@@ -2638,21 +2877,21 @@ impl Renderer {
             }
 
             let overlay_slot = slots.master_output.unwrap_or(1);
-            let comp_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Conditional Composite Uniforms"),
-                    contents: bytemuck::cast_slice(&[CompositeUniforms {
-                        opacity: *opacity,
-                        blend_mode: if stack_index == 0 {
-                            0
-                        } else {
-                            layer.blend_mode.as_u32()
-                        },
-                        _pad: [0.0; 2],
-                    }]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+            let composite_uniforms = CompositeUniforms {
+                opacity: *opacity,
+                blend_mode: if stack_index == 0 {
+                    0
+                } else {
+                    layer.blend_mode.as_u32()
+                },
+                _pad: [0.0; 2],
+            };
+            let comp_buffer = create_uploaded_uniform(
+                &self.device,
+                &self.queue,
+                "Conditional Composite Uniforms",
+                &composite_uniforms,
+            );
             let composite_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Conditional Composite Textures BG"),
                 layout: &self.composite_bind_group_layout,
@@ -2732,13 +2971,12 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         master_uniforms: &EffectUniforms,
     ) {
-        let fx_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Master FX Uniforms"),
-                contents: bytemuck::cast_slice(&[*master_uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let fx_buffer = create_uploaded_uniform(
+            &self.device,
+            &self.queue,
+            "Master FX Uniforms",
+            master_uniforms,
+        );
 
         let tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Master FX Input"),
@@ -2897,6 +3135,7 @@ impl Renderer {
         master_uniforms: &EffectUniforms,
         plan: SelectiveNtscPlan,
     ) -> Result<bool, String> {
+        self.ensure_device_healthy()?;
         if plan.generation.width != self.output_width
             || plan.generation.height != self.output_height
         {
@@ -2918,13 +3157,12 @@ impl Renderer {
         self.ensure_selective_ntsc_gpu(used_size);
 
         let state = self.selective_ntsc_gpu.as_ref().unwrap();
-        let master_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Selective NTSC Master FX Uniforms"),
-                contents: bytemuck::cast_slice(&[*master_uniforms]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let master_buffer = create_uploaded_uniform(
+            &self.device,
+            &self.queue,
+            "Selective NTSC Master FX Uniforms",
+            master_uniforms,
+        );
         let master_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Selective NTSC Master FX Input"),
             layout: &self.effects_bind_group_layout,
@@ -2968,13 +3206,12 @@ impl Renderer {
             let uniforms = mods[source_index]
                 .0
                 .for_render_target(self.output_width, self.output_height);
-            let fx_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Selective NTSC Layer FX Uniforms"),
-                    contents: bytemuck::cast_slice(&[uniforms]),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+            let fx_buffer = create_uploaded_uniform(
+                &self.device,
+                &self.queue,
+                "Selective NTSC Layer FX Uniforms",
+                &uniforms,
+            );
             let layer_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Selective NTSC Layer FX Input"),
                 layout: &self.effects_bind_group_layout,
@@ -3078,6 +3315,9 @@ impl Renderer {
     /// Request the asynchronous map after the encoder containing the batch
     /// copy has been submitted.
     pub fn map_selective_ntsc_readback(&self) {
+        if self.ensure_device_healthy().is_err() {
+            return;
+        }
         let Some(state) = self.selective_ntsc_gpu.as_ref() else {
             return;
         };
@@ -3109,8 +3349,14 @@ impl Renderer {
 
     /// Harvest the single newest mapped selective batch without blocking.
     pub fn poll_selective_ntsc_readback(&mut self) -> Option<SelectiveNtscBatch> {
-        let state = self.selective_ntsc_gpu.as_mut()?;
+        if self.ensure_device_healthy().is_err() {
+            return None;
+        }
         let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.gpu_health.error().is_some() {
+            return None;
+        }
+        let state = self.selective_ntsc_gpu.as_mut()?;
         match state.slot.status.load(Ordering::Acquire) {
             SLOT_MAPPED => {
                 let plan = state.slot.plan.take();
@@ -3231,6 +3477,9 @@ impl Renderer {
         selective_sample: Option<SelectiveNtscGeneration>,
         held_audience: bool,
     ) -> Option<usize> {
+        if self.ensure_device_healthy().is_err() {
+            return None;
+        }
         let buffer_size = (self.readback_bytes_per_row() * self.output_height) as u64;
 
         let idx = match self
@@ -3295,6 +3544,9 @@ impl Renderer {
     /// Phase 2: request the async map. Must be called after the encoder
     /// from `begin_readback` has been submitted. Never blocks.
     pub fn map_readback(&self, idx: usize) {
+        if self.ensure_device_healthy().is_err() {
+            return;
+        }
         let slot = &self.readback_slots[idx];
         if slot.status.load(Ordering::Acquire) != SLOT_MAP_PENDING {
             return;
@@ -3324,8 +3576,20 @@ impl Renderer {
                 held_audience_not_harvested: false,
             };
         }
+        if self.ensure_device_healthy().is_err() {
+            return ReadbackPoll {
+                frame: None,
+                held_audience_not_harvested: false,
+            };
+        }
         // Drive map callbacks without waiting.
         let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.gpu_health.error().is_some() {
+            return ReadbackPoll {
+                frame: None,
+                held_audience_not_harvested: false,
+            };
+        }
 
         let newest_idx = self
             .readback_slots
