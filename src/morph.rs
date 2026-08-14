@@ -668,6 +668,23 @@ pub struct LayerMorphSnapshot {
     pub key_threshold: Option<f32>,
 }
 
+/// One independently optional field family in a persisted layer capture.
+/// Opacity and speed existed in the original schema; newer fields must only
+/// claim editor ownership when both engaged slots actually contain them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayerMorphControl {
+    Opacity,
+    Speed,
+    Fps,
+    Effects,
+    AnyEffect,
+    KeyThreshold,
+    BlendMode,
+    Visible,
+    Paused,
+    BypassMasterFx,
+}
+
 impl Default for LayerMorphSnapshot {
     fn default() -> Self {
         Self {
@@ -1010,6 +1027,40 @@ impl Morph {
         self.a.is_some() && self.b.is_some()
     }
 
+    /// Whether the engaged A/B pair owns a particular layer field at this
+    /// stack position. Newly appended layers remain directly editable, and a
+    /// legacy slot cannot claim fields that did not yet exist when captured.
+    pub(crate) fn controls_layer_field(&self, position: usize, control: LayerMorphControl) -> bool {
+        let (Some(a), Some(b)) = (&self.a, &self.b) else {
+            return false;
+        };
+        let Some(a) = a.layers.iter().find(|layer| layer.position == position) else {
+            return false;
+        };
+        let Some(b) = b.layers.iter().find(|layer| layer.position == position) else {
+            return false;
+        };
+        match control {
+            LayerMorphControl::Opacity | LayerMorphControl::Speed => true,
+            LayerMorphControl::Fps => a.fps.is_some() && b.fps.is_some(),
+            LayerMorphControl::Effects => a.effects.is_some() && b.effects.is_some(),
+            LayerMorphControl::AnyEffect => {
+                (a.effects.is_some() && b.effects.is_some())
+                    || (a.effective_key_threshold().is_some()
+                        && b.effective_key_threshold().is_some())
+            }
+            LayerMorphControl::KeyThreshold => {
+                a.effective_key_threshold().is_some() && b.effective_key_threshold().is_some()
+            }
+            LayerMorphControl::BlendMode => a.blend_mode.is_some() && b.blend_mode.is_some(),
+            LayerMorphControl::Visible => a.visible.is_some() && b.visible.is_some(),
+            LayerMorphControl::Paused => a.paused.is_some() && b.paused.is_some(),
+            LayerMorphControl::BypassMasterFx => {
+                a.bypass_master_fx.is_some() && b.bypass_master_fx.is_some()
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.a = None;
         self.b = None;
@@ -1291,6 +1342,35 @@ mod tests {
             ..Default::default()
         }];
         slot
+    }
+
+    #[test]
+    fn layer_ownership_requires_the_position_in_both_engaged_slots() {
+        let a = slot(1.0, 0.0, 0.25);
+        let mut b = slot(2.0, 1.0, 0.75);
+        let mut morph = Morph {
+            a: Some(a),
+            b: Some(b.clone()),
+            ..Default::default()
+        };
+        assert!(morph.controls_layer_field(3, LayerMorphControl::Opacity));
+        assert!(morph.controls_layer_field(3, LayerMorphControl::Speed));
+        assert!(morph.controls_layer_field(3, LayerMorphControl::KeyThreshold));
+        assert!(morph.controls_layer_field(3, LayerMorphControl::AnyEffect));
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::Fps));
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::Effects));
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::Visible));
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::Paused));
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::BypassMasterFx));
+        assert!(!morph.controls_layer_field(4, LayerMorphControl::Opacity));
+
+        b.layers[0].position = 4;
+        morph.b = Some(b);
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::Opacity));
+        assert!(!morph.controls_layer_field(4, LayerMorphControl::Opacity));
+
+        morph.b = None;
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::Opacity));
     }
 
     fn full_layer(position: usize, high: bool) -> LayerMorphSnapshot {

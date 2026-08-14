@@ -322,6 +322,14 @@ positional identities remain aligned; topology changes also purge queued stale
 captures. Live and export sample the same persisted state and apply modulation
 around the same materialized bases.
 
+An engaged A/B pair owns the master, NTSC, temporal, and intersecting captured
+layer positions. Before a direct manual edit to owned state, materialize the
+current beat plus Morph-route offset once, clear both slots, and then apply the
+edit. This transfers control without a visual jump or later snap-back. Do this
+when a beat-latched action executes, not when it is enqueued. A single slot and
+an appended layer absent from the slot intersection remain directly editable
+without being cleared.
+
 ## Temporal state
 
 Temporal effects use two memories:

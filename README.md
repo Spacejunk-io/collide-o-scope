@@ -117,6 +117,11 @@ ordering barrier: it first materializes the current Morph result, including a
 Morph-target routing offset, then records the bases at the current layer-stack
 revision. Stale captures are rejected. Manual fader and law edits still apply
 to the materialized bases while Pause holds automatic glide and clock motion.
+While both slots are engaged, A/B owns the controls it captured. Moving or
+resetting one of those controls commits the currently displayed interpolation,
+clears A/B, and then applies the manual edit so it cannot snap back. A newly
+appended layer remains outside older slots and can be edited without disengaging
+them. With beat latch enabled, that ownership transfer occurs on the downbeat.
 Pause also snapshots the exact audience across a blackout: the cut remains
 absolutely black while active, then releasing it while still paused restores
 the pre-cut image. A paused selective-VHS transition remains held until Resume

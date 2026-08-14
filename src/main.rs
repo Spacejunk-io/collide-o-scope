@@ -1225,6 +1225,201 @@ impl App {
         self.materialize_morph_at_current_beat_with_offset(morph_offset);
     }
 
+    /// Hand control back to a direct editor without jumping away from the
+    /// currently displayed A/B interpolation. The sampled world becomes the
+    /// new base, then the caller's edit is applied on top of it. A single
+    /// captured slot is deliberately preserved so the performer can continue
+    /// authoring its partner.
+    fn release_active_morph_for_manual_edit(&mut self) {
+        if !self.morph.active() {
+            return;
+        }
+        self.materialize_morph_at_current_beat();
+        self.morph.clear();
+    }
+
+    fn valid_effect_edit(param: &str, value: &serde_json::Value) -> bool {
+        match param {
+            "invert" | "color_grain" => value.as_bool().is_some(),
+            "grain_algo" | "key_mode" => value.as_u64().is_some(),
+            "pixelate"
+            | "downsample"
+            | "rgb_split"
+            | "hue_shift"
+            | "saturation"
+            | "brightness"
+            | "contrast"
+            | "posterize"
+            | "grain_intensity"
+            | "grain_size"
+            | "vignette"
+            | "color_drift"
+            | "breathe_scale"
+            | "breathe_rotation"
+            | "breathe_position"
+            | "key_color_r"
+            | "key_color_g"
+            | "key_color_b"
+            | "key_threshold"
+            | "key_softness"
+            | "key_tolerance"
+            | "cellular_amount"
+            | "cellular_scale"
+            | "cellular_warp"
+            | "cellular_speed"
+            | "cellular_gap_amount"
+            | "cellular_gap_threshold"
+            | "cellular_gap_softness" => value.as_f64().is_some_and(f64::is_finite),
+            _ => false,
+        }
+    }
+
+    fn finite_f32_edit(value: &serde_json::Value) -> bool {
+        value
+            .as_f64()
+            .map(|number| number as f32)
+            .is_some_and(f32::is_finite)
+    }
+
+    fn valid_ntsc_edit(param: &str, value: &serde_json::Value) -> bool {
+        match param {
+            "enabled"
+            | "edge_wave_enabled"
+            | "head_switching_enabled"
+            | "tracking_noise_enabled" => value.as_bool().is_some(),
+            "tape_speed" => value.as_u64().is_some(),
+            "head_switching_height" | "tracking_noise_height" => value.as_i64().is_some(),
+            "chroma_loss"
+            | "edge_wave_intensity"
+            | "edge_wave_speed"
+            | "head_switching_shift"
+            | "tracking_noise_wave"
+            | "tracking_noise_snow"
+            | "snow_intensity"
+            | "composite_noise_intensity"
+            | "luma_noise_intensity"
+            | "chroma_noise_intensity"
+            | "luma_smear"
+            | "composite_sharpening" => Self::finite_f32_edit(value),
+            _ => false,
+        }
+    }
+
+    fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
+        match param {
+            "slit_axis" | "key_mode" => value.as_u64().is_some(),
+            "slit_angle" => Self::finite_f32_edit(value),
+            "feedback" | "fb_zoom" | "fb_rotate" | "slitscan" | "key_threshold"
+            | "key_softness" | "key_history" => value.as_f64().is_some_and(f64::is_finite),
+            _ => false,
+        }
+    }
+
+    fn layer_param_morph_control(
+        param: &str,
+        value: &serde_json::Value,
+    ) -> Option<morph::LayerMorphControl> {
+        use morph::LayerMorphControl as Control;
+        match param {
+            "opacity" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::Opacity),
+            "speed" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::Speed),
+            "fps" if Self::finite_f32_edit(value) => Some(Control::Fps),
+            "blend_mode"
+                if matches!(
+                    value.as_str(),
+                    Some("normal" | "screen" | "multiply" | "difference")
+                ) =>
+            {
+                Some(Control::BlendMode)
+            }
+            "bypass_master_fx" if value.as_bool().is_some() => Some(Control::BypassMasterFx),
+            "key_threshold" if value.as_f64().is_some_and(f64::is_finite) => {
+                Some(Control::KeyThreshold)
+            }
+            "key_mode" if value.as_u64().is_some() => Some(Control::Effects),
+            "key_softness" | "key_color_r" | "key_color_g" | "key_color_b" | "key_tolerance"
+                if value.as_f64().is_some_and(f64::is_finite) =>
+            {
+                Some(Control::Effects)
+            }
+            _ => None,
+        }
+    }
+
+    /// Quantized wrappers return false here: ownership transfers only when the
+    /// inner edit actually executes on its downbeat, never while it is merely
+    /// pending. Stable layer IDs are resolved before deciding whether an edit
+    /// touches a captured layer; stale/removed targets cannot clear A/B.
+    fn manual_action_targets_active_morph(&self, action: &web::state::WebAction) -> bool {
+        use web::state::WebAction;
+        if !self.morph.active() {
+            return false;
+        }
+        match action {
+            WebAction::SetParam { param, value } => Self::valid_effect_edit(param, value),
+            WebAction::SetNtscParam { param, value } => Self::valid_ntsc_edit(param, value),
+            WebAction::SetTemporal { param, value } => Self::valid_temporal_edit(param, value),
+            WebAction::ResetGroup { group } => matches!(
+                group.as_str(),
+                "digital" | "analog" | "key" | "motion" | "cellular" | "vhs" | "temporal"
+            ),
+            WebAction::SetLayerParam {
+                index,
+                layer_id,
+                param,
+                value,
+            } => Self::layer_param_morph_control(param, value).is_some_and(|control| {
+                self.resolve_layer_index(*index, layer_id)
+                    .is_some_and(|resolved| self.morph.controls_layer_field(resolved, control))
+            }),
+            WebAction::SetLayerEffect {
+                index,
+                layer_id,
+                param,
+                value,
+            } if Self::valid_effect_edit(param, value) => {
+                let control = if param == "key_threshold" {
+                    morph::LayerMorphControl::KeyThreshold
+                } else {
+                    morph::LayerMorphControl::Effects
+                };
+                self.resolve_layer_index(*index, layer_id)
+                    .is_some_and(|resolved| self.morph.controls_layer_field(resolved, control))
+            }
+            WebAction::ResetLayerFx { index, layer_id } => self
+                .resolve_layer_index(*index, layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::AnyEffect)
+                }),
+            WebAction::SetLayerVisibility {
+                index, layer_id, ..
+            } => self
+                .resolve_layer_index(*index, layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::Visible)
+                }),
+            WebAction::SetLayerPaused {
+                index, layer_id, ..
+            } => self
+                .resolve_layer_index(*index, layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::Paused)
+                }),
+            WebAction::ToggleVisibility { index } | WebAction::ToggleLayerPause { index } => {
+                let control = if matches!(action, WebAction::ToggleVisibility { .. }) {
+                    morph::LayerMorphControl::Visible
+                } else {
+                    morph::LayerMorphControl::Paused
+                };
+                *index < self.layers.len() && self.morph.controls_layer_field(*index, control)
+            }
+            _ => false,
+        }
+    }
+
     /// Restore the complete post-stack visual program to neutral while
     /// preserving layers, transport, BPM, and live input/device choices.
     /// Automation that could immediately overwrite the defaults is cleared.
@@ -1348,6 +1543,9 @@ impl App {
     /// Handle an action from the web UI.
     fn handle_web_action(&mut self, action: web::state::WebAction) {
         use web::state::WebAction;
+        if self.manual_action_targets_active_morph(&action) {
+            self.release_active_morph_for_manual_edit();
+        }
         match action {
             WebAction::Quantized { inner } => self.queue_quantized_action(*inner),
             WebAction::QuickSavePatch => {
@@ -2064,12 +2262,16 @@ impl App {
                         }
                         "blend_mode" => {
                             if let Some(s) = value.as_str() {
-                                layer.blend_mode = match s {
-                                    "screen" => crate::layers::BlendMode::Screen,
-                                    "multiply" => crate::layers::BlendMode::Multiply,
-                                    "difference" => crate::layers::BlendMode::Difference,
-                                    _ => crate::layers::BlendMode::Normal,
+                                let blend_mode = match s {
+                                    "normal" => Some(crate::layers::BlendMode::Normal),
+                                    "screen" => Some(crate::layers::BlendMode::Screen),
+                                    "multiply" => Some(crate::layers::BlendMode::Multiply),
+                                    "difference" => Some(crate::layers::BlendMode::Difference),
+                                    _ => None,
                                 };
+                                if let Some(blend_mode) = blend_mode {
+                                    layer.blend_mode = blend_mode;
+                                }
                             }
                         }
                         "bypass_master_fx" => {
@@ -4847,6 +5049,137 @@ mod app_state_tests {
             (app.morph.a.as_ref().unwrap().master.brightness - 0.8).abs() < 1.0e-6,
             "capture must observe the preceding fader action, not the prior frame"
         );
+    }
+
+    #[test]
+    fn direct_manual_edit_commits_current_morph_then_takes_ownership() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let a = morph::MorphSlot::capture(
+            &effects::EffectUniforms {
+                brightness: 0.0,
+                saturation: 0.0,
+                ..Default::default()
+            },
+            &ntsc::NtscParams::default(),
+            &effects::params::TemporalParams::default(),
+            &[],
+        );
+        let b = morph::MorphSlot::capture(
+            &effects::EffectUniforms {
+                brightness: 1.0,
+                saturation: 1.0,
+                ..Default::default()
+            },
+            &ntsc::NtscParams::default(),
+            &effects::params::TemporalParams::default(),
+            &[],
+        );
+        app.morph.a = Some(a);
+        app.morph.b = Some(b);
+        app.morph.t = 0.5;
+
+        app.handle_web_action(web::state::WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.8),
+        });
+
+        assert!(!app.morph.active());
+        assert!(app.morph.a.is_none() && app.morph.b.is_none());
+        assert!((app.master_effects.brightness - 0.8).abs() < 1.0e-6);
+        assert!(
+            (app.master_effects.saturation - 0.5).abs() < 1.0e-6,
+            "an untouched field must prove the visible morph world was committed first"
+        );
+        app.materialize_morph_at_current_beat();
+        assert!((app.master_effects.brightness - 0.8).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn invalid_manual_commands_never_disengage_an_active_morph() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.morph.a = Some(morph::MorphSlot::default());
+        app.morph.b = Some(morph::MorphSlot::default());
+
+        for action in [
+            web::state::WebAction::SetParam {
+                param: "future_effect".into(),
+                value: serde_json::json!(0.5),
+            },
+            web::state::WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!("not a number"),
+            },
+            web::state::WebAction::SetNtscParam {
+                param: "future_vhs".into(),
+                value: serde_json::json!(true),
+            },
+            web::state::WebAction::SetTemporal {
+                param: "feedback".into(),
+                value: serde_json::json!(false),
+            },
+            web::state::WebAction::SetNtscParam {
+                param: "edge_wave_intensity".into(),
+                value: serde_json::json!(1.0e300),
+            },
+            web::state::WebAction::SetTemporal {
+                param: "slit_angle".into(),
+                value: serde_json::json!(1.0e300),
+            },
+        ] {
+            app.handle_web_action(action);
+            assert!(app.morph.active());
+        }
+    }
+
+    #[test]
+    fn single_slot_survives_manual_edit_and_quantized_pair_releases_only_on_downbeat() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let a = morph::MorphSlot::capture(
+            &effects::EffectUniforms {
+                brightness: 0.0,
+                ..Default::default()
+            },
+            &ntsc::NtscParams::default(),
+            &effects::params::TemporalParams::default(),
+            &[],
+        );
+        let b = morph::MorphSlot::capture(
+            &effects::EffectUniforms {
+                brightness: 1.0,
+                ..Default::default()
+            },
+            &ntsc::NtscParams::default(),
+            &effects::params::TemporalParams::default(),
+            &[],
+        );
+        app.morph.a = Some(a.clone());
+        app.handle_web_action(web::state::WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.2),
+        });
+        assert!(app.morph.a.is_some() && app.morph.b.is_none());
+        assert!((app.master_effects.brightness - 0.2).abs() < 1.0e-6);
+
+        app.morph.a = Some(a);
+        app.morph.b = Some(b);
+        app.morph.t = 0.5;
+        app.materialize_morph_at_current_beat();
+        app.quantized_bar = Some(0);
+        app.queue_quantized_action(web::state::WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.75),
+        });
+        assert!(app.morph.active());
+        assert!((app.master_effects.brightness - 0.5).abs() < 1.0e-6);
+
+        app.mod_matrix.current_beat = 4.0;
+        app.release_quantized_actions_on_downbeat();
+        assert!(app.quantized_actions.is_empty());
+        assert!(!app.morph.active());
+        assert!((app.master_effects.brightness - 0.75).abs() < 1.0e-6);
     }
 
     #[test]

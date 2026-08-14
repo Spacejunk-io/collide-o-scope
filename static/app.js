@@ -208,6 +208,20 @@ function layerSelector(layer, index) {
   return { index, layer_id: layer?.layer_id || null };
 }
 
+function currentLayerContext(card, fallbackLayer, fallbackIndex) {
+  const currentLayer = card?._layerState || fallbackLayer;
+  const currentIndex = Number.parseInt(card?.dataset.index, 10);
+  return {
+    layer: currentLayer,
+    index: Number.isInteger(currentIndex) ? currentIndex : fallbackIndex,
+  };
+}
+
+function currentLayerSelector(card, fallbackLayer, fallbackIndex) {
+  const current = currentLayerContext(card, fallbackLayer, fallbackIndex);
+  return layerSelector(current.layer, current.index);
+}
+
 // Attach missing programmatic names without requiring every compact visual
 // label to carry a bespoke id/for pair.
 document.querySelectorAll('.param-row').forEach((row) => {
@@ -1027,7 +1041,7 @@ function wireLayerEffects(card, layer, index) {
     const send = () => {
       const value = kind === 'checkbox' ? control.checked : kind === 'select' ? parseInt(control.value, 10) : parseFloat(control.value);
       row.querySelector('.value')?.replaceChildren(document.createTextNode(formatValue(value, Number(control.min), Number(control.max), Number(control.step))));
-      sendAction({ action: 'set_layer_effect', ...layerSelector(layer, index), param, value });
+      sendAction({ action: 'set_layer_effect', ...currentLayerSelector(card, layer, index), param, value });
     };
     control.addEventListener(kind === 'range' ? 'input' : 'change', send);
     if (kind === 'range') resetRangeOnDoubleActivation(control, fallback);
@@ -1146,8 +1160,8 @@ function createLayerCard(layer, index) {
   // Play/pause
   card.querySelector('.layer-play-btn').addEventListener('click', (e) => {
     e.stopPropagation();
-    const current = card._layerState || layer;
-    sendAction({ action: 'set_layer_paused', ...layerSelector(current, index), paused: !current.paused });
+    const current = currentLayerContext(card, layer, index);
+    sendAction({ action: 'set_layer_paused', ...layerSelector(current.layer, current.index), paused: !current.layer.paused });
   });
 
   // Pointer-owned reorder works for mouse, pen, and touch. The list stays
@@ -1155,7 +1169,8 @@ function createLayerCard(layer, index) {
   const dragBtn = card.querySelector('.layer-drag-btn');
   dragBtn.addEventListener('pointerdown', (e) => {
     if (layerDrag) return;
-    layerDrag = { pointerId: e.pointerId, from: index, to: index };
+    const current = currentLayerContext(card, layer, index);
+    layerDrag = { pointerId: e.pointerId, from: current.index, to: current.index, layerId: current.layer?.layer_id || null };
     dragBtn.setPointerCapture(e.pointerId);
     card.classList.add('reorder-target');
     e.stopPropagation();
@@ -1169,9 +1184,9 @@ function createLayerCard(layer, index) {
   dragBtn.addEventListener('pointerup', (e) => {
     if (!layerDrag || layerDrag.pointerId !== e.pointerId) return;
     updateLayerDragTarget(e.clientX, e.clientY);
-    const { from, to } = layerDrag;
+    const { from, to, layerId } = layerDrag;
     clearLayerDrag();
-    if (from !== to) sendAction({ action: 'move_layer', from, to, layer_id: layer.layer_id || null, stack_revision: layerStackRevision });
+    if (from !== to) sendAction({ action: 'move_layer', from, to, layer_id: layerId, stack_revision: layerStackRevision });
     e.stopPropagation();
     e.preventDefault();
   });
@@ -1180,31 +1195,32 @@ function createLayerCard(layer, index) {
     if (layerDrag?.pointerId === e.pointerId) clearLayerDrag();
   });
   dragBtn.addEventListener('keydown', (e) => {
+    const current = currentLayerContext(card, layer, index);
     const targets = {
-      ArrowUp: index - 1,
-      ArrowLeft: index - 1,
-      ArrowDown: index + 1,
-      ArrowRight: index + 1,
+      ArrowUp: current.index - 1,
+      ArrowLeft: current.index - 1,
+      ArrowDown: current.index + 1,
+      ArrowRight: current.index + 1,
       Home: 0,
       End: layersList.children.length - 1,
     };
     if (!(e.key in targets)) return;
     e.preventDefault();
     const to = Math.max(0, Math.min(layersList.children.length - 1, targets[e.key]));
-    if (to !== index) sendAction({ action: 'move_layer', from: index, to, layer_id: layer.layer_id || null, stack_revision: layerStackRevision });
+    if (to !== current.index) sendAction({ action: 'move_layer', from: current.index, to, layer_id: current.layer?.layer_id || null, stack_revision: layerStackRevision });
   });
 
   // Visibility
   card.querySelector('.layer-vis-btn').addEventListener('click', (e) => {
     e.stopPropagation();
-    const current = card._layerState || layer;
-    sendAction({ action: 'set_layer_visibility', ...layerSelector(current, index), visible: !current.visible });
+    const current = currentLayerContext(card, layer, index);
+    sendAction({ action: 'set_layer_visibility', ...layerSelector(current.layer, current.index), visible: !current.layer.visible });
   });
 
   // Remove
   card.querySelector('.layer-remove-btn').addEventListener('click', (e) => {
     e.stopPropagation();
-    sendAction({ action: 'remove_layer', ...layerSelector(layer, index) });
+    sendAction({ action: 'remove_layer', ...currentLayerSelector(card, layer, index) });
   });
 
   // Layer param sliders
@@ -1218,7 +1234,7 @@ function createLayerCard(layer, index) {
       slider.addEventListener('input', () => {
         const v = parseFloat(slider.value);
         if (valueEl) valueEl.textContent = v.toFixed(2);
-        sendAction({ action: 'set_layer_param', ...layerSelector(layer, index), param, value: v });
+        sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param, value: v });
       });
       const defaults = {
         opacity: 1, speed: 1, fps: 30, key_threshold: 0.5, key_softness: 0.1,
@@ -1230,15 +1246,15 @@ function createLayerCard(layer, index) {
     if (select) {
       select.addEventListener('change', () => {
         const v = param === 'key_mode' ? parseInt(select.value) : select.value;
-        sendAction({ action: 'set_layer_param', ...layerSelector(layer, index), param, value: v });
+        sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param, value: v });
       });
     }
   });
   card.querySelector('.layer-reset-fx').addEventListener('click', () => {
-    sendAction({ action: 'reset_layer_fx', ...layerSelector(layer, index) });
+    sendAction({ action: 'reset_layer_fx', ...currentLayerSelector(card, layer, index) });
   });
   card.querySelector('.layer-master-bypass input').addEventListener('change', (event) => {
-    sendAction({ action: 'set_layer_param', ...layerSelector(layer, index), param: 'bypass_master_fx', value: event.currentTarget.checked });
+    sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param: 'bypass_master_fx', value: event.currentTarget.checked });
   });
   wireLayerDisclosures(card, layer, index);
   wireLayerEffects(card, layer, index);
@@ -1253,6 +1269,7 @@ function updateLayerCard(card, layer, index) {
   // Cards survive ordinary state snapshots, so callbacks must read the latest
   // immutable layer DTO instead of the one captured at card construction.
   card._layerState = layer;
+  card.dataset.index = String(index);
   const playBtn = card.querySelector('.layer-play-btn');
   const title = card.querySelector('.layer-title');
   const visBtn = card.querySelector('.layer-vis-btn');
@@ -2884,7 +2901,7 @@ function syncMorph(m) {
   if (m.gliding) {
     morphStatus.textContent = `gliding to ${m.glide_target >= 0.5 ? 'B' : 'A'} — ${Number(m.glide_duration_beats).toFixed(2)} beats remaining`;
   } else if (m.active) {
-    morphStatus.textContent = 'morphing — sliders follow the crossfade';
+    morphStatus.textContent = 'morphing — editing a captured control disengages A/B';
   } else if (m.has_a || m.has_b) {
     morphStatus.textContent = m.has_a ? 'A set — capture B to engage' : 'B set — capture A to engage';
   } else {

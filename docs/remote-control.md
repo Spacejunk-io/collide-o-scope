@@ -212,6 +212,13 @@ restored with the patch, including a remainder shorter than the new-glide
 control's quarter-beat minimum. Morph commands can also use beat latch. Other
 matrix offsets stay frame-local rather than being written into a capture.
 
+While A and B are both engaged, they own the master, temporal, VHS, and captured
+layer controls. Moving or resetting one of those controls commits the visible
+interpolation, clears A/B, and then applies the manual value, so the control and
+audience output stay together. A layer appended after capture remains outside
+the old slots and does not disengage them when edited. With beat latch enabled,
+the transfer to manual control occurs on the downbeat rather than at enqueue.
+
 ### Audio
 
 Enable analysis in **AUDIO**, choose **Live input** or **Looping file**, and set

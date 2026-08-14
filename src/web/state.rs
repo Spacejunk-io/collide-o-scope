@@ -1782,6 +1782,24 @@ mod protocol_tests {
     }
 
     #[test]
+    fn dynamic_layer_controls_use_current_identity_and_explain_morph_ownership() {
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "function currentLayerContext(card, fallbackLayer, fallbackIndex)",
+            "function currentLayerSelector(card, fallbackLayer, fallbackIndex)",
+            "card?._layerState || fallbackLayer",
+            "card.dataset.index = String(index)",
+            "...currentLayerSelector(card, layer, index)",
+            "editing a captured control disengages A/B",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing dynamic layer contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_layer_snapshot_defaults_master_fx_bypass_to_off() {
         let current = LayerSnapshot {
             layer_id: "17".into(),
@@ -2163,9 +2181,9 @@ mod protocol_tests {
     fn persistent_layer_cards_toggle_from_the_latest_snapshot() {
         let js = include_str!("../../static/app.js");
         assert!(js.contains("card._layerState = layer"));
-        assert!(js.contains("const current = card._layerState || layer;"));
-        assert!(js.contains("paused: !current.paused"));
-        assert!(js.contains("visible: !current.visible"));
+        assert!(js.contains("const current = currentLayerContext(card, layer, index);"));
+        assert!(js.contains("paused: !current.layer.paused"));
+        assert!(js.contains("visible: !current.layer.visible"));
     }
 
     #[test]
@@ -2176,7 +2194,7 @@ mod protocol_tests {
             "aria-label=\"Bypass Master FX for layer ${index + 1}\"",
             "aria-describedby=\"layer-master-bypass-help-${index}\"",
             "param: 'bypass_master_fx'",
-            "...layerSelector(layer, index)",
+            "...currentLayerSelector(card, layer, index)",
             "bypassMasterFx.checked = !!layer.bypass_master_fx",
             "Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.",
         ] {
