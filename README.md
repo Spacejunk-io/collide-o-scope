@@ -12,6 +12,9 @@ control panel.
 > offline export, and Windows support. See [LICENSE](LICENSE) for the precise
 > licensing and attribution boundary.
 
+<img width="1919" height="1040" alt="collide-o-scope" src="https://github.com/user-attachments/assets/3690c19f-8ab4-4a9d-9672-45476da4dede" />
+
+
 ## What it does
 
 - Composites up to 16 video, PNG/JPEG/BMP/WebP still, or live Spout layers with normal, screen,
