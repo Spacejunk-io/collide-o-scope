@@ -27,7 +27,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::error::RecvError;
 
-use super::state::{EnqueueOutcome, WebAction, WebState};
+use super::state::{EnqueueOutcome, RerollScope, WebAction, WebState};
 use super::static_files;
 
 const AUTH_COOKIE: &str = "cos_key";
@@ -52,6 +52,7 @@ fn exceeds_upload_limit(extension: &str, bytes: u64) -> bool {
 /// Start the web server on a background thread. Returns the local URL.
 pub fn spawn(state: Arc<WebState>, port: u16) -> String {
     let local_url = format!("http://127.0.0.1:{port}/?key={}", state.access_token);
+    state.mark_control_server_starting(local_url.clone());
     let https_port = port + 1;
     let lan_ip = detect_lan_ip();
 
@@ -80,19 +81,7 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
 
     std::thread::spawn(move || {
         rt.block_on(async move {
-            let app = Router::new()
-                .route("/ws", get(ws_handler))
-                .route("/thumb/:filename", get(thumb_handler))
-                .route("/preview/:filename/:index", get(preview_handler))
-                .route("/qr.svg", get(qr_handler))
-                .route(
-                    "/upload",
-                    post(upload_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)),
-                )
-                .route("/delete", post(delete_handler))
-                .fallback(get(static_files::serve))
-                .layer(middleware::from_fn_with_state(state.clone(), auth))
-                .with_state(state);
+            let app = control_router(state.clone());
 
             // HTTPS listener (phones — secure context for sensors).
             if let Ok((cert_chain, key_der)) = tls {
@@ -122,6 +111,7 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
+                    state.mark_control_server_unavailable(format!("cannot bind port {port}: {e}"));
                     log::error!(
                         "Cannot bind port {port} ({e}) — is another collide-o-scope \
                          already running? This instance continues without a control panel."
@@ -129,17 +119,40 @@ pub fn spawn(state: Arc<WebState>, port: u16) -> String {
                     return;
                 }
             };
+            state.mark_control_server_listening();
             log::info!("Web control panel listening on {addr}");
-            axum::serve(
+            if let Err(error) = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
-            .unwrap();
+            {
+                state.mark_control_server_unavailable(format!("control server stopped: {error}"));
+                log::error!("Web control panel stopped: {error}");
+            }
         });
     });
 
     local_url
+}
+
+/// Build the exact production router independently of listener ownership.
+/// Keeping this seam small lets the transport test bind an ephemeral port and
+/// exercise the real authentication, WebSocket upgrade, and action ingress.
+fn control_router(state: Arc<WebState>) -> Router {
+    Router::new()
+        .route("/ws", get(ws_handler))
+        .route("/thumb/:filename", get(thumb_handler))
+        .route("/preview/:filename/:index", get(preview_handler))
+        .route("/qr.svg", get(qr_handler))
+        .route(
+            "/upload",
+            post(upload_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)),
+        )
+        .route("/delete", post(delete_handler))
+        .fallback(get(static_files::serve))
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
+        .with_state(state)
 }
 
 /// Load the persisted self-signed certificate, or mint a fresh one when
@@ -606,12 +619,7 @@ async fn delete_handler(
 
     match tokio::task::spawn_blocking(move || trash::delete(&path)).await {
         Ok(Ok(())) => {
-            if let Ok(mut cache) = state.thumbnails.write() {
-                cache.remove(&name);
-            }
-            if let Ok(mut cache) = state.preview_frames.write() {
-                cache.remove(&name);
-            }
+            state.remove_library_media_cache_entry(&name);
             log::info!("Clip moved to Recycle Bin: {name}");
             let _ = state.enqueue_action(WebAction::RescanLibrary).await;
             (StatusCode::OK, name).into_response()
@@ -710,9 +718,7 @@ fn is_layer_routing_target(value: &serde_json::Value) -> bool {
     let Some((number, _suffix)) = rest.split_once('_') else {
         return false;
     };
-    number
-        .parse::<usize>()
-        .is_ok_and(|layer| (1..=crate::modulation::MAX_MOD_LAYERS).contains(&layer))
+    number.parse::<usize>().is_ok_and(|layer| layer != 0)
         && crate::modulation::is_valid_target(target.as_ref())
 }
 
@@ -756,7 +762,10 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         return false;
     }
     match action {
-        WebAction::Quantized { inner } => valid_action(inner, depth + 1),
+        WebAction::Quantized { inner } => {
+            !matches!(inner.as_ref(), WebAction::SetMediaSafetyMode { .. })
+                && valid_action(inner, depth + 1)
+        }
         WebAction::AddLayer { filename } => valid_identifier(filename, 1024),
         WebAction::AddSpoutLayer { sender } => valid_identifier(sender, 255),
         WebAction::SetLayerParam {
@@ -780,6 +789,34 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         | WebAction::SetLayerVisibility { layer_id, .. }
         | WebAction::SetLayerPaused { layer_id, .. }
         | WebAction::MoveLayer { layer_id, .. } => valid_optional_layer_id(layer_id),
+        WebAction::SetLayerRerollOnLoop { layer_id, .. } => valid_optional_stable_id(layer_id),
+        WebAction::Reroll {
+            scope,
+            index,
+            layer_id,
+            stack_revision,
+            amount,
+            ..
+        } => {
+            amount.is_finite()
+                && (0.0..=2.0).contains(amount)
+                && match scope {
+                    RerollScope::Master => {
+                        index.is_none() && layer_id.is_none() && stack_revision.is_none()
+                    }
+                    RerollScope::Layer => {
+                        index.is_some()
+                            && layer_id.is_some()
+                            && valid_optional_stable_id(layer_id)
+                            && stack_revision.is_none()
+                    }
+                    RerollScope::All => {
+                        index.is_none()
+                            && layer_id.is_none()
+                            && stack_revision.is_some_and(|revision| revision != 0)
+                    }
+                }
+        }
         WebAction::SetParam { param, value }
         | WebAction::SetNtscParam { param, value }
         | WebAction::SetAudio { param, value }
@@ -845,9 +882,9 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && *height > 0
                 && *width <= 8192
                 && *height <= 8192
-                && width
-                    .checked_mul(*height)
-                    .is_some_and(|pixels| pixels <= 33_177_600)
+                && u64::from(*width)
+                    .checked_mul(u64::from(*height))
+                    .is_some_and(|pixels| pixels <= crate::media_safety::SAFE_MEDIA_MAX_PIXELS)
                 && (1..=240).contains(fps)
                 && duration_secs.is_finite()
                 && *duration_secs > 0.0
@@ -949,6 +986,131 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    #[tokio::test]
+    async fn authenticated_websocket_round_trip_dispatches_and_returns_authoritative_state() {
+        let state = WebState::new().expect("test access token");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                control_router(server_state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut request = format!("ws://{address}/ws?key={}", state.access_token)
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_str(&format!("http://{address}")).unwrap(),
+        );
+        let (mut socket, response) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .expect("WebSocket upgrade timed out")
+        .expect("authenticated same-origin WebSocket upgrade");
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+        let initial = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("initial state timed out")
+            .expect("server closed before initial state")
+            .expect("initial WebSocket frame");
+        let ClientMessage::Text(initial) = initial else {
+            panic!("expected initial text state");
+        };
+        let snapshot: crate::web::state::AppSnapshot = serde_json::from_str(&initial).unwrap();
+        assert_eq!(snapshot.msg_type, "state");
+
+        for payload in [
+            r#"{"action":"reset_fx"}"#,
+            r#"{"action":"reset_visual_program"}"#,
+            r#"{"action":"set_routing","index":0,"param":"target","value":"layer17_opacity"}"#,
+            r#"{"action":"set_media_safety_mode","mode":"expert"}"#,
+            r#"{"action":"set_param","param":"brightness","value":0.375}"#,
+        ] {
+            socket
+                .send(ClientMessage::Text(payload.to_string()))
+                .await
+                .unwrap();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.actions.lock().await.len() == 5 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actions did not cross the real WebSocket ingress");
+
+        let mut queued = state.actions.lock().await;
+        assert!(matches!(queued[0], WebAction::ResetFx));
+        assert!(matches!(queued[1], WebAction::ResetVisualProgram));
+        assert!(matches!(
+            &queued[2],
+            WebAction::SetRouting { value, .. } if value == "layer17_opacity"
+        ));
+        assert!(matches!(
+            queued[3],
+            WebAction::SetMediaSafetyMode {
+                mode: crate::media_safety::MediaSafetyMode::Expert
+            }
+        ));
+        assert!(matches!(
+            &queued[4],
+            WebAction::SetParam { param, value }
+                if param == "brightness" && value.as_f64() == Some(0.375)
+        ));
+        let actions = std::mem::take(&mut *queued);
+        drop(queued);
+
+        // Close the loop exercised by a real controller: socket ingress is
+        // drained by the application, dispatched through the production
+        // action handler, published, broadcast, and observed back on the same
+        // authenticated WebSocket as authoritative state.
+        let mut app = crate::App::new(None, None, state.clone());
+        for action in actions {
+            app.handle_web_action(action);
+        }
+        app.push_web_state();
+
+        let returned = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(ClientMessage::Text(message))) => break message,
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("WebSocket failed before returned state: {error}"),
+                    None => panic!("server closed before returned state"),
+                }
+            }
+        })
+        .await
+        .expect("authoritative returned state timed out");
+        let returned: crate::web::state::AppSnapshot = serde_json::from_str(&returned).unwrap();
+        assert_eq!(returned.effects.brightness, 0.375);
+        assert_eq!(
+            returned.media_safety.mode,
+            crate::media_safety::MediaSafetyMode::Expert
+        );
+
+        socket.close(None).await.unwrap();
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn library_filename_validator_accepts_only_exact_safe_media_components() {
@@ -1120,6 +1282,7 @@ mod tests {
             height: 8192,
             fps: 240,
             duration_secs: 1.0,
+            ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
             audio_layer: None,
             audio_layer_id: None,
         };
@@ -1129,10 +1292,31 @@ mod tests {
             height: 1080,
             fps: 60,
             duration_secs: 0.0,
+            ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
             audio_layer: None,
             audio_layer_id: None,
         };
         assert!(!valid_action(&zero_duration, 0));
+        let uhd_area = WebAction::StartExport {
+            width: 3840,
+            height: 2160,
+            fps: 60,
+            duration_secs: 1.0,
+            ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+            audio_layer: None,
+            audio_layer_id: None,
+        };
+        assert!(valid_action(&uhd_area, 0));
+        let above_uhd_area = WebAction::StartExport {
+            width: 4096,
+            height: 2160,
+            fps: 60,
+            duration_secs: 1.0,
+            ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+            audio_layer: None,
+            audio_layer_id: None,
+        };
+        assert!(!valid_action(&above_uhd_area, 0));
         let nested = WebAction::Quantized {
             inner: Box::new(WebAction::Quantized {
                 inner: Box::new(WebAction::Quantized {
@@ -1141,6 +1325,17 @@ mod tests {
             }),
         };
         assert!(!valid_action(&nested, 0));
+
+        let direct_media_mode = WebAction::SetMediaSafetyMode {
+            mode: crate::media_safety::MediaSafetyMode::Safe,
+        };
+        assert!(valid_action(&direct_media_mode, 0));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(direct_media_mode),
+            },
+            0,
+        ));
     }
 
     #[test]
@@ -1154,6 +1349,25 @@ mod tests {
             value: serde_json::json!("layer2_opacity"),
         };
         assert!(valid_action(&valid, 0));
+
+        for target in [
+            "layer17_opacity".to_string(),
+            "layer4096_opacity".to_string(),
+            format!("layer{}_opacity", usize::MAX),
+        ] {
+            let mut dynamic = valid.clone();
+            if let WebAction::SetRouting { value, .. } = &mut dynamic {
+                *value = serde_json::json!(target);
+            }
+            assert!(valid_action(&dynamic, 0));
+        }
+        for target in ["layer0_opacity", "layer184467440737095516160_opacity"] {
+            let mut invalid = valid.clone();
+            if let WebAction::SetRouting { value, .. } = &mut invalid {
+                *value = serde_json::json!(target);
+            }
+            assert!(!valid_action(&invalid, 0));
+        }
 
         let malformed_route = WebAction::SetRouting {
             index: 0,
@@ -1204,6 +1418,99 @@ mod tests {
             value: serde_json::json!("brightness"),
         };
         assert!(valid_action(&legacy_master, 0));
+    }
+
+    #[test]
+    fn reroll_scope_identity_revision_amount_and_loop_actions_are_strictly_validated() {
+        fn reroll(
+            scope: RerollScope,
+            index: Option<usize>,
+            layer_id: Option<&str>,
+            stack_revision: Option<u64>,
+            amount: f32,
+        ) -> WebAction {
+            WebAction::Reroll {
+                scope,
+                index,
+                layer_id: layer_id.map(str::to_owned),
+                stack_revision,
+                seed: None,
+                mode: crate::web::state::RerollMode::Pattern,
+                amount,
+                include_grain_controls: false,
+            }
+        }
+
+        assert!(valid_action(
+            &reroll(RerollScope::Master, None, None, None, 0.0),
+            0
+        ));
+        assert!(valid_action(
+            &reroll(RerollScope::Master, None, None, None, 2.0),
+            0
+        ));
+        for invalid in [
+            reroll(RerollScope::Master, Some(0), None, None, 0.7),
+            reroll(RerollScope::Master, None, Some("22"), None, 0.7),
+            reroll(RerollScope::Master, None, None, Some(9), 0.7),
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
+
+        assert!(valid_action(
+            &reroll(RerollScope::Layer, Some(3), Some("22"), None, 0.7),
+            0
+        ));
+        for invalid in [
+            reroll(RerollScope::Layer, None, Some("22"), None, 0.7),
+            reroll(RerollScope::Layer, Some(3), None, None, 0.7),
+            reroll(RerollScope::Layer, Some(3), Some("layer-22"), None, 0.7),
+            reroll(RerollScope::Layer, Some(3), Some("0"), None, 0.7),
+            reroll(RerollScope::Layer, Some(3), Some("22"), Some(9), 0.7),
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
+
+        assert!(valid_action(
+            &reroll(RerollScope::All, None, None, Some(9), 0.7),
+            0
+        ));
+        for invalid in [
+            reroll(RerollScope::All, None, None, None, 0.7),
+            reroll(RerollScope::All, None, None, Some(0), 0.7),
+            reroll(RerollScope::All, Some(0), None, Some(9), 0.7),
+            reroll(RerollScope::All, None, Some("22"), Some(9), 0.7),
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
+
+        for amount in [-0.001, 2.001, f32::NAN, f32::INFINITY] {
+            assert!(!valid_action(
+                &reroll(RerollScope::Master, None, None, None, amount),
+                0
+            ));
+        }
+
+        for layer_id in [None, Some("22")] {
+            assert!(valid_action(
+                &WebAction::SetLayerRerollOnLoop {
+                    index: 3,
+                    layer_id: layer_id.map(str::to_owned),
+                    enabled: true,
+                },
+                0
+            ));
+        }
+        for layer_id in ["", "0", "layer-22", "22\n"] {
+            assert!(!valid_action(
+                &WebAction::SetLayerRerollOnLoop {
+                    index: 3,
+                    layer_id: Some(layer_id.into()),
+                    enabled: false,
+                },
+                0
+            ));
+        }
     }
 
     #[test]

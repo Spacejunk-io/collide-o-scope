@@ -347,7 +347,7 @@ pub fn save_patch(
     ntsc_params: &NtscParams,
     mod_matrix: &crate::modulation::ModMatrix,
     temporal: &crate::effects::params::TemporalParams,
-    master_paused: bool,
+    transport: super::PatchTransportState,
     morph: &crate::morph::Morph,
 ) {
     let patch = PatchState::capture(
@@ -356,7 +356,7 @@ pub fn save_patch(
         ntsc_params,
         mod_matrix,
         temporal,
-        master_paused,
+        transport,
         morph,
     );
     let yaml = serde_yaml::to_string(&patch).unwrap_or_default();
@@ -372,24 +372,80 @@ pub fn save_patch(
     }
 }
 
-/// Pick and parse a patch via the native dialog. Layer reconstruction needs
-/// the renderer device and is therefore performed by `App`; returning the
-/// source path also lets it resolve clips stored beside the patch.
-pub fn load_patch() -> Option<(PatchState, std::path::PathBuf)> {
-    let path = rfd::FileDialog::new()
+/// Pick and parse a patch via the native dialog. Cancellation is distinct from
+/// parse/read failure so browser and keyboard callers can report honestly.
+pub fn choose_patch() -> Result<Option<(PatchState, std::path::PathBuf)>, String> {
+    let Some(path) = rfd::FileDialog::new()
         .add_filter("YAML", &["yaml", "yml"])
-        .pick_file()?;
-    match std::fs::read_to_string(&path) {
-        Ok(yaml) => match serde_yaml::from_str::<PatchState>(&yaml) {
-            Ok(patch) => Some((patch, path)),
-            Err(e) => {
-                eprintln!("Failed to parse patch: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("Failed to read file: {e}");
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    load_patch_path(&path).map(|patch| Some((patch, path)))
+}
+
+/// Parse a specific patch path through the same bounded semantic entry point
+/// used by the native picker.
+pub fn load_patch_path(path: &std::path::Path) -> Result<PatchState, String> {
+    let yaml = std::fs::read_to_string(path)
+        .map_err(|error| format!("read patch {}: {error}", path.display()))?;
+    serde_yaml::from_str::<PatchState>(&yaml)
+        .map_err(|error| format!("parse patch {}: {error}", path.display()))
+}
+
+/// Compatibility wrapper retained for existing native callers.
+#[allow(dead_code)]
+pub fn load_patch() -> Option<(PatchState, std::path::PathBuf)> {
+    match choose_patch() {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("Failed to load patch: {error}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_PATCH: AtomicU64 = AtomicU64::new(0);
+
+    struct TempPatch(std::path::PathBuf);
+
+    impl TempPatch {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP_PATCH.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "collide-o-scope-patch-test-{}-{sequence}.yaml",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TempPatch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn load_patch_path_accepts_legacy_media_freeze_shape() {
+        let path = TempPatch::new();
+        std::fs::write(&path.0, "master: {}\nlayers: []\nmaster_paused: true\n").unwrap();
+
+        let legacy = load_patch_path(&path.0).unwrap();
+        assert!(legacy.master_paused);
+        assert!(!legacy.media_frozen);
+
+        std::fs::write(
+            &path.0,
+            "master: {}\nlayers: []\nmaster_paused: false\nmedia_frozen: true\n",
+        )
+        .unwrap();
+        let current = load_patch_path(&path.0).unwrap();
+        assert!(!current.master_paused);
+        assert!(current.media_frozen);
     }
 }

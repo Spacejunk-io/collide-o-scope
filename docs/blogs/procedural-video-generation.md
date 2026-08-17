@@ -26,7 +26,8 @@ and what still needs evidence.
 | clip luminance/color/motion statistics | deferred | motion statistics require bounded multi-frame decoding and a persistent cache; they are not “almost free” |
 | second-order markov names from two-word phrases | replaced | two-word examples cannot train a genuine second-order model; a weighted finite grammar is honest and deterministic |
 | visual-parameter-driven audio DSP | research gate | the current exporter promises explicit 1x media-audio muxing; pitch shift, convolution, dynamics, smoothing, and loudness need a real DSP contract |
-| automatic batch video rendering | deferred one stage | version one generates reviewable patches and manifests without monopolizing the live GPU or hiding expensive failures |
+| content-aware source identity and preflight | implemented in generator v2 | bounded SHA-256 fingerprinting removes host paths from canonical identity and produces a reviewable receipt before commit |
+| automatic batch video rendering | still deferred | v2 prepares reviewable patches, manifests, and receipts but does not yet own a cancellable budgeted GPU render session |
 
 ---
 
@@ -57,7 +58,7 @@ they already have a useful visual logic.
 a patch is not a vector of interchangeable floats. it contains continuous,
 circular, logarithmic, quantized, categorical, boolean, and structural values.
 source identity, layer order, visibility, pause state, and routing topology are
-composition—not noise—and are preserved by version one.
+composition—not noise—and are preserved by the generator.
 
 for a bounded continuous parameter, the generator uses an OU-inspired reflected
 AR(1) step around the anchor:
@@ -73,6 +74,11 @@ samples at zero and one. hue, slit angle, and LFO phase wrap on a circle instead
 speed, downsample fraction, pixel size, and cellular scale move in log space.
 pixel/posterize/FPS values are quantized after movement. blend algorithms and
 booleans change through rare transitions, not float arithmetic.
+
+the seeded block Shift participates without becoming arbitrary topology:
+amount, density, and speed use bounded linear steps, block size uses the
+reflected log-space walk, and the existing pattern seed determines each band's
+arrangement. amount zero remains the exact pre-Shift shader path.
 
 the walk is sequential and mean-reverting: siblings have local continuity but
 do not drift without bound. temperature is finite and constrained to 0–2. at
@@ -91,18 +97,29 @@ change a patch.
 
 ---
 
-### command-line generation
+### command-line generation and source preflight
 
-version one is deliberately patch-only:
+generator v2 is deliberately patch-only:
 
 ```powershell
 target\release\collide-o-scope.exe generate `
   --anchor patches\anchor.yaml `
   --output generated `
+  --library path\to\media `
   --count 10 `
   --temperature 0.5 `
-  --seed 424242
+  --seed 424242 `
+  --max-fingerprint-bytes 68719476736
 ```
+
+`--library` is optional and adds one host-local resolution root. the anchor's
+directory remains the other root. `--max-fingerprint-bytes` bounds total file
+bytes read during one invocation and defaults to 64 GiB; the resolver also caps
+content-search inspection at 4,096 directory entries. `--allow-unverified-sources`
+is an explicit degradation: an unavailable file is reduced to its logical name,
+`identity_complete` becomes false, and the receipt records a privacy-safe warning.
+it does not pretend that missing bytes were verified. `--allow-black-sources`
+remains separately required for Spout's deterministic-black offline policy.
 
 `--count` is bounded to 1–256. every piece is committed to its own new directory:
 
@@ -111,25 +128,52 @@ generated/
   0001-grid-lattice-00067932/
     patch.yaml
     manifest.json
+    preflight.json
 ```
 
-output is no-overwrite. each directory is assembled under a sibling temporary
-name, its files are flushed, and the directory is committed with an
-operating-system no-replace rename. all names and serializations are preflighted
-before the first commit. the transaction boundary is one piece—not the whole
-invocation—so an exceptional later storage failure does not erase already
-committed work; the returned error names those paths explicitly. rerunning the
-same command into a clean directory yields byte-identical YAML and manifest files.
+output is no-overwrite. the three files are assembled under a sibling temporary
+directory, flushed, and committed together with an operating-system no-replace
+rename. all known names and serializations are preflighted before the first
+piece commits, so a known later name conflict cannot produce a misleading
+partial invocation. the transaction boundary is one piece—not the whole
+invocation—so an exceptional later storage failure can leave already committed
+piece directories; the returned error names them. rerunning the same command
+into a clean directory yields byte-identical YAML, manifest, and preflight files.
 
-the manifest records a schema version, generator algorithm version, seed, index,
-temperature, deterministic title/slug, canonical-anchor FNV-1a digest, lineage,
-logical source names, and warnings. it deliberately excludes local absolute media
-paths.
+the v2 manifest retains the v1 FNV field for deserialization compatibility, but
+the authoritative identity is SHA-256 over normalized patch JSON with a
+versioned domain prefix. before hashing, file paths are replaced by content
+references of the form `cos-sha256://<sha256>/<byte-length>` and filenames are
+reduced to logical names. `anchor_sha256`, each `piece_sha256`, and lineage are
+therefore path-independent: moving the same media and anchor to another root
+does not change them, while changing source bytes does. the manifest records
+schema and generator versions, the canonical-identity algorithm,
+seed/index/temperature, deterministic title/slug, logical source roles, byte
+lengths and SHA-256 values, identity completeness, and warnings. it never
+records local absolute paths, timestamps, or other private filesystem metadata.
 
-this manifest proves patch-generation replay, not universal pixel identity. a
-future artifact manifest must additionally record media content digests, export
-settings, application/build identity, FFmpeg identity, and relevant GPU/backend
-facts. “same library” is too vague when two different files can share a name.
+`preflight.json` is a deterministic receipt for the same anchor/piece hashes and
+source inventory. it records the fingerprint/search limits, unique verified
+file count and bytes, status, warnings, and the deliberately narrow claim scope
+`canonical_configuration_and_source_bytes`. `pixel_identity_claimed` is false:
+the receipt does not capture application/build identity, export settings,
+FFmpeg, GPU/backend behavior, or a rendered-artifact digest.
+
+the resolver is shared by exact visual patch loading, offline visual-source
+reconstruction, and imported analysis-audio reconstruction. ordinary patches
+retain their compatible path-first behavior. a `cos-sha256://` reference is
+stricter: a candidate must match both recorded length and SHA-256 before use;
+same-named but different bytes are rejected. fingerprinting streams through a
+fixed 1 MiB buffer, reuses a per-invocation canonical-path cache, detects a file
+that changes during hashing, and never recursively searches or follows a
+directory symlink. this makes source identity portable without making file I/O
+unbounded.
+
+the live application retains that content reference separately from its
+resolved host path. later capture/save therefore preserves the portable
+identity, and UI export uses the resolved path only as a transient candidate
+that is re-fingerprinted against the expected digest. a same-length mutation
+after load is rejected rather than silently exported.
 
 ---
 
@@ -230,7 +274,7 @@ the next acceptable design is a bounded analysis worker with:
 5. explicit unknown/error states;
 6. measured scan-time and memory budgets.
 
-until then, version one preserves the anchor's source assignments rather than
+until then, the generator preserves the anchor's source assignments rather than
 pretending it can make informed random pairings.
 
 ---
@@ -264,15 +308,21 @@ pad when short, trim when long, and remain independent of visual speed/pause.
 ### next build order
 
 1. **implemented:** bounded atomic patch capture.
-2. **implemented:** deterministic typed generator, weighted titles, and manifests.
+2. **implemented:** deterministic typed generator, weighted titles, v2 manifests,
+   and content-aware preflight receipts.
 3. **implemented:** bounded cellular/Worley effect across live and offline paths.
-4. **next:** shared, content-aware source resolution and stronger artifact hashes.
-5. **then:** cancellable sequential batch rendering with explicit GPU/time/disk budgets.
+4. **implemented:** shared digest-enforcing source resolution and path-independent
+   canonical patch hashes.
+5. **then:** cancellable sequential MP4 batch rendering with explicit
+   GPU/time/disk budgets and artifact receipts.
 6. **then:** bounded clip statistics and a curation view, after profiling.
 7. **research branch:** opt-in audio DSP, only after the signal contract and tests.
 
 the closed-system ambition survives, but in layers. a generated patch can already
-be replayed, inspected, edited, and rendered. titles and lineage are deterministic.
+be replayed, inspected, edited, and rendered explicitly. titles, lineage, source
+identity, and preflight receipts are deterministic. generation does not yet
+render MP4 batches, compute clip statistics, or transform audio through the
+research DSP mappings.
 the shader adds a new organic cellular vocabulary without compromising fixed-cost
 rendering. audio becomes part of the same generative system only when its behavior
 is as explicit and verifiable as the image path.

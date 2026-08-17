@@ -1,7 +1,7 @@
 # Collide-o-Scope developer notes
 
 Native Rust VDJ instrument. It decodes video or receives live Spout frames,
-composites up to 16 layers with GPU effects, exposes browser controls, and can
+composites a dynamic layer stack with GPU effects, exposes browser controls, and can
 render a saved patch offline.
 
 ## Stack
@@ -15,7 +15,7 @@ render a saved patch offline.
 - **midir** — MIDI CC and clock input
 - **spout2-rs** — Windows Spout sender and receiver
 - **axum + tokio** — HTTP/HTTPS panel and WebSocket state/action protocol
-- **egui** — native preview shell and patch parameter editor
+- **egui** — native preview/recovery shell and patch parameter editor
 
 The `ffmpeg-next = "8"` crate must match the installed FFmpeg major.
 
@@ -23,7 +23,9 @@ The `ffmpeg-next = "8"` crate must match the installed FFmpeg major.
 
 ```text
 src/
-├── main.rs              winit loop, app state, web actions, patch reconstruction
+├── main.rs              winit loop, recovery strip, app state, web actions, patch reconstruction
+├── media_safety.rs      Safe/Expert source planning, device bounds, reservations
+├── media_source.rs      shared resolution, bounded SHA-256 fingerprinting, content references
 ├── renderer/state.rs    wgpu passes, temporal state, async readbacks/output blits
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
 ├── video/threaded.rs    request-driven decoder, first-frame seed, latest-only mailbox
@@ -37,7 +39,7 @@ src/
 ├── spout_in.rs          newest-frame-wins live receiver worker
 ├── spout_out.rs         bounded/drop-new output worker
 ├── patch/               YAML model, capture/apply, editor and file dialogs
-├── procedural.rs        deterministic typed patch walk, manifests, capture worker
+├── procedural.rs        deterministic typed patch walk, manifests/preflight, capture worker
 ├── render_export.rs     deterministic offline renderer and optional audio mux
 ├── web/                 panel server, protocol snapshots/actions, embedded assets
 ├── input/keyboard.rs    key-to-action mapping
@@ -158,18 +160,88 @@ helpers where possible. Time-dependent offline behavior must derive from
   coalesces older absolute values for the same semantic control, reserves
   admission for safety/release actions, and broadcasts a complete
   `AppSnapshot`. Do not replace it with an unbounded collection.
-- The **thumbnail worker** invokes FFmpeg outside the render path.
+- **Thumbnail/preview helpers** invoke FFmpeg outside the render path only after
+  a metadata probe and `MediaSafetyPolicy` plan. Keep candidates, elapsed time,
+  captured stdout/stderr, and concurrency bounded; Safe admits at most four
+  thumbnail and two preview helpers, while Expert serializes each class. Every
+  helper retains its source reservation and is killed/reaped when its library
+  generation becomes stale, without suspending its absolute deadline. Keep
+  output within 180×180 and 512 KiB per JPEG, and charge both caches against the
+  shared 64 MiB retained-byte budget on insert, replacement, deletion, and
+  folder clear. The entire scan pipeline is guarded process-wide; every rescan
+  advances the library generation so repeated requests replace rather than
+  multiply the documented helper fan-out.
+- The native **RECOVERY** strip is a browser-independent control path. Collect
+  its absolute actions during egui construction, then dispatch them through the
+  same App handler after queued browser actions and before sampling ProgramClock
+  for the frame. This gives a deterministic local-last result without inserting
+  native actions into browser ingress. Listener lifecycle and browser receiver
+  count are separate facts; never infer bind health from receiver count. Keep
+  output and media-source status visible in the second recovery row. The strip
+  is preview-only and must remain absent from every audience surface.
+- `rfd` library-folder selection is modal on the render/event thread. Pause the
+  program clock for the dialog, then restore its prior pause state and rebase
+  frame, modulation, decoder, and Spout timing so dialog wall time cannot become
+  catch-up debt. Cancellation is a no-op. A committed folder switch advances
+  `library_generation`, clears basename-keyed thumbnail/preview caches, updates
+  the shared upload target, and starts scans under the new generation. Workers
+  must recheck that generation while holding the cache-write lock.
 
-## Layer sources and limits
+## Layer sources and resource bounds
 
-`MAX_MOD_LAYERS` is 16. Do not raise the app's layer limit without also making
-every layer index available to `target_range` and the panel target list.
+The stack has no fixed layer-count policy. Layer, patch, morph, compositor, and
+modulation storage are dynamic, and every current index must remain available
+to `target_range` and the panel target list. Preserve the independent source,
+decoded-image, GPU-adapter, output-size, route-count, and selective-VHS memory
+bounds; they report concrete resource failures instead of silently imposing a
+topology ceiling.
+
+Source admission is governed by the process-local `MediaSafetyPolicy`:
+
+- `Safe` is the launch default and preserves the exact legacy per-source limit
+  of 8,294,400 pixels / 33,177,600 RGBA bytes (3840×2160 area), plus the 16,384
+  px absolute edge and any known device texture-edge/per-buffer limits.
+- `Expert` affects future video, still, and Spout allocations only. Its absolute
+  source ceiling is DCI-8K area: 35,389,440 pixels / 141,557,760 RGBA bytes,
+  still intersected with every edge and device limit above.
+- An above-Safe plan reserves a conservative combined CPU/GPU working-set
+  weight: 4× RGBA for video or Spout and 6× for a still. Aggregate reservations
+  cannot exceed `min(detected_physical_memory / 8, 2 GiB)`. Safe-sized sources
+  retain legacy behavior and reserve zero Expert bytes. The reservation must
+  live as long as the accepted above-Safe source and release on Drop.
+- `wgpu` exposes capability limits but no portable live/free-VRAM budget. Never
+  relabel the host-memory reservation as VRAM detection or allocation proof;
+  keep actual GPU texture/buffer creation and queue uploads inside recoverable
+  Validation/Internal/OutOfMemory scopes. Only mark a source frame initialized
+  after those scopes return cleanly, and propagate failures to layer/export
+  status.
+- Changing back to Safe governs future plans and must not invalidate accepted
+  sources. The mode is intentionally absent from patches and starts Safe again
+  in a new process.
+
+This override applies to source admission, not program surfaces. Renderer,
+fullscreen-output, and export-output dimensions retain their established UHD-
+area validation. The 320 MiB incremental selective-VHS budget is an independent
+pipeline bound and must not be raised by Expert mode.
+
+Before the initial media file influences preview dimensions, probe only its
+metadata under Safe policy. A rejected probe uses 1280×720. If renderer creation
+at an otherwise admitted source size fails, drop that window and make one
+1280×720 recovery attempt; publish the recovery through `output_error` and the
+native strip. Never loop retries or turn Expert source admission into a larger
+program-surface policy.
 
 `LayerSource` distinguishes request-driven video, immutable still image, and a
-live `SpoutIn`. Every layer keeps a stable `source_path`:
+live `SpoutIn`. Every live layer keeps a stable `source_path`:
 
 - video/still: canonical file path when available, otherwise the supplied path;
 - Spout: `spout://<sanitized-sender-name>`.
+
+A persisted procedural `LayerConfig` may instead carry path-independent
+`cos-sha256://<sha256>/<byte-length>`. The constructed live file layer keeps
+that identity separately from the resolved canonical runtime path: capture and
+save emit the retained identity, while export uses the runtime path only as a
+candidate that must still satisfy the recorded length and digest.
 
 PNG/JPEG/BMP/WebP stills decode once to bounded straight-alpha RGBA, publish
 exactly one upload, and have no transport clock. Live and offline rendering
@@ -204,14 +276,15 @@ layer-numbered modulation routes do not slide onto another source.
 ## Modulation
 
 The static `TARGETS` table covers continuous master, NTSC, temporal, and morph
-values. `target_range` additionally recognizes `layer1_…` through
-`layer16_…` for:
+values. `target_range` additionally recognizes every positive, parseable
+`layerN_…` index for:
 
 - opacity, speed, and target FPS;
 - static key threshold/softness, RGB target, and chroma tolerance;
 - pixelate, RGB split, hue, saturation, brightness, contrast, posterize;
 - grain intensity/size, vignette, color drift;
 - breathing scale/rotation/position;
+- Shift amount/block size/density/speed;
 - downsample;
 - cellular amount/scale/warp/speed and gap amount/threshold/softness.
 
@@ -222,8 +295,10 @@ per frame. `MAX_ROUTINGS` is 64.
 
 Compile each route destination when the routing changes; never parse
 `layerN_*`, format target names, or search the target table at frame rate.
-`ModMatrix::frame()` performs one O(routes) accumulation into fixed indexed
-storage. Its immutable `ModulationFrame` is the sole per-frame source for the
+`ModMatrix::frame(layer_count)` performs one O(routes) accumulation into
+caller-sized indexed storage. Out-of-stack targets remain dormant and must not
+cause allocation proportional to their authored index. Its immutable
+`ModulationFrame` is the sole per-frame source for the
 Morph offset, master/NTSC/Temporal copies, layer transport, and the batched
 layer-effect copies. Morph materializes first at the sampled beat; the remaining
 offsets then operate around those materialized bases. Pause freezes clock,
@@ -303,6 +378,11 @@ so equal endpoint values remain equal. Glides use beat durations, can be
 retargeted continuously, and serialize as remaining movement rather than an
 absolute live-clock origin.
 
+Shift's four continuous values follow the same slot and ownership law. Runtime
+pattern seeds remain intentionally outside Morph slots, so a pattern-only
+reroll can rearrange Shift without rewriting or interpolating its captured
+controls; Bounded variation follows the ordinary owned-base transfer law.
+
 The morph target is itself routable. Before capture, materialize the effective
 Morph result at the authoritative beat, including the current Morph-route
 offset; all other route offsets remain transient. A capture action is an
@@ -359,6 +439,13 @@ the shader uniform layout tests current when changing temporal uniforms.
 - The disabled cellular branch must skip its fixed 3×3 Worley search. Feature
   points remain bounded within cells, use integer hashing and smooth target
   interpolation, and keep live/export effect time anchored to patch generation.
+- Shift partitions output-space Y into 2–256 px bands, gates them by a hash of
+  band, discrete program-time epoch, and `random_seed`, and wraps horizontal
+  displacement at no more than 25% of width. Preserve the explicit amount-zero
+  branch as the exact established sampling path. Its four controls are finite
+  and clamped, patch/Morph/modulation/Dice aware at master and layer scope, and
+  must use the same shader and frame-indexed time in export. Domain-separate
+  Shift's bounded-variation RNG so adding it does not perturb older Dice streams.
 - A fullscreen triangle computes UVs from `vertex_index`.
 - Static keying at layer and program scope supports Off, Keep Bright, Keep
   Dark, Remove Chroma, and Keep Chroma. Luminance modes use threshold/softness;
@@ -399,20 +486,89 @@ serializes the complete `PatchState` as YAML; the native editor intentionally
 edits the live master/layer parameter subset rather than presenting itself as
 a full YAML text editor.
 
-After a patch has rebuilt and validated its complete layer stack, commit new
-topology and visual generations. Clear both the immediate web queue and the
-downbeat-latched queue, advance `layer_stack_revision` and the application
-visual epoch, clear renderer temporal history and retained NTSC output, and
-invalidate pending readbacks so downstream Spout/NTSC consumers reject work
-from the previous patch. Do not reset the current world before reconstruction
-succeeds.
+The native preview also owns the browser-independent **RECOVERY** strip: truthful
+panel-listener state and browser count, the exact authenticated loopback link,
+absolute Freeze Program and Blackout setters, broad `ResetVisualProgram`, and
+active-library Choose/Rescan. Its second row carries non-empty `output_error`
+and media-source status. Hide it whenever single-monitor Output reuses the main
+surface. A dedicated output surface is already clean and may leave the strip on
+the preview. Folder selection is host-local and is not an arbitrary remote
+filesystem action; choosing or rescanning a folder does not add a layer.
+
+Before `patch.apply`, rebuild and validate the complete layer stack and stage
+saved imported analysis audio through full decode. Missing/corrupt visual or
+audio input rejects the snapshot without changing live master/audio/topology or
+generations; a legacy patch with no modulation section preserves current audio
+state. After commit, clear the immediate web queue, downbeat-latched queue, and
+already-drained action-batch remainder; advance `layer_stack_revision` and the
+application visual epoch, clear renderer temporal history and retained NTSC
+output, and invalidate pending readbacks so downstream Spout/NTSC consumers
+reject work from the previous patch.
+
+A successful Apply Look has a narrower barrier. Filter conflicting master,
+mapped-layer, reroll, all topology, and present NTSC/Temporal actions from the
+drained remainder plus immediate/latched queues, including work admitted while
+the native dialog was open. Preserve unrelated transport/safety, unmapped-layer,
+and omitted-section actions in order. Cancel/error/stale look selection is not a
+barrier.
 
 Backward compatibility rules matter:
 
 - no `modulation` section leaves the existing matrix untouched;
 - old layers without `source_path` resolve by library filename;
 - old temporal `slit_axis` values map to 0° or 90°;
+- legacy `reset_fx` resets only direct master effect uniforms; the bundled
+  panel uses `reset_visual_program` for the broader master-program revert;
+- absent Shift fields mean amount 0, block size 8 px, density 0.5, and speed 3,
+  preserving the exact pre-Shift visual path;
+- no media-safety field means Safe; media mode is process-local rather than
+  patch-persistent, so an untrusted or legacy patch cannot enable Expert;
 - new finite/clamp defaults reject NaN/overflow without panicking.
+
+## Procedural generation and source identity
+
+`media_source` is the single resolver for exact visual patch load, offline
+visual reconstruction, and imported analysis-audio reconstruction. Preserve
+ordinary patch compatibility: try an explicit path, patch-relative and active-
+library logical names first. A `cos-sha256://<sha256>/<bytes>` reference is a
+different contract: accept only a file with the recorded length and SHA-256,
+including a bounded non-recursive search of patch/library roots. Never let a
+same-named mismatch satisfy a content reference.
+Do not collapse a resolved content reference back into a host path. Visual
+layers and imported analysis audio retain the persisted reference separately;
+capture/save emits it, and UI export passes any live resolved path only as a
+transient hint alongside the expected identity. Re-fingerprint that hint so a
+post-load mutation cannot bypass provenance, including for patch-adjacent files
+outside the active library.
+
+Fingerprinting uses a fixed 1 MiB streaming buffer, per-invocation canonical-
+path cache, cancellation checks, before/after metadata consistency, at most
+4,096 searched entries, and a default 64 GiB total-read budget. Generation's
+`--max-fingerprint-bytes` may lower or raise that invocation budget explicitly;
+zero is invalid. Operational paths and filesystem metadata must not enter
+shareable manifests or receipts.
+
+Generator v2 normalizes the anchor, replaces verified file sources with content
+references, reduces filenames to logical names, and hashes version-prefixed
+canonical JSON with SHA-256. `anchor_sha256`, `piece_sha256`, and lineage must be
+path-independent and source-byte-sensitive. Schema-v2 manifests retain defaulted
+v1 fields for deserialization compatibility. Each generated piece stages
+`patch.yaml`, `manifest.json`, and deterministic `preflight.json`, then commits
+the directory no-replace; preflight all known names and serializations before
+the first commit. The receipt claims canonical configuration and source bytes,
+sets `pixel_identity_claimed` false, and records exact limits and warnings.
+
+The CLI accepts optional `--library`, `--max-fingerprint-bytes`, and
+`--allow-unverified-sources`. The last is an explicit incomplete-identity mode:
+preserve only a logical name, set `identity_complete` false, and emit a privacy-
+safe warning. It is independent from `--allow-black-sources`, which acknowledges
+Spout's deterministic-black offline policy.
+
+Generation remains patch-only. Do not claim that it batch-renders MP4s or that
+its preflight receipt is an artifact/pixel proof. A cancellable sequential GPU
+session with time/disk budgets and artifact receipts is still deferred; bounded
+clip statistics/cache work follows profiling; visual-parameter audio DSP remains
+research-gated behind a defined signal, smoothing, loudness, and test contract.
 
 ## Offline export
 
@@ -421,6 +577,12 @@ beat, route slew, pad spring, morph glide, layer transport, temporal history,
 and frame counts from the selected FPS. Live audio/MIDI values are zero.
 Unavailable/missing/live sources become deterministic black placeholders at
 their original source indices.
+
+Source reconstruction may use the current host's media policy and must retain
+any above-Safe reservation for the export lifetime. This does not authorize a
+larger export target: `validate_export_dimensions` keeps the established UHD-
+area output boundary. Selective export keeps its separate staging/working-set
+checks. Do not describe Expert as an 8K-output or native-VHS-budget override.
 
 Selective VHS export uses the shared planner and persistent NTSC processor
 synchronously. Render contributing slices after local effects and conditional
@@ -470,6 +632,24 @@ fullscreen output window. Keep the checkbox synchronized to the renderer's
 actual surface state and show creation/surface errors instead of implying that
 an unavailable output is open.
 
+`AppSnapshot::media_safety` is additive and defaults to Safe when absent. The
+bundled panel sends the idempotent, immediate
+`set_media_safety_mode { mode: "safe" | "expert" }` action; never make this a
+beat-latched creative control. Publish the effective area/byte/device/host-plan
+limits and reservation totals so the visible rationale remains authoritative.
+Do not publish or invent a portable free-VRAM figure. Switching to Safe changes
+future allocations only.
+
+Live NTSC diagnostics remain path-specific. For both the global and selective
+paths, `attempted` counts admission decisions, `accepted` counts admitted work,
+`skipped` counts only healthy Busy backpressure, and `unavailable` separately
+counts a disconnected/failed worker. `stale` counts an accepted asynchronous
+result rejected later by the current visual-generation, topology, or path gate.
+Use saturating counters. The active-path and busy fields are presentation
+context; absent metric data defaults to zero and off. These metrics exclude
+synchronous export and do not claim that every accepted result reached an
+audience surface.
+
 The panel uses fixed functional columns on desktop and one column under 900
 px. Layer reordering sends one atomic `move_layer` on release. Range controls
 support double-click/double-tap reset, and group reset buttons send explicit
@@ -506,7 +686,20 @@ mislead browser tests.
 - Browser QA must include desktop and narrow viewports, touch/pointer release,
   multi-controller stale-topology rejection, token and foreign-Origin denial,
   direct layer FPS/effects, reorder, beat latch, input configurations,
+  media-safety rationale/confirmation/reconciliation, NTSC path metrics,
   patch/parameter-editor state, and export.
+- Media-policy tests must cover Safe legacy acceptance/rejection, every Expert
+  hard/device/aggregate bound, reservation release, missing host-memory data,
+  non-persistence, and output/export-output non-expansion. Static panel tests
+  must preserve accessible labels/descriptions and keep fast NTSC counters out
+  of a live announcement region.
+- Shift tests must preserve the amount-zero shader branch and uniform layout,
+  old-seed Dice streams, bounded deterministic variation, patch defaults,
+  Morph/modulation wiring, resets, static controls, and a labeled export case.
+- Source-identity tests must cover cross-root canonical equality, changed-byte
+  inequality, digest-enforcing load/export resolution, fingerprint/search
+  budgets and cancellation, v1 manifest compatibility, private-path absence,
+  and three-file atomic no-overwrite generation.
 - Windows Spout requires real sender and receiver applications; use
   `spout_probe` for the output side.
 
@@ -523,6 +716,11 @@ a passing claim.
   offline.
 - Audio exposes 3–8 routable bands; the compact 32-bin spectrum remains
   display-only telemetry.
+- Portable wgpu exposes no live/free-VRAM budget. Expert media status reports a
+  conservative host plan and capability limits, not detected VRAM headroom.
+- Procedural generation emits patches/manifests/preflight receipts only; MP4
+  batch rendering, clip-statistics curation, and visual-driven audio DSP remain
+  explicit deferred/research boundaries.
 - Physical MIDI, phone, audio-interface, Spout-host, and multi-monitor proof is
   separate from software tests.
 - Upstream original code has no blanket MIT grant; `LICENSE` only covers the

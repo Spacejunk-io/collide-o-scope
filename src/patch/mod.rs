@@ -35,6 +35,15 @@ fn default_cellular_gap_threshold() -> f32 {
 fn default_cellular_gap_softness() -> f32 {
     0.08
 }
+fn default_shift_block_size() -> f32 {
+    8.0
+}
+fn default_shift_density() -> f32 {
+    0.5
+}
+fn default_shift_speed() -> f32 {
+    3.0
+}
 fn default_key_color() -> [f32; 3] {
     [0.0, 1.0, 0.0]
 }
@@ -106,6 +115,30 @@ pub fn param_meta(name: &str) -> Option<ParamMeta> {
             min: 0.05,
             max: 1.0,
             desc: "render resolution fraction",
+        }),
+        "shift_amount" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "horizontal block displacement mix",
+        }),
+        "shift_block_size" => Some(ParamMeta {
+            step: 1.0,
+            min: 2.0,
+            max: 256.0,
+            desc: "horizontal band height in pixels",
+        }),
+        "shift_density" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "fraction of bands displaced per epoch",
+        }),
+        "shift_speed" => Some(ParamMeta {
+            step: 0.25,
+            min: 0.0,
+            max: 20.0,
+            desc: "deterministic pattern epochs per second",
         }),
         "cellular_amount" => Some(ParamMeta {
             step: 0.05,
@@ -247,6 +280,9 @@ pub struct PatchState {
     pub layers: Vec<LayerConfig>,
     #[serde(default)]
     pub master_paused: bool,
+    /// Hold file/Spout source images while program clocks and effects continue.
+    #[serde(default)]
+    pub media_frozen: bool,
     #[serde(default)]
     pub ntsc: Option<NtscConfig>,
     #[serde(default)]
@@ -255,6 +291,20 @@ pub struct PatchState {
     pub temporal: Option<TemporalConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub morph: Option<crate::morph::MorphStateSnapshot>,
+}
+
+/// Transport fields captured alongside a full patch snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchTransportState {
+    pub master_paused: bool,
+    pub media_frozen: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LookApplySummary {
+    pub mapped_layers: usize,
+    pub unused_patch_layers: usize,
+    pub untouched_live_layers: usize,
 }
 
 /// Serializable temporal (feedback/slit-scan) parameters for patch files.
@@ -426,6 +476,8 @@ pub struct LfoConfig {
     pub beats: f32,
     #[serde(default)]
     pub phase: f32,
+    #[serde(default)]
+    pub seed: u32,
 }
 
 fn default_shape() -> String {
@@ -532,6 +584,7 @@ impl ModConfig {
                     shape: l.shape.as_str().to_string(),
                     beats: l.beats,
                     phase: l.normalized_phase(),
+                    seed: l.seed,
                 })
                 .collect(),
             routings: m
@@ -552,7 +605,10 @@ impl ModConfig {
             audio_device: m.audio_device.clone(),
             audio_source_kind: crate::modulation::normalize_audio_source_kind(&m.audio_source_kind)
                 .to_string(),
-            audio_clip_path: m.audio_clip_path.clone(),
+            audio_clip_path: m
+                .audio_clip_source_reference
+                .clone()
+                .unwrap_or_else(|| m.audio_clip_path.clone()),
             audio_band_count: m.audio_band_config.count(),
             audio_band_edges: m.audio_band_config.crossovers().to_vec(),
             audio_band_ceiling_hz: Some(m.audio_band_config.ceiling_hz()),
@@ -588,6 +644,7 @@ impl ModConfig {
                 shape: LfoShape::from_str(&cfg.shape),
                 beats: finite_or(cfg.beats, 4.0).clamp(0.0625, 64.0),
                 phase: 0.0,
+                seed: cfg.seed,
             };
             lfo.set_phase(cfg.phase);
             m.lfos[i] = lfo;
@@ -634,6 +691,11 @@ impl ModConfig {
         m.audio_device = self.audio_device.clone();
         m.audio_source_kind =
             crate::modulation::normalize_audio_source_kind(&self.audio_source_kind).to_string();
+        m.audio_clip_source_reference =
+            crate::media_source::parse_content_reference(&self.audio_clip_path)
+                .ok()
+                .flatten()
+                .map(|_| self.audio_clip_path.clone());
         m.audio_clip_path = self.audio_clip_path.clone();
         let count = self
             .audio_band_count
@@ -856,6 +918,8 @@ pub struct LayerConfig {
     #[serde(default)]
     pub bypass_master_fx: bool,
     #[serde(default)]
+    pub reroll_on_loop: bool,
+    #[serde(default)]
     pub effects: EffectsConfig,
 }
 
@@ -867,6 +931,9 @@ fn default_true() -> bool {
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EffectsConfig {
+    /// Deterministic shader pattern seed. Zero is the exact legacy sequence.
+    #[serde(default)]
+    pub random_seed: u32,
     #[serde(default = "one")]
     pub pixelate: f32,
     #[serde(default)]
@@ -886,6 +953,14 @@ pub struct EffectsConfig {
     /// Fraction of full render resolution (1.0 = full resolution).
     #[serde(default = "one")]
     pub downsample: f32,
+    #[serde(default)]
+    pub shift_amount: f32,
+    #[serde(default = "default_shift_block_size")]
+    pub shift_block_size: f32,
+    #[serde(default = "default_shift_density")]
+    pub shift_density: f32,
+    #[serde(default = "default_shift_speed")]
+    pub shift_speed: f32,
     #[serde(default)]
     pub grain_intensity: f32,
     #[serde(default = "one")]
@@ -940,6 +1015,7 @@ fn default_key_softness() -> f32 {
 impl Default for EffectsConfig {
     fn default() -> Self {
         Self {
+            random_seed: 0,
             pixelate: 1.0,
             rgb_split: 0.0,
             hue_shift: 0.0,
@@ -949,6 +1025,10 @@ impl Default for EffectsConfig {
             posterize: 0.0,
             invert: false,
             downsample: 1.0,
+            shift_amount: 0.0,
+            shift_block_size: 8.0,
+            shift_density: 0.5,
+            shift_speed: 3.0,
             grain_intensity: 0.0,
             grain_size: 1.0,
             grain_algo: 0,
@@ -979,6 +1059,7 @@ impl Default for EffectsConfig {
 impl EffectsConfig {
     pub fn from_uniforms(u: &EffectUniforms) -> Self {
         Self {
+            random_seed: u.random_seed,
             pixelate: u.pixelate_size,
             rgb_split: u.rgb_split,
             hue_shift: u.hue_shift,
@@ -988,6 +1069,10 @@ impl EffectsConfig {
             posterize: u.posterize,
             invert: u.invert > 0.5,
             downsample: u.downsample,
+            shift_amount: u.shift_amount,
+            shift_block_size: u.shift_block_size,
+            shift_density: u.shift_density,
+            shift_speed: u.shift_speed,
             grain_intensity: u.grain_intensity,
             grain_size: u.grain_size,
             grain_algo: u.grain_algo as u32,
@@ -1013,6 +1098,7 @@ impl EffectsConfig {
     }
 
     pub fn apply_to_uniforms(&self, u: &mut EffectUniforms) {
+        u.random_seed = self.random_seed;
         u.pixelate_size = finite_or(self.pixelate, 1.0).clamp(1.0, 32.0);
         u.rgb_split = finite_or(self.rgb_split, 0.0).clamp(0.0, 30.0);
         u.hue_shift = finite_or(self.hue_shift, 0.0).clamp(-180.0, 180.0);
@@ -1022,6 +1108,10 @@ impl EffectsConfig {
         u.posterize = finite_or(self.posterize, 0.0).clamp(0.0, 16.0);
         u.invert = if self.invert { 1.0 } else { 0.0 };
         u.downsample = finite_or(self.downsample, 1.0).clamp(0.05, 1.0);
+        u.shift_amount = finite_or(self.shift_amount, 0.0).clamp(0.0, 1.0);
+        u.shift_block_size = finite_or(self.shift_block_size, 8.0).clamp(2.0, 256.0);
+        u.shift_density = finite_or(self.shift_density, 0.5).clamp(0.0, 1.0);
+        u.shift_speed = finite_or(self.shift_speed, 3.0).clamp(0.0, 20.0);
         u.grain_intensity = finite_or(self.grain_intensity, 0.0).clamp(0.0, 0.3);
         u.grain_size = finite_or(self.grain_size, 1.0).clamp(1.0, 4.0);
         u.grain_algo = (self.grain_algo.min(3)) as f32;
@@ -1064,6 +1154,15 @@ impl EffectsConfig {
                     ("posterize", format!("{:.1}", self.posterize)),
                     ("invert", format!("{}", self.invert)),
                     ("downsample", format!("{:.2}", self.downsample)),
+                ],
+            ),
+            (
+                "shift",
+                vec![
+                    ("shift_amount", format!("{:.2}", self.shift_amount)),
+                    ("shift_block_size", format!("{:.1}", self.shift_block_size)),
+                    ("shift_density", format!("{:.2}", self.shift_density)),
+                    ("shift_speed", format!("{:.2}", self.shift_speed)),
                 ],
             ),
             (
@@ -1175,6 +1274,30 @@ impl EffectsConfig {
             "downsample" => {
                 if let Ok(v) = value.parse() {
                     self.downsample = v;
+                    return true;
+                }
+            }
+            "shift_amount" => {
+                if let Ok(v) = value.parse() {
+                    self.shift_amount = v;
+                    return true;
+                }
+            }
+            "shift_block_size" => {
+                if let Ok(v) = value.parse() {
+                    self.shift_block_size = v;
+                    return true;
+                }
+            }
+            "shift_density" => {
+                if let Ok(v) = value.parse() {
+                    self.shift_density = v;
+                    return true;
+                }
+            }
+            "shift_speed" => {
+                if let Ok(v) = value.parse() {
+                    self.shift_speed = v;
                     return true;
                 }
             }
@@ -1321,7 +1444,7 @@ impl LayerConfig {
     pub fn from_layer(layer: &Layer) -> Self {
         Self {
             filename: layer.filename.clone(),
-            source_path: layer.source_path.clone(),
+            source_path: layer.source_reference_for_persistence().to_owned(),
             opacity: layer.opacity,
             blend_mode: layer.blend_mode.key().to_string(),
             speed: layer.speed,
@@ -1329,6 +1452,7 @@ impl LayerConfig {
             paused: layer.paused,
             visible: layer.visible,
             bypass_master_fx: layer.bypass_master_fx,
+            reroll_on_loop: layer.reroll_on_loop,
             effects: EffectsConfig::from_uniforms(&layer.effects),
         }
     }
@@ -1346,7 +1470,41 @@ impl LayerConfig {
         layer.paused = self.paused;
         layer.visible = self.visible;
         layer.bypass_master_fx = self.bypass_master_fx;
+        layer.reroll_on_loop = self.reroll_on_loop;
         self.effects.apply_to_uniforms(&mut layer.effects);
+    }
+
+    /// Apply only the visual contribution of this saved position. Source
+    /// identity, playback cadence, pause state, and loop-reroll policy belong
+    /// to the current live stack and are deliberately retained.
+    pub fn apply_look_to_layer(&self, layer: &mut Layer) {
+        self.apply_look_to_fields(
+            &mut layer.opacity,
+            &mut layer.blend_mode,
+            &mut layer.visible,
+            &mut layer.bypass_master_fx,
+            &mut layer.effects,
+        );
+    }
+
+    fn apply_look_to_fields(
+        &self,
+        opacity: &mut f32,
+        blend_mode: &mut BlendMode,
+        visible: &mut bool,
+        bypass_master_fx: &mut bool,
+        effects: &mut EffectUniforms,
+    ) {
+        *opacity = finite_or(self.opacity, 1.0).clamp(0.0, 1.0);
+        *blend_mode = match self.blend_mode.as_str() {
+            "screen" => BlendMode::Screen,
+            "multiply" => BlendMode::Multiply,
+            "difference" => BlendMode::Difference,
+            _ => BlendMode::Normal,
+        };
+        *visible = self.visible;
+        *bypass_master_fx = self.bypass_master_fx;
+        self.effects.apply_to_uniforms(effects);
     }
 
     /// Get top-level layer fields as (key, value_string) pairs.
@@ -1360,6 +1518,7 @@ impl LayerConfig {
             ("paused", format!("{}", self.paused)),
             ("visible", format!("{}", self.visible)),
             ("bypass_master_fx", format!("{}", self.bypass_master_fx)),
+            ("reroll_on_loop", format!("{}", self.reroll_on_loop)),
         ]
     }
 
@@ -1406,9 +1565,31 @@ impl LayerConfig {
                     return true;
                 }
             }
+            "reroll_on_loop" => {
+                if let Ok(v) = value.parse() {
+                    self.reroll_on_loop = v;
+                    return true;
+                }
+            }
             _ => {}
         }
         false
+    }
+}
+
+fn apply_positional_looks<T>(
+    saved_layers: &[LayerConfig],
+    live_layers: &mut [T],
+    mut apply: impl FnMut(&LayerConfig, &mut T),
+) -> LookApplySummary {
+    let mapped_layers = saved_layers.len().min(live_layers.len());
+    for (config, layer) in saved_layers.iter().zip(live_layers.iter_mut()) {
+        apply(config, layer);
+    }
+    LookApplySummary {
+        mapped_layers,
+        unused_patch_layers: saved_layers.len().saturating_sub(mapped_layers),
+        untouched_live_layers: live_layers.len().saturating_sub(mapped_layers),
     }
 }
 
@@ -1421,13 +1602,14 @@ impl PatchState {
         ntsc_params: &NtscParams,
         mod_matrix: &ModMatrix,
         temporal: &TemporalParams,
-        master_paused: bool,
+        transport: PatchTransportState,
         morph: &crate::morph::Morph,
     ) -> Self {
         Self {
             master: EffectsConfig::from_uniforms(master),
             layers: layers.iter().map(LayerConfig::from_layer).collect(),
-            master_paused,
+            master_paused: transport.master_paused,
+            media_frozen: transport.media_frozen,
             ntsc: Some(NtscConfig::from_params(ntsc_params)),
             modulation: Some(ModConfig::from_matrix(mod_matrix)),
             temporal: Some(TemporalConfig::from_params(temporal)),
@@ -1457,11 +1639,309 @@ impl PatchState {
             *temporal = temporal_cfg.to_params();
         }
     }
+
+    /// Transfer a saved visual look onto the current positional stack without
+    /// replacing sources or transport/control state. Extra saved/current
+    /// layers are intentionally ignored/retained respectively.
+    pub fn apply_look(
+        &self,
+        master: &mut EffectUniforms,
+        layers: &mut [Layer],
+        ntsc_params: &mut NtscParams,
+        temporal: &mut TemporalParams,
+    ) -> LookApplySummary {
+        self.master.apply_to_uniforms(master);
+        let summary = apply_positional_looks(&self.layers, layers, |config, layer| {
+            config.apply_look_to_layer(layer);
+        });
+        if let Some(ref ntsc) = self.ntsc {
+            *ntsc_params = ntsc.to_params();
+        }
+        if let Some(ref temporal_cfg) = self.temporal {
+            *temporal = temporal_cfg.to_params();
+        }
+        summary
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn saved_layer(
+        filename: &str,
+        opacity: f32,
+        blend_mode: &str,
+        visible: bool,
+        bypass_master_fx: bool,
+        brightness: f32,
+        random_seed: u32,
+    ) -> LayerConfig {
+        LayerConfig {
+            filename: filename.to_string(),
+            source_path: format!("patch://{filename}"),
+            opacity,
+            blend_mode: blend_mode.to_string(),
+            speed: 4.0,
+            fps: 240.0,
+            paused: true,
+            visible,
+            bypass_master_fx,
+            reroll_on_loop: true,
+            effects: EffectsConfig {
+                brightness,
+                random_seed,
+                ..Default::default()
+            },
+        }
+    }
+
+    struct FakeLiveLayer {
+        topology_id: u64,
+        source_path: String,
+        filename: String,
+        speed: f32,
+        fps: f32,
+        paused: bool,
+        reroll_on_loop: bool,
+        opacity: f32,
+        blend_mode: BlendMode,
+        visible: bool,
+        bypass_master_fx: bool,
+        effects: EffectUniforms,
+    }
+
+    fn fake_live_layer(topology_id: u64, filename: &str, opacity: f32) -> FakeLiveLayer {
+        FakeLiveLayer {
+            topology_id,
+            source_path: format!("live://{filename}"),
+            filename: filename.to_string(),
+            speed: 0.5 + topology_id as f32 / 10.0,
+            fps: 20.0 + topology_id as f32,
+            paused: topology_id.is_multiple_of(2),
+            reroll_on_loop: topology_id.is_multiple_of(3),
+            opacity,
+            blend_mode: BlendMode::Multiply,
+            visible: true,
+            bypass_master_fx: false,
+            effects: EffectUniforms {
+                brightness: -0.9,
+                random_seed: topology_id as u32 + 1_000,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn look_application_is_visual_only_positional_and_reports_mismatches() {
+        let saved = vec![
+            saved_layer("saved-a.mp4", 0.2, "difference", false, true, 0.25, 41),
+            saved_layer("saved-b.mp4", 0.7, "screen", true, false, -0.3, 97),
+        ];
+        let mut live = vec![
+            fake_live_layer(11, "live-a.mov", 0.91),
+            fake_live_layer(22, "live-b.mov", 0.92),
+            fake_live_layer(33, "live-c.mov", 0.93),
+        ];
+        let topology_and_sources_before: Vec<_> = live
+            .iter()
+            .map(|layer| {
+                (
+                    layer.topology_id,
+                    layer.source_path.clone(),
+                    layer.filename.clone(),
+                )
+            })
+            .collect();
+        let transport_before: Vec<_> = live
+            .iter()
+            .map(|layer| (layer.speed, layer.fps, layer.paused, layer.reroll_on_loop))
+            .collect();
+        let untouched_visual_before = (
+            live[2].opacity,
+            live[2].blend_mode,
+            live[2].visible,
+            live[2].bypass_master_fx,
+            live[2].effects.brightness,
+            live[2].effects.random_seed,
+        );
+
+        let summary = apply_positional_looks(&saved, &mut live, |config, layer| {
+            config.apply_look_to_fields(
+                &mut layer.opacity,
+                &mut layer.blend_mode,
+                &mut layer.visible,
+                &mut layer.bypass_master_fx,
+                &mut layer.effects,
+            );
+        });
+
+        assert_eq!(
+            summary,
+            LookApplySummary {
+                mapped_layers: 2,
+                unused_patch_layers: 0,
+                untouched_live_layers: 1,
+            }
+        );
+        assert_eq!(live[0].opacity, 0.2);
+        assert_eq!(live[0].blend_mode, BlendMode::Difference);
+        assert!(!live[0].visible);
+        assert!(live[0].bypass_master_fx);
+        assert_eq!(live[0].effects.brightness, 0.25);
+        assert_eq!(live[0].effects.random_seed, 41);
+        assert_eq!(live[1].opacity, 0.7);
+        assert_eq!(live[1].blend_mode, BlendMode::Screen);
+        assert!(live[1].visible);
+        assert!(!live[1].bypass_master_fx);
+        assert_eq!(live[1].effects.brightness, -0.3);
+        assert_eq!(live[1].effects.random_seed, 97);
+        assert_eq!(
+            (
+                live[2].opacity,
+                live[2].blend_mode,
+                live[2].visible,
+                live[2].bypass_master_fx,
+                live[2].effects.brightness,
+                live[2].effects.random_seed,
+            ),
+            untouched_visual_before
+        );
+
+        let topology_and_sources_after: Vec<_> = live
+            .iter()
+            .map(|layer| {
+                (
+                    layer.topology_id,
+                    layer.source_path.clone(),
+                    layer.filename.clone(),
+                )
+            })
+            .collect();
+        let transport_after: Vec<_> = live
+            .iter()
+            .map(|layer| (layer.speed, layer.fps, layer.paused, layer.reroll_on_loop))
+            .collect();
+        assert_eq!(topology_and_sources_after, topology_and_sources_before);
+        assert_eq!(transport_after, transport_before);
+
+        let mut one_live_position = [()];
+        let reverse_mismatch = apply_positional_looks(&saved, &mut one_live_position, |_, _| {});
+        assert_eq!(
+            reverse_mismatch,
+            LookApplySummary {
+                mapped_layers: 1,
+                unused_patch_layers: 1,
+                untouched_live_layers: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn look_application_preserves_absent_ntsc_and_temporal_but_applies_present_sections() {
+        let mut patch = PatchState {
+            master: EffectsConfig {
+                brightness: 0.55,
+                random_seed: 31_337,
+                ..Default::default()
+            },
+            layers: Vec::new(),
+            master_paused: true,
+            media_frozen: true,
+            ntsc: None,
+            modulation: None,
+            temporal: None,
+            morph: None,
+        };
+        let mut master = EffectUniforms {
+            brightness: -0.4,
+            ..Default::default()
+        };
+        let mut ntsc = NtscParams {
+            enabled: true,
+            snow_intensity: 0.33,
+            ..Default::default()
+        };
+        let original_ntsc = ntsc.clone();
+        let mut temporal = TemporalParams {
+            feedback: 0.42,
+            slit_angle: 73.0,
+            ..Default::default()
+        };
+
+        let summary = patch.apply_look(&mut master, &mut [], &mut ntsc, &mut temporal);
+        assert_eq!(summary, LookApplySummary::default());
+        assert_eq!(master.brightness, 0.55);
+        assert_eq!(master.random_seed, 31_337);
+        assert_eq!(ntsc, original_ntsc);
+        assert_eq!(temporal.feedback, 0.42);
+        assert_eq!(temporal.slit_angle, 73.0);
+
+        let saved_ntsc = NtscParams {
+            enabled: false,
+            tape_speed: 2,
+            chroma_loss: 0.007,
+            snow_intensity: 0.6,
+            ..Default::default()
+        };
+        let saved_temporal = TemporalParams {
+            feedback: 0.7,
+            fb_zoom: 1.04,
+            slit_angle: -35.0,
+            ..Default::default()
+        };
+        patch.ntsc = Some(NtscConfig::from_params(&saved_ntsc));
+        patch.temporal = Some(TemporalConfig::from_params(&saved_temporal));
+
+        patch.apply_look(&mut master, &mut [], &mut ntsc, &mut temporal);
+        assert_eq!(ntsc, saved_ntsc);
+        assert_eq!(temporal.feedback, 0.7);
+        assert_eq!(temporal.fb_zoom, 1.04);
+        assert_eq!(temporal.slit_angle, -35.0);
+    }
+
+    #[test]
+    fn legacy_patch_defaults_media_frozen_without_conflating_master_pause() {
+        let legacy: PatchState =
+            serde_yaml::from_str("master: {}\nlayers: []\nmaster_paused: true\n").unwrap();
+
+        assert!(legacy.master_paused);
+        assert!(!legacy.media_frozen);
+    }
+
+    #[test]
+    fn patch_schema_round_trips_stacks_beyond_the_retired_sixteen_layer_limit() {
+        let layers = (0..24)
+            .map(|index| {
+                saved_layer(
+                    &format!("clip-{index}.mp4"),
+                    1.0 - index as f32 / 100.0,
+                    "normal",
+                    true,
+                    false,
+                    index as f32 / 100.0,
+                    index as u32 + 1,
+                )
+            })
+            .collect();
+        let patch = PatchState {
+            master: EffectsConfig::default(),
+            layers,
+            master_paused: false,
+            media_frozen: false,
+            ntsc: None,
+            modulation: None,
+            temporal: None,
+            morph: None,
+        };
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(restored.layers.len(), 24);
+        assert_eq!(restored.layers[16].filename, "clip-16.mp4");
+        assert_eq!(restored.layers[23].effects.random_seed, 24);
+    }
 
     #[test]
     fn patch_capture_rebases_in_flight_morph_to_remaining_beats() {
@@ -1476,7 +1956,10 @@ mod tests {
             &NtscParams::default(),
             &matrix,
             &TemporalParams::default(),
-            false,
+            PatchTransportState {
+                master_paused: false,
+                media_frozen: false,
+            },
             &morph,
         );
         let snapshot = patch.morph.unwrap();
@@ -1511,9 +1994,11 @@ mod tests {
                 paused: false,
                 visible: true,
                 bypass_master_fx: true,
+                reroll_on_loop: false,
                 effects: layer_effects,
             }],
             master_paused: false,
+            media_frozen: false,
             ntsc: None,
             modulation: None,
             temporal: None,
@@ -1651,6 +2136,61 @@ mod tests {
     }
 
     #[test]
+    fn shift_controls_round_trip_sanitize_and_keep_legacy_defaults() {
+        let configured = EffectsConfig {
+            shift_amount: 0.8,
+            shift_block_size: 48.0,
+            shift_density: 0.7,
+            shift_speed: 9.5,
+            ..Default::default()
+        };
+        let decoded: EffectsConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&configured).unwrap()).unwrap();
+        let mut uniforms = EffectUniforms::default();
+        decoded.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.shift_amount, 0.8);
+        assert_eq!(uniforms.shift_block_size, 48.0);
+        assert_eq!(uniforms.shift_density, 0.7);
+        assert_eq!(uniforms.shift_speed, 9.5);
+        assert_eq!(EffectsConfig::from_uniforms(&uniforms).shift_speed, 9.5);
+
+        let legacy: EffectsConfig = serde_yaml::from_str("pixelate: 4.0\n").unwrap();
+        assert_eq!(legacy.shift_amount, 0.0);
+        assert_eq!(legacy.shift_block_size, 8.0);
+        assert_eq!(legacy.shift_density, 0.5);
+        assert_eq!(legacy.shift_speed, 3.0);
+
+        let invalid: EffectsConfig = serde_yaml::from_str(
+            "shift_amount: .nan\nshift_block_size: -9\nshift_density: 7\nshift_speed: .inf\n",
+        )
+        .unwrap();
+        invalid.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.shift_amount, 0.0);
+        assert_eq!(uniforms.shift_block_size, 2.0);
+        assert_eq!(uniforms.shift_density, 1.0);
+        assert_eq!(uniforms.shift_speed, 3.0);
+
+        let mut editable = EffectsConfig::default();
+        for (key, value) in [
+            ("shift_amount", "0.6"),
+            ("shift_block_size", "32"),
+            ("shift_density", "0.4"),
+            ("shift_speed", "7.25"),
+        ] {
+            assert!(editable.set_field(key, value));
+            let metadata = param_meta(key).unwrap();
+            assert!(metadata.min < metadata.max);
+            assert!(metadata.step > 0.0);
+        }
+        let shift_group = editable
+            .grouped_fields()
+            .into_iter()
+            .find(|(name, _)| *name == "shift")
+            .unwrap();
+        assert_eq!(shift_group.1.len(), 4);
+    }
+
+    #[test]
     fn chroma_and_temporal_keys_round_trip_with_safe_legacy_defaults() {
         let configured = EffectsConfig {
             key_mode: 3,
@@ -1779,12 +2319,16 @@ mod tests {
             &NtscParams::default(),
             &matrix,
             &temporal,
-            true,
+            PatchTransportState {
+                master_paused: true,
+                media_frozen: true,
+            },
             &crate::morph::Morph::default(),
         );
         let yaml = serde_yaml::to_string(&patch).unwrap();
         let parsed: PatchState = serde_yaml::from_str(&yaml).unwrap();
         assert!(parsed.master_paused);
+        assert!(parsed.media_frozen);
 
         let mut restored = ModMatrix::new();
         let mut restored_temporal = TemporalParams::default();
@@ -2003,5 +2547,20 @@ routings:
             crate::modulation::AUDIO_SOURCE_LIVE
         );
         assert!(legacy_audio_matrix.audio_clip_path.is_empty());
+    }
+
+    #[test]
+    fn modulation_capture_prefers_retained_content_identity_without_changing_legacy_paths() {
+        let mut matrix = ModMatrix::new();
+        matrix.audio_clip_path = r"D:\resolved\analysis.wav".to_string();
+        let reference = format!("cos-sha256://{}/4096", "b".repeat(64));
+        matrix.audio_clip_source_reference = Some(reference.clone());
+        assert_eq!(ModConfig::from_matrix(&matrix).audio_clip_path, reference);
+
+        matrix.audio_clip_source_reference = None;
+        assert_eq!(
+            ModConfig::from_matrix(&matrix).audio_clip_path,
+            r"D:\resolved\analysis.wav"
+        );
     }
 }

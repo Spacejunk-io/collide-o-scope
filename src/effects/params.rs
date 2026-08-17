@@ -230,7 +230,7 @@ mod temporal_tests {
 }
 
 /// GPU-side effect parameters, uploaded as a uniform buffer each frame.
-/// Must be 16-byte aligned (144 bytes total = 9 x vec4).
+/// Must be 16-byte aligned (160 bytes total = 10 x vec4).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EffectUniforms {
@@ -272,10 +272,17 @@ pub struct EffectUniforms {
     pub cellular_gap_amount: f32, // 0.0 = opaque/back-compatible, 1.0 = fully key ridges
     pub cellular_gap_threshold: f32, // 0.0..1.0 ridge strength where the key opens
     pub cellular_gap_softness: f32, // 0.0..0.5 feather around the threshold
-    pub _cellular_pad: f32,
+    /// Public deterministic pattern seed. Zero preserves the legacy shader
+    /// sequence byte-for-byte; this replaces an unused pad at the same offset.
+    pub random_seed: u32,
     // vec4 #9 — chroma key target in display/sRGB coordinates
     pub key_color: [f32; 3], // 0.0..1.0, default green-screen green
     pub key_tolerance: f32,  // 0.0..1.0 chroma-plane distance
+    // vec4 #10 — deterministic horizontal block displacement
+    pub shift_amount: f32, // 0.0 = exact legacy path, 1.0 = full displacement
+    pub shift_block_size: f32, // 2.0..256.0 screen pixels per horizontal band
+    pub shift_density: f32, // 0.0..1.0 fraction of bands displaced per epoch
+    pub shift_speed: f32,  // 0.0..20.0 deterministic epochs per second
 }
 
 impl Default for EffectUniforms {
@@ -311,9 +318,13 @@ impl Default for EffectUniforms {
             cellular_gap_amount: 0.0,
             cellular_gap_threshold: 0.65,
             cellular_gap_softness: 0.08,
-            _cellular_pad: 0.0,
+            random_seed: 0,
             key_color: [0.0, 1.0, 0.0],
             key_tolerance: 0.15,
+            shift_amount: 0.0,
+            shift_block_size: 8.0,
+            shift_density: 0.5,
+            shift_speed: 3.0,
         }
     }
 }
@@ -379,8 +390,8 @@ mod uniform_tests {
     use super::*;
 
     #[test]
-    fn effect_uniform_layout_is_nine_vec4s() {
-        assert_eq!(std::mem::size_of::<EffectUniforms>(), 144);
+    fn effect_uniform_layout_is_ten_vec4s() {
+        assert_eq!(std::mem::size_of::<EffectUniforms>(), 160);
         assert!(std::mem::size_of::<EffectUniforms>().is_multiple_of(16));
         assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_amount), 96);
         assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_scale), 100);
@@ -398,24 +409,41 @@ mod uniform_tests {
             std::mem::offset_of!(EffectUniforms, cellular_gap_softness),
             120
         );
-        assert_eq!(std::mem::offset_of!(EffectUniforms, _cellular_pad), 124);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, random_seed), 124);
         assert_eq!(std::mem::offset_of!(EffectUniforms, key_color), 128);
         assert_eq!(std::mem::offset_of!(EffectUniforms, key_tolerance), 140);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, shift_amount), 144);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, shift_block_size), 148);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, shift_density), 152);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, shift_speed), 156);
+        assert_eq!(EffectUniforms::default().random_seed, 0);
 
         let shader = include_str!("../shaders/effects.wgsl");
         let amount = shader.find("cellular_gap_amount: f32").unwrap();
         let threshold = shader.find("cellular_gap_threshold: f32").unwrap();
         let softness = shader.find("cellular_gap_softness: f32").unwrap();
-        let pad = shader.find("_cellular_pad: f32").unwrap();
+        let seed = shader.find("random_seed: u32").unwrap();
         let color = shader.find("key_color: vec3f").unwrap();
         let tolerance = shader.find("key_tolerance: f32").unwrap();
+        let shift_amount = shader.find("shift_amount: f32").unwrap();
+        let shift_block_size = shader.find("shift_block_size: f32").unwrap();
+        let shift_density = shader.find("shift_density: f32").unwrap();
+        let shift_speed = shader.find("shift_speed: f32").unwrap();
         assert!(
             amount < threshold
                 && threshold < softness
-                && softness < pad
-                && pad < color
+                && softness < seed
+                && seed < color
                 && color < tolerance
+                && tolerance < shift_amount
+                && shift_amount < shift_block_size
+                && shift_block_size < shift_density
+                && shift_density < shift_speed
         );
+        assert!(shader.contains("if uniforms.shift_amount > 0.0001"));
+        assert!(shader.contains("pattern_seed_offset()"));
+        assert!(shader.contains("if uniforms.random_seed == 0u"));
+        assert!(shader.contains("if uniforms.random_seed != 0u"));
     }
 
     #[test]
@@ -430,6 +458,10 @@ mod uniform_tests {
         assert_eq!(defaults.cellular_gap_softness, 0.08);
         assert_eq!(defaults.key_color, [0.0, 1.0, 0.0]);
         assert_eq!(defaults.key_tolerance, 0.15);
+        assert_eq!(defaults.shift_amount, 0.0);
+        assert_eq!(defaults.shift_block_size, 8.0);
+        assert_eq!(defaults.shift_density, 0.5);
+        assert_eq!(defaults.shift_speed, 3.0);
 
         let mut changed = defaults;
         changed.cellular_amount = 1.0;
@@ -441,6 +473,10 @@ mod uniform_tests {
         changed.cellular_gap_softness = 0.5;
         changed.key_color = [1.0, 0.0, 1.0];
         changed.key_tolerance = 0.9;
+        changed.shift_amount = 1.0;
+        changed.shift_block_size = 256.0;
+        changed.shift_density = 1.0;
+        changed.shift_speed = 20.0;
         changed.reset();
         assert_eq!(changed.cellular_amount, 0.0);
         assert_eq!(changed.cellular_scale, 10.0);
@@ -451,6 +487,10 @@ mod uniform_tests {
         assert_eq!(changed.cellular_gap_softness, 0.08);
         assert_eq!(changed.key_color, [0.0, 1.0, 0.0]);
         assert_eq!(changed.key_tolerance, 0.15);
+        assert_eq!(changed.shift_amount, 0.0);
+        assert_eq!(changed.shift_block_size, 8.0);
+        assert_eq!(changed.shift_density, 0.5);
+        assert_eq!(changed.shift_speed, 3.0);
     }
 
     #[test]

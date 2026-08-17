@@ -2,9 +2,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::effects::EffectUniforms;
+use crate::media_safety::{
+    validate_safe_dimensions, MediaAllocationPlan, MediaDeviceLimits, MediaSafetyPolicy,
+    MediaSourceKind,
+};
 use crate::spout_in::{SpoutFrame, SpoutIn, SpoutStatus};
-use crate::video::threaded::{DecoderHealth, MAX_ADVANCE_FRAMES};
-use crate::video::{decode_still_image, StillImage, ThreadedDecoder};
+use crate::video::threaded::{DecoderHealth, ReadyFrame, MAX_ADVANCE_FRAMES};
+use crate::video::{decode_still_image_with_media_policy, StillImage, ThreadedDecoder};
 
 /// Bounds decoder/channel work on any one render tick while retaining excess
 /// transport debt for subsequent ticks.
@@ -78,6 +82,13 @@ impl LayerSource {
     }
 }
 
+fn source_reference_for_persistence<'a>(
+    runtime_path: &'a str,
+    persisted_reference: Option<&'a str>,
+) -> &'a str {
+    persisted_reference.unwrap_or(runtime_path)
+}
+
 pub struct Layer {
     /// Process-lifetime identity for this live instance. Moving/reordering a
     /// layer retains the ID; constructing a replacement (including patch
@@ -87,6 +98,12 @@ pub struct Layer {
     /// is the canonical path when canonicalization succeeds, otherwise it is
     /// the caller-provided path verbatim.
     pub source_path: String,
+    /// Content-addressed identity retained across runtime path resolution.
+    ///
+    /// Decoders continue to use `source_path`; patch capture and export use
+    /// this reference when present so moving or changing the resolved host
+    /// file cannot silently weaken a `cos-sha256://` source contract.
+    persisted_source_reference: Option<String>,
     pub filename: String,
     pub source: LayerSource,
     pub texture: wgpu::Texture,
@@ -98,12 +115,19 @@ pub struct Layer {
     /// When true, this layer skips the shared master shader stage while
     /// retaining its own effects and all later program-wide stages.
     pub bypass_master_fx: bool,
+    /// Advance this layer's deterministic pattern seed at each authoritative
+    /// video-loop boundary. Stills and live inputs ignore the flag.
+    pub reroll_on_loop: bool,
     pub effects: EffectUniforms,
     pub width: u32,
     pub height: u32,
     /// Render-side source error (for example a live frame exceeding GPU
     /// limits). Spout worker errors are merged into `spout_status()`.
     source_error: String,
+    /// True after the first source image has reached the GPU texture. A file
+    /// layer may upload its decoder seed while globally frozen, but no later
+    /// in-flight completion may leak through that freeze.
+    source_frame_initialized: bool,
     // Transport
     pub speed: f32, // 0.25..4.0 playback multiplier (1.0 = normal)
     pub fps: f32,   // target decode FPS (e.g. 30.0)
@@ -169,21 +193,46 @@ impl Layer {
     /// Open a persisted visual source. Still-image extensions use a bounded
     /// one-shot decoder; all other paths retain the ordinary video path so
     /// codec/container probing and contextual FFmpeg errors stay unchanged.
+    #[allow(dead_code)]
     pub fn new(path: &str, device: &wgpu::Device) -> Result<Self, String> {
-        if is_still_image_file(std::path::Path::new(path)) {
-            return Self::new_still(path, device);
-        }
-        Self::new_video(path, device)
+        let media_policy = MediaSafetyPolicy::safe();
+        Self::new_with_media_policy(path, device, &media_policy)
     }
 
-    fn new_video(path: &str, device: &wgpu::Device) -> Result<Self, String> {
-        let max_dimension = device.limits().max_texture_dimension_2d;
-        let decoder = ThreadedDecoder::open_with_texture_limit(path, max_dimension)?;
+    /// Open a source under an explicit host-local media policy. This policy is
+    /// supplied by the running host and is deliberately absent from patches.
+    pub fn new_with_media_policy(
+        path: &str,
+        device: &wgpu::Device,
+        media_policy: &MediaSafetyPolicy,
+    ) -> Result<Self, String> {
+        if is_still_image_file(std::path::Path::new(path)) {
+            return Self::new_still(path, device, media_policy);
+        }
+        Self::new_video(path, device, media_policy)
+    }
+
+    fn new_video(
+        path: &str,
+        device: &wgpu::Device,
+        media_policy: &MediaSafetyPolicy,
+    ) -> Result<Self, String> {
+        let device_limits = media_device_limits(device);
+        let decoder = ThreadedDecoder::open_with_media_policy(path, media_policy, device_limits)?;
         let width = decoder.width;
         let height = decoder.height;
         let fps = decoder.fps;
-        validate_source_texture_dimensions(width, height, max_dimension, "video")?;
-        let (texture, texture_view) = create_layer_texture(device, width, height, "Layer Texture");
+        let media_plan = decoder.media_allocation_plan();
+        debug_assert_eq!((media_plan.width, media_plan.height), (width, height));
+        validate_source_texture_dimensions_with_media_policy(
+            width,
+            height,
+            device_limits,
+            MediaSourceKind::Video,
+            "video",
+            media_policy,
+        )?;
+        let (texture, texture_view) = create_layer_texture(device, width, height, "Layer Texture")?;
 
         // Preserve a stable path independently from the short display label.
         // Canonicalization makes relative drag/drop and file-dialog paths
@@ -208,6 +257,7 @@ impl Layer {
         Ok(Self {
             layer_id: allocate_layer_id(),
             source_path,
+            persisted_source_reference: None,
             filename,
             source: LayerSource::Video(decoder),
             texture,
@@ -217,10 +267,12 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            reroll_on_loop: false,
             effects,
             width,
             height,
             source_error: String::new(),
+            source_frame_initialized: false,
             speed: 1.0,
             fps,
             last_decode: now,
@@ -228,14 +280,36 @@ impl Layer {
         })
     }
 
-    fn new_still(path: &str, device: &wgpu::Device) -> Result<Self, String> {
-        let max_dimension = device.limits().max_texture_dimension_2d;
-        let decoded = decode_still_image(std::path::Path::new(path), Some(max_dimension))?;
+    fn new_still(
+        path: &str,
+        device: &wgpu::Device,
+        media_policy: &MediaSafetyPolicy,
+    ) -> Result<Self, String> {
+        let device_limits = media_device_limits(device);
+        let decoded = decode_still_image_with_media_policy(
+            std::path::Path::new(path),
+            media_policy,
+            device_limits,
+        )?;
         let width = decoded.width;
         let height = decoded.height;
-        validate_source_texture_dimensions(width, height, max_dimension, "still image")?;
+        debug_assert_eq!(
+            (
+                decoded.media_allocation_plan().width,
+                decoded.media_allocation_plan().height
+            ),
+            (width, height)
+        );
+        validate_source_texture_dimensions_with_media_policy(
+            width,
+            height,
+            device_limits,
+            MediaSourceKind::Still,
+            "still image",
+            media_policy,
+        )?;
         let (texture, texture_view) =
-            create_layer_texture(device, width, height, "Still Layer Texture");
+            create_layer_texture(device, width, height, "Still Layer Texture")?;
 
         let source_path = std::fs::canonicalize(path)
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
@@ -254,6 +328,7 @@ impl Layer {
         Ok(Self {
             layer_id: allocate_layer_id(),
             source_path,
+            persisted_source_reference: None,
             filename,
             source: LayerSource::Still(StillImage::from_decoded(decoded)),
             texture,
@@ -263,10 +338,12 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            reroll_on_loop: false,
             effects,
             width,
             height,
             source_error: String::new(),
+            source_frame_initialized: false,
             speed: 1.0,
             // A still has no source cadence. Retaining the conventional value
             // keeps old patch/config consumers finite while transport methods
@@ -281,12 +358,25 @@ impl Layer {
     /// transparent black so a missing/warming sender never exposes
     /// uninitialized GPU memory or masks lower layers. `SpoutIn` sanitizes the
     /// requested sender name before this stable `spout://` identity is persisted.
+    #[allow(dead_code)]
     pub fn new_spout(
         sender_name: &str,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<Self, String> {
-        let mut receiver = SpoutIn::new(sender_name);
+        let media_policy = MediaSafetyPolicy::safe();
+        Self::new_spout_with_media_policy(sender_name, device, queue, &media_policy)
+    }
+
+    pub fn new_spout_with_media_policy(
+        sender_name: &str,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        media_policy: &MediaSafetyPolicy,
+    ) -> Result<Self, String> {
+        let device_limits = media_device_limits(device);
+        let mut receiver =
+            SpoutIn::new_with_media_policy(sender_name, media_policy.clone(), device_limits);
         let sanitized_name = receiver.status().sender_name;
         if sanitized_name.is_empty() {
             return Err("Spout sender name is empty after sanitization".to_string());
@@ -295,26 +385,16 @@ impl Layer {
         let width = 1;
         let height = 1;
         let (texture, texture_view) =
-            create_layer_texture(device, width, height, "Spout Layer Texture");
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+            create_layer_texture(device, width, height, "Spout Layer Texture")?;
+        write_layer_texture_checked(
+            device,
+            queue,
+            &texture,
             &[0, 0, 0, 0],
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
+            width,
+            height,
+            "Spout Layer Texture",
+        )?;
         receiver.start();
 
         let effects = EffectUniforms {
@@ -325,6 +405,7 @@ impl Layer {
         Ok(Self {
             layer_id: allocate_layer_id(),
             source_path: format!("{SPOUT_SOURCE_PREFIX}{sanitized_name}"),
+            persisted_source_reference: None,
             filename: format!("Spout: {sanitized_name}"),
             source: LayerSource::Spout(receiver),
             texture,
@@ -334,10 +415,12 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            reroll_on_loop: false,
             effects,
             width,
             height,
             source_error: String::new(),
+            source_frame_initialized: false,
             speed: 1.0,
             fps: 30.0,
             last_decode: now,
@@ -352,6 +435,20 @@ impl Layer {
     /// Immutable identity of this live layer instance.
     pub fn layer_id(&self) -> u64 {
         self.layer_id
+    }
+
+    /// Keep a verified content reference while the decoder uses its resolved
+    /// host path. Passing `None` restores ordinary path-based persistence.
+    pub(crate) fn set_persisted_source_reference(&mut self, reference: Option<String>) {
+        self.persisted_source_reference = reference;
+    }
+
+    /// Source identity written to patches and handed to offline export.
+    pub fn source_reference_for_persistence(&self) -> &str {
+        source_reference_for_persistence(
+            &self.source_path,
+            self.persisted_source_reference.as_deref(),
+        )
     }
 
     pub fn is_video(&self) -> bool {
@@ -372,22 +469,37 @@ impl Layer {
         }
     }
 
+    pub fn source_frame_initialized(&self) -> bool {
+        self.source_frame_initialized
+    }
+
     /// Take a file source's initial/newest frame. Video publishes the initial
     /// seed plus requested advances; a still publishes exactly one immutable
     /// RGBA frame. Call this before pause gating so either kind starts defined.
-    pub fn take_ready_media_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
-        self.take_ready_video_frame()
+    pub fn take_ready_media_frame(&mut self) -> Result<Option<ReadyFrame>, String> {
+        match &mut self.source {
+            LayerSource::Video(decoder) => decoder.try_next_ready_frame_result(),
+            LayerSource::Still(image) => Ok(image.take_frame().map(|rgba| ReadyFrame {
+                rgba,
+                loops_advanced: 0,
+            })),
+            LayerSource::Spout(_) => Ok(None),
+        }
+    }
+
+    pub fn restore_ready_media_frame_after_failed_upload(&mut self, frame: ReadyFrame) {
+        if let LayerSource::Still(image) = &mut self.source {
+            image.restore_frame_after_failed_upload(frame.rgba);
+        }
     }
 
     /// Compatibility name retained for existing render-loop callers. It now
     /// harvests either supported file source; new call sites should use the
     /// accurately named `take_ready_media_frame` wrapper above.
+    #[allow(dead_code)]
     pub fn take_ready_video_frame(&mut self) -> Result<Option<Vec<u8>>, String> {
-        match &mut self.source {
-            LayerSource::Video(decoder) => decoder.try_next_frame_result(),
-            LayerSource::Still(image) => Ok(image.take_frame()),
-            LayerSource::Spout(_) => Ok(None),
-        }
+        self.take_ready_media_frame()
+            .map(|ready| ready.map(|frame| frame.rgba))
     }
 
     /// Queue a bounded video advancement request. The returned count is the
@@ -436,6 +548,10 @@ impl Layer {
             }
             LayerSource::Video(_) | LayerSource::Still(_) => None,
         }
+    }
+
+    pub fn source_error(&self) -> &str {
+        &self.source_error
     }
 
     /// Take at most the newest live frame. The receiver's one-frame slot
@@ -494,16 +610,30 @@ impl Layer {
 
         if frame.width != self.width || frame.height != self.height {
             let (texture, texture_view) =
-                create_layer_texture(device, frame.width, frame.height, "Spout Layer Texture");
+                create_layer_texture(device, frame.width, frame.height, "Spout Layer Texture")
+                    .inspect_err(|error| self.source_error.clone_from(error))?;
+            if let Err(error) = write_layer_texture_checked(
+                device,
+                queue,
+                &texture,
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                "Spout Layer Texture",
+            ) {
+                self.source_error.clone_from(&error);
+                return Err(error);
+            }
             self.texture = texture;
             self.texture_view = texture_view;
             self.width = frame.width;
             self.height = frame.height;
             self.effects.resolution = [frame.width as f32, frame.height as f32];
+            self.source_frame_initialized = true;
+            self.source_error.clear();
+            return Ok(());
         }
-        self.upload_frame(queue, &frame.pixels);
-        self.source_error.clear();
-        Ok(())
+        self.upload_frame(device, queue, &frame.pixels)
     }
 
     /// Number of media frames currently due at the given (possibly modulated)
@@ -546,27 +676,106 @@ impl Layer {
         self.last_decode = now;
     }
 
-    pub fn upload_frame(&self, queue: &wgpu::Queue, rgba_data: &[u8]) {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+    pub fn upload_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba_data: &[u8],
+    ) -> Result<(), String> {
+        match write_layer_texture_checked(
+            device,
+            queue,
+            &self.texture,
             rgba_data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * self.width),
-                rows_per_image: Some(self.height),
-            },
-            wgpu::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
-        );
+            self.width,
+            self.height,
+            "Layer Source Texture",
+        ) {
+            Ok(()) => {
+                self.source_frame_initialized = true;
+                self.source_error.clear();
+                Ok(())
+            }
+            Err(error) => {
+                self.source_error.clone_from(&error);
+                Err(error)
+            }
+        }
     }
+}
+
+fn write_layer_texture_checked(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    rgba_data: &[u8],
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(), String> {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| format!("{label} upload dimensions overflow for {width}x{height}"))?;
+    if rgba_data.len() != expected {
+        return Err(format!(
+            "{label} upload has {} bytes; expected {expected} for {width}x{height}",
+            rgba_data.len()
+        ));
+    }
+
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba_data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let _ = device.poll(wgpu::PollType::Poll);
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
+    if let Some(error) = layer_texture_upload_error(label, width, height, &errors) {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn layer_texture_upload_error(
+    label: &str,
+    width: u32,
+    height: u32,
+    errors: &[String],
+) -> Option<String> {
+    (!errors.is_empty()).then(|| {
+        format!(
+            "could not upload {label} at {width}x{height}: {}",
+            errors.join("; ")
+        )
+    })
 }
 
 fn create_layer_texture(
@@ -574,7 +783,10 @@ fn create_layer_texture(
     width: u32,
     height: u32,
     label: &str,
-) -> (wgpu::Texture, wgpu::TextureView) {
+) -> Result<(wgpu::Texture, wgpu::TextureView), String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -590,18 +802,54 @@ fn create_layer_texture(
         view_formats: &[],
     });
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    (texture, texture_view)
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ];
+    if let Some(error) = errors.into_iter().flatten().next() {
+        return Err(format!(
+            "could not allocate {label} at {width}x{height}: {error}"
+        ));
+    }
+    Ok((texture, texture_view))
 }
 
+#[allow(dead_code)] // Compatibility Safe wrapper for legacy validation call sites.
 pub(crate) fn validate_source_texture_dimensions(
     width: u32,
     height: u32,
     max_dimension: u32,
     source_kind: &str,
 ) -> Result<(), String> {
-    crate::video::decoder::validate_media_dimensions(width, height, Some(max_dimension))
-        .map(|_| ())
-        .map_err(|error| format!("{source_kind} source rejected: {error}"))
+    validate_safe_dimensions(
+        MediaSourceKind::Video,
+        width,
+        height,
+        MediaDeviceLimits::texture_only(max_dimension),
+    )
+    .map(|_| ())
+    .map_err(|error| format!("{source_kind} source rejected: {error}"))
+}
+
+/// Policy-aware source-texture admission used before decoder and GPU
+/// allocation. The returned plan can be surfaced in operator diagnostics.
+pub(crate) fn validate_source_texture_dimensions_with_media_policy(
+    width: u32,
+    height: u32,
+    device_limits: MediaDeviceLimits,
+    source_kind: MediaSourceKind,
+    source_label: &str,
+    media_policy: &MediaSafetyPolicy,
+) -> Result<MediaAllocationPlan, String> {
+    media_policy
+        .plan(source_kind, width, height, device_limits)
+        .map_err(|error| format!("{source_label} source rejected: {error}"))
+}
+
+fn media_device_limits(device: &wgpu::Device) -> MediaDeviceLimits {
+    let limits = device.limits();
+    MediaDeviceLimits::new(limits.max_texture_dimension_2d, limits.max_buffer_size)
 }
 
 /// Parse the stable source identity used for persisted Spout receiver layers.
@@ -645,10 +893,12 @@ fn extension_in(extension: &str, allowed: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_layer_id, default_bypass_master_fx, is_still_image_file,
+        allocate_layer_id, create_layer_texture, default_bypass_master_fx, is_still_image_file,
         is_supported_visual_extension, is_supported_visual_file, is_video_file,
-        spout_sender_from_source_path, validate_source_texture_dimensions, BlendMode, FramePacer,
-        LayerSource, MAX_DECODE_FRAMES_PER_TICK,
+        layer_texture_upload_error, source_reference_for_persistence,
+        spout_sender_from_source_path, validate_source_texture_dimensions,
+        write_layer_texture_checked, BlendMode, FramePacer, LayerSource,
+        MAX_DECODE_FRAMES_PER_TICK,
     };
     use std::time::{Duration, Instant};
 
@@ -717,6 +967,18 @@ mod tests {
     }
 
     #[test]
+    fn resolved_runtime_path_does_not_replace_retained_content_identity() {
+        let runtime = r"D:\host\resolved\clip.mp4";
+        let reference = format!("cos-sha256://{}/1234", "a".repeat(64));
+
+        assert_eq!(source_reference_for_persistence(runtime, None), runtime);
+        assert_eq!(
+            source_reference_for_persistence(runtime, Some(&reference)),
+            reference
+        );
+    }
+
+    #[test]
     fn blend_mode_protocol_keys_match_web_option_values() {
         assert_eq!(BlendMode::Normal.key(), "normal");
         assert_eq!(BlendMode::Screen.key(), "screen");
@@ -752,6 +1014,63 @@ mod tests {
     }
 
     #[test]
+    fn source_texture_upload_errors_are_contextual_and_recoverable() {
+        assert!(layer_texture_upload_error("Layer", 7680, 4320, &[]).is_none());
+        let error = layer_texture_upload_error(
+            "Layer",
+            7680,
+            4320,
+            &["Out of Memory".to_string(), "validation failed".to_string()],
+        )
+        .expect("scoped GPU error");
+        assert!(error.contains("Layer"));
+        assert!(error.contains("7680x4320"));
+        assert!(error.contains("Out of Memory"));
+        assert!(error.contains("validation failed"));
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_source_upload_scope_reports_invalid_extent_and_accepts_valid_rgba() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Layer Upload Scope Test"),
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let (texture, _view) =
+            create_layer_texture(&device, 1, 1, "Layer Upload Scope Test").unwrap();
+
+        let error = write_layer_texture_checked(
+            &device,
+            &queue,
+            &texture,
+            &[0; 8],
+            2,
+            1,
+            "Layer Upload Scope Test",
+        )
+        .expect_err("extent wider than the texture must be recoverable");
+        assert!(error.contains("Layer Upload Scope Test"));
+        assert!(write_layer_texture_checked(
+            &device,
+            &queue,
+            &texture,
+            &[10, 20, 30, 255],
+            1,
+            1,
+            "Layer Upload Scope Test",
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn visual_file_classifier_accepts_supported_stills_case_insensitively() {
         for filename in [
             "frame.png",
@@ -782,11 +1101,7 @@ mod tests {
     #[test]
     fn still_source_has_no_transport_clock() {
         let source = LayerSource::Still(crate::video::StillImage::from_decoded(
-            crate::video::DecodedStillImage {
-                width: 1,
-                height: 1,
-                rgba: vec![0, 0, 0, 0],
-            },
+            crate::video::DecodedStillImage::from_rgba(1, 1, vec![0, 0, 0, 0]).unwrap(),
         ));
         assert_eq!(source.kind(), "image");
         assert!(!source.has_transport());

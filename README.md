@@ -14,15 +14,17 @@ control panel.
 
 <img width="1919" height="1040" alt="collide-o-scope" src="https://github.com/user-attachments/assets/3690c19f-8ab4-4a9d-9672-45476da4dede" />
 
-
 ## What it does
 
-- Composites up to 16 video, PNG/JPEG/BMP/WebP still, or live Spout layers with normal, screen,
-  multiply, and difference blending.
+- Composites a dynamically sized stack of video, PNG/JPEG/BMP/WebP still, or
+  live Spout layers with normal, screen, multiply, and difference blending.
+  There is no fixed layer-count policy; usable depth is governed by source,
+  GPU, output-resolution, and selective-VHS memory resources.
 - Applies per-layer and master pixelation, RGB split, hue, saturation,
   brightness, contrast, posterize, invert, film grain, vignette, color drift,
-  breathing motion, luminance/chroma keying, and bounded animated
-  cellular/Worley warping with a separately feathered cell-gap key.
+  breathing motion, seeded horizontal block Shift, luminance/chroma keying,
+  and bounded animated cellular/Worley warping with a separately feathered
+  cell-gap key.
 - Runs [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) VHS simulation without
   blocking the render thread. Existing all-inherited stacks keep the global
   post-composite path; a contributing **Bypass Master FX** layer selects an
@@ -30,14 +32,24 @@ control panel.
 - Provides feedback trails and arbitrary-angle slit-scan from a 24-sample
   temporal history. History advances at a fixed 30 Hz, so its approximately
   0.8-second span does not change with display or export frame rate.
-- Saves and restores complete YAML performance patches, including stable
-  source identities, layer pause/speed, master pause, modulation/input
-  configuration, temporal and NTSC state, and morph slots/glides.
+- Saves complete YAML performance patches. **Load snapshot** reconstructs the
+  saved performance, while **Apply look** transfers its visual treatment onto
+  the sources already on stage.
 - Keeps live decoding request-driven and bounded: each layer's worker performs
   only transport advances requested by the engine and publishes the newest
   completed image through a one-frame overwrite slot. A first-frame seed is
   decoded at open time, so a clip added or restored while paused still has a
   defined image.
+- Keeps a browser-independent **RECOVERY** strip on the native preview with
+  truthful panel-listener and browser-connection status, an authenticated
+  **Open Panel** link, absolute Freeze Program and Blackout controls, broad
+  visual Revert, active-library selection/rescan, and surfaced output/media
+  status. It is a preview-only operator surface and never contaminates an
+  audience output.
+- Defaults source admission to **Safe** and offers an explicit, host-session
+  **Expert** mode for future large video, still, and Spout opens. Expert remains
+  bounded by fixed area/edge ceilings, device limits, and a conservative host-
+  memory plan; it is not an unbounded allocation switch.
 - Renders MP4 files through a deterministic frame-indexed offline path; real
   MIDI, phone, Spout, audio-device, and multi-GPU output still require the
   corresponding hardware for end-to-end validation.
@@ -70,15 +82,18 @@ targets, transport, and every layer target reuse that same sample; source,
 curve, and slew work is not repeated for each consumer. Offline rendering uses
 the same frame-indexed ordering.
 
-The matrix exposes every continuous master and NTSC value, temporal feedback,
-slit-scan and history-key values, morph position, and each layer's opacity,
-speed, target FPS, key controls, and continuous effects. This includes RGB
+The matrix exposes every continuous master and NTSC value, Shift amount/block
+size/density/speed, temporal feedback, slit-scan and history-key values, morph
+position, and each layer's opacity, speed, target FPS, key controls, and
+continuous effects. This includes RGB
 chroma targets/tolerance, key thresholds and softness, temporal key history,
 and VHS edge-wave speed, tracking wave, composite/chroma noise, luma smear,
 and sharpening. Selector choices such as static/temporal key mode, blend mode,
 and grain algorithm remain deliberate discrete controls and are not modulation
 targets. The legacy patch target `layerN_key` is read as the canonical
 `layerN_key_threshold`; if both spellings occur, the canonical route wins.
+Every current layer is routable, including stacks beyond the original panel's
+former 16-layer ceiling; the independent limit remains 64 simultaneous routes.
 
 Phone input is configurable at the engine rather than being a one-off browser
 effect:
@@ -111,7 +126,8 @@ decodes at most 10 minutes and abandons a decode that has not completed within
 60 seconds. A successful clip is decoded once, then program time selects a
 circular analysis window. It does not need to play through the speakers. The
 same clip, gain, band layout, and timestamp produce the same routing values
-live and offline; Pause holds that timestamp exactly.
+live and offline; Freeze Program holds that timestamp exactly, while Freeze
+Media leaves it running.
 
 The optional beat latch coalesces eligible control changes and releases them
 on the next four-beat downbeat. The morph section supports linear or
@@ -119,21 +135,67 @@ equal-power interpolation plus beat-duration glides to A or B. A capture is an
 ordering barrier: it first materializes the current Morph result, including a
 Morph-target routing offset, then records the bases at the current layer-stack
 revision. Stale captures are rejected. Manual fader and law edits still apply
-to the materialized bases while Pause holds automatic glide and clock motion.
+to the materialized bases while Freeze Program holds automatic glide and clock
+motion.
 While both slots are engaged, A/B owns the controls it captured. Moving or
 resetting one of those controls commits the currently displayed interpolation,
 clears A/B, and then applies the manual edit so it cannot snap back. A newly
 appended layer remains outside older slots and can be edited without disengaging
 them. With beat latch enabled, that ownership transfer occurs on the downbeat.
-Pause also snapshots the exact audience across a blackout: the cut remains
-absolutely black while active, then releasing it while still paused restores
-the pre-cut image. A paused selective-VHS transition remains held until Resume
-can produce a complete replacement. Hue and slit angle take the shortest wrapped arc,
+Freeze Program also snapshots the exact audience across a blackout: the cut
+remains absolutely black while active, then releasing it while still frozen
+restores the pre-cut image. A frozen selective-VHS transition remains held
+until the program resumes and can produce a complete replacement. Hue and slit
+angle take the shortest wrapped arc,
 discrete choices switch at the midpoint, and stored layer slots follow
 reorder/removal while a newly appended layer remains untouched.
 Slots, law, position, and the exact remaining glide—even below the UI's
 quarter-beat minimum—are patch-persistent. Other modulation offsets remain
 frame-local and do not rewrite the captured bases.
+
+## Freeze and Random / Dice
+
+**Freeze Program** holds the complete visual program: file and Spout images,
+shader/VHS time, temporal history, LFO and morph phase, routing slew, and
+imported-audio analysis all resume without catch-up. **Freeze Media** (`M` or
+the **MED** button) holds only file and Spout images; program time, animated
+effects, modulation, temporal/VHS processing, and imported-audio analysis keep
+running. The two freeze states are independent and patch-persistent. `Space`
+pauses the selected layer; only when no layer is selected does it toggle
+Freeze Program.
+
+**RANDOM / DICE** is deterministic. **Pattern only** changes stochastic shader
+seeds without moving effect controls. **Bounded variation** first chooses the
+seeds, then makes range-safe changes to continuous Digital, Analog, Motion,
+Shift, and core Cellular amount/scale/warp/speed controls; **Amount** sets their scale
+and **Grain mode** additionally allows the grain algorithm and color-grain
+switch to change. Sources, stack, opacity, visibility, blend, keying, Bypass
+Master FX, transport, routings, VHS, and Temporal are not randomized.
+
+**Master** targets the master pattern plus all four LFO seeds; **Everything**
+also targets every current layer. A layer card has its own seed and
+pattern-only reroll. Leave **Exact seed** blank to advance deterministically
+from stored master/layer seeds, or enter an unsigned 32-bit base value to
+replay it. Master keeps that base exactly; Everything derives reproducible
+per-position layer streams. Master and Everything derive all four LFO seeds
+from the resulting master seed. `0` explicitly restores the legacy pattern
+family everywhere. Each LFO exposes its own 32-bit seed, and sample-and-hold
+holds one deterministic value for each complete LFO cycle. A decoded video can
+also enable **each loop**, which advances that layer's seed at every loop
+boundary live and offline; stills and Spout inputs do not reroll. All seeds and
+per-video loop choices persist in snapshots.
+
+**Shift** divides the image into output-pixel horizontal bands and displaces a
+seeded subset sideways with wrapping edges rather than exposing blank pixels.
+**Amount** bounds displacement to at most one quarter of the image width;
+**Block px**, **Density**, and **Speed** control band height, the participating
+fraction, and deterministic time epochs. Amount zero takes the exact established
+shader path. Freeze Program holds the epoch; Freeze Media lets it advance while
+source images remain held. Pattern-only Dice or a layer **Reroll** changes the
+arrangement through the stored seed, while Bounded variation can also move the
+four Shift controls. Master and layer Shift values are patch-persistent,
+Morph-interpolated, modulation targets, and evaluated by the same shader during
+offline export.
 
 ## Browser control
 
@@ -146,6 +208,15 @@ same-origin. The REMOTE section shows the current tokenized QR code. HTTPS is
 required for iOS motion permission; a bare, stale, unauthenticated, or
 cross-origin control request receives 403.
 
+The native preview's **RECOVERY** strip remains useful when no browser is
+connected or the panel listener cannot bind. It reports the listener lifecycle
+separately from browser count, exposes the current tokenized **Open Panel** URL,
+and dispatches Freeze Program, Blackout, and **Revert Visuals** directly through
+the engine. It also shows the active library and provides **Choose Library** and
+**Rescan**, and it surfaces recoverable output and media-source status. The strip
+belongs only to the operator preview: it is hidden when single-monitor Output
+owns the main surface, and a dedicated output display is always clean.
+
 The panel is mobile-first below 900 px. Touch controls include pointer-safe XY
 input, layer drag-to-reorder, group resets, and double-tap/double-click reset
 for individual sliders. Layer cards expose direct transport, target decode
@@ -154,6 +225,32 @@ effect values are also modulation targets. The **Layer effects** disclosure and
 its nested **CELLULAR** disclosure start closed for each new layer card and
 remember their state by layer identity while that layer remains present. All
 connected panels receive the same engine state.
+
+The Library column makes the source-allocation policy visible. **Safe** is the
+default and preserves the established per-source UHD-area ceiling of 8,294,400
+pixels / 33,177,600 RGBA bytes. **Expert** applies only to future source opens
+and permits at most DCI-8K area (35,389,440 pixels / 141,557,760 RGBA bytes),
+subject to the 16,384 px absolute edge, the device's 2D-texture edge and per-
+buffer limits, and an aggregate host-memory planning budget no larger than one
+eighth of detected physical RAM or 2 GiB, whichever is smaller. Portable wgpu
+does not report free VRAM headroom, so the eventual GPU allocation can still
+reject a source recoverably. Texture creation and every source upload are
+error-scoped; a failed upload remains uninitialized/inactive and surfaces on
+the layer instead of being reported healthy. The mode is not stored in patches;
+returning to Safe affects future allocations and does not destroy accepted
+sources.
+
+Library thumbnail and hover-preview work is subject to that same admission
+planner before FFmpeg decodes a candidate. Helpers have a fixed timeout,
+bounded captured output, and library-generation cancellation that does not
+suppress the deadline. Both encoded dimensions are capped at 180 px, each
+accepted JPEG is at most 512 KiB, and thumbnails plus preview strips share a
+64 MiB retained-cache ceiling. Safe mode permits at most four thumbnail and two
+preview helpers process-wide, while Expert mode serializes helpers one at a
+time. Startup, folder changes, and repeated rescans share a single-flight gate;
+a newer rescan cancels and then replaces the older generation. This background
+convenience path cannot evade the DCI-8K-area, device-edge,
+max-buffer, host-planning, or cache boundaries.
 
 Each layer can independently enable **Bypass Master FX**. This skips inherited
 Digital, Analog, Cellular, Motion, and VHS processing for that layer while its
@@ -167,7 +264,10 @@ not allocate selective work. Live selective processing is latest-only and has a
 that budget or processing fails, the engine holds the prior exact audience
 frame and reports the VHS error; it never falls back to applying global VHS to
 a bypassed layer. The bypass is non-destructive: neither **Reset FX** on the
-layer nor master **Revert** changes it.
+layer nor master **Revert** changes it. Expert media mode does not enlarge this
+selective-VHS budget. The VHS panel labels the active global or selective live
+path and reports admitted work and healthy busy/backpressure skips; it separates
+unavailable worker failures, stale completions, and the current busy state.
 
 Every slider's displayed value is also an editable numeric field. Select it,
 type any in-range value, and press Enter or leave the field to commit through
@@ -204,8 +304,12 @@ that now occupies the old index. See
 
 ## Sources and output
 
-- **Video layers:** add files from the library or drag/drop. Patches retain a
-  stable path and fall back to the library filename for older patches.
+- **Video and still layers:** add files from the active library or drag/drop.
+  The default active folder is `videos/`; the native **Choose Library** control
+  can switch the visual/audio scan and browser-upload destination. **Rescan**
+  refreshes that folder. Neither operation adds a layer automatically. Patches
+  retain a stable path and fall back to the active-library filename for older
+  patches.
 - **Spout input (Windows):** enter an exact sender name and choose **Add
   live**. The receiver is an ordinary composited layer with transport/effect
   controls and a visible connection status. A missing or warming sender stays
@@ -219,6 +323,10 @@ that now occupies the old index. See
   existing main preview to a clean fullscreen audience surface. Window/surface
   creation failures are returned to the panel instead of leaving its switch in
   a false-open state.
+- **Startup recovery:** the initial visual is metadata-probed under Safe policy
+  before it can choose preview dimensions. A rejected probe uses 1280×720, and
+  a source-sized renderer initialization failure receives one 1280×720 retry;
+  the RECOVERY strip and browser snapshot surface the recoverable status.
 - **Blackout:** press `B` or use the panel button. Preview, output window,
   Spout, and NTSC/readback consumers receive the same black frame.
 
@@ -233,6 +341,18 @@ master processing, inherited-only VHS, straight-alpha stack composition, and
 post-composite Temporal order as live rendering, but evaluates it synchronously
 for each output frame. The legacy no-bypass and VHS-off paths remain unchanged.
 
+Expert media mode may admit a larger saved source during offline source
+reconstruction, under the same host-local reservation policy. It does not raise
+the renderer, fullscreen-output, or export-output UHD-area limits, and it does
+not relax the separate 320 MiB selective-VHS working-set budget.
+
+When VHS is enabled, **VHS quality** selects its spatial processing resolution
+for both global and selective export. **Live parity (half)** is the default and
+matches the real-time path by processing at half width and height, then
+upscaling. **Native (full resolution)** processes at the selected export size;
+it avoids that downscale/upscale step but is slower and more memory-intensive.
+This choice does not change Bypass Master FX routing or pipeline order.
+
 An optional video layer can supply its first audio stream. That audio starts at
 source time zero, plays once at 1×, and is independent of visual pause, speed,
 modulation, and looping. It is padded with silence or trimmed to the requested
@@ -241,29 +361,70 @@ arbitrarily modulated visual transport can be represented by one audio tempo.
 
 ## Patches
 
-`Ctrl+S` saves and `Ctrl+O` loads a YAML patch. `Ctrl+E` opens the native patch
-parameter editor; the saved file itself is ordinary YAML and may also be
-edited in a text editor. Current patches include:
+`Ctrl+S` saves a YAML patch through a native dialog. The browser's **Capture
+snapshot** writes a uniquely named YAML file under `patches/` without blocking
+the render loop or overwriting an earlier capture. Recall has two deliberately
+different paths:
 
-- master, per-layer, NTSC, and temporal values;
-- layer order, visibility, pause, speed, blend, keying, master-FX bypass, and stable source path;
-- master pause and complete modulation state;
+- **Load snapshot…** (`Ctrl+O`) reconstructs the saved sources and layer order,
+  then restores visual state, layer and program transport, both freeze states,
+  modulation and input configuration, LFO state, and morph automation. The
+  replacement is atomic across the visual stack and saved imported analysis
+  audio: every file is resolved and the audio is fully decoded before commit,
+  so a missing, invalid, or corrupt source leaves the current performance in
+  place. A legacy patch with no modulation section preserves current audio state.
+- **Apply look…** (`Ctrl+Shift+O`) keeps the current sources, layer identities,
+  order, layer count, speed/FPS/pause, per-video loop-reroll choices, both
+  freeze states, BPM, modulation, and input state. It applies master effects
+  and maps each saved layer by position onto the corresponding current layer:
+  direct effects/keying/pattern seed, opacity, blend, visibility, and Bypass
+  Master FX. Saved NTSC and Temporal sections apply when present; a legacy
+  patch that omits either leaves that current section unchanged. Extra current
+  layers remain visually unchanged and extra saved layers are reported unused.
+  A stack change while the picker is open rejects the transfer. An engaged
+  current A/B morph is materialized and cleared before the look is applied;
+  the patch's saved morph is not imported.
+
+After a successful Apply Look, actions that could overwrite its applied master,
+mapped-layer, reroll, topology, and present NTSC/Temporal scope are discarded,
+including conflicting input queued while the native picker was open. Unrelated
+transport/safety actions, unmapped-layer edits, and edits to an omitted section
+keep their order. Cancelling, failing, or rejecting a stale picker is not a
+barrier.
+
+`Ctrl+E` opens the native patch parameter editor; the file itself remains
+ordinary YAML and can also be edited in a text editor. Current snapshots
+include:
+
+- master, per-layer, NTSC, and temporal values, including visual pattern seeds;
+- layer order, visibility, pause, speed, blend, keying, master-FX bypass,
+  per-video loop reroll, and stable source paths;
+- Freeze Program, Freeze Media, and complete modulation state, including LFO
+  sample-and-hold seeds;
 - routing curves/slew, audio band count/crossovers/ceiling, gyro calibration/configuration, and XY
   configuration/current position;
 - morph A/B slots, crossfader law/position, and remaining beat glide.
 
 Old patches remain accepted through serde defaults and legacy filename/slit
-axis fallbacks.
+axis fallbacks. New seeds default to `0` (the legacy pattern family), while
+per-video loop reroll and Freeze Media default to off.
 
-The browser's **Capture patch** control writes a unique YAML snapshot under
-`patches/` through a bounded background writer. Existing captures are never
-overwritten and the render loop does not wait for disk I/O.
+Exact patch load and offline export share one visual/imported-analysis-audio
+resolver. Ordinary snapshots keep compatible path-first and nearby/library
+filename fallbacks. Procedurally generated `cos-sha256://` references instead
+require the candidate byte length and SHA-256 to match; a same-named different
+file is not silently substituted.
+The running layer keeps that persisted identity separately from its resolved
+host path. Capture/save writes the identity, while UI export treats the host
+path only as a candidate and re-fingerprints it against the recorded digest;
+moving the file remains operationally harmless and mutating it after load is a
+hard preflight error.
 
 A successful patch load starts new topology and visual generations. Immediate
-browser work and downbeat-latched actions from the prior patch are cleared;
-temporal history, retained NTSC output, and pending asynchronous readbacks are
-invalidated so neither an old command nor an old frame can bleed into the
-restored world.
+browser work, downbeat-latched actions, and the already-drained remainder of the
+current action batch are cleared; temporal history, retained NTSC output, and
+pending asynchronous readbacks are invalidated so neither an old command nor an
+old frame can bleed into the restored world.
 
 ## Procedural patch generation
 
@@ -274,19 +435,36 @@ starting GPU exports:
 target\release\collide-o-scope.exe generate `
   --anchor patches\anchor.yaml `
   --output generated `
+  --library path\to\media `
   --count 10 `
   --temperature 0.5 `
-  --seed 424242
+  --seed 424242 `
+  --max-fingerprint-bytes 68719476736
 ```
 
-Each new piece directory contains `patch.yaml` and `manifest.json`. Generation
-uses typed, reflected, mean-reverting mutations; preserves source/layer/routing
-topology; rejects active two-slot morphs and in-flight glides; and requires explicit
-`--allow-black-sources` before accepting live Spout layers. Output directories
-are committed atomically and never overwritten. See
+Generator v2 resolves and SHA-256 fingerprints visual and imported
+analysis-audio files before it commits output. It replaces private local paths
+with `cos-sha256://<digest>/<bytes>` references, so canonical anchor/piece hashes
+and lineage are independent of the host root and change when source bytes do.
+`--library` is optional; `--max-fingerprint-bytes` defaults to 64 GiB and bounds
+one invocation. `--allow-unverified-sources` explicitly permits a logical-name
+fallback with an incomplete-identity warning.
+
+Each new piece directory contains `patch.yaml`, schema-v2 `manifest.json`, and
+deterministic `preflight.json`. The receipt records source digests, byte/search
+limits, warnings, and a narrow configuration/source-byte claim; it explicitly
+does not claim rendered-pixel identity. Generation uses typed, reflected,
+mean-reverting mutations, including Shift; preserves source/layer/routing
+topology; rejects active two-slot morphs and in-flight glides; and requires
+explicit `--allow-black-sources` before accepting live Spout layers. The three
+files are committed atomically per piece and never overwritten.
+
+Generation still does not render MP4 batches. Clip-statistics work remains
+deferred pending a bounded analysis/cache design, and visual-parameter-driven
+audio DSP remains research-gated. See
 [procedural video generation](docs/blogs/procedural-video-generation.md) for
-the mathematical design, cellular effect, reproducibility boundary, and
-deliberately deferred clip-analysis/audio-DSP work.
+the mutation design, shared source resolver, reproducibility boundary, and
+remaining research trajectory.
 
 ## Build
 
@@ -318,17 +496,21 @@ cargo run -- path/to/clip.mp4
 # Open with a folder
 cargo run -- path/to/clips/
 
-# No arguments: drag and drop files/folders after launch
+# No arguments: use/create ./videos as the initial library
 cargo run
 ```
 
-The control panel opens in the default browser.
+The control panel opens in the default browser. If automatic opening fails, use
+the current authenticated **Open Panel** link in the native **RECOVERY** strip.
+Use **Choose Library** there to select another folder without restarting; a
+cancelled chooser leaves the current library and program state unchanged.
 
 ## Keyboard
 
 | Key | Action |
 |---|---|
-| Space | Pause/resume selected layer |
+| Space | Pause/resume selected layer; with no selected layer, toggle Freeze Program |
+| M | Toggle Freeze Media |
 | F | Toggle main-window fullscreen |
 | O | Toggle fullscreen output window |
 | B | Blackout/unblackout |
@@ -336,7 +518,7 @@ The control panel opens in the default browser.
 | G / Shift+G | Increase/decrease RGB split |
 | 0 | Reset effects |
 | Ctrl+E | Toggle patch parameter editor |
-| Ctrl+S / Ctrl+O | Save/load patch |
+| Ctrl+S / Ctrl+O / Ctrl+Shift+O | Save / Load snapshot / Apply look |
 | Esc | Quit or close output window as appropriate |
 
 ## Validation boundary

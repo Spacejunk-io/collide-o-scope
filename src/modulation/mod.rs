@@ -23,10 +23,6 @@ use crate::ntsc::NtscParams;
 
 pub const NUM_LFOS: usize = 4;
 pub const MAX_ROUTINGS: usize = 64;
-/// Maximum live stack size advertised by the modulation matrix and panel.
-/// Keeping this explicit prevents a layer from existing without routable
-/// opacity, transport, key, and effect controls.
-pub const MAX_MOD_LAYERS: usize = 16;
 pub const AUDIO_SOURCE_LIVE: &str = "live";
 pub const AUDIO_SOURCE_FILE: &str = "file";
 
@@ -69,6 +65,10 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("cellular_gap_amount", 0.0, 1.0),
     ("cellular_gap_threshold", 0.0, 1.0),
     ("cellular_gap_softness", 0.0, 0.5),
+    ("shift_amount", 0.0, 1.0),
+    ("shift_block_size", 2.0, 256.0),
+    ("shift_density", 0.0, 1.0),
+    ("shift_speed", 0.0, 20.0),
     ("ntsc_snow", 0.0, 1.0),
     ("ntsc_tracking_snow", 0.0, 1.0),
     ("ntsc_edge_wave", 0.0, 20.0),
@@ -109,14 +109,16 @@ pub fn canonical_target(target: &str) -> Cow<'_, str> {
     let Ok(layer) = number.parse::<usize>() else {
         return Cow::Borrowed(target);
     };
-    if !(1..=MAX_MOD_LAYERS).contains(&layer) {
+    if layer == 0 {
         return Cow::Borrowed(target);
     }
     Cow::Owned(format!("layer{layer}_key_threshold"))
 }
 
-/// Resolve a target's legal value range, including dynamically named layer
-/// targets up to [`MAX_MOD_LAYERS`].
+/// Resolve a target's legal value range, including any positive, dynamically
+/// named one-based layer target. Actual-stack bounds are enforced when a
+/// frame-sized routing accumulator is built, not while parsing persisted
+/// target names.
 pub fn target_range(target: &str) -> Option<(f32, f32)> {
     let target = canonical_target(target);
     let target = target.as_ref();
@@ -127,7 +129,7 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
     let rest = target.strip_prefix("layer")?;
     let (number, suffix) = rest.split_once('_')?;
     let layer = number.parse::<usize>().ok()?;
-    if !(1..=MAX_MOD_LAYERS).contains(&layer) {
+    if layer == 0 {
         return None;
     }
     match suffix {
@@ -156,6 +158,10 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "cellular_gap_amount" => Some((0.0, 1.0)),
         "cellular_gap_threshold" => Some((0.0, 1.0)),
         "cellular_gap_softness" => Some((0.0, 0.5)),
+        "shift_amount" => Some((0.0, 1.0)),
+        "shift_block_size" => Some((2.0, 256.0)),
+        "shift_density" => Some((0.0, 1.0)),
+        "shift_speed" => Some((0.0, 20.0)),
         _ => None,
     }
 }
@@ -174,7 +180,7 @@ pub struct LayerModulation {
 }
 
 /// One-frame modulation cache. Every route is accumulated exactly once; all
-/// master, morph, and layer consumers then read fixed-size indexed storage.
+/// master, morph, and layer consumers then read frame-sized indexed storage.
 /// Keeping this frame-local makes route edits immediately authoritative while
 /// avoiding repeated scans and target parsing in both live and export paths.
 pub struct ModulationFrame {
@@ -284,6 +290,9 @@ pub struct Lfo {
     pub beats: f32,
     /// Phase offset, 0..1 of a cycle.
     pub phase: f32,
+    /// Independent deterministic seed for Sample & Hold. Zero reproduces the
+    /// historical cycle/index sequence exactly.
+    pub seed: u32,
 }
 
 impl Default for Lfo {
@@ -292,6 +301,7 @@ impl Default for Lfo {
             shape: LfoShape::Sine,
             beats: 4.0,
             phase: 0.0,
+            seed: 0,
         }
     }
 }
@@ -333,6 +343,9 @@ impl Lfo {
                 let mut h = cycle
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     .wrapping_add(lfo_index as u64 + 1);
+                if self.seed != 0 {
+                    h ^= u64::from(self.seed).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                }
                 h ^= h >> 33;
                 h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
                 h ^= h >> 33;
@@ -802,6 +815,10 @@ pub struct ModMatrix {
     pub audio_source_kind: String,
     /// Persisted source identity for deterministic, circular file analysis.
     pub audio_clip_path: String,
+    /// Verified content reference retained while `audio_clip_path` points at
+    /// the resolved host file used by the live decoder. Runtime-only: patch
+    /// conversion writes this identity back into `audio_clip_path`.
+    pub audio_clip_source_reference: Option<String>,
     /// Validated 3–8-band layout mirrored into `AudioAnalyzer`.
     pub audio_band_config: AudioBandConfig,
     /// Latest MIDI slot values 0..1 (pushed by the app from the MIDI engine).
@@ -842,6 +859,7 @@ impl ModMatrix {
             audio_device: String::new(),
             audio_source_kind: AUDIO_SOURCE_LIVE.to_string(),
             audio_clip_path: String::new(),
+            audio_clip_source_reference: None,
             audio_band_config: AudioBandConfig::default(),
             midi: [0.0; NUM_MIDI_SLOTS],
             midi_enabled: false,
@@ -1014,7 +1032,7 @@ impl ModMatrix {
         ntsc: &NtscParams,
         temporal: &TemporalParams,
     ) -> (EffectUniforms, NtscParams, TemporalParams) {
-        Self::modulate_from_offsets(effects, ntsc, temporal, &self.accumulate_offsets())
+        Self::modulate_from_offsets(effects, ntsc, temporal, &self.accumulate_offsets(0))
     }
 
     fn modulate_from_offsets(
@@ -1091,6 +1109,10 @@ impl ModMatrix {
         apply!(cellular_gap_amount, "cellular_gap_amount", 0.0, 1.0);
         apply!(cellular_gap_threshold, "cellular_gap_threshold", 0.0, 1.0);
         apply!(cellular_gap_softness, "cellular_gap_softness", 0.0, 0.5);
+        apply!(shift_amount, "shift_amount", 0.0, 1.0);
+        apply!(shift_block_size, "shift_block_size", 2.0, 256.0);
+        apply!(shift_density, "shift_density", 0.0, 1.0);
+        apply!(shift_speed, "shift_speed", 0.0, 20.0);
 
         LayerModulation {
             opacity,
@@ -1103,9 +1125,14 @@ impl ModMatrix {
     /// Modulate a complete stack from one O(routes) accumulator pass. This is
     /// the live/export hot-path API; the single-layer method remains as a
     /// compatibility convenience for patch tooling and focused tests.
-    pub fn frame(&self) -> ModulationFrame {
+    /// Build one immutable modulation sample for an actual live/export stack.
+    ///
+    /// Layer storage is sized only from this trusted caller-supplied count.
+    /// A persisted or network-authored target with an enormous layer number is
+    /// therefore ignored by bounds checks instead of driving an allocation.
+    pub fn frame(&self, layer_count: usize) -> ModulationFrame {
         ModulationFrame {
-            offsets: self.accumulate_offsets(),
+            offsets: self.accumulate_offsets(layer_count),
         }
     }
 
@@ -1120,9 +1147,27 @@ impl ModMatrix {
         base_speed: f32,
         base_fps: f32,
     ) -> LayerModulation {
-        let offsets = self.accumulate_offsets();
+        // This test/tooling convenience must not size storage from the target
+        // index: a valid parsed target may be as large as `usize::MAX - 1`.
+        // Remap only the requested layer into one trusted local slot.
+        let mut offsets = RoutingOffsets::new(1);
+        for routing in &self.routings {
+            let CompiledTarget::Layer {
+                index: target_index,
+                suffix,
+            } = routing.compiled_target
+            else {
+                continue;
+            };
+            if target_index == index {
+                let amount = routing.cached_value() * finite_or(routing.depth, 0.0);
+                if amount != 0.0 {
+                    offsets.add(CompiledTarget::Layer { index: 0, suffix }, amount);
+                }
+            }
+        }
         Self::modulate_layer_from_offsets(
-            index,
+            0,
             base_effects,
             base_opacity,
             base_speed,
@@ -1135,16 +1180,16 @@ impl ModMatrix {
     /// applies itself (e.g. the morph crossfader) rather than via
     /// `modulate`. Uses the same depth × half-range scaling.
     #[cfg(test)]
-    pub fn target_offset(&self, target: &str) -> f32 {
+    pub fn target_offset(&self, target: &str, layer_count: usize) -> f32 {
         let Some((min, max)) = target_range(target) else {
             return 0.0;
         };
         let compiled = compile_target(target);
-        self.accumulate_offsets().value(compiled) * (max - min) * 0.5
+        self.accumulate_offsets(layer_count).value(compiled) * (max - min) * 0.5
     }
 
-    fn accumulate_offsets(&self) -> RoutingOffsets {
-        let mut offsets = RoutingOffsets::default();
+    fn accumulate_offsets(&self, layer_count: usize) -> RoutingOffsets {
+        let mut offsets = RoutingOffsets::new(layer_count);
         for routing in &self.routings {
             let amount = routing.cached_value() * finite_or(routing.depth, 0.0);
             if amount != 0.0 {
@@ -1217,18 +1262,17 @@ fn parse_layer_target(target: &str) -> Option<(usize, &str)> {
     let rest = target.strip_prefix("layer")?;
     let (number, suffix) = rest.split_once('_')?;
     let one_based = number.parse::<usize>().ok()?;
-    (1..=MAX_MOD_LAYERS)
-        .contains(&one_based)
-        .then_some((one_based - 1, suffix))
+    (one_based > 0).then_some((one_based - 1, suffix))
 }
 
 /// Source-depth sums, before multiplication by each destination's half-range.
-/// The arrays are small, fixed, stack-resident, and rebuilt once per consumer
-/// batch so routing edits never need an invalidation protocol.
+/// Master storage is fixed; layer storage is sized from the actual consumer
+/// stack and rebuilt once per batch so routing edits need no invalidation
+/// protocol. Untrusted target indices are never used as allocation sizes.
 #[derive(Clone)]
 struct RoutingOffsets {
     master: [f32; TARGETS.len()],
-    layer: [[f32; LAYER_TARGET_SUFFIXES.len()]; MAX_MOD_LAYERS],
+    layer: Vec<[f32; LAYER_TARGET_SUFFIXES.len()]>,
 }
 
 const LAYER_TARGET_SUFFIXES: &[&str] = &[
@@ -1263,14 +1307,64 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "cellular_gap_softness",
     "key_softness",
     "downsample",
+    // Appended so every established layer suffix retains its compiled index.
+    "shift_amount",
+    "shift_block_size",
+    "shift_density",
+    "shift_speed",
 ];
 
-impl Default for RoutingOffsets {
-    fn default() -> Self {
+impl RoutingOffsets {
+    fn new(layer_count: usize) -> Self {
         Self {
             master: [0.0; TARGETS.len()],
-            layer: [[0.0; LAYER_TARGET_SUFFIXES.len()]; MAX_MOD_LAYERS],
+            layer: vec![[0.0; LAYER_TARGET_SUFFIXES.len()]; layer_count],
         }
+    }
+
+    fn add(&mut self, target: CompiledTarget, amount: f32) {
+        match target {
+            CompiledTarget::Master(index) => {
+                if let Some(slot) = self.master.get_mut(index) {
+                    *slot += amount;
+                }
+            }
+            CompiledTarget::Layer { index, suffix } => {
+                if let Some(slot) = self
+                    .layer
+                    .get_mut(index)
+                    .and_then(|values| values.get_mut(suffix))
+                {
+                    *slot += amount;
+                }
+            }
+            CompiledTarget::Invalid => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn value(&self, target: CompiledTarget) -> f32 {
+        match target {
+            CompiledTarget::Master(index) => self.master.get(index).copied().unwrap_or(0.0),
+            CompiledTarget::Layer { index, suffix } => self
+                .layer
+                .get(index)
+                .and_then(|values| values.get(suffix))
+                .copied()
+                .unwrap_or(0.0),
+            CompiledTarget::Invalid => 0.0,
+        }
+    }
+
+    fn layer_value(&self, layer: usize, suffix: &str) -> f32 {
+        let Some(suffix) = layer_suffix_index(suffix) else {
+            return 0.0;
+        };
+        self.layer
+            .get(layer)
+            .and_then(|values| values.get(suffix))
+            .copied()
+            .unwrap_or(0.0)
     }
 }
 
@@ -1307,38 +1401,12 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "cellular_gap_softness" => 28,
         "key_softness" => 29,
         "downsample" => 30,
+        "shift_amount" => 31,
+        "shift_block_size" => 32,
+        "shift_density" => 33,
+        "shift_speed" => 34,
         _ => return None,
     })
-}
-
-impl RoutingOffsets {
-    fn add(&mut self, target: CompiledTarget, amount: f32) {
-        match target {
-            CompiledTarget::Master(index) => self.master[index] += amount,
-            CompiledTarget::Layer { index, suffix } => self.layer[index][suffix] += amount,
-            CompiledTarget::Invalid => {}
-        }
-    }
-
-    #[cfg(test)]
-    fn value(&self, target: CompiledTarget) -> f32 {
-        match target {
-            CompiledTarget::Master(index) => self.master[index],
-            CompiledTarget::Layer { index, suffix } => self.layer[index][suffix],
-            CompiledTarget::Invalid => 0.0,
-        }
-    }
-
-    fn layer_value(&self, layer: usize, suffix: &str) -> f32 {
-        let Some(suffix) = layer_suffix_index(suffix) else {
-            return 0.0;
-        };
-        self.layer
-            .get(layer)
-            .and_then(|values| values.get(suffix))
-            .copied()
-            .unwrap_or(0.0)
-    }
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -1425,6 +1493,10 @@ fn apply_offset(
         "cellular_gap_amount" => &mut fx.cellular_gap_amount,
         "cellular_gap_threshold" => &mut fx.cellular_gap_threshold,
         "cellular_gap_softness" => &mut fx.cellular_gap_softness,
+        "shift_amount" => &mut fx.shift_amount,
+        "shift_block_size" => &mut fx.shift_block_size,
+        "shift_density" => &mut fx.shift_density,
+        "shift_speed" => &mut fx.shift_speed,
         "ntsc_snow" => &mut np.snow_intensity,
         "ntsc_tracking_snow" => &mut np.tracking_noise_snow,
         "ntsc_edge_wave" => &mut np.edge_wave_intensity,
@@ -1458,6 +1530,55 @@ mod tests {
         assert!(
             (actual - expected).abs() < 1e-5,
             "expected {expected}, got {actual}"
+        );
+    }
+
+    fn sample_hold(seed: u32) -> Lfo {
+        Lfo {
+            shape: LfoShape::SampleHold,
+            beats: 4.0,
+            phase: 0.0,
+            seed,
+        }
+    }
+
+    #[test]
+    fn sample_hold_seed_zero_matches_the_legacy_golden_sequence() {
+        let lfo = sample_hold(0);
+        let observed = [
+            lfo.value(0.0, 0).to_bits(),
+            lfo.value(4.0, 0).to_bits(),
+            lfo.value(8.0, 0).to_bits(),
+            lfo.value(0.0, 2).to_bits(),
+        ];
+        assert_eq!(
+            observed,
+            [0x3f7e_a360, 0x3e14_9bd0, 0xbf45_a34b, 0x3f7b_ea1f]
+        );
+    }
+
+    #[test]
+    fn sample_hold_is_constant_within_a_cycle_and_changes_at_the_boundary() {
+        let lfo = sample_hold(0);
+        let held = lfo.value(0.0, 0);
+        for beat in [0.25, 1.0, 2.5, 3.999] {
+            assert_eq!(lfo.value(beat, 0).to_bits(), held.to_bits());
+        }
+        assert_ne!(lfo.value(4.0, 0).to_bits(), held.to_bits());
+    }
+
+    #[test]
+    fn sample_hold_seed_selects_an_independent_deterministic_sequence() {
+        let legacy = sample_hold(0);
+        let seeded = sample_hold(42);
+        let first = seeded.value(0.0, 0);
+
+        assert_eq!(first.to_bits(), 0x3f12_db40);
+        assert_eq!(seeded.value(0.0, 0).to_bits(), first.to_bits());
+        assert_ne!(first.to_bits(), legacy.value(0.0, 0).to_bits());
+        assert_ne!(
+            seeded.value(4.0, 0).to_bits(),
+            legacy.value(4.0, 0).to_bits()
         );
     }
 
@@ -1673,7 +1794,7 @@ mod tests {
         matrix.update_at_beat(0.0, 0.5);
         let cached = matrix.routings[1].cached;
 
-        let _ = matrix.target_offset("contrast");
+        let _ = matrix.target_offset("contrast", 0);
         let _ = matrix.modulate(
             &EffectUniforms::default(),
             &NtscParams::default(),
@@ -1707,7 +1828,7 @@ mod tests {
         let expected_second = matrix.modulate_layer_full(1, &second, 0.7, 1.5, 24.0);
 
         let batched = matrix
-            .frame()
+            .frame(2)
             .modulate_layers([(&first, 0.9, 1.0, 30.0), (&second, 0.7, 1.5, 24.0)]);
 
         approx(batched[0].opacity, expected_first.opacity);
@@ -1720,7 +1841,7 @@ mod tests {
             batched[1].effects.cellular_gap_softness,
             expected_second.effects.cellular_gap_softness,
         );
-        let frame = matrix.frame();
+        let frame = matrix.frame(2);
         let cached = frame.modulate_layers([(&first, 0.9, 1.0, 30.0), (&second, 0.7, 1.5, 24.0)]);
         approx(cached[0].opacity, batched[0].opacity);
         approx(cached[1].fps, batched[1].fps);
@@ -1761,7 +1882,7 @@ mod tests {
         route.cached = 1.0;
         let mut matrix = ModMatrix::new();
         matrix.routings.push(route);
-        let frame = matrix.frame();
+        let frame = matrix.frame(0);
         let (effects, _, _) = frame.modulate(
             &EffectUniforms::default(),
             &NtscParams::default(),
@@ -1872,24 +1993,46 @@ mod tests {
     }
 
     #[test]
-    fn every_supported_layer_has_full_target_validation_and_modulation() {
-        assert!(include_str!("../../static/app.js")
-            .contains(&format!("const MAX_MOD_LAYERS = {MAX_MOD_LAYERS};")));
+    fn arbitrary_positive_layer_targets_are_bounded_by_the_actual_frame_size() {
         assert_eq!(target_range("layer16_brightness"), Some((-1.0, 1.0)));
         assert_eq!(target_range("layer16_downsample"), Some((0.05, 1.0)));
-        assert_eq!(target_range("layer17_opacity"), None);
+        assert_eq!(target_range("layer17_opacity"), Some((0.0, 1.0)));
+        assert_eq!(target_range("layer257_downsample"), Some((0.05, 1.0)));
         assert_eq!(target_range("layer0_speed"), None);
         assert_eq!(target_range("layer16_unknown"), None);
 
         let mut matrix = ModMatrix::new();
         matrix.midi[0] = 1.0;
-        matrix
-            .routings
-            .push(Routing::new(ModSource::Midi(0), "layer16_brightness", 1.0));
+        matrix.routings = vec![
+            Routing::new(ModSource::Midi(0), "layer17_brightness", 1.0),
+            Routing::new(
+                ModSource::Midi(0),
+                format!("layer{}_brightness", usize::MAX),
+                1.0,
+            ),
+        ];
         matrix.update_at_beat(0.0, 0.0);
         let base = EffectUniforms::default();
-        let modulated = matrix.modulate_layer_full(15, &base, 1.0, 1.0, 30.0);
+
+        let frame = matrix.frame(17);
+        assert_eq!(frame.offsets.layer.len(), 17);
+        let modulated =
+            ModMatrix::modulate_layer_from_offsets(16, &base, 1.0, 1.0, 30.0, &frame.offsets);
         approx(modulated.effects.brightness, 1.0);
+
+        // A forged, parseable destination does not influence allocation and
+        // is simply ignored when it lies outside the caller's actual stack.
+        let one_layer_frame = matrix.frame(1);
+        assert_eq!(one_layer_frame.offsets.layer.len(), 1);
+        let first = one_layer_frame
+            .modulate_layers([(&base, 1.0, 1.0, 30.0)])
+            .remove(0);
+        approx(first.effects.brightness, 0.0);
+
+        // The single-layer test/tooling adapter also uses one local slot,
+        // even when asked to inspect the largest representable parsed index.
+        let huge = matrix.modulate_layer_full(usize::MAX - 1, &base, 1.0, 1.0, 30.0);
+        approx(huge.effects.brightness, 1.0);
         approx(base.brightness, 0.0);
     }
 
@@ -1965,6 +2108,61 @@ mod tests {
         approx(base.cellular_gap_amount, 0.0);
         approx(base.cellular_gap_threshold, 0.65);
         approx(base.cellular_gap_softness, 0.08);
+    }
+
+    #[test]
+    fn shift_targets_modulate_master_and_arbitrary_layers_without_mutating_bases() {
+        for (target, range) in [
+            ("shift_amount", (0.0, 1.0)),
+            ("shift_block_size", (2.0, 256.0)),
+            ("shift_density", (0.0, 1.0)),
+            ("shift_speed", (0.0, 20.0)),
+            ("layer17_shift_amount", (0.0, 1.0)),
+            ("layer17_shift_block_size", (2.0, 256.0)),
+            ("layer17_shift_density", (0.0, 1.0)),
+            ("layer17_shift_speed", (0.0, 20.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range));
+        }
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        for target in [
+            "shift_amount",
+            "shift_block_size",
+            "shift_density",
+            "shift_speed",
+            "layer17_shift_amount",
+            "layer17_shift_block_size",
+            "layer17_shift_density",
+            "layer17_shift_speed",
+        ] {
+            matrix
+                .routings
+                .push(Routing::new(ModSource::Midi(0), target, 1.0));
+        }
+        matrix.update_at_beat(0.0, 0.0);
+
+        let base = EffectUniforms::default();
+        let (master, _, _) =
+            matrix.modulate(&base, &NtscParams::default(), &TemporalParams::default());
+        approx(master.shift_amount, 0.5);
+        approx(master.shift_block_size, 135.0);
+        approx(master.shift_density, 1.0);
+        approx(master.shift_speed, 13.0);
+
+        let frame = matrix.frame(17);
+        let layer =
+            ModMatrix::modulate_layer_from_offsets(16, &base, 1.0, 1.0, 30.0, &frame.offsets);
+        approx(layer.effects.shift_amount, 0.5);
+        approx(layer.effects.shift_block_size, 135.0);
+        approx(layer.effects.shift_density, 1.0);
+        approx(layer.effects.shift_speed, 13.0);
+
+        approx(base.shift_amount, 0.0);
+        approx(base.shift_block_size, 8.0);
+        approx(base.shift_density, 0.5);
+        approx(base.shift_speed, 3.0);
     }
 
     #[test]

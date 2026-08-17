@@ -10,6 +10,34 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::effects::EffectUniforms;
 
+/// Lifecycle of the authenticated loopback control listener. This is kept
+/// separate from browser connection count: zero connected browsers can be a
+/// perfectly healthy server, while a bind failure means the local panel is
+/// genuinely unavailable for this process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlServerStatus {
+    NotStarted,
+    Starting,
+    Listening,
+    Unavailable(String),
+}
+
+/// Atomic native-shell view of the local listener and its bearer-token URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlServerInfo {
+    pub local_url: String,
+    pub status: ControlServerStatus,
+}
+
+impl Default for ControlServerInfo {
+    fn default() -> Self {
+        Self {
+            local_url: String::new(),
+            status: ControlServerStatus::NotStarted,
+        }
+    }
+}
+
 /// Shared state accessible by both the web server and the render loop.
 pub struct WebState {
     /// Full app snapshot (pushed from render loop each frame)
@@ -22,6 +50,14 @@ pub struct WebState {
     pub thumbnails: std::sync::RwLock<HashMap<String, Vec<u8>>>,
     /// Preview frames: filename → vec of JPEG frames (for hover animation)
     pub preview_frames: std::sync::RwLock<HashMap<String, Vec<Vec<u8>>>>,
+    /// Aggregate bytes retained by both convenience caches. The mutex is also
+    /// their cross-cache publication/clear barrier, so concurrent helper
+    /// completions cannot independently over-admit the same remaining budget.
+    library_media_cache_bytes: std::sync::Mutex<u64>,
+    /// One metadata/decode pipeline at a time across startup, folder changes,
+    /// and repeated rescans. Per-pipeline helper fan-out is therefore also the
+    /// process-wide concurrency ceiling rather than a per-request ceiling.
+    library_media_helper_gate: std::sync::Mutex<()>,
     /// Library folder for clip uploads (set by the app; None until known).
     pub library_folder: std::sync::RwLock<Option<std::path::PathBuf>>,
     /// Per-session access token. Every client must present it once (the local
@@ -29,6 +65,12 @@ pub struct WebState {
     pub access_token: String,
     /// Full remote URL (LAN address + token), set by the server at startup.
     pub lan_url: std::sync::RwLock<String>,
+    /// Truthful loopback listener lifecycle and authenticated local URL for the
+    /// native recovery strip.
+    control_server: std::sync::RwLock<ControlServerInfo>,
+    /// Rejects thumbnail/preview writes from a folder that is no longer the
+    /// active library, even if its background ffmpeg worker finishes later.
+    library_generation: AtomicU64,
     /// Server-owned phone-stream membership and monotonic sample freshness.
     gyro_streams: std::sync::Mutex<GyroStreamRegistry>,
     next_client_id: AtomicU64,
@@ -117,13 +159,22 @@ pub struct AppSnapshot {
     pub msg_type: String,
     pub effects: EffectsSnapshot,
     pub ntsc: NtscSnapshot,
+    /// Host-local admission limits for future media source allocations. This is
+    /// deliberately independent from patches and output/export dimensions.
+    #[serde(default)]
+    pub media_safety: MediaSafetySnapshot,
     pub layers: Vec<LayerSnapshot>,
     /// Monotonic topology generation used to reject stale multi-controller
     /// reorder requests. Zero means an older server/client with no revision.
     #[serde(default)]
     pub layer_stack_revision: u64,
     pub library: Vec<String>,
+    /// Legacy mirror of `program_frozen` for older bundled clients.
     pub paused: bool,
+    #[serde(default)]
+    pub program_frozen: bool,
+    #[serde(default)]
+    pub media_frozen: bool,
     /// Modulation matrix state (BPM, LFOs, routings)
     #[serde(default)]
     pub modulation: ModSnapshot,
@@ -160,6 +211,11 @@ pub struct AppSnapshot {
     /// Non-empty when export encountered an error
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub export_error: String,
+    /// Recoverable source substitutions made by the current or most recent
+    /// export. Kept separate from `export_error` so a compatible legacy
+    /// render can succeed while still reporting exactly what rendered black.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub export_warnings: Vec<String>,
     /// Stable lifecycle state:
     /// idle | running | cancelling | succeeded | failed | cancelled.
     #[serde(default)]
@@ -168,6 +224,9 @@ pub struct AppSnapshot {
     /// this text so clients never manufacture a successful-save indication.
     #[serde(default)]
     pub patch_save_status: String,
+    /// Result of the most recent exact-load or Apply Look request.
+    #[serde(default)]
+    pub patch_load_status: String,
     /// Number of coalesced actions waiting for the next downbeat.
     #[serde(default)]
     pub quantized_pending: usize,
@@ -179,10 +238,13 @@ impl Default for AppSnapshot {
             msg_type: "state".to_string(),
             effects: EffectsSnapshot::default(),
             ntsc: NtscSnapshot::default(),
+            media_safety: MediaSafetySnapshot::default(),
             layers: Vec::new(),
             layer_stack_revision: 0,
             library: Vec::new(),
             paused: false,
+            program_frozen: false,
+            media_frozen: false,
             modulation: ModSnapshot::default(),
             audio: AudioSnapshot::default(),
             midi: MidiSnapshot::default(),
@@ -195,8 +257,10 @@ impl Default for AppSnapshot {
             blackout: false,
             export_progress: 0.0,
             export_error: String::new(),
+            export_warnings: Vec::new(),
             export_status: "idle".to_string(),
             patch_save_status: String::new(),
+            patch_load_status: String::new(),
             quantized_pending: 0,
         }
     }
@@ -205,8 +269,19 @@ impl Default for AppSnapshot {
 /// A JSON-friendly snapshot of the current effect parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectsSnapshot {
+    /// Public deterministic pattern seed. Zero selects the legacy sequence.
+    #[serde(default)]
+    pub random_seed: u32,
     pub pixelate: f32,
     pub downsample: f32,
+    #[serde(default)]
+    pub shift_amount: f32,
+    #[serde(default = "default_shift_block_size")]
+    pub shift_block_size: f32,
+    #[serde(default = "default_shift_density")]
+    pub shift_density: f32,
+    #[serde(default = "default_shift_speed")]
+    pub shift_speed: f32,
     pub rgb_split: f32,
     pub hue_shift: f32,
     pub saturation: f32,
@@ -285,11 +360,36 @@ fn default_cellular_gap_softness() -> f32 {
     0.08
 }
 
+fn default_shift_block_size() -> f32 {
+    8.0
+}
+
+fn default_shift_density() -> f32 {
+    0.5
+}
+
+fn default_shift_speed() -> f32 {
+    3.0
+}
+
+fn finite_effect_value(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() {
+        value
+    } else {
+        fallback
+    }
+}
+
 impl Default for EffectsSnapshot {
     fn default() -> Self {
         Self {
+            random_seed: 0,
             pixelate: 1.0,
             downsample: 1.0,
+            shift_amount: 0.0,
+            shift_block_size: default_shift_block_size(),
+            shift_density: default_shift_density(),
+            shift_speed: default_shift_speed(),
             rgb_split: 0.0,
             hue_shift: 0.0,
             saturation: 0.0,
@@ -347,6 +447,130 @@ pub struct NtscSnapshot {
     /// Last asynchronous worker error, if any.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// Process-lifetime, path-specific admission diagnostics for the bounded
+    /// live VHS pipelines. Additive defaults preserve older snapshots.
+    #[serde(default)]
+    pub live_metrics: NtscLiveMetricsSnapshot,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NtscLiveMetricsSnapshot {
+    /// off | global | selective
+    #[serde(default)]
+    pub active_path: String,
+    #[serde(default)]
+    pub global: crate::ntsc::NtscPathMetrics,
+    #[serde(default)]
+    pub selective: crate::ntsc::NtscPathMetrics,
+    /// True while the active path owns bounded CPU work or, for selective VHS,
+    /// a GPU staging readback.
+    #[serde(default)]
+    pub busy: bool,
+}
+
+/// Browser-facing view of the host's bounded source-admission policy. Keeping
+/// the status text alongside exact numeric limits lets the UI explain a reject
+/// without implying that `wgpu` exposes portable free-VRAM information.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaSafetySnapshot {
+    #[serde(default)]
+    pub mode: crate::media_safety::MediaSafetyMode,
+    #[serde(default = "default_safe_media_max_pixels")]
+    pub safe_max_pixels: u64,
+    #[serde(default = "default_safe_media_max_rgba_bytes")]
+    pub safe_max_rgba_bytes: u64,
+    #[serde(default = "default_expert_media_max_pixels")]
+    pub expert_max_pixels: u64,
+    #[serde(default = "default_expert_media_max_rgba_bytes")]
+    pub expert_max_rgba_bytes: u64,
+    #[serde(default = "default_absolute_media_max_edge")]
+    pub absolute_max_edge: u32,
+    #[serde(default)]
+    pub physical_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub planning_budget_bytes: u64,
+    #[serde(default)]
+    pub reserved_bytes: u64,
+    #[serde(default)]
+    pub available_planning_bytes: u64,
+    #[serde(default)]
+    pub device_max_texture_dimension_2d: Option<u32>,
+    #[serde(default)]
+    pub device_max_buffer_size: Option<u64>,
+    #[serde(default)]
+    pub portable_vram_budget_available: bool,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+const fn default_safe_media_max_pixels() -> u64 {
+    crate::media_safety::SAFE_MEDIA_MAX_PIXELS
+}
+
+const fn default_safe_media_max_rgba_bytes() -> u64 {
+    crate::media_safety::SAFE_MEDIA_MAX_RGBA_BYTES
+}
+
+const fn default_expert_media_max_pixels() -> u64 {
+    crate::media_safety::EXPERT_MEDIA_MAX_PIXELS
+}
+
+const fn default_expert_media_max_rgba_bytes() -> u64 {
+    crate::media_safety::EXPERT_MEDIA_MAX_RGBA_BYTES
+}
+
+const fn default_absolute_media_max_edge() -> u32 {
+    crate::media_safety::ABSOLUTE_MEDIA_MAX_EDGE
+}
+
+impl Default for MediaSafetySnapshot {
+    fn default() -> Self {
+        Self {
+            mode: crate::media_safety::MediaSafetyMode::Safe,
+            safe_max_pixels: default_safe_media_max_pixels(),
+            safe_max_rgba_bytes: default_safe_media_max_rgba_bytes(),
+            expert_max_pixels: default_expert_media_max_pixels(),
+            expert_max_rgba_bytes: default_expert_media_max_rgba_bytes(),
+            absolute_max_edge: default_absolute_media_max_edge(),
+            physical_memory_bytes: None,
+            planning_budget_bytes: 0,
+            reserved_bytes: 0,
+            available_planning_bytes: 0,
+            device_max_texture_dimension_2d: None,
+            device_max_buffer_size: None,
+            portable_vram_budget_available: false,
+            rationale: String::new(),
+            status: String::new(),
+        }
+    }
+}
+
+impl MediaSafetySnapshot {
+    pub fn from_policy(
+        policy: crate::media_safety::MediaSafetySnapshotData,
+        status: String,
+    ) -> Self {
+        let rationale = policy.rationale();
+        Self {
+            mode: policy.mode,
+            safe_max_pixels: policy.safe_max_pixels,
+            safe_max_rgba_bytes: policy.safe_max_rgba_bytes,
+            expert_max_pixels: policy.expert_max_pixels,
+            expert_max_rgba_bytes: policy.expert_max_rgba_bytes,
+            absolute_max_edge: policy.absolute_max_edge,
+            physical_memory_bytes: policy.physical_memory_bytes,
+            planning_budget_bytes: policy.planning_budget_bytes,
+            reserved_bytes: policy.reserved_bytes,
+            available_planning_bytes: policy.available_planning_bytes,
+            device_max_texture_dimension_2d: policy.device_max_texture_dimension_2d,
+            device_max_buffer_size: policy.device_max_buffer_size,
+            portable_vram_budget_available: policy.portable_vram_budget_available,
+            rationale,
+            status,
+        }
+    }
 }
 
 impl Default for NtscSnapshot {
@@ -372,6 +596,7 @@ impl Default for NtscSnapshot {
             luma_smear: 0.0,
             composite_sharpening: 0.0,
             error: String::new(),
+            live_metrics: NtscLiveMetricsSnapshot::default(),
         }
     }
 }
@@ -399,6 +624,7 @@ impl NtscSnapshot {
             luma_smear: p.luma_smear,
             composite_sharpening: p.composite_sharpening,
             error: String::new(),
+            live_metrics: NtscLiveMetricsSnapshot::default(),
         }
     }
 }
@@ -450,6 +676,8 @@ pub struct LfoSnapshot {
     pub shape: String,
     pub beats: f32,
     pub phase: f32,
+    #[serde(default)]
+    pub seed: u32,
     /// Live output value in [-1, 1], for UI meters.
     pub value: f32,
 }
@@ -687,6 +915,7 @@ impl ModSnapshot {
                     shape: l.shape.as_str().to_string(),
                     beats: l.beats,
                     phase: l.phase,
+                    seed: l.seed,
                     value: v,
                 })
                 .collect(),
@@ -879,6 +1108,9 @@ pub struct LayerSnapshot {
     /// processing. The later program-wide Temporal stage still applies.
     #[serde(default)]
     pub bypass_master_fx: bool,
+    /// Video-only deterministic pattern reroll at each decoded loop boundary.
+    #[serde(default)]
+    pub reroll_on_loop: bool,
     pub paused: bool,
     pub opacity: f32,
     pub speed: f32,
@@ -921,6 +1153,26 @@ pub struct LayerSnapshot {
 
 fn default_layer_fps() -> f32 {
     30.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerollScope {
+    Master,
+    Layer,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RerollMode {
+    #[default]
+    Pattern,
+    Variation,
+}
+
+fn default_reroll_amount() -> f32 {
+    0.7
 }
 
 /// Actions the browser can request (processed by the render loop).
@@ -968,10 +1220,15 @@ pub enum WebAction {
     /// Toggle master play/pause
     #[serde(rename = "toggle_master_pause")]
     ToggleMasterPause,
-    /// Revert the complete master visual state. Layers, transport, BPM, and
-    /// input/device selections are preserved.
+    /// Legacy compatibility command: reset only the direct master effect
+    /// uniforms. NTSC, temporal state, modulation, morph, and queued
+    /// automation remain untouched, matching the original protocol contract.
     #[serde(rename = "reset_fx")]
     ResetFx,
+    /// Revert the complete master visual program. Layers, transport, BPM, and
+    /// input/device selections are preserved.
+    #[serde(rename = "reset_visual_program")]
+    ResetVisualProgram,
     /// Reset a specific effect group (digital, analog, motion)
     #[serde(rename = "reset_group")]
     ResetGroup { group: String },
@@ -1018,6 +1275,46 @@ pub enum WebAction {
     },
     #[serde(rename = "set_master_paused")]
     SetMasterPaused { paused: bool },
+    /// Canonical spelling for the complete program freeze. The legacy master
+    /// pause actions remain accepted indefinitely.
+    #[serde(rename = "set_program_frozen")]
+    SetProgramFrozen { frozen: bool },
+    /// Hold only source textures; clocks, effects, modulation, and histories run.
+    #[serde(rename = "set_media_frozen")]
+    SetMediaFrozen { frozen: bool },
+    /// Change the bounded host-session policy for future source allocations.
+    /// This setting is never persisted in patches or applied retroactively.
+    #[serde(rename = "set_media_safety_mode")]
+    SetMediaSafetyMode {
+        mode: crate::media_safety::MediaSafetyMode,
+    },
+    /// Deterministically choose a new stochastic pattern and optionally make
+    /// bounded visual-control variations. Every press is an ordered barrier.
+    #[serde(rename = "reroll")]
+    Reroll {
+        scope: RerollScope,
+        #[serde(default)]
+        index: Option<usize>,
+        #[serde(default)]
+        layer_id: Option<String>,
+        #[serde(default)]
+        stack_revision: Option<u64>,
+        #[serde(default)]
+        seed: Option<u32>,
+        #[serde(default)]
+        mode: RerollMode,
+        #[serde(default = "default_reroll_amount")]
+        amount: f32,
+        #[serde(default)]
+        include_grain_controls: bool,
+    },
+    #[serde(rename = "set_layer_reroll_on_loop")]
+    SetLayerRerollOnLoop {
+        index: usize,
+        #[serde(default)]
+        layer_id: Option<String>,
+        enabled: bool,
+    },
     #[serde(rename = "set_blackout")]
     SetBlackout { enabled: bool },
     /// Set an NTSC/VHS effect parameter
@@ -1159,6 +1456,13 @@ pub enum WebAction {
     /// Enable/disable the Spout output sender
     #[serde(rename = "set_spout")]
     SetSpout { enabled: bool },
+    /// Open a host-native picker and replace the complete performance state.
+    #[serde(rename = "open_patch_snapshot")]
+    OpenPatchSnapshot,
+    /// Open a host-native picker and transfer only visual state onto the
+    /// current positional stack. The revision protects that mapping.
+    #[serde(rename = "open_patch_look")]
+    OpenPatchLook { stack_revision: u64 },
     /// Capture the complete current performance state into the local patch
     /// corpus without opening a native file dialog.
     #[serde(rename = "quick_save_patch")]
@@ -1170,6 +1474,10 @@ pub enum WebAction {
         height: u32,
         fps: u32,
         duration_secs: f32,
+        /// Defaults to the established half-resolution live look for legacy
+        /// clients. Native processes VHS at the selected export dimensions.
+        #[serde(default)]
+        ntsc_quality: crate::ntsc::NtscExportQuality,
         #[serde(default)]
         audio_layer: Option<usize>,
         #[serde(default)]
@@ -1237,6 +1545,15 @@ impl WebAction {
                 Self::layer_key(*index, layer_id)
             )),
             Self::SetMasterPaused { .. } => Some("master:paused".into()),
+            Self::SetProgramFrozen { .. } => Some("master:paused".into()),
+            Self::SetMediaFrozen { .. } => Some("media:frozen".into()),
+            Self::SetMediaSafetyMode { .. } => Some("media:safety-mode".into()),
+            Self::SetLayerRerollOnLoop {
+                index, layer_id, ..
+            } => Some(format!(
+                "layer:{}:reroll-on-loop",
+                Self::layer_key(*index, layer_id)
+            )),
             Self::SetBlackout { .. } => Some("master:blackout".into()),
             Self::SetOutputWindow { .. } => Some("output:enabled".into()),
             Self::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
@@ -1261,6 +1578,8 @@ impl WebAction {
             Self::SetMorphLaw { .. } => Some("morph:law".into()),
             Self::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
             Self::SetSpout { .. } => Some("spout:enabled".into()),
+            Self::OpenPatchSnapshot => Some("patch:open-snapshot".into()),
+            Self::OpenPatchLook { .. } => Some("patch:open-look".into()),
             Self::QuickSavePatch => Some("patch:quick-save".into()),
             Self::CancelExport => Some("export:cancel".into()),
             Self::RescanLibrary => Some("library:rescan".into()),
@@ -1276,11 +1595,21 @@ impl WebAction {
             | Self::SetOutputWindow { .. }
             | Self::ToggleOutputWindow
             | Self::SetMasterPaused { .. }
+            | Self::SetProgramFrozen { .. }
+            | Self::SetMediaFrozen { .. }
+            | Self::Reroll { .. }
+            | Self::SetLayerRerollOnLoop { .. }
             | Self::ResetFx
+            | Self::ResetVisualProgram
             | Self::SetLayerPaused { .. }
             | Self::SetLayerVisibility { .. }
+            | Self::OpenPatchSnapshot
+            | Self::OpenPatchLook { .. }
             | Self::QuickSavePatch
             | Self::RescanLibrary => true,
+            Self::SetMediaSafetyMode {
+                mode: crate::media_safety::MediaSafetyMode::Safe,
+            } => true,
             Self::Pad { active, .. } => !active,
             Self::Quantized { inner } => inner.is_priority(),
             _ => false,
@@ -1336,8 +1665,13 @@ fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutc
 impl EffectsSnapshot {
     pub fn from_uniforms(u: &EffectUniforms) -> Self {
         Self {
+            random_seed: u.random_seed,
             pixelate: u.pixelate_size,
             downsample: u.downsample,
+            shift_amount: u.shift_amount,
+            shift_block_size: u.shift_block_size,
+            shift_density: u.shift_density,
+            shift_speed: u.shift_speed,
             rgb_split: u.rgb_split,
             hue_shift: u.hue_shift,
             saturation: u.saturation,
@@ -1370,8 +1704,13 @@ impl EffectsSnapshot {
     }
 
     pub fn apply_to_uniforms(&self, u: &mut EffectUniforms) {
+        u.random_seed = self.random_seed;
         u.pixelate_size = self.pixelate.clamp(1.0, 32.0);
         u.downsample = self.downsample.clamp(0.05, 1.0);
+        u.shift_amount = finite_effect_value(self.shift_amount, 0.0).clamp(0.0, 1.0);
+        u.shift_block_size = finite_effect_value(self.shift_block_size, 8.0).clamp(2.0, 256.0);
+        u.shift_density = finite_effect_value(self.shift_density, 0.5).clamp(0.0, 1.0);
+        u.shift_speed = finite_effect_value(self.shift_speed, 3.0).clamp(0.0, 20.0);
         u.rgb_split = self.rgb_split.clamp(0.0, 30.0);
         u.hue_shift = self.hue_shift.clamp(-180.0, 180.0);
         u.saturation = self.saturation.clamp(-1.0, 1.0);
@@ -1405,6 +1744,11 @@ impl EffectsSnapshot {
     pub fn apply_param(&mut self, param: &str, value: &serde_json::Value) {
         let v = value;
         match param {
+            "random_seed" => {
+                if let Some(n) = v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                    self.random_seed = n;
+                }
+            }
             "pixelate" => {
                 if let Some(n) = v.as_f64() {
                     self.pixelate = n as f32;
@@ -1413,6 +1757,26 @@ impl EffectsSnapshot {
             "downsample" => {
                 if let Some(n) = v.as_f64() {
                     self.downsample = n as f32;
+                }
+            }
+            "shift_amount" => {
+                if let Some(n) = v.as_f64() {
+                    self.shift_amount = n as f32;
+                }
+            }
+            "shift_block_size" => {
+                if let Some(n) = v.as_f64() {
+                    self.shift_block_size = n as f32;
+                }
+            }
+            "shift_density" => {
+                if let Some(n) = v.as_f64() {
+                    self.shift_density = n as f32;
+                }
+            }
+            "shift_speed" => {
+                if let Some(n) = v.as_f64() {
+                    self.shift_speed = n as f32;
                 }
             }
             "rgb_split" => {
@@ -1580,12 +1944,16 @@ impl WebState {
             actions: Mutex::new(Vec::new()),
             thumbnails: std::sync::RwLock::new(HashMap::new()),
             preview_frames: std::sync::RwLock::new(HashMap::new()),
+            library_media_cache_bytes: std::sync::Mutex::new(0),
+            library_media_helper_gate: std::sync::Mutex::new(()),
             library_folder: std::sync::RwLock::new(None),
             access_token: token_bytes
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
             lan_url: std::sync::RwLock::new(String::new()),
+            control_server: std::sync::RwLock::new(ControlServerInfo::default()),
+            library_generation: AtomicU64::new(0),
             gyro_streams: std::sync::Mutex::new(GyroStreamRegistry::default()),
             next_client_id: AtomicU64::new(1),
         }))
@@ -1598,6 +1966,192 @@ impl WebState {
 
     pub fn allocate_client_id(&self) -> u64 {
         self.next_client_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn control_server_info(&self) -> ControlServerInfo {
+        self.control_server
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn mark_control_server_starting(&self, local_url: String) {
+        let mut info = self
+            .control_server
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        info.local_url = local_url;
+        info.status = ControlServerStatus::Starting;
+    }
+
+    pub(crate) fn mark_control_server_listening(&self) {
+        self.control_server
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status = ControlServerStatus::Listening;
+    }
+
+    pub(crate) fn mark_control_server_unavailable(&self, error: String) {
+        self.control_server
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status = ControlServerStatus::Unavailable(error);
+    }
+
+    /// Start a new folder identity. Workers must compare their captured value
+    /// at the cache-write boundary before publishing decoded previews.
+    pub fn begin_library_generation(&self) -> u64 {
+        self.library_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                Some(generation.wrapping_add(1).max(1))
+            })
+            .unwrap_or_else(|generation| generation)
+            .wrapping_add(1)
+            .max(1)
+    }
+
+    pub fn library_generation(&self) -> u64 {
+        self.library_generation.load(Ordering::Acquire)
+    }
+
+    pub fn library_generation_is_current(&self, generation: u64) -> bool {
+        generation != 0 && self.library_generation() == generation
+    }
+
+    pub(crate) fn publish_thumbnail_with_budget(
+        &self,
+        generation: u64,
+        filename: String,
+        bytes: Vec<u8>,
+        byte_limit: u64,
+    ) -> bool {
+        let Ok(new_bytes) = u64::try_from(bytes.len()) else {
+            return false;
+        };
+        let mut retained = self
+            .library_media_cache_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = self
+            .thumbnails
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.library_generation_is_current(generation) {
+            return false;
+        }
+        let old_bytes = cache
+            .get(&filename)
+            .and_then(|old| u64::try_from(old.len()).ok())
+            .unwrap_or(0);
+        let Some(next_retained) = retained
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .filter(|bytes| *bytes <= byte_limit)
+        else {
+            return false;
+        };
+        cache.insert(filename, bytes);
+        *retained = next_retained;
+        true
+    }
+
+    pub(crate) fn publish_preview_with_budget(
+        &self,
+        generation: u64,
+        filename: String,
+        frames: Vec<Vec<u8>>,
+        byte_limit: u64,
+    ) -> bool {
+        let Some(new_bytes) = frames.iter().try_fold(0_u64, |total, frame| {
+            total.checked_add(u64::try_from(frame.len()).ok()?)
+        }) else {
+            return false;
+        };
+        let mut retained = self
+            .library_media_cache_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = self
+            .preview_frames
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.library_generation_is_current(generation) {
+            return false;
+        }
+        let old_bytes = cache
+            .get(&filename)
+            .and_then(|old| {
+                old.iter().try_fold(0_u64, |total, frame| {
+                    total.checked_add(u64::try_from(frame.len()).ok()?)
+                })
+            })
+            .unwrap_or(0);
+        let Some(next_retained) = retained
+            .checked_sub(old_bytes)
+            .and_then(|bytes| bytes.checked_add(new_bytes))
+            .filter(|bytes| *bytes <= byte_limit)
+        else {
+            return false;
+        };
+        cache.insert(filename, frames);
+        *retained = next_retained;
+        true
+    }
+
+    pub(crate) fn clear_library_media_caches(&self) {
+        let mut retained = self
+            .library_media_cache_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.thumbnails
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.preview_frames
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        *retained = 0;
+    }
+
+    pub(crate) fn remove_library_media_cache_entry(&self, filename: &str) {
+        let mut retained = self
+            .library_media_cache_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let thumbnail_bytes = self
+            .thumbnails
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(filename)
+            .and_then(|bytes| u64::try_from(bytes.len()).ok())
+            .unwrap_or(0);
+        let preview_bytes = self
+            .preview_frames
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(filename)
+            .and_then(|frames| {
+                frames.iter().try_fold(0_u64, |total, frame| {
+                    total.checked_add(u64::try_from(frame.len()).ok()?)
+                })
+            })
+            .unwrap_or(0);
+        *retained = retained.saturating_sub(thumbnail_bytes.saturating_add(preview_bytes));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn library_media_cache_bytes(&self) -> u64 {
+        *self
+            .library_media_cache_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn lock_library_media_helpers(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.library_media_helper_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn set_gyro_stream(&self, client_id: u64, enabled: bool) {
@@ -1639,6 +2193,52 @@ mod protocol_tests {
             (actual - expected).abs() < 1.0e-6,
             "expected {expected}, got {actual}"
         );
+    }
+
+    #[test]
+    fn native_control_server_info_reports_listener_lifecycle_truthfully() {
+        let state = WebState::new().expect("test token");
+        assert_eq!(state.control_server_info(), ControlServerInfo::default());
+
+        let local_url = format!("http://127.0.0.1:3030/?key={}", state.access_token);
+        state.mark_control_server_starting(local_url.clone());
+        assert_eq!(
+            state.control_server_info(),
+            ControlServerInfo {
+                local_url: local_url.clone(),
+                status: ControlServerStatus::Starting,
+            }
+        );
+
+        state.mark_control_server_listening();
+        assert_eq!(
+            state.control_server_info().status,
+            ControlServerStatus::Listening
+        );
+
+        state.mark_control_server_unavailable("address already in use".to_string());
+        assert_eq!(
+            state.control_server_info(),
+            ControlServerInfo {
+                local_url,
+                status: ControlServerStatus::Unavailable("address already in use".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn library_generations_are_nonzero_monotonic_stale_write_barriers() {
+        let state = WebState::new().expect("test token");
+        assert_eq!(state.library_generation(), 0);
+
+        let first = state.begin_library_generation();
+        let second = state.begin_library_generation();
+
+        assert_ne!(first, 0);
+        assert!(second > first);
+        assert!(!state.library_generation_is_current(first));
+        assert!(state.library_generation_is_current(second));
+        assert!(!state.library_generation_is_current(0));
     }
 
     fn set_bpm(value: f32) -> WebAction {
@@ -1777,8 +2377,43 @@ mod protocol_tests {
         )
         .unwrap();
         assert!(
-            matches!(export, WebAction::StartExport { audio_layer_id: Some(id), .. } if id == "layer-abc")
+            matches!(export, WebAction::StartExport { audio_layer_id: Some(id), ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity, .. } if id == "layer-abc")
         );
+
+        let native: WebAction = serde_json::from_str(
+            r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"ntsc_quality":"native"}"#,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&native).unwrap();
+        assert_eq!(encoded["ntsc_quality"], "native");
+        assert!(matches!(
+            native,
+            WebAction::StartExport {
+                ntsc_quality: crate::ntsc::NtscExportQuality::Native,
+                ..
+            }
+        ));
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"ntsc_quality":"unknown"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn export_panel_exposes_safe_ntsc_quality_choices() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        assert!(html.contains("id=\"export-ntsc-quality\""));
+        assert!(html.contains("value=\"live_parity\" selected"));
+        assert!(html.contains("value=\"native\""));
+        assert!(html.contains("id=\"export-warnings\""));
+        assert!(html.contains("id=\"export-warnings-list\""));
+        assert!(js.contains("['live_parity', 'native'].includes(requestedNtscQuality)"));
+        assert!(js.contains("ntsc_quality: ntscQuality"));
+        assert!(js.contains("msg.export_warnings"));
+        assert!(js.contains("function syncExportWarnings(warnings = [])"));
+        assert!(js.contains("item.textContent = message"));
+        assert!(js.contains("if (warningsKey === exportWarningsKey) return"));
     }
 
     #[test]
@@ -1806,6 +2441,7 @@ mod protocol_tests {
             filename: "plate.png".into(),
             visible: true,
             bypass_master_fx: true,
+            reroll_on_loop: false,
             paused: false,
             opacity: 1.0,
             speed: 1.0,
@@ -1829,8 +2465,10 @@ mod protocol_tests {
         };
         let mut value = serde_json::to_value(current).unwrap();
         value.as_object_mut().unwrap().remove("bypass_master_fx");
+        value.as_object_mut().unwrap().remove("reroll_on_loop");
         let legacy: LayerSnapshot = serde_json::from_value(value).unwrap();
         assert!(!legacy.bypass_master_fx);
+        assert!(!legacy.reroll_on_loop);
     }
 
     #[test]
@@ -1928,16 +2566,94 @@ mod protocol_tests {
         assert!(js.contains("class=\"layer-cellular-body\""));
         for contract in [
             "const MASTER_MOD_TARGETS = MOD_TARGETS.slice()",
-            "Math.min(MAX_MOD_LAYERS, latestLayerIdentities.length)",
+            "const liveLayerCount = latestLayerIdentities.length",
             "targets.push([`layer${layer}_${suffix}`, `L${layer} ${label}`])",
             "groups.push([`Layer ${layer}`, targets])",
+            "const layerMatch = /^layer([1-9]\\d*)_/.exec(target)",
             "routes: routings.map((routing, index)",
         ] {
             assert!(
                 js.contains(contract),
-                "missing bounded target menu contract: {contract}"
+                "missing dynamic target menu contract: {contract}"
             );
         }
+        assert!(!js.contains("MAX_MOD_LAYERS"));
+        assert!(!js.contains("Math.min(MAX_MOD_LAYERS"));
+        assert!(!js.contains("/^layer([1-9]|1[0-6])_/"));
+    }
+
+    #[test]
+    fn shift_snapshot_controls_and_legacy_defaults_are_complete() {
+        let mut uniforms = EffectUniforms {
+            shift_amount: 0.7,
+            shift_block_size: 40.0,
+            shift_density: 0.6,
+            shift_speed: 8.25,
+            ..EffectUniforms::default()
+        };
+        let snapshot = EffectsSnapshot::from_uniforms(&uniforms);
+        assert_eq!(snapshot.shift_amount, 0.7);
+        assert_eq!(snapshot.shift_block_size, 40.0);
+        assert_eq!(snapshot.shift_density, 0.6);
+        assert_eq!(snapshot.shift_speed, 8.25);
+
+        let mut changed = EffectsSnapshot::default();
+        for (param, value) in [
+            ("shift_amount", 0.5),
+            ("shift_block_size", 32.0),
+            ("shift_density", 0.8),
+            ("shift_speed", 7.5),
+        ] {
+            changed.apply_param(param, &serde_json::json!(value));
+        }
+        changed.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.shift_amount, 0.5);
+        assert_eq!(uniforms.shift_block_size, 32.0);
+        assert_eq!(uniforms.shift_density, 0.8);
+        assert_eq!(uniforms.shift_speed, 7.5);
+
+        let mut legacy_json = serde_json::to_value(EffectsSnapshot::default()).unwrap();
+        let legacy_object = legacy_json.as_object_mut().unwrap();
+        for field in [
+            "shift_amount",
+            "shift_block_size",
+            "shift_density",
+            "shift_speed",
+        ] {
+            legacy_object.remove(field);
+        }
+        let legacy: EffectsSnapshot = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.shift_amount, 0.0);
+        assert_eq!(legacy.shift_block_size, 8.0);
+        assert_eq!(legacy.shift_density, 0.5);
+        assert_eq!(legacy.shift_speed, 3.0);
+
+        let invalid = EffectsSnapshot {
+            shift_amount: f32::NAN,
+            shift_block_size: -4.0,
+            shift_density: 9.0,
+            shift_speed: f32::INFINITY,
+            ..EffectsSnapshot::default()
+        };
+        invalid.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.shift_amount, 0.0);
+        assert_eq!(uniforms.shift_block_size, 2.0);
+        assert_eq!(uniforms.shift_density, 1.0);
+        assert_eq!(uniforms.shift_speed, 3.0);
+
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        for field in [
+            "shift_amount",
+            "shift_block_size",
+            "shift_density",
+            "shift_speed",
+        ] {
+            assert!(html.contains(&format!("data-param=\"{field}\"")));
+            assert!(js.contains(&format!("'{field}'")));
+        }
+        assert!(html.contains("data-group=\"shift\""));
+        assert!(js.contains("'set_layer_effect'"));
     }
 
     #[test]
@@ -2018,6 +2734,22 @@ mod protocol_tests {
         assert!(js.contains("syncPatchSave(msg.patch_save_status || '')"));
         assert!(js.contains("text.startsWith('Saving')"));
         assert!(!js.contains("setTimeout(() => patchCaptureButton"));
+
+        let snapshot_action: WebAction =
+            serde_json::from_str(r#"{"action":"open_patch_snapshot"}"#).unwrap();
+        assert!(matches!(snapshot_action, WebAction::OpenPatchSnapshot));
+        let look_action: WebAction =
+            serde_json::from_str(r#"{"action":"open_patch_look","stack_revision":17}"#).unwrap();
+        assert!(matches!(
+            look_action,
+            WebAction::OpenPatchLook { stack_revision: 17 }
+        ));
+        assert!(html.contains("id=\"patch-load-snapshot\""));
+        assert!(html.contains("id=\"patch-apply-look\""));
+        assert!(html.contains("id=\"patch-load-status\" role=\"status\" aria-live=\"polite\""));
+        assert!(js.contains("{ action: 'open_patch_snapshot' }"));
+        assert!(js.contains("{ action: 'open_patch_look', stack_revision: layerStackRevision }"));
+        assert!(js.contains("syncPatchLoad(msg.patch_load_status || '')"));
     }
 
     #[test]
@@ -2077,7 +2809,7 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 58);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 62);
         assert_eq!(assert_range_tags_are_bounded(js, false), 12);
 
         for contract in [
@@ -2210,13 +2942,18 @@ mod protocol_tests {
             "let transportPendingPaused = null",
             "let transportRequestSequence = 0",
             "if (transportPendingPaused !== null) return",
-            "sendAction({ action: 'set_master_paused', paused: target })",
+            "sendAction({ action: 'set_program_frozen', frozen: target })",
             "transportPendingPaused === transportAuthoritativePaused",
             "renderMasterTransport(target, true)",
             "btn.toggleAttribute('aria-busy', pending)",
             "window.setTimeout(() =>",
             "transportRequestSequence === requestSequence",
-            "sendAction({ action: 'reset_fx' })",
+            "sendAction({ action: 'reset_visual_program' })",
+            "let mediaAuthoritativeFrozen = false",
+            "let mediaPendingFrozen = null",
+            "sendAction({ action: 'set_media_frozen', frozen: target })",
+            "syncTransport(msg.program_frozen ?? msg.paused, msg.media_frozen)",
+            "btn.setAttribute('aria-pressed', String(!!frozen))",
         ] {
             assert!(
                 js.contains(contract),
@@ -2224,12 +2961,305 @@ mod protocol_tests {
             );
         }
 
-        let mut queue = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
-        assert_ne!(
-            enqueue_bounded(&mut queue, WebAction::ResetFx),
-            EnqueueOutcome::Dropped
+        for action in [WebAction::ResetFx, WebAction::ResetVisualProgram] {
+            let mut queue = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
+            assert_ne!(
+                enqueue_bounded(&mut queue, action.clone()),
+                EnqueueOutcome::Dropped
+            );
+            assert!(
+                matches!(queue.last(), Some(queued) if std::mem::discriminant(queued) == std::mem::discriminant(&action))
+            );
+        }
+    }
+
+    #[test]
+    fn reset_protocol_versions_legacy_fx_and_broad_visual_program_commands() {
+        let legacy: WebAction = serde_json::from_str(r#"{"action":"reset_fx"}"#).unwrap();
+        let broad: WebAction =
+            serde_json::from_str(r#"{"action":"reset_visual_program"}"#).unwrap();
+
+        assert!(matches!(&legacy, WebAction::ResetFx));
+        assert!(matches!(&broad, WebAction::ResetVisualProgram));
+        assert!(legacy.is_priority());
+        assert!(broad.is_priority());
+    }
+
+    #[test]
+    fn reroll_protocol_defaults_and_ordered_barriers_are_explicit() {
+        let reroll: WebAction =
+            serde_json::from_str(r#"{"action":"reroll","scope":"master"}"#).unwrap();
+        assert!(matches!(
+            &reroll,
+            WebAction::Reroll {
+                scope: RerollScope::Master,
+                index: None,
+                layer_id: None,
+                stack_revision: None,
+                seed: None,
+                mode: RerollMode::Pattern,
+                amount,
+                include_grain_controls: false,
+            } if (*amount - 0.7).abs() < f32::EPSILON
+        ));
+        assert_eq!(reroll.coalesce_key(), None);
+        assert!(reroll.is_priority());
+
+        let explicit = WebAction::Reroll {
+            scope: RerollScope::All,
+            index: None,
+            layer_id: None,
+            stack_revision: Some(19),
+            seed: Some(u32::MAX),
+            mode: RerollMode::Variation,
+            amount: 1.25,
+            include_grain_controls: true,
+        };
+        let encoded = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(encoded["action"], "reroll");
+        assert_eq!(encoded["scope"], "all");
+        assert_eq!(encoded["stack_revision"], 19);
+        assert_eq!(encoded["seed"], u32::MAX);
+        assert_eq!(encoded["mode"], "variation");
+        assert_json_number_near(&encoded["amount"], 1.25);
+        assert_eq!(encoded["include_grain_controls"], true);
+
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.1),
+                },
+            ),
+            EnqueueOutcome::Added
         );
-        assert!(matches!(queue.last(), Some(WebAction::ResetFx)));
+        assert_eq!(
+            enqueue_bounded(&mut queue, reroll.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.9),
+                },
+            ),
+            EnqueueOutcome::Added,
+            "an absolute edit after a reroll must not replace the edit observed before it"
+        );
+        assert_eq!(
+            enqueue_bounded(&mut queue, explicit),
+            EnqueueOutcome::Added,
+            "each dice press is an independently ordered command"
+        );
+        assert!(matches!(
+            queue.as_slice(),
+            [
+                WebAction::SetParam { value: before, .. },
+                WebAction::Reroll {
+                    scope: RerollScope::Master,
+                    ..
+                },
+                WebAction::SetParam { value: after, .. },
+                WebAction::Reroll {
+                    scope: RerollScope::All,
+                    ..
+                },
+            ] if before == &serde_json::json!(0.1) && after == &serde_json::json!(0.9)
+        ));
+
+        assert!(
+            serde_json::from_str::<WebAction>(r#"{"action":"reroll","scope":"unknown"}"#).is_err()
+        );
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"reroll","scope":"master","mode":"unknown"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn random_dice_and_layer_loop_browser_contract_is_complete() {
+        let mut legacy_effects = serde_json::to_value(EffectsSnapshot::default()).unwrap();
+        legacy_effects
+            .as_object_mut()
+            .unwrap()
+            .remove("random_seed");
+        let restored: EffectsSnapshot = serde_json::from_value(legacy_effects).unwrap();
+        assert_eq!(restored.random_seed, 0);
+
+        let loop_action: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_reroll_on_loop","index":3,"layer_id":"22","enabled":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &loop_action,
+            WebAction::SetLayerRerollOnLoop {
+                index: 3,
+                layer_id: Some(layer_id),
+                enabled: true,
+            } if layer_id == "22"
+        ));
+        assert_eq!(
+            loop_action.coalesce_key().as_deref(),
+            Some("layer:id:22:reroll-on-loop")
+        );
+        assert!(loop_action.is_priority());
+
+        let html = include_str!("../../static/index.html");
+        for contract in [
+            "id=\"random-group\"",
+            "RANDOM / DICE",
+            "id=\"reroll-scope\"",
+            "<option value=\"master\">Master</option>",
+            "<option value=\"all\">Everything</option>",
+            "id=\"reroll-mode\"",
+            "<option value=\"pattern\">Pattern only</option>",
+            "<option value=\"variation\">Bounded variation</option>",
+            "id=\"reroll-seed\"",
+            "max=\"4294967295\"",
+            "id=\"reroll-amount\"",
+            "max=\"2\"",
+            "id=\"reroll-grain-controls\"",
+            "id=\"reroll-button\"",
+            "id=\"reroll-status\"",
+        ] {
+            assert!(
+                html.contains(contract),
+                "missing random HTML contract: {contract}"
+            );
+        }
+
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "const scope = rerollScope.value === 'all' ? 'all' : 'master'",
+            "action: 'reroll'",
+            "mode: rerollMode.value === 'variation' ? 'variation' : 'pattern'",
+            "include_grain_controls: !!rerollGrainControls.checked",
+            "if (scope === 'all') action.stack_revision = layerStackRevision",
+            "Number(effects.random_seed) >>> 0",
+            "class=\"layer-random-seed seed-input\"",
+            "class=\"layer-reroll\"",
+            "scope: 'layer'",
+            "...currentLayerSelector(card, layer, index)",
+            "action: 'set_layer_reroll_on_loop'",
+            "layer.reroll_on_loop ? 'checked' : ''",
+            "Number(layer.effects?.random_seed || 0) >>> 0",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing random JS contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_freeze_protocol_snapshot_and_controls_remain_distinct() {
+        let program: WebAction =
+            serde_json::from_str(r#"{"action":"set_program_frozen","frozen":true}"#).unwrap();
+        let media: WebAction =
+            serde_json::from_str(r#"{"action":"set_media_frozen","frozen":true}"#).unwrap();
+        assert!(matches!(
+            program,
+            WebAction::SetProgramFrozen { frozen: true }
+        ));
+        assert!(matches!(media, WebAction::SetMediaFrozen { frozen: true }));
+        assert_eq!(program.coalesce_key().as_deref(), Some("master:paused"));
+        assert_eq!(media.coalesce_key().as_deref(), Some("media:frozen"));
+        assert_eq!(
+            program.coalesce_key(),
+            WebAction::SetMasterPaused { paused: false }.coalesce_key(),
+            "the canonical program action must replace a pending legacy master action"
+        );
+        assert_ne!(program.coalesce_key(), media.coalesce_key());
+        assert!(program.is_priority());
+        assert!(media.is_priority());
+
+        let mut legacy = serde_json::to_value(AppSnapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("program_frozen");
+        legacy.as_object_mut().unwrap().remove("media_frozen");
+        let restored: AppSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(!restored.program_frozen);
+        assert!(!restored.media_frozen);
+
+        let html = include_str!("../../static/index.html");
+        for contract in [
+            "id=\"btn-play-all\"",
+            "aria-label=\"Freeze program\"",
+            "Freeze the complete visual program, including clocks and histories",
+            "id=\"btn-freeze-media\"",
+            "aria-label=\"Freeze media\"",
+            "Hold video and Spout frames while effects and modulation continue",
+        ] {
+            assert!(
+                html.contains(contract),
+                "missing freeze HTML contract: {contract}"
+            );
+        }
+
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "sendAction({ action: 'set_program_frozen', frozen: target })",
+            "sendAction({ action: 'set_media_frozen', frozen: target })",
+            "syncTransport(msg.program_frozen ?? msg.paused, msg.media_frozen)",
+            "renderMasterTransport(target, true)",
+            "renderMediaFreeze(target, true)",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing freeze JS contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfo_seed_snapshot_action_and_browser_contract_are_backward_compatible() {
+        let legacy: LfoSnapshot = serde_json::from_str(
+            r#"{"shape":"sample_hold","beats":4.0,"phase":0.25,"value":-0.5}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.seed, 0);
+
+        let current = LfoSnapshot {
+            shape: "sample_hold".into(),
+            beats: 8.0,
+            phase: 0.5,
+            seed: u32::MAX,
+            value: 0.75,
+        };
+        let value = serde_json::to_value(current).unwrap();
+        assert_eq!(value["seed"], u32::MAX);
+
+        let action: WebAction = serde_json::from_str(
+            r#"{"action":"set_lfo","index":2,"param":"seed","value":4294967295}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &action,
+            WebAction::SetLfo {
+                index: 2,
+                param,
+                value,
+            } if param == "seed" && value == &serde_json::json!(u32::MAX)
+        ));
+        assert_eq!(action.coalesce_key().as_deref(), Some("lfo:2:seed"));
+
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "class=\"lfo-seed seed-input\" type=\"number\" min=\"0\" max=\"4294967295\"",
+            "row.querySelector('.lfo-seed').hidden = e.target.value !== 'sample_hold'",
+            "Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff",
+            "sendAction({ action: 'set_lfo', index: i, param: 'seed', value: seed })",
+            "seedInput.value = String(Number(lfo.seed || 0) >>> 0)",
+            "seedInput.hidden = lfo.shape !== 'sample_hold'",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing LFO seed contract: {contract}"
+            );
+        }
     }
 
     #[test]
@@ -2600,10 +3630,19 @@ mod protocol_tests {
     fn legacy_app_snapshot_defaults_export_status() {
         let mut value = serde_json::to_value(AppSnapshot::default()).unwrap();
         value.as_object_mut().unwrap().remove("export_status");
+        value.as_object_mut().unwrap().remove("export_warnings");
         value.as_object_mut().unwrap().remove("patch_save_status");
         let restored: AppSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(restored.export_status, "");
+        assert!(restored.export_warnings.is_empty());
         assert_eq!(restored.patch_save_status, "");
+
+        let current = AppSnapshot {
+            export_warnings: vec!["Layer 1 substituted deterministic black.".into()],
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(current).unwrap();
+        assert_eq!(serialized["export_warnings"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -2665,5 +3704,112 @@ mod protocol_tests {
         assert!(js.contains("syncGyroStatus(m.gyro_status)"));
         assert!(js.contains("sensor data stale"));
         assert!(js.contains("output centered"));
+    }
+
+    #[test]
+    fn media_safety_protocol_is_strict_coalesced_and_safe_disable_is_priority() {
+        let expert: WebAction =
+            serde_json::from_str(r#"{"action":"set_media_safety_mode","mode":"expert"}"#).unwrap();
+        assert!(matches!(
+            expert,
+            WebAction::SetMediaSafetyMode {
+                mode: crate::media_safety::MediaSafetyMode::Expert
+            }
+        ));
+        assert_eq!(expert.coalesce_key().as_deref(), Some("media:safety-mode"));
+        assert!(!expert.is_priority());
+
+        let safe: WebAction =
+            serde_json::from_str(r#"{"action":"set_media_safety_mode","mode":"safe"}"#).unwrap();
+        assert!(safe.is_priority());
+        assert_eq!(safe.coalesce_key().as_deref(), Some("media:safety-mode"));
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_media_safety_mode","mode":"unbounded"}"#
+        )
+        .is_err());
+
+        let mut queue = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
+        assert_ne!(enqueue_bounded(&mut queue, safe), EnqueueOutcome::Dropped);
+        assert!(matches!(
+            queue.last(),
+            Some(WebAction::SetMediaSafetyMode {
+                mode: crate::media_safety::MediaSafetyMode::Safe
+            })
+        ));
+    }
+
+    #[test]
+    fn media_safety_and_ntsc_metrics_default_old_snapshots_without_raising_limits() {
+        let mut app_value = serde_json::to_value(AppSnapshot::default()).unwrap();
+        app_value.as_object_mut().unwrap().remove("media_safety");
+        let restored: AppSnapshot = serde_json::from_value(app_value).unwrap();
+        assert_eq!(
+            restored.media_safety.mode,
+            crate::media_safety::MediaSafetyMode::Safe
+        );
+        assert_eq!(
+            restored.media_safety.safe_max_pixels,
+            crate::media_safety::SAFE_MEDIA_MAX_PIXELS
+        );
+        assert_eq!(restored.media_safety.planning_budget_bytes, 0);
+
+        let mut ntsc_value = serde_json::to_value(NtscSnapshot::default()).unwrap();
+        ntsc_value.as_object_mut().unwrap().remove("live_metrics");
+        let restored: NtscSnapshot = serde_json::from_value(ntsc_value).unwrap();
+        assert_eq!(restored.live_metrics, NtscLiveMetricsSnapshot::default());
+
+        let metrics = NtscLiveMetricsSnapshot {
+            active_path: "selective".to_string(),
+            global: crate::ntsc::NtscPathMetrics {
+                attempted: 7,
+                accepted: 5,
+                skipped: 2,
+                unavailable: 0,
+                stale: 1,
+            },
+            selective: crate::ntsc::NtscPathMetrics {
+                attempted: 11,
+                accepted: 9,
+                skipped: 2,
+                unavailable: 1,
+                stale: 3,
+            },
+            busy: true,
+        };
+        let round_trip: NtscLiveMetricsSnapshot =
+            serde_json::from_value(serde_json::to_value(&metrics).unwrap()).unwrap();
+        assert_eq!(round_trip, metrics);
+    }
+
+    #[test]
+    fn media_safety_and_vhs_metrics_static_contract_is_accessible_and_authoritative() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+
+        assert!(html.contains("class=\"media-safety\""));
+        assert!(html.contains("aria-labelledby=\"media-safety-title\""));
+        assert!(html.contains("id=\"expert-media-toggle\""));
+        assert!(html.contains("aria-label=\"Enable bounded Expert media mode\""));
+        assert!(html.contains("aria-describedby=\"media-safety-summary media-safety-rationale\""));
+        assert!(html.contains("id=\"media-safety-rationale\""));
+        assert!(html.contains("id=\"media-safety-status\" role=\"status\" aria-live=\"polite\""));
+
+        let metrics_tag = html
+            .lines()
+            .find(|line| line.contains("id=\"ntsc-metrics\""))
+            .expect("dedicated VHS metrics element");
+        assert!(metrics_tag.contains("aria-label=\"Live VHS worker metrics\""));
+        assert!(!metrics_tag.contains("aria-live"));
+
+        assert!(js.contains("syncMediaSafety(msg.media_safety)"));
+        assert!(js.contains("action: 'set_media_safety_mode'"));
+        assert!(js.contains("window.confirm("));
+        assert!(js.contains("authoritativeMediaSafetyMode === 'expert'"));
+        assert!(js.contains("toggleAttribute('aria-busy', false)"));
+        assert!(js.contains("Global live"));
+        assert!(js.contains("Selective live"));
+        assert!(js.contains("skipped"));
+        assert!(js.contains("unavailable"));
+        assert!(js.contains("stale"));
     }
 }

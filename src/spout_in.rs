@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::media_safety::{
+    MediaDeviceLimits, MediaReservation, MediaSafetyPolicy, MediaSourceKind,
+};
+
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
@@ -22,6 +26,16 @@ const MAX_SENDER_NAME_BYTES: usize = 255;
 // Spout's default shared-texture format. `receive_image` returns the texture's
 // native four-byte channel order, while our wgpu layer texture is RGBA8.
 const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+
+#[cfg(windows)]
+struct ReceiveWorkerContext<'a> {
+    running: &'a AtomicBool,
+    next_sequence: &'a AtomicU64,
+    latest: &'a Mutex<Option<SpoutFrame>>,
+    status: &'a Mutex<SpoutStatus>,
+    media_policy: &'a MediaSafetyPolicy,
+    device_limits: MediaDeviceLimits,
+}
 
 /// A complete RGBA8 frame received from a Spout sender.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,12 +71,26 @@ pub struct SpoutIn {
     next_sequence: Arc<AtomicU64>,
     latest: Arc<Mutex<Option<SpoutFrame>>>,
     status: Arc<Mutex<SpoutStatus>>,
+    media_policy: MediaSafetyPolicy,
+    device_limits: MediaDeviceLimits,
 }
 
 impl SpoutIn {
     /// Create a stopped receiver. Control characters (including embedded NULs)
     /// are removed and names are truncated to Spout's 255-byte safe limit.
+    #[allow(dead_code)] // Compatibility Safe wrapper for pre-policy callers.
     pub fn new(name: impl AsRef<str>) -> Self {
+        Self::new_with_media_policy(name, MediaSafetyPolicy::safe(), MediaDeviceLimits::none())
+    }
+
+    /// Create a stopped receiver under an explicit process-local policy. The
+    /// worker reserves every above-UHD receive buffer before asking Spout to
+    /// fill it, and retains that reservation while the sender size is live.
+    pub fn new_with_media_policy(
+        name: impl AsRef<str>,
+        media_policy: MediaSafetyPolicy,
+        device_limits: MediaDeviceLimits,
+    ) -> Self {
         let sender_name = sanitize_sender_name(name.as_ref());
         let error = if sender_name.is_empty() {
             "Spout sender name is empty after sanitization".to_string()
@@ -83,6 +111,8 @@ impl SpoutIn {
             next_sequence: Arc::new(AtomicU64::new(0)),
             latest: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(status)),
+            media_policy,
+            device_limits,
         }
     }
 
@@ -139,20 +169,23 @@ impl SpoutIn {
         let next_sequence = Arc::clone(&self.next_sequence);
         let latest = Arc::clone(&self.latest);
         let status = Arc::clone(&self.status);
+        let media_policy = self.media_policy.clone();
+        let device_limits = self.device_limits;
         running.store(true, Ordering::Release);
 
         let spawned = std::thread::Builder::new()
             .name("spout-in".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    receive_worker(
-                        &sender_name,
-                        &stop_rx,
-                        &running,
-                        &next_sequence,
-                        &latest,
-                        &status,
-                    );
+                    let context = ReceiveWorkerContext {
+                        running: &running,
+                        next_sequence: &next_sequence,
+                        latest: &latest,
+                        status: &status,
+                        media_policy: &media_policy,
+                        device_limits,
+                    };
+                    receive_worker(&sender_name, &stop_rx, &context);
                 }));
 
                 if result.is_err() {
@@ -218,11 +251,14 @@ impl Drop for SpoutIn {
 fn receive_worker(
     sender_name: &str,
     stop_rx: &StopReceiver<()>,
-    running: &AtomicBool,
-    next_sequence: &AtomicU64,
-    latest: &Mutex<Option<SpoutFrame>>,
-    status: &Mutex<SpoutStatus>,
+    context: &ReceiveWorkerContext<'_>,
 ) {
+    let running = context.running;
+    let next_sequence = context.next_sequence;
+    let latest = context.latest;
+    let status = context.status;
+    let media_policy = context.media_policy;
+    let device_limits = context.device_limits;
     let mut retry_backoff = INITIAL_RETRY_BACKOFF;
 
     while running.load(Ordering::Acquire) {
@@ -240,7 +276,15 @@ fn receive_worker(
 
         // The first receive establishes the real sender dimensions.
         let (mut width, mut height) = (16u32, 16u32);
-        let mut pixels = vec![0u8; 16 * 16 * 4];
+        let (mut pixels, mut _media_reservation) =
+            match allocate_frame_with_media_policy(16, 16, media_policy, device_limits) {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    set_worker_error(status, error);
+                    return;
+                }
+            };
+        let mut approved_len = pixels.len();
         let mut sender_format = 0;
         let retry_error = loop {
             if should_stop(stop_rx, running) {
@@ -262,10 +306,18 @@ fn receive_worker(
                         current.height = 0;
                     });
                 } else {
-                    pixels = match allocate_frame(new_width, new_height) {
-                        Ok(pixels) => pixels,
+                    let (new_pixels, new_reservation) = match allocate_frame_with_media_policy(
+                        new_width,
+                        new_height,
+                        media_policy,
+                        device_limits,
+                    ) {
+                        Ok(allocation) => allocation,
                         Err(error) => break error,
                     };
+                    pixels = new_pixels;
+                    _media_reservation = new_reservation;
+                    approved_len = pixels.len();
                     width = new_width;
                     height = new_height;
                     update_status(status, |current| {
@@ -290,10 +342,20 @@ fn receive_worker(
                 });
 
                 if receiver.is_frame_new() {
-                    if let Some(sequence) =
-                        publish_latest(latest, &pixels, width, height, sender_format, next_sequence)
-                    {
-                        update_status(status, |current| current.sequence = sequence);
+                    match publish_latest_approved(
+                        latest,
+                        &pixels,
+                        width,
+                        height,
+                        approved_len,
+                        sender_format,
+                        next_sequence,
+                    ) {
+                        Ok(Some(sequence)) => {
+                            update_status(status, |current| current.sequence = sequence);
+                        }
+                        Ok(None) => {}
+                        Err(error) => break error,
                     }
                 }
             } else {
@@ -365,6 +427,7 @@ fn sanitize_sender_name(input: &str) -> String {
     sanitized[..end].trim_end().to_string()
 }
 
+#[cfg(test)]
 fn frame_byte_len(width: u32, height: u32) -> Result<usize, String> {
     crate::video::decoder::validate_media_dimensions(width, height, None)
         .map_err(|error| format!("invalid Spout sender: {error}"))?
@@ -372,16 +435,41 @@ fn frame_byte_len(width: u32, height: u32) -> Result<usize, String> {
         .map_err(|_| format!("Spout sender RGBA size does not fit memory: {width}x{height}"))
 }
 
-fn allocate_frame(width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let len = frame_byte_len(width, height)?;
+#[cfg(test)]
+fn frame_byte_len_with_media_policy(
+    width: u32,
+    height: u32,
+    media_policy: &MediaSafetyPolicy,
+    device_limits: MediaDeviceLimits,
+) -> Result<usize, String> {
+    media_policy
+        .plan(MediaSourceKind::Spout, width, height, device_limits)
+        .map_err(|error| format!("invalid Spout sender: {error}"))?
+        .rgba_bytes
+        .try_into()
+        .map_err(|_| format!("Spout sender RGBA size does not fit memory: {width}x{height}"))
+}
+
+fn allocate_frame_with_media_policy(
+    width: u32,
+    height: u32,
+    media_policy: &MediaSafetyPolicy,
+    device_limits: MediaDeviceLimits,
+) -> Result<(Vec<u8>, MediaReservation), String> {
+    let reservation = media_policy
+        .reserve_source(MediaSourceKind::Spout, width, height, device_limits)
+        .map_err(|error| format!("invalid Spout sender: {error}"))?;
+    let len = usize::try_from(reservation.plan().rgba_bytes)
+        .map_err(|_| format!("Spout sender RGBA size does not fit memory: {width}x{height}"))?;
     let mut pixels = Vec::new();
     pixels
         .try_reserve_exact(len)
         .map_err(|error| format!("could not allocate Spout frame {width}x{height}: {error}"))?;
     pixels.resize(len, 0);
-    Ok(pixels)
+    Ok((pixels, reservation))
 }
 
+#[cfg(test)]
 fn publish_latest(
     latest: &Mutex<Option<SpoutFrame>>,
     pixels: &[u8],
@@ -391,14 +479,41 @@ fn publish_latest(
     next_sequence: &AtomicU64,
 ) -> Option<u64> {
     let expected_len = frame_byte_len(width, height).ok()?;
+    publish_latest_approved(
+        latest,
+        pixels,
+        width,
+        height,
+        expected_len,
+        sender_format,
+        next_sequence,
+    )
+    .ok()
+    .flatten()
+}
+
+fn publish_latest_approved(
+    latest: &Mutex<Option<SpoutFrame>>,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    expected_len: usize,
+    sender_format: u32,
+    next_sequence: &AtomicU64,
+) -> Result<Option<u64>, String> {
     if pixels.len() != expected_len {
-        return None;
+        return Err(format!(
+            "Spout sender {}x{} supplied {} bytes; expected {expected_len}",
+            width,
+            height,
+            pixels.len()
+        ));
     }
 
     let mut slot = match latest.try_lock() {
         Ok(slot) => slot,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-        Err(TryLockError::WouldBlock) => return None,
+        Err(TryLockError::WouldBlock) => return Ok(None),
     };
     let sequence = increment_sequence(next_sequence);
 
@@ -411,7 +526,16 @@ fn publish_latest(
         frame.height = height;
         frame.sequence = sequence;
     } else {
-        let mut rgba = vec![0; pixels.len()];
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(pixels.len()).map_err(|error| {
+            format!(
+                "could not allocate Spout publish frame {}x{} ({} bytes): {error}",
+                width,
+                height,
+                pixels.len()
+            )
+        })?;
+        rgba.resize(pixels.len(), 0);
         copy_received_pixels_to_rgba(&mut rgba, pixels, sender_format);
         *slot = Some(SpoutFrame {
             pixels: rgba,
@@ -420,7 +544,7 @@ fn publish_latest(
             sequence,
         });
     }
-    Some(sequence)
+    Ok(Some(sequence))
 }
 
 /// Copy a native Spout pixel buffer into the RGBA8 layout used by wgpu.
@@ -502,6 +626,27 @@ mod tests {
         assert!(frame_byte_len(0, 1080).is_err());
         assert!(frame_byte_len(u32::MAX, u32::MAX).is_err());
         assert!(frame_byte_len(16_384, 16_384).is_err());
+    }
+
+    #[test]
+    fn expert_spout_length_still_obeys_policy_and_device_limits() {
+        let policy = MediaSafetyPolicy::for_test(
+            crate::media_safety::MediaSafetyMode::Expert,
+            2 * 1024 * 1024 * 1024,
+        );
+        let device = MediaDeviceLimits::new(8_192, 512 * 1024 * 1024);
+        assert_eq!(
+            frame_byte_len_with_media_policy(7_680, 4_320, &policy, device),
+            Ok(7_680 * 4_320 * 4)
+        );
+        assert!(frame_byte_len_with_media_policy(8_193, 4_320, &policy, device).is_err());
+        assert!(frame_byte_len_with_media_policy(
+            7_680,
+            4_320,
+            &policy,
+            MediaDeviceLimits::new(8_192, 64 * 1024 * 1024),
+        )
+        .is_err());
     }
 
     #[test]

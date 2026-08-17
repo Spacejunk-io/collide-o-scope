@@ -1,0 +1,218 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  FFMPEG_VERSION: 8.1.2
+  FFMPEG_SOURCE_SHA256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+  FFMPEG_WINDOWS_SHA256: 274923c68904a9b76c73b908f57923dafba81155856cd742138515ded570d066
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (Ubuntu 24.04)
+            os: ubuntu-24.04
+          - name: macOS 15
+            os: macos-15
+          - name: Windows (VS 2022)
+            os: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust with lint components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustc --version --verbose
+          cargo --version
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Linux native prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            clang \
+            curl \
+            libasound2-dev \
+            libclang-dev \
+            pkg-config \
+            xz-utils
+
+      - name: Verify macOS native prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          command -v make
+          command -v pkg-config
+          command -v xz
+          llvm_prefix="$(brew --prefix llvm@18)"
+          test -f "$llvm_prefix/lib/libclang.dylib"
+          echo "LIBCLANG_PATH=$llvm_prefix/lib" >> "$GITHUB_ENV"
+
+      - name: Cache FFmpeg 8.1.2 libraries on Unix
+        if: runner.os != 'Windows'
+        id: ffmpeg-unix-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-8.1.2
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-8.1.2-shared-v1
+
+      - name: Build FFmpeg 8.1.2 libraries on Unix
+        if: runner.os != 'Windows' && steps.ffmpeg-unix-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION.tar.xz"
+          source_root="$RUNNER_TEMP/ffmpeg-source"
+          prefix="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION"
+
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$FFMPEG_SOURCE_SHA256  $archive" | sha256sum --check --strict
+          else
+            actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
+            test "$actual" = "$FFMPEG_SOURCE_SHA256"
+          fi
+
+          mkdir -p "$source_root"
+          tar -xJf "$archive" -C "$source_root"
+          cd "$source_root/ffmpeg-$FFMPEG_VERSION"
+          ./configure \
+            --prefix="$prefix" \
+            --disable-autodetect \
+            --disable-doc \
+            --disable-programs \
+            --disable-static \
+            --disable-x86asm \
+            --enable-pic \
+            --enable-shared
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            jobs="$(sysctl -n hw.logicalcpu)"
+          else
+            jobs="$(nproc)"
+          fi
+          make -j"$jobs"
+          make install
+
+      - name: Configure FFmpeg 8.1.2 on Unix
+        if: runner.os != 'Windows'
+        run: |
+          prefix="$RUNNER_TEMP/ffmpeg-$FFMPEG_VERSION"
+          test -f "$prefix/lib/pkgconfig/libavcodec.pc"
+          echo "FFMPEG_DIR=$prefix" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$prefix/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          else
+            echo "LD_LIBRARY_PATH=$prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Cache FFmpeg 8.1.2 shared build on Windows
+        if: runner.os == 'Windows'
+        id: ffmpeg-windows-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-8.1.2-windows
+          key: ffmpeg-Windows-${{ runner.arch }}-8.1.2-shared-v1
+
+      - name: Download FFmpeg 8.1.2 shared build on Windows
+        if: runner.os == 'Windows' && steps.ffmpeg-windows-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "ffmpeg-$env:FFMPEG_VERSION-full_build-shared.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "ffmpeg-$env:FFMPEG_VERSION-windows"
+          $url = "https://github.com/GyanD/codexffmpeg/releases/download/$env:FFMPEG_VERSION/ffmpeg-$env:FFMPEG_VERSION-full_build-shared.zip"
+
+          Invoke-WebRequest -Uri $url -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 5
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $env:FFMPEG_WINDOWS_SHA256) {
+            throw "FFmpeg checksum mismatch: expected $env:FFMPEG_WINDOWS_SHA256, got $actual"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+
+      - name: Configure FFmpeg and MSVC on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $destination = Join-Path $env:RUNNER_TEMP "ffmpeg-$env:FFMPEG_VERSION-windows"
+          $ffmpeg = Get-ChildItem -LiteralPath $destination -Directory -Recurse |
+            Where-Object Name -eq "ffmpeg-$env:FFMPEG_VERSION-full_build-shared" |
+            Select-Object -First 1
+          if ($null -eq $ffmpeg) {
+            throw "FFmpeg shared build was not found under $destination"
+          }
+
+          $libclang = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path -LiteralPath "$libclang\libclang.dll")) {
+            throw "libclang.dll was not found at $libclang"
+          }
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($vsPath)) {
+            throw "Visual Studio 2022 C++ tools were not found"
+          }
+          $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+
+          "FFMPEG_DIR=$($ffmpeg.FullName)" >> $env:GITHUB_ENV
+          "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
+          "VCVARS64=$vcvars" >> $env:GITHUB_ENV
+          (Join-Path $ffmpeg.FullName "bin") >> $env:GITHUB_PATH
+
+      - name: Check Rust formatting and JavaScript syntax
+        run: |
+          cargo fmt --all -- --check
+          node --check static/app.js
+          node --check docs/ui-ux/wireframe.js
+
+      - name: Check, test, and lint on Unix
+        if: runner.os != 'Windows'
+        run: |
+          cargo check --locked --all-targets
+          cargo test --locked --all-targets -- --test-threads=1
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Check, test, and lint on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmd /c "`"$env:VCVARS64`" >nul && cargo check --locked --all-targets"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmd /c "`"$env:VCVARS64`" >nul && cargo test --locked --all-targets -- --test-threads=1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmd /c "`"$env:VCVARS64`" >nul && cargo clippy --locked --all-targets --all-features -- -D warnings"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

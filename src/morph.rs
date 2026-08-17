@@ -7,12 +7,13 @@
 //! constructing or mutating a [`Layer`]. [`Morph::apply`] remains as the
 //! compatibility adapter used by the live renderer.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::effects::params::TemporalParams;
 use crate::effects::EffectUniforms;
 use crate::layers::{BlendMode, Layer};
-use crate::modulation::MAX_MOD_LAYERS;
 use crate::ntsc::NtscParams;
 
 /// Parameter interpolation law for the A/B crossfader.
@@ -121,7 +122,8 @@ impl MorphGlide {
 }
 
 /// Serializable master-effect values captured by a morph slot.
-/// Runtime-only `resolution` and `time` uniforms are intentionally absent.
+/// Runtime-owned `resolution`, `time`, and `random_seed` uniforms are
+/// intentionally absent. Pattern identity must not drift while Morph moves.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MorphMasterSnapshot {
@@ -155,6 +157,10 @@ pub struct MorphMasterSnapshot {
     pub cellular_gap_amount: f32,
     pub cellular_gap_threshold: f32,
     pub cellular_gap_softness: f32,
+    pub shift_amount: f32,
+    pub shift_block_size: f32,
+    pub shift_density: f32,
+    pub shift_speed: f32,
 }
 
 impl Default for MorphMasterSnapshot {
@@ -196,6 +202,10 @@ impl MorphMasterSnapshot {
             cellular_gap_amount: value.cellular_gap_amount,
             cellular_gap_threshold: value.cellular_gap_threshold,
             cellular_gap_softness: value.cellular_gap_softness,
+            shift_amount: value.shift_amount,
+            shift_block_size: value.shift_block_size,
+            shift_density: value.shift_density,
+            shift_speed: value.shift_speed,
         }
         .sanitized()
     }
@@ -239,11 +249,15 @@ impl MorphMasterSnapshot {
             cellular_gap_amount: finite_clamp(self.cellular_gap_amount, 0.0, 0.0, 1.0),
             cellular_gap_threshold: finite_clamp(self.cellular_gap_threshold, 0.65, 0.0, 1.0),
             cellular_gap_softness: finite_clamp(self.cellular_gap_softness, 0.08, 0.0, 0.5),
+            shift_amount: finite_clamp(self.shift_amount, 0.0, 0.0, 1.0),
+            shift_block_size: finite_clamp(self.shift_block_size, 8.0, 2.0, 256.0),
+            shift_density: finite_clamp(self.shift_density, 0.5, 0.0, 1.0),
+            shift_speed: finite_clamp(self.shift_speed, 3.0, 0.0, 20.0),
         }
     }
 
     /// Apply the captured performance values while preserving render-loop
-    /// ownership of resolution and time.
+    /// ownership of resolution, time, and deterministic pattern identity.
     pub fn apply_to(&self, value: &mut EffectUniforms) {
         let clean = self.sanitized();
         value.pixelate_size = clean.pixelate_size;
@@ -276,6 +290,10 @@ impl MorphMasterSnapshot {
         value.cellular_gap_amount = clean.cellular_gap_amount;
         value.cellular_gap_threshold = clean.cellular_gap_threshold;
         value.cellular_gap_softness = clean.cellular_gap_softness;
+        value.shift_amount = clean.shift_amount;
+        value.shift_block_size = clean.shift_block_size;
+        value.shift_density = clean.shift_density;
+        value.shift_speed = clean.shift_speed;
     }
 
     fn interpolate(a: &Self, b: &Self, weights: [f32; 2], choose_b: bool) -> Self {
@@ -328,6 +346,10 @@ impl MorphMasterSnapshot {
                 b.cellular_gap_softness,
                 weights,
             ),
+            shift_amount: blend_finite(a.shift_amount, b.shift_amount, weights),
+            shift_block_size: blend_finite(a.shift_block_size, b.shift_block_size, weights),
+            shift_density: blend_finite(a.shift_density, b.shift_density, weights),
+            shift_speed: blend_finite(a.shift_speed, b.shift_speed, weights),
         }
         .sanitized()
     }
@@ -855,13 +877,10 @@ impl MorphSlot {
     }
 
     pub fn sanitized(&self) -> Self {
-        let mut layers = Vec::with_capacity(self.layers.len().min(MAX_MOD_LAYERS));
+        let mut positions = HashSet::with_capacity(self.layers.len());
+        let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            if layer.position >= MAX_MOD_LAYERS
-                || layers
-                    .iter()
-                    .any(|existing: &LayerMorphSnapshot| existing.position == layer.position)
-            {
+            if !positions.insert(layer.position) {
                 continue;
             }
             layers.push(layer.sanitized());
@@ -1406,6 +1425,10 @@ mod tests {
                 cellular_gap_amount: 1.0,
                 cellular_gap_threshold: 1.0,
                 cellular_gap_softness: 0.5,
+                shift_amount: 1.0,
+                shift_block_size: 256.0,
+                shift_density: 1.0,
+                shift_speed: 20.0,
             }
         } else {
             MorphMasterSnapshot::default()
@@ -1578,6 +1601,10 @@ mod tests {
         close(effects.cellular_gap_amount, 0.5);
         close(effects.cellular_gap_threshold, 0.825);
         close(effects.cellular_gap_softness, 0.29);
+        close(effects.shift_amount, 0.5);
+        close(effects.shift_block_size, 132.0);
+        close(effects.shift_density, 0.75);
+        close(effects.shift_speed, 11.5);
 
         assert_eq!(morph.sample(0.0).unwrap().layers[0], full_layer(2, false));
         assert_eq!(morph.sample(1.0).unwrap().layers[0], full_layer(2, true));
@@ -1863,6 +1890,65 @@ key_threshold: 0.2
     }
 
     #[test]
+    fn shift_morph_interpolates_controls_but_preserves_pattern_seed() {
+        let a = MorphMasterSnapshot::capture(&EffectUniforms {
+            shift_amount: 0.2,
+            shift_block_size: 12.0,
+            shift_density: 0.3,
+            shift_speed: 2.0,
+            random_seed: 11,
+            ..Default::default()
+        });
+        let b = MorphMasterSnapshot::capture(&EffectUniforms {
+            shift_amount: 1.0,
+            shift_block_size: 52.0,
+            shift_density: 0.9,
+            shift_speed: 10.0,
+            random_seed: 99,
+            ..Default::default()
+        });
+        let midpoint = MorphMasterSnapshot::interpolate(&a, &b, [0.5, 0.5], true);
+        close(midpoint.shift_amount, 0.6);
+        close(midpoint.shift_block_size, 32.0);
+        close(midpoint.shift_density, 0.6);
+        close(midpoint.shift_speed, 6.0);
+
+        let mut applied = EffectUniforms {
+            resolution: [1280.0, 720.0],
+            time: 17.0,
+            random_seed: 0x1234_5678,
+            ..Default::default()
+        };
+        midpoint.apply_to(&mut applied);
+        close(applied.shift_amount, 0.6);
+        close(applied.shift_block_size, 32.0);
+        close(applied.shift_density, 0.6);
+        close(applied.shift_speed, 6.0);
+        assert_eq!(applied.resolution, [1280.0, 720.0]);
+        close(applied.time, 17.0);
+        assert_eq!(applied.random_seed, 0x1234_5678);
+
+        let invalid = MorphMasterSnapshot {
+            shift_amount: f32::NAN,
+            shift_block_size: -5.0,
+            shift_density: 8.0,
+            shift_speed: f32::INFINITY,
+            ..Default::default()
+        }
+        .sanitized();
+        close(invalid.shift_amount, 0.0);
+        close(invalid.shift_block_size, 2.0);
+        close(invalid.shift_density, 1.0);
+        close(invalid.shift_speed, 3.0);
+
+        let legacy: MorphMasterSnapshot = serde_yaml::from_str("pixelate_size: 2\n").unwrap();
+        close(legacy.shift_amount, 0.0);
+        close(legacy.shift_block_size, 8.0);
+        close(legacy.shift_density, 0.5);
+        close(legacy.shift_speed, 3.0);
+    }
+
+    #[test]
     fn chroma_and_temporal_key_morphing_is_bounded_and_discrete_where_required() {
         let a = MorphMasterSnapshot::capture(&EffectUniforms {
             key_mode: 3.0,
@@ -2033,8 +2119,12 @@ glide:
         close(slot.temporal.fb_zoom, 1.1);
         close(slot.temporal.fb_rotate, -5.0);
         close(slot.temporal.slit_angle, 0.0);
-        assert_eq!(slot.layers.len(), 1);
-        let layer = slot.layers[0];
+        assert_eq!(slot.layers.len(), 2);
+        let layer = *slot
+            .layers
+            .iter()
+            .find(|layer| layer.position == 0)
+            .unwrap();
         close(layer.opacity, 1.0);
         close(layer.speed, 4.0);
         close(layer.fps.unwrap(), 30.0);
@@ -2044,6 +2134,44 @@ glide:
         let effects = layer.effects.unwrap();
         close(effects.brightness, 0.0);
         close(effects.key_threshold, 1.0);
+
+        let far_layer = *slot
+            .layers
+            .iter()
+            .find(|layer| layer.position == 999)
+            .unwrap();
+        close(far_layer.opacity, 0.0);
+    }
+
+    #[test]
+    fn morph_sanitizer_retains_unbounded_positions_and_deduplicates_first_wins() {
+        let first = LayerMorphSnapshot {
+            position: usize::MAX,
+            opacity: 0.25,
+            ..Default::default()
+        };
+        let duplicate = LayerMorphSnapshot {
+            position: usize::MAX,
+            opacity: 0.75,
+            ..Default::default()
+        };
+        let above_legacy_cap = LayerMorphSnapshot {
+            position: 16,
+            opacity: 0.5,
+            ..Default::default()
+        };
+
+        let slot = MorphSlot {
+            layers: vec![first, duplicate, above_legacy_cap],
+            ..Default::default()
+        }
+        .sanitized();
+
+        assert_eq!(slot.layers.len(), 2);
+        assert_eq!(slot.layers[0].position, usize::MAX);
+        close(slot.layers[0].opacity, 0.25);
+        assert_eq!(slot.layers[1].position, 16);
+        close(slot.layers[1].opacity, 0.5);
     }
 
     #[test]

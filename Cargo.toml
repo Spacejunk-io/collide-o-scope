@@ -19,7 +19,8 @@ rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "fs", "io-util"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "macros", "fs", "io-util", "time"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["fs"] }
 futures = "0.3"
@@ -37,10 +38,13 @@ rcgen = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 spout2-rs = { version = "0.1", default-features = false, features = ["dx"] }
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
 
 # ntsc-rs is CPU-intensive; always optimize it even in debug builds
 [profile.dev.package.ntsc-rs]

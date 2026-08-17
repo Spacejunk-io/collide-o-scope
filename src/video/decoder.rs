@@ -7,12 +7,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Ordinary media is capped at UHD independently of the active GPU's edge
-/// limit. A permissive adapter must not turn corrupt codec metadata into a
-/// multi-gigabyte scaler or texture allocation.
-pub const MAX_MEDIA_PIXELS: u64 = 3_840 * 2_160;
-pub const MAX_MEDIA_RGBA_BYTES: u64 = MAX_MEDIA_PIXELS * 4;
-pub const MAX_MEDIA_EDGE: u32 = 16_384;
+use crate::media_safety::{
+    validate_safe_dimensions, MediaAllocationPlan, MediaDeviceLimits, MediaReservation,
+    MediaSafetyPolicy, MediaSourceKind,
+};
+
+// Compatibility names used by existing callers/tests. Safe mode remains the
+// exact UHD-area boundary these constants represented before Expert mode was
+// introduced.
+#[allow(unused_imports)]
+pub use crate::media_safety::{
+    ABSOLUTE_MEDIA_MAX_EDGE as MAX_MEDIA_EDGE, SAFE_MEDIA_MAX_PIXELS as MAX_MEDIA_PIXELS,
+    SAFE_MEDIA_MAX_RGBA_BYTES as MAX_MEDIA_RGBA_BYTES,
+};
 /// A valid inter-frame stream should never need anywhere near this many
 /// packets to produce one image. The cap makes corrupt packet-only streams
 /// fail deterministically even before EOF.
@@ -38,10 +45,19 @@ pub struct VideoDecoder {
     pub fps: f32,
     frame_count: u64,
     total_frames: u64,
+    /// Number of times EOF was reached and the input was successfully
+    /// reopened. This never resets during the decoder's lifetime.
+    loop_generation: u64,
     cancel: Arc<AtomicBool>,
+    /// Retains any above-UHD Expert working-set reservation for the complete
+    /// decoder lifetime, including EOF reopens.
+    _media_reservation: MediaReservation,
+    media_plan: MediaAllocationPlan,
 }
 
 impl VideoDecoder {
+    /// Safe-policy compatibility constructor retained for embedders and tests.
+    #[allow(dead_code)]
     pub fn open(path: &str) -> Result<Self, String> {
         Self::open_with_cancel(path, Arc::new(AtomicBool::new(false)))
     }
@@ -49,7 +65,67 @@ impl VideoDecoder {
     /// Open a decoder with a cooperative cancellation flag shared by the
     /// caller. FFmpeg's interrupt callback observes both cancellation and a
     /// fixed I/O deadline during open and every later packet read/reopen.
+    /// Cancellation-aware Safe-policy compatibility constructor.
+    #[allow(dead_code)]
     pub fn open_with_cancel(path: &str, cancel: Arc<AtomicBool>) -> Result<Self, String> {
+        let policy = MediaSafetyPolicy::safe();
+        Self::open_with_cancel_and_media_policy(path, cancel, &policy, MediaDeviceLimits::none())
+    }
+
+    /// Inspect codec dimensions under the same admission policy without
+    /// constructing a scaler or allocating a decoded-frame mailbox. Startup
+    /// uses this to choose a preview size; actual layer construction still
+    /// reserves the complete working set below.
+    pub fn probe_dimensions_with_media_policy(
+        path: &str,
+        media_policy: &MediaSafetyPolicy,
+        device_limits: MediaDeviceLimits,
+    ) -> Result<MediaAllocationPlan, String> {
+        ffmpeg::init().map_err(|error| format!("ffmpeg init failed: {error}"))?;
+        let input_ctx = open_input(path, Arc::new(AtomicBool::new(false)), "dimension probe")?;
+        let stream = input_ctx
+            .streams()
+            .best(Type::Video)
+            .ok_or("No video stream found")?;
+        let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+            .map_err(|error| format!("Codec params: {error}"))?;
+        let decoder = codec_ctx
+            .decoder()
+            .video()
+            .map_err(|error| format!("Decoder: {error}"))?;
+        media_policy
+            .plan(
+                MediaSourceKind::Video,
+                decoder.width(),
+                decoder.height(),
+                device_limits,
+            )
+            .map_err(|error| format!("video source rejected: {error}"))
+    }
+
+    /// Open using an explicit host-local media policy and detected device
+    /// limits. Patches never construct or alter this policy.
+    #[allow(dead_code)]
+    pub fn open_with_media_policy(
+        path: &str,
+        media_policy: &MediaSafetyPolicy,
+        device_limits: MediaDeviceLimits,
+    ) -> Result<Self, String> {
+        Self::open_with_cancel_and_media_policy(
+            path,
+            Arc::new(AtomicBool::new(false)),
+            media_policy,
+            device_limits,
+        )
+    }
+
+    /// Cancellation-aware form used by the threaded decoder worker.
+    pub fn open_with_cancel_and_media_policy(
+        path: &str,
+        cancel: Arc<AtomicBool>,
+        media_policy: &MediaSafetyPolicy,
+        device_limits: MediaDeviceLimits,
+    ) -> Result<Self, String> {
         ffmpeg::init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
 
         let input_ctx = open_input(path, cancel.clone(), "open")?;
@@ -69,7 +145,10 @@ impl VideoDecoder {
 
         let width = decoder.width();
         let height = decoder.height();
-        validate_media_dimensions(width, height, None)?;
+        let media_reservation = media_policy
+            .reserve_source(MediaSourceKind::Video, width, height, device_limits)
+            .map_err(|error| format!("video source rejected: {error}"))?;
+        let media_plan = media_reservation.plan().clone();
         let avg_fps = f64::from(stream.avg_frame_rate());
         let fps = if avg_fps.is_finite() && avg_fps > 0.0 {
             avg_fps as f32
@@ -113,7 +192,10 @@ impl VideoDecoder {
             fps,
             frame_count: 0,
             total_frames,
+            loop_generation: 0,
             cancel,
+            _media_reservation: media_reservation,
+            media_plan,
         })
     }
 
@@ -171,6 +253,16 @@ impl VideoDecoder {
         (self.frame_count % self.total_frames) as f32 / self.total_frames as f32
     }
 
+    /// Cumulative count of successful EOF reopens.
+    pub fn loop_generation(&self) -> u64 {
+        self.loop_generation
+    }
+
+    /// Checked allocation plan retained for status/reporting integrations.
+    pub fn media_allocation_plan(&self) -> &MediaAllocationPlan {
+        &self.media_plan
+    }
+
     fn scale_frame(&mut self, frame: &VideoFrame) -> Result<Vec<u8>, String> {
         let mut rgb_frame = VideoFrame::empty();
         self.scaler.run(frame, &mut rgb_frame).map_err(|e| {
@@ -220,7 +312,6 @@ impl VideoDecoder {
             .decoder()
             .video()
             .map_err(|e| format!("Decoder on reopen: {e}"))?;
-        validate_media_dimensions(decoder.width(), decoder.height(), None)?;
         if decoder.width() != self.width || decoder.height() != self.height {
             return Err(format!(
                 "video dimensions changed while reopening {}: expected {}x{}, got {}x{}",
@@ -235,6 +326,7 @@ impl VideoDecoder {
         self.decoder = decoder;
 
         self.frame_count = 0;
+        self.loop_generation = next_loop_generation(self.loop_generation);
 
         Ok(())
     }
@@ -246,6 +338,10 @@ impl VideoDecoder {
             Ok(())
         }
     }
+}
+
+fn next_loop_generation(current: u64) -> u64 {
+    current.saturating_add(1)
 }
 
 fn count_packet_without_frame(count: u32, path: &str) -> Result<u32, String> {
@@ -318,35 +414,33 @@ pub fn validate_media_dimensions(
     height: u32,
     adapter_max_dimension: Option<u32>,
 ) -> Result<u64, String> {
-    if width == 0 || height == 0 {
-        return Err(format!(
-            "media reported invalid dimensions {width}x{height}"
-        ));
-    }
-    if width > MAX_MEDIA_EDGE || height > MAX_MEDIA_EDGE {
-        return Err(format!(
-            "media dimensions {width}x{height} exceed the {MAX_MEDIA_EDGE}px safety edge limit"
-        ));
-    }
-    if let Some(limit) = adapter_max_dimension {
-        if width > limit || height > limit {
-            return Err(format!(
-                "media dimensions {width}x{height} exceed this GPU's {limit}px 2D texture limit"
-            ));
-        }
-    }
-    let pixels = u64::from(width)
-        .checked_mul(u64::from(height))
-        .ok_or_else(|| format!("media pixel count overflows for {width}x{height}"))?;
-    let rgba_bytes = pixels
-        .checked_mul(4)
-        .ok_or_else(|| format!("media RGBA byte size overflows for {width}x{height}"))?;
-    if pixels > MAX_MEDIA_PIXELS || rgba_bytes > MAX_MEDIA_RGBA_BYTES {
-        return Err(format!(
-            "media dimensions {width}x{height} require {pixels} pixels/{rgba_bytes} RGBA bytes; the safety limit is {MAX_MEDIA_PIXELS} pixels/{MAX_MEDIA_RGBA_BYTES} bytes (3840x2160)"
-        ));
-    }
-    Ok(rgba_bytes)
+    validate_safe_dimensions(
+        MediaSourceKind::Video,
+        width,
+        height,
+        MediaDeviceLimits {
+            max_texture_dimension_2d: adapter_max_dimension,
+            max_buffer_size: None,
+        },
+    )
+    .map(|plan| plan.rgba_bytes)
+    .map_err(|error| error.to_string())
+}
+
+/// Policy-aware dimension planning for callers that have a shared host-local
+/// policy. This does not reserve memory; source constructors must retain the
+/// [`MediaReservation`] returned by `MediaSafetyPolicy::reserve_source`.
+#[allow(dead_code)]
+pub fn validate_media_dimensions_with_policy(
+    width: u32,
+    height: u32,
+    source_kind: MediaSourceKind,
+    media_policy: &MediaSafetyPolicy,
+    device_limits: MediaDeviceLimits,
+) -> Result<MediaAllocationPlan, String> {
+    media_policy
+        .plan(source_kind, width, height, device_limits)
+        .map_err(|error| error.to_string())
 }
 
 /// FFmpeg aligns decoded planes for SIMD, so `stride` is often larger than
@@ -358,9 +452,19 @@ fn repack_rgba_plane(
     width: u32,
     height: u32,
 ) -> Result<Vec<u8>, String> {
-    let row_bytes = width as usize * 4;
-    let height = height as usize;
-    let required_len = stride.saturating_mul(height);
+    let width = usize::try_from(width)
+        .map_err(|_| "FFmpeg RGBA width does not fit this platform".to_string())?;
+    let height = usize::try_from(height)
+        .map_err(|_| "FFmpeg RGBA height does not fit this platform".to_string())?;
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| "FFmpeg RGBA row byte count overflows".to_string())?;
+    let required_len = stride
+        .checked_mul(height)
+        .ok_or_else(|| "FFmpeg RGBA plane byte count overflows".to_string())?;
+    let output_len = row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| "packed FFmpeg RGBA frame byte count overflows".to_string())?;
     if stride < row_bytes || data.len() < required_len {
         return Err(format!(
             "Invalid FFmpeg RGBA plane: stride={stride}, row_bytes={row_bytes}, height={height}, data_len={}",
@@ -368,22 +472,32 @@ fn repack_rgba_plane(
         ));
     }
 
+    let mut packed = reserve_packed_rgba(output_len)?;
     if stride == row_bytes {
-        return Ok(data[..row_bytes * height].to_vec());
+        packed.extend_from_slice(&data[..output_len]);
+        return Ok(packed);
     }
 
-    let mut packed = Vec::with_capacity(row_bytes * height);
     for row in data.chunks_exact(stride).take(height) {
         packed.extend_from_slice(&row[..row_bytes]);
     }
     Ok(packed)
 }
 
+fn reserve_packed_rgba(output_len: usize) -> Result<Vec<u8>, String> {
+    let mut packed = Vec::new();
+    packed.try_reserve_exact(output_len).map_err(|error| {
+        format!("could not reserve {output_len} bytes for packed FFmpeg RGBA frame: {error}")
+    })?;
+    Ok(packed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        count_packet_without_frame, repack_rgba_plane, require_decoded_frame_before_loop,
-        should_interrupt_input, validate_media_dimensions, MAX_PACKETS_WITHOUT_FRAME,
+        count_packet_without_frame, next_loop_generation, repack_rgba_plane,
+        require_decoded_frame_before_loop, reserve_packed_rgba, should_interrupt_input,
+        validate_media_dimensions, VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -409,6 +523,12 @@ mod tests {
         let error = repack_rgba_plane(&[0; 15], 8, 3, 2).unwrap_err();
         assert!(error.contains("stride=8"));
         assert!(error.contains("row_bytes=12"));
+    }
+
+    #[test]
+    fn impossible_packed_frame_reservation_is_fallible() {
+        let error = reserve_packed_rgba(usize::MAX).unwrap_err();
+        assert!(error.contains("could not reserve"));
     }
 
     #[test]
@@ -467,5 +587,69 @@ mod tests {
             count_packet_without_frame(MAX_PACKETS_WITHOUT_FRAME, "packets.mp4").unwrap_err();
         assert!(error.contains("packets.mp4"));
         assert!(error.contains("no decodable frame"));
+    }
+
+    #[test]
+    fn loop_generation_is_monotonic_for_the_decoder_lifetime() {
+        assert_eq!(next_loop_generation(0), 1);
+        assert_eq!(next_loop_generation(41), 42);
+        assert_eq!(next_loop_generation(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn real_video_eof_reopens_advance_the_cumulative_loop_generation() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("loop-72f.mp4");
+        assert!(
+            fixture.is_file(),
+            "missing decode fixture: {}",
+            fixture.display()
+        );
+        let mut decoder = VideoDecoder::open(&fixture.to_string_lossy()).unwrap();
+        let expected_bytes = decoder.width as usize * decoder.height as usize * 4;
+        let mut observed_generation = decoder.loop_generation();
+        let mut generation_edges = Vec::new();
+
+        // The fixture contains 72 frames. The guard is deliberately much
+        // larger than two loops but finite, so a broken EOF/reopen path fails
+        // instead of turning the test into an unbounded decoder loop.
+        for _ in 0..256 {
+            let frame = decoder.next_frame_result().unwrap();
+            assert_eq!(frame.len(), expected_bytes);
+            let generation = decoder.loop_generation();
+            if generation != observed_generation {
+                assert_eq!(generation, observed_generation + 1);
+                generation_edges.push(generation);
+                observed_generation = generation;
+                if generation == 2 {
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(generation_edges, [1, 2]);
+    }
+
+    #[test]
+    fn metadata_probe_reports_dimensions_without_constructing_playback_state() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("loop-72f.mp4");
+        let policy = crate::media_safety::MediaSafetyPolicy::safe();
+        let plan = VideoDecoder::probe_dimensions_with_media_policy(
+            &fixture.to_string_lossy(),
+            &policy,
+            crate::media_safety::MediaDeviceLimits::none(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.source_kind,
+            crate::media_safety::MediaSourceKind::Video
+        );
+        assert!(plan.width > 0 && plan.height > 0);
+        assert_eq!(plan.pixels, u64::from(plan.width) * u64::from(plan.height));
     }
 }

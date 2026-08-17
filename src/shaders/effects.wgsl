@@ -36,10 +36,18 @@ struct Uniforms {
     cellular_gap_amount: f32,
     cellular_gap_threshold: f32,
     cellular_gap_softness: f32,
-    _cellular_pad: f32,
+    // Reuses the old 32-bit pad within the original nine-vec4 prefix.
+    // Zero is a strict legacy sentinel and therefore contributes no offset.
+    random_seed: u32,
     // Chroma-key target is supplied in display/sRGB coordinates.
     key_color: vec3f,
     key_tolerance: f32,
+    // Deterministic horizontal block displacement. The amount's zero default
+    // takes an exact no-op path, preserving legacy pixels.
+    shift_amount: f32,
+    shift_block_size: f32,
+    shift_density: f32,
+    shift_speed: f32,
 };
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -106,12 +114,23 @@ fn cellular_avalanche(value: u32) -> u32 {
     return x ^ (x >> 16u);
 }
 
+fn pattern_seed_offset() -> f32 {
+    if uniforms.random_seed == 0u {
+        return 0.0;
+    }
+    // A 24-bit integer is represented exactly by f32, keeping every backend
+    // on the same deterministic path before the legacy float hashes run.
+    return f32(cellular_avalanche(uniforms.random_seed) & 0x00ffffffu);
+}
+
 fn cellular_hash2(cell: vec2i, epoch: u32) -> vec2f {
     let cx = bitcast<u32>(cell.x);
     let cy = bitcast<u32>(cell.y);
-    let seed = cellular_avalanche(
-        cx ^ (cy * 0x9e3779b9u) ^ (epoch * 0x85ebca6bu)
-    );
+    var seed_input = cx ^ (cy * 0x9e3779b9u) ^ (epoch * 0x85ebca6bu);
+    if uniforms.random_seed != 0u {
+        seed_input ^= cellular_avalanche(uniforms.random_seed);
+    }
+    let seed = cellular_avalanche(seed_input);
     let hx = cellular_avalanche(seed ^ 0x68bc21ebu);
     let hy = cellular_avalanche(seed ^ 0x02e5be93u);
     let unit = 1.0 / 16777216.0;
@@ -166,7 +185,7 @@ fn get_grain(uv: vec2f) -> vec3f {
         grain_uv = floor(uv * grid) / grid;
     }
 
-    let seed = floor(uniforms.time * 30.0);
+    let seed = floor(uniforms.time * 30.0) + pattern_seed_offset();
     var n1: f32; var n2: f32; var n3: f32;
 
     let algo = i32(uniforms.grain_algo);
@@ -203,7 +222,7 @@ fn get_grain(uv: vec2f) -> vec3f {
 // --- Breathing (UV distortion) ---
 fn apply_breathing(uv: vec2f) -> vec2f {
     var out_uv = uv;
-    let seed = floor(uniforms.time * 30.0);
+    let seed = floor(uniforms.time * 30.0) + pattern_seed_offset();
 
     // Scale breathing (zoom pulsing)
     if uniforms.breathe_scale > 0.0 {
@@ -356,6 +375,25 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         sample_uv = clamp(sample_uv + warp_uv * amount, vec2f(0.0), vec2f(1.0));
     }
 
+    // --- Shift (seeded horizontal block displacement) ---
+    // Bands are anchored to output pixels and advance in discrete time epochs,
+    // so a given seed, time and parameter set always produces the same frame.
+    if uniforms.shift_amount > 0.0001 {
+        let amount = clamp(uniforms.shift_amount, 0.0, 1.0);
+        let block_size = clamp(uniforms.shift_block_size, 2.0, 256.0);
+        let density = clamp(uniforms.shift_density, 0.0, 1.0);
+        let speed = clamp(uniforms.shift_speed, 0.0, 20.0);
+        let band = floor(uv.y * max(uniforms.resolution.y, 1.0) / block_size);
+        let epoch = floor(max(uniforms.time, 0.0) * speed);
+        let seed = pattern_seed_offset();
+        let gate = hash(vec2f(band + seed, epoch + 17.0));
+        if gate < density {
+            let direction = hash(vec2f(band * 1.6180339 + seed, epoch + 73.0)) * 2.0 - 1.0;
+            let offset = direction * amount * 0.25;
+            sample_uv.x = fract(sample_uv.x + offset + 1.0);
+        }
+    }
+
     // --- Downsample (lossy video look) ---
     if uniforms.downsample < 0.99 {
         let virtual_res = uniforms.resolution * uniforms.downsample;
@@ -372,7 +410,7 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     // --- Color drift (per-frame random chromatic aberration) ---
     var color: vec4f;
     if uniforms.color_drift > 0.0 {
-        let seed = floor(uniforms.time * 30.0);
+        let seed = floor(uniforms.time * 30.0) + pattern_seed_offset();
         let r_shift = (hash(vec2f(seed, 10.0)) - 0.5) * uniforms.color_drift;
         let b_shift = (hash(vec2f(seed, 11.0)) - 0.5) * uniforms.color_drift;
         let r = textureSample(tex, samp, vec2f(sample_uv.x + r_shift, sample_uv.y)).r;

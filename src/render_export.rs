@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use crate::effects::EffectUniforms;
 use crate::layers::BlendMode;
+use crate::media_safety::{MediaDeviceLimits, MediaSafetyPolicy};
 use crate::ntsc::{
-    plan_selective_ntsc, process_selective_ntsc_batch_with_state, reference_frame_for_output,
-    NtscFrameMetadata, NtscState, SelectiveNtscBatch, SelectiveNtscGeneration,
-    SelectiveNtscLayerDescriptor, SelectiveNtscPlan,
+    plan_selective_ntsc, process_selective_ntsc_batch_with_state_and_resolution,
+    reference_frame_for_output, NtscExportQuality, NtscFrameMetadata, NtscState,
+    SelectiveNtscBatch, SelectiveNtscGeneration, SelectiveNtscLayerDescriptor, SelectiveNtscPlan,
 };
 use crate::patch::PatchState;
 use crate::renderer::state::{
@@ -37,6 +38,10 @@ const OUTCOME_CANCEL_REQUESTED: u8 = 1;
 const OUTCOME_SUCCEEDED: u8 = 2;
 const OUTCOME_FAILED: u8 = 3;
 const OUTCOME_CANCELLED: u8 = 4;
+/// Keep protocol snapshots bounded even when a hand-authored legacy patch
+/// contains an excessive number of unavailable layers.
+const MAX_EXPORT_WARNINGS: usize = 128;
+const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
 
 const fn transparent_accumulation_clear() -> wgpu::Color {
     wgpu::Color {
@@ -63,6 +68,21 @@ pub struct ExportConfig {
     /// with silence when short. This remains deterministic when visual speed
     /// changes over time and cannot be represented by one audio tempo.
     pub audio_path: Option<String>,
+    /// Runtime candidate paired with a content-addressed `audio_path`.
+    /// Never persisted or trusted without re-fingerprinting.
+    pub audio_path_hint: Option<String>,
+    /// Runtime candidates aligned with `PatchState::layers`. These allow a
+    /// just-loaded patch-adjacent source to export even when it is outside the
+    /// active library, while the saved content identity remains authoritative.
+    pub layer_source_hints: Vec<String>,
+    /// Runtime candidate for content-addressed imported analysis audio.
+    pub analysis_audio_path_hint: Option<String>,
+    /// Spatial quality for CPU NTSC processing. This affects both the global
+    /// post-composite path and selective inherited-layer processing.
+    pub ntsc_quality: NtscExportQuality,
+    /// Shared host-session policy used only when reconstructing saved sources.
+    /// Export output dimensions remain governed by `validate_export_dimensions`.
+    pub media_safety_policy: MediaSafetyPolicy,
 }
 
 /// Shared state for progress/cancellation between the render thread and the UI.
@@ -77,6 +97,10 @@ pub struct ExportProgress {
     pub done: AtomicBool,
     /// Error message if the job failed (empty = success).
     pub error: std::sync::Mutex<String>,
+    /// Recoverable source substitutions encountered by the worker. These do
+    /// not change a successful export into a failure; callers surface the
+    /// messages separately from `error`.
+    warnings: Mutex<Vec<String>>,
     /// Atomic arbitration between a cancellation request and success/failure.
     /// Public cancellation changes RUNNING -> CANCEL_REQUESTED without locks;
     /// only an owner that has completed external cleanup may publish a
@@ -109,6 +133,7 @@ impl ExportProgress {
             cancelled: AtomicBool::new(false),
             done: AtomicBool::new(false),
             error: std::sync::Mutex::new(String::new()),
+            warnings: Mutex::new(Vec::new()),
             outcome: AtomicU8::new(OUTCOME_RUNNING),
             terminal: Mutex::new(()),
             output_started: AtomicBool::new(false),
@@ -122,6 +147,35 @@ impl ExportProgress {
 
     pub fn progress_f32(&self) -> f32 {
         self.progress.load(Ordering::Relaxed) as f32 / 10000.0
+    }
+
+    /// Snapshot recoverable source-substitution diagnostics for the control
+    /// panel. The clone is deliberately small and avoids exposing a lock to
+    /// the render loop.
+    pub fn warnings(&self) -> Vec<String> {
+        self.warnings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn record_warning(&self, warning: impl AsRef<str>) {
+        let warning = bounded_export_warning(warning.as_ref());
+        log::warn!("Export: {warning}");
+        let mut warnings = self
+            .warnings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warnings.len() < MAX_EXPORT_WARNINGS {
+            warnings.push(warning);
+        } else if warnings
+            .last()
+            .is_some_and(|last| last != "Additional export source warnings were omitted.")
+        {
+            if let Some(last) = warnings.last_mut() {
+                *last = "Additional export source warnings were omitted.".to_string();
+            }
+        }
     }
 
     fn terminal_guard(&self) -> MutexGuard<'_, ()> {
@@ -149,6 +203,18 @@ impl ExportProgress {
             log::debug!("export cancellation requested");
         }
     }
+}
+
+fn bounded_export_warning(message: &str) -> String {
+    if message.chars().count() <= MAX_EXPORT_WARNING_CHARS {
+        return message.to_string();
+    }
+    let mut bounded = message
+        .chars()
+        .take(MAX_EXPORT_WARNING_CHARS.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    bounded
 }
 
 /// Handle to a running export job.
@@ -723,6 +789,89 @@ fn create_uploaded_uniform<T: bytemuck::Pod>(
     buffer
 }
 
+/// Error scopes are thread-local even when export reuses the live renderer's
+/// device. Keep every export-frame operation on this worker inside a typed
+/// scope and latch failures so an early `break` cannot silently discard them.
+struct ExportGpuErrorCapture {
+    device: wgpu::Device,
+    validation: Option<wgpu::ErrorScopeGuard>,
+    internal: Option<wgpu::ErrorScopeGuard>,
+    out_of_memory: Option<wgpu::ErrorScopeGuard>,
+    context: String,
+    sink: Arc<Mutex<Vec<String>>>,
+}
+
+impl ExportGpuErrorCapture {
+    fn new(
+        device: &wgpu::Device,
+        context: impl Into<String>,
+        sink: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        Self {
+            device: device.clone(),
+            validation: Some(validation),
+            internal: Some(internal),
+            out_of_memory: Some(out_of_memory),
+            context: context.into(),
+            sink,
+        }
+    }
+
+    fn collect(&mut self) {
+        if self.validation.is_none() {
+            return;
+        }
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let errors = [
+            self.out_of_memory
+                .take()
+                .and_then(|scope| pollster::block_on(scope.pop())),
+            self.internal
+                .take()
+                .and_then(|scope| pollster::block_on(scope.pop())),
+            self.validation
+                .take()
+                .and_then(|scope| pollster::block_on(scope.pop())),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            self.sink
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(format!("{}: {}", self.context, errors.join("; ")));
+        }
+    }
+}
+
+impl Drop for ExportGpuErrorCapture {
+    fn drop(&mut self) {
+        self.collect();
+    }
+}
+
+fn take_export_gpu_errors(sink: &Arc<Mutex<Vec<String>>>) -> Option<String> {
+    let mut errors = sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    (!errors.is_empty()).then(|| std::mem::take(&mut *errors).join("; "))
+}
+
+fn scoped_export_gpu_operation<T>(
+    device: &wgpu::Device,
+    context: impl Into<String>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let scope = ExportGpuErrorCapture::new(device, context, sink.clone());
+    let value = operation();
+    drop(scope);
+    take_export_gpu_errors(&sink).map_or(Ok(value), Err)
+}
+
 /// Internal layer state for offline rendering.
 struct ExportLayer {
     /// Index in the saved patch. Failed-to-open layers must not shift
@@ -731,12 +880,18 @@ struct ExportLayer {
     /// `None` is an explicit deterministic-black placeholder for a live,
     /// missing, or undecodable source that cannot be sampled offline.
     decoder: Option<VideoDecoder>,
+    /// Retain the still's Expert reservation for the lifetime of its uploaded
+    /// texture. The decoded bytes are also retained within the conservative
+    /// six-RGBA-buffer planning estimate.
+    _still_source: Option<DecodedStillImage>,
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     effects: EffectUniforms,
     opacity: f32,
     blend_mode: BlendMode,
     bypass_master_fx: bool,
+    reroll_on_loop: bool,
+    consumed_loop_generation: u64,
     speed: f32,
     visible: bool,
     paused: bool,
@@ -775,28 +930,21 @@ impl From<&ExportLayer> for ExportFrameLayerBase {
     }
 }
 
-fn configured_blend_mode(value: &str) -> BlendMode {
-    match value {
-        "screen" => BlendMode::Screen,
-        "multiply" => BlendMode::Multiply,
-        "difference" => BlendMode::Difference,
-        _ => BlendMode::Normal,
-    }
-}
-
-/// Retain an unavailable source as a one-pixel opaque-black texture. Keeping
-/// the layer visible preserves the saved compositing stack (including Normal
-/// or Multiply darkening) instead of silently changing the patch by omission.
-fn black_placeholder_layer(
+/// Source admission proves dimensions and a conservative host-memory plan, but
+/// `wgpu` has no portable free-VRAM query. Catch backend validation/internal/OOM
+/// failures around the actual Expert-sized texture allocation instead of
+/// letting an export worker panic.
+fn create_export_source_texture(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    source_index: usize,
-    layer_cfg: &crate::patch::LayerConfig,
-) -> ExportLayer {
-    let width = 1;
-    let height = 1;
+    width: u32,
+    height: u32,
+    label: &'static str,
+) -> Result<(wgpu::Texture, wgpu::TextureView), String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Export Black Placeholder"),
+        label: Some(label),
         size: wgpu::Extent3d {
             width,
             height,
@@ -810,40 +958,252 @@ fn black_placeholder_layer(
         view_formats: &[],
     });
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
+    if let Some(error) = export_source_texture_allocation_error(label, width, height, &errors) {
+        return Err(error);
+    }
+    Ok((texture, texture_view))
+}
+
+fn export_source_texture_allocation_error(
+    label: &str,
+    width: u32,
+    height: u32,
+    errors: &[String],
+) -> Option<String> {
+    (!errors.is_empty()).then(|| {
+        format!(
+            "could not allocate {label} at {width}x{height}: {}",
+            errors.join("; ")
+        )
+    })
+}
+
+fn export_gpu_setup_error(width: u32, height: u32, errors: &[String]) -> Option<String> {
+    (!errors.is_empty()).then(|| {
+        format!(
+            "could not initialize export GPU resources at {width}x{height}: {}",
+            errors.join("; ")
+        )
+    })
+}
+
+fn create_export_readback_buffer(
+    device: &wgpu::Device,
+    size: u64,
+    label: &'static str,
+) -> Result<wgpu::Buffer, String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(buffer)
+    } else {
+        Err(format!(
+            "could not allocate {label} ({size} bytes): {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+fn black_substitution_warning(source_index: usize, filename: &str, reason: &str) -> String {
+    let filename = if filename.trim().is_empty() {
+        "unnamed source"
+    } else {
+        filename
+    };
+    format!(
+        "Layer {} ('{filename}') {reason}; substituted deterministic black.",
+        source_index + 1
+    )
+}
+
+fn strict_content_addressed_export_source(source_path: &str) -> bool {
+    source_path.starts_with(crate::media_source::CONTENT_SHA256_PREFIX)
+}
+
+fn resolve_export_file_source<F>(
+    persisted_source: &str,
+    logical_name: &str,
+    runtime_hint: Option<&str>,
+    context: &crate::media_source::ResolveContext,
+    accepts: F,
+    fingerprints: &mut crate::media_source::FingerprintSession,
+) -> Result<crate::media_source::ResolvedFile, crate::media_source::SourceResolveError>
+where
+    F: Fn(&std::path::Path) -> bool,
+{
+    let expected = crate::media_source::parse_content_reference(persisted_source)?;
+    match (
+        expected.as_ref(),
+        runtime_hint.filter(|hint| !hint.is_empty()),
+    ) {
+        (Some(expected), Some(runtime_hint)) => crate::media_source::resolve_file_source(
+            runtime_hint,
+            logical_name,
+            context,
+            Some(expected),
+            accepts,
+            fingerprints,
+        ),
+        _ => crate::media_source::resolve_file_source(
+            persisted_source,
+            logical_name,
+            context,
+            None,
+            accepts,
+            fingerprints,
+        ),
+    }
+}
+
+fn resolve_export_visual_source(
+    persisted_source: &str,
+    logical_name: &str,
+    runtime_hint: Option<&str>,
+    context: &crate::media_source::ResolveContext,
+    fingerprints: &mut crate::media_source::FingerprintSession,
+) -> Result<crate::media_source::ResolvedVisualSource, crate::media_source::SourceResolveError> {
+    if crate::layers::spout_sender_from_source_path(persisted_source).is_some() {
+        return crate::media_source::resolve_visual_source(
+            persisted_source,
+            logical_name,
+            context,
+            None,
+            crate::layers::is_supported_visual_file,
+            fingerprints,
+        );
+    }
+    resolve_export_file_source(
+        persisted_source,
+        logical_name,
+        runtime_hint,
+        context,
+        crate::layers::is_supported_visual_file,
+        fingerprints,
+    )
+    .map(crate::media_source::ResolvedVisualSource::File)
+}
+
+fn configured_blend_mode(value: &str) -> BlendMode {
+    match value {
+        "screen" => BlendMode::Screen,
+        "multiply" => BlendMode::Multiply,
+        "difference" => BlendMode::Difference,
+        _ => BlendMode::Normal,
+    }
+}
+
+fn upload_export_texture_checked(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    label: &'static str,
+) -> Result<(), String> {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| format!("{label} dimensions overflow for {width}x{height}"))?;
+    if pixels.len() != expected {
+        return Err(format!(
+            "{label} has {} bytes; expected {expected} for {width}x{height}",
+            pixels.len()
+        ));
+    }
+    scoped_export_gpu_operation(
+        device,
+        format!("could not upload {label} at {width}x{height}"),
+        || {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
         },
+    )
+}
+
+/// Retain an unavailable source as a one-pixel opaque-black texture. Keeping
+/// the layer visible preserves the saved compositing stack (including Normal
+/// or Multiply darkening) instead of silently changing the patch by omission.
+fn black_placeholder_layer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source_index: usize,
+    layer_cfg: &crate::patch::LayerConfig,
+) -> Result<ExportLayer, String> {
+    let width = 1;
+    let height = 1;
+    let (texture, texture_view) =
+        create_export_source_texture(device, width, height, "Export Black Placeholder")?;
+    upload_export_texture_checked(
+        device,
+        queue,
+        &texture,
         &[0, 0, 0, 255],
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4),
-            rows_per_image: Some(1),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+        width,
+        height,
+        "Export Black Placeholder",
+    )?;
 
     let mut effects = EffectUniforms {
         resolution: [width as f32, height as f32],
         ..Default::default()
     };
     layer_cfg.effects.apply_to_uniforms(&mut effects);
-    ExportLayer {
+    Ok(ExportLayer {
         source_index,
         decoder: None,
+        _still_source: None,
         texture,
         texture_view,
         effects,
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        reroll_on_loop: false,
+        consumed_loop_generation: 0,
         speed: layer_cfg.speed,
         visible: layer_cfg.visible,
         paused: true,
@@ -854,7 +1214,7 @@ fn black_placeholder_layer(
         },
         width,
         height,
-    }
+    })
 }
 
 /// Upload an immutable source exactly once. With no decoder handle, the frame
@@ -866,58 +1226,38 @@ fn still_export_layer(
     source_index: usize,
     layer_cfg: &crate::patch::LayerConfig,
     decoded: DecodedStillImage,
-) -> ExportLayer {
+) -> Result<ExportLayer, String> {
     let width = decoded.width;
     let height = decoded.height;
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Export Still Layer"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
+    let (texture, texture_view) =
+        create_export_source_texture(device, width, height, "Export Still Layer")?;
+    upload_export_texture_checked(
+        device,
+        queue,
+        &texture,
         &decoded.rgba,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
+        width,
+        height,
+        "Export Still Layer",
+    )?;
 
     let mut effects = EffectUniforms {
         resolution: [width as f32, height as f32],
         ..Default::default()
     };
     layer_cfg.effects.apply_to_uniforms(&mut effects);
-    ExportLayer {
+    Ok(ExportLayer {
         source_index,
         decoder: None,
+        _still_source: Some(decoded),
         texture,
         texture_view,
         effects,
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        reroll_on_loop: false,
+        consumed_loop_generation: 0,
         speed: layer_cfg.speed,
         visible: layer_cfg.visible,
         paused: layer_cfg.paused,
@@ -928,7 +1268,7 @@ fn still_export_layer(
         },
         width,
         height,
-    }
+    })
 }
 
 fn media_has_audio_stream(path: &str) -> Result<bool, String> {
@@ -1047,6 +1387,21 @@ fn export_program_transport(frame_num: u64, frame_interval: f32, paused: bool) -
             if frame_num == 0 { 0.0 } else { frame_interval },
         )
     }
+}
+
+fn apply_export_loop_generation(
+    effects: &mut EffectUniforms,
+    reroll_on_loop: bool,
+    consumed_generation: &mut u64,
+    decoded_generation: u64,
+) -> u64 {
+    let loops_advanced = decoded_generation.saturating_sub(*consumed_generation);
+    *consumed_generation = (*consumed_generation).max(decoded_generation);
+    if reroll_on_loop && loops_advanced > 0 {
+        effects.random_seed =
+            crate::randomization::advance_seed(effects.random_seed, loops_advanced);
+    }
+    loops_advanced
 }
 
 /// Mirror live pause semantics for transient modulation state. Routing caches
@@ -1194,13 +1549,6 @@ fn run_export(
     if config.fps == 0 || config.fps > 240 {
         return Err("export FPS must be between 1 and 240".to_string());
     }
-    if patch.layers.len() > crate::modulation::MAX_MOD_LAYERS {
-        return Err(format!(
-            "export patch has {} layers; maximum is {}",
-            patch.layers.len(),
-            crate::modulation::MAX_MOD_LAYERS
-        ));
-    }
     if !config.duration_secs.is_finite()
         || config.duration_secs <= 0.0
         || config.duration_secs > 3600.0
@@ -1241,12 +1589,24 @@ fn run_export(
 
     let w = config.width;
     let h = config.height;
-    let max_dimension = device.limits().max_texture_dimension_2d;
+    let raw_device_limits = device.limits();
+    let max_dimension = raw_device_limits.max_texture_dimension_2d;
+    let media_device_limits =
+        MediaDeviceLimits::new(max_dimension, raw_device_limits.max_buffer_size);
     if w > max_dimension || h > max_dimension {
         return Err(format!(
             "export dimensions {w}x{h} exceed this GPU's {max_dimension}px texture limit"
         ));
     }
+
+    // --- Build pipelines and mandatory output-sized resources ---
+    // Safe admission constrains dimensions but cannot know free VRAM. Scope
+    // the complete setup so UHD composite/history/readback allocations and
+    // pipeline validation failures return through the worker's normal error
+    // path instead of reaching the process-level uncaptured-error callback.
+    let setup_validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let setup_internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let setup_out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
     // --- Build pipelines (same as renderer/state.rs) ---
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1469,34 +1829,111 @@ fn run_export(
         &sampler,
     );
 
+    // Temporal history is the largest mandatory output-sized allocation. It
+    // belongs to the setup scope above even when a saved patch currently has
+    // temporal amounts at zero because morph/modulation can activate them.
+    let (temporal_pipeline, temporal_bgl, temporal_ubl) =
+        crate::renderer::state::build_temporal_pipeline(&device);
+    let (history_texture, history_view) =
+        crate::renderer::state::build_history_texture(&device, w, h);
+    let (feedback_texture, feedback_view) =
+        crate::renderer::state::build_feedback_texture(&device, w, h);
+
+    // --- Readback staging buffer ---
+    let bytes_per_row = (w * 4 + 255) & !255;
+    let buffer_size = (bytes_per_row * h) as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Export Readback"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let setup_errors = [
+        pollster::block_on(setup_out_of_memory.pop()),
+        pollster::block_on(setup_internal.pop()),
+        pollster::block_on(setup_validation.pop()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|error| error.to_string())
+    .collect::<Vec<_>>();
+    if let Some(error) = export_gpu_setup_error(w, h, &setup_errors) {
+        return Err(error);
+    }
+
+    // Selective VHS reads one straight-alpha slice per contributing layer.
+    // Its staging buffer stays lazy so legacy/all-inherited exports preserve
+    // their established resource profile; the allocation is independently
+    // scoped at the point of first use.
+    let mut selective_staging: Option<wgpu::Buffer> = None;
+
     // --- Open video decoders for each layer ---
+    let source_context = crate::media_source::ResolveContext::new(
+        None,
+        (!library_folder.is_empty()).then(|| std::path::PathBuf::from(library_folder)),
+    );
+    let mut source_fingerprints = crate::media_source::FingerprintSession::with_cancel(
+        crate::media_source::FingerprintLimits::default(),
+        Some(progress.cancel.clone()),
+    )
+    .map_err(|error| error.to_string())?;
     let mut layers: Vec<ExportLayer> = Vec::new();
     for (source_index, layer_cfg) in patch.layers.iter().enumerate() {
         check_cancelled(progress)?;
-        if crate::layers::spout_sender_from_source_path(&layer_cfg.source_path).is_some() {
-            log::warn!(
-                "Export: live Spout layer '{}' is unavailable offline; rendering deterministic black at source index {source_index}",
-                layer_cfg.filename
-            );
-            layers.push(black_placeholder_layer(
-                &device,
-                &queue,
-                source_index,
-                layer_cfg,
-            ));
-            continue;
-        }
-
-        let persisted = std::path::PathBuf::from(&layer_cfg.source_path);
-        let library_path = std::path::Path::new(library_folder).join(&layer_cfg.filename);
-        let path = if !layer_cfg.source_path.is_empty() && persisted.is_file() {
-            persisted
-        } else {
-            library_path
+        let resolved = resolve_export_visual_source(
+            &layer_cfg.source_path,
+            &layer_cfg.filename,
+            config
+                .layer_source_hints
+                .get(source_index)
+                .map(String::as_str),
+            &source_context,
+            &mut source_fingerprints,
+        );
+        let path = match resolved {
+            Ok(crate::media_source::ResolvedVisualSource::Spout { .. }) => {
+                progress.record_warning(black_substitution_warning(
+                    source_index,
+                    &layer_cfg.filename,
+                    "is a live Spout source unavailable to offline export",
+                ));
+                layers.push(black_placeholder_layer(
+                    &device,
+                    &queue,
+                    source_index,
+                    layer_cfg,
+                )?);
+                continue;
+            }
+            Ok(crate::media_source::ResolvedVisualSource::File(resolved)) => resolved.path,
+            Err(error) if strict_content_addressed_export_source(&layer_cfg.source_path) => {
+                return Err(format!(
+                    "content-addressed export layer '{}' could not be resolved: {error}",
+                    layer_cfg.filename
+                ));
+            }
+            Err(error) => {
+                progress.record_warning(black_substitution_warning(
+                    source_index,
+                    &layer_cfg.filename,
+                    &format!("could not be resolved ({error})"),
+                ));
+                layers.push(black_placeholder_layer(
+                    &device,
+                    &queue,
+                    source_index,
+                    layer_cfg,
+                )?);
+                continue;
+            }
         };
         let path_text = path.to_string_lossy();
         if crate::layers::is_still_image_file(&path) {
-            match crate::video::decode_still_image(&path, Some(max_dimension)) {
+            match crate::video::decode_still_image_with_media_policy(
+                &path,
+                &config.media_safety_policy,
+                media_device_limits,
+            ) {
                 Ok(decoded) => {
                     layers.push(still_export_layer(
                         &device,
@@ -1504,59 +1941,50 @@ fn run_export(
                         source_index,
                         layer_cfg,
                         decoded,
-                    ));
+                    )?);
                     continue;
                 }
                 Err(error) => {
-                    log::warn!(
-                        "Export: still layer '{}' could not be opened ({error}); rendering deterministic black at source index {source_index}",
-                        layer_cfg.filename
-                    );
+                    progress.record_warning(black_substitution_warning(
+                        source_index,
+                        &layer_cfg.filename,
+                        &format!("could not open as a still image ({error})"),
+                    ));
                     layers.push(black_placeholder_layer(
                         &device,
                         &queue,
                         source_index,
                         layer_cfg,
-                    ));
+                    )?);
                     continue;
                 }
             }
         }
-        let mut decoder = match VideoDecoder::open_with_cancel(&path_text, progress.cancel.clone())
-        {
+        let mut decoder = match VideoDecoder::open_with_cancel_and_media_policy(
+            &path_text,
+            progress.cancel.clone(),
+            &config.media_safety_policy,
+            media_device_limits,
+        ) {
             Ok(d) => d,
             Err(e) => {
-                log::warn!(
-                    "Export: layer '{}' could not be opened ({e}); rendering deterministic black at source index {source_index}",
-                    layer_cfg.filename
-                );
+                progress.record_warning(black_substitution_warning(
+                    source_index,
+                    &layer_cfg.filename,
+                    &format!("could not open as video ({e})"),
+                ));
                 layers.push(black_placeholder_layer(
                     &device,
                     &queue,
                     source_index,
                     layer_cfg,
-                ));
+                )?);
                 continue;
             }
         };
 
         let lw = decoder.width;
         let lh = decoder.height;
-        if let Err(error) =
-            crate::layers::validate_source_texture_dimensions(lw, lh, max_dimension, "export video")
-        {
-            log::warn!(
-                "Export: layer '{}' cannot use dimensions {lw}x{lh} ({error}); rendering deterministic black at source index {source_index}",
-                layer_cfg.filename,
-            );
-            layers.push(black_placeholder_layer(
-                &device,
-                &queue,
-                source_index,
-                layer_cfg,
-            ));
-            continue;
-        }
         let fps = if layer_cfg.fps.is_finite() && layer_cfg.fps > 0.0 {
             layer_cfg.fps
         } else {
@@ -1566,21 +1994,8 @@ fn run_export(
 
         check_cancelled(progress)?;
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Export Layer Tex"),
-            size: wgpu::Extent3d {
-                width: lw,
-                height: lh,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let (texture, texture_view) =
+            create_export_source_texture(&device, lw, lh, "Export Layer Tex")?;
 
         // Seed every layer texture before frame zero. This makes paused layers
         // show a stable first frame and avoids reading uninitialized GPU memory
@@ -1588,39 +2003,30 @@ fn run_export(
         let first_frame = match decoder.next_frame_result() {
             Ok(frame) => frame,
             Err(error) => {
-                log::warn!(
-                    "Export: layer '{}' could not decode its first frame ({error}); rendering deterministic black at source index {source_index}",
-                    layer_cfg.filename
-                );
+                progress.record_warning(black_substitution_warning(
+                    source_index,
+                    &layer_cfg.filename,
+                    &format!("could not decode its first frame ({error})"),
+                ));
                 layers.push(black_placeholder_layer(
                     &device,
                     &queue,
                     source_index,
                     layer_cfg,
-                ));
+                )?);
                 continue;
             }
         };
         check_cancelled(progress)?;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+        upload_export_texture_checked(
+            &device,
+            &queue,
+            &texture,
             &first_frame,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * lw),
-                rows_per_image: Some(lh),
-            },
-            wgpu::Extent3d {
-                width: lw,
-                height: lh,
-                depth_or_array_layers: 1,
-            },
-        );
+            lw,
+            lh,
+            "Export Video Layer",
+        )?;
 
         let mut effects = EffectUniforms {
             resolution: [lw as f32, lh as f32],
@@ -1630,13 +2036,16 @@ fn run_export(
 
         layers.push(ExportLayer {
             source_index,
+            consumed_loop_generation: decoder.loop_generation(),
             decoder: Some(decoder),
+            _still_source: None,
             texture,
             texture_view,
             effects,
             opacity: layer_cfg.opacity,
             blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
             bypass_master_fx: layer_cfg.bypass_master_fx,
+            reroll_on_loop: layer_cfg.reroll_on_loop,
             speed: layer_cfg.speed,
             visible: layer_cfg.visible,
             paused: layer_cfg.paused,
@@ -1675,27 +2084,35 @@ fn run_export(
     let analysis_clip = if mod_matrix.audio_enabled
         && mod_matrix.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
     {
-        let requested = std::path::PathBuf::from(&mod_matrix.audio_clip_path);
-        let resolved = if requested.is_file() {
-            requested
+        let requested = mod_matrix.audio_clip_path.clone();
+        let logical_name = if crate::media_source::parse_content_reference(&requested)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            String::new()
         } else {
-            let basename = requested
+            std::path::Path::new(&requested)
                 .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new(&mod_matrix.audio_clip_path));
-            std::path::Path::new(library_folder).join(basename)
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| requested.clone())
         };
-        if !resolved.is_file() {
-            return Err(format!(
-                "deterministic audio-analysis clip not found: {}",
-                mod_matrix.audio_clip_path
-            ));
-        }
-        Some(crate::audio::AudioClip::open(&resolved).map_err(|error| {
-            format!(
-                "cannot load deterministic audio-analysis clip {}: {error}",
-                resolved.display()
-            )
-        })?)
+        let resolved = resolve_export_file_source(
+            &requested,
+            &logical_name,
+            config.analysis_audio_path_hint.as_deref(),
+            &source_context,
+            |path: &std::path::Path| crate::audio::is_supported_audio_file(path),
+            &mut source_fingerprints,
+        )
+        .map_err(|error| format!("deterministic audio-analysis clip: {error}"))?;
+        Some(
+            crate::audio::AudioClip::open(&resolved.path).map_err(|error| {
+                format!(
+                    "cannot load deterministic audio-analysis clip {}: {error}",
+                    resolved.path.display()
+                )
+            })?,
+        )
     } else {
         None
     };
@@ -1707,31 +2124,9 @@ fn run_export(
         .as_ref()
         .map(|t| t.to_params())
         .unwrap_or_default();
-    let (temporal_pipeline, temporal_bgl, temporal_ubl) =
-        crate::renderer::state::build_temporal_pipeline(&device);
-    let (history_texture, history_view) =
-        crate::renderer::state::build_history_texture(&device, w, h);
-    let (feedback_texture, feedback_view) =
-        crate::renderer::state::build_feedback_texture(&device, w, h);
     let mut temporal_state = crate::renderer::state::TemporalState::default();
     let mut previous_selective_frame: Option<bool> = None;
     let mut previous_selective_topology: Option<u64> = None;
-
-    // --- Readback staging buffer ---
-    let bytes_per_row = (w * 4 + 255) & !255;
-    let buffer_size = (bytes_per_row * h) as u64;
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Export Readback"),
-        size: buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    // Selective VHS reads one straight-alpha slice per contributing layer.
-    // Reuse a single staging allocation sequentially so peak host/GPU memory
-    // stays one frame plus the final CPU batch rather than N padded frames.
-    // This is allocated lazily on the first selective frame, preserving the
-    // established resource profile for every legacy/all-inherited export.
-    let mut selective_staging: Option<wgpu::Buffer> = None;
 
     // --- Spawn ffmpeg ---
     // Ensure output directory exists
@@ -1746,24 +2141,51 @@ fn run_export(
 
     let audio_path = match config.audio_path.as_deref() {
         None => None,
-        Some(path) => match media_has_audio_stream(path) {
-            Ok(true) => Some(path),
-            Ok(false) => {
-                return Err(format!(
-                    "selected export audio source '{path}' contains no audio stream"
-                ));
+        Some(persisted_source) => {
+            let path = if crate::media_source::parse_content_reference(persisted_source)
+                .map_err(|error| format!("selected export audio source: {error}"))?
+                .is_some()
+            {
+                let logical_name = config
+                    .audio_path_hint
+                    .as_deref()
+                    .and_then(|hint| std::path::Path::new(hint).file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                resolve_export_file_source(
+                    persisted_source,
+                    &logical_name,
+                    config.audio_path_hint.as_deref(),
+                    &source_context,
+                    crate::layers::is_supported_visual_file,
+                    &mut source_fingerprints,
+                )
+                .map_err(|error| format!("selected export audio source: {error}"))?
+                .path
+                .to_string_lossy()
+                .into_owned()
+            } else {
+                persisted_source.to_owned()
+            };
+            match media_has_audio_stream(&path) {
+                Ok(true) => Some(path),
+                Ok(false) => {
+                    return Err(format!(
+                        "selected export audio source '{path}' contains no audio stream"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to inspect selected export audio source '{path}': {error}"
+                    ));
+                }
             }
-            Err(error) => {
-                return Err(format!(
-                    "failed to inspect selected export audio source '{path}': {error}"
-                ));
-            }
-        },
+        }
     };
     check_cancelled(progress)?;
     let encoder = start_encoder_supervisor(
         "ffmpeg".to_string(),
-        build_ffmpeg_args(config, audio_path),
+        build_ffmpeg_args(config, audio_path.as_deref()),
         progress.clone(),
         config.output_path.clone(),
     )?;
@@ -1779,6 +2201,7 @@ fn run_export(
 
     // Track per-layer frame timing (accumulator-based)
     let mut layer_accumulators: Vec<f32> = vec![0.0; layers.len()];
+    let frame_gpu_errors = Arc::new(Mutex::new(Vec::new()));
 
     for frame_num in 0..total_frames {
         if progress.cancel.load(Ordering::Acquire) {
@@ -1807,7 +2230,7 @@ fn run_export(
             mod_matrix.audio = crate::audio::AudioLevels::default();
         }
         update_export_modulation(&mut mod_matrix, beat, program_dt, patch.master_paused);
-        let modulation_frame = mod_matrix.frame();
+        let modulation_frame = mod_matrix.frame(layers.len());
         let mut frame_master = master_effects;
         let mut frame_ntsc = base_ntsc.clone();
         let mut frame_temporal = base_temporal;
@@ -1889,6 +2312,11 @@ fn run_export(
         }
 
         // --- GPU render ---
+        let frame_gpu_scope = ExportGpuErrorCapture::new(
+            &device,
+            format!("export frame {} GPU operation failed", frame_num + 1),
+            frame_gpu_errors.clone(),
+        );
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Export Frame Encoder"),
         });
@@ -1921,14 +2349,23 @@ fn run_export(
         previous_selective_frame = Some(selective_frame);
         previous_selective_topology = selective_topology;
         if let Some(plan) = selective_plan {
-            let selective_staging = selective_staging.get_or_insert_with(|| {
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("Export Selective NTSC Readback"),
-                    size: buffer_size,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                })
-            });
+            if selective_staging.is_none() {
+                match create_export_readback_buffer(
+                    &device,
+                    buffer_size,
+                    "Export Selective NTSC Readback",
+                ) {
+                    Ok(buffer) => selective_staging = Some(buffer),
+                    Err(error) => {
+                        write_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let Some(selective_staging) = selective_staging.as_ref() else {
+                write_error = Some("selective NTSC staging initialization failed".to_string());
+                break;
+            };
             // Each slice is rendered through local FX and conditional direct
             // master FX in one coherent command stream. Composite/VHS stays
             // on the CPU, so no unprocessed intermediate reaches Temporal.
@@ -1962,9 +2399,10 @@ fn run_export(
                 write_error = Some("export cancelled before selective NTSC processing".into());
                 break;
             }
-            let processed = match process_selective_ntsc_batch_with_state(
+            let processed = match process_selective_ntsc_batch_with_state_and_resolution(
                 &mut selective_ntsc_state,
                 SelectiveNtscBatch { plan, slices },
+                config.ntsc_quality,
             ) {
                 Ok(processed) => processed,
                 Err(error) => {
@@ -1977,6 +2415,7 @@ fn run_export(
                 break;
             }
             if let Err(error) = upload_engine_composite_export(
+                &device,
                 &queue,
                 &composite_textures[0],
                 &processed.pixels,
@@ -2075,11 +2514,12 @@ fn run_export(
         // post-composite VHS call exactly once.
         if !selective_frame {
             ntsc_state.params = mod_ntsc;
-            ntsc_state.apply_at_reference_frame(
+            ntsc_state.apply_at_reference_frame_with_resolution(
                 &mut pixels,
                 w,
                 h,
                 export_ntsc_reference_frame(frame_num, config.fps, patch.master_paused),
+                config.ntsc_quality,
             );
         }
 
@@ -2097,7 +2537,7 @@ fn run_export(
                 let base = frame_layer_bases[i];
                 let fps = frame_fps[i];
                 let paused = base.paused;
-                if patch.master_paused || paused {
+                if patch.master_paused || patch.media_frozen || paused {
                     // Live transport resets fractional debt while paused, so
                     // a morph-driven pause/unpause must resume from a fresh
                     // cadence boundary offline as well.
@@ -2116,26 +2556,33 @@ fn run_export(
                     let Some(decoder) = layer.decoder.as_mut() else {
                         continue;
                     };
-                    match decoder.next_frame_result() {
-                        Ok(rgba) => queue.write_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &layer.texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            &rgba,
-                            wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(4 * layer.width),
-                                rows_per_image: Some(layer.height),
-                            },
-                            wgpu::Extent3d {
-                                width: layer.width,
-                                height: layer.height,
-                                depth_or_array_layers: 1,
-                            },
-                        ),
+                    match decoder
+                        .next_frame_result()
+                        .map(|rgba| (rgba, decoder.loop_generation()))
+                    {
+                        Ok((rgba, loop_generation)) => {
+                            apply_export_loop_generation(
+                                &mut layer.effects,
+                                layer.reroll_on_loop,
+                                &mut layer.consumed_loop_generation,
+                                loop_generation,
+                            );
+                            if let Err(error) = upload_export_texture_checked(
+                                &device,
+                                &queue,
+                                &layer.texture,
+                                &rgba,
+                                layer.width,
+                                layer.height,
+                                "Export Video Frame",
+                            ) {
+                                write_error = Some(format!(
+                                    "layer {} GPU upload failed during export: {error}",
+                                    layer.source_index + 1
+                                ));
+                                break;
+                            }
+                        }
                         Err(error) => {
                             write_error = Some(format!(
                                 "layer {} decode failed during export: {error}",
@@ -2151,6 +2598,10 @@ fn run_export(
             }
         }
 
+        drop(frame_gpu_scope);
+        if let Some(error) = take_export_gpu_errors(&frame_gpu_errors) {
+            write_error = Some(error);
+        }
         if write_error.is_some() {
             break;
         }
@@ -2160,6 +2611,13 @@ fn run_export(
             ((frame_num + 1) * 10000 / total_frames) as u32,
             Ordering::Relaxed,
         );
+    }
+
+    if let Some(gpu_error) = take_export_gpu_errors(&frame_gpu_errors) {
+        write_error = Some(match write_error {
+            Some(existing) => format!("{existing}; {gpu_error}"),
+            None => gpu_error,
+        });
     }
 
     // Tell the supervisor this is an intentional end-of-input before closing
@@ -2342,6 +2800,7 @@ fn readback_pixels(
 }
 
 fn upload_engine_composite_export(
+    device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     pixels: &[u8],
@@ -2358,26 +2817,15 @@ fn upload_engine_composite_export(
             pixels.len()
         ));
     }
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
+    upload_export_texture_checked(
+        device,
+        queue,
+        texture,
         pixels,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    Ok(())
+        width,
+        height,
+        "Export Selective NTSC Composite",
+    )
 }
 
 /// Render all planned straight-alpha slices and synchronously collect them in
@@ -3253,6 +3701,11 @@ mod tests {
             duration_secs,
             output_path: "render.mp4".to_owned(),
             audio_path: None,
+            audio_path_hint: None,
+            layer_source_hints: Vec::new(),
+            analysis_audio_path_hint: None,
+            ntsc_quality: NtscExportQuality::LiveParity,
+            media_safety_policy: MediaSafetyPolicy::default(),
         }
     }
 
@@ -3260,6 +3713,33 @@ mod tests {
     fn export_layer_accumulation_starts_transparent() {
         let clear = transparent_accumulation_clear();
         assert_eq!([clear.r, clear.g, clear.b, clear.a], [0.0; 4]);
+    }
+
+    #[test]
+    fn export_loop_reroll_consumes_every_generation_once() {
+        let mut effects = EffectUniforms {
+            random_seed: 9,
+            ..Default::default()
+        };
+        let expected = crate::randomization::advance_seed(9, 3);
+        let mut consumed = 0;
+        assert_eq!(
+            apply_export_loop_generation(&mut effects, true, &mut consumed, 3),
+            3
+        );
+        assert_eq!(effects.random_seed, expected);
+        assert_eq!(consumed, 3);
+        assert_eq!(
+            apply_export_loop_generation(&mut effects, true, &mut consumed, 3),
+            0
+        );
+        assert_eq!(effects.random_seed, expected);
+        assert_eq!(
+            apply_export_loop_generation(&mut effects, true, &mut consumed, 2),
+            0,
+            "a stale generation cannot reroll or rewind the consumer"
+        );
+        assert_eq!(consumed, 3);
     }
 
     #[test]
@@ -3445,6 +3925,219 @@ mod tests {
         assert!(validate_export_dimensions(3840, 2160).is_ok());
         assert!(validate_export_dimensions(4096, 2160).is_err());
         assert!(validate_export_dimensions(MAX_EXPORT_EDGE + 1, 2).is_err());
+    }
+
+    #[test]
+    fn source_texture_scope_errors_are_descriptive_and_cpu_testable() {
+        assert_eq!(
+            export_source_texture_allocation_error("Expert source", 8192, 4096, &[]),
+            None
+        );
+        let error = export_source_texture_allocation_error(
+            "Expert source",
+            8192,
+            4096,
+            &["out of memory".into(), "backend rejected allocation".into()],
+        )
+        .unwrap();
+        assert!(error.contains("Expert source"));
+        assert!(error.contains("8192x4096"));
+        assert!(error.contains("out of memory; backend rejected allocation"));
+
+        let setup = export_gpu_setup_error(3840, 2160, &["Out of Memory".into()]).unwrap();
+        assert_eq!(
+            setup,
+            "could not initialize export GPU resources at 3840x2160: Out of Memory"
+        );
+
+        let sink = Arc::new(Mutex::new(vec![
+            "frame validation".to_string(),
+            "frame out of memory".to_string(),
+        ]));
+        assert_eq!(
+            take_export_gpu_errors(&sink).as_deref(),
+            Some("frame validation; frame out of memory")
+        );
+        assert!(take_export_gpu_errors(&sink).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_export_upload_scope_reports_invalid_extent() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Export Upload Scope Test"),
+            ..Default::default()
+        }))
+        .expect("GPU device");
+        let (texture, _view) =
+            create_export_source_texture(&device, 1, 1, "Export Upload Scope Test").unwrap();
+
+        let error = upload_export_texture_checked(
+            &device,
+            &queue,
+            &texture,
+            &[0; 8],
+            2,
+            1,
+            "Export Upload Scope Test",
+        )
+        .expect_err("extent wider than the texture must be recoverable");
+        assert!(error.contains("Export Upload Scope Test"));
+    }
+
+    #[test]
+    fn recoverable_source_warnings_survive_a_success_without_becoming_errors() {
+        let progress = ExportProgress::new();
+        progress.record_warning(black_substitution_warning(
+            1,
+            "missing.mov",
+            "could not be resolved",
+        ));
+        finalize_export_worker(&progress, "", None);
+
+        assert!(progress.done.load(Ordering::Acquire));
+        assert_eq!(progress.outcome.load(Ordering::Acquire), OUTCOME_SUCCEEDED);
+        assert!(progress.error.lock().unwrap().is_empty());
+        assert_eq!(
+            progress.warnings(),
+            vec!["Layer 2 ('missing.mov') could not be resolved; substituted deterministic black."]
+        );
+    }
+
+    #[test]
+    fn content_addressed_export_sources_never_enter_legacy_black_fallback() {
+        let digest = "0".repeat(64);
+        assert!(strict_content_addressed_export_source(&format!(
+            "cos-sha256://{digest}/12"
+        )));
+        assert!(strict_content_addressed_export_source(
+            "cos-sha256://malformed"
+        ));
+        assert!(!strict_content_addressed_export_source(
+            "C:/legacy/missing.mov"
+        ));
+    }
+
+    #[test]
+    fn export_preflight_reverifies_patch_adjacent_runtime_hints_outside_library() {
+        let unique = format!(
+            "collideoscope-export-source-hint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let patch_media = root.join("patch-media");
+        let active_library = root.join("active-library");
+        std::fs::create_dir_all(&patch_media).unwrap();
+        std::fs::create_dir_all(&active_library).unwrap();
+        let visual = patch_media.join("outside.mp4");
+        let analysis_audio = patch_media.join("outside.wav");
+        std::fs::write(&visual, b"frame-one").unwrap();
+        std::fs::write(&analysis_audio, b"audio-one").unwrap();
+
+        let mut identity_session = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        let visual_reference = identity_session
+            .fingerprint(&visual)
+            .unwrap()
+            .source_reference();
+        let audio_reference = identity_session
+            .fingerprint(&analysis_audio)
+            .unwrap()
+            .source_reference();
+        let visual_hint = visual.to_string_lossy().into_owned();
+        let audio_hint = analysis_audio.to_string_lossy().into_owned();
+        let context = crate::media_source::ResolveContext::new(None, Some(active_library));
+
+        let mut preflight = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        let resolved_visual = resolve_export_visual_source(
+            &visual_reference,
+            "outside.mp4",
+            Some(&visual_hint),
+            &context,
+            &mut preflight,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolved_visual,
+            crate::media_source::ResolvedVisualSource::File(ref resolved)
+                if resolved.path == visual.canonicalize().unwrap()
+        ));
+        let resolved_audio = resolve_export_file_source(
+            &audio_reference,
+            "outside.wav",
+            Some(&audio_hint),
+            &context,
+            |path: &std::path::Path| crate::audio::is_supported_audio_file(path),
+            &mut preflight,
+        )
+        .unwrap();
+        assert_eq!(resolved_audio.path, analysis_audio.canonicalize().unwrap());
+
+        // Same-length replacements prove that export trusts the digest, not
+        // the retained host path or a stale metadata-only admission decision.
+        std::fs::write(&visual, b"frame-two").unwrap();
+        std::fs::write(&analysis_audio, b"audio-two").unwrap();
+        let mut changed_preflight = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        assert!(resolve_export_visual_source(
+            &visual_reference,
+            "outside.mp4",
+            Some(&visual_hint),
+            &context,
+            &mut changed_preflight,
+        )
+        .is_err());
+        let mut changed_audio_preflight = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        assert!(resolve_export_file_source(
+            &audio_reference,
+            "outside.wav",
+            Some(&audio_hint),
+            &context,
+            |path: &std::path::Path| crate::audio::is_supported_audio_file(path),
+            &mut changed_audio_preflight,
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn export_warning_snapshot_is_count_and_character_bounded() {
+        let progress = ExportProgress::new();
+        progress.record_warning("é".repeat(MAX_EXPORT_WARNING_CHARS + 20));
+        for index in 1..=MAX_EXPORT_WARNINGS {
+            progress.record_warning(format!("warning {index}"));
+        }
+
+        let warnings = progress.warnings();
+        assert_eq!(warnings.len(), MAX_EXPORT_WARNINGS);
+        assert_eq!(warnings[0].chars().count(), MAX_EXPORT_WARNING_CHARS);
+        assert!(warnings[0].ends_with('…'));
+        assert_eq!(
+            warnings.last().map(String::as_str),
+            Some("Additional export source warnings were omitted.")
+        );
     }
 
     #[test]
@@ -3685,6 +4378,7 @@ mod tests {
                 opacity: 1.0,
                 blend_mode: "normal".to_string(),
                 bypass_master_fx: false,
+                reroll_on_loop: false,
                 speed: 1.0,
                 fps: 30.0,
                 paused: false,
@@ -3695,6 +4389,7 @@ mod tests {
         let patch = PatchState {
             master: EffectsConfig::default(),
             master_paused: false,
+            media_frozen: false,
             layers,
             ntsc: None,
             modulation: None,
@@ -3716,6 +4411,11 @@ mod tests {
             duration_secs: 30.0,
             output_path: output.to_string_lossy().into_owned(),
             audio_path: None,
+            audio_path_hint: None,
+            layer_source_hints: Vec::new(),
+            analysis_audio_path_hint: None,
+            ntsc_quality: NtscExportQuality::LiveParity,
+            media_safety_policy: MediaSafetyPolicy::default(),
         };
         let mut job = ExportJob::start(patch, config, "videos");
 
@@ -3771,12 +4471,14 @@ mod effects_audit {
         PatchState {
             master: EffectsConfig::default(),
             master_paused: false,
+            media_frozen: false,
             layers: vec![LayerConfig {
                 filename: "audit.mp4".to_string(),
                 source_path: String::new(),
                 opacity: 1.0,
                 blend_mode: "normal".to_string(),
                 bypass_master_fx: false,
+                reroll_on_loop: false,
                 speed: 1.0,
                 fps: 30.0,
                 paused: false,
@@ -3798,6 +4500,11 @@ mod effects_audit {
             duration_secs: 1.0,
             output_path: format!("renders/audit_{label}.mp4"),
             audio_path: None,
+            audio_path_hint: None,
+            layer_source_hints: Vec::new(),
+            analysis_audio_path_hint: None,
+            ntsc_quality: NtscExportQuality::LiveParity,
+            media_safety_policy: MediaSafetyPolicy::default(),
         };
         let job = ExportJob::start(patch, config, "videos");
         while !job.is_done() {
@@ -3899,6 +4606,14 @@ mod effects_audit {
         p.master.cellular_warp = 0.6;
         p.master.cellular_speed = 0.75;
         render("cellular", p);
+
+        let mut p = base_patch();
+        p.master.random_seed = 0x5348_4946;
+        p.master.shift_amount = 0.8;
+        p.master.shift_block_size = 24.0;
+        p.master.shift_density = 0.75;
+        p.master.shift_speed = 6.0;
+        render("shift", p);
 
         let mut p = base_patch();
         p.layers[0].effects.key_mode = 1;

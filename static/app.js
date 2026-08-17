@@ -7,6 +7,12 @@ const libraryGrid = document.getElementById('library-grid');
 const spoutInForm = document.getElementById('spout-in-form');
 const spoutInName = document.getElementById('spout-in-name');
 const spoutInStatus = document.getElementById('spout-in-status');
+const expertMediaToggle = document.getElementById('expert-media-toggle');
+const mediaSafetyMode = document.getElementById('media-safety-mode');
+const mediaSafetySummary = document.getElementById('media-safety-summary');
+const mediaSafetyRationale = document.getElementById('media-safety-rationale');
+const mediaSafetyStatus = document.getElementById('media-safety-status');
+let authoritativeMediaSafetyMode = 'safe';
 
 // The one-time query key bootstraps the HttpOnly Strict cookie. Remove only
 // that secret from browser history once the document has received its cookie;
@@ -49,6 +55,9 @@ let latestLayerIdentities = [];
 let transportAuthoritativePaused = false;
 let transportPendingPaused = null;
 let transportRequestSequence = 0;
+let mediaAuthoritativeFrozen = false;
+let mediaPendingFrozen = null;
+let mediaRequestSequence = 0;
 let outputAuthoritativeOpen = false;
 let outputPendingOpen = null;
 let outputRequestSequence = 0;
@@ -88,6 +97,13 @@ function connect() {
     transportRequestSequence += 1;
     transportPendingPaused = null;
     renderMasterTransport(transportAuthoritativePaused, false);
+    mediaRequestSequence += 1;
+    mediaPendingFrozen = null;
+    renderMediaFreeze(mediaAuthoritativeFrozen, false);
+    if (expertMediaToggle) {
+      expertMediaToggle.checked = authoritativeMediaSafetyMode === 'expert';
+      expertMediaToggle.toggleAttribute('aria-busy', false);
+    }
     outputRequestSequence += 1;
     outputPendingOpen = null;
     renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
@@ -106,9 +122,11 @@ function connect() {
         layerStackRevision = Number(msg.layer_stack_revision) || 0;
         syncLayers(msg.layers);
         syncLibrary(msg.library);
-        syncTransport(msg.paused);
-        syncExport(msg.export_progress, msg.export_error, msg.export_status);
+        syncMediaSafety(msg.media_safety);
+        syncTransport(msg.program_frozen ?? msg.paused, msg.media_frozen);
+        syncExport(msg.export_progress, msg.export_error, msg.export_status, msg.export_warnings);
         syncPatchSave(msg.patch_save_status || '');
+        syncPatchLoad(msg.patch_load_status || '');
         syncModulation(msg.modulation);
         syncAudio(msg.audio);
         syncMidi(msg.midi);
@@ -574,6 +592,7 @@ document.querySelectorAll('.param-row[data-param]').forEach((row) => {
     const defaults = {
       pixelate: 1, rgb_split: 0, hue_shift: 0, saturation: 0,
       downsample: 1,
+      shift_amount: 0, shift_block_size: 8, shift_density: 0.5, shift_speed: 3,
       brightness: 0, contrast: 0, posterize: 0, grain_intensity: 0,
       grain_size: 1, vignette: 0, color_drift: 0, breathe_scale: 0,
       breathe_rotation: 0, breathe_position: 0,
@@ -784,7 +803,7 @@ document.querySelectorAll('.group-reset').forEach((btn) => {
 document.getElementById('btn-play-all').addEventListener('click', () => {
   if (transportPendingPaused !== null) return;
   const target = !transportAuthoritativePaused;
-  if (sendAction({ action: 'set_master_paused', paused: target })) {
+  if (sendAction({ action: 'set_program_frozen', frozen: target })) {
     const requestSequence = ++transportRequestSequence;
     transportPendingPaused = target;
     renderMasterTransport(target, true);
@@ -800,8 +819,24 @@ document.getElementById('btn-play-all').addEventListener('click', () => {
   }
 });
 
+document.getElementById('btn-freeze-media').addEventListener('click', () => {
+  if (mediaPendingFrozen !== null) return;
+  const target = !mediaAuthoritativeFrozen;
+  if (sendAction({ action: 'set_media_frozen', frozen: target })) {
+    const requestSequence = ++mediaRequestSequence;
+    mediaPendingFrozen = target;
+    renderMediaFreeze(target, true);
+    window.setTimeout(() => {
+      if (mediaPendingFrozen !== null && mediaRequestSequence === requestSequence) {
+        mediaPendingFrozen = null;
+        renderMediaFreeze(mediaAuthoritativeFrozen, false);
+      }
+    }, 2000);
+  }
+});
+
 document.getElementById('btn-revert-master').addEventListener('click', () => {
-  sendAction({ action: 'reset_fx' });
+  sendAction({ action: 'reset_visual_program' });
 });
 
 document.getElementById('btn-blackout').addEventListener('click', () => {
@@ -816,6 +851,13 @@ function syncBlackout(on) {
 
 function syncEffects(effects) {
   if (!effects) return;
+  const randomStatus = document.getElementById('reroll-status');
+  if (randomStatus) {
+    const seed = Number(effects.random_seed) >>> 0;
+    randomStatus.textContent = seed === 0
+      ? 'Master seed 0 · legacy pattern'
+      : `Master seed ${seed}`;
+  }
   const values = { ...effects };
   if (Array.isArray(effects.key_color)) {
     [values.key_color_r, values.key_color_g, values.key_color_b] = effects.key_color;
@@ -847,12 +889,70 @@ function syncEffects(effects) {
   }
 }
 
+// --- Deterministic Random / Dice controls ---
+
+const rerollScope = document.getElementById('reroll-scope');
+const rerollMode = document.getElementById('reroll-mode');
+const rerollSeed = document.getElementById('reroll-seed');
+const rerollAmount = document.getElementById('reroll-amount');
+const rerollAmountValue = document.getElementById('reroll-amount-value');
+const rerollGrainControls = document.getElementById('reroll-grain-controls');
+const rerollButton = document.getElementById('reroll-button');
+
+function syncRerollModeControls() {
+  const variation = rerollMode?.value === 'variation';
+  document.getElementById('reroll-amount-row')?.classList.toggle('control-disabled', !variation);
+  document.getElementById('reroll-grain-row')?.classList.toggle('control-disabled', !variation);
+  if (rerollAmount) rerollAmount.disabled = !variation;
+  if (rerollGrainControls) rerollGrainControls.disabled = !variation;
+}
+
+function readExactRerollSeed() {
+  const text = rerollSeed?.value.trim() || '';
+  if (text === '') {
+    rerollSeed?.setCustomValidity('');
+    return { valid: true, value: null };
+  }
+  const seed = Number(text);
+  const valid = Number.isInteger(seed) && seed >= 0 && seed <= 0xffffffff;
+  rerollSeed?.setCustomValidity(valid ? '' : 'Seed must be a whole number from 0 to 4294967295');
+  if (!valid) rerollSeed?.reportValidity();
+  return { valid, value: valid ? seed : null };
+}
+
+rerollMode?.addEventListener('change', syncRerollModeControls);
+rerollAmount?.addEventListener('input', () => {
+  rerollAmountValue.textContent = Number(rerollAmount.value).toFixed(2);
+});
+rerollSeed?.addEventListener('input', () => readExactRerollSeed());
+rerollButton?.addEventListener('click', () => {
+  const seed = readExactRerollSeed();
+  if (!seed.valid) return;
+  const scope = rerollScope.value === 'all' ? 'all' : 'master';
+  const action = {
+    action: 'reroll',
+    scope,
+    mode: rerollMode.value === 'variation' ? 'variation' : 'pattern',
+    amount: Math.min(2, Math.max(0, Number(rerollAmount.value) || 0)),
+    include_grain_controls: !!rerollGrainControls.checked,
+  };
+  if (seed.value !== null) action.seed = seed.value;
+  if (scope === 'all') action.stack_revision = layerStackRevision;
+  if (sendAction(action)) {
+    document.getElementById('reroll-status').textContent = seed.value === null
+      ? 'Advancing deterministic seed…'
+      : `Applying exact seed ${seed.value}…`;
+  }
+});
+syncRerollModeControls();
+
 // --- Sync NTSC/VHS UI from server ---
 
 function syncNtsc(ntsc) {
   if (!ntsc) return;
   const ntscStatus = document.getElementById('ntsc-status');
   if (ntscStatus) ntscStatus.textContent = ntsc.error || '';
+  syncNtscMetrics(ntsc.live_metrics);
   for (const [param, value] of Object.entries(ntsc)) {
     const row = document.querySelector(`.param-row[data-ntsc="${param}"]`);
     if (!row) continue;
@@ -879,6 +979,96 @@ function syncNtsc(ntsc) {
     }
   }
 }
+
+function formatCount(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 MiB';
+  return `${(bytes / (1024 * 1024)).toFixed(bytes >= 1024 * 1024 * 1024 ? 1 : 0)} MiB`;
+}
+
+function syncNtscMetrics(metrics) {
+  const el = document.getElementById('ntsc-metrics');
+  if (!el) return;
+  const path = metrics?.active_path || 'off';
+  const global = metrics?.global || {};
+  const selective = metrics?.selective || {};
+  const totalObserved = Number(global.attempted || 0) + Number(global.stale || 0)
+    + Number(selective.attempted || 0) + Number(selective.stale || 0);
+  if (path === 'off' && totalObserved === 0) {
+    if (el.textContent !== 'Live worker: no samples yet') el.textContent = 'Live worker: no samples yet';
+    return;
+  }
+  const formatBucket = (label, bucket, active) => {
+    const attempted = Number(bucket?.attempted || 0);
+    const accepted = Number(bucket?.accepted || 0);
+    const skipped = Number(bucket?.skipped || 0);
+    const unavailable = Number(bucket?.unavailable || 0);
+    const stale = Number(bucket?.stale || 0);
+    const rate = attempted > 0 ? ` (${(skipped * 100 / attempted).toFixed(1)}%)` : '';
+    const busy = active && metrics?.busy ? ' · busy' : '';
+    const failed = unavailable > 0 ? ` · ${formatCount(unavailable)} unavailable` : '';
+    return `${label} · ${formatCount(accepted)}/${formatCount(attempted)} admitted · ${formatCount(skipped)} skipped${rate}${failed} · ${formatCount(stale)} stale${busy}`;
+  };
+  const text = [
+    formatBucket('Global live', global, path === 'global'),
+    formatBucket('Selective live', selective, path === 'selective'),
+  ].join(' | ');
+  if (el.textContent !== text) el.textContent = text;
+}
+
+function syncMediaSafety(safety) {
+  if (!safety || !expertMediaToggle) return;
+  const mode = safety.mode === 'expert' ? 'expert' : 'safe';
+  authoritativeMediaSafetyMode = mode;
+  expertMediaToggle.checked = mode === 'expert';
+  expertMediaToggle.toggleAttribute('aria-busy', false);
+  mediaSafetyMode.textContent = mode.toUpperCase();
+  mediaSafetyMode.classList.toggle('expert', mode === 'expert');
+
+  const pixels = formatCount(mode === 'expert' ? safety.expert_max_pixels : safety.safe_max_pixels);
+  const rgba = formatBytes(mode === 'expert' ? safety.expert_max_rgba_bytes : safety.safe_max_rgba_bytes);
+  const edge = formatCount(safety.device_max_texture_dimension_2d || safety.absolute_max_edge);
+  mediaSafetySummary.textContent = `${pixels} pixels / ${rgba} RGBA · ${edge}px device edge`;
+  const budget = formatBytes(safety.planning_budget_bytes);
+  const reserved = formatBytes(safety.reserved_bytes);
+  mediaSafetyRationale.textContent = mode === 'expert'
+    ? `Expert source planning: ${reserved} reserved of ${budget}. Portable VRAM totals are unavailable, so texture creation may still reject a source safely.`
+    : `Safe defaults cap each source to UHD area. Expert mode affects future source opens only and remains bounded by device and ${budget} host planning limits.`;
+  const status = String(safety.status || '');
+  mediaSafetyStatus.textContent = status;
+  mediaSafetyStatus.classList.toggle(
+    'error',
+    /^(rejected\b|error:|expert mode unavailable)/i.test(status)
+  );
+}
+
+expertMediaToggle?.addEventListener('change', () => {
+  const mode = expertMediaToggle.checked ? 'expert' : 'safe';
+  if (mode === 'expert') {
+    const accepted = window.confirm(
+      'Expert large-media mode can use substantially more CPU and GPU memory. It applies only to future source opens, remains bounded by this host, and does not raise the existing UHD-area export-output limit. Enable it?'
+    );
+    if (!accepted) {
+      expertMediaToggle.checked = authoritativeMediaSafetyMode === 'expert';
+      return;
+    }
+  }
+  if (sendAction({ action: 'set_media_safety_mode', mode })) {
+    expertMediaToggle.toggleAttribute('aria-busy', true);
+    mediaSafetyStatus.textContent = mode === 'expert'
+      ? 'Enabling bounded Expert mode…'
+      : 'Returning future source opens to Safe mode…';
+    mediaSafetyStatus.classList.remove('error');
+  } else {
+    expertMediaToggle.checked = authoritativeMediaSafetyMode === 'expert';
+    mediaSafetyStatus.textContent = 'Control connection is offline; media safety mode was not changed.';
+    mediaSafetyStatus.classList.add('error');
+  }
+});
 
 // --- Sync layers ---
 
@@ -966,6 +1156,10 @@ const LAYER_EFFECT_CONTROLS = [
   ['breathe_scale', 'Bth Scale', 'range', 0, 0.05, 0.001, 0],
   ['breathe_rotation', 'Bth Rotate', 'range', 0, 2, 0.05, 0],
   ['breathe_position', 'Bth Drift', 'range', 0, 0.02, 0.001, 0],
+  ['shift_amount', 'Shift Amt', 'range', 0, 1, 0.01, 0],
+  ['shift_block_size', 'Shift Block', 'range', 2, 256, 1, 8],
+  ['shift_density', 'Shift Density', 'range', 0, 1, 0.01, 0.5],
+  ['shift_speed', 'Shift Speed', 'range', 0, 20, 0.25, 3],
   ['cellular_amount', 'Amount', 'range', 0, 1, 0.05, 0],
   ['cellular_scale', 'Scale', 'range', 2, 32, 1, 10],
   ['cellular_warp', 'Warp', 'range', 0, 1, 0.05, 0.35],
@@ -1141,6 +1335,11 @@ function createLayerCard(layer, index) {
         </label>
         <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.</span>
       </div>
+      <div class="layer-random-controls" role="group" aria-label="Layer ${index + 1} deterministic random pattern">
+        <label>Seed <input class="layer-random-seed seed-input" type="number" min="0" max="4294967295" step="1" inputmode="numeric" value="${Number(layer.effects?.random_seed || 0) >>> 0}" aria-label="Layer ${index + 1} pattern seed" title="Zero restores the legacy pattern"></label>
+        <button class="layer-reroll" type="button" title="Advance this layer's deterministic pattern seed" aria-label="Reroll layer ${index + 1} pattern">&#x2684; Reroll</button>
+        ${layer.source_kind === 'video' ? `<label class="layer-loop-reroll"><input type="checkbox" ${layer.reroll_on_loop ? 'checked' : ''}> each loop</label>` : ''}
+      </div>
       <div class="layer-fx-heading">
         <button class="layer-fx-toggle" type="button" aria-expanded="false" aria-controls="layer-fx-body-${index}">
           <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Layer effects</span>
@@ -1255,6 +1454,29 @@ function createLayerCard(layer, index) {
   });
   card.querySelector('.layer-master-bypass input').addEventListener('change', (event) => {
     sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param: 'bypass_master_fx', value: event.currentTarget.checked });
+  });
+  card.querySelector('.layer-reroll').addEventListener('click', () => {
+    sendAction({
+      action: 'reroll',
+      scope: 'layer',
+      ...currentLayerSelector(card, layer, index),
+      mode: 'pattern',
+      amount: 0.7,
+      include_grain_controls: false,
+    });
+  });
+  card.querySelector('.layer-random-seed').addEventListener('change', (event) => {
+    const seed = Number(event.currentTarget.value);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
+      event.currentTarget.setCustomValidity('Seed must be a whole number from 0 to 4294967295');
+      event.currentTarget.reportValidity();
+      return;
+    }
+    event.currentTarget.setCustomValidity('');
+    sendAction({ action: 'set_layer_effect', ...currentLayerSelector(card, layer, index), param: 'random_seed', value: seed });
+  });
+  card.querySelector('.layer-loop-reroll input')?.addEventListener('change', (event) => {
+    sendAction({ action: 'set_layer_reroll_on_loop', ...currentLayerSelector(card, layer, index), enabled: event.currentTarget.checked });
   });
   wireLayerDisclosures(card, layer, index);
   wireLayerEffects(card, layer, index);
@@ -1374,6 +1596,10 @@ function updateLayerCard(card, layer, index) {
   if (bypassMasterFx && canSync(bypassMasterFx)) {
     bypassMasterFx.checked = !!layer.bypass_master_fx;
   }
+  const layerSeed = card.querySelector('.layer-random-seed');
+  if (layerSeed && canSync(layerSeed)) layerSeed.value = String(Number(layer.effects?.random_seed || 0) >>> 0);
+  const loopReroll = card.querySelector('.layer-loop-reroll input');
+  if (loopReroll && canSync(loopReroll)) loopReroll.checked = !!layer.reroll_on_loop;
   for (const [param, , kind, min, max, step, fallback] of LAYER_EFFECT_CONTROLS) {
     const row = card.querySelector(`[data-layer-effect="${param}"]`);
     const control = row?.querySelector('input,select');
@@ -1606,14 +1832,29 @@ function uploadClip(file, statusElement = libUploadStatus) {
 function renderMasterTransport(paused, pending) {
   const btn = document.getElementById('btn-play-all');
   btn.textContent = paused ? '\u25B6' : '\u23F8';
-  btn.title = paused ? 'Resume visual program' : 'Pause visual program';
+  btn.title = paused
+    ? 'Resume the complete visual program'
+    : 'Freeze the complete visual program, including clocks and histories';
   btn.dataset.paused = String(paused);
   btn.disabled = pending;
   btn.toggleAttribute('aria-busy', pending);
   btn.setAttribute('aria-label', btn.title);
+  btn.setAttribute('aria-pressed', String(!!paused));
 }
 
-function syncTransport(paused) {
+function renderMediaFreeze(frozen, pending) {
+  const btn = document.getElementById('btn-freeze-media');
+  btn.classList.toggle('active', !!frozen);
+  btn.title = frozen
+    ? 'Release video and Spout frames'
+    : 'Hold video and Spout frames while effects and modulation continue';
+  btn.disabled = pending;
+  btn.toggleAttribute('aria-busy', pending);
+  btn.setAttribute('aria-label', btn.title);
+  btn.setAttribute('aria-pressed', String(!!frozen));
+}
+
+function syncTransport(paused, mediaFrozen = false) {
   transportAuthoritativePaused = !!paused;
   if (transportPendingPaused === transportAuthoritativePaused) {
     transportRequestSequence += 1;
@@ -1623,6 +1864,15 @@ function syncTransport(paused) {
     transportPendingPaused ?? transportAuthoritativePaused,
     transportPendingPaused !== null,
   );
+  mediaAuthoritativeFrozen = !!mediaFrozen;
+  if (mediaPendingFrozen === mediaAuthoritativeFrozen) {
+    mediaRequestSequence += 1;
+    mediaPendingFrozen = null;
+  }
+  renderMediaFreeze(
+    mediaPendingFrozen ?? mediaAuthoritativeFrozen,
+    mediaPendingFrozen !== null,
+  );
 }
 
 
@@ -1630,6 +1880,9 @@ function syncTransport(paused) {
 
 const patchCaptureButton = document.getElementById('patch-capture');
 const patchSaveStatus = document.getElementById('patch-save-status');
+const patchLoadSnapshotButton = document.getElementById('patch-load-snapshot');
+const patchApplyLookButton = document.getElementById('patch-apply-look');
+const patchLoadStatus = document.getElementById('patch-load-status');
 
 patchCaptureButton.addEventListener('click', () => {
   if (patchCaptureButton.disabled) return;
@@ -1655,7 +1908,39 @@ function syncPatchSave(status = '') {
       : 'export-status';
 }
 
+function requestPatchDialog(action) {
+  if (patchLoadSnapshotButton.disabled || patchApplyLookButton.disabled) return;
+  if (sendAction(action)) {
+    patchLoadSnapshotButton.disabled = true;
+    patchApplyLookButton.disabled = true;
+    patchLoadStatus.textContent = 'Choose a YAML patch in the desktop window…';
+    patchLoadStatus.className = 'export-status';
+  } else {
+    patchLoadStatus.textContent = 'Not connected';
+    patchLoadStatus.className = 'export-status error';
+  }
+}
+
+patchLoadSnapshotButton.addEventListener('click', () => {
+  requestPatchDialog({ action: 'open_patch_snapshot' });
+});
+
+patchApplyLookButton.addEventListener('click', () => {
+  requestPatchDialog({ action: 'open_patch_look', stack_revision: layerStackRevision });
+});
+
+function syncPatchLoad(status = '') {
+  patchLoadSnapshotButton.disabled = false;
+  patchApplyLookButton.disabled = false;
+  if (!status) return;
+  patchLoadStatus.textContent = String(status);
+  patchLoadStatus.className = String(status).startsWith('Error:')
+    ? 'export-status error'
+    : 'export-status success';
+}
+
 let exportActive = false;
+let exportWarningsKey = null;
 
 document.getElementById('export-start').addEventListener('click', () => {
   if (exportActive) return;
@@ -1665,6 +1950,9 @@ document.getElementById('export-start').addEventListener('click', () => {
   durationInput.value = duration;
   const fps = [24, 30, 60, 120, 240].includes(parseInt(document.getElementById('export-fps').value))
     ? parseInt(document.getElementById('export-fps').value) : 30;
+  const requestedNtscQuality = document.getElementById('export-ntsc-quality').value;
+  const ntscQuality = ['live_parity', 'native'].includes(requestedNtscQuality)
+    ? requestedNtscQuality : 'live_parity';
   const audioSelect = document.getElementById('export-audio');
   const audioOption = audioSelect.selectedOptions[0];
   const audioLayerId = audioSelect.value === '' || audioSelect.value.startsWith('legacy-index:')
@@ -1675,7 +1963,8 @@ document.getElementById('export-start').addEventListener('click', () => {
   document.getElementById('export-cancel').style.display = '';
   document.getElementById('export-progress').style.display = '';
   document.getElementById('export-status').textContent = 'Starting render…';
-  if (!sendAction({ action: 'start_export', width: w, height: h, fps, duration_secs: duration, audio_layer: audioLayer, audio_layer_id: audioLayerId })) {
+  syncExportWarnings([]);
+  if (!sendAction({ action: 'start_export', width: w, height: h, fps, duration_secs: duration, ntsc_quality: ntscQuality, audio_layer: audioLayer, audio_layer_id: audioLayerId })) {
     exportActive = false;
     document.getElementById('export-start').style.display = '';
     document.getElementById('export-cancel').style.display = 'none';
@@ -1689,13 +1978,40 @@ document.getElementById('export-cancel').addEventListener('click', () => {
   sendAction({ action: 'cancel_export' });
 });
 
-function syncExport(progress, error, status = '') {
+function syncExportWarnings(warnings = []) {
+  const panel = document.getElementById('export-warnings');
+  const summary = document.getElementById('export-warnings-summary');
+  const list = document.getElementById('export-warnings-list');
+  if (!panel || !summary || !list) return;
+
+  const messages = Array.isArray(warnings)
+    ? warnings.filter(message => typeof message === 'string' && message.trim() !== '').slice(0, 128)
+    : [];
+  const warningsKey = JSON.stringify(messages);
+  // State arrives around 30 times per second. Do not recreate an unchanged
+  // aria-live list and make assistive technology announce it repeatedly.
+  if (warningsKey === exportWarningsKey) return;
+  exportWarningsKey = warningsKey;
+  panel.hidden = messages.length === 0;
+  summary.textContent = messages.length === 0
+    ? ''
+    : `${messages.length} source substitution${messages.length === 1 ? '' : 's'}:`;
+  list.replaceChildren(...messages.map(message => {
+    const item = document.createElement('li');
+    item.textContent = message;
+    return item;
+  }));
+}
+
+function syncExport(progress, error, status = '', warnings = []) {
   const startBtn = document.getElementById('export-start');
   const cancelBtn = document.getElementById('export-cancel');
   const progressEl = document.getElementById('export-progress');
   const fillEl = document.getElementById('export-fill');
   const textEl = document.getElementById('export-text');
   const statusEl = document.getElementById('export-status');
+  const warningCount = Array.isArray(warnings) ? warnings.length : 0;
+  syncExportWarnings(warnings);
   progress = Math.min(1, Math.max(0, Number(progress) || 0));
   progressEl.setAttribute('aria-valuenow', String(Math.round(progress * 100)));
 
@@ -1714,7 +2030,9 @@ function syncExport(progress, error, status = '') {
       statusEl.textContent = 'Error: ' + (error || 'render failed');
       statusEl.className = 'export-status error';
     } else {
-      statusEl.textContent = 'Render complete!';
+      statusEl.textContent = warningCount > 0
+        ? `Render complete with ${warningCount} source substitution${warningCount === 1 ? '' : 's'}.`
+        : 'Render complete!';
       statusEl.className = 'export-status success';
     }
   } else if (status === 'cancelling') {
@@ -1780,6 +2098,10 @@ const MOD_TARGETS = [
   ['cellular_gap_amount', 'Master Cell Gap Key'],
   ['cellular_gap_threshold', 'Master Cell Gap Threshold'],
   ['cellular_gap_softness', 'Master Cell Gap Softness'],
+  ['shift_amount', 'Shift Amount'],
+  ['shift_block_size', 'Shift Block Size'],
+  ['shift_density', 'Shift Density'],
+  ['shift_speed', 'Shift Speed'],
   ['key_threshold', 'Key Threshold'],
   ['key_softness', 'Key Softness'],
   ['key_color_r', 'Key Color Red'],
@@ -1810,7 +2132,6 @@ const MOD_TARGETS = [
 ];
 const MASTER_MOD_TARGETS = MOD_TARGETS.slice();
 
-const MAX_MOD_LAYERS = 16;
 const LAYER_FX_TARGETS = [
   ['opacity', 'Opacity'], ['speed', 'Speed'], ['fps', 'FPS'],
   ['key_threshold', 'Key Threshold'],
@@ -1829,6 +2150,8 @@ const LAYER_FX_TARGETS = [
   ['cellular_gap_threshold', 'Cell Gap Thresh'],
   ['cellular_gap_softness', 'Cell Gap Soft'],
   ['key_softness', 'Key Soft'], ['downsample', 'Downsample'],
+  ['shift_amount', 'Shift Amount'], ['shift_block_size', 'Shift Block Size'],
+  ['shift_density', 'Shift Density'], ['shift_speed', 'Shift Speed'],
 ];
 
 const ROUTING_CURVES = [
@@ -1920,13 +2243,25 @@ for (let i = 0; i < 4; i++) {
     <span class="lfo-name">LFO ${i + 1}</span>
     <select class="lfo-shape">${optionsHtml(LFO_SHAPES, 'sine')}</select>
     <select class="lfo-rate">${optionsHtml(LFO_RATES, 4)}</select>
+    <input class="lfo-seed seed-input" type="number" min="0" max="4294967295" step="1" inputmode="numeric" value="0" aria-label="LFO ${i + 1} sample and hold seed" title="Sample &amp; Hold seed; zero reproduces the legacy sequence" hidden>
     <div class="lfo-meter"><div class="lfo-meter-fill"></div></div>
   `;
   row.querySelector('.lfo-shape').addEventListener('change', (e) => {
     sendAction({ action: 'set_lfo', index: i, param: 'shape', value: e.target.value });
+    row.querySelector('.lfo-seed').hidden = e.target.value !== 'sample_hold';
   });
   row.querySelector('.lfo-rate').addEventListener('change', (e) => {
     sendAction({ action: 'set_lfo', index: i, param: 'beats', value: parseFloat(e.target.value) });
+  });
+  row.querySelector('.lfo-seed').addEventListener('change', (e) => {
+    const seed = Number(e.target.value);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
+      e.target.setCustomValidity('Seed must be a whole number from 0 to 4294967295');
+      e.target.reportValidity();
+      return;
+    }
+    e.target.setCustomValidity('');
+    sendAction({ action: 'set_lfo', index: i, param: 'seed', value: seed });
   });
   lfoList.appendChild(row);
 }
@@ -1964,7 +2299,7 @@ const MOD_SOURCES = [
 
 function currentModTargets(selected = '') {
   const groups = [['Master / Program', MASTER_MOD_TARGETS.slice()]];
-  const liveLayerCount = Math.min(MAX_MOD_LAYERS, latestLayerIdentities.length);
+  const liveLayerCount = latestLayerIdentities.length;
   for (let layer = 1; layer <= liveLayerCount; layer++) {
     const targets = [];
     for (const [suffix, label] of LAYER_FX_TARGETS) {
@@ -2010,7 +2345,7 @@ function createRoutingRow(routing, index) {
   });
   row.querySelector('.routing-target').addEventListener('change', (e) => {
     const target = e.target.value;
-    const layerMatch = /^layer([1-9]|1[0-6])_/.exec(target);
+    const layerMatch = /^layer([1-9]\d*)_/.exec(target);
     let targetIdentity = {};
     if (layerMatch) {
       const targetLayerId = latestLayerIdentities[Number(layerMatch[1]) - 1];
@@ -2076,8 +2411,11 @@ function syncModulation(m) {
     if (!row) return;
     const shapeSel = row.querySelector('.lfo-shape');
     const rateSel = row.querySelector('.lfo-rate');
+    const seedInput = row.querySelector('.lfo-seed');
     if (canSync(shapeSel)) shapeSel.value = lfo.shape;
     if (canSync(rateSel)) rateSel.value = lfo.beats;
+    if (canSync(seedInput)) seedInput.value = String(Number(lfo.seed || 0) >>> 0);
+    seedInput.hidden = lfo.shape !== 'sample_hold';
     // Live meter: map [-1, 1] → [0%, 100%]
     const fill = row.querySelector('.lfo-meter-fill');
     fill.style.width = `${((lfo.value + 1) * 50).toFixed(1)}%`;

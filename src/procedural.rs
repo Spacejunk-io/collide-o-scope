@@ -1,9 +1,10 @@
 //! Deterministic, patch-only procedural generation.
 //!
-//! Version one deliberately generates inspectable YAML and manifests rather
-//! than starting GPU exports. Rendering remains an explicit second step, so a
-//! large request cannot monopolize the live renderer and every variant can be
-//! curated before expensive media work begins.
+//! Generation deliberately produces inspectable YAML, a deterministic
+//! manifest, and a bounded source-preflight receipt rather than starting GPU
+//! exports. Rendering remains an explicit second step, so a large request
+//! cannot monopolize the live renderer and every variant can be curated before
+//! expensive media work begins.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -13,11 +14,24 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
+use crate::media_source::{
+    ContentIdentity, FingerprintLimits, FingerprintSession, ResolveContext, ResolvedVisualSource,
+    DEFAULT_MAX_FINGERPRINT_BYTES, DEFAULT_MAX_SEARCH_ENTRIES,
+};
 use crate::patch::{EffectsConfig, PatchState};
+use crate::randomization::{
+    mutate_circular, mutate_discrete, mutate_linear, mutate_log, SplitMix64,
+};
+#[cfg(test)]
+use crate::randomization::{reflect, wrap};
 
-pub const GENERATOR_VERSION: &str = "1";
+pub const GENERATOR_VERSION: &str = "2";
 pub const MAX_GENERATED_COUNT: usize = 256;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
+pub const CANONICAL_IDENTITY_ALGORITHM: &str = "normalized-patch-json-v1+sha256";
 
 #[derive(Clone, Debug)]
 pub struct GenerationConfig {
@@ -36,48 +50,96 @@ pub struct Manifest {
     pub temperature: f32,
     pub title: String,
     pub slug: String,
+    /// Legacy compatibility field. New lineage authority is `anchor_sha256`.
+    #[serde(default)]
     pub anchor_fnv1a64: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub canonical_identity_algorithm: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub anchor_sha256: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub piece_sha256: String,
+    #[serde(default)]
+    pub identity_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lineage: Option<String>,
     pub logical_sources: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<ManifestSource>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestSource {
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_index: Option<usize>,
+    pub logical_name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_policy: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreflightLimits {
+    pub max_search_entries: usize,
+    pub max_fingerprint_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreflightReceipt {
+    pub schema_version: u32,
+    pub canonical_identity_algorithm: String,
+    pub anchor_sha256: String,
+    pub piece_sha256: String,
+    pub status: String,
+    pub claim_scope: String,
+    pub pixel_identity_claimed: bool,
+    pub source_files: usize,
+    pub source_bytes: u64,
+    pub limits: PreflightLimits,
+    pub sources: Vec<ManifestSource>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SourcePreflightConfig {
+    pub anchor_dir: Option<PathBuf>,
+    pub library_dir: Option<PathBuf>,
+    pub max_fingerprint_bytes: u64,
+    pub allow_unverified_sources: bool,
+}
+
+impl Default for SourcePreflightConfig {
+    fn default() -> Self {
+        Self {
+            anchor_dir: None,
+            library_dir: None,
+            max_fingerprint_bytes: DEFAULT_MAX_FINGERPRINT_BYTES,
+            allow_unverified_sources: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SourceInventory {
+    sources: Vec<ManifestSource>,
+    limits: PreflightLimits,
+    warnings: Vec<String>,
+    identity_complete: bool,
 }
 
 #[derive(Clone)]
 pub struct GeneratedPiece {
     pub patch: PatchState,
     pub manifest: Manifest,
-}
-
-#[derive(Clone, Debug)]
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn unit(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) * (1.0 / 16_777_216.0)
-    }
-
-    fn signed(&mut self) -> f32 {
-        self.unit() * 2.0 - 1.0
-    }
-
-    fn chance(&mut self, probability: f32) -> bool {
-        self.unit() < probability.clamp(0.0, 1.0)
-    }
+    pub preflight: PreflightReceipt,
 }
 
 fn domain_seed(seed: u64, index: usize, domain: u64) -> u64 {
@@ -89,102 +151,6 @@ fn finite_temperature(value: f32) -> Result<f32, String> {
         return Err("temperature must be finite and between 0 and 2".to_string());
     }
     Ok(value)
-}
-
-/// Reflect a value at both walls rather than clamping it. Reflection avoids
-/// accumulating probability mass at minima and maxima during a long walk.
-fn reflect(mut value: f32, min: f32, max: f32) -> f32 {
-    if !value.is_finite() || min >= max {
-        return min;
-    }
-    let span = max - min;
-    value = (value - min) % (2.0 * span);
-    if value < 0.0 {
-        value += 2.0 * span;
-    }
-    if value > span {
-        value = 2.0 * span - value;
-    }
-    min + value
-}
-
-fn wrap(value: f32, min: f32, max: f32) -> f32 {
-    let span = max - min;
-    if !value.is_finite() || span <= 0.0 {
-        return min;
-    }
-    (value - min).rem_euclid(span) + min
-}
-
-const MEAN_REVERSION: f32 = 0.85;
-
-fn mutate_linear(
-    anchor: f32,
-    value: f32,
-    min: f32,
-    max: f32,
-    scale: f32,
-    rng: &mut SplitMix64,
-) -> f32 {
-    reflect(
-        anchor + MEAN_REVERSION * (value - anchor) + rng.signed() * scale,
-        min,
-        max,
-    )
-}
-
-fn mutate_log(
-    anchor: f32,
-    value: f32,
-    min: f32,
-    max: f32,
-    scale: f32,
-    rng: &mut SplitMix64,
-) -> f32 {
-    let anchor = anchor.clamp(min, max).ln();
-    let value = value.clamp(min, max).ln();
-    reflect(
-        anchor + MEAN_REVERSION * (value - anchor) + rng.signed() * scale,
-        min.ln(),
-        max.ln(),
-    )
-    .exp()
-}
-
-fn circular_delta(value: f32, anchor: f32, period: f32) -> f32 {
-    (value - anchor + period * 0.5).rem_euclid(period) - period * 0.5
-}
-
-fn mutate_circular(
-    anchor: f32,
-    value: f32,
-    min: f32,
-    max: f32,
-    scale: f32,
-    rng: &mut SplitMix64,
-) -> f32 {
-    let period = max - min;
-    wrap(
-        anchor + MEAN_REVERSION * circular_delta(value, anchor, period) + rng.signed() * scale,
-        min,
-        max,
-    )
-}
-
-fn mutate_discrete<T: Copy + PartialEq>(
-    anchor: T,
-    value: T,
-    choices: &[T],
-    change_probability: f32,
-    rng: &mut SplitMix64,
-) -> T {
-    if value != anchor && rng.chance(0.15) {
-        anchor
-    } else if !choices.is_empty() && rng.chance(change_probability) {
-        choices[(rng.next_u64() % choices.len() as u64) as usize]
-    } else {
-        value
-    }
 }
 
 fn mutate_bool(anchor: bool, value: bool, change_probability: f32, rng: &mut SplitMix64) -> bool {
@@ -285,6 +251,24 @@ fn mutate_effects(
         t * 0.25,
         rng,
     );
+    e.shift_amount = mutate_linear(anchor.shift_amount, e.shift_amount, 0.0, 1.0, t * 0.14, rng);
+    e.shift_block_size = mutate_log(
+        anchor.shift_block_size,
+        e.shift_block_size,
+        2.0,
+        256.0,
+        t * 0.35,
+        rng,
+    );
+    e.shift_density = mutate_linear(
+        anchor.shift_density,
+        e.shift_density,
+        0.0,
+        1.0,
+        t * 0.12,
+        rng,
+    );
+    e.shift_speed = mutate_linear(anchor.shift_speed, e.shift_speed, 0.0, 20.0, t * 2.5, rng);
 
     // Discrete changes are deliberately rare. Zero-valued effects activate
     // sparsely so variation does not become a wall of every effect at once.
@@ -496,9 +480,360 @@ fn logical_filename(value: &str) -> String {
         .to_string()
 }
 
+fn manifest_file_source(
+    role: &str,
+    layer_index: Option<usize>,
+    logical_name: String,
+    identity: Option<ContentIdentity>,
+) -> ManifestSource {
+    let verified = identity.is_some();
+    ManifestSource {
+        role: role.to_string(),
+        layer_index,
+        logical_name,
+        kind: "file".to_string(),
+        byte_len: identity.as_ref().map(|value| value.byte_len),
+        sha256: identity.map(|value| value.sha256),
+        offline_policy: None,
+        verified,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn unverified_inventory(anchor: &PatchState) -> SourceInventory {
+    let mut sources = Vec::new();
+    let mut warnings = Vec::new();
+    for (index, layer) in anchor.layers.iter().enumerate() {
+        if let Some(sender) = layer
+            .source_path
+            .strip_prefix(crate::layers::SPOUT_SOURCE_PREFIX)
+        {
+            sources.push(ManifestSource {
+                role: "layer".into(),
+                layer_index: Some(index),
+                logical_name: sender.to_string(),
+                kind: "spout".into(),
+                byte_len: None,
+                sha256: None,
+                offline_policy: Some("deterministic_black".into()),
+                verified: true,
+            });
+        } else {
+            let logical_name = logical_filename(&layer.filename);
+            warnings.push(format!(
+                "layer {} source {:?} is not content-verified",
+                index + 1,
+                logical_name
+            ));
+            sources.push(manifest_file_source(
+                "layer",
+                Some(index),
+                logical_name,
+                None,
+            ));
+        }
+    }
+    if let Some(modulation) = anchor.modulation.as_ref() {
+        if modulation.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
+            && !modulation.audio_clip_path.is_empty()
+        {
+            let logical_name =
+                if crate::media_source::parse_content_reference(&modulation.audio_clip_path)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    "analysis-audio".to_string()
+                } else {
+                    logical_filename(&modulation.audio_clip_path)
+                };
+            warnings.push(format!(
+                "analysis-audio source {logical_name:?} is not content-verified"
+            ));
+            sources.push(manifest_file_source(
+                "analysis_audio",
+                None,
+                logical_name,
+                None,
+            ));
+        }
+    }
+    let identity_complete = sources
+        .iter()
+        .all(|source| source.kind != "file" || source.verified);
+    SourceInventory {
+        sources,
+        limits: PreflightLimits {
+            max_search_entries: DEFAULT_MAX_SEARCH_ENTRIES,
+            max_fingerprint_bytes: DEFAULT_MAX_FINGERPRINT_BYTES,
+        },
+        warnings,
+        identity_complete,
+    }
+}
+
+/// Resolve and fingerprint every file source before generation commits any
+/// output. Local paths and filesystem metadata remain operational state and are
+/// never copied into the returned inventory.
+pub fn preflight_sources(
+    anchor: &PatchState,
+    config: &SourcePreflightConfig,
+) -> Result<SourceInventory, String> {
+    let limits = FingerprintLimits {
+        max_search_entries: DEFAULT_MAX_SEARCH_ENTRIES,
+        max_total_bytes: config.max_fingerprint_bytes,
+    };
+    let mut fingerprints = FingerprintSession::new(limits).map_err(|error| error.to_string())?;
+    let context = ResolveContext::new(config.anchor_dir.clone(), config.library_dir.clone());
+    let mut sources = Vec::new();
+    let mut warnings = Vec::new();
+    let mut identity_complete = true;
+
+    for (index, layer) in anchor.layers.iter().enumerate() {
+        let resolved = crate::media_source::resolve_visual_source(
+            &layer.source_path,
+            &layer.filename,
+            &context,
+            None,
+            crate::layers::is_supported_visual_file,
+            &mut fingerprints,
+        );
+        match resolved {
+            Ok(ResolvedVisualSource::Spout { sender }) => sources.push(ManifestSource {
+                role: "layer".into(),
+                layer_index: Some(index),
+                logical_name: sender,
+                kind: "spout".into(),
+                byte_len: None,
+                sha256: None,
+                offline_policy: Some("deterministic_black".into()),
+                verified: true,
+            }),
+            Ok(ResolvedVisualSource::File(resolved)) => {
+                let logical_name = logical_filename(&layer.filename);
+                let identity = fingerprints
+                    .fingerprint(&resolved.path)
+                    .map_err(|error| format!("fingerprint layer {}: {error}", index + 1))?;
+                sources.push(manifest_file_source(
+                    "layer",
+                    Some(index),
+                    logical_name,
+                    Some(identity),
+                ));
+            }
+            Err(error) if config.allow_unverified_sources => {
+                let logical_name = logical_filename(&layer.filename);
+                identity_complete = false;
+                warnings.push(format!(
+                    "layer {} source {:?} is unverified: {}",
+                    index + 1,
+                    logical_name,
+                    privacy_safe_resolution_reason(&error)
+                ));
+                sources.push(manifest_file_source(
+                    "layer",
+                    Some(index),
+                    logical_name,
+                    None,
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "resolve layer {} source {:?}: {error}; pass --allow-unverified-sources to preserve only its logical name",
+                    index + 1,
+                    logical_filename(&layer.filename)
+                ));
+            }
+        }
+    }
+
+    if let Some(modulation) = anchor.modulation.as_ref() {
+        if modulation.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
+            && !modulation.audio_clip_path.is_empty()
+        {
+            let embedded =
+                crate::media_source::parse_content_reference(&modulation.audio_clip_path)
+                    .map_err(|error| error.to_string())?;
+            let logical_name = if embedded.is_some() {
+                "analysis-audio".to_string()
+            } else {
+                logical_filename(&modulation.audio_clip_path)
+            };
+            let resolved = crate::media_source::resolve_file_source(
+                &modulation.audio_clip_path,
+                &logical_name,
+                &context,
+                None,
+                |path: &Path| crate::audio::is_supported_audio_file(path),
+                &mut fingerprints,
+            );
+            match resolved {
+                Ok(resolved) => {
+                    let identity = fingerprints.fingerprint(&resolved.path).map_err(|error| {
+                        format!("fingerprint analysis-audio source {logical_name:?}: {error}")
+                    })?;
+                    sources.push(manifest_file_source(
+                        "analysis_audio",
+                        None,
+                        logical_name,
+                        Some(identity),
+                    ));
+                }
+                Err(error) if config.allow_unverified_sources => {
+                    identity_complete = false;
+                    warnings.push(format!(
+                        "analysis-audio source {logical_name:?} is unverified: {}",
+                        privacy_safe_resolution_reason(&error)
+                    ));
+                    sources.push(manifest_file_source(
+                        "analysis_audio",
+                        None,
+                        logical_name,
+                        None,
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "resolve analysis-audio source {logical_name:?}: {error}; pass --allow-unverified-sources to preserve only its logical name"
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(SourceInventory {
+        sources,
+        limits: PreflightLimits {
+            max_search_entries: limits.max_search_entries,
+            max_fingerprint_bytes: limits.max_total_bytes,
+        },
+        warnings,
+        identity_complete,
+    })
+}
+
+fn privacy_safe_resolution_reason(error: &crate::media_source::SourceResolveError) -> &'static str {
+    use crate::media_source::SourceResolveError;
+    match error {
+        SourceResolveError::InvalidContentReference(_) => "invalid content reference",
+        SourceResolveError::InvalidLimit(_) => "invalid resource limit",
+        SourceResolveError::Missing(_) => "not found",
+        SourceResolveError::ContentMismatch(_) => "content mismatch",
+        SourceResolveError::FingerprintBudget(_) => "fingerprint budget exceeded",
+        SourceResolveError::SearchBudget(_) => "search budget exceeded",
+        SourceResolveError::ChangedDuringFingerprint(_) => "changed during fingerprinting",
+        SourceResolveError::Cancelled => "cancelled",
+        SourceResolveError::Io(_) => "filesystem error",
+    }
+}
+
+fn source_for_layer(inventory: &SourceInventory, layer_index: usize) -> Option<&ManifestSource> {
+    inventory
+        .sources
+        .iter()
+        .find(|source| source.role == "layer" && source.layer_index == Some(layer_index))
+}
+
+fn analysis_audio_source(inventory: &SourceInventory) -> Option<&ManifestSource> {
+    inventory
+        .sources
+        .iter()
+        .find(|source| source.role == "analysis_audio")
+}
+
+fn apply_inventory_references(patch: &mut PatchState, inventory: &SourceInventory) {
+    for (index, layer) in patch.layers.iter_mut().enumerate() {
+        let Some(source) = source_for_layer(inventory, index) else {
+            layer.filename = logical_filename(&layer.filename);
+            layer.source_path.clear();
+            continue;
+        };
+        layer.filename = source.logical_name.clone();
+        match source.kind.as_str() {
+            "spout" => {
+                layer.source_path = format!(
+                    "{}{}",
+                    crate::layers::SPOUT_SOURCE_PREFIX,
+                    source.logical_name
+                );
+            }
+            "file" => {
+                layer.source_path = source
+                    .sha256
+                    .as_ref()
+                    .zip(source.byte_len)
+                    .and_then(|(sha256, byte_len)| {
+                        ContentIdentity::new(sha256.clone(), byte_len).ok()
+                    })
+                    .map(|identity| identity.source_reference())
+                    .unwrap_or_default();
+            }
+            _ => layer.source_path.clear(),
+        }
+    }
+    if let Some(modulation) = patch.modulation.as_mut() {
+        if modulation.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
+            && !modulation.audio_clip_path.is_empty()
+        {
+            if let Some(source) = analysis_audio_source(inventory) {
+                modulation.audio_clip_path = source
+                    .sha256
+                    .as_ref()
+                    .zip(source.byte_len)
+                    .and_then(|(sha256, byte_len)| {
+                        ContentIdentity::new(sha256.clone(), byte_len).ok()
+                    })
+                    .map(|identity| identity.source_reference())
+                    .unwrap_or_else(|| source.logical_name.clone());
+            } else {
+                modulation.audio_clip_path = logical_filename(&modulation.audio_clip_path);
+            }
+        }
+    }
+}
+
+fn canonical_patch_bytes(patch: &PatchState) -> Result<Vec<u8>, String> {
+    let json =
+        serde_json::to_vec(patch).map_err(|error| format!("serialize canonical patch: {error}"))?;
+    let mut bytes = b"collide-o-scope/canonical-patch/v1\0".to_vec();
+    bytes.extend_from_slice(&json);
+    Ok(bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn canonical_patch_sha256(patch: &PatchState) -> Result<String, String> {
+    canonical_patch_bytes(patch).map(|bytes| sha256_hex(&bytes))
+}
+
+fn inventory_summary(inventory: &SourceInventory) -> (usize, u64) {
+    let mut unique = std::collections::BTreeSet::new();
+    for source in &inventory.sources {
+        if let (Some(sha256), Some(byte_len)) = (&source.sha256, source.byte_len) {
+            unique.insert((sha256.clone(), byte_len));
+        }
+    }
+    let bytes = unique
+        .iter()
+        .fold(0u64, |total, (_, byte_len)| total.saturating_add(*byte_len));
+    (unique.len(), bytes)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate(
     anchor: &PatchState,
     config: &GenerationConfig,
+) -> Result<Vec<GeneratedPiece>, String> {
+    let inventory = unverified_inventory(anchor);
+    generate_with_inventory(anchor, config, &inventory)
+}
+
+pub fn generate_with_inventory(
+    anchor: &PatchState,
+    config: &GenerationConfig,
+    inventory: &SourceInventory,
 ) -> Result<Vec<GeneratedPiece>, String> {
     if !(1..=MAX_GENERATED_COUNT).contains(&config.count) {
         return Err(format!("count must be between 1 and {MAX_GENERATED_COUNT}"));
@@ -528,10 +863,11 @@ pub fn generate(
         return Err("live Spout sources render black offline; pass --allow-black-sources to accept that policy".into());
     }
 
-    let normalized = normalized_anchor(anchor)?;
-    let anchor_yaml = serde_yaml::to_string(&normalized)
-        .map_err(|e| format!("serialize normalized anchor: {e}"))?;
-    let anchor_hash = format!("{:016x}", fnv1a64(anchor_yaml.as_bytes()));
+    let mut normalized = normalized_anchor(anchor)?;
+    apply_inventory_references(&mut normalized, inventory);
+    let anchor_bytes = canonical_patch_bytes(&normalized)?;
+    let anchor_sha256 = sha256_hex(&anchor_bytes);
+    let anchor_hash = format!("{:016x}", fnv1a64(&anchor_bytes));
     let logical_sources: Vec<String> = normalized
         .layers
         .iter()
@@ -775,12 +1111,15 @@ pub fn generate(
         let title_seed = domain_seed(config.seed, index, 0x5449_544c_4500);
         let title = title_for(&patch, title_seed);
         let slug = slugify(&title);
-        let warnings = spout_sources
-            .iter()
-            .map(|name| format!("Spout source {name:?} is deterministic black offline"))
-            .collect();
+        let mut warnings = inventory.warnings.clone();
+        warnings.extend(
+            spout_sources
+                .iter()
+                .map(|name| format!("Spout source {name:?} is deterministic black offline")),
+        );
+        let piece_sha256 = canonical_patch_sha256(&patch)?;
         let manifest = Manifest {
-            schema_version: 1,
+            schema_version: MANIFEST_SCHEMA_VERSION,
             generator_version: GENERATOR_VERSION.to_string(),
             seed: config.seed,
             index,
@@ -788,12 +1127,41 @@ pub fn generate(
             title,
             slug,
             anchor_fnv1a64: anchor_hash.clone(),
-            lineage: Some(anchor_hash.clone()),
+            canonical_identity_algorithm: CANONICAL_IDENTITY_ALGORITHM.to_string(),
+            anchor_sha256: anchor_sha256.clone(),
+            piece_sha256: piece_sha256.clone(),
+            identity_complete: inventory.identity_complete,
+            lineage: Some(anchor_sha256.clone()),
             logical_sources: logical_sources.clone(),
+            sources: inventory.sources.clone(),
+            warnings: warnings.clone(),
+        };
+        let (source_files, source_bytes) = inventory_summary(inventory);
+        let status = if inventory.identity_complete && warnings.is_empty() {
+            "ready"
+        } else {
+            "ready_with_warnings"
+        };
+        let preflight = PreflightReceipt {
+            schema_version: PREFLIGHT_SCHEMA_VERSION,
+            canonical_identity_algorithm: CANONICAL_IDENTITY_ALGORITHM.to_string(),
+            anchor_sha256: anchor_sha256.clone(),
+            piece_sha256,
+            status: status.to_string(),
+            claim_scope: "canonical_configuration_and_source_bytes".to_string(),
+            pixel_identity_claimed: false,
+            source_files,
+            source_bytes,
+            limits: inventory.limits.clone(),
+            sources: inventory.sources.clone(),
             warnings,
         };
         walk = patch.clone();
-        pieces.push(GeneratedPiece { patch, manifest });
+        pieces.push(GeneratedPiece {
+            patch,
+            manifest,
+            preflight,
+        });
     }
     Ok(pieces)
 }
@@ -916,6 +1284,7 @@ pub fn write_patch_only(
         temp_dir: PathBuf,
         yaml: String,
         manifest: Vec<u8>,
+        preflight: Vec<u8>,
     }
 
     // Serialize and preflight the complete invocation before committing the
@@ -959,6 +1328,8 @@ pub fn write_patch_only(
                 .map_err(|e| format!("serialize generated patch: {e}"))?,
             manifest: serde_json::to_vec_pretty(&piece.manifest)
                 .map_err(|e| format!("serialize generation manifest: {e}"))?,
+            preflight: serde_json::to_vec_pretty(&piece.preflight)
+                .map_err(|e| format!("serialize generation preflight: {e}"))?,
         });
     }
 
@@ -990,6 +1361,7 @@ pub fn write_patch_only(
         }
         let staged = write_new_file(&plan.temp_dir.join("patch.yaml"), plan.yaml.as_bytes())
             .and_then(|_| write_new_file(&plan.temp_dir.join("manifest.json"), &plan.manifest))
+            .and_then(|_| write_new_file(&plan.temp_dir.join("preflight.json"), &plan.preflight))
             .and_then(|_| {
                 sync_parent(&plan.temp_dir.join("patch.yaml"))
                     .map_err(|error| format!("sync staged output: {error}"))
@@ -1250,9 +1622,11 @@ mod tests {
                 paused: false,
                 visible: true,
                 bypass_master_fx: false,
+                reroll_on_loop: false,
                 effects: EffectsConfig::default(),
             }],
             master_paused: false,
+            media_frozen: false,
             ntsc: None,
             modulation: None,
             temporal: None,
@@ -1299,6 +1673,10 @@ mod tests {
             serde_yaml::to_string(&second[0].patch).unwrap()
         );
         assert_eq!(first[0].patch.master.cellular_amount, 0.0);
+        assert_eq!(first[0].patch.master.shift_amount, 0.0);
+        assert_eq!(first[0].patch.master.shift_block_size, 8.0);
+        assert_eq!(first[0].patch.master.shift_density, 0.5);
+        assert_eq!(first[0].patch.master.shift_speed, 3.0);
         assert_eq!(first[0].patch.layers[0].filename, "clip.mp4");
         assert!(first[0].manifest.title.contains(' '));
     }
@@ -1404,6 +1782,104 @@ mod tests {
     }
 
     #[test]
+    fn verified_generation_is_byte_identical_across_roots_and_content_sensitive() {
+        let base = std::env::temp_dir().join(format!(
+            "collideoscope-procedural-content-id-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_root = base.join("first-private-root");
+        let second_root = base.join("second-private-root");
+        fs::create_dir_all(&first_root).unwrap();
+        fs::create_dir_all(&second_root).unwrap();
+        let first_media = first_root.join("clip.mp4");
+        let second_media = second_root.join("clip.mp4");
+        fs::write(&first_media, b"same source bytes").unwrap();
+        fs::write(&second_media, b"same source bytes").unwrap();
+
+        let config = GenerationConfig {
+            seed: 0x5151,
+            count: 1,
+            temperature: 0.5,
+            allow_black_sources: false,
+        };
+        let build = |media: &Path, root: &Path| {
+            let mut patch = anchor();
+            patch.layers[0].source_path = media.to_string_lossy().into_owned();
+            let inventory = preflight_sources(
+                &patch,
+                &SourcePreflightConfig {
+                    anchor_dir: Some(root.to_path_buf()),
+                    ..SourcePreflightConfig::default()
+                },
+            )
+            .unwrap();
+            generate_with_inventory(&patch, &config, &inventory)
+                .unwrap()
+                .remove(0)
+        };
+        let first = build(&first_media, &first_root);
+        let second = build(&second_media, &second_root);
+        let serialize = |piece: &GeneratedPiece| {
+            (
+                serde_yaml::to_string(&piece.patch).unwrap(),
+                serde_json::to_vec_pretty(&piece.manifest).unwrap(),
+                serde_json::to_vec_pretty(&piece.preflight).unwrap(),
+            )
+        };
+        assert_eq!(serialize(&first), serialize(&second));
+        assert!(first.patch.layers[0]
+            .source_path
+            .starts_with(crate::media_source::CONTENT_SHA256_PREFIX));
+        assert!(first.manifest.identity_complete);
+        assert!(!first.preflight.pixel_identity_claimed);
+        let artifacts = format!(
+            "{}\n{}\n{}",
+            serde_yaml::to_string(&first.patch).unwrap(),
+            serde_json::to_string(&first.manifest).unwrap(),
+            serde_json::to_string(&first.preflight).unwrap()
+        );
+        assert!(!artifacts.contains(&first_root.to_string_lossy().to_string()));
+        assert!(!artifacts.contains(&second_root.to_string_lossy().to_string()));
+
+        fs::write(&second_media, b"changed source bytes").unwrap();
+        let changed = build(&second_media, &second_root);
+        assert_ne!(first.manifest.anchor_sha256, changed.manifest.anchor_sha256);
+        assert_ne!(first.manifest.piece_sha256, changed.manifest.piece_sha256);
+        assert_ne!(
+            first.preflight.sources[0].sha256,
+            changed.preflight.sources[0].sha256
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn version_one_manifest_deserializes_with_safe_identity_defaults() {
+        let legacy = r#"{
+            "schema_version": 1,
+            "generator_version": "1",
+            "seed": 9,
+            "index": 0,
+            "temperature": 0.5,
+            "title": "grid field",
+            "slug": "grid-field",
+            "anchor_fnv1a64": "0123456789abcdef",
+            "lineage": "0123456789abcdef",
+            "logical_sources": ["clip.mp4"],
+            "warnings": []
+        }"#;
+        let manifest: Manifest = serde_json::from_str(legacy).unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert!(manifest.anchor_sha256.is_empty());
+        assert!(manifest.piece_sha256.is_empty());
+        assert!(!manifest.identity_complete);
+        assert!(manifest.sources.is_empty());
+    }
+
+    #[test]
     fn generated_values_stay_finite_bounded_and_preserve_topology() {
         let config = GenerationConfig {
             seed: 99,
@@ -1426,6 +1902,10 @@ mod tests {
             assert!(piece.patch.master.cellular_amount.is_finite());
             assert!((0.0..=1.0).contains(&piece.patch.master.cellular_amount));
             assert!((2.0..=32.0).contains(&piece.patch.master.cellular_scale));
+            assert!((0.0..=1.0).contains(&piece.patch.master.shift_amount));
+            assert!((2.0..=256.0).contains(&piece.patch.master.shift_block_size));
+            assert!((0.0..=1.0).contains(&piece.patch.master.shift_density));
+            assert!((0.0..=20.0).contains(&piece.patch.master.shift_speed));
         }
     }
 
@@ -1472,6 +1952,14 @@ mod tests {
         let created = write_patch_only(&pieces, &root).unwrap();
         assert!(created[0].join("patch.yaml").is_file());
         assert!(created[0].join("manifest.json").is_file());
+        assert!(created[0].join("preflight.json").is_file());
+        assert_eq!(
+            fs::read_dir(&created[0])
+                .unwrap()
+                .filter_map(Result::ok)
+                .count(),
+            3
+        );
         assert!(write_patch_only(&pieces, &root)
             .unwrap_err()
             .contains("overwrite"));

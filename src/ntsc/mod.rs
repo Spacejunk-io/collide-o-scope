@@ -57,6 +57,19 @@ pub struct NtscParams {
 /// live readback latency or export frame rate.
 pub const NTSC_REFERENCE_FPS: f64 = 30.0;
 
+/// Spatial resolution used by the CPU NTSC processor.
+///
+/// Live rendering intentionally keeps the historical half-resolution path for
+/// bounded latency. Offline export may opt into native resolution when visual
+/// fidelity is more important than render time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NtscExportQuality {
+    #[default]
+    LiveParity,
+    Native,
+}
+
 /// Effect state sampled alongside one raw composite readback.
 ///
 /// Keeping this metadata attached to the pixels prevents a delayed GPU map
@@ -450,6 +463,26 @@ impl NtscState {
         height: u32,
         reference_frame: usize,
     ) -> bool {
+        self.apply_at_reference_frame_with_resolution(
+            pixels,
+            width,
+            height,
+            reference_frame,
+            NtscExportQuality::LiveParity,
+        )
+    }
+
+    /// Apply one explicitly phased frame at the requested export quality.
+    /// Native processing is intentionally opt-in because its CPU and memory
+    /// cost scale with the full output dimensions.
+    pub fn apply_at_reference_frame_with_resolution(
+        &mut self,
+        pixels: &mut [u8],
+        width: u32,
+        height: u32,
+        reference_frame: usize,
+        quality: NtscExportQuality,
+    ) -> bool {
         if !self.params.enabled {
             return false;
         }
@@ -478,22 +511,34 @@ impl NtscState {
             .map(|pixel| pixel[3])
             .collect();
 
-        // Ceil division keeps a real sample for an odd final row/column.
-        let half_w = w.div_ceil(2);
-        let half_h = h.div_ceil(2);
-        let mut small = downscale_rgba_2x(pixels, w, h);
+        match quality {
+            NtscExportQuality::LiveParity => {
+                // Ceil division keeps a real sample for an odd final row/column.
+                let half_w = w.div_ceil(2);
+                let half_h = h.div_ceil(2);
+                let mut small = downscale_rgba_2x(pixels, w, h);
 
-        // Apply ntsc-rs at half resolution
-        self.effect.apply_effect_to_buffer::<Rgbx, u8>(
-            &self.ctx,
-            (half_w, half_h),
-            &mut small,
-            reference_frame,
-            [1.0, 1.0],
-        );
+                self.effect.apply_effect_to_buffer::<Rgbx, u8>(
+                    &self.ctx,
+                    (half_w, half_h),
+                    &mut small,
+                    reference_frame,
+                    [1.0, 1.0],
+                );
 
-        // Upscale back with nearest-neighbor (VHS doesn't need bilinear).
-        upscale_rgba_2x(&small, half_w, pixels, w, h);
+                // Preserve the established live look and cost profile.
+                upscale_rgba_2x(&small, half_w, pixels, w, h);
+            }
+            NtscExportQuality::Native => {
+                self.effect.apply_effect_to_buffer::<Rgbx, u8>(
+                    &self.ctx,
+                    (w, h),
+                    &mut pixels[..expected_len],
+                    reference_frame,
+                    [1.0, 1.0],
+                );
+            }
+        }
         restore_alpha(pixels, &source_alpha);
 
         true
@@ -817,6 +862,20 @@ pub(crate) fn process_selective_ntsc_batch_with_state(
     state: &mut NtscState,
     batch: SelectiveNtscBatch,
 ) -> Result<SelectiveNtscProcessedFrame, String> {
+    process_selective_ntsc_batch_with_state_and_resolution(
+        state,
+        batch,
+        NtscExportQuality::LiveParity,
+    )
+}
+
+/// Resolution-selectable form used by offline export. The live worker calls
+/// the compatibility wrapper above and therefore always remains half-size.
+pub(crate) fn process_selective_ntsc_batch_with_state_and_resolution(
+    state: &mut NtscState,
+    batch: SelectiveNtscBatch,
+    quality: NtscExportQuality,
+) -> Result<SelectiveNtscProcessedFrame, String> {
     let expected =
         checked_rgba_frame_len(batch.plan.generation.width, batch.plan.generation.height)
             .ok_or_else(|| "selective NTSC dimensions overflow".to_string())?;
@@ -838,11 +897,12 @@ pub(crate) fn process_selective_ntsc_batch_with_state(
             ));
         }
         if !layer.bypass_master_fx
-            && !state.apply_at_reference_frame(
+            && !state.apply_at_reference_frame_with_resolution(
                 &mut slice,
                 batch.plan.generation.width,
                 batch.plan.generation.height,
                 batch.plan.metadata.reference_frame,
+                quality,
             )
         {
             return Err(format!(
@@ -885,6 +945,125 @@ pub struct NtscProcessedFrame {
     pub epoch: u64,
     #[cfg(test)]
     pub metadata: NtscFrameMetadata,
+}
+
+/// Result of a non-blocking admission attempt into either live NTSC worker.
+///
+/// `Busy` is bounded backpressure: the worker is healthy but already owns a
+/// sample. `Unavailable` is terminal for the current worker instance and is
+/// kept separate so diagnostics never misreport a failed/disconnected worker
+/// as ordinary performance shedding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "NTSC admission outcomes distinguish performance backpressure from worker failure"]
+pub enum NtscSubmitOutcome {
+    Accepted,
+    Busy,
+    Unavailable,
+}
+
+impl NtscSubmitOutcome {
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
+}
+
+/// Saturating counters for one live NTSC path.
+///
+/// `attempted`, `accepted`, `skipped`, and `unavailable` describe admission
+/// decisions. `skipped` is reserved for healthy bounded backpressure;
+/// disconnected/failed workers are counted separately so a fault is never
+/// presented as ordinary load shedding.
+/// `stale` is deliberately orthogonal: already-admitted asynchronous work may
+/// later be rejected at a visual-generation or topology boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct NtscPathMetrics {
+    pub attempted: u64,
+    pub accepted: u64,
+    pub skipped: u64,
+    pub unavailable: u64,
+    pub stale: u64,
+}
+
+impl NtscPathMetrics {
+    /// Record one admission decision at the path's bounded-work boundary.
+    pub fn record_admission(&mut self, outcome: NtscSubmitOutcome) {
+        self.attempted = self.attempted.saturating_add(1);
+        match outcome {
+            NtscSubmitOutcome::Accepted => {
+                self.accepted = self.accepted.saturating_add(1);
+            }
+            NtscSubmitOutcome::Busy => {
+                self.skipped = self.skipped.saturating_add(1);
+            }
+            NtscSubmitOutcome::Unavailable => {
+                self.unavailable = self.unavailable.saturating_add(1);
+            }
+        }
+    }
+
+    /// Record an admission decision made by a non-worker stage, such as the
+    /// selective GPU staging slot.
+    pub fn record_attempt(&mut self, accepted: bool) {
+        self.record_admission(if accepted {
+            NtscSubmitOutcome::Accepted
+        } else {
+            NtscSubmitOutcome::Busy
+        });
+    }
+
+    /// Record one asynchronously completed sample rejected by the caller's
+    /// current visual-generation/path compatibility gate.
+    pub fn record_stale(&mut self) {
+        self.stale = self.stale.saturating_add(1);
+    }
+
+    /// Record a rejection at a downstream stage after this path's primary
+    /// admission was already counted. This is orthogonal to `attempted`:
+    /// selective VHS first admits a GPU readback, then offers its mapped batch
+    /// to the CPU worker.
+    pub fn record_downstream_rejection(&mut self, outcome: NtscSubmitOutcome) {
+        match outcome {
+            NtscSubmitOutcome::Accepted => {}
+            NtscSubmitOutcome::Busy => {
+                self.skipped = self.skipped.saturating_add(1);
+            }
+            NtscSubmitOutcome::Unavailable => {
+                self.unavailable = self.unavailable.saturating_add(1);
+            }
+        }
+    }
+
+    /// Add another interval or collector into this one without wrapping.
+    #[cfg(test)]
+    pub fn merge(&mut self, other: Self) {
+        self.attempted = self.attempted.saturating_add(other.attempted);
+        self.accepted = self.accepted.saturating_add(other.accepted);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+        self.unavailable = self.unavailable.saturating_add(other.unavailable);
+        self.stale = self.stale.saturating_add(other.stale);
+    }
+
+    #[cfg(test)]
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Process-lifetime live metrics remain split because the global and
+/// selective paths apply bounded backpressure at different pipeline stages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LiveNtscMetrics {
+    pub global: NtscPathMetrics,
+    pub selective: NtscPathMetrics,
+}
+
+impl LiveNtscMetrics {
+    #[cfg(test)]
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Runs ntsc-rs on a dedicated thread. The render loop submits composite
@@ -961,18 +1140,21 @@ impl NtscWorker {
         }
     }
 
-    /// Submit a frame for processing. Returns false (dropping the frame)
-    /// if the worker is still busy with the previous one.
-    pub fn try_submit(
+    /// Submit a frame for processing and distinguish bounded backpressure from
+    /// a worker that can no longer accept work.
+    pub fn try_submit_outcome(
         &mut self,
         pixels: Vec<u8>,
         width: u32,
         height: u32,
         metadata: NtscFrameMetadata,
         epoch: u64,
-    ) -> bool {
-        if self.failed || self.in_flight > 0 {
-            return false;
+    ) -> NtscSubmitOutcome {
+        if self.failed {
+            return NtscSubmitOutcome::Unavailable;
+        }
+        if self.in_flight > 0 {
+            return NtscSubmitOutcome::Busy;
         }
         let job = NtscJob {
             pixels,
@@ -984,14 +1166,28 @@ impl NtscWorker {
         match self.job_tx.try_send(job) {
             Ok(()) => {
                 self.in_flight += 1;
-                true
+                NtscSubmitOutcome::Accepted
             }
-            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Full(_)) => NtscSubmitOutcome::Busy,
             Err(TrySendError::Disconnected(_)) => {
                 self.mark_failed("NTSC worker input disconnected");
-                false
+                NtscSubmitOutcome::Unavailable
             }
         }
+    }
+
+    /// Compatibility wrapper for callers interested only in admission.
+    #[allow(dead_code)] // retained for older internal callers and focused tests
+    pub fn try_submit(
+        &mut self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        metadata: NtscFrameMetadata,
+        epoch: u64,
+    ) -> bool {
+        self.try_submit_outcome(pixels, width, height, metadata, epoch)
+            .is_accepted()
     }
 
     /// Collect a processed frame if one is ready.
@@ -1017,6 +1213,10 @@ impl NtscWorker {
 
     pub fn error(&self) -> &str {
         &self.last_error
+    }
+
+    pub fn is_busy(&self) -> bool {
+        !self.failed && self.in_flight > 0
     }
 
     fn mark_failed(&mut self, message: &str) {
@@ -1078,25 +1278,52 @@ impl SelectiveNtscWorker {
         }
     }
 
+    #[allow(dead_code)] // compatibility helper; admission_outcome preserves failure semantics
     pub fn is_idle(&self) -> bool {
-        !self.failed && !self.in_flight
+        matches!(self.admission_outcome(), NtscSubmitOutcome::Accepted)
     }
 
-    pub fn try_submit(&mut self, batch: SelectiveNtscBatch) -> bool {
-        if !self.is_idle() {
-            return false;
+    pub fn is_busy(&self) -> bool {
+        matches!(self.admission_outcome(), NtscSubmitOutcome::Busy)
+    }
+
+    /// Current classification at the CPU-worker admission boundary. Callers
+    /// must not infer failure from `!is_idle()`: healthy in-flight work and a
+    /// disconnected worker have different telemetry and recovery meaning.
+    pub fn admission_outcome(&self) -> NtscSubmitOutcome {
+        if self.failed {
+            NtscSubmitOutcome::Unavailable
+        } else if self.in_flight {
+            NtscSubmitOutcome::Busy
+        } else {
+            NtscSubmitOutcome::Accepted
+        }
+    }
+
+    pub fn try_submit_outcome(&mut self, batch: SelectiveNtscBatch) -> NtscSubmitOutcome {
+        if self.failed {
+            return NtscSubmitOutcome::Unavailable;
+        }
+        if self.in_flight {
+            return NtscSubmitOutcome::Busy;
         }
         match self.job_tx.try_send(batch) {
             Ok(()) => {
                 self.in_flight = true;
-                true
+                NtscSubmitOutcome::Accepted
             }
-            Err(TrySendError::Full(_)) => false,
+            Err(TrySendError::Full(_)) => NtscSubmitOutcome::Busy,
             Err(TrySendError::Disconnected(_)) => {
                 self.mark_failed("selective NTSC worker input disconnected");
-                false
+                NtscSubmitOutcome::Unavailable
             }
         }
+    }
+
+    /// Compatibility wrapper for callers interested only in admission.
+    #[allow(dead_code)] // retained for older internal callers and focused tests
+    pub fn try_submit(&mut self, batch: SelectiveNtscBatch) -> bool {
+        self.try_submit_outcome(batch).is_accepted()
     }
 
     pub fn try_recv(&mut self) -> Option<SelectiveNtscProcessedFrame> {
@@ -1137,11 +1364,13 @@ impl SelectiveNtscWorker {
 mod tests {
     use super::{
         composite_selective_ntsc_layers, downscale_rgba_2x, plan_selective_ntsc,
-        process_selective_ntsc_batch, reference_frame_for_output, reference_frame_for_time,
-        restore_alpha, selective_generation_compatible, selective_generation_is_current,
-        selective_ntsc_required, selective_plan_compatible, srgb_byte_to_linear, upscale_rgba_2x,
+        process_selective_ntsc_batch, process_selective_ntsc_batch_with_state_and_resolution,
+        reference_frame_for_output, reference_frame_for_time, restore_alpha,
+        selective_generation_compatible, selective_generation_is_current, selective_ntsc_required,
+        selective_plan_compatible, srgb_byte_to_linear, upscale_rgba_2x,
         validate_selective_ntsc_gpu_staging_limit, validate_selective_ntsc_live_memory,
-        NtscFrameMetadata, NtscParams, NtscWorker, SelectiveNtscBatch, SelectiveNtscGeneration,
+        LiveNtscMetrics, NtscExportQuality, NtscFrameMetadata, NtscParams, NtscPathMetrics,
+        NtscState, NtscSubmitOutcome, NtscWorker, SelectiveNtscBatch, SelectiveNtscGeneration,
         SelectiveNtscLayerDescriptor, SelectiveNtscWorker, MAX_SELECTIVE_NTSC_LIVE_BYTES,
     };
     use std::time::{Duration, Instant};
@@ -1173,6 +1402,75 @@ mod tests {
     }
 
     #[test]
+    fn export_quality_defaults_to_live_parity_and_native_preserves_alpha() {
+        assert_eq!(NtscExportQuality::default(), NtscExportQuality::LiveParity);
+        assert_eq!(
+            serde_json::from_str::<NtscExportQuality>("\"live_parity\"").unwrap(),
+            NtscExportQuality::LiveParity
+        );
+        assert_eq!(
+            serde_json::from_str::<NtscExportQuality>("\"native\"").unwrap(),
+            NtscExportQuality::Native
+        );
+        assert!(serde_json::from_str::<NtscExportQuality>("\"unknown\"").is_err());
+
+        let width = 8u32;
+        let height = 8u32;
+        let mut source = Vec::with_capacity((width * height * 4) as usize);
+        for index in 0..(width * height) {
+            let value = if (index + index / width).is_multiple_of(2) {
+                0
+            } else {
+                255
+            };
+            source.extend_from_slice(&[value, 255 - value, value, (index * 3) as u8]);
+        }
+        let expected_alpha: Vec<_> = source.chunks_exact(4).map(|pixel| pixel[3]).collect();
+
+        let params = NtscParams {
+            enabled: true,
+            snow_intensity: 0.35,
+            ..Default::default()
+        };
+        let mut half = source.clone();
+        let mut explicit_half = source.clone();
+        let mut native = source;
+        let mut half_state = NtscState::new();
+        half_state.params = params.clone();
+        assert!(half_state.apply_at_reference_frame(&mut half, width, height, 17));
+        let mut explicit_half_state = NtscState::new();
+        explicit_half_state.params = params.clone();
+        assert!(
+            explicit_half_state.apply_at_reference_frame_with_resolution(
+                &mut explicit_half,
+                width,
+                height,
+                17,
+                NtscExportQuality::LiveParity,
+            )
+        );
+        let mut native_state = NtscState::new();
+        native_state.params = params;
+        assert!(native_state.apply_at_reference_frame_with_resolution(
+            &mut native,
+            width,
+            height,
+            17,
+            NtscExportQuality::Native,
+        ));
+
+        assert_eq!(half, explicit_half);
+        assert_ne!(half, native);
+        assert_eq!(
+            native
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>(),
+            expected_alpha
+        );
+    }
+
+    #[test]
     fn reference_phase_matches_at_thirty_and_sixty_fps() {
         for frame_30 in 0..120u64 {
             let at_30 = reference_frame_for_output(frame_30, 30);
@@ -1186,6 +1484,79 @@ mod tests {
         }
         assert_eq!(reference_frame_for_time(f64::NAN), 0);
         assert_eq!(reference_frame_for_time(-1.0), 0);
+    }
+
+    #[test]
+    fn live_metrics_are_path_specific_saturating_and_backward_compatible() {
+        let mut metrics = LiveNtscMetrics::default();
+        metrics.global.record_admission(NtscSubmitOutcome::Accepted);
+        metrics.global.record_admission(NtscSubmitOutcome::Busy);
+        metrics
+            .global
+            .record_admission(NtscSubmitOutcome::Unavailable);
+        metrics.global.record_stale();
+        metrics.selective.record_attempt(true);
+        metrics.selective.record_attempt(false);
+        metrics
+            .selective
+            .record_downstream_rejection(NtscSubmitOutcome::Unavailable);
+
+        assert_eq!(
+            metrics.global,
+            NtscPathMetrics {
+                attempted: 3,
+                accepted: 1,
+                skipped: 1,
+                unavailable: 1,
+                stale: 1,
+            }
+        );
+        assert_eq!(
+            metrics.selective,
+            NtscPathMetrics {
+                attempted: 2,
+                accepted: 1,
+                skipped: 1,
+                unavailable: 1,
+                stale: 0,
+            }
+        );
+
+        let legacy: LiveNtscMetrics = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy, LiveNtscMetrics::default());
+
+        let mut saturated = NtscPathMetrics {
+            attempted: u64::MAX,
+            accepted: u64::MAX,
+            skipped: u64::MAX,
+            unavailable: u64::MAX,
+            stale: u64::MAX,
+        };
+        saturated.record_admission(NtscSubmitOutcome::Accepted);
+        saturated.record_admission(NtscSubmitOutcome::Busy);
+        saturated.record_stale();
+        saturated.merge(NtscPathMetrics {
+            attempted: 1,
+            accepted: 1,
+            skipped: 1,
+            unavailable: 1,
+            stale: 1,
+        });
+        assert_eq!(
+            saturated,
+            NtscPathMetrics {
+                attempted: u64::MAX,
+                accepted: u64::MAX,
+                skipped: u64::MAX,
+                unavailable: u64::MAX,
+                stale: u64::MAX,
+            }
+        );
+
+        metrics.reset();
+        assert_eq!(metrics, LiveNtscMetrics::default());
+        saturated.reset();
+        assert_eq!(saturated, NtscPathMetrics::default());
     }
 
     #[test]
@@ -1207,8 +1578,15 @@ mod tests {
             },
             reference_frame: 41,
         };
-        assert!(worker.try_submit(vec![128; 64 * 64 * 4], 64, 64, first.clone(), 9));
-        assert!(!worker.try_submit(vec![64; 64 * 64 * 4], 64, 64, newer, 9));
+        assert_eq!(
+            worker.try_submit_outcome(vec![128; 64 * 64 * 4], 64, 64, first.clone(), 9),
+            NtscSubmitOutcome::Accepted
+        );
+        assert!(worker.is_busy());
+        assert_eq!(
+            worker.try_submit_outcome(vec![64; 64 * 64 * 4], 64, 64, newer, 9),
+            NtscSubmitOutcome::Busy
+        );
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let processed = loop {
@@ -1220,6 +1598,9 @@ mod tests {
         };
         assert_eq!(processed.epoch, 9);
         assert_eq!(processed.metadata, first);
+        assert!(!worker.is_busy());
+
+        assert!(worker.try_submit(vec![128; 4 * 4 * 4], 4, 4, enabled_metadata(), 10,));
     }
 
     fn descriptor(
@@ -1381,13 +1762,71 @@ mod tests {
         )
         .unwrap();
         let dry = vec![3, 17, 249, 0, 255, 128, 7, 231];
-        let processed = process_selective_ntsc_batch(SelectiveNtscBatch {
-            plan,
-            slices: vec![dry.clone()],
-        })
+        for quality in [NtscExportQuality::LiveParity, NtscExportQuality::Native] {
+            let processed = process_selective_ntsc_batch_with_state_and_resolution(
+                &mut NtscState::new(),
+                SelectiveNtscBatch {
+                    plan: plan.clone(),
+                    slices: vec![dry.clone()],
+                },
+                quality,
+            )
+            .unwrap();
+            assert_eq!(processed.pixels, dry, "quality {quality:?}");
+            assert_eq!(processed.plan.generation, generation(2, 1));
+        }
+    }
+
+    #[test]
+    fn selective_export_quality_changes_only_the_inherited_processing_route() {
+        let width = 8;
+        let height = 8;
+        let plan = plan_selective_ntsc(
+            generation(width, height),
+            NtscFrameMetadata {
+                params: NtscParams {
+                    enabled: true,
+                    snow_intensity: 0.35,
+                    ..Default::default()
+                },
+                reference_frame: 19,
+            },
+            [
+                descriptor(10, true, true, 0.35, 0),
+                descriptor(20, true, false, 1.0, 0),
+            ],
+        )
         .unwrap();
-        assert_eq!(processed.pixels, dry);
-        assert_eq!(processed.plan.generation, generation(2, 1));
+        assert!(!plan.layers[0].bypass_master_fx);
+        assert!(plan.layers[1].bypass_master_fx);
+
+        let mut inherited = Vec::with_capacity((width * height * 4) as usize);
+        for index in 0..(width * height) {
+            let value = if (index + index / width) % 2 == 0 {
+                0
+            } else {
+                255
+            };
+            inherited.extend_from_slice(&[value, 255 - value, value, 255]);
+        }
+        let bypass = vec![24; (width * height * 4) as usize];
+
+        let run = |quality| {
+            process_selective_ntsc_batch_with_state_and_resolution(
+                &mut NtscState::new(),
+                SelectiveNtscBatch {
+                    plan: plan.clone(),
+                    slices: vec![inherited.clone(), bypass.clone()],
+                },
+                quality,
+            )
+            .unwrap()
+            .pixels
+        };
+        assert_ne!(
+            run(NtscExportQuality::LiveParity),
+            run(NtscExportQuality::Native)
+        );
     }
 
     #[test]
@@ -1513,14 +1952,21 @@ mod tests {
         )
         .unwrap();
         let mut worker = SelectiveNtscWorker::new();
-        assert!(worker.try_submit(SelectiveNtscBatch {
-            plan: plan.clone(),
-            slices: vec![vec![4, 3, 2, 1]],
-        }));
-        assert!(!worker.try_submit(SelectiveNtscBatch {
-            plan,
-            slices: vec![vec![9, 8, 7, 6]],
-        }));
+        assert_eq!(
+            worker.try_submit_outcome(SelectiveNtscBatch {
+                plan: plan.clone(),
+                slices: vec![vec![4, 3, 2, 1]],
+            }),
+            NtscSubmitOutcome::Accepted
+        );
+        assert!(worker.is_busy());
+        assert_eq!(
+            worker.try_submit_outcome(SelectiveNtscBatch {
+                plan,
+                slices: vec![vec![9, 8, 7, 6]],
+            }),
+            NtscSubmitOutcome::Busy
+        );
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let frame = loop {
@@ -1534,5 +1980,24 @@ mod tests {
             std::thread::yield_now();
         };
         assert_eq!(frame.pixels, [4, 3, 2, 1]);
+        assert!(!worker.is_busy());
+        assert_eq!(worker.admission_outcome(), NtscSubmitOutcome::Accepted);
+    }
+
+    #[test]
+    fn failed_selective_worker_is_unavailable_never_healthy_backpressure() {
+        let mut worker = SelectiveNtscWorker::new();
+        worker.mark_failed("selective worker failure fixture");
+
+        assert_eq!(worker.admission_outcome(), NtscSubmitOutcome::Unavailable);
+        assert!(!worker.is_idle());
+        assert!(!worker.is_busy());
+
+        let mut metrics = NtscPathMetrics::default();
+        metrics.record_admission(worker.admission_outcome());
+        assert_eq!(metrics.attempted, 1);
+        assert_eq!(metrics.accepted, 0);
+        assert_eq!(metrics.skipped, 0);
+        assert_eq!(metrics.unavailable, 1);
     }
 }

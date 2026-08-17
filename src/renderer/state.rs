@@ -14,6 +14,82 @@ use crate::ntsc::{
 /// Frames of output history kept for temporal effects (0.8s at 30fps).
 pub const HISTORY_LEN: u32 = 24;
 
+/// Full-frame RGBA textures owned unconditionally by a live renderer: the
+/// history ring, one feedback texture, three composite targets, and one held
+/// audience frame. This is an exact payload floor, not a VRAM estimate: driver
+/// padding, surfaces, buffers, and media/layer textures are intentionally not
+/// included.
+const RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES: u64 = HISTORY_LEN as u64 + 5;
+
+fn renderer_owned_full_frame_texture_floor_bytes(width: u32, height: u32) -> Option<u64> {
+    u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)?
+        .checked_mul(RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScopedGpuErrors {
+    out_of_memory: Option<String>,
+    internal: Option<String>,
+    validation: Option<String>,
+}
+
+/// Turn wgpu's three handle-returning error channels into one stable,
+/// user-facing failure. Allocation pressure wins over backend and validation
+/// noise because it gives the operator the most actionable recovery signal.
+fn scoped_gpu_error_message(context: &str, errors: ScopedGpuErrors) -> Option<String> {
+    [
+        ("out of memory", errors.out_of_memory),
+        ("internal/backend", errors.internal),
+        ("validation", errors.validation),
+    ]
+    .into_iter()
+    .find_map(|(kind, error)| error.map(|error| format!("{context} failed ({kind}): {error}")))
+}
+
+/// Construct handle-returning wgpu resources under all recoverable error
+/// scopes and inspect those scopes before any returned handle is used.
+fn create_gpu_resources_checked<T>(
+    device: &wgpu::Device,
+    context: &str,
+    create: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let resources = create();
+    let errors = ScopedGpuErrors {
+        out_of_memory: pollster::block_on(out_of_memory.pop()).map(|error| error.to_string()),
+        internal: pollster::block_on(internal.pop()).map(|error| error.to_string()),
+        validation: pollster::block_on(validation.pop()).map(|error| error.to_string()),
+    };
+    match scoped_gpu_error_message(context, errors) {
+        Some(error) => Err(error),
+        None => Ok(resources),
+    }
+}
+
+fn validate_readback_buffer_size(
+    padded_row_bytes: u32,
+    height: u32,
+    max_buffer_size: u64,
+) -> Result<u64, String> {
+    let size = u64::from(padded_row_bytes)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| "audience readback buffer size overflowed".to_string())?;
+    if size == 0 {
+        return Err("audience readback buffer cannot be empty".to_string());
+    }
+    if size > max_buffer_size {
+        return Err(format!(
+            "audience readback requires {size} bytes, exceeding the GPU buffer limit of \
+             {max_buffer_size} bytes"
+        ));
+    }
+    Ok(size)
+}
+
 /// Internal render targets carry sRGB-encoded bytes but are sampled through
 /// sRGB views so all shader math happens in linear light.
 const COMPOSITE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -208,6 +284,72 @@ mod temporal_state_tests {
             health.error().as_deref(),
             Some("device lost during output configure")
         );
+    }
+
+    #[test]
+    fn renderer_owned_full_frame_texture_floor_is_exact_and_checked() {
+        assert_eq!(RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES, 29);
+        assert_eq!(
+            renderer_owned_full_frame_texture_floor_bytes(1280, 720),
+            Some(106_905_600)
+        );
+        assert_eq!(
+            renderer_owned_full_frame_texture_floor_bytes(3840, 2160),
+            Some(962_150_400)
+        );
+        assert_eq!(
+            renderer_owned_full_frame_texture_floor_bytes(u32::MAX, u32::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_gpu_errors_are_descriptive_and_prioritize_allocation_pressure() {
+        let message = scoped_gpu_error_message(
+            "selective NTSC GPU resources",
+            ScopedGpuErrors {
+                out_of_memory: Some("allocation rejected".to_string()),
+                internal: Some("backend also reported an error".to_string()),
+                validation: Some("descriptor also rejected".to_string()),
+            },
+        );
+        assert_eq!(
+            message.as_deref(),
+            Some("selective NTSC GPU resources failed (out of memory): allocation rejected")
+        );
+        assert_eq!(
+            scoped_gpu_error_message(
+                "audience readback buffer allocation",
+                ScopedGpuErrors {
+                    validation: Some("size is invalid".to_string()),
+                    ..ScopedGpuErrors::default()
+                },
+            )
+            .as_deref(),
+            Some("audience readback buffer allocation failed (validation): size is invalid")
+        );
+        assert_eq!(
+            scoped_gpu_error_message("unused", ScopedGpuErrors::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn audience_readback_buffer_size_is_checked_against_the_device_limit() {
+        assert_eq!(
+            validate_readback_buffer_size(5_120, 720, 8_000_000),
+            Ok(3_686_400)
+        );
+        assert!(validate_readback_buffer_size(5_120, 720, 3_686_399)
+            .unwrap_err()
+            .contains("exceeding the GPU buffer limit"));
+        assert_eq!(
+            validate_readback_buffer_size(u32::MAX, u32::MAX, u64::MAX),
+            Ok(u64::from(u32::MAX) * u64::from(u32::MAX))
+        );
+        assert!(validate_readback_buffer_size(0, 720, u64::MAX)
+            .unwrap_err()
+            .contains("cannot be empty"));
     }
 
     fn advance(state: &mut TemporalState, delta_seconds: f32) -> u32 {
@@ -802,6 +944,21 @@ struct SelectiveNtscGpuState {
     scratch_textures: [wgpu::Texture; 2],
     scratch_views: [wgpu::TextureView; 2],
     slot: SelectiveNtscReadbackSlot,
+}
+
+/// One frame's selective bindings. Keeping the uniform buffers beside their
+/// bind groups makes their lifetime explicit until command encoding finishes.
+struct SelectiveNtscLayerGpuBindings {
+    _uniform_buffer: wgpu::Buffer,
+    texture_bind_group: wgpu::BindGroup,
+    uniform_bind_group: wgpu::BindGroup,
+}
+
+struct SelectiveNtscBatchGpuBindings {
+    _master_uniform_buffer: wgpu::Buffer,
+    master_texture_bind_group: wgpu::BindGroup,
+    master_uniform_bind_group: wgpu::BindGroup,
+    layers: Vec<SelectiveNtscLayerGpuBindings>,
 }
 
 /// Build the temporal pipeline and its layouts. Shared by the live
@@ -1618,6 +1775,13 @@ impl Renderer {
         // never the sole memory-safety boundary.
         crate::video::decoder::validate_media_dimensions(output_width, output_height, None)
             .map_err(|error| format!("invalid renderer output dimensions: {error}"))?;
+        let full_frame_texture_floor = renderer_owned_full_frame_texture_floor_bytes(
+            output_width,
+            output_height,
+        )
+        .ok_or_else(|| {
+            format!("renderer output texture footprint overflows at {output_width}x{output_height}")
+        })?;
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance
@@ -1682,6 +1846,15 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         configure_surface_checked(&device, &surface, &config, &gpu_health)?;
+
+        // Resource constructors return handles rather than Results. Keep the
+        // complete startup allocation/pipeline phase under explicit scopes so
+        // validation, backend, and allocation failures can activate the
+        // caller's lower-resolution recovery path instead of surfacing later
+        // as an uncaptured error.
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
@@ -1939,6 +2112,24 @@ impl Renderer {
             &composite_views[0],
             &sampler,
         );
+
+        let allocation_errors = [
+            pollster::block_on(out_of_memory.pop()),
+            pollster::block_on(internal.pop()),
+            pollster::block_on(validation.pop()),
+        ];
+        if let Some(error) = allocation_errors.into_iter().flatten().next() {
+            return Err(format!(
+                "renderer resource allocation failed at {output_width}x{output_height} \
+                 ({full_frame_texture_floor} bytes of mandatory owned full-frame RGBA texture \
+                 payload): {error}"
+            ));
+        }
+        if let Some(error) = gpu_health.error() {
+            return Err(format!(
+                "renderer resource allocation failed at {output_width}x{output_height}: {error}"
+            ));
+        }
 
         Ok(Self {
             surface,
@@ -3063,64 +3254,106 @@ impl Renderer {
         ))
     }
 
-    fn ensure_selective_ntsc_gpu(&mut self, required_capacity: u64) {
+    fn ensure_selective_ntsc_gpu(&mut self, required_capacity: u64) -> Result<(), String> {
+        self.ensure_device_healthy()
+            .map_err(|error| format!("selective NTSC GPU allocation unavailable: {error}"))?;
         let needs_state = self.selective_ntsc_gpu.is_none();
         if needs_state {
-            let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC;
-            let scratch_textures: [wgpu::Texture; 2] = std::array::from_fn(|index| {
-                self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&format!("Selective NTSC Scratch {index}")),
-                    size: wgpu::Extent3d {
-                        width: self.output_width,
-                        height: self.output_height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: COMPOSITE_FORMAT,
-                    usage,
-                    view_formats: &[],
-                })
-            });
-            let scratch_views = std::array::from_fn(|index| {
-                scratch_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
-            });
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Selective NTSC Readback Batch"),
-                size: required_capacity,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            self.selective_ntsc_gpu = Some(SelectiveNtscGpuState {
-                scratch_textures,
-                scratch_views,
-                slot: SelectiveNtscReadbackSlot {
-                    buffer,
-                    capacity: required_capacity,
-                    status: Arc::new(AtomicU8::new(SLOT_IDLE)),
-                    used_size: 0,
-                    padded_row_bytes: 0,
-                    slice_stride: 0,
-                    plan: None,
+            let state = create_gpu_resources_checked(
+                &self.device,
+                &format!(
+                    "selective NTSC full-output resources at {}x{} with a \
+                     {required_capacity}-byte staging buffer",
+                    self.output_width, self.output_height
+                ),
+                || {
+                    let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC;
+                    let scratch_textures: [wgpu::Texture; 2] = std::array::from_fn(|index| {
+                        self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some(&format!("Selective NTSC Scratch {index}")),
+                            size: wgpu::Extent3d {
+                                width: self.output_width,
+                                height: self.output_height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: COMPOSITE_FORMAT,
+                            usage,
+                            view_formats: &[],
+                        })
+                    });
+                    let scratch_views = std::array::from_fn(|index| {
+                        scratch_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+                    });
+                    let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Selective NTSC Readback Batch"),
+                        size: required_capacity,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    SelectiveNtscGpuState {
+                        scratch_textures,
+                        scratch_views,
+                        slot: SelectiveNtscReadbackSlot {
+                            buffer,
+                            capacity: required_capacity,
+                            status: Arc::new(AtomicU8::new(SLOT_IDLE)),
+                            used_size: 0,
+                            padded_row_bytes: 0,
+                            slice_stride: 0,
+                            plan: None,
+                        },
+                    }
                 },
-            });
-            return;
+            )?;
+            self.ensure_device_healthy().map_err(|error| {
+                format!("selective NTSC full-output resource allocation failed: {error}")
+            })?;
+            self.selective_ntsc_gpu = Some(state);
+            return Ok(());
         }
 
-        let state = self.selective_ntsc_gpu.as_mut().unwrap();
-        if state.slot.capacity < required_capacity {
-            debug_assert_eq!(state.slot.status.load(Ordering::Acquire), SLOT_IDLE);
-            state.slot.buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Selective NTSC Readback Batch"),
-                size: required_capacity,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
+        let current_capacity = self
+            .selective_ntsc_gpu
+            .as_ref()
+            .map(|state| state.slot.capacity)
+            .unwrap();
+        if current_capacity < required_capacity {
+            debug_assert_eq!(
+                self.selective_ntsc_gpu
+                    .as_ref()
+                    .unwrap()
+                    .slot
+                    .status
+                    .load(Ordering::Acquire),
+                SLOT_IDLE
+            );
+            let buffer = create_gpu_resources_checked(
+                &self.device,
+                &format!(
+                    "selective NTSC staging-buffer resize from {} to {required_capacity} bytes",
+                    current_capacity
+                ),
+                || {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Selective NTSC Readback Batch"),
+                        size: required_capacity,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    })
+                },
+            )?;
+            self.ensure_device_healthy()
+                .map_err(|error| format!("selective NTSC staging-buffer resize failed: {error}"))?;
+            let state = self.selective_ntsc_gpu.as_mut().unwrap();
+            state.slot.buffer = buffer;
             state.slot.capacity = required_capacity;
         }
+        Ok(())
     }
 
     /// Encode one generation-coherent selective-VHS batch. Every contributing
@@ -3152,41 +3385,9 @@ impl Renderer {
             return Ok(false);
         }
 
-        let (padded_row_bytes, slice_stride, used_size) =
-            self.selective_batch_layout(plan.layers.len())?;
-        self.ensure_selective_ntsc_gpu(used_size);
-
-        let state = self.selective_ntsc_gpu.as_ref().unwrap();
-        let master_buffer = create_uploaded_uniform(
-            &self.device,
-            &self.queue,
-            "Selective NTSC Master FX Uniforms",
-            master_uniforms,
-        );
-        let master_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Selective NTSC Master FX Input"),
-            layout: &self.effects_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&state.scratch_views[0]),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        let master_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Selective NTSC Master FX Uniforms BG"),
-            layout: &self.effects_uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: master_buffer.as_entire_binding(),
-            }],
-        });
-
-        for (slice_index, planned_layer) in plan.layers.iter().enumerate() {
+        let mut source_indices = Vec::with_capacity(plan.layers.len());
+        let mut layer_uniforms = Vec::with_capacity(plan.layers.len());
+        for planned_layer in &plan.layers {
             let source_index = layers
                 .iter()
                 .position(|layer| layer.layer_id() == planned_layer.layer_id)
@@ -3203,37 +3404,112 @@ impl Renderer {
                     planned_layer.layer_id
                 ));
             }
-            let uniforms = mods[source_index]
-                .0
-                .for_render_target(self.output_width, self.output_height);
-            let fx_buffer = create_uploaded_uniform(
-                &self.device,
-                &self.queue,
-                "Selective NTSC Layer FX Uniforms",
-                &uniforms,
+            source_indices.push(source_index);
+            layer_uniforms.push(
+                mods[source_index]
+                    .0
+                    .for_render_target(self.output_width, self.output_height),
             );
-            let layer_tex_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Selective NTSC Layer FX Input"),
-                layout: &self.effects_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&layer.texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            });
-            let layer_uniform_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Selective NTSC Layer FX Uniforms BG"),
-                layout: &self.effects_uniform_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: fx_buffer.as_entire_binding(),
-                }],
-            });
+        }
+
+        let (padded_row_bytes, slice_stride, used_size) =
+            self.selective_batch_layout(plan.layers.len())?;
+        self.ensure_selective_ntsc_gpu(used_size)?;
+
+        let state = self.selective_ntsc_gpu.as_ref().unwrap();
+        let bindings = create_gpu_resources_checked(
+            &self.device,
+            "selective NTSC per-batch uniform buffers and bind groups",
+            || {
+                let master_uniform_buffer = create_uploaded_uniform(
+                    &self.device,
+                    &self.queue,
+                    "Selective NTSC Master FX Uniforms",
+                    master_uniforms,
+                );
+                let master_texture_bind_group =
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Selective NTSC Master FX Input"),
+                        layout: &self.effects_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(
+                                    &state.scratch_views[0],
+                                ),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+                let master_uniform_bind_group =
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Selective NTSC Master FX Uniforms BG"),
+                        layout: &self.effects_uniform_layout,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: master_uniform_buffer.as_entire_binding(),
+                        }],
+                    });
+                let layers = source_indices
+                    .iter()
+                    .zip(&layer_uniforms)
+                    .map(|(&source_index, uniforms)| {
+                        let uniform_buffer = create_uploaded_uniform(
+                            &self.device,
+                            &self.queue,
+                            "Selective NTSC Layer FX Uniforms",
+                            uniforms,
+                        );
+                        let texture_bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("Selective NTSC Layer FX Input"),
+                                layout: &self.effects_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &layers[source_index].texture_view,
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                                    },
+                                ],
+                            });
+                        let uniform_bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("Selective NTSC Layer FX Uniforms BG"),
+                                layout: &self.effects_uniform_layout,
+                                entries: &[wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: uniform_buffer.as_entire_binding(),
+                                }],
+                            });
+                        SelectiveNtscLayerGpuBindings {
+                            _uniform_buffer: uniform_buffer,
+                            texture_bind_group,
+                            uniform_bind_group,
+                        }
+                    })
+                    .collect();
+                SelectiveNtscBatchGpuBindings {
+                    _master_uniform_buffer: master_uniform_buffer,
+                    master_texture_bind_group,
+                    master_uniform_bind_group,
+                    layers,
+                }
+            },
+        )?;
+        self.ensure_device_healthy().map_err(|error| {
+            format!("selective NTSC per-batch resource allocation failed: {error}")
+        })?;
+
+        for (slice_index, planned_layer) in plan.layers.iter().enumerate() {
+            let layer_bindings = &bindings.layers[slice_index];
 
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3251,8 +3527,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &layer_tex_bg, &[]);
-                pass.set_bind_group(1, &layer_uniform_bg, &[]);
+                pass.set_bind_group(0, &layer_bindings.texture_bind_group, &[]);
+                pass.set_bind_group(1, &layer_bindings.uniform_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -3274,8 +3550,8 @@ impl Renderer {
                     ..Default::default()
                 });
                 pass.set_pipeline(&self.effects_pipeline);
-                pass.set_bind_group(0, &master_tex_bg, &[]);
-                pass.set_bind_group(1, &master_uniform_bg, &[]);
+                pass.set_bind_group(0, &bindings.master_texture_bind_group, &[]);
+                pass.set_bind_group(1, &bindings.master_uniform_bind_group, &[]);
                 pass.draw(0..3, 0..1);
                 1
             };
@@ -3345,6 +3621,15 @@ impl Renderer {
                 );
             },
         );
+    }
+
+    /// Whether the one-slot selective staging pipeline currently owns a GPU
+    /// batch. This is separate from CPU-worker occupancy and is surfaced only
+    /// as live diagnostics; callers must still use `begin_*` for admission.
+    pub fn selective_ntsc_readback_busy(&self) -> bool {
+        self.selective_ntsc_gpu
+            .as_ref()
+            .is_some_and(|state| state.slot.status.load(Ordering::Acquire) != SLOT_IDLE)
     }
 
     /// Harvest the single newest mapped selective batch without blocking.
@@ -3436,13 +3721,14 @@ impl Renderer {
     /// image in composite_textures[2]
     /// into a free staging buffer. Returns the slot index to pass to
     /// `map_readback` after the encoder is submitted, or None if every
-    /// slot still has a copy in flight.
+    /// slot still has a copy in flight. Lazy allocation/validation failures
+    /// are returned before an invalid buffer handle can enter a command.
     pub fn begin_readback(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
         ntsc_metadata: Option<NtscFrameMetadata>,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, String> {
         self.begin_readback_tagged(encoder, epoch, ntsc_metadata, None, false)
     }
 
@@ -3454,7 +3740,7 @@ impl Renderer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         sample: SelectiveNtscGeneration,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, String> {
         self.begin_readback_tagged(encoder, sample.visual_epoch, None, Some(sample), false)
     }
 
@@ -3465,7 +3751,7 @@ impl Renderer {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
-    ) -> Option<usize> {
+    ) -> Result<Option<usize>, String> {
         self.begin_readback_tagged(encoder, epoch, None, None, true)
     }
 
@@ -3476,11 +3762,15 @@ impl Renderer {
         ntsc_metadata: Option<NtscFrameMetadata>,
         selective_sample: Option<SelectiveNtscGeneration>,
         held_audience: bool,
-    ) -> Option<usize> {
-        if self.ensure_device_healthy().is_err() {
-            return None;
-        }
-        let buffer_size = (self.readback_bytes_per_row() * self.output_height) as u64;
+    ) -> Result<Option<usize>, String> {
+        self.ensure_device_healthy()
+            .map_err(|error| format!("audience readback unavailable: {error}"))?;
+        let padded_row_bytes = self.readback_bytes_per_row();
+        let buffer_size = validate_readback_buffer_size(
+            padded_row_bytes,
+            self.output_height,
+            self.device.limits().max_buffer_size,
+        )?;
 
         let idx = match self
             .readback_slots
@@ -3489,13 +3779,29 @@ impl Renderer {
         {
             Some(idx) => idx,
             None if self.readback_slots.len() < MAX_READBACK_SLOTS => {
+                let buffer = create_gpu_resources_checked(
+                    &self.device,
+                    &format!(
+                        "audience NTSC/Spout readback buffer {} of {MAX_READBACK_SLOTS} \
+                         ({buffer_size} bytes at {}x{})",
+                        self.readback_slots.len() + 1,
+                        self.output_width,
+                        self.output_height
+                    ),
+                    || {
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("NTSC/Spout Audience Readback Slot"),
+                            size: buffer_size,
+                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                            mapped_at_creation: false,
+                        })
+                    },
+                )?;
+                self.ensure_device_healthy().map_err(|error| {
+                    format!("audience NTSC/Spout readback buffer allocation failed: {error}")
+                })?;
                 self.readback_slots.push(ReadbackSlot {
-                    buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("NTSC Readback Slot"),
-                        size: buffer_size,
-                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                        mapped_at_creation: false,
-                    }),
+                    buffer,
                     status: Arc::new(AtomicU8::new(SLOT_IDLE)),
                     sequence: 0,
                     epoch,
@@ -3505,7 +3811,7 @@ impl Renderer {
                 });
                 self.readback_slots.len() - 1
             }
-            None => return None,
+            None => return Ok(None),
         };
 
         let sequence = self.next_readback_sequence;
@@ -3527,7 +3833,7 @@ impl Renderer {
                 buffer: &slot.buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.readback_bytes_per_row()),
+                    bytes_per_row: Some(padded_row_bytes),
                     rows_per_image: Some(self.output_height),
                 },
             },
@@ -3538,7 +3844,7 @@ impl Renderer {
             },
         );
         slot.status.store(SLOT_MAP_PENDING, Ordering::Release);
-        Some(idx)
+        Ok(Some(idx))
     }
 
     /// Phase 2: request the async map. Must be called after the encoder

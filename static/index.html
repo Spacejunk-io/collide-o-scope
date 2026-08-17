@@ -18,6 +18,19 @@
           </label>
         </h3>
         <div class="lib-upload-status" id="lib-upload-status"></div>
+        <section class="media-safety" aria-labelledby="media-safety-title">
+          <div class="media-safety-heading">
+            <span id="media-safety-title">MEDIA SAFETY</span>
+            <label class="toggle" title="Permit future source loads above the default UHD area only within this host's detected edge and planning budgets">
+              <input type="checkbox" id="expert-media-toggle" aria-label="Enable bounded Expert media mode" aria-describedby="media-safety-summary media-safety-rationale">
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="media-safety-mode" id="media-safety-mode">SAFE</span>
+          </div>
+          <div class="media-safety-summary" id="media-safety-summary">UHD-area source ceiling</div>
+          <div class="media-safety-rationale" id="media-safety-rationale">The default cap bounds decoder, mailbox, and texture allocations. Expert mode affects future source opens only and remains limited by this host.</div>
+          <div class="lib-upload-status media-safety-status" id="media-safety-status" role="status" aria-live="polite"></div>
+        </section>
         <form class="spout-in-form" id="spout-in-form">
           <label for="spout-in-name">Spout input</label>
           <div class="spout-in-row">
@@ -47,7 +60,8 @@
       <!-- RIGHT: Transport + Master Effects -->
       <aside class="col-right">
         <div class="transport-row">
-          <button class="transport-btn" type="button" id="btn-play-all" title="Play visual program" aria-label="Play visual program">&#x25B6;</button>
+          <button class="transport-btn" type="button" id="btn-play-all" title="Freeze the complete visual program, including clocks and histories" aria-label="Freeze program" aria-pressed="false">&#x23F8;</button>
+          <button class="transport-btn" type="button" id="btn-freeze-media" title="Hold video and Spout frames while effects and modulation continue" aria-label="Freeze media" aria-pressed="false">MED</button>
           <button class="transport-btn" type="button" id="btn-revert-master" title="Revert master visual state (layers and transport are preserved)" aria-label="Revert master visual state; layers and transport are preserved">&#x21BA;</button>
           <button class="transport-btn blackout-btn" id="btn-blackout" title="Blackout (B)">BLK</button>
           <span class="beat-light" id="beat-light" title="beat"></span>
@@ -92,6 +106,29 @@
                 <label>Invert</label>
                 <label class="toggle"><input type="checkbox"><span class="toggle-slider"></span></label>
               </div>
+            </div>
+          </div>
+
+          <div class="fx-group" data-group="shift">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">SHIFT / BLOCK GLITCH</span>
+              <button class="group-reset" data-group="shift" aria-label="Reset Shift block displacement">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row" data-param="shift_amount" data-min="0" data-max="1" data-step="0.01">
+                <label>Amount</label><input type="range" aria-label="Master Shift amount"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="shift_block_size" data-min="2" data-max="256" data-step="1">
+                <label>Block px</label><input type="range" aria-label="Master Shift block height"><span class="value">8</span>
+              </div>
+              <div class="param-row" data-param="shift_density" data-min="0" data-max="1" data-step="0.01">
+                <label>Density</label><input type="range" aria-label="Master Shift band density"><span class="value">0.5</span>
+              </div>
+              <div class="param-row" data-param="shift_speed" data-min="0" data-max="20" data-step="0.25">
+                <label>Speed</label><input type="range" aria-label="Master Shift epoch speed"><span class="value">3</span>
+              </div>
+              <div class="audio-status">Deterministic block shifts follow the Pattern seed. Random / Dice and per-loop rerolls change their arrangement.</div>
             </div>
           </div>
 
@@ -177,6 +214,7 @@
             </div>
             <div class="fx-group-body">
               <div class="audio-status error" id="ntsc-status" role="status" aria-live="polite"></div>
+              <div class="audio-status ntsc-metrics" id="ntsc-metrics" aria-label="Live VHS worker metrics">Live worker: no samples yet</div>
               <div class="param-row toggle-row" data-ntsc="enabled">
                 <label>Enable</label>
                 <label class="toggle"><input type="checkbox"><span class="toggle-slider"></span></label>
@@ -445,6 +483,44 @@
 
           </div>
           <div class="fx-col" data-fx-column="sources"><!-- live modulation controls and sources -->
+          <div class="fx-group collapsed" data-group="random" id="random-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">RANDOM / DICE</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row select-row">
+                <label for="reroll-scope">Scope</label>
+                <select id="reroll-scope">
+                  <option value="master">Master</option>
+                  <option value="all">Everything</option>
+                </select>
+              </div>
+              <div class="param-row select-row">
+                <label for="reroll-mode">Mode</label>
+                <select id="reroll-mode">
+                  <option value="pattern">Pattern only</option>
+                  <option value="variation">Bounded variation</option>
+                </select>
+              </div>
+              <div class="param-row">
+                <label for="reroll-seed">Exact seed</label>
+                <input id="reroll-seed" class="seed-input" type="number" min="0" max="4294967295" step="1" inputmode="numeric" placeholder="auto" title="Leave blank to advance deterministically; zero restores legacy patterns">
+              </div>
+              <div class="param-row" id="reroll-amount-row">
+                <label for="reroll-amount">Amount</label>
+                <input id="reroll-amount" type="range" min="0" max="2" step="0.05" value="0.7">
+                <span class="value" id="reroll-amount-value">0.70</span>
+              </div>
+              <div class="param-row toggle-row" id="reroll-grain-row">
+                <label for="reroll-grain-controls">Grain mode</label>
+                <label class="toggle"><input type="checkbox" id="reroll-grain-controls" aria-label="Include discrete grain algorithm and color grain"><span class="toggle-slider"></span></label>
+              </div>
+              <button id="reroll-button" class="btn-export" type="button" title="Choose a deterministic new pattern; supplied seeds are exactly replayable">&#x2684; Reroll</button>
+              <div class="audio-status" id="reroll-status" role="status" aria-live="polite">Master seed 0 · legacy pattern</div>
+            </div>
+          </div>
+
           <div class="fx-group" data-group="mod" id="mod-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -597,13 +673,23 @@
                 </select>
               </div>
               <div class="param-row select-row">
+                <label title="Live parity matches the real-time half-resolution VHS path. Native processes VHS at the selected export dimensions and is slower and more memory intensive.">VHS quality</label>
+                <select id="export-ntsc-quality">
+                  <option value="live_parity" selected>Live parity (half)</option>
+                  <option value="native">Native (full resolution)</option>
+                </select>
+              </div>
+              <div class="param-row select-row">
                 <label title="Audio starts at source time zero at 1x; visual pause, speed, modulation, and looping do not alter it.">Audio (1x independent)</label>
                 <select id="export-audio"><option value="">None</option></select>
               </div>
               <div class="patch-capture-controls">
-                <button id="patch-capture" class="btn-export" type="button">Capture patch</button>
+                <button id="patch-capture" class="btn-export" type="button" title="Save the complete performance state">Capture snapshot</button>
+                <button id="patch-load-snapshot" class="btn-export" type="button" title="Replace sources, stack, transport, modulation, morph, and visual state from a patch">Load snapshot…</button>
+                <button id="patch-apply-look" class="btn-export" type="button" title="Apply saved visual state positionally while preserving current sources, transport, modulation, and stack">Apply look…</button>
               </div>
               <div class="export-status" id="patch-save-status" role="status" aria-live="polite"></div>
+              <div class="export-status" id="patch-load-status" role="status" aria-live="polite"></div>
               <div class="export-controls">
                 <button id="export-start" class="btn-export">Render</button>
                 <button id="export-cancel" class="btn-export btn-cancel" style="display:none">Cancel</button>
@@ -613,6 +699,10 @@
                 <span class="progress-text" id="export-text">0%</span>
               </div>
               <div class="export-status" id="export-status" role="status" aria-live="polite"></div>
+              <div class="export-warnings" id="export-warnings" role="status" aria-live="polite" hidden>
+                <div class="export-warnings-summary" id="export-warnings-summary"></div>
+                <ul id="export-warnings-list"></ul>
+              </div>
             </div>
           </div>
 

@@ -4,6 +4,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use crate::effects::EffectUniforms;
 
 /// Actions that can be triggered by keyboard input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     IncreasePixelate,
     DecreasePixelate,
@@ -11,6 +12,7 @@ pub enum Action {
     DecreaseRgbSplit,
     ResetEffects,
     TogglePause,
+    ToggleMediaFreeze,
     ToggleFullscreen,
     ToggleOutputWindow,
     ToggleBlackout,
@@ -41,6 +43,7 @@ pub fn map_key(key: PhysicalKey, state: ElementState, shift: bool) -> Action {
         }
         PhysicalKey::Code(KeyCode::Digit0) => Action::ResetEffects,
         PhysicalKey::Code(KeyCode::Space) => Action::TogglePause,
+        PhysicalKey::Code(KeyCode::KeyM) => Action::ToggleMediaFreeze,
         PhysicalKey::Code(KeyCode::KeyF) => Action::ToggleFullscreen,
         PhysicalKey::Code(KeyCode::KeyO) => Action::ToggleOutputWindow,
         PhysicalKey::Code(KeyCode::KeyB) => Action::ToggleBlackout,
@@ -58,6 +61,7 @@ pub fn apply_action(action: Action, uniforms: &mut EffectUniforms) -> ControlFlo
         Action::DecreaseRgbSplit => uniforms.decrease_rgb_split(),
         Action::ResetEffects => uniforms.reset(),
         Action::TogglePause => return ControlFlow::TogglePause,
+        Action::ToggleMediaFreeze => return ControlFlow::ToggleMediaFreeze,
         Action::ToggleFullscreen => return ControlFlow::ToggleFullscreen,
         Action::ToggleOutputWindow => return ControlFlow::ToggleOutputWindow,
         Action::ToggleBlackout => return ControlFlow::ToggleBlackout,
@@ -67,11 +71,42 @@ pub fn apply_action(action: Action, uniforms: &mut EffectUniforms) -> ControlFlo
     ControlFlow::Continue
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlow {
     Continue,
     TogglePause,
+    ToggleMediaFreeze,
     ToggleFullscreen,
     ToggleOutputWindow,
     ToggleBlackout,
     Quit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m_is_the_media_freeze_shortcut_and_release_is_inert() {
+        assert_eq!(
+            map_key(
+                PhysicalKey::Code(KeyCode::KeyM),
+                ElementState::Pressed,
+                false
+            ),
+            Action::ToggleMediaFreeze
+        );
+        assert_eq!(
+            map_key(
+                PhysicalKey::Code(KeyCode::KeyM),
+                ElementState::Released,
+                false
+            ),
+            Action::None
+        );
+        assert_eq!(
+            apply_action(Action::ToggleMediaFreeze, &mut EffectUniforms::default()),
+            ControlFlow::ToggleMediaFreeze
+        );
+    }
 }
