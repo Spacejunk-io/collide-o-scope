@@ -541,6 +541,63 @@ the shader uniform layout tests current when changing temporal uniforms.
 - The chain operates with sRGB decode, linear-light math, and sRGB encode.
 - Blackout occurs before audience-facing readback/blit consumers.
 
+### Named two-input Displace
+
+`Displace` is a Collision Rack node that warps its carrier by a vector field
+read from a second stable image tap. `NodeKindTag::Displace` holds append-only
+signature code 10; kind codes are never renumbered or reused.
+
+Authored state is `DisplaceParams { tap, amount_x, amount_y, boundary }`.
+Amounts are independent finite UV gains clamped to `[-1, 1]`; non-finite input
+takes the neutral `0.0` fallback rather than a clamped extreme.
+`DisplaceBoundary` is `Transparent | Mirror | Wrap | Hold` with shader codes
+0…3 and `Transparent` as the default — the only law that removes coverage.
+
+The donor decode is alpha-covered:
+
+```text
+vector = (premultiplied_rg - 0.5 * alpha) * 2
+```
+
+Neutral donor encoding is `RG = 0.5` at full coverage. Because the decode reads
+*premultiplied* RG against the filtered alpha, a transparent donor, a partially
+covered neutral donor, and a missing binding all yield exact zero, so hostile
+hidden RGB at alpha zero can never reach the vector field.
+
+`DisplaceParams::is_exact_bypass()` is true when both gains sanitize to zero.
+That is a real delegation, not a cosmetic one: the planner collects no tap, the
+executor encodes no pass, and the saved-patch dependency walk claims no edge.
+Admission is therefore identical in `collect_rack_taps`, `flush_segment`, and
+`collect_rack_dependencies` — enabled ∧ wet > 0 ∧ at least one nonzero amount.
+
+Resource delta per active node, charged through the existing descriptor ledger:
+
+| Item | Exact charge |
+|---|---:|
+| Render passes | 1 |
+| Logical lookups/pixel | 3 |
+| Explicit texture operations/pixel | 12 |
+| Simultaneously sampled textures | 2 |
+| Cross-scope image taps | 1 |
+| New persistent surfaces | 0 |
+
+The three logical lookups are the dry carrier, the displaced carrier, and the
+donor, each a four-load premultiplied bilinear. Displace reuses the established
+carrier/donor/sampler bind layout and the rack-owned 1×1 zero texture; it adds
+no pipeline, no bind-group layout, and no full-frame surface.
+
+Route and boundary are stable authored topology. Morph interpolates the two
+gains only when both slots name the exact same tap and switches the boundary
+discretely at the midpoint; Dice and procedural generation mutate only the
+gains; modulation exposes only `amount_x` and `amount_y`. The browser edits the
+gains and the boundary through the ordinary coalescible parameter action, while
+the donor — the only field that rewrites the image dependency graph — uses the
+ordered, revision-protected `SetVisualNodeDisplaceRoute { scope, node_id,
+route, composition_revision }`. Snapshot params are
+`{ donor_tap, amount_x, amount_y, boundary, diagnostic }`. Export consumes the
+same evaluated plan and the same rack shader; there is no export-only
+displacement path.
+
 ## Patches and native parameter editor
 
 `PatchState::capture` includes master and layer state, stable source identity,
@@ -779,6 +836,18 @@ mislead browser tests.
 - Shift tests must preserve the amount-zero shader branch and uniform layout,
   old-seed Dice streams, bounded deterministic variation, patch defaults,
   Morph/modulation wiring, resets, static controls, and a labeled export case.
+- Displace tests must cover the append-only kind code and frozen legacy rack
+  signatures, sanitize/exact-bypass laws including hostile non-finite gains,
+  the 1/3/12/2/1 descriptor ledger, the CPU reference with analytic ±X/±Y
+  fixtures for all four boundaries, a transparent hostile-hidden-RGB donor
+  decoding to exact zero, planner admission and current-frame self-cycle
+  rejection with an admitted N-1 edge, saved-patch dormant-versus-woken edges,
+  tombstones that never rebind after replacement, Morph route-match
+  interpolation with endpoint-exact boundary, values-only Look/preset apply,
+  Dice/generator gain-only mutation, `amount_x`/`amount_y` modulation
+  addresses, the uncoalesced revision-barriered browser route action, and a
+  labeled export case. The two `renderer::rack::tests::gpu_displace_` fixtures
+  carry the physical-GPU claim.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,

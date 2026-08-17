@@ -27,9 +27,10 @@ use crate::patch::{
 use crate::spatial::SpatialTransform;
 use crate::temporal::CollisionScoreLoopDriver;
 use crate::visual_rack::{
-    CellularParams, DigitalColorParams, EllipseMask, GrainParams, ImageMatte, KeyParams,
-    MaskParams, RectangleMask, RuntimeImageMatte, RuntimeMaskParams, RuntimeVisualNodeKind,
-    RuntimeVisualRack, SavedImageSource, ShiftParams, VisualNodeKind, VisualRack,
+    CellularParams, DigitalColorParams, DisplaceParams, EllipseMask, GrainParams, ImageMatte,
+    KeyParams, MaskParams, RectangleMask, RuntimeImageMatte, RuntimeMaskParams,
+    RuntimeVisualNodeKind, RuntimeVisualRack, SavedImageSource, ShiftParams, VisualNodeKind,
+    VisualRack,
 };
 
 // Morph's positional layer world follows the existing saved stack bound, not
@@ -2239,12 +2240,19 @@ fn saved_node_topology_matches(a: VisualNodeKind, b: VisualNodeKind) -> bool {
             VisualNodeKind::Mask(MaskParams::Image(b)),
         ) => image_matte_route_matches(a, b),
         (VisualNodeKind::Mask(_), VisualNodeKind::Mask(_)) => false,
+        (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => displace_route_matches(a, b),
         _ => true,
     }
 }
 
 fn image_matte_route_matches(a: ImageMatte, b: ImageMatte) -> bool {
     a.tap == b.tap && a.channel == b.channel && a.invert == b.invert
+}
+
+/// Displace amounts interpolate only when both slots name the exact same donor.
+/// Two different routes are different topology, not two ends of a blend.
+fn displace_route_matches(a: DisplaceParams, b: DisplaceParams) -> bool {
+    a.tap == b.tap
 }
 
 fn interpolate_rack(
@@ -2303,7 +2311,30 @@ fn interpolate_node_kind(
         (VisualNodeKind::Mask(a), VisualNodeKind::Mask(b)) => {
             VisualNodeKind::Mask(interpolate_mask(a, b, weights, choose_b)?)
         }
+        (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => {
+            VisualNodeKind::Displace(interpolate_displace(a, b, weights, choose_b)?)
+        }
         _ => return None,
+    })
+}
+
+/// Amounts blend continuously; the boundary law is discrete and switches at the
+/// midpoint like every other authored enum. The donor route is topology: A/B
+/// compatibility already proved it equal, so it is carried, never interpolated.
+fn interpolate_displace(
+    a: DisplaceParams,
+    b: DisplaceParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<DisplaceParams> {
+    if !displace_route_matches(a, b) {
+        return None;
+    }
+    Some(DisplaceParams {
+        tap: a.tap,
+        amount_x: blend_finite(a.amount_x, b.amount_x, weights),
+        amount_y: blend_finite(a.amount_y, b.amount_y, weights),
+        boundary: pick(a.boundary, b.boundary, choose_b),
     })
 }
 
@@ -2586,8 +2617,24 @@ fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKi
             apply_saved_image_matte_values(value, live);
             true
         }
+        (VisualNodeKind::Displace(value), VisualNodeKind::Displace(live)) => {
+            apply_saved_displace_values(value, live);
+            true
+        }
         _ => false,
     }
+}
+
+/// Values only. The live donor route is preserved so applying a Look or preset
+/// can never silently retarget a Displace at another image.
+#[allow(
+    dead_code,
+    reason = "implementation detail of retained saved value application"
+)]
+fn apply_saved_displace_values(sampled: DisplaceParams, live: &mut DisplaceParams) {
+    live.amount_x = sampled.amount_x;
+    live.amount_y = sampled.amount_y;
+    live.boundary = sampled.boundary;
 }
 
 #[allow(
@@ -2775,6 +2822,12 @@ fn apply_saved_node_kind_values_to_runtime(
             live.softness = value.softness;
             true
         }
+        (VisualNodeKind::Displace(value), RuntimeVisualNodeKind::Displace(live)) => {
+            live.amount_x = value.amount_x;
+            live.amount_y = value.amount_y;
+            live.boundary = value.boundary;
+            true
+        }
         _ => false,
     }
 }
@@ -2804,6 +2857,9 @@ fn runtime_racks_share_strict_topology(a: &RuntimeVisualRack, b: &RuntimeVisualR
                 RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(a)),
                 RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(b)),
             ) => a.tap == b.tap && a.channel == b.channel && a.invert == b.invert,
+            (RuntimeVisualNodeKind::Displace(a), RuntimeVisualNodeKind::Displace(b)) => {
+                a.tap == b.tap
+            }
             _ => true,
         })
 }
@@ -2865,6 +2921,13 @@ fn apply_runtime_node_kind_values(
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(live)),
         ) => {
             apply_runtime_image_matte_values(value, live);
+            true
+        }
+        (RuntimeVisualNodeKind::Displace(value), RuntimeVisualNodeKind::Displace(live)) => {
+            // Values only; the live donor route stays under topology control.
+            live.amount_x = value.amount_x;
+            live.amount_y = value.amount_y;
+            live.boundary = value.boundary;
             true
         }
         _ => false,
@@ -4712,5 +4775,141 @@ glide:
             restored[256].topology_signature(),
             crate::visual_rack::LEGACY_LAYER_RACK_SIGNATURE
         );
+    }
+
+    fn displace_rack(params: crate::visual_rack::DisplaceParams) -> VisualRack {
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Displace(params)).unwrap();
+        rack
+    }
+
+    fn displace_tap(position: u32) -> crate::visual_rack::SavedImageTap {
+        crate::visual_rack::SavedImageTap {
+            source: SavedImageSource::SelectedLayer {
+                layer_position: crate::performance::SavedLayerPosition::new(position).unwrap(),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            },
+            timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+        }
+    }
+
+    #[test]
+    fn morph_interpolates_displace_amounts_only_on_an_exact_route_match() {
+        use crate::visual_rack::{DisplaceBoundary, DisplaceParams};
+
+        let tap = displace_tap(3);
+        let a = displace_rack(DisplaceParams {
+            tap,
+            amount_x: 0.0,
+            amount_y: -1.0,
+            boundary: DisplaceBoundary::Wrap,
+        });
+        let b = displace_rack(DisplaceParams {
+            tap,
+            amount_x: 1.0,
+            amount_y: 1.0,
+            boundary: DisplaceBoundary::Mirror,
+        });
+
+        // Midpoint: amounts blend, the discrete boundary switches at the
+        // midpoint, and the shared route is carried rather than interpolated.
+        let sampled = interpolate_rack(&a, &b, [0.5, 0.5], true).expect("routes match");
+        let VisualNodeKind::Displace(params) = sampled.iter().next().unwrap().kind else {
+            panic!("displace node")
+        };
+        assert!((params.amount_x - 0.5).abs() <= 1.0e-6);
+        assert!(params.amount_y.abs() <= 1.0e-6);
+        assert_eq!(params.boundary, DisplaceBoundary::Mirror);
+        assert_eq!(params.tap, tap);
+
+        // Endpoints are exact on both the continuous and the discrete fields.
+        for (weights, choose_b, expected_x, expected_boundary) in [
+            ([1.0_f32, 0.0_f32], false, 0.0_f32, DisplaceBoundary::Wrap),
+            ([0.0, 1.0], true, 1.0, DisplaceBoundary::Mirror),
+        ] {
+            let sampled = interpolate_rack(&a, &b, weights, choose_b).unwrap();
+            let VisualNodeKind::Displace(params) = sampled.iter().next().unwrap().kind else {
+                panic!("displace node")
+            };
+            assert_eq!(params.amount_x, expected_x);
+            assert_eq!(params.boundary, expected_boundary);
+        }
+
+        // A different donor is different topology, not two ends of a blend.
+        let rerouted = displace_rack(DisplaceParams {
+            tap: displace_tap(4),
+            amount_x: 1.0,
+            amount_y: 1.0,
+            boundary: DisplaceBoundary::Mirror,
+        });
+        assert!(interpolate_rack(&a, &rerouted, [0.5, 0.5], false).is_none());
+
+        // So is a differently timed edge on the same layer.
+        let retimed = displace_rack(DisplaceParams {
+            tap: crate::visual_rack::SavedImageTap {
+                timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+                ..tap
+            },
+            ..DisplaceParams::default()
+        });
+        assert!(interpolate_rack(&a, &retimed, [0.5, 0.5], false).is_none());
+    }
+
+    #[test]
+    fn applying_displace_values_never_retargets_the_live_donor() {
+        use crate::visual_rack::{DisplaceBoundary, DisplaceParams, RuntimeDisplaceParams};
+
+        // Saved-to-runtime apply (Look, preset) copies values only.
+        let sampled = displace_rack(DisplaceParams {
+            tap: displace_tap(3),
+            amount_x: 0.75,
+            amount_y: -0.25,
+            boundary: DisplaceBoundary::Hold,
+        });
+        let live_tap = crate::visual_rack::ResolvedImageTap {
+            source: crate::visual_rack::ResolvedImageSource::OneBelow,
+            timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+        };
+        let mut live = sampled.resolve_routes(|_| None, |_| false);
+        let node_id = live.iter().next().unwrap().stable_id;
+        let RuntimeVisualNodeKind::Displace(params) = &mut live.get_mut(node_id).unwrap().kind
+        else {
+            panic!("displace node")
+        };
+        *params = RuntimeDisplaceParams {
+            tap: live_tap,
+            amount_x: 0.0,
+            amount_y: 0.0,
+            boundary: DisplaceBoundary::Transparent,
+        };
+
+        assert!(apply_saved_rack_values_to_runtime(&sampled, &mut live));
+        let RuntimeVisualNodeKind::Displace(params) = live.get(node_id).unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!(params.amount_x, 0.75);
+        assert_eq!(params.amount_y, -0.25);
+        assert_eq!(params.boundary, DisplaceBoundary::Hold);
+        assert_eq!(
+            params.tap, live_tap,
+            "value transfer must never rewrite the live donor route"
+        );
+
+        // The strict runtime-to-runtime path instead refuses a route mismatch.
+        let mut other = live.clone();
+        let RuntimeVisualNodeKind::Displace(params) = &mut other.get_mut(node_id).unwrap().kind
+        else {
+            panic!("displace node")
+        };
+        params.tap = crate::visual_rack::ResolvedImageTap {
+            source: crate::visual_rack::ResolvedImageSource::CleanProgram,
+            timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let mut target = live.clone();
+        assert!(
+            !apply_runtime_rack_values_strict(&other, &mut target),
+            "strict apply must reject a Displace whose donor differs"
+        );
+        assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
     }
 }

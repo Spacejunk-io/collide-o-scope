@@ -20,9 +20,10 @@ use crate::spatial::{SpatialGpuUniforms, SpatialTransform};
 use crate::visual_rack::{
     node_kind_descriptor, CellularParams, DigitalColorParams, EllipseMask, GrainAlgorithm,
     GrainParams, KeyMode, KeyParams, MatteChannel, NodeBlend, NodeId, NodeKindTag, RectangleMask,
-    ResolvedImageTap, RuntimeImageMatte, RuntimeMaskParams, RuntimeRackError, RuntimeVisualNode,
-    RuntimeVisualNodeKind, RuntimeVisualRack, ShiftParams, MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK,
-    MAX_NODES_PER_RACK, MAX_SAMPLED_TEXTURES_PER_PASS, MAX_TEXTURE_SAMPLES_PER_RACK,
+    ResolvedImageTap, RuntimeDisplaceParams, RuntimeImageMatte, RuntimeMaskParams,
+    RuntimeRackError, RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack, ShiftParams,
+    MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK, MAX_NODES_PER_RACK, MAX_SAMPLED_TEXTURES_PER_PASS,
+    MAX_TEXTURE_SAMPLES_PER_RACK,
 };
 
 pub(crate) const RACK_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -39,6 +40,7 @@ const KIND_GRAIN: u32 = 6;
 const KIND_RECTANGLE_MASK: u32 = 7;
 const KIND_ELLIPSE_MASK: u32 = 8;
 const KIND_IMAGE_MASK: u32 = 9;
+const KIND_DISPLACE: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RackPassKind {
@@ -51,6 +53,7 @@ pub(crate) enum RackPassKind {
     RectangleMask(RectangleMask),
     EllipseMask(EllipseMask),
     ImageMask(RuntimeImageMatte),
+    Displace(RuntimeDisplaceParams),
 }
 
 impl RackPassKind {
@@ -63,13 +66,25 @@ impl RackPassKind {
             Self::Shift(_) => NodeKindTag::Shift,
             Self::Grain(_) => NodeKindTag::Grain,
             Self::RectangleMask(_) | Self::EllipseMask(_) | Self::ImageMask(_) => NodeKindTag::Mask,
+            Self::Displace(_) => NodeKindTag::Displace,
         }
     }
 
     pub const fn image_tap(self) -> Option<ResolvedImageTap> {
         match self {
             Self::ImageMask(matte) => Some(matte.tap),
+            Self::Displace(displace) => Some(displace.tap),
             _ => None,
+        }
+    }
+
+    /// Kinds whose authored values make the whole pass a no-op. Only Displace
+    /// declares one: zero gain on both axes must delegate to the dry carrier
+    /// exactly, without encoding a pass or binding a donor.
+    fn is_exact_value_bypass(self) -> bool {
+        match self {
+            Self::Displace(displace) => displace.is_exact_bypass(),
+            _ => false,
         }
     }
 }
@@ -87,8 +102,8 @@ pub(crate) struct RackPassDescriptor {
 }
 
 impl RackPassDescriptor {
-    pub const fn is_exact_bypass(self) -> bool {
-        !self.enabled || self.wet <= 0.0
+    pub fn is_exact_bypass(self) -> bool {
+        !self.enabled || self.wet <= 0.0 || self.kind.is_exact_value_bypass()
     }
 }
 
@@ -276,6 +291,9 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
         }
         RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(value)) => {
             RackPassKind::ImageMask(sanitize_runtime_matte(value))
+        }
+        RuntimeVisualNodeKind::Displace(value) => {
+            RackPassKind::Displace(sanitize_runtime_displace(value))
         }
     };
     Ok(RackPassDescriptor {
@@ -487,6 +505,15 @@ impl RackUniforms {
                     value.threshold,
                 ];
                 uniforms.p1[0] = value.softness;
+            }
+            RackPassKind::Displace(value) => {
+                uniforms.meta[0] = KIND_DISPLACE;
+                uniforms.p0 = [
+                    value.amount_x,
+                    value.amount_y,
+                    value.boundary.code() as f32,
+                    0.0,
+                ];
             }
         }
         uniforms
@@ -1571,6 +1598,15 @@ fn sanitize_runtime_matte(value: RuntimeImageMatte) -> RuntimeImageMatte {
     }
 }
 
+fn sanitize_runtime_displace(value: RuntimeDisplaceParams) -> RuntimeDisplaceParams {
+    RuntimeDisplaceParams {
+        tap: value.tap,
+        amount_x: finite_clamp(value.amount_x, 0.0, -1.0, 1.0),
+        amount_y: finite_clamp(value.amount_y, 0.0, -1.0, 1.0),
+        boundary: value.boundary,
+    }
+}
+
 const fn key_mode_code(mode: KeyMode) -> u32 {
     match mode {
         KeyMode::KeepBright => 0,
@@ -1603,11 +1639,144 @@ const fn matte_channel_code(channel: MatteChannel) -> u32 {
 mod tests {
     use super::*;
     use crate::visual_rack::{
-        EdgeTiming, LegacyRackScope, ResolvedImageSource, RuntimeVisualNodeKind,
+        DisplaceBoundary, EdgeTiming, LegacyRackScope, ResolvedImageSource, RuntimeVisualNodeKind,
+        PREMULTIPLIED_BILINEAR_TEXTURE_OPS,
     };
 
     fn node_id(value: u64) -> NodeId {
         NodeId::new(value).unwrap()
+    }
+
+    /// Straight-alpha reference image with the exact filtering law used by
+    /// `rack_node.wgsl`: clamped `textureLoad` corners, covered in
+    /// premultiplied space, bilinearly mixed there.
+    struct RefImage {
+        dimensions: [u32; 2],
+        pixels: Vec<[f32; 4]>,
+    }
+
+    impl RefImage {
+        fn new(dimensions: [u32; 2], pixels: Vec<[f32; 4]>) -> Self {
+            assert_eq!(
+                pixels.len(),
+                dimensions[0] as usize * dimensions[1] as usize
+            );
+            Self { dimensions, pixels }
+        }
+
+        fn uniform(dimensions: [u32; 2], pixel: [f32; 4]) -> Self {
+            let count = dimensions[0] as usize * dimensions[1] as usize;
+            Self::new(dimensions, vec![pixel; count])
+        }
+
+        fn load(&self, x: i32, y: i32) -> [f32; 4] {
+            let x = x.clamp(0, self.dimensions[0] as i32 - 1) as usize;
+            let y = y.clamp(0, self.dimensions[1] as i32 - 1) as usize;
+            self.pixels[y * self.dimensions[0] as usize + x]
+        }
+
+        fn premultiplied_bilinear(&self, uv: [f32; 2]) -> [f32; 4] {
+            let coordinate = [
+                uv[0] * self.dimensions[0] as f32 - 0.5,
+                uv[1] * self.dimensions[1] as f32 - 0.5,
+            ];
+            let base = [coordinate[0].floor(), coordinate[1].floor()];
+            let fraction = [coordinate[0] - base[0], coordinate[1] - base[1]];
+            let (bx, by) = (base[0] as i32, base[1] as i32);
+            let cover = |pixel: [f32; 4]| {
+                let alpha = pixel[3].clamp(0.0, 1.0);
+                [pixel[0] * alpha, pixel[1] * alpha, pixel[2] * alpha, alpha]
+            };
+            let c00 = cover(self.load(bx, by));
+            let c10 = cover(self.load(bx + 1, by));
+            let c01 = cover(self.load(bx, by + 1));
+            let c11 = cover(self.load(bx + 1, by + 1));
+            std::array::from_fn(|channel| {
+                let top = c00[channel] + (c10[channel] - c00[channel]) * fraction[0];
+                let bottom = c01[channel] + (c11[channel] - c01[channel]) * fraction[0];
+                top + (bottom - top) * fraction[1]
+            })
+        }
+
+        fn straight_bilinear(&self, uv: [f32; 2]) -> [f32; 4] {
+            let premultiplied = self.premultiplied_bilinear(uv);
+            let alpha = premultiplied[3].clamp(0.0, 1.0);
+            if alpha <= 0.000_001 {
+                return [0.0; 4];
+            }
+            [
+                premultiplied[0] / alpha,
+                premultiplied[1] / alpha,
+                premultiplied[2] / alpha,
+                alpha,
+            ]
+        }
+    }
+
+    fn fract(value: f32) -> f32 {
+        value - value.floor()
+    }
+
+    /// Alpha-covered donor decode. Neutral encoding is `RG = 0.5` at full
+    /// coverage; premultiplied RG against filtered alpha makes a transparent
+    /// or missing donor exactly zero whatever its hidden RGB holds.
+    fn displace_vector(donor: &RefImage, uv: [f32; 2], donor_valid: bool) -> [f32; 2] {
+        if !donor_valid {
+            return [0.0, 0.0];
+        }
+        let sample = donor.premultiplied_bilinear(uv);
+        [
+            (sample[0] - 0.5 * sample[3]) * 2.0,
+            (sample[1] - 0.5 * sample[3]) * 2.0,
+        ]
+    }
+
+    fn displace_boundary(uv: [f32; 2], boundary: DisplaceBoundary) -> ([f32; 2], bool) {
+        let clamped = [uv[0].clamp(0.0, 1.0), uv[1].clamp(0.0, 1.0)];
+        match boundary {
+            DisplaceBoundary::Mirror => (
+                [
+                    1.0 - (fract(uv[0] * 0.5) * 2.0 - 1.0).abs(),
+                    1.0 - (fract(uv[1] * 0.5) * 2.0 - 1.0).abs(),
+                ],
+                true,
+            ),
+            DisplaceBoundary::Wrap => ([fract(uv[0]), fract(uv[1])], true),
+            DisplaceBoundary::Hold => (clamped, true),
+            DisplaceBoundary::Transparent => {
+                let inside = uv[0] >= 0.0 && uv[0] <= 1.0 && uv[1] >= 0.0 && uv[1] <= 1.0;
+                (clamped, inside)
+            }
+        }
+    }
+
+    /// CPU reference for the whole Displace node, mirroring `displace_node`.
+    fn displace_reference(
+        carrier: &RefImage,
+        donor: &RefImage,
+        uv: [f32; 2],
+        params: RuntimeDisplaceParams,
+        donor_valid: bool,
+    ) -> [f32; 4] {
+        let vector = displace_vector(donor, uv, donor_valid);
+        let displaced = [
+            uv[0] + vector[0] * params.amount_x,
+            uv[1] + vector[1] * params.amount_y,
+        ];
+        let (mapped, covered) = displace_boundary(displaced, params.boundary);
+        if !covered {
+            return [0.0; 4];
+        }
+        carrier.straight_bilinear(mapped)
+    }
+
+    fn displace(amount_x: f32, amount_y: f32, boundary: DisplaceBoundary) -> RuntimeDisplaceParams {
+        RuntimeDisplaceParams {
+            amount_x,
+            amount_y,
+            boundary,
+            ..RuntimeDisplaceParams::default()
+        }
     }
 
     fn route(source: ResolvedImageSource) -> ResolvedImageTap {
@@ -2261,5 +2430,448 @@ mod tests {
         };
         assert!(bindings.find(node_id(3), expected).is_none());
         assert!(bindings.find(node_id(3), other).is_some());
+    }
+
+    #[test]
+    fn displace_ledger_charges_one_pass_three_lookups_and_twelve_explicit_operations() {
+        let budget = node_kind_descriptor(NodeKindTag::Displace).budget;
+        assert_eq!(budget.full_frame_passes, 1);
+        assert_eq!(budget.logical_texture_lookups_per_pixel, 3);
+        assert_eq!(budget.texture_samples_per_pixel, 12);
+        assert_eq!(budget.sampled_textures_in_pass, 2);
+        assert_eq!(budget.cross_input_taps, 1);
+        // Three logical bilinear lookups are exactly twelve explicit loads:
+        // dry carrier, displaced carrier, donor vector field.
+        assert_eq!(
+            budget.texture_samples_per_pixel,
+            budget.logical_texture_lookups_per_pixel * PREMULTIPLIED_BILINEAR_TEXTURE_OPS
+        );
+
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack
+            .push(RuntimeVisualNodeKind::Displace(displace(
+                0.25,
+                -0.5,
+                DisplaceBoundary::Wrap,
+            )))
+            .unwrap();
+        let compiled = plan(&rack, [16, 9]);
+        assert_eq!(compiled.logical_texture_lookups_per_pixel(), 3);
+        assert_eq!(compiled.texture_samples_per_pixel(), 12);
+        assert_eq!(compiled.max_sampled_textures_in_pass(), 2);
+        assert_eq!(compiled.cross_input_taps(), 1);
+        assert!(compiled.max_sampled_textures_in_pass() <= MAX_SAMPLED_TEXTURES_PER_PASS);
+        assert_eq!(compiled.passes()[0].node_id, id);
+        assert_eq!(
+            compiled.passes()[0].kind.image_tap(),
+            Some(RuntimeDisplaceParams::default().tap),
+            "an active Displace must expose exactly one cross-scope donor tap"
+        );
+    }
+
+    #[test]
+    fn displace_zero_amounts_and_zero_wet_are_exact_bypasses_that_encode_no_pass() {
+        let mut rack = RuntimeVisualRack::empty();
+        rack.push(RuntimeVisualNodeKind::Displace(
+            RuntimeDisplaceParams::default(),
+        ))
+        .unwrap();
+        let compiled = plan(&rack, [8, 8]);
+        assert!(
+            compiled.passes()[0].is_exact_bypass(),
+            "an exact-default Displace must delegate before encoding a pass"
+        );
+
+        // Hostile non-finite gains sanitize to zero and stay an exact bypass.
+        let mut hostile = RuntimeVisualRack::empty();
+        hostile
+            .push(RuntimeVisualNodeKind::Displace(displace(
+                f32::NAN,
+                f32::INFINITY,
+                DisplaceBoundary::Wrap,
+            )))
+            .unwrap();
+        assert!(plan(&hostile, [8, 8]).passes()[0].is_exact_bypass());
+
+        // One nonzero axis is enough to make the node live.
+        for (x, y) in [(0.001_f32, 0.0_f32), (0.0, -0.001)] {
+            let mut live = RuntimeVisualRack::empty();
+            live.push(RuntimeVisualNodeKind::Displace(displace(
+                x,
+                y,
+                DisplaceBoundary::Transparent,
+            )))
+            .unwrap();
+            assert!(!plan(&live, [8, 8]).passes()[0].is_exact_bypass());
+        }
+
+        // Zero wet remains an exact bypass even with live gains.
+        let mut wet_zero = RuntimeVisualRack::empty();
+        let id = wet_zero
+            .push(RuntimeVisualNodeKind::Displace(displace(
+                0.5,
+                0.5,
+                DisplaceBoundary::Wrap,
+            )))
+            .unwrap();
+        wet_zero.get_mut(id).unwrap().wet = 0.0;
+        assert!(plan(&wet_zero, [8, 8]).passes()[0].is_exact_bypass());
+
+        // No other node kind acquires a value-driven bypass from this change.
+        let mut others = RuntimeVisualRack::empty();
+        others
+            .push(RuntimeVisualNodeKind::Grain(GrainParams::default()))
+            .unwrap();
+        others
+            .push(RuntimeVisualNodeKind::Cellular(CellularParams::default()))
+            .unwrap();
+        others
+            .push(RuntimeVisualNodeKind::Shift(ShiftParams::default()))
+            .unwrap();
+        for pass in plan(&others, [8, 8]).passes() {
+            assert!(!pass.is_exact_bypass());
+        }
+    }
+
+    #[test]
+    fn displace_neutral_and_transparent_hostile_donors_produce_exact_zero_displacement() {
+        let carrier = RefImage::new(
+            [4, 1],
+            vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.25, 0.0, 0.0, 1.0],
+                [0.5, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+            ],
+        );
+        let params = displace(1.0, 1.0, DisplaceBoundary::Wrap);
+        let probes = [[0.125, 0.5], [0.375, 0.5], [0.625, 0.5], [0.875, 0.5]];
+
+        // Neutral RG = 0.5 at full coverage.
+        let neutral = RefImage::uniform([4, 1], [0.5, 0.5, 0.0, 1.0]);
+        // Fully transparent, but with maximally hostile hidden RGB.
+        let hostile = RefImage::uniform([4, 1], [1.0, 1.0, 1.0, 0.0]);
+        // Half coverage with neutral straight RG stays exactly neutral.
+        let half_covered = RefImage::uniform([4, 1], [0.5, 0.5, 0.5, 0.5]);
+
+        for uv in probes {
+            let identity = carrier.straight_bilinear(uv);
+            for donor in [&neutral, &hostile, &half_covered] {
+                assert_eq!(displace_vector(donor, uv, true), [0.0, 0.0]);
+                assert_eq!(
+                    displace_reference(&carrier, donor, uv, params, true),
+                    identity
+                );
+            }
+            // A missing binding is the same defined zero field.
+            assert_eq!(displace_vector(&hostile, uv, false), [0.0, 0.0]);
+            assert_eq!(
+                displace_reference(&carrier, &neutral, uv, params, false),
+                identity
+            );
+        }
+    }
+
+    #[test]
+    fn displace_analytic_axis_fixtures_hold_for_every_boundary() {
+        // A 4x1 carrier whose red channel identifies the sampled column.
+        let carrier = RefImage::new(
+            [4, 1],
+            vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.25, 0.0, 0.0, 1.0],
+                [0.5, 0.0, 0.0, 1.0],
+                [1.0, 0.0, 0.0, 1.0],
+            ],
+        );
+        let plus_x = RefImage::uniform([4, 1], [1.0, 0.5, 0.0, 1.0]);
+        let minus_x = RefImage::uniform([4, 1], [0.0, 0.5, 0.0, 1.0]);
+        let plus_y = RefImage::uniform([4, 1], [0.5, 1.0, 0.0, 1.0]);
+        let minus_y = RefImage::uniform([4, 1], [0.5, 0.0, 0.0, 1.0]);
+        let uv = [0.25, 0.5];
+
+        // Full-scale donors decode to exactly ±1 on their own axis only.
+        assert_eq!(displace_vector(&plus_x, uv, true), [1.0, 0.0]);
+        assert_eq!(displace_vector(&minus_x, uv, true), [-1.0, 0.0]);
+        assert_eq!(displace_vector(&plus_y, uv, true), [0.0, 1.0]);
+        assert_eq!(displace_vector(&minus_y, uv, true), [0.0, -1.0]);
+
+        // A quarter-scale +X gain moves the sample a quarter of the frame.
+        let quarter = displace(0.25, 0.0, DisplaceBoundary::Hold);
+        assert_eq!(
+            displace_reference(&carrier, &plus_x, uv, quarter, true),
+            carrier.straight_bilinear([0.5, 0.5])
+        );
+        let quarter_negative = displace(0.25, 0.0, DisplaceBoundary::Hold);
+        assert_eq!(
+            displace_reference(&carrier, &minus_x, uv, quarter_negative, true),
+            carrier.straight_bilinear([0.0, 0.5])
+        );
+
+        // Full +X gain pushes 0.25 to 1.25, exercising every boundary law.
+        let expectations = [
+            (DisplaceBoundary::Wrap, Some(0.25_f32)),
+            (DisplaceBoundary::Mirror, Some(0.75)),
+            (DisplaceBoundary::Hold, Some(1.0)),
+            (DisplaceBoundary::Transparent, None),
+        ];
+        for (boundary, expected_x) in expectations {
+            let params = displace(1.0, 0.0, boundary);
+            let (mapped, covered) = displace_boundary([1.25, 0.5], boundary);
+            let actual = displace_reference(&carrier, &plus_x, uv, params, true);
+            match expected_x {
+                Some(x) => {
+                    assert!(covered, "{boundary:?} must keep coverage");
+                    assert!(
+                        (mapped[0] - x).abs() <= 1.0e-6,
+                        "{boundary:?} mapped 1.25 to {} rather than {x}",
+                        mapped[0]
+                    );
+                    assert_eq!(actual, carrier.straight_bilinear([x, 0.5]));
+                }
+                None => {
+                    assert!(
+                        !covered,
+                        "Transparent must drop coverage outside the domain"
+                    );
+                    assert_eq!(actual, [0.0; 4], "Transparent must resolve to nothing");
+                }
+            }
+        }
+
+        // Full -X gain pushes 0.25 to -0.75 through the same laws.
+        for (boundary, expected_x) in [
+            (DisplaceBoundary::Wrap, Some(0.25_f32)),
+            (DisplaceBoundary::Mirror, Some(0.75)),
+            (DisplaceBoundary::Hold, Some(0.0)),
+            (DisplaceBoundary::Transparent, None),
+        ] {
+            let (mapped, covered) = displace_boundary([-0.75, 0.5], boundary);
+            match expected_x {
+                Some(x) => {
+                    assert!(covered);
+                    assert!(
+                        (mapped[0] - x).abs() <= 1.0e-6,
+                        "{boundary:?} mapped -0.75 to {}",
+                        mapped[0]
+                    );
+                }
+                None => assert!(!covered),
+            }
+        }
+    }
+
+    #[test]
+    fn displace_boundary_codes_are_append_only_and_uniforms_carry_them() {
+        assert_eq!(DisplaceBoundary::Transparent.code(), 0);
+        assert_eq!(DisplaceBoundary::Mirror.code(), 1);
+        assert_eq!(DisplaceBoundary::Wrap.code(), 2);
+        assert_eq!(DisplaceBoundary::Hold.code(), 3);
+        assert_eq!(DisplaceBoundary::default(), DisplaceBoundary::Transparent);
+
+        for boundary in [
+            DisplaceBoundary::Transparent,
+            DisplaceBoundary::Mirror,
+            DisplaceBoundary::Wrap,
+            DisplaceBoundary::Hold,
+        ] {
+            let pass = RackPassDescriptor {
+                node_id: node_id(7),
+                enabled: true,
+                wet: 1.0,
+                blend: NodeBlend::Normal,
+                kind: RackPassKind::Displace(displace(0.5, -0.25, boundary)),
+            };
+            let uniforms = RackUniforms::for_pass(pass, [8, 8], [8, 8], 0.0, true);
+            assert_eq!(uniforms.meta[0], KIND_DISPLACE);
+            assert_eq!(uniforms.meta[2], 1, "donor validity travels in meta.z");
+            assert_eq!(uniforms.p0[0], 0.5);
+            assert_eq!(uniforms.p0[1], -0.25);
+            assert_eq!(uniforms.p0[2], boundary.code() as f32);
+            let missing = RackUniforms::for_pass(pass, [8, 8], [8, 8], 0.0, false);
+            assert_eq!(missing.meta[2], 0);
+        }
+    }
+
+    #[test]
+    fn displace_pass_sanitizes_hostile_gains_without_touching_route_or_boundary() {
+        let tap = route(ResolvedImageSource::CleanProgram);
+        let authored = RuntimeDisplaceParams {
+            tap,
+            amount_x: 9.0,
+            amount_y: -9.0,
+            boundary: DisplaceBoundary::Mirror,
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        rack.push(RuntimeVisualNodeKind::Displace(authored))
+            .unwrap();
+        let compiled = plan(&rack, [8, 8]);
+        let RackPassKind::Displace(compiled_params) = compiled.passes()[0].kind else {
+            panic!("compiled pass must remain a Displace");
+        };
+        assert_eq!(compiled_params.amount_x, 1.0);
+        assert_eq!(compiled_params.amount_y, -1.0);
+        assert_eq!(compiled_params.boundary, DisplaceBoundary::Mirror);
+        assert_eq!(
+            compiled_params.tap, tap,
+            "sanitizing never rewrites a route"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_displace_matches_the_cpu_reference_and_zero_gain_is_byte_identical() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let carrier_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| {
+                let x = (index % 8) as f32 / 7.0;
+                let y = (index / 8) as f32 / 7.0;
+                [x, y, 0.5, 1.0]
+            })
+            .collect();
+        let carrier = RefImage::new(dimensions, carrier_pixels.clone());
+        let (_carrier_texture, carrier_view, carrier_bytes) =
+            gpu.texture(dimensions, &carrier_pixels, "displace carrier");
+
+        // Constant full-scale +X donor at full coverage.
+        let donor_pixels = vec![[1.0, 0.5, 0.0, 1.0]; 64];
+        let donor = RefImage::new(dimensions, donor_pixels.clone());
+        let (_donor_texture, donor_view, _) = gpu.texture(dimensions, &donor_pixels, "donor");
+
+        let executor = CollisionRackExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        let source = executor
+            .prepare_source(&gpu.device, &carrier_view, dimensions)
+            .unwrap();
+
+        let params = displace(0.25, 0.0, DisplaceBoundary::Wrap);
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack.push(RuntimeVisualNodeKind::Displace(params)).unwrap();
+        let compiled = plan(&rack, dimensions);
+        let bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[RackImageInput {
+                    node_id: id,
+                    tap: params.tap,
+                    view: Some(&donor_view),
+                }],
+            )
+            .unwrap();
+        let warm = executor.allocation_snapshot();
+        let (report, bytes) = gpu.render(&executor, &compiled, &source, &bindings, 0.0);
+        assert_eq!(report.executed_passes, 1);
+        assert_eq!(report.missing_image_count, 0);
+        assert_eq!(
+            warm,
+            executor.allocation_snapshot(),
+            "a warmed Displace encode must allocate nothing"
+        );
+
+        let rendered = decode_pixels(&bytes);
+        for (index, actual) in rendered.iter().enumerate() {
+            let uv = [
+                (index % 8) as f32 / 8.0 + 0.5 / 8.0,
+                (index / 8) as f32 / 8.0 + 0.5 / 8.0,
+            ];
+            let expected = displace_reference(&carrier, &donor, uv, params, true);
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 0.01,
+                    "pixel {index} channel {channel}: GPU {} vs reference {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+
+        // Zero gain must return the carrier bytes untouched.
+        let mut bypass = RuntimeVisualRack::empty();
+        bypass
+            .push(RuntimeVisualNodeKind::Displace(
+                RuntimeDisplaceParams::default(),
+            ))
+            .unwrap();
+        let (bypass_report, bypass_bytes) = gpu.render(
+            &executor,
+            &plan(&bypass, dimensions),
+            &source,
+            &RackImageBindings::empty(),
+            0.0,
+        );
+        assert_eq!(bypass_report.executed_passes, 0);
+        assert_eq!(
+            bypass_bytes, carrier_bytes,
+            "zero-gain Displace must be a byte-exact bypass"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_displace_transparent_hostile_donor_is_byte_identical_to_the_carrier() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let carrier_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| [(index % 8) as f32 / 7.0, 0.25, 0.75, 1.0])
+            .collect();
+        let (_carrier_texture, carrier_view, _) =
+            gpu.texture(dimensions, &carrier_pixels, "hostile carrier");
+        let executor = CollisionRackExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        let source = executor
+            .prepare_source(&gpu.device, &carrier_view, dimensions)
+            .unwrap();
+
+        let params = displace(1.0, 1.0, DisplaceBoundary::Transparent);
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack.push(RuntimeVisualNodeKind::Displace(params)).unwrap();
+        let compiled = plan(&rack, dimensions);
+
+        // Neutral donor: a full-gain node that must still not move a pixel.
+        let neutral = vec![[0.5, 0.5, 0.0, 1.0]; 64];
+        let (_neutral_texture, neutral_view, _) =
+            gpu.texture(dimensions, &neutral, "neutral donor");
+        let neutral_bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[RackImageInput {
+                    node_id: id,
+                    tap: params.tap,
+                    view: Some(&neutral_view),
+                }],
+            )
+            .unwrap();
+        let (_, neutral_bytes) = gpu.render(&executor, &compiled, &source, &neutral_bindings, 0.0);
+
+        // Transparent donor carrying maximally hostile hidden RGB.
+        let hostile = vec![[1.0, 1.0, 1.0, 0.0]; 64];
+        let (_hostile_texture, hostile_view, _) =
+            gpu.texture(dimensions, &hostile, "hostile donor");
+        let hostile_bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[RackImageInput {
+                    node_id: id,
+                    tap: params.tap,
+                    view: Some(&hostile_view),
+                }],
+            )
+            .unwrap();
+        let (_, hostile_bytes) = gpu.render(&executor, &compiled, &source, &hostile_bindings, 0.0);
+
+        assert_eq!(
+            hostile_bytes, neutral_bytes,
+            "hidden RGB at alpha zero must never reach the vector field"
+        );
+
+        // A missing binding is the same defined zero field.
+        let (missing_report, missing_bytes) = gpu.render(
+            &executor,
+            &compiled,
+            &source,
+            &RackImageBindings::empty(),
+            0.0,
+        );
+        assert_eq!(missing_report.missing_image_count, 1);
+        assert_eq!(missing_bytes, neutral_bytes);
     }
 }

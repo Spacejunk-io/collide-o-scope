@@ -1280,6 +1280,13 @@ fn apply_stable_node_offset(
             "image_softness" => Some(&mut value.softness),
             _ => None,
         },
+        // Displace exposes its two gains and nothing else: the donor route and
+        // the boundary law are topology and have no modulatable address.
+        RuntimeVisualNodeKind::Displace(value) => match descriptor.key {
+            "amount_x" => Some(&mut value.amount_x),
+            "amount_y" => Some(&mut value.amount_y),
+            _ => None,
+        },
     };
     if let Some(slot) = slot {
         if matches!(
@@ -4701,5 +4708,100 @@ mod tests {
                 parameter: CompositionModParameter::BusCrossfade,
             })
         );
+    }
+
+    #[test]
+    fn displace_exposes_stable_addresses_for_its_two_gains_only() {
+        use crate::visual_rack::{
+            DisplaceBoundary, EdgeTiming, ResolvedImageSource, ResolvedImageTap,
+            RuntimeDisplaceParams, RuntimeVisualNodeKind, RuntimeVisualRack,
+        };
+
+        let authored = RuntimeDisplaceParams {
+            tap: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            amount_x: 0.25,
+            amount_y: -0.25,
+            boundary: DisplaceBoundary::Mirror,
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::Displace(authored))
+            .unwrap();
+
+        let mut book = StableModAddressBook::default();
+        book.add_rack(StableModScope::Master, &rack).unwrap();
+
+        // Exactly one address per gain, plus the shared structural wet.
+        let keys: Vec<_> = book
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                StableModTarget::Node { parameter, .. } => match parameter {
+                    StableNodeParameter::Wet => Some("wet"),
+                    StableNodeParameter::Descriptor {
+                        descriptor_index, ..
+                    } => NODE_PARAM_DESCRIPTORS
+                        .get(usize::from(*descriptor_index))
+                        .map(|descriptor| descriptor.key),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec!["wet", "amount_x", "amount_y"]);
+
+        // Offsets land on the addressed axis and clamp to the ±1 UV domain.
+        let address_of = |key: &str| {
+            book.targets
+                .iter()
+                .position(|target| {
+                    matches!(
+                        target,
+                        StableModTarget::Node {
+                            parameter: StableNodeParameter::Descriptor { descriptor_index, .. },
+                            ..
+                        } if NODE_PARAM_DESCRIPTORS[usize::from(*descriptor_index)].key == key
+                    )
+                })
+                .map(|index| StableModAddress(index as u16))
+                .unwrap()
+        };
+        let mut offsets = vec![0.0_f32; book.targets.len()];
+        offsets[address_of("amount_x").index()] = 0.5;
+        offsets[address_of("amount_y").index()] = -5.0;
+        let frame = StableModulationFrame { offsets };
+
+        let mut modulated = rack.clone();
+        apply_stable_rack_modulation(&book, &frame, StableModScope::Master, &mut modulated);
+        let RuntimeVisualNodeKind::Displace(params) = modulated.get(node_id).unwrap().kind else {
+            panic!("displace node")
+        };
+        assert!((params.amount_x - 0.75).abs() < 1e-5);
+        assert_eq!(params.amount_y, -1.0, "offsets clamp into the UV domain");
+        assert_eq!(
+            params.tap, authored.tap,
+            "modulation never touches the donor route"
+        );
+        assert_eq!(
+            params.boundary, authored.boundary,
+            "modulation never touches the boundary law"
+        );
+
+        // The route and boundary descriptors have no modulatable address.
+        for key in ["donor_tap", "boundary"] {
+            let index = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .position(|descriptor| {
+                    descriptor.kind == NodeKindTag::Displace && descriptor.key == key
+                })
+                .unwrap();
+            let parameter = StableNodeParameter::Descriptor {
+                descriptor_index: index as u16,
+                component: StableModComponent::Scalar,
+            };
+            assert!(!parameter.is_valid_for_kind(NodeKindTag::Displace));
+        }
     }
 }

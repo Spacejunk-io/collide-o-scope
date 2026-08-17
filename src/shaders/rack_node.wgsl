@@ -17,6 +17,14 @@ const RACK_GRAIN: u32 = 6u;
 const RACK_RECTANGLE_MASK: u32 = 7u;
 const RACK_ELLIPSE_MASK: u32 = 8u;
 const RACK_IMAGE_MASK: u32 = 9u;
+const RACK_DISPLACE: u32 = 10u;
+
+// Displace boundary laws. These codes are permanent and append-only; they
+// mirror `visual_rack::DisplaceBoundary::code`.
+const DISPLACE_TRANSPARENT: u32 = 0u;
+const DISPLACE_MIRROR: u32 = 1u;
+const DISPLACE_WRAP: u32 = 2u;
+const DISPLACE_HOLD: u32 = 3u;
 
 struct RackUniforms {
     // Node kind, blend code, donor-valid flag, deterministic seed.
@@ -484,6 +492,64 @@ fn image_mask(uv: vec2f, dry: vec4f) -> vec4f {
     return vec4f(dry.rgb, dry.a * admission);
 }
 
+// Donor vectors are alpha-covered, so the donor is filtered in premultiplied
+// space and the result is deliberately returned premultiplied. The decode then
+// consumes premultiplied RG together with the filtered alpha, which makes a
+// transparent donor exactly zero no matter what its hidden RGB contains.
+fn donor_premultiplied_linear(uv: vec2f) -> vec4f {
+    let dimensions = vec2i(textureDimensions(donor_tex));
+    let coordinate = uv * vec2f(dimensions) - vec2f(0.5);
+    let base = vec2i(floor(coordinate));
+    let fraction = fract(coordinate);
+    let maximum = dimensions - vec2i(1);
+    let p00 = clamp(base, vec2i(0), maximum);
+    let p10 = clamp(base + vec2i(1, 0), vec2i(0), maximum);
+    let p01 = clamp(base + vec2i(0, 1), vec2i(0), maximum);
+    let p11 = clamp(base + vec2i(1, 1), vec2i(0), maximum);
+    let s00 = textureLoad(donor_tex, p00, 0);
+    let s10 = textureLoad(donor_tex, p10, 0);
+    let s01 = textureLoad(donor_tex, p01, 0);
+    let s11 = textureLoad(donor_tex, p11, 0);
+    let c00 = vec4f(s00.rgb * clamp(s00.a, 0.0, 1.0), clamp(s00.a, 0.0, 1.0));
+    let c10 = vec4f(s10.rgb * clamp(s10.a, 0.0, 1.0), clamp(s10.a, 0.0, 1.0));
+    let c01 = vec4f(s01.rgb * clamp(s01.a, 0.0, 1.0), clamp(s01.a, 0.0, 1.0));
+    let c11 = vec4f(s11.rgb * clamp(s11.a, 0.0, 1.0), clamp(s11.a, 0.0, 1.0));
+    return mix(mix(c00, c10, fraction.x), mix(c01, c11, fraction.x), fraction.y);
+}
+
+// Remap a displaced coordinate under the authored boundary law. `xy` is the
+// carrier coordinate to sample; `z` is binary coverage, which only Transparent
+// ever drops to zero.
+fn displace_boundary(uv: vec2f) -> vec3f {
+    let law = u32(rack.p0.z);
+    if law == DISPLACE_MIRROR {
+        return vec3f(vec2f(1.0) - abs(fract(uv * 0.5) * 2.0 - vec2f(1.0)), 1.0);
+    }
+    if law == DISPLACE_WRAP {
+        return vec3f(fract(uv), 1.0);
+    }
+    if law == DISPLACE_HOLD {
+        return vec3f(clamp(uv, vec2f(0.0), vec2f(1.0)), 1.0);
+    }
+    let inside = all(uv >= vec2f(0.0)) && all(uv <= vec2f(1.0));
+    return vec3f(clamp(uv, vec2f(0.0), vec2f(1.0)), select(0.0, 1.0, inside));
+}
+
+fn displace_node(uv: vec2f) -> vec4f {
+    // Sampled unconditionally so the lookup cost matches the declared ledger
+    // for every donor state; a missing binding is a defined transparent field.
+    let donor = donor_premultiplied_linear(uv);
+    var vector = vec2f(0.0);
+    if rack.node_meta.z != 0u {
+        // Neutral donor encoding is RG = 0.5 at full coverage.
+        vector = (donor.rg - vec2f(0.5) * donor.a) * 2.0;
+    }
+    let mapped = displace_boundary(uv + vector * rack.p0.xy);
+    let sampled = source_linear(mapped.xy);
+    // Coverage is binary, so this stays an exact keep-or-clear decision.
+    return select(vec4f(0.0), sampled, mapped.z > 0.5);
+}
+
 fn apply_node_law(dry: vec4f, processed: vec4f) -> vec4f {
     let wet = clamp(rack.frame.x, 0.0, 1.0);
     if wet <= 0.0 { return dry; }
@@ -526,6 +592,7 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             processed = vec4f(dry.rgb, dry.a * shape_mask(uv, true));
         }
         case RACK_IMAGE_MASK: { processed = image_mask(uv, dry); }
+        case RACK_DISPLACE: { processed = displace_node(uv); }
         default: {}
     }
     // Normal/full-wet uses the exact processed straight-alpha value. Other

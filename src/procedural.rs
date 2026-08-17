@@ -31,7 +31,7 @@ use crate::spatial::{
     SpatialTransform, ANCHOR_MAX, ANCHOR_MIN, CROP_MAX, POSITION_MAX, POSITION_MIN, SCALE_MAX,
     SCALE_MIN, SKEW_LIMIT_DEGREES,
 };
-use crate::visual_rack::{GroupId, MaskParams, NodeId, VisualNodeKind, VisualRack};
+use crate::visual_rack::{DisplaceParams, GroupId, MaskParams, NodeId, VisualNodeKind, VisualRack};
 
 /// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
 /// new isolated domains. Manifest readers remain data-driven and accept every
@@ -781,6 +781,14 @@ enum CreativeEdgeFallback {
         node_id: NodeId,
         prior: f32,
     },
+    /// Displace collects its donor only while at least one gain is nonzero, so
+    /// leaving the zero pair wakes a saved edge exactly like a mask amount.
+    DisplaceAmounts {
+        owner: ProceduralRackOwner,
+        node_id: NodeId,
+        prior_x: f32,
+        prior_y: f32,
+    },
     GroupMatteAmount {
         group_id: GroupId,
         prior: f32,
@@ -823,6 +831,22 @@ impl CreativeEdgeFallback {
                 };
                 if let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind {
                     matte.amount = prior;
+                }
+            }
+            Self::DisplaceAmounts {
+                owner,
+                node_id,
+                prior_x,
+                prior_y,
+            } => {
+                let Some(node) =
+                    saved_rack_mut(patch, owner).and_then(|rack| rack.get_mut(node_id))
+                else {
+                    return;
+                };
+                if let VisualNodeKind::Displace(params) = &mut node.kind {
+                    params.amount_x = prior_x;
+                    params.amount_y = prior_y;
                 }
             }
             Self::GroupMatteAmount { group_id, prior } => {
@@ -870,6 +894,10 @@ fn mutate_saved_rack_values(
         let prior_wet = node.wet;
         let prior_image_amount = match node.kind {
             VisualNodeKind::Mask(MaskParams::Image(matte)) => Some(matte.amount),
+            _ => None,
+        };
+        let prior_displace = match node.kind {
+            VisualNodeKind::Displace(params) => Some(params),
             _ => None,
         };
         let mut rng = procedural_node_rng(seed, index, owner, node_id);
@@ -1235,6 +1263,27 @@ fn mutate_saved_rack_values(
                 }
                 _ => {}
             },
+            (VisualNodeKind::Displace(anchor), VisualNodeKind::Displace(value)) => {
+                // Donor route and boundary law are stable authored topology and
+                // are preserved exactly. Each node draws from its own domain, so
+                // this arm cannot perturb any older generated stream.
+                value.amount_x = mutate_linear(
+                    anchor.amount_x,
+                    value.amount_x,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.amount_y = mutate_linear(
+                    anchor.amount_y,
+                    value.amount_y,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+            }
             (VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal, _)
             | (_, VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal) => {}
             // A generated patch never changes rack topology. Be defensive if
@@ -1249,7 +1298,12 @@ fn mutate_saved_rack_values(
             VisualNodeKind::Mask(MaskParams::Image(matte)) => Some(matte.amount),
             _ => None,
         };
-        let route_effect_active = current_image_amount.is_some_and(|value| value > 0.0);
+        let current_displace = match node.kind {
+            VisualNodeKind::Displace(params) => Some(params),
+            _ => None,
+        };
+        let route_effect_active = current_image_amount.is_some_and(|value| value > 0.0)
+            || current_displace.is_some_and(|params| !params.is_exact_bypass());
         if prior_wet <= 0.0 && node.wet > 0.0 && route_effect_active {
             edge_fallbacks.push(CreativeEdgeFallback::NodeWet {
                 owner,
@@ -1265,6 +1319,18 @@ fn mutate_saved_rack_values(
                 owner,
                 node_id,
                 prior: prior_image_amount.unwrap_or(0.0),
+            });
+        }
+        if node.wet > 0.0
+            && prior_displace.is_some_and(DisplaceParams::is_exact_bypass)
+            && current_displace.is_some_and(|params| !params.is_exact_bypass())
+        {
+            let prior = prior_displace.unwrap_or_default();
+            edge_fallbacks.push(CreativeEdgeFallback::DisplaceAmounts {
+                owner,
+                node_id,
+                prior_x: prior.amount_x,
+                prior_y: prior.amount_y,
             });
         }
     }
@@ -4223,5 +4289,110 @@ scenes:
             CAPTURE_SAVING
         );
         assert_eq!(*status.lock().unwrap(), "Saving…");
+    }
+
+    #[test]
+    fn generated_displace_moves_gains_only_and_wakes_its_edge_transactionally() {
+        use crate::visual_rack::{
+            DisplaceBoundary, DisplaceParams, EdgeTiming, SavedImageSource, SavedImageTap,
+        };
+
+        let authored = DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            amount_x: 0.3,
+            amount_y: -0.3,
+            boundary: DisplaceBoundary::Hold,
+        };
+        let mut anchor = VisualRack::empty();
+        let node_id = anchor.push(VisualNodeKind::Displace(authored)).unwrap();
+        let params_of = |rack: &VisualRack| match rack.get(node_id).unwrap().kind {
+            VisualNodeKind::Displace(params) => params,
+            _ => panic!("displace node"),
+        };
+
+        let mut generated = anchor.clone();
+        let mut fallbacks = Vec::new();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut generated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut fallbacks,
+        );
+        let after = params_of(&generated);
+        assert_eq!(after.tap, authored.tap, "generation never reroutes a donor");
+        assert_eq!(after.boundary, authored.boundary);
+        assert!(after.amount_x != authored.amount_x || after.amount_y != authored.amount_y);
+        assert!((-1.0..=1.0).contains(&after.amount_x));
+        assert!((-1.0..=1.0).contains(&after.amount_y));
+
+        // Deterministic: identical seed and index reproduce identical gains.
+        let mut repeated = anchor.clone();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut repeated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(params_of(&repeated), after);
+
+        // Zero temperature is an exact no-op.
+        let mut untouched = anchor.clone();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut untouched,
+            0.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(params_of(&untouched), authored);
+
+        // A node that starts at zero gain has a dormant edge. Waking it must
+        // record a transactional fallback so the caller can restore the
+        // dormant state if the woken graph fails preflight.
+        let mut dormant_anchor = VisualRack::empty();
+        let dormant_id = dormant_anchor
+            .push(VisualNodeKind::Displace(DisplaceParams {
+                tap: SavedImageTap {
+                    source: SavedImageSource::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ..DisplaceParams::default()
+            }))
+            .unwrap();
+        let mut woken = dormant_anchor.clone();
+        let mut fallbacks = Vec::new();
+        mutate_saved_rack_values(
+            &dormant_anchor,
+            &mut woken,
+            1.0,
+            0x1234,
+            1,
+            ProceduralRackOwner::Master,
+            &mut fallbacks,
+        );
+        let VisualNodeKind::Displace(params) = woken.get(dormant_id).unwrap().kind else {
+            panic!("displace node")
+        };
+        if !params.is_exact_bypass() {
+            assert!(
+                fallbacks.iter().any(|fallback| matches!(
+                    fallback,
+                    CreativeEdgeFallback::DisplaceAmounts { node_id, prior_x, prior_y, .. }
+                        if *node_id == dormant_id && *prior_x == 0.0 && *prior_y == 0.0
+                )),
+                "waking a dormant Displace edge must be transactionally restorable"
+            );
+        }
     }
 }
