@@ -15,7 +15,10 @@ use crate::video::indexed::{
     finite_nonnegative, timestamp_to_source_seconds, DecodeWorkError, DecodedVideoFrame,
     FrameMetadata, KeyframeIndex, ReverseFrameCache,
 };
-use crate::video::CodecMotionFrame;
+use crate::video::{
+    AdjacentReferencePolicy, CodecFrameIdentity, CodecMotionFrame, CodecMotionFrameType,
+    CodecMotionProduct, CodecMotionSequence, CodecPastReferenceProof, CodecTimeBase,
+};
 
 // Compatibility names used by existing callers/tests. Safe mode remains the
 // exact UHD-area boundary these constants represented before Expert mode was
@@ -116,6 +119,15 @@ pub struct VideoDecoder {
     keyframe_index: KeyframeIndex,
     reverse_cache: ReverseFrameCache,
     seek_stats: DecoderSeekStats,
+    /// FFmpeg's AVMotionVector side data does not identify the exact reference
+    /// picture. MPEG-4 Part 2 P/B VOPs have a bounded previous-anchor law that
+    /// lets this decoder derive the past interval from decoded timestamps.
+    /// Other codecs remain conservatively unavailable to codec-vector motion.
+    codec_motion_previous_anchor_law: bool,
+    codec_time_base: Option<CodecTimeBase>,
+    codec_motion_generation: Option<u64>,
+    codec_previous_output: Option<CodecFrameIdentity>,
+    codec_previous_anchor: Option<CodecFrameIdentity>,
 }
 
 impl VideoDecoder {
@@ -199,14 +211,21 @@ impl VideoDecoder {
             .best(Type::Video)
             .ok_or("No video stream found")?;
         let stream_index = stream.index();
+        let codec_time_base = CodecTimeBase::new(
+            stream.time_base().numerator(),
+            stream.time_base().denominator(),
+        );
 
         let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| format!("Codec params: {e}"))?;
         enable_export_motion_vectors(&mut codec_ctx);
+        let codec_id = codec_ctx.id();
         let decoder = codec_ctx
             .decoder()
             .video()
             .map_err(|e| format!("Decoder: {e}"))?;
+        let codec_motion_previous_anchor_law =
+            codec_has_previous_anchor_motion(codec_id, decoder.profile(), decoder.has_b_frames());
 
         let width = decoder.width();
         let height = decoder.height();
@@ -301,6 +320,11 @@ impl VideoDecoder {
                 media_policy.reverse_cache_ledger(),
             ),
             seek_stats: DecoderSeekStats::default(),
+            codec_motion_previous_anchor_law,
+            codec_time_base,
+            codec_motion_generation: None,
+            codec_previous_output: None,
+            codec_previous_anchor: None,
         })
     }
 
@@ -430,6 +454,58 @@ impl VideoDecoder {
         &mut self,
         target_seconds: f64,
         source_generation: u64,
+        is_current: F,
+    ) -> Result<DecodedVideoFrame, DecodeWorkError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.seek_decode_internal(target_seconds, source_generation, None, false, is_current)
+    }
+
+    /// Select one absolute frame while retaining every adjacent codec-motion
+    /// transition after the previously accepted source image. Passing `None`
+    /// is a source cut: the decoded pixels remain valid, but codec motion is
+    /// intentionally unavailable for that first image.
+    pub fn seek_decode_after_for_generation(
+        &mut self,
+        target_seconds: f64,
+        source_generation: u64,
+        previous_accepted_identity: Option<CodecFrameIdentity>,
+    ) -> Result<DecodedVideoFrame, String> {
+        self.seek_decode_after_interruptible(
+            target_seconds,
+            source_generation,
+            previous_accepted_identity,
+            || true,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn seek_decode_after_interruptible<F>(
+        &mut self,
+        target_seconds: f64,
+        source_generation: u64,
+        previous_accepted_identity: Option<CodecFrameIdentity>,
+        is_current: F,
+    ) -> Result<DecodedVideoFrame, DecodeWorkError>
+    where
+        F: FnMut() -> bool,
+    {
+        self.seek_decode_internal(
+            target_seconds,
+            source_generation,
+            previous_accepted_identity,
+            true,
+            is_current,
+        )
+    }
+
+    fn seek_decode_internal<F>(
+        &mut self,
+        target_seconds: f64,
+        source_generation: u64,
+        previous_accepted_identity: Option<CodecFrameIdentity>,
+        compose_skipped_motion: bool,
         mut is_current: F,
     ) -> Result<DecodedVideoFrame, DecodeWorkError>
     where
@@ -448,16 +524,24 @@ impl VideoDecoder {
             target_seconds.max(0.0)
         };
         let frame_period = 1.0 / f64::from(self.fps.max(1.0));
-        if let Some(frame) = self
-            .reverse_cache
-            .near_at_or_before(target_seconds, source_generation, frame_period * 1.5)
-            .map_err(DecodeWorkError::Failed)?
-        {
-            self.check_work_current(&mut is_current)?;
-            self.seek_stats.reverse_cache_hits =
-                self.seek_stats.reverse_cache_hits.saturating_add(1);
-            self.adopt_selected_metadata(frame.metadata);
-            return Ok(frame);
+        let reverse_request =
+            is_strict_reverse_request(target_seconds, self.last_source_seconds, frame_period);
+        if reverse_request {
+            if let Some(frame) = self
+                .reverse_cache
+                .near_at_or_before(target_seconds, source_generation, frame_period * 1.5)
+                .map_err(DecodeWorkError::Failed)?
+            {
+                self.check_work_current(&mut is_current)?;
+                self.seek_stats.reverse_cache_hits =
+                    self.seek_stats.reverse_cache_hits.saturating_add(1);
+                self.adopt_selected_metadata(frame.metadata);
+                // Cached pixels are exact, but the live FFmpeg decoder is not
+                // positioned at this cached picture. No subsequent decode may
+                // inherit its prior anchor state as if the cache hit decoded.
+                self.reset_codec_motion_reference_state();
+                return Ok(frame);
+            }
         }
 
         let keyframe = self.keyframe_index.preceding(target_seconds);
@@ -468,21 +552,43 @@ impl VideoDecoder {
             .floor()
             .max(0.0) as u64;
 
+        let previous_accepted_identity = previous_accepted_identity
+            .filter(|identity| identity.source_generation == source_generation);
+        let mut motion_sequence = None;
+        let mut motion_sequence_rejected = false;
         let mut newest = None;
         let mut reached_eof = false;
         for _ in 0..MAX_SEEK_DECODE_FRAMES {
             self.check_work_current(&mut is_current)?;
-            let Some(frame) =
+            let Some(mut frame) =
                 self.next_frame_without_loop_interruptible(source_generation, &mut is_current)?
             else {
                 reached_eof = true;
                 break;
             };
+            if compose_skipped_motion {
+                append_codec_motion_after(
+                    &mut motion_sequence,
+                    &mut motion_sequence_rejected,
+                    &frame,
+                    previous_accepted_identity,
+                );
+            }
             let reached = frame.metadata.source_seconds + frame_period * 0.5 >= target_seconds;
             if reached {
+                if compose_skipped_motion {
+                    frame.codec_motion =
+                        accepted_codec_motion_sequence(motion_sequence, motion_sequence_rejected);
+                }
                 return Ok(frame);
             }
             newest = Some(frame);
+        }
+        if compose_skipped_motion {
+            if let Some(frame) = newest.as_mut() {
+                frame.codec_motion =
+                    accepted_codec_motion_sequence(motion_sequence, motion_sequence_rejected);
+            }
         }
         finish_unreached_seek(
             newest,
@@ -598,6 +704,7 @@ impl VideoDecoder {
             ));
         }
         self.decoder.flush();
+        self.reset_codec_motion_reference_state();
         self.seek_stats.seek_calls = self.seek_stats.seek_calls.saturating_add(1);
         Ok(())
     }
@@ -616,20 +723,70 @@ impl VideoDecoder {
                 self.stream_time_base_seconds,
             )
         });
+        let identity = pts.map(|pts| CodecFrameIdentity {
+            source_generation,
+            pts,
+            presentation_ordinal: self.frame_count.saturating_sub(1),
+        });
         let metadata = FrameMetadata::sanitized(
             source_generation,
             pts,
             source_seconds,
             self.duration_seconds,
-        );
+        )
+        .with_codec_identity(identity);
         let rgba = self.scale_frame(frame)?;
-        let codec_motion = Some(CodecMotionFrame::from_decoded_frame(
-            frame,
-            [self.width, self.height],
-            1.0 / self.fps,
-            source_generation,
-            self.frame_count.saturating_sub(1),
-        ));
+        if self.codec_motion_generation != Some(source_generation) {
+            self.reset_codec_motion_reference_state();
+            self.codec_motion_generation = Some(source_generation);
+        }
+        let frame_type = CodecMotionFrameType::from_ffmpeg(frame.kind());
+        let frame_delta_seconds = self
+            .codec_time_base
+            .and_then(|time_base| {
+                exact_identity_elapsed(self.codec_previous_output, identity, time_base)
+            })
+            .unwrap_or_else(|| 1.0 / self.fps.max(1.0));
+        let past_reference_proof = if self.codec_motion_previous_anchor_law
+            && frame_type == CodecMotionFrameType::Predictive
+            && !frame.is_interlaced()
+            && !frame.is_corrupt()
+            && self.codec_previous_anchor == self.codec_previous_output
+        {
+            exact_adjacent_reference_proof(
+                self.codec_previous_anchor,
+                identity,
+                self.codec_time_base,
+            )
+        } else {
+            None
+        };
+        let codec_motion = Some(
+            CodecMotionFrame::from_decoded_frame(
+                frame,
+                [self.width, self.height],
+                frame_delta_seconds,
+                past_reference_proof,
+                source_generation,
+                self.frame_count.saturating_sub(1),
+            )
+            .into(),
+        );
+        self.codec_previous_output = identity;
+        if !frame.is_interlaced()
+            && !frame.is_corrupt()
+            && matches!(
+                frame_type,
+                CodecMotionFrameType::Intra | CodecMotionFrameType::Predictive
+            )
+        {
+            self.codec_previous_anchor = identity;
+        } else {
+            // A corrupt/interlaced output cannot become the proven reference
+            // for the next progressive P picture merely because it occupied
+            // the immediately preceding presentation slot.
+            self.codec_previous_anchor = None;
+        }
         let decoded = DecodedVideoFrame {
             rgba,
             metadata,
@@ -648,6 +805,12 @@ impl VideoDecoder {
     fn adopt_selected_metadata(&mut self, metadata: FrameMetadata) {
         self.last_pts = metadata.pts;
         self.last_source_seconds = metadata.source_seconds;
+    }
+
+    fn reset_codec_motion_reference_state(&mut self) {
+        self.codec_motion_generation = None;
+        self.codec_previous_output = None;
+        self.codec_previous_anchor = None;
     }
 
     fn scale_frame(&mut self, frame: &VideoFrame) -> Result<Vec<u8>, String> {
@@ -704,13 +867,20 @@ impl VideoDecoder {
             .ok_or("No video stream on reopen")?;
 
         let stream_index = stream.index();
+        let codec_time_base = CodecTimeBase::new(
+            stream.time_base().numerator(),
+            stream.time_base().denominator(),
+        );
         let mut codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|e| format!("Codec params on reopen: {e}"))?;
         enable_export_motion_vectors(&mut codec_ctx);
+        let codec_id = codec_ctx.id();
         let decoder = codec_ctx
             .decoder()
             .video()
             .map_err(|e| format!("Decoder on reopen: {e}"))?;
+        let codec_motion_previous_anchor_law =
+            codec_has_previous_anchor_motion(codec_id, decoder.profile(), decoder.has_b_frames());
         if decoder.width() != self.width || decoder.height() != self.height {
             return Err(format!(
                 "video dimensions changed while reopening {}: expected {}x{}, got {}x{}",
@@ -723,11 +893,14 @@ impl VideoDecoder {
         }
         self.stream_index = stream_index;
         self.decoder = decoder;
+        self.codec_motion_previous_anchor_law = codec_motion_previous_anchor_law;
+        self.codec_time_base = codec_time_base;
 
         self.frame_count = 0;
         self.loop_generation = next_loop_generation(self.loop_generation);
         self.last_pts = None;
         self.last_source_seconds = 0.0;
+        self.reset_codec_motion_reference_state();
         self.seek_stats.reopen_calls = self.seek_stats.reopen_calls.saturating_add(1);
 
         Ok(())
@@ -751,6 +924,128 @@ impl VideoDecoder {
             self.check_cancelled().map_err(DecodeWorkError::Failed)
         }
     }
+}
+
+fn is_strict_reverse_request(
+    target_seconds: f64,
+    last_source_seconds: f64,
+    frame_period: f64,
+) -> bool {
+    target_seconds.is_finite()
+        && last_source_seconds.is_finite()
+        && frame_period.is_finite()
+        && target_seconds >= 0.0
+        && last_source_seconds >= 0.0
+        && frame_period > 0.0
+        && target_seconds + frame_period * 0.25 < last_source_seconds
+}
+
+/// Narrow codec whitelist whose bitstream law identifies every past-directed
+/// exported vector on a P VOP with the immediately previous I/P anchor. Only
+/// progressive, uncorrupted destinations are admitted at frame decode. The
+/// exact interval still comes from integer presentation timestamps; the ABI's
+/// `AVMotionVector.source` magnitude is never interpreted as distance.
+fn codec_has_previous_anchor_motion(
+    codec_id: ffmpeg::codec::Id,
+    profile: ffmpeg::codec::Profile,
+    has_b_frames: bool,
+) -> bool {
+    matches!(
+        (codec_id, profile, has_b_frames),
+        (
+            ffmpeg::codec::Id::MPEG4,
+            ffmpeg::codec::Profile::MPEG4(ffmpeg::codec::profile::MPEG4::Simple),
+            false
+        )
+    )
+}
+
+fn exact_identity_elapsed(
+    previous: Option<CodecFrameIdentity>,
+    current: Option<CodecFrameIdentity>,
+    time_base: CodecTimeBase,
+) -> Option<f32> {
+    let previous = previous?;
+    let current = current?;
+    if previous.source_generation != current.source_generation
+        || current.presentation_ordinal != previous.presentation_ordinal.saturating_add(1)
+    {
+        return None;
+    }
+    time_base.elapsed_seconds(current.pts.checked_sub(previous.pts)?)
+}
+
+fn exact_adjacent_reference_proof(
+    reference: Option<CodecFrameIdentity>,
+    destination: Option<CodecFrameIdentity>,
+    time_base: Option<CodecTimeBase>,
+) -> Option<CodecPastReferenceProof> {
+    let reference = reference?;
+    let destination = destination?;
+    let time_base = time_base?;
+    let elapsed_ticks = destination.pts.checked_sub(reference.pts)?;
+    let proof = CodecPastReferenceProof {
+        policy: AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp,
+        reference,
+        destination,
+        elapsed_ticks,
+        time_base,
+    };
+    proof.elapsed_seconds().map(|_| proof)
+}
+
+fn append_codec_motion_after(
+    sequence: &mut Option<CodecMotionSequence>,
+    rejected: &mut bool,
+    frame: &DecodedVideoFrame,
+    previous_accepted_identity: Option<CodecFrameIdentity>,
+) {
+    let Some(previous_identity) = previous_accepted_identity else {
+        return;
+    };
+    if *rejected {
+        return;
+    }
+    let Some(product) = frame.codec_motion.as_ref() else {
+        *sequence = None;
+        *rejected = true;
+        return;
+    };
+    let transition = product.latest().clone();
+    if transition.frame_ordinal <= previous_identity.presentation_ordinal {
+        return;
+    }
+    if sequence.is_none() {
+        let Some(proof) = transition.past_reference_proof else {
+            *rejected = true;
+            return;
+        };
+        if proof.reference != previous_identity {
+            *rejected = true;
+            return;
+        }
+        match CodecMotionSequence::from_frame(transition) {
+            Ok(first) => *sequence = Some(first),
+            Err(_) => *rejected = true,
+        }
+        return;
+    }
+    if sequence
+        .as_mut()
+        .expect("sequence existence checked above")
+        .push_contiguous(transition)
+        .is_err()
+    {
+        *sequence = None;
+        *rejected = true;
+    }
+}
+
+fn accepted_codec_motion_sequence(
+    sequence: Option<CodecMotionSequence>,
+    rejected: bool,
+) -> Option<CodecMotionProduct> {
+    (!rejected).then_some(sequence).flatten().map(Into::into)
 }
 
 fn finish_unreached_seek(
@@ -940,6 +1235,7 @@ mod tests {
         repack_rgba_plane, require_decoded_frame_before_loop, reserve_packed_rgba,
         should_interrupt_input, validate_media_dimensions, VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
     };
+    use crate::video::{CodecFrameIdentity, CodecTimeBase};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1142,6 +1438,10 @@ mod tests {
         let earlier = decoder.seek_decode_for_generation(1.52, 77).unwrap();
         assert!((earlier.metadata.source_seconds - 1.52).abs() <= 1.0 / 15.0);
         assert_eq!(earlier.metadata.source_generation, 77);
+        assert!(earlier.metadata.codec_identity.is_none_or(|identity| {
+            identity.source_generation == earlier.metadata.source_generation
+                && Some(identity.pts) == earlier.metadata.pts
+        }));
         assert!(
             earlier.codec_motion.is_none(),
             "reverse-cache retrieval must not retain stale codec metadata"
@@ -1151,8 +1451,105 @@ mod tests {
         assert_eq!(after_reverse.reverse_cache_hits, 1);
         assert_eq!(after_reverse.reopen_calls, 0);
         assert_eq!(after_reverse.scans_from_zero, 0);
+
+        // The cache already contains the later frame, but a forward request
+        // must decode from the index so it can reconstruct current codec
+        // proof state instead of returning an RGBA-only cache hit.
+        let forward_again = decoder.seek_decode_for_generation(1.6, 78).unwrap();
+        assert_eq!(forward_again.metadata.source_generation, 78);
+        let after_forward_again = decoder.seek_stats();
+        assert_eq!(after_forward_again.seek_calls, after_reverse.seek_calls + 1);
+        assert_eq!(
+            after_forward_again.reverse_cache_hits,
+            after_reverse.reverse_cache_hits
+        );
         let (_, cache_bytes) = decoder.reverse_cache_usage();
         assert!(cache_bytes <= super::super::indexed::MAX_REVERSE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn reverse_cache_direction_has_a_strict_finite_deadband() {
+        assert!(super::is_strict_reverse_request(1.0, 1.1, 1.0 / 30.0));
+        assert!(!super::is_strict_reverse_request(1.1, 1.0, 1.0 / 30.0));
+        assert!(!super::is_strict_reverse_request(1.0, 1.0, 1.0 / 30.0));
+        assert!(!super::is_strict_reverse_request(f64::NAN, 1.0, 1.0 / 30.0));
+        assert!(!super::is_strict_reverse_request(1.0, 1.1, 0.0));
+    }
+
+    #[test]
+    fn only_mpeg4_simple_progressive_ip_has_the_previous_anchor_law() {
+        use ffmpeg_next::codec::profile::MPEG4;
+        use ffmpeg_next::codec::Profile;
+
+        assert!(super::codec_has_previous_anchor_motion(
+            ffmpeg_next::codec::Id::MPEG4,
+            Profile::MPEG4(MPEG4::Simple),
+            false,
+        ));
+        assert!(!super::codec_has_previous_anchor_motion(
+            ffmpeg_next::codec::Id::MPEG4,
+            Profile::MPEG4(MPEG4::Simple),
+            true,
+        ));
+        assert!(!super::codec_has_previous_anchor_motion(
+            ffmpeg_next::codec::Id::MPEG4,
+            Profile::MPEG4(MPEG4::AdvancedSimple),
+            false,
+        ));
+        assert!(!super::codec_has_previous_anchor_motion(
+            ffmpeg_next::codec::Id::H264,
+            Profile::Unknown,
+            false,
+        ));
+    }
+
+    #[test]
+    fn exact_vfr_proof_uses_pts_ticks_and_rejects_hostile_identity_gaps() {
+        let reference = CodecFrameIdentity {
+            source_generation: 3,
+            pts: 100,
+            presentation_ordinal: 40,
+        };
+        let destination = CodecFrameIdentity {
+            source_generation: 3,
+            pts: 106,
+            presentation_ordinal: 41,
+        };
+        let time_base = CodecTimeBase::new(1, 1_000).unwrap();
+        let proof = super::exact_adjacent_reference_proof(
+            Some(reference),
+            Some(destination),
+            Some(time_base),
+        )
+        .expect("six VFR ticks are an exact adjacent presentation interval");
+        assert_eq!(proof.elapsed_ticks, 6);
+        assert!((proof.elapsed_seconds().unwrap() - 0.006).abs() < 1.0e-7);
+        assert_eq!(
+            super::exact_identity_elapsed(Some(reference), Some(destination), time_base),
+            Some(0.006)
+        );
+
+        for hostile in [
+            CodecFrameIdentity {
+                presentation_ordinal: 42,
+                ..destination
+            },
+            CodecFrameIdentity {
+                source_generation: 4,
+                ..destination
+            },
+            CodecFrameIdentity {
+                pts: 100,
+                ..destination
+            },
+        ] {
+            assert!(super::exact_adjacent_reference_proof(
+                Some(reference),
+                Some(hostile),
+                Some(time_base),
+            )
+            .is_none());
+        }
     }
 
     struct TemporaryCodecMotionFixture {
@@ -1162,6 +1559,10 @@ mod tests {
 
     impl TemporaryCodecMotionFixture {
         fn create() -> Result<Self, String> {
+            Self::create_with_b_frames(2)
+        }
+
+        fn create_with_b_frames(b_frames: u8) -> Result<Self, String> {
             let root = std::env::temp_dir().join(format!(
                 "collideoscope-codec-motion-{}-{}",
                 std::process::id(),
@@ -1193,7 +1594,9 @@ mod tests {
                     "-g",
                     "12",
                     "-bf",
-                    "2",
+                ])
+                .arg(b_frames.to_string())
+                .args([
                     "-q:v",
                     "2",
                     "-pix_fmt",
@@ -1221,9 +1624,9 @@ mod tests {
     #[test]
     #[ignore = "requires an ffmpeg executable; creates only a temporary inter-frame clip"]
     fn real_temporary_ffmpeg_fixture_exposes_intra_and_inter_codec_metadata() {
-        use crate::video::CodecMotionStatus;
+        use crate::video::{AdjacentReferencePolicy, CodecMotionStatus};
 
-        let fixture = TemporaryCodecMotionFixture::create().unwrap();
+        let fixture = TemporaryCodecMotionFixture::create_with_b_frames(0).unwrap();
         let mut decoder = VideoDecoder::open(&fixture.video.to_string_lossy()).unwrap();
         let mut saw_intra = false;
         let mut saw_inter_vectors = false;
@@ -1239,8 +1642,27 @@ mod tests {
                     saw_intra = true;
                     assert!(motion.vectors.is_empty());
                 }
-                CodecMotionStatus::Available => saw_inter_vectors = true,
+                CodecMotionStatus::Available => {
+                    saw_inter_vectors = true;
+                    let proof = motion
+                        .past_reference_proof
+                        .expect("an available real P frame has typed proof");
+                    assert_eq!(
+                        proof.policy,
+                        AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp
+                    );
+                    assert_eq!(proof.destination, frame.metadata.codec_identity.unwrap());
+                    assert_eq!(
+                        proof.destination.presentation_ordinal,
+                        proof.reference.presentation_ordinal + 1
+                    );
+                    let elapsed = proof.elapsed_seconds().unwrap();
+                    assert!(motion.vectors.iter().all(|vector| {
+                        (vector.seconds_from_reference - elapsed).abs() < 1.0e-6
+                    }));
+                }
                 CodecMotionStatus::FutureOnly
+                | CodecMotionStatus::ReferenceUnproven
                 | CodecMotionStatus::Unavailable
                 | CodecMotionStatus::Rejected(_) => {}
             }
@@ -1254,6 +1676,172 @@ mod tests {
             "generated inter-frame stream exposed no usable past vectors"
         );
         assert!(!fixture.video.starts_with(env!("CARGO_MANIFEST_DIR")));
+    }
+
+    #[test]
+    #[ignore = "requires an ffmpeg executable; creates only a temporary B-frame clip"]
+    fn real_b_frame_stream_never_claims_an_unproven_codec_reference_interval() {
+        use crate::video::{CodecMotionFrameType, CodecMotionStatus};
+
+        let fixture = TemporaryCodecMotionFixture::create().unwrap();
+        let mut decoder = VideoDecoder::open(&fixture.video.to_string_lossy()).unwrap();
+        let mut saw_inter = false;
+        let mut saw_bidirectional = false;
+        for _ in 0..24 {
+            let frame = decoder.next_timed_frame_result(92).unwrap();
+            let motion = frame
+                .codec_motion
+                .expect("video frames carry bounded codec metadata");
+            if motion.frame_type != CodecMotionFrameType::Intra {
+                saw_inter = true;
+                saw_bidirectional |= motion.frame_type == CodecMotionFrameType::Bidirectional;
+                assert_ne!(motion.status, CodecMotionStatus::Available);
+                assert!(motion.vectors.is_empty());
+            }
+        }
+        assert!(
+            saw_inter,
+            "generated B-frame stream exposed no inter frames"
+        );
+        assert!(
+            saw_bidirectional,
+            "FFmpeg fixture did not actually decode a B picture"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an ffmpeg executable; creates only a temporary adjacent-P-frame clip"]
+    fn real_temporary_ffmpeg_fixture_composes_every_skipped_adjacent_transition() {
+        let fixture = TemporaryCodecMotionFixture::create_with_b_frames(0).unwrap();
+        let mut decoder = VideoDecoder::open(&fixture.video.to_string_lossy()).unwrap();
+        let generation = 121;
+        let previous = decoder
+            .seek_decode_for_generation(1.0 / 12.0, generation)
+            .unwrap();
+        let selected = decoder
+            .seek_decode_after_for_generation(
+                5.0 / 12.0,
+                generation,
+                previous.metadata.codec_identity,
+            )
+            .unwrap();
+        let product = selected
+            .codec_motion
+            .expect("adjacent P frames expose a complete codec-motion chain");
+        assert_eq!(product.transition_count(), 4);
+        assert_eq!(product.latest().source_generation, generation);
+        assert_eq!(product.latest().frame_ordinal, 5);
+        let field = product
+            .rasterize(crate::motion::MotionLatticeQuality::Live)
+            .unwrap()
+            .expect("the composed adjacent chain rasterizes");
+        assert_eq!(
+            field.origin(),
+            crate::motion::MotionFieldOrigin::CodecVectors
+        );
+        assert!(field
+            .packed_vectors()
+            .iter()
+            .copied()
+            .map(crate::motion::PackedMotionVector::sample)
+            .any(|sample| sample.confidence > 0.0));
+    }
+
+    #[test]
+    fn skipped_codec_steps_publish_only_a_contiguous_accepted_interval() {
+        fn frame(source_seconds: f64, ordinal: u64) -> crate::video::DecodedVideoFrame {
+            let destination = crate::video::CodecFrameIdentity {
+                source_generation: 7,
+                pts: ordinal as i64,
+                presentation_ordinal: ordinal,
+            };
+            let reference = crate::video::CodecFrameIdentity {
+                source_generation: 7,
+                pts: ordinal.saturating_sub(1) as i64,
+                presentation_ordinal: ordinal.saturating_sub(1),
+            };
+            crate::video::DecodedVideoFrame {
+                rgba: vec![0; 64 * 64 * 4],
+                metadata: crate::video::FrameMetadata::sanitized(
+                    7,
+                    Some(ordinal as i64),
+                    source_seconds,
+                    10.0,
+                )
+                .with_codec_identity(Some(destination)),
+                codec_motion: Some(
+                    crate::video::CodecMotionFrame {
+                        source_dimensions: [64, 64],
+                        frame_delta_seconds: 1.0 / 30.0,
+                        source_generation: 7,
+                        frame_ordinal: ordinal,
+                        algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+                        provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
+                        frame_type: crate::video::CodecMotionFrameType::Predictive,
+                        status: crate::video::CodecMotionStatus::Available,
+                        past_reference_proof: Some(crate::video::CodecPastReferenceProof {
+                            policy: crate::video::AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp,
+                            reference,
+                            destination,
+                            elapsed_ticks: 1,
+                            time_base: crate::video::CodecTimeBase::new(1, 30).unwrap(),
+                        }),
+                        vectors: vec![crate::motion::CodecMotionVector {
+                            destination: [32, 32],
+                            block: [64, 64],
+                            motion: [-1, 0],
+                            motion_scale: 1,
+                            seconds_from_reference: 1.0 / 30.0,
+                            reference: crate::motion::CodecReferenceDirection::Past,
+                            visibility: 1.0,
+                        }],
+                    }
+                    .into(),
+                ),
+            }
+        }
+
+        let previous = crate::video::CodecFrameIdentity {
+            source_generation: 7,
+            pts: 10,
+            presentation_ordinal: 10,
+        };
+        let mut sequence = None;
+        let mut rejected = false;
+        for ordinal in 11..=14 {
+            super::append_codec_motion_after(
+                &mut sequence,
+                &mut rejected,
+                &frame(ordinal as f64 / 30.0, ordinal),
+                Some(previous),
+            );
+        }
+        let product = super::accepted_codec_motion_sequence(sequence, rejected).unwrap();
+        assert_eq!(product.transition_count(), 4);
+        assert_eq!(product.frame_ordinal, 14);
+
+        let mut missing_prefix = None;
+        let mut missing_prefix_rejected = false;
+        super::append_codec_motion_after(
+            &mut missing_prefix,
+            &mut missing_prefix_rejected,
+            &frame(14.0 / 30.0, 14),
+            Some(previous),
+        );
+        assert!(
+            super::accepted_codec_motion_sequence(missing_prefix, missing_prefix_rejected)
+                .is_none()
+        );
+
+        let mut source_cut = None;
+        let mut source_cut_rejected = false;
+        super::append_codec_motion_after(
+            &mut source_cut,
+            &mut source_cut_rejected,
+            &frame(11.0 / 30.0, 11),
+            None,
+        );
+        assert!(super::accepted_codec_motion_sequence(source_cut, source_cut_rejected).is_none());
     }
 
     #[test]

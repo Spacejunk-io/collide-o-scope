@@ -20,8 +20,9 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    MotionConfig, MotionDonorConfig, RefreshGardenConfig, TemporalLoomConfig,
-    TemporalOriginalsConfig, TemporalResetPolicyConfig,
+    MotionConfig, MotionDonorConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
+    RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
+    TemporalResetPolicyConfig,
 };
 use crate::spatial::SpatialTransform;
 use crate::temporal::CollisionScoreLoopDriver;
@@ -701,6 +702,8 @@ fn interpolate_temporal_originals(
             softness: blend_finite(a.garden.softness, b.garden.softness, weights),
             decay: blend_finite(a.garden.decay, b.garden.decay, weights),
             max_hold_ticks: blend_u32(a.garden.max_hold_ticks, b.garden.max_hold_ticks, weights),
+            matte_route: pick(a.garden.matte_route, b.garden.matte_route, choose_b),
+            motion_route: pick(a.garden.motion_route, b.garden.motion_route, choose_b),
         },
         // Score configuration is entirely discrete: an A/B move may recall
         // either conductor, but may not synthesize a third sequence.
@@ -1219,6 +1222,86 @@ fn remap_score_driver_after_remove(driver: &mut CollisionScoreLoopDriverConfig, 
     };
 }
 
+fn remap_garden_matte_route_after_move(
+    route: &mut RefreshGardenMatteRouteConfig,
+    from: usize,
+    to: usize,
+) {
+    let RefreshGardenMatteRouteConfig::SelectedLayer { saved_position, .. } = route else {
+        return;
+    };
+    *saved_position = remapped_saved_position_after_move(*saved_position, from, to);
+}
+
+fn remap_garden_matte_route_after_remove(
+    route: &mut RefreshGardenMatteRouteConfig,
+    removed: usize,
+) {
+    let RefreshGardenMatteRouteConfig::SelectedLayer {
+        saved_position,
+        stage,
+    } = *route
+    else {
+        return;
+    };
+    let position = saved_position.get() as usize;
+    *route = if position == removed {
+        RefreshGardenMatteRouteConfig::MissingSelectedLayer {
+            saved_position,
+            stage,
+        }
+    } else if position > removed {
+        RefreshGardenMatteRouteConfig::SelectedLayer {
+            saved_position: crate::performance::SavedLayerPosition::new(
+                saved_position
+                    .get()
+                    .checked_sub(1)
+                    .expect("a position greater than the removed index is nonzero"),
+            )
+            .expect("decrementing a valid saved position remains valid"),
+            stage,
+        }
+    } else {
+        *route
+    };
+}
+
+fn remap_garden_motion_route_after_move(
+    route: &mut RefreshGardenMotionRouteConfig,
+    from: usize,
+    to: usize,
+) {
+    let RefreshGardenMotionRouteConfig::SelectedLayer { saved_position } = route else {
+        return;
+    };
+    *saved_position = remapped_saved_position_after_move(*saved_position, from, to);
+}
+
+fn remap_garden_motion_route_after_remove(
+    route: &mut RefreshGardenMotionRouteConfig,
+    removed: usize,
+) {
+    let RefreshGardenMotionRouteConfig::SelectedLayer { saved_position } = *route else {
+        return;
+    };
+    let position = saved_position.get() as usize;
+    *route = if position == removed {
+        RefreshGardenMotionRouteConfig::MissingSelectedLayer { saved_position }
+    } else if position > removed {
+        RefreshGardenMotionRouteConfig::SelectedLayer {
+            saved_position: crate::performance::SavedLayerPosition::new(
+                saved_position
+                    .get()
+                    .checked_sub(1)
+                    .expect("a position greater than the removed index is nonzero"),
+            )
+            .expect("decrementing a valid saved position remains valid"),
+        }
+    } else {
+        *route
+    };
+}
+
 fn remap_motion_donor_after_move(donor: &mut MotionDonorConfig, from: usize, to: usize) {
     let MotionDonorConfig::Selected { saved_position } = donor else {
         return;
@@ -1258,6 +1341,16 @@ impl MorphSlot {
     ) -> Self {
         let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         let mut temporal_snapshot = MorphTemporalSnapshot::capture(temporal);
+        temporal_snapshot.originals.garden.matte_route =
+            RefreshGardenMatteRouteConfig::from_runtime_for_capture(
+                temporal.originals.garden.matte_route,
+                &layer_ids,
+            );
+        temporal_snapshot.originals.garden.motion_route =
+            RefreshGardenMotionRouteConfig::from_runtime_for_capture(
+                temporal.originals.garden.motion_route,
+                &layer_ids,
+            );
         temporal_snapshot.originals.score.loop_driver =
             CollisionScoreLoopDriverConfig::from_runtime_for_capture(
                 temporal.originals.score.loop_driver,
@@ -1417,6 +1510,14 @@ impl MorphSlot {
     /// Keep positional snapshots aligned after removing one live layer while
     /// preserving the independent master/NTSC/temporal worlds.
     fn remap_layers_after_remove(&mut self, removed: usize) {
+        remap_garden_matte_route_after_remove(
+            &mut self.temporal.originals.garden.matte_route,
+            removed,
+        );
+        remap_garden_motion_route_after_remove(
+            &mut self.temporal.originals.garden.motion_route,
+            removed,
+        );
         remap_score_driver_after_remove(&mut self.temporal.originals.score.loop_driver, removed);
         if let Some(motion) = &mut self.master_motion {
             remap_motion_donor_after_remove(&mut motion.transplant.donor, removed);
@@ -1461,6 +1562,16 @@ impl MorphSlot {
         if from == to {
             return;
         }
+        remap_garden_matte_route_after_move(
+            &mut self.temporal.originals.garden.matte_route,
+            from,
+            to,
+        );
+        remap_garden_motion_route_after_move(
+            &mut self.temporal.originals.garden.motion_route,
+            from,
+            to,
+        );
         remap_score_driver_after_move(&mut self.temporal.originals.score.loop_driver, from, to);
         if let Some(motion) = &mut self.master_motion {
             remap_motion_donor_after_move(&mut motion.transplant.donor, from, to);
@@ -1586,19 +1697,31 @@ impl MorphSample {
         }
         *ntsc = self.ntsc.to_params();
         let mut sampled_temporal = self.temporal.to_params();
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        sampled_temporal.originals.garden.matte_route = self
+            .temporal
+            .originals
+            .garden
+            .matte_route
+            .resolve_runtime(&layer_ids);
+        sampled_temporal.originals.garden.motion_route = self
+            .temporal
+            .originals
+            .garden
+            .motion_route
+            .resolve_runtime(&layer_ids);
         sampled_temporal.originals.score.loop_driver = resolve_score_loop_driver(
             self.temporal.originals.score.loop_driver,
             |saved_position| saved_position.resolve(layers).map(Layer::stable_layer_id),
         );
         *temporal = sampled_temporal;
-        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         for sampled in &self.layers {
             let Some(layer) = layers.get_mut(sampled.position) else {
                 continue;
             };
             sampled.apply_to(layer);
             if let Some(motion) = sampled.motion {
-                layer.motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+                layer.motion = motion.resolve_runtime(&layer_ids);
             }
         }
     }
@@ -1616,9 +1739,8 @@ impl MorphSample {
     ) {
         self.apply_to(master, master_transform, ntsc, temporal, layers);
         if let Some(motion) = self.master_motion {
-            *master_motion = motion.to_params().sanitized();
             let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
-            master_motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+            *master_motion = motion.resolve_runtime(&layer_ids);
         }
     }
 
@@ -1690,9 +1812,8 @@ impl MorphSample {
             composition,
         );
         if let Some(motion) = self.master_motion {
-            *master_motion = motion.to_params().sanitized();
             let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
-            master_motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+            *master_motion = motion.resolve_runtime(&layer_ids);
         }
     }
 }
@@ -3307,8 +3428,10 @@ mod tests {
 
     #[test]
     fn temporal_originals_morph_numeric_values_and_recall_discrete_laws() {
+        use crate::image_routing::LayerImageStage;
         use crate::patch::{
             CollisionScoreConfig, CollisionScoreTriggerConfig, RefreshGardenGateConfig,
+            RefreshGardenMatteRouteConfig, RefreshGardenMotionRouteConfig,
             TemporalEventResetModeConfig, TemporalInterpolationConfig, TemporalTopologyConfig,
         };
         use crate::performance::SavedLayerPosition;
@@ -3333,6 +3456,10 @@ mod tests {
         a.temporal.originals.garden.softness = 0.1;
         a.temporal.originals.garden.decay = 1.0;
         a.temporal.originals.garden.max_hold_ticks = 10;
+        a.temporal.originals.garden.matte_route = RefreshGardenMatteRouteConfig::SelectedLayer {
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PreLocalEffects,
+        };
         a.temporal.originals.score = CollisionScoreConfig {
             enabled: false,
             seed: 31,
@@ -3364,6 +3491,14 @@ mod tests {
         b.temporal.originals.garden.softness = 0.3;
         b.temporal.originals.garden.decay = 0.0;
         b.temporal.originals.garden.max_hold_ticks = 20;
+        b.temporal.originals.garden.matte_route =
+            RefreshGardenMatteRouteConfig::MissingSelectedLayer {
+                saved_position: SavedLayerPosition::new(3).unwrap(),
+                stage: LayerImageStage::PostLocalEffects,
+            };
+        b.temporal.originals.garden.motion_route = RefreshGardenMotionRouteConfig::SelectedLayer {
+            saved_position: SavedLayerPosition::new(2).unwrap(),
+        };
         b.temporal.originals.score = CollisionScoreConfig {
             enabled: true,
             seed: 47,
@@ -3415,6 +3550,14 @@ mod tests {
         close(midpoint.garden.decay, 0.5);
         assert_eq!(midpoint.garden.max_hold_ticks, 15);
         assert_eq!(midpoint.garden.gate, RefreshGardenGateConfig::Matte);
+        assert_eq!(
+            midpoint.garden.matte_route,
+            b.temporal.originals.garden.matte_route
+        );
+        assert_eq!(
+            midpoint.garden.motion_route,
+            b.temporal.originals.garden.motion_route
+        );
         assert_eq!(midpoint.score, b.temporal.originals.score);
         assert_eq!(
             midpoint.reset.loop_boundary,
@@ -3428,6 +3571,14 @@ mod tests {
         );
         assert_eq!(before_endpoint.atlas.seed, 11);
         assert_eq!(before_endpoint.score, a.temporal.originals.score);
+        assert_eq!(
+            before_endpoint.garden.matte_route,
+            a.temporal.originals.garden.matte_route
+        );
+        assert_eq!(
+            before_endpoint.garden.motion_route,
+            a.temporal.originals.garden.motion_route
+        );
         assert!(matches!(
             before_endpoint.score.loop_driver,
             CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
@@ -3884,12 +4035,30 @@ key_threshold: 0.2
         slot.temporal.originals.score.loop_driver = CollisionScoreLoopDriverConfig::SelectedLayer {
             saved_position: SavedLayerPosition::new(0).unwrap(),
         };
+        slot.temporal.originals.garden.matte_route = RefreshGardenMatteRouteConfig::SelectedLayer {
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        slot.temporal.originals.garden.motion_route =
+            RefreshGardenMotionRouteConfig::SelectedLayer {
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            };
 
         slot.remap_layers_after_move(0, 2);
         assert!(matches!(
             slot.temporal.originals.score.loop_driver,
             CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
                 if saved_position.get() == 2
+        ));
+        assert!(matches!(
+            slot.temporal.originals.garden.matte_route,
+            RefreshGardenMatteRouteConfig::SelectedLayer { saved_position, .. }
+                if saved_position.get() == 2
+        ));
+        assert!(matches!(
+            slot.temporal.originals.garden.motion_route,
+            RefreshGardenMotionRouteConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 0
         ));
         let master = slot.master_rack.as_ref().unwrap();
         assert!(matches!(
@@ -3927,6 +4096,16 @@ key_threshold: 0.2
                 if saved_position.get() == 1
         ));
         assert!(matches!(
+            slot.temporal.originals.garden.matte_route,
+            RefreshGardenMatteRouteConfig::SelectedLayer { saved_position, .. }
+                if saved_position.get() == 1
+        ));
+        assert!(matches!(
+            slot.temporal.originals.garden.motion_route,
+            RefreshGardenMotionRouteConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 0
+        ));
+        assert!(matches!(
             route(slot.master_rack.as_ref().unwrap()),
             SavedImageSource::SelectedLayer { layer_position, .. } if layer_position.get() == 1
         ));
@@ -3945,10 +4124,28 @@ key_threshold: 0.2
         slot.temporal.originals.score.loop_driver = CollisionScoreLoopDriverConfig::SelectedLayer {
             saved_position: SavedLayerPosition::new(1).unwrap(),
         };
+        slot.temporal.originals.garden.matte_route = RefreshGardenMatteRouteConfig::SelectedLayer {
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PreLocalEffects,
+        };
+        slot.temporal.originals.garden.motion_route =
+            RefreshGardenMotionRouteConfig::SelectedLayer {
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            };
         slot.remap_layers_after_remove(1);
         assert!(matches!(
             slot.temporal.originals.score.loop_driver,
             CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position }
+                if saved_position.get() == 1
+        ));
+        assert!(matches!(
+            slot.temporal.originals.garden.matte_route,
+            RefreshGardenMatteRouteConfig::MissingSelectedLayer { saved_position, stage }
+                if saved_position.get() == 1 && stage == LayerImageStage::PreLocalEffects
+        ));
+        assert!(matches!(
+            slot.temporal.originals.garden.motion_route,
+            RefreshGardenMotionRouteConfig::MissingSelectedLayer { saved_position }
                 if saved_position.get() == 1
         ));
     }

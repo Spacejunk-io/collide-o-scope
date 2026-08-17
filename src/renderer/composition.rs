@@ -11,8 +11,9 @@ use std::fmt;
 use crate::composition::{BusAssignment, RuntimeRootItem};
 use crate::evaluated_frame::evaluated_composition::{
     AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
-    EvaluatedScopeExecution, EvaluatedScopeStep, ImageTapConsumer, LegacyCanonicalApplication,
-    MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
+    EvaluatedRefreshGardenSignalPlan, EvaluatedScopeExecution, EvaluatedScopeStep,
+    ImageTapConsumer, LegacyCanonicalApplication, MotionFieldAttachment, PlannedImageSource,
+    PlannedImageTap,
 };
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::layers::BlendMode;
@@ -20,8 +21,8 @@ use crate::motion::MotionFieldOrigin;
 use crate::program_recorder::CaptureTarget;
 use crate::renderer::composition_host::{
     CompositionHost, CompositionHostError, HostCapacities, HostCompositeInputs,
-    HostCompositeUniforms, HostEffectSource, HostFrameTiming, HostMatteInputs, HostSurface,
-    HostTemporalInput, HostTextureInputs, HostUniformSlot,
+    HostCompositeUniforms, HostEffectSource, HostFrameTiming, HostMatteInputs,
+    HostRoutedGardenInput, HostSurface, HostTemporalInput, HostTextureInputs, HostUniformSlot,
 };
 use crate::renderer::compositor::{MatteChannelCode, MatteCompositeUniforms, ResolvedMatteParams};
 use crate::renderer::motion::{
@@ -414,6 +415,7 @@ struct PreparedAdvanced {
     /// both possible committed N-1 read parities.
     matte_bindings: BTreeMap<ImageTapConsumer, [HostMatteInputs; 2]>,
     temporal: HostTemporalInput,
+    routed_garden: Option<HostRoutedGardenInput>,
     bus_inputs: HostTextureInputs,
     present: HostTextureInputs,
     effect_slots: BTreeMap<(VisualScopeId, usize), HostUniformSlot>,
@@ -1260,6 +1262,7 @@ impl PreparedAdvanced {
                         ) || motion_plan.scope(field.scope).is_some_and(|scope| {
                             scope.params.field_source == crate::motion::MotionFieldSource::Auto
                         }),
+                        required_as_garden_signal: field.required_as_garden_signal,
                     })
                     .collect::<Vec<_>>();
                 let prepared_resources = MotionGpuResources::prepare(
@@ -1304,16 +1307,12 @@ impl PreparedAdvanced {
                         .scopes()
                         .iter()
                         .filter_map(|scope| {
-                            if scope.params.is_exact_zero()
-                                || (!scope.transplant_admitted && scope.field_slot.is_none())
-                            {
+                            let effect_active =
+                                scope.transplant_admitted || !scope.params.shutter.is_exact_zero();
+                            if !effect_active {
                                 return None;
                             }
-                            let render_field_slot = if scope.transplant_admitted {
-                                scope.donor_field_slot?
-                            } else {
-                                scope.field_slot?
-                            };
+                            let render_field_slot = scope.admitted_field_slot()?;
                             Some(MotionGpuScopeSpec {
                                 scope: scope.scope,
                                 render_field_slot,
@@ -1375,7 +1374,9 @@ impl PreparedAdvanced {
                         }
                     }
                     ImageTapConsumer::GroupMatte { .. } => rack_zero.view,
-                    ImageTapConsumer::RackNode { .. } => unreachable!(),
+                    ImageTapConsumer::RackNode { .. } | ImageTapConsumer::RefreshGardenMatte => {
+                        unreachable!()
+                    }
                 };
                 matte_bindings.insert(
                     tap.consumer,
@@ -1415,6 +1416,49 @@ impl PreparedAdvanced {
             let (root_schedule, member_schedules) =
                 build_block_schedules(plan, &retained_scope_sources)?;
             let temporal = host.prepare_temporal_input(device, ping.view, pong.view);
+            let garden_signal = plan.refresh_garden_signal();
+            let garden_resources = plan.refresh_garden_resources();
+            if garden_signal.is_routed()
+                != (garden_resources.full_frame_passes == 1
+                    && garden_resources.max_sampled_textures_in_pass == 3)
+            {
+                return Err(CompositionGpuError::InvalidSchedule(
+                    "routed Garden signal and immutable resource plan disagree".into(),
+                ));
+            }
+            let routed_garden = match garden_signal {
+                EvaluatedRefreshGardenSignalPlan::Inline => None,
+                EvaluatedRefreshGardenSignalPlan::Matte { valid } => {
+                    let signal = valid
+                        .then(|| {
+                            tap_index_for_consumer(plan, ImageTapConsumer::RefreshGardenMatte).map(
+                                |tap_index| {
+                                    prepared_tap_view(
+                                        &host,
+                                        &prelocal_surfaces,
+                                        rack_zero.view,
+                                        &taps[tap_index],
+                                        0,
+                                    )
+                                },
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or(rack_zero.view);
+                    Some(host.prepare_routed_garden_input(device, pong.view, signal))
+                }
+                EvaluatedRefreshGardenSignalPlan::Motion { valid, .. } => {
+                    let signal = valid
+                        .then(|| {
+                            motion
+                                .as_ref()
+                                .and_then(MotionGpuResources::garden_signal_view)
+                        })
+                        .flatten()
+                        .unwrap_or(rack_zero.view);
+                    Some(host.prepare_routed_garden_input(device, pong.view, signal))
+                }
+            };
             let bus_inputs = host.prepare_bus_inputs(
                 device,
                 host.surface(HostSurface::A).view,
@@ -1484,6 +1528,7 @@ impl PreparedAdvanced {
                 prefix_group_composite,
                 matte_bindings,
                 temporal,
+                routed_garden,
                 bus_inputs,
                 present,
                 effect_slots,
@@ -1553,6 +1598,7 @@ impl PreparedAdvanced {
             {
                 resources.encode_field_scope(encoder, motion_plan, field.scope)?;
             }
+            resources.encode_garden_signal(encoder)?;
         }
 
         for surface in [
@@ -1575,6 +1621,13 @@ impl PreparedAdvanced {
             .encode_clear(encoder, rack_zero.view, wgpu::Color::TRANSPARENT);
 
         self.stage_previous_prelocal(queue, encoder, plan)?;
+        if let Some(tap_index) = self.tap_index(ImageTapConsumer::RefreshGardenMatte) {
+            // Routed Garden is a master host-boundary consumer rather than a
+            // rack node, so it must explicitly materialize a selected
+            // PreLocal source. PostLocal sources are staged by the ordinary
+            // scope-output capture below.
+            self.ensure_current_prelocal(encoder, tap_index)?;
+        }
         self.capture_root_prefix(queue, encoder, plan, 0)?;
 
         let mut completed_root_items = 0_usize;
@@ -2541,17 +2594,35 @@ impl PreparedAdvanced {
                     }
                     let ping = self.host.surface(HostSurface::Ping);
                     let pong = self.host.surface(HostSurface::Pong);
-                    self.host.encode_temporal(
-                        queue,
-                        encoder,
-                        &self.temporal,
-                        ping.texture,
-                        pong.texture,
-                        pong.view,
-                        params,
-                        HostFrameTiming::from_temporal_input(timing.temporal_input()),
-                    );
-                    copy_texture(encoder, pong.texture, ping.texture, self.host.dimensions());
+                    let wrote_ping = if let Some(routed) = &self.routed_garden {
+                        self.host.encode_temporal_routed(
+                            queue,
+                            encoder,
+                            &self.temporal,
+                            ping.texture,
+                            ping.view,
+                            pong.texture,
+                            pong.view,
+                            routed,
+                            params,
+                            HostFrameTiming::from_temporal_input(timing.temporal_input()),
+                        )
+                    } else {
+                        self.host.encode_temporal(
+                            queue,
+                            encoder,
+                            &self.temporal,
+                            ping.texture,
+                            pong.texture,
+                            pong.view,
+                            params,
+                            HostFrameTiming::from_temporal_input(timing.temporal_input()),
+                        );
+                        false
+                    };
+                    if !wrote_ping {
+                        copy_texture(encoder, pong.texture, ping.texture, self.host.dimensions());
+                    }
                 }
                 EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(
@@ -3313,7 +3384,7 @@ mod tests {
     use crate::ntsc::NtscParams;
     use crate::performance::SavedLayerPosition;
     use crate::spatial::SpatialTransform;
-    use crate::temporal::{TemporalFrameEvents, TemporalFreezeState};
+    use crate::temporal::{TemporalFrameEvents, TemporalFrameInput, TemporalFreezeState};
     use crate::visual_rack::{
         DigitalColorParams, LegacyRackScope, ResolvedImageTap, RuntimeImageMatte,
         RuntimeMaskParams, RuntimeVisualNodeKind, RuntimeVisualRack,
@@ -3342,6 +3413,7 @@ mod tests {
                 downbeat_events: 3,
                 audio_onset_events: 4,
                 manual_events: 5,
+                garden_refresh_events: 6,
             },
         );
         assert_eq!(
@@ -3617,6 +3689,36 @@ mod tests {
                     &mut encoder,
                     plan,
                     CompositionFrameTiming::new(delta_seconds, true),
+                )
+                .unwrap();
+            self.queue.submit(std::iter::once(encoder.finish()));
+            if commit {
+                executor.commit_frame_history();
+            } else {
+                executor.discard_frame_history();
+            }
+        }
+
+        fn submit_with_motion_temporal(
+            &self,
+            executor: &mut CompositionGpuExecutor,
+            plan: &EvaluatedCompositionPlan,
+            temporal: TemporalFrameInput,
+            motion_input: CompositionMotionFrameInput<'_>,
+            commit: bool,
+        ) {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Advanced composition motion truth encoder"),
+                });
+            executor
+                .encode_with_motion(
+                    &self.queue,
+                    &mut encoder,
+                    plan,
+                    CompositionFrameTiming::from_temporal_input(temporal),
+                    motion_input,
                 )
                 .unwrap();
             self.queue.submit(std::iter::once(encoder.finish()));
@@ -4010,7 +4112,21 @@ mod tests {
         // Frame one primes luma; frame two publishes a deterministic static
         // field; frame three consumes it through the fixed Sharp shutter.
         gpu.submit(&mut executor, &plan, 1.0 / 30.0, true);
+        let primed = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .expect("primed motion metrics");
+        assert_eq!(primed.valid_fields, 0);
+        assert_eq!(primed.field_origin, MotionFieldOrigin::None);
         gpu.submit(&mut executor, &plan, 1.0 / 30.0, true);
+        let published = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .expect("published lattice metrics");
+        assert_eq!(published.valid_fields, 1);
+        assert_eq!(published.field_origin, MotionFieldOrigin::LatticeFallback);
+        assert_eq!(
+            published.field_source_scope,
+            Some(VisualScopeId::Layer(stable_layer(1)))
+        );
         let pixels = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
         let metrics = executor
             .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
@@ -4083,6 +4199,7 @@ mod tests {
             scope: VisualScopeId::Layer(stable_layer(1)),
             source_generation: 7,
             frame_ordinal: 9,
+            product_content_sha256: [7; 32],
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             source_dimensions: dimensions,
             grid,
@@ -4199,6 +4316,14 @@ mod tests {
             .expect("exact donor motion metrics");
         assert_eq!(recipient_metrics.active_field_slots, 1);
         assert_eq!(recipient_metrics.persistent_carriers, 1);
+        assert_eq!(
+            recipient_metrics.field_origin,
+            MotionFieldOrigin::LatticeFallback
+        );
+        assert_eq!(
+            recipient_metrics.field_source_scope,
+            Some(VisualScopeId::Layer(stable_layer(1)))
+        );
         assert!(recipient_metrics.carrier_valid);
         assert_eq!(donor_metrics.active_field_slots, 1);
         assert_eq!(donor_metrics.persistent_carriers, 0);
@@ -4243,6 +4368,7 @@ mod tests {
             scope: VisualScopeId::Layer(stable_layer(1)),
             source_generation: 7,
             frame_ordinal: 9,
+            product_content_sha256: [7; 32],
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             source_dimensions: dimensions,
             grid,
@@ -4253,6 +4379,26 @@ mod tests {
         executor
             .prepare(&gpu.device, &gpu.queue, &plan, &sources)
             .unwrap();
+        for freeze in [
+            TemporalFreezeState::ProgramFrozen,
+            TemporalFreezeState::MediaFrozen,
+        ] {
+            gpu.submit_with_motion_temporal(
+                &mut executor,
+                &plan,
+                TemporalFrameInput::new(1.0 / 30.0, freeze, false, TemporalFrameEvents::default()),
+                CompositionMotionFrameInput {
+                    attachments: &[valid],
+                    held_scopes: &[],
+                },
+                true,
+            );
+            let unprimed = executor
+                .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+                .unwrap();
+            assert_eq!(unprimed.valid_fields, 0);
+            assert_eq!(unprimed.field_origin, MotionFieldOrigin::None);
+        }
         let pixels = gpu.render_with_motion(
             &mut executor,
             &plan,
@@ -4264,14 +4410,65 @@ mod tests {
             },
         );
         assert!(executor.motion_diagnostics().is_empty());
+        let accepted = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .unwrap();
+        assert_eq!(accepted.valid_fields, 1);
+        assert_eq!(accepted.field_origin, MotionFieldOrigin::CodecVectors);
+        assert_eq!(
+            accepted.field_source_scope,
+            Some(VisualScopeId::Layer(stable_layer(1)))
+        );
+        assert_eq!(accepted.field_source_generation, Some(7));
+        assert_eq!(accepted.field_frame_ordinal, Some(9));
+        assert_eq!(accepted.field_product_content_sha256, Some([7; 32]));
+        assert!(pixels.iter().all(|pixel| pixel[0] >= 0.99));
+
+        let changed_payload = MotionFieldAttachment {
+            product_content_sha256: [8; 32],
+            ..valid
+        };
+        gpu.submit_with_motion_temporal(
+            &mut executor,
+            &plan,
+            TemporalFrameInput::new(
+                1.0 / 30.0,
+                TemporalFreezeState::MediaFrozen,
+                false,
+                TemporalFrameEvents::default(),
+            ),
+            CompositionMotionFrameInput {
+                attachments: &[changed_payload],
+                held_scopes: &[],
+            },
+            true,
+        );
         assert_eq!(
             executor
                 .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
                 .unwrap()
-                .valid_fields,
-            1
+                .field_product_content_sha256,
+            Some([7; 32]),
+            "Media Freeze must retain the committed codec identity"
         );
-        assert!(pixels.iter().all(|pixel| pixel[0] >= 0.99));
+        let _ = gpu.render_with_motion(
+            &mut executor,
+            &plan,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[changed_payload],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(
+            executor
+                .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+                .unwrap()
+                .field_product_content_sha256,
+            Some([7; 32]),
+            "discard must not publish a staged codec product identity"
+        );
 
         let stale = MotionFieldAttachment {
             source_generation: 8,
@@ -4295,6 +4492,11 @@ mod tests {
                 } if *id == stable_layer(1)
             )
         }));
+        let retained = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .unwrap();
+        assert_eq!(retained.field_source_generation, Some(7));
+        assert_eq!(retained.field_product_content_sha256, Some([7; 32]));
     }
 
     fn temporal_originals_fixture(

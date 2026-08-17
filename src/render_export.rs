@@ -50,7 +50,9 @@ use crate::transport::{
     TransportTimeline,
 };
 use crate::video::decoder::{validate_media_dimensions, MAX_MEDIA_PIXELS};
-use crate::video::{CodecMotionFrame, DecodedStillImage, VideoDecoder};
+#[cfg(test)]
+use crate::video::CodecMotionFrame;
+use crate::video::{CodecFrameIdentity, CodecMotionProduct, DecodedStillImage, VideoDecoder};
 use crate::visual_rack::{CreativeResourceLimits, RuntimeVisualRack};
 
 /// App shutdown must not wait forever on a wedged graphics backend. By the
@@ -69,7 +71,7 @@ const OUTCOME_CANCELLED: u8 = 4;
 /// contains an excessive number of unavailable layers.
 const MAX_EXPORT_WARNINGS: usize = 128;
 const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 1;
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 3;
 const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
 const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
@@ -112,9 +114,74 @@ pub struct ExportConfig {
     /// Spatial quality for CPU NTSC processing. This affects both the global
     /// post-composite path and selective inherited-layer processing.
     pub ntsc_quality: NtscExportQuality,
+    /// Exact bounded Curved Shutter sample policy for this export. `Authored`
+    /// preserves each scope's live tier; explicit variants replace only the
+    /// tier after Morph/modulation and before resource preflight.
+    pub shutter_samples: ExportShutterSamples,
     /// Shared host-session policy used only when reconstructing saved sources.
     /// Export output dimensions remain governed by `validate_export_dimensions`.
     pub media_safety_policy: MediaSafetyPolicy,
+    /// Bounded accepted manual Score/Garden events recorded by the live host.
+    /// This is runtime performance data, never inferred from wall time or
+    /// serialized into the authored patch.
+    pub(crate) temporal_event_track: crate::temporal::TemporalEventTrack,
+}
+
+/// Closed offline Curved Shutter sample policy. The explicit variants name
+/// their literal shader sample count so protocol/UI requests cannot imply an
+/// approximate or silently substituted quality.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ExportShutterSamples {
+    #[default]
+    #[serde(rename = "authored")]
+    Authored,
+    #[serde(rename = "samples_1")]
+    Samples1,
+    #[serde(rename = "samples_4")]
+    Samples4,
+    #[serde(rename = "samples_8")]
+    Samples8,
+    #[serde(rename = "samples_16")]
+    Samples16,
+}
+
+impl ExportShutterSamples {
+    pub const fn requested_count(self) -> Option<u8> {
+        match self {
+            Self::Authored => None,
+            Self::Samples1 => Some(1),
+            Self::Samples4 => Some(4),
+            Self::Samples8 => Some(8),
+            Self::Samples16 => Some(16),
+        }
+    }
+
+    const fn quality_override(self) -> Option<crate::motion::CurvedShutterQuality> {
+        match self {
+            Self::Authored => None,
+            Self::Samples1 => Some(crate::motion::CurvedShutterQuality::Sharp),
+            Self::Samples4 => Some(crate::motion::CurvedShutterQuality::Draft),
+            Self::Samples8 => Some(crate::motion::CurvedShutterQuality::Live),
+            Self::Samples16 => Some(crate::motion::CurvedShutterQuality::High),
+        }
+    }
+
+    pub const fn is_valid(self) -> bool {
+        matches!(
+            self,
+            Self::Authored | Self::Samples1 | Self::Samples4 | Self::Samples8 | Self::Samples16
+        )
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::Samples1 => "samples_1",
+            Self::Samples4 => "samples_4",
+            Self::Samples8 => "samples_8",
+            Self::Samples16 => "samples_16",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,11 +203,24 @@ pub struct ExportMotionScopeMetadata {
     pub algorithm_version: u16,
     pub requested_source: crate::motion::MotionFieldSource,
     pub lattice_quality: crate::motion::MotionLatticeQuality,
+    /// Pure planner decision after exact codec preparation/fallback.
     pub source_origin: crate::motion::MotionFieldOrigin,
+    /// Field origin actually attached/generated for the accepted GPU frame.
+    pub rendered_source_origin: crate::motion::MotionFieldOrigin,
+    /// The evaluated scope required a field even when admission or first-frame
+    /// priming prevented one from becoming resident.
+    pub field_planned: bool,
+    pub field_attached: bool,
     pub source_diagnostic: crate::motion::MotionSourceDiagnostic,
     pub codec_provenance: Option<crate::video::CodecMotionProvenance>,
     pub source_generation: Option<u64>,
     pub frame_ordinal: Option<u64>,
+    /// Exact digest of the committed codec proof chain and vector payload.
+    pub codec_product_sha256: Option<[u8; 32]>,
+    /// Number of adjacent decoded transitions represented by the accepted
+    /// codec product. `None` means codec metadata was unavailable.
+    pub codec_transition_count: Option<u8>,
+    pub codec_elapsed_seconds: Option<f32>,
     pub donor_saved_position: Option<u32>,
     pub donor_stable_id: Option<u64>,
     pub carrier: crate::motion::MotionCarrier,
@@ -177,6 +257,25 @@ struct MotionSidecarArtifact {
     height: u32,
     fps: u32,
     duration_seconds: f32,
+    requested_shutter_sample_policy: String,
+    requested_shutter_sample_count: Option<u8>,
+}
+
+impl MotionSidecarArtifact {
+    fn from_config(config: &ExportConfig) -> Self {
+        Self {
+            file_name: std::path::Path::new(&config.output_path)
+                .file_name()
+                .map(|name| bounded_export_warning(&name.to_string_lossy()))
+                .unwrap_or_default(),
+            width: config.width,
+            height: config.height,
+            fps: config.fps,
+            duration_seconds: config.duration_secs,
+            requested_shutter_sample_policy: config.shutter_samples.key().to_owned(),
+            requested_shutter_sample_count: config.shutter_samples.requested_count(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -223,10 +322,16 @@ struct MotionSidecarScopeState {
     requested_source: String,
     lattice_quality: String,
     source_origin: String,
+    rendered_source_origin: String,
+    field_planned: bool,
+    field_attached: bool,
     source_diagnostic: String,
     codec_provenance: Option<String>,
     source_generation: Option<u64>,
     frame_ordinal: Option<u64>,
+    codec_product_sha256: Option<String>,
+    codec_transition_count: Option<u8>,
+    codec_elapsed_seconds: Option<f32>,
     donor_saved_position: Option<u32>,
     donor_stable_id: Option<u64>,
     carrier: String,
@@ -1273,7 +1378,11 @@ struct ExportLayer {
     /// Sparse decoder metadata committed only after the matching RGBA upload
     /// succeeds. Stills, offline Spout substitutions, and reverse-cache hits
     /// remain explicitly absent rather than inventing a lattice here.
-    codec_motion: Option<CodecMotionFrame>,
+    codec_motion: Option<CodecMotionProduct>,
+    /// Exact source image currently resident in `texture`. Skipped-frame
+    /// composition starts strictly after this accepted predecessor; cuts
+    /// clear it before decode so no transition crosses a generation.
+    codec_motion_predecessor: Option<CodecFrameIdentity>,
     /// Retain the still's Expert reservation for the lifetime of its uploaded
     /// texture. The decoded bytes are also retained within the conservative
     /// six-RGBA-buffer planning estimate.
@@ -1340,6 +1449,16 @@ fn motion_origin_key(value: crate::motion::MotionFieldOrigin) -> &'static str {
         crate::motion::MotionFieldOrigin::Lattice => "lattice",
         crate::motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
     }
+}
+
+pub(crate) fn sha256_bytes_hex(value: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in value {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn motion_diagnostic_key(value: crate::motion::MotionSourceDiagnostic) -> &'static str {
@@ -1422,6 +1541,9 @@ fn sidecar_scope_state(value: &ExportMotionScopeMetadata) -> MotionSidecarScopeS
         requested_source: motion_field_source_key(value.requested_source).to_owned(),
         lattice_quality: motion_lattice_quality_key(value.lattice_quality).to_owned(),
         source_origin: motion_origin_key(value.source_origin).to_owned(),
+        rendered_source_origin: motion_origin_key(value.rendered_source_origin).to_owned(),
+        field_planned: value.field_planned,
+        field_attached: value.field_attached,
         source_diagnostic: motion_diagnostic_key(value.source_diagnostic).to_owned(),
         codec_provenance: value
             .codec_provenance
@@ -1429,6 +1551,9 @@ fn sidecar_scope_state(value: &ExportMotionScopeMetadata) -> MotionSidecarScopeS
             .map(str::to_owned),
         source_generation: value.source_generation,
         frame_ordinal: value.frame_ordinal,
+        codec_product_sha256: value.codec_product_sha256.map(sha256_bytes_hex),
+        codec_transition_count: value.codec_transition_count,
+        codec_elapsed_seconds: value.codec_elapsed_seconds,
         donor_saved_position: value.donor_saved_position,
         donor_stable_id: value.donor_stable_id,
         carrier: motion_carrier_key(value.carrier).to_owned(),
@@ -1448,8 +1573,10 @@ fn same_distinct_motion_state(
     let mut right = right.clone();
     left.source_generation = None;
     left.frame_ordinal = None;
+    left.codec_product_sha256 = None;
     right.source_generation = None;
     right.frame_ordinal = None;
+    right.codec_product_sha256 = None;
     left == right
 }
 
@@ -1511,16 +1638,7 @@ impl ExportMotionSidecarAccumulator {
             ));
         }
         Self {
-            artifact: MotionSidecarArtifact {
-                file_name: std::path::Path::new(&config.output_path)
-                    .file_name()
-                    .map(|name| bounded_export_warning(&name.to_string_lossy()))
-                    .unwrap_or_default(),
-                width: config.width,
-                height: config.height,
-                fps: config.fps,
-                duration_seconds: config.duration_secs,
-            },
+            artifact: MotionSidecarArtifact::from_config(config),
             sources,
             sources_truncated,
             authored_scopes,
@@ -2029,10 +2147,10 @@ fn upload_export_texture_checked(
 /// Decoder rejection/status remains intact for the shared motion evaluator;
 /// this seam checks pairing/provenance, not source selection.
 fn matching_export_codec_motion(
-    motion: Option<CodecMotionFrame>,
+    motion: Option<CodecMotionProduct>,
     source_generation: u64,
     source_dimensions: [u32; 2],
-) -> Option<CodecMotionFrame> {
+) -> Option<CodecMotionProduct> {
     motion.filter(|motion| {
         motion.source_generation == source_generation
             && motion.source_dimensions == source_dimensions
@@ -2075,6 +2193,7 @@ fn black_placeholder_layer(
         motion_source: ExportMotionSourceRecord::unavailable(layer_cfg),
         decoder: None,
         codec_motion: None,
+        codec_motion_predecessor: None,
         _still_source: None,
         texture,
         texture_view,
@@ -2141,6 +2260,7 @@ fn still_export_layer(
         },
         decoder: None,
         codec_motion: None,
+        codec_motion_predecessor: None,
         _still_source: Some(decoded),
         texture,
         texture_view,
@@ -2522,6 +2642,42 @@ fn resolved_export_motion(
     params
 }
 
+fn resolved_export_patch_temporal(
+    config: Option<&crate::patch::TemporalConfig>,
+    layer_ids: &[StableLayerId],
+) -> crate::effects::params::TemporalParams {
+    let mut params = config.map_or_else(Default::default, crate::patch::TemporalConfig::to_params);
+    if let Some(originals) = config.and_then(|temporal| temporal.originals.as_ref()) {
+        params.originals.garden.matte_route =
+            originals.garden.matte_route.resolve_runtime(layer_ids);
+        params.originals.garden.motion_route =
+            originals.garden.motion_route.resolve_runtime(layer_ids);
+        params.originals.score.loop_driver =
+            resolve_export_score_loop_driver(originals.score.loop_driver, layer_ids);
+    }
+    params
+}
+
+fn resolved_export_morph_temporal(
+    snapshot: crate::morph::MorphTemporalSnapshot,
+    layer_ids: &[StableLayerId],
+) -> crate::effects::params::TemporalParams {
+    let mut params = snapshot.to_params();
+    params.originals.garden.matte_route = snapshot
+        .originals
+        .garden
+        .matte_route
+        .resolve_runtime(layer_ids);
+    params.originals.garden.motion_route = snapshot
+        .originals
+        .garden
+        .motion_route
+        .resolve_runtime(layer_ids);
+    params.originals.score.loop_driver =
+        resolve_export_score_loop_driver(snapshot.originals.score.loop_driver, layer_ids);
+    params
+}
+
 fn apply_export_morph_world(
     sample: &crate::morph::MorphSample,
     layers: &[ExportLayer],
@@ -2536,11 +2692,8 @@ fn apply_export_morph_world(
         world.master_motion = resolved_export_motion(Some(motion), &world.creative_graph.layer_ids);
     }
     world.ntsc = sample.ntsc.to_params();
-    world.temporal = sample.temporal.to_params();
-    world.temporal.originals.score.loop_driver = resolve_export_score_loop_driver(
-        sample.temporal.originals.score.loop_driver,
-        &world.creative_graph.layer_ids,
-    );
+    world.temporal =
+        resolved_export_morph_temporal(sample.temporal, &world.creative_graph.layer_ids);
     for sampled in &sample.layers {
         if let Some((position, _)) = layers
             .iter()
@@ -2669,10 +2822,48 @@ struct ExportMotionPlanAdapter<'a> {
     layers: &'a [crate::motion::MotionParams],
     sources: &'a [ExportLayer],
     limits: crate::motion::MotionDeviceLimits,
+    modulation: &'a crate::modulation::ModulationFrame,
+    shutter_samples: ExportShutterSamples,
+    /// `None` uses decoder-advertised status for the first pure plan. A retry
+    /// supplies the exact rasterization/attachment outcome aligned with
+    /// `sources`, so Auto can fall back before any GPU work is encoded.
+    codec_availability: Option<&'a [bool]>,
+}
+
+fn apply_export_shutter_samples(
+    mut params: crate::motion::MotionParams,
+    policy: ExportShutterSamples,
+) -> crate::motion::MotionParams {
+    if let Some(quality) = policy.quality_override() {
+        params.shutter.quality = quality;
+    }
+    params
+}
+
+fn effective_export_motion_params(
+    master: crate::motion::MotionParams,
+    layers: &[crate::motion::MotionParams],
+    modulation: &crate::modulation::ModulationFrame,
+    policy: ExportShutterSamples,
+) -> (
+    crate::motion::MotionParams,
+    Vec<crate::motion::MotionParams>,
+) {
+    let master = modulation.modulate_motion(&master);
+    (
+        apply_export_shutter_samples(master, policy),
+        layers
+            .iter()
+            .enumerate()
+            .map(|(index, params)| modulation.modulate_layer_motion(index, params))
+            .map(|params| apply_export_shutter_samples(params, policy))
+            .collect(),
+    )
 }
 
 struct ExportMotionFieldProduct {
     scope: crate::visual_rack::VisualScopeId,
+    codec_identity: crate::video::CodecMotionProductIdentity,
     source_generation: u64,
     frame_ordinal: u64,
     field: crate::motion::MotionField,
@@ -2686,6 +2877,7 @@ impl ExportMotionFieldProduct {
             scope: self.scope,
             source_generation: self.source_generation,
             frame_ordinal: self.frame_ordinal,
+            product_content_sha256: self.codec_identity.content_sha256,
             algorithm_version: self.field.algorithm_version(),
             source_dimensions: self.field.source_dimensions(),
             grid: self.field.grid(),
@@ -2711,7 +2903,7 @@ fn export_codec_motion_fields(
 fn export_codec_motion_fields_from<'a>(
     plan: &crate::evaluated_frame::evaluated_composition::AdvancedCompositionPlan,
     graph: &ExportCreativeGraph,
-    sources: impl IntoIterator<Item = (usize, Option<&'a CodecMotionFrame>)>,
+    sources: impl IntoIterator<Item = (usize, Option<&'a CodecMotionProduct>)>,
 ) -> (Vec<ExportMotionFieldProduct>, Vec<String>) {
     let Some(motion_plan) = plan.motion().advanced() else {
         return (Vec::new(), Vec::new());
@@ -2727,7 +2919,7 @@ fn export_codec_motion_fields_from<'a>(
         }
         let crate::visual_rack::VisualScopeId::Layer(layer_id) = field_plan.scope else {
             diagnostics.push(format!(
-                "Motion field {:?} selected codec vectors without a layer source; rendered zero.",
+                "Motion field {:?} selected codec vectors without a layer source.",
                 field_plan.scope
             ));
             continue;
@@ -2738,7 +2930,7 @@ fn export_codec_motion_fields_from<'a>(
             .position(|candidate| *candidate == layer_id)
         else {
             diagnostics.push(format!(
-                "Motion field {:?} has no export source identity; rendered zero.",
+                "Motion field {:?} has no export source identity.",
                 field_plan.scope
             ));
             continue;
@@ -2746,14 +2938,14 @@ fn export_codec_motion_fields_from<'a>(
         let codec = match sources.get(&saved_position).copied() {
             None => {
                 diagnostics.push(format!(
-                    "Motion field {:?} has no prepared export source; rendered zero.",
+                    "Motion field {:?} has no prepared export source.",
                     field_plan.scope
                 ));
                 continue;
             }
             Some(None) => {
                 diagnostics.push(format!(
-                    "Motion field {:?} lost its exact codec metadata before attachment; rendered zero.",
+                    "Motion field {:?} lost its exact codec metadata before attachment.",
                     field_plan.scope
                 ));
                 continue;
@@ -2762,27 +2954,30 @@ fn export_codec_motion_fields_from<'a>(
         };
         let Some(scope_plan) = motion_plan.scope(field_plan.scope) else {
             diagnostics.push(format!(
-                "Motion field {:?} has no evaluated scope; rendered zero.",
+                "Motion field {:?} has no evaluated scope.",
                 field_plan.scope
             ));
             continue;
         };
-        let field = match crate::motion::rasterize_codec_motion_vectors(
-            codec.source_dimensions,
-            scope_plan.params.lattice_quality,
-            &codec.vectors,
-        ) {
+        let Some(codec_identity) = codec.exact_identity() else {
+            diagnostics.push(format!(
+                "Motion field {:?} codec product lacks exact adjacent-reference identity.",
+                field_plan.scope
+            ));
+            continue;
+        };
+        let field = match codec.rasterize(scope_plan.params.lattice_quality) {
             Ok(Some(field)) => field,
             Ok(None) => {
                 diagnostics.push(format!(
-                    "Motion field {:?} codec records contained no past-reference field; rendered zero.",
+                    "Motion field {:?} codec records contained no past-reference field.",
                     field_plan.scope
                 ));
                 continue;
             }
             Err(error) => {
                 diagnostics.push(format!(
-                    "Motion field {:?} codec rasterization was rejected ({error}); rendered zero.",
+                    "Motion field {:?} codec rasterization was rejected ({error}).",
                     field_plan.scope
                 ));
                 continue;
@@ -2790,6 +2985,7 @@ fn export_codec_motion_fields_from<'a>(
         };
         let product = ExportMotionFieldProduct {
             scope: field_plan.scope,
+            codec_identity,
             source_generation: codec.source_generation,
             frame_ordinal: codec.frame_ordinal,
             field,
@@ -2798,7 +2994,7 @@ fn export_codec_motion_fields_from<'a>(
             products.push(product);
         } else {
             diagnostics.push(format!(
-                "Motion field {:?} failed exact attachment provenance; rendered zero.",
+                "Motion field {:?} failed exact attachment provenance.",
                 field_plan.scope
             ));
         }
@@ -2806,10 +3002,130 @@ fn export_codec_motion_fields_from<'a>(
     (products, diagnostics)
 }
 
+fn retain_exact_export_codec_fields(
+    plan: &EvaluatedCompositionPlan,
+    products: &mut Vec<ExportMotionFieldProduct>,
+) {
+    let motion = match plan {
+        EvaluatedCompositionPlan::Advanced(plan) => plan.motion().advanced(),
+        EvaluatedCompositionPlan::LegacyExact(_) => None,
+    };
+    products.retain(|product| {
+        motion.is_some_and(|motion| {
+            motion.fields().iter().any(|field| {
+                field.source.origin == crate::motion::MotionFieldOrigin::CodecVectors
+                    && field.scope == product.scope
+                    && field.accepts(product.attachment())
+            })
+        })
+    });
+}
+
+fn export_codec_fields_complete(
+    plan: &EvaluatedCompositionPlan,
+    products: &[ExportMotionFieldProduct],
+) -> bool {
+    let planned = planned_export_codec_scopes(plan);
+    let attached = products
+        .iter()
+        .map(|product| product.scope)
+        .collect::<std::collections::BTreeSet<_>>();
+    planned.is_subset(&attached)
+}
+
+fn planned_export_codec_scopes(
+    plan: &EvaluatedCompositionPlan,
+) -> std::collections::BTreeSet<crate::visual_rack::VisualScopeId> {
+    let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+        return std::collections::BTreeSet::new();
+    };
+    plan.motion()
+        .advanced()
+        .map_or_else(std::collections::BTreeSet::new, |motion| {
+            motion
+                .fields()
+                .iter()
+                .filter(|field| {
+                    field.source.origin == crate::motion::MotionFieldOrigin::CodecVectors
+                })
+                .map(|field| field.scope)
+                .collect()
+        })
+}
+
+fn exact_export_codec_availability(
+    graph: &ExportCreativeGraph,
+    layers: &[ExportLayer],
+    products: &[ExportMotionFieldProduct],
+) -> Vec<bool> {
+    let attached = products
+        .iter()
+        .map(|product| product.scope)
+        .collect::<std::collections::BTreeSet<_>>();
+    layers
+        .iter()
+        .map(|layer| {
+            graph
+                .layer_ids
+                .get(layer.source_index)
+                .is_some_and(|layer_id| {
+                    attached.contains(&crate::visual_rack::VisualScopeId::Layer(*layer_id))
+                })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExportRenderedMotionField {
+    scope: crate::visual_rack::VisualScopeId,
+    source_scope: crate::visual_rack::VisualScopeId,
+    origin: crate::motion::MotionFieldOrigin,
+    source_generation: Option<u64>,
+    frame_ordinal: Option<u64>,
+    product_content_sha256: Option<[u8; 32]>,
+}
+
+/// Read accepted field truth only after `commit_frame_history`. This is the
+/// publication boundary shared by field/gate parity, temporal history, and
+/// the CPU identity stored beside the committed GPU slot.
+fn export_rendered_motion_fields(
+    plan: &EvaluatedCompositionPlan,
+    executor: Option<&CompositionGpuExecutor>,
+) -> Vec<ExportRenderedMotionField> {
+    let (EvaluatedCompositionPlan::Advanced(plan), Some(executor)) = (plan, executor) else {
+        return Vec::new();
+    };
+    let Some(motion) = plan.motion().advanced() else {
+        return Vec::new();
+    };
+    motion
+        .scopes()
+        .iter()
+        .filter_map(|scope| {
+            let metrics = executor.motion_metrics(scope.scope)?;
+            if metrics.valid_fields > 0
+                && metrics.field_origin != crate::motion::MotionFieldOrigin::None
+            {
+                Some(ExportRenderedMotionField {
+                    scope: scope.scope,
+                    source_scope: metrics.field_source_scope?,
+                    origin: metrics.field_origin,
+                    source_generation: metrics.field_source_generation,
+                    frame_ordinal: metrics.field_frame_ordinal,
+                    product_content_sha256: metrics.field_product_content_sha256,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 fn export_motion_metadata_for_frame(
     plan: &EvaluatedCompositionPlan,
     graph: &ExportCreativeGraph,
     layers: &[ExportLayer],
+    rendered_fields: &[ExportRenderedMotionField],
     frame_num: u64,
 ) -> ExportMotionMetadata {
     export_motion_metadata_for_frame_from(
@@ -2818,6 +3134,7 @@ fn export_motion_metadata_for_frame(
         layers
             .iter()
             .map(|layer| (layer.source_index, layer.codec_motion.as_ref())),
+        rendered_fields.iter().copied(),
         frame_num,
     )
 }
@@ -2825,7 +3142,8 @@ fn export_motion_metadata_for_frame(
 fn export_motion_metadata_for_frame_from<'a>(
     plan: &EvaluatedCompositionPlan,
     graph: &ExportCreativeGraph,
-    sources: impl IntoIterator<Item = (usize, Option<&'a CodecMotionFrame>)>,
+    sources: impl IntoIterator<Item = (usize, Option<&'a CodecMotionProduct>)>,
+    rendered_fields: impl IntoIterator<Item = ExportRenderedMotionField>,
     frame_num: u64,
 ) -> ExportMotionMetadata {
     let mut metadata = ExportMotionMetadata {
@@ -2845,13 +3163,17 @@ fn export_motion_metadata_for_frame_from<'a>(
     let sources = sources
         .into_iter()
         .collect::<std::collections::BTreeMap<_, _>>();
+    let rendered_fields = rendered_fields
+        .into_iter()
+        .map(|field| (field.scope, field))
+        .collect::<std::collections::BTreeMap<_, _>>();
     for scope in motion
         .scopes()
         .iter()
         .take(MAX_EXPORT_MOTION_SIDECAR_SCOPES)
     {
-        let (identity, codec) = match scope.scope {
-            crate::visual_rack::VisualScopeId::Master => (ExportMotionScopeIdentity::Master, None),
+        let identity = match scope.scope {
+            crate::visual_rack::VisualScopeId::Master => ExportMotionScopeIdentity::Master,
             crate::visual_rack::VisualScopeId::Layer(layer_id) => {
                 let Some(saved_position) = graph
                     .layer_ids
@@ -2860,15 +3182,11 @@ fn export_motion_metadata_for_frame_from<'a>(
                 else {
                     continue;
                 };
-                let codec = sources.get(&saved_position).copied().flatten();
-                (
-                    ExportMotionScopeIdentity::Layer {
-                        saved_position: u32::try_from(saved_position).unwrap_or(u32::MAX),
-                        stable_id: layer_id.get(),
-                        source_tap_id: export_selective_layer_id(saved_position),
-                    },
-                    codec,
-                )
+                ExportMotionScopeIdentity::Layer {
+                    saved_position: u32::try_from(saved_position).unwrap_or(u32::MAX),
+                    stable_id: layer_id.get(),
+                    source_tap_id: export_selective_layer_id(saved_position),
+                }
             }
             crate::visual_rack::VisualScopeId::Group(_)
             | crate::visual_rack::VisualScopeId::Program => continue,
@@ -2883,16 +3201,47 @@ fn export_motion_metadata_for_frame_from<'a>(
                 (Some(saved_position.get()), None)
             }
         };
+        let rendered = rendered_fields.get(&scope.scope).copied();
+        let field_planned = scope.admitted_field_slot().is_some();
+        let field_attached = rendered.is_some();
+        let rendered_source_origin =
+            rendered.map_or(crate::motion::MotionFieldOrigin::None, |field| field.origin);
+        let codec = rendered
+            .filter(|field| field.origin == crate::motion::MotionFieldOrigin::CodecVectors)
+            .and_then(|field| {
+                let source_position = match field.source_scope {
+                    crate::visual_rack::VisualScopeId::Layer(layer_id) => graph
+                        .layer_ids
+                        .iter()
+                        .position(|candidate| *candidate == layer_id),
+                    crate::visual_rack::VisualScopeId::Master
+                    | crate::visual_rack::VisualScopeId::Group(_)
+                    | crate::visual_rack::VisualScopeId::Program => None,
+                }?;
+                let codec = sources.get(&source_position).copied().flatten()?;
+                let identity = codec.exact_identity()?;
+                (Some(codec.source_generation) == field.source_generation
+                    && Some(codec.frame_ordinal) == field.frame_ordinal
+                    && Some(identity.content_sha256) == field.product_content_sha256)
+                    .then_some(codec)
+            });
         metadata.scopes.push(ExportMotionScopeMetadata {
             scope: identity,
             algorithm_version: scope.params.algorithm_version,
             requested_source: scope.params.field_source,
             lattice_quality: scope.params.lattice_quality,
             source_origin: scope.source.origin,
+            rendered_source_origin,
+            field_planned,
+            field_attached,
             source_diagnostic: scope.source.diagnostic,
             codec_provenance: codec.map(|codec| codec.provenance),
-            source_generation: codec.map(|codec| codec.source_generation),
-            frame_ordinal: codec.map(|codec| codec.frame_ordinal),
+            source_generation: rendered.and_then(|field| field.source_generation),
+            frame_ordinal: rendered.and_then(|field| field.frame_ordinal),
+            codec_product_sha256: rendered.and_then(|field| field.product_content_sha256),
+            codec_transition_count: codec
+                .and_then(|codec| u8::try_from(codec.transition_count()).ok()),
+            codec_elapsed_seconds: codec.and_then(CodecMotionProduct::elapsed_seconds),
             donor_saved_position,
             donor_stable_id,
             carrier: scope.params.transplant.carrier,
@@ -2907,21 +3256,57 @@ fn export_motion_metadata_for_frame_from<'a>(
 }
 
 fn export_motion_plan_warnings(plan: &EvaluatedCompositionPlan) -> Vec<String> {
-    use crate::evaluated_frame::evaluated_composition::MotionPlanDiagnostic;
+    use crate::evaluated_frame::evaluated_composition::{
+        CompositionPlanDiagnostic, ImageTapConsumer, MotionPlanDiagnostic,
+    };
 
     let EvaluatedCompositionPlan::Advanced(plan) = plan else {
         return Vec::new();
     };
-    let Some(motion) = plan.motion().advanced() else {
-        return Vec::new();
-    };
-    motion
+    let mut warnings = plan
         .diagnostics()
         .iter()
-        .map(|diagnostic| match *diagnostic {
-            MotionPlanDiagnostic::Source { scope, diagnostic } => format!(
-                "Motion field {scope:?} resolved with {diagnostic:?}; the fixed authored source law remains visible."
+        .filter_map(|diagnostic| match *diagnostic {
+            CompositionPlanDiagnostic::RefreshGardenMatteNotSelected => Some(
+                "Refresh Garden has no selected matte route; its Matte gate resolves to zero."
+                    .to_owned(),
             ),
+            CompositionPlanDiagnostic::MissingSelectedLayer {
+                consumer: ImageTapConsumer::RefreshGardenMatte,
+                saved_position,
+            } => Some(format!(
+                "Refresh Garden is missing saved matte route position {}; its Matte gate resolves to zero.",
+                saved_position.get()
+            )),
+            CompositionPlanDiagnostic::MissingStableScope {
+                consumer: ImageTapConsumer::RefreshGardenMatte,
+                producer,
+            } => Some(format!(
+                "Refresh Garden matte producer {producer:?} is unavailable; its Matte gate resolves to zero."
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(motion) = plan.motion().advanced() else {
+        return warnings;
+    };
+    warnings.extend(motion.diagnostics().iter().map(|diagnostic| match *diagnostic {
+        MotionPlanDiagnostic::Source {
+            scope,
+            diagnostic: crate::motion::MotionSourceDiagnostic::None,
+        } => format!("Motion field {scope:?} resolved without a source diagnostic."),
+        MotionPlanDiagnostic::Source {
+            scope,
+            diagnostic: crate::motion::MotionSourceDiagnostic::CodecUnavailable,
+        } => format!(
+            "Motion field {scope:?} requested explicit codec vectors, but exact adjacent-reference metadata was unavailable; no field was admitted."
+        ),
+        MotionPlanDiagnostic::Source {
+            scope,
+            diagnostic: crate::motion::MotionSourceDiagnostic::CodecUnavailableFallback,
+        } => format!(
+            "Motion field {scope:?} could not admit exact codec vectors and selected the deterministic lattice fallback."
+        ),
             MotionPlanDiagnostic::MasterTransplantRejected => {
                 "Master Faraday transplant has no layer recipient and was rendered inactive."
                     .to_owned()
@@ -2946,17 +3331,28 @@ fn export_motion_plan_warnings(plan: &EvaluatedCompositionPlan) -> Vec<String> {
                 recipient.get(),
                 admitted_recipient.get()
             ),
-        })
-        .collect()
+            MotionPlanDiagnostic::RefreshGardenMotionNotSelected =>
+                "Refresh Garden has no selected motion route; its motion gate resolves to zero."
+                    .to_owned(),
+            MotionPlanDiagnostic::MissingRefreshGardenMotion { saved_position } => format!(
+                "Refresh Garden is missing saved motion route position {}; its motion gate resolves to zero.",
+                saved_position.get()
+            ),
+            MotionPlanDiagnostic::RefreshGardenMotionUnavailable =>
+                "Refresh Garden's selected motion route is unavailable; its motion gate resolves to zero."
+                    .to_owned(),
+        }));
+    warnings
 }
 
 fn export_codec_frame_facts(
     layer: &ExportLayer,
+    available_override: Option<bool>,
 ) -> crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts {
     layer.codec_motion.as_ref().map_or_else(
         crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts::default,
         |motion| crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts {
-            available: motion.codec_vectors_available(),
+            available: available_override.unwrap_or_else(|| motion.codec_vectors_available()),
             source_generation: motion.source_generation,
             frame_ordinal: motion.frame_ordinal,
         },
@@ -3065,24 +3461,38 @@ fn plan_export_composition_inner(
     resource_limits: CreativeResourceLimits,
     motion: Option<ExportMotionPlanAdapter<'_>>,
 ) -> Result<EvaluatedCompositionPlan, String> {
-    let motion_layers = motion
+    let planned_motion = motion
         .map(|motion| {
+            let (master, effective_layers) = effective_export_motion_params(
+                motion.master,
+                motion.layers,
+                motion.modulation,
+                motion.shutter_samples,
+            );
             export_motion_layer_plan_inputs(
                 graph,
-                motion.layers,
-                motion
-                    .sources
-                    .iter()
-                    .map(|source| (source.source_index, export_codec_frame_facts(source))),
+                &effective_layers,
+                motion.sources.iter().enumerate().map(|(index, source)| {
+                    (
+                        source.source_index,
+                        export_codec_frame_facts(
+                            source,
+                            motion
+                                .codec_availability
+                                .and_then(|availability| availability.get(index).copied()),
+                        ),
+                    )
+                }),
             )
+            .map(|layers| (master, layers))
         })
         .transpose()?;
     let mut input =
         CompositionPlanInput::new(&graph.composition, &graph.master_rack, &graph.layer_racks)
             .with_layer_mattes(layer_mattes, program_history_initialized);
     input.resource_limits = resource_limits;
-    if let (Some(motion), Some(layers)) = (motion, motion_layers.as_deref()) {
-        input = input.with_motion(motion.master, layers, motion.limits);
+    if let (Some(motion), Some((master, layers))) = (motion, planned_motion.as_ref()) {
+        input = input.with_motion(*master, layers, motion.limits);
     }
     evaluated
         .plan_composition(input)
@@ -3201,6 +3611,14 @@ fn export_ntsc_reference_frame(frame_num: u64, fps: u32, paused: bool) -> usize 
     } else {
         reference_frame_for_output(frame_num, fps)
     }
+}
+
+fn export_temporal_reference_tick(frame_num: u64, fps: u32) -> u64 {
+    let fps = u64::from(fps.max(1));
+    frame_num
+        .saturating_mul(crate::effects::params::TEMPORAL_REFERENCE_FPS as u64)
+        .saturating_add(fps / 2)
+        / fps
 }
 
 fn export_selective_topology_signature(plan: &SelectiveNtscPlan) -> u64 {
@@ -3760,9 +4178,11 @@ fn run_export(
         // Seed every layer texture with the exact saved-playhead selection
         // before frame zero. Paused/Frozen exports therefore hold the authored
         // frame rather than silently falling back to source frame zero.
-        let first_frame = match decoder
-            .seek_decode_for_generation(seed_selection.source_seconds, seed_selection.generation)
-        {
+        let first_frame = match decoder.seek_decode_after_for_generation(
+            seed_selection.source_seconds,
+            seed_selection.generation,
+            None,
+        ) {
             Ok(frame) if frame.metadata.source_generation == seed_selection.generation => frame,
             Ok(frame) => {
                 progress.record_warning(black_substitution_warning(
@@ -3831,6 +4251,9 @@ fn run_export(
             consumed_loop_generation: 0,
             decoder: Some(decoder),
             codec_motion,
+            codec_motion_predecessor: first_frame.metadata.codec_identity.filter(|identity| {
+                identity.source_generation == first_frame.metadata.source_generation
+            }),
             _still_source: None,
             texture,
             texture_view,
@@ -3952,29 +4375,27 @@ fn run_export(
     let export_morph = patch.morph.clone().map(crate::morph::Morph::from_snapshot);
 
     // --- Temporal effects (feedback/slit-scan), same pass as live ---
-    let mut base_temporal = patch
-        .temporal
-        .as_ref()
-        .map(|t| t.to_params())
-        .unwrap_or_default();
-    if let Some(originals) = patch
-        .temporal
-        .as_ref()
-        .and_then(|temporal| temporal.originals.as_ref())
-    {
-        base_temporal.originals.score.loop_driver = resolve_export_score_loop_driver(
-            originals.score.loop_driver,
-            &base_creative_graph.layer_ids,
-        );
-    }
+    let base_temporal =
+        resolved_export_patch_temporal(patch.temporal.as_ref(), &base_creative_graph.layer_ids);
     let mut temporal_state = crate::renderer::state::TemporalState::default();
     let mut temporal_boundaries = crate::performance::BeatBoundaryTracker::default();
     let mut temporal_audio_onsets = crate::temporal::TemporalAudioOnsetTracker::default();
+    let recorded_temporal_track = config.temporal_event_track.clone();
+    let mut recorded_temporal_replay = recorded_temporal_track.replay();
+    if recorded_temporal_track.truncated() {
+        progress.record_warning(
+            "The live temporal event track reached its bounded cap; export replays the retained prefix only.",
+        );
+    }
     if base_temporal.originals.score.enabled {
         match base_temporal.originals.score.trigger {
-            crate::temporal::CollisionScoreTrigger::Manual => progress.record_warning(
-                "Collision Score manual events have no recorded offline event stream; deterministic export supplies zero manual events.",
-            ),
+            crate::temporal::CollisionScoreTrigger::Manual
+                if recorded_temporal_track.events().is_empty() =>
+            {
+                progress.record_warning(
+                    "Collision Score manual mode has no accepted live event track; deterministic export supplies zero manual events.",
+                );
+            }
             crate::temporal::CollisionScoreTrigger::AudioOnset if analysis_clip.is_none() => {
                 progress.record_warning(
                     "Collision Score audio-onset events require a deterministic imported analysis clip; export supplies zero live-input onset events.",
@@ -4153,6 +4574,9 @@ fn run_export(
                         layers: &candidate.layer_motion,
                         sources: &layers,
                         limits: motion_device_limits,
+                        modulation: &modulation_frame,
+                        shutter_samples: config.shutter_samples,
+                        codec_availability: None,
                     },
                 )?;
                 Ok(candidate)
@@ -4281,6 +4705,7 @@ fn run_export(
                 // No field from the previous source generation may cross a
                 // seek/cue/loop cut or a transparent OneShot terminal.
                 layer.codec_motion = None;
+                layer.codec_motion_predecessor = None;
             }
 
             if selection.sample_due && !selection.transparent {
@@ -4288,9 +4713,15 @@ fn run_export(
                     write_error = Some("export cancelled during indexed source decode".to_string());
                     break;
                 }
+                let previous_accepted_codec_identity = layer
+                    .codec_motion_predecessor
+                    .filter(|identity| identity.source_generation == selection.generation);
                 let decoded = layer.decoder.as_mut().map(|decoder| {
-                    decoder
-                        .seek_decode_for_generation(selection.source_seconds, selection.generation)
+                    decoder.seek_decode_after_for_generation(
+                        selection.source_seconds,
+                        selection.generation,
+                        previous_accepted_codec_identity,
+                    )
                 });
                 if let Some(decoded) = decoded {
                     match decoded {
@@ -4318,6 +4749,10 @@ fn run_export(
                             // Pixels and decoder metadata publish as one
                             // export-side transaction only after upload.
                             layer.codec_motion = codec_motion;
+                            layer.codec_motion_predecessor =
+                                frame.metadata.codec_identity.filter(|identity| {
+                                    identity.source_generation == frame.metadata.source_generation
+                                });
                         }
                         Ok(frame) => {
                             write_error = Some(format!(
@@ -4359,6 +4794,8 @@ fn run_export(
         let temporal_crossings = temporal_boundaries.observe(beat, 4, patch.master_paused);
         let temporal_audio_events =
             temporal_audio_onsets.observe(mod_matrix.audio.onset, !patch.master_paused);
+        let recorded_reference_tick = export_temporal_reference_tick(frame_num, config.fps);
+        let recorded_events = recorded_temporal_replay.events_due(recorded_reference_tick);
         let temporal_input = crate::temporal::TemporalFrameInput::new(
             program_dt,
             match (patch.master_paused, patch.media_frozen) {
@@ -4372,10 +4809,8 @@ fn run_export(
                 boundary_events: temporal_loop_events,
                 downbeat_events: temporal_crossings.bars,
                 audio_onset_events: temporal_audio_events,
-                // Offline renders currently have no authored event recording;
-                // the one-time warning above makes this deterministic zero
-                // substitution visible rather than pretending wall-clock UI.
-                manual_events: 0,
+                manual_events: recorded_events.manual_events,
+                garden_refresh_events: recorded_events.garden_refresh_events,
             },
         )
         .with_audio_energy(mod_matrix.audio.level);
@@ -4413,7 +4848,7 @@ fn run_export(
                     },
                 ),
             );
-        let evaluated_composition = match plan_export_composition_with_motion(
+        let mut evaluated_composition = match plan_export_composition_with_motion(
             &evaluated_frame,
             &frame_creative_graph,
             &frame_mattes,
@@ -4424,6 +4859,9 @@ fn run_export(
                 layers: &frame_layer_motion,
                 sources: &layers,
                 limits: motion_device_limits,
+                modulation: &modulation_frame,
+                shutter_samples: config.shutter_samples,
+                codec_availability: None,
             },
         ) {
             Ok(plan) => plan,
@@ -4435,23 +4873,61 @@ fn run_export(
         debug_assert_eq!(evaluated_frame.context().output_size, [w, h]);
         let mod_ntsc = evaluated_frame.ntsc().clone();
         let mod_temporal = *evaluated_frame.temporal();
-        let frame_motion_metadata = export_motion_metadata_for_frame(
-            &evaluated_composition,
-            &frame_creative_graph,
-            &layers,
-            frame_num,
-        );
-        for warning in export_motion_plan_warnings(&evaluated_composition) {
-            if emitted_motion_warnings.insert(warning.clone()) {
-                progress.record_warning(warning);
-            }
-        }
-        let (motion_field_products, motion_field_diagnostics) = match &evaluated_composition {
+        let (mut motion_field_products, motion_field_diagnostics) = match &evaluated_composition {
             EvaluatedCompositionPlan::Advanced(plan) => {
                 export_codec_motion_fields(plan, &frame_creative_graph, &layers)
             }
             EvaluatedCompositionPlan::LegacyExact(_) => (Vec::new(), Vec::new()),
         };
+        let planned_codec_scopes = planned_export_codec_scopes(&evaluated_composition);
+        let attached_codec_scopes = motion_field_products
+            .iter()
+            .map(|product| product.scope)
+            .collect::<std::collections::BTreeSet<_>>();
+        if !planned_codec_scopes.is_subset(&attached_codec_scopes) {
+            let codec_availability = exact_export_codec_availability(
+                &frame_creative_graph,
+                &layers,
+                &motion_field_products,
+            );
+            evaluated_composition = match plan_export_composition_with_motion(
+                &evaluated_frame,
+                &frame_creative_graph,
+                &frame_mattes,
+                composition_history_ready,
+                creative_resource_limits,
+                ExportMotionPlanAdapter {
+                    master: frame_master_motion,
+                    layers: &frame_layer_motion,
+                    sources: &layers,
+                    limits: motion_device_limits,
+                    modulation: &modulation_frame,
+                    shutter_samples: config.shutter_samples,
+                    codec_availability: Some(&codec_availability),
+                },
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    write_error = Some(format!("export codec fallback plan rejected: {error}"));
+                    break;
+                }
+            };
+            // The immutable retry may only remove codec requirements or
+            // select lattice fallback. Retain products already rasterized
+            // against the exact first plan; never perform a second fallible
+            // allocation/rasterization after fallback preflight.
+            retain_exact_export_codec_fields(&evaluated_composition, &mut motion_field_products);
+        }
+        if !export_codec_fields_complete(&evaluated_composition, &motion_field_products) {
+            write_error =
+                Some("export codec field set changed after immutable fallback planning".to_owned());
+            break;
+        }
+        for warning in export_motion_plan_warnings(&evaluated_composition) {
+            if emitted_motion_warnings.insert(warning.clone()) {
+                progress.record_warning(warning);
+            }
+        }
         for warning in motion_field_diagnostics {
             if emitted_motion_warnings.insert(warning.clone()) {
                 progress.record_warning(warning);
@@ -4848,6 +5324,15 @@ fn run_export(
                 executor.commit_frame_history();
             }
         }
+        let rendered_motion_fields =
+            export_rendered_motion_fields(&evaluated_composition, composition_gpu.as_ref());
+        let frame_motion_metadata = export_motion_metadata_for_frame(
+            &evaluated_composition,
+            &frame_creative_graph,
+            &layers,
+            &rendered_motion_fields,
+            frame_num,
+        );
         motion_sidecar.observe_accepted(&frame_motion_metadata);
         progress.publish_motion_metadata(frame_motion_metadata);
 
@@ -6491,7 +6976,9 @@ mod tests {
             layer_source_hints: Vec::new(),
             analysis_audio_path_hint: None,
             ntsc_quality: NtscExportQuality::LiveParity,
+            shutter_samples: ExportShutterSamples::Authored,
             media_safety_policy: MediaSafetyPolicy::default(),
+            temporal_event_track: crate::temporal::TemporalEventTrack::default(),
         }
     }
 
@@ -6532,6 +7019,7 @@ mod tests {
                     softness: 0.1,
                     decay: 0.91,
                     max_hold_ticks: 17,
+                    ..RefreshGardenParams::default()
                 },
                 score: CollisionScoreParams {
                     enabled: true,
@@ -6653,6 +7141,7 @@ mod tests {
                 downbeat_events: live_crossings.bars,
                 audio_onset_events: live_audio_events,
                 manual_events: u32::from(frame == fps * 3 + 1),
+                garden_refresh_events: 0,
             };
             let blackout = (fps * 2..fps * 9 / 4).contains(&frame);
             let live_input = TemporalFrameInput::new(delta, live_freeze, blackout, events)
@@ -6666,6 +7155,7 @@ mod tests {
                     downbeat_events: export_crossings.bars,
                     audio_onset_events: export_audio_events,
                     manual_events: u32::from(frame == fps * 3 + 1),
+                    garden_refresh_events: 0,
                 },
             )
             .with_audio_energy(audio_energy);
@@ -6915,6 +7405,140 @@ layers:
 "#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn export_resolves_patch_and_morph_garden_routes_against_job_local_ids() {
+        use crate::image_routing::LayerImageStage;
+        use crate::patch::{
+            RefreshGardenMatteRouteConfig, RefreshGardenMotionRouteConfig, TemporalOriginalsConfig,
+        };
+        use crate::temporal::{RefreshGardenMatteRoute, RefreshGardenMotionRoute};
+
+        let ids = [
+            StableLayerId::new(1).unwrap(),
+            StableLayerId::new(2).unwrap(),
+        ];
+        let zero = SavedLayerPosition::new(0).unwrap();
+        let one = SavedLayerPosition::new(1).unwrap();
+        let mut config = crate::patch::TemporalConfig::default();
+        let originals = config
+            .originals
+            .get_or_insert_with(TemporalOriginalsConfig::default);
+        originals.garden.matte_route = RefreshGardenMatteRouteConfig::SelectedLayer {
+            saved_position: one,
+            stage: LayerImageStage::PreLocalEffects,
+        };
+        originals.garden.motion_route = RefreshGardenMotionRouteConfig::MissingSelectedLayer {
+            saved_position: zero,
+        };
+        let patch = resolved_export_patch_temporal(Some(&config), &ids);
+        assert_eq!(
+            patch.originals.garden.matte_route,
+            RefreshGardenMatteRoute::SelectedLayer {
+                layer_id: ids[1],
+                saved_position: one,
+                stage: LayerImageStage::PreLocalEffects,
+            }
+        );
+        assert_eq!(
+            patch.originals.garden.motion_route,
+            RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: zero,
+            }
+        );
+
+        let mut morph = crate::morph::MorphTemporalSnapshot::default();
+        morph.originals.garden.matte_route = RefreshGardenMatteRouteConfig::MissingSelectedLayer {
+            saved_position: one,
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        morph.originals.garden.motion_route = RefreshGardenMotionRouteConfig::SelectedLayer {
+            saved_position: zero,
+        };
+        let sampled = resolved_export_morph_temporal(morph, &ids);
+        assert_eq!(
+            sampled.originals.garden.matte_route,
+            RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position: one,
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            sampled.originals.garden.motion_route,
+            RefreshGardenMotionRoute::SelectedLayer {
+                layer_id: ids[0],
+                saved_position: zero,
+            }
+        );
+    }
+
+    fn garden_export_plan(
+        graph: &ExportCreativeGraph,
+        temporal: &crate::effects::params::TemporalParams,
+    ) -> EvaluatedCompositionPlan {
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(graph.layer_ids.len());
+        let evaluated = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(64, 36, 0.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal,
+            },
+            graph
+                .layer_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(slot, id)| LayerFrameInput {
+                    source: SourceTap::new(id.get(), slot, 64, 36),
+                    effects: &effects,
+                    transform: &transform,
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }),
+        );
+        plan_export_composition(
+            &evaluated,
+            graph,
+            &vec![LayerMatte::default(); graph.layer_ids.len()],
+            false,
+            CreativeResourceLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn export_surfaces_closed_garden_matte_and_motion_route_warnings() {
+        let graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        let mut temporal = crate::effects::params::TemporalParams::default();
+        temporal.originals.garden.amount = 1.0;
+        temporal.originals.garden.gate = crate::temporal::RefreshGardenGate::Matte;
+        let matte = export_motion_plan_warnings(&garden_export_plan(&graph, &temporal));
+        assert!(matte
+            .iter()
+            .any(|warning| warning.contains("no selected matte route")));
+
+        temporal.originals.garden.gate = crate::temporal::RefreshGardenGate::Motion;
+        temporal.originals.garden.motion_route =
+            crate::temporal::RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: SavedLayerPosition::new(2).unwrap(),
+            };
+        let motion = export_motion_plan_warnings(&garden_export_plan(&graph, &temporal));
+        assert!(motion.iter().any(|warning| {
+            warning.contains("missing saved motion route position 2")
+                && warning.contains("resolves to zero")
+        }));
     }
 
     fn dormant_cycle_saved_rack(
@@ -7554,6 +8178,172 @@ layers:
     }
 
     #[test]
+    fn export_shutter_request_is_exact_and_candidate_final_resources_match() {
+        use crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts;
+        use crate::motion::{
+            CurvedShutterParams, CurvedShutterQuality, MotionFieldSource, MotionParams,
+        };
+
+        let policies = [
+            (ExportShutterSamples::Authored, None, "authored"),
+            (ExportShutterSamples::Samples1, Some(1), "samples_1"),
+            (ExportShutterSamples::Samples4, Some(4), "samples_4"),
+            (ExportShutterSamples::Samples8, Some(8), "samples_8"),
+            (ExportShutterSamples::Samples16, Some(16), "samples_16"),
+        ];
+        for (policy, count, wire_key) in policies {
+            assert!(policy.is_valid());
+            assert_eq!(policy.requested_count(), count);
+            assert_eq!(serde_json::to_value(policy).unwrap(), wire_key);
+        }
+
+        let graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        let evaluated = m4_motion_evaluated_frame(&graph, 30);
+        let master = MotionParams::default();
+        let mut authored_layers = vec![MotionParams::default(); graph.layer_ids.len()];
+        authored_layers[0] = MotionParams {
+            field_source: MotionFieldSource::Lattice,
+            shutter: CurvedShutterParams {
+                angle_degrees: 180.0,
+                quality: CurvedShutterQuality::Sharp,
+                ..CurvedShutterParams::default()
+            },
+            ..MotionParams::default()
+        };
+        let modulation = crate::modulation::ModMatrix::new().frame(authored_layers.len());
+        let plan = |policy| {
+            let (effective_master, effective_layers) =
+                effective_export_motion_params(master, &authored_layers, &modulation, policy);
+            let inputs = export_motion_layer_plan_inputs(
+                &graph,
+                &effective_layers,
+                (0..effective_layers.len()).map(|index| (index, MotionCodecFrameFacts::default())),
+            )
+            .unwrap();
+            m4_motion_plan(&evaluated, &graph, effective_master, &inputs)
+        };
+
+        // Morph-candidate preflight and final immutable planning consume the
+        // same post-Morph/post-modulation explicit-count policy.
+        let candidate = plan(ExportShutterSamples::Samples16);
+        let final_plan = plan(ExportShutterSamples::Samples16);
+        assert_m4_motion_plans_equal(&candidate, &final_plan);
+        let candidate_motion = candidate.motion().advanced().unwrap();
+        assert_eq!(candidate_motion.resources().max_shutter_samples, 16);
+        assert_eq!(candidate_motion.budget().full_frame_passes, 1);
+        assert_eq!(
+            candidate_motion.budget().logical_texture_lookups_per_pixel,
+            18
+        );
+        assert_eq!(candidate_motion.budget().texture_samples_per_pixel, 66);
+        assert_eq!(
+            candidate_motion
+                .scope(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+                .unwrap()
+                .params
+                .shutter
+                .quality,
+            CurvedShutterQuality::High
+        );
+
+        let authored = plan(ExportShutterSamples::Authored);
+        let authored_motion = authored.motion().advanced().unwrap();
+        assert_eq!(authored_motion.resources().max_shutter_samples, 1);
+        assert_eq!(
+            authored_motion.budget().logical_texture_lookups_per_pixel,
+            3
+        );
+        assert_eq!(authored_motion.budget().texture_samples_per_pixel, 6);
+        let authored_metadata = export_motion_metadata_for_frame_from(
+            &EvaluatedCompositionPlan::Advanced(Box::new(authored.clone())),
+            &graph,
+            [(0, None), (1, None), (2, None)],
+            [],
+            0,
+        );
+        for saved_position in 0..3 {
+            let scope = authored_metadata
+                .scopes
+                .iter()
+                .find(|scope| {
+                    matches!(
+                        scope.scope,
+                        ExportMotionScopeIdentity::Layer {
+                            saved_position: candidate,
+                            ..
+                        } if candidate == saved_position
+                    )
+                })
+                .unwrap();
+            assert_eq!(scope.field_planned, saved_position == 0);
+            assert!(!scope.field_attached);
+        }
+
+        // Frame-local modulation is resolved before the fixed export tier, so
+        // candidate preflight accounts for an angle activated by modulation.
+        let mut matrix = crate::modulation::ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings.push(crate::modulation::Routing::new(
+            crate::modulation::ModSource::Midi(0),
+            "layer1_motion_shutter_angle",
+            1.0,
+        ));
+        matrix.update_at_beat(0.0, 0.0);
+        let modulated = matrix.frame(authored_layers.len());
+        let zero_layers = vec![MotionParams::default(); graph.layer_ids.len()];
+        let (_, modulated_layers) = effective_export_motion_params(
+            MotionParams::default(),
+            &zero_layers,
+            &modulated,
+            ExportShutterSamples::Samples16,
+        );
+        assert_eq!(modulated_layers[0].shutter.angle_degrees, 180.0);
+        assert_eq!(
+            modulated_layers[0].shutter.quality,
+            CurvedShutterQuality::High
+        );
+
+        // An explicit request changes only quality. It cannot activate a
+        // zero-angle shutter or weaken literal LegacyExact delegation.
+        let modulation = crate::modulation::ModMatrix::new().frame(graph.layer_ids.len());
+        let (zero_master, zero_layers) = effective_export_motion_params(
+            MotionParams::default(),
+            &zero_layers,
+            &modulation,
+            ExportShutterSamples::Samples16,
+        );
+        assert!(zero_layers.iter().all(|params| {
+            params.shutter.quality == CurvedShutterQuality::High && params.shutter.is_exact_zero()
+        }));
+        let zero_inputs = export_motion_layer_plan_inputs(
+            &graph,
+            &zero_layers,
+            (0..zero_layers.len()).map(|index| (index, MotionCodecFrameFacts::default())),
+        )
+        .unwrap();
+        let mattes = vec![LayerMatte::default(); graph.layer_ids.len()];
+        let zero_plan = evaluated
+            .plan_composition(
+                CompositionPlanInput::new(
+                    &graph.composition,
+                    &graph.master_rack,
+                    &graph.layer_racks,
+                )
+                .with_layer_mattes(&mattes, false)
+                .with_motion(
+                    zero_master,
+                    &zero_inputs,
+                    crate::motion::MotionDeviceLimits::new(16_384, u64::MAX),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            zero_plan,
+            EvaluatedCompositionPlan::LegacyExact(_)
+        ));
+    }
+
+    #[test]
     fn m4_export_donor_resolution_holds_and_fixed_shutter_tiers_use_authored_laws() {
         use crate::motion::{CurvedShutterQuality, MotionDonor};
         use crate::transport::NormalizedTime;
@@ -7630,7 +8420,7 @@ layers:
             Some(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
         );
 
-        let before_seek = m4_codec_motion_frame(held.generation, 4);
+        let before_seek: CodecMotionProduct = m4_codec_motion_frame(held.generation, 4).into();
         let seek = transport.select(
             transport.authored,
             ProgramTransportTick {
@@ -7647,6 +8437,35 @@ layers:
         );
     }
 
+    fn m4_codec_past_reference_proof(
+        source_generation: u64,
+        destination_ordinal: u64,
+        time_base_numerator: i32,
+        time_base_denominator: i32,
+    ) -> crate::video::CodecPastReferenceProof {
+        let reference_ordinal = destination_ordinal
+            .checked_sub(1)
+            .expect("available codec fixture has an adjacent predecessor");
+        let destination_pts =
+            i64::try_from(destination_ordinal).expect("codec fixture ordinal fits the PTS domain");
+        crate::video::CodecPastReferenceProof {
+            policy: crate::video::AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp,
+            reference: crate::video::CodecFrameIdentity {
+                source_generation,
+                pts: destination_pts - 1,
+                presentation_ordinal: reference_ordinal,
+            },
+            destination: crate::video::CodecFrameIdentity {
+                source_generation,
+                pts: destination_pts,
+                presentation_ordinal: destination_ordinal,
+            },
+            elapsed_ticks: 1,
+            time_base: crate::video::CodecTimeBase::new(time_base_numerator, time_base_denominator)
+                .expect("codec fixture time base is positive"),
+        }
+    }
+
     fn m4_codec_motion_frame(source_generation: u64, frame_ordinal: u64) -> CodecMotionFrame {
         CodecMotionFrame {
             source_dimensions: [64, 32],
@@ -7657,12 +8476,18 @@ layers:
             provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
             frame_type: crate::video::CodecMotionFrameType::Predictive,
             status: crate::video::CodecMotionStatus::Available,
+            past_reference_proof: Some(m4_codec_past_reference_proof(
+                source_generation,
+                frame_ordinal,
+                1,
+                30,
+            )),
             vectors: vec![crate::motion::CodecMotionVector {
                 destination: [8, 8],
                 block: [16, 16],
                 motion: [-4, 0],
                 motion_scale: 1,
-                seconds_from_reference: 0.5,
+                seconds_from_reference: 1.0 / 30.0,
                 reference: crate::motion::CodecReferenceDirection::Past,
                 visibility: 1.0,
             }],
@@ -7689,7 +8514,7 @@ layers:
             export_motion_layer_plan_inputs(&graph, &params, facts.into_iter().enumerate())
                 .unwrap();
         let plan = m4_motion_plan(&evaluated, &graph, master, &inputs);
-        let codec = m4_codec_motion_frame(11, 17);
+        let codec: CodecMotionProduct = m4_codec_motion_frame(11, 17).into();
         let sources = [(0, Some(&codec)), (1, None), (2, None)];
         let (products, diagnostics) = export_codec_motion_fields_from(&plan, &graph, sources);
         assert!(diagnostics.is_empty());
@@ -7708,10 +8533,54 @@ layers:
         assert!(sample.velocity_uv_per_second[0] > 0.0);
         assert_eq!(sample.velocity_uv_per_second[1], 0.0);
 
+        let mut rendered = plan
+            .motion()
+            .advanced()
+            .unwrap()
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.source.origin == crate::motion::MotionFieldOrigin::CodecVectors {
+                    let product = products
+                        .iter()
+                        .find(|product| product.scope == field.scope)
+                        .unwrap();
+                    ExportRenderedMotionField {
+                        scope: field.scope,
+                        source_scope: field.scope,
+                        origin: field.source.origin,
+                        source_generation: Some(product.source_generation),
+                        frame_ordinal: Some(product.frame_ordinal),
+                        product_content_sha256: Some(product.codec_identity.content_sha256),
+                    }
+                } else {
+                    ExportRenderedMotionField {
+                        scope: field.scope,
+                        source_scope: field.scope,
+                        origin: field.source.origin,
+                        source_generation: None,
+                        frame_ordinal: None,
+                        product_content_sha256: None,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let donor = *rendered
+            .iter()
+            .find(|field| {
+                field.scope == crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0])
+            })
+            .unwrap();
+        rendered.push(ExportRenderedMotionField {
+            scope: crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[2]),
+            ..donor
+        });
+
         let metadata = export_motion_metadata_for_frame_from(
             &EvaluatedCompositionPlan::Advanced(Box::new(plan.clone())),
             &graph,
             [(0, Some(&codec)), (1, None), (2, None)],
+            rendered.iter().copied(),
             23,
         );
         assert_eq!(metadata.accepted_frame, Some(23));
@@ -7738,11 +8607,51 @@ layers:
             crate::motion::MotionFieldOrigin::CodecVectors
         );
         assert_eq!(
+            codec_metadata.rendered_source_origin,
+            crate::motion::MotionFieldOrigin::CodecVectors
+        );
+        assert!(codec_metadata.field_attached);
+        assert_eq!(
             codec_metadata.codec_provenance,
             Some(crate::video::CodecMotionProvenance::FfmpegExportMvs)
         );
         assert_eq!(codec_metadata.source_generation, Some(11));
         assert_eq!(codec_metadata.frame_ordinal, Some(17));
+        assert_eq!(
+            codec_metadata.codec_product_sha256,
+            Some(products[0].codec_identity.content_sha256)
+        );
+        assert_eq!(codec_metadata.codec_transition_count, Some(1));
+        assert_eq!(codec_metadata.codec_elapsed_seconds, Some(1.0 / 30.0));
+        let unattached = export_motion_metadata_for_frame_from(
+            &EvaluatedCompositionPlan::Advanced(Box::new(plan.clone())),
+            &graph,
+            [(0, Some(&codec)), (1, None), (2, None)],
+            [],
+            23,
+        );
+        let unattached_codec = unattached
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(!unattached_codec.field_attached);
+        assert!(unattached_codec.field_planned);
+        assert_eq!(
+            unattached_codec.rendered_source_origin,
+            crate::motion::MotionFieldOrigin::None
+        );
+        assert_eq!(unattached_codec.codec_provenance, None);
+        assert_eq!(unattached_codec.codec_transition_count, None);
+        assert_eq!(unattached_codec.codec_elapsed_seconds, None);
         let fallback_metadata = metadata
             .scopes
             .iter()
@@ -7761,6 +8670,91 @@ layers:
             crate::motion::MotionFieldOrigin::LatticeFallback
         );
         assert_eq!(fallback_metadata.codec_provenance, None);
+        let recipient_metadata = metadata
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 2,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            recipient_metadata.source_origin,
+            crate::motion::MotionFieldOrigin::LatticeFallback
+        );
+        assert_eq!(
+            recipient_metadata.rendered_source_origin,
+            crate::motion::MotionFieldOrigin::CodecVectors,
+            "Faraday recipient metadata must describe its admitted donor field"
+        );
+        assert_eq!(
+            recipient_metadata.codec_product_sha256,
+            Some(products[0].codec_identity.content_sha256)
+        );
+        assert_eq!(
+            recipient_metadata.codec_provenance,
+            Some(crate::video::CodecMotionProvenance::FfmpegExportMvs)
+        );
+
+        let unavailable_inputs = export_motion_layer_plan_inputs(
+            &graph,
+            &params,
+            (0..params.len()).map(|index| (index, MotionCodecFrameFacts::default())),
+        )
+        .unwrap();
+        let unavailable_plan = m4_motion_plan(&evaluated, &graph, master, &unavailable_inputs);
+        let (mut retry_products, retry_diagnostics) = export_codec_motion_fields_from(
+            &plan,
+            &graph,
+            [(0, Some(&codec)), (1, None), (2, None)],
+        );
+        assert!(retry_diagnostics.is_empty());
+        assert!(export_codec_fields_complete(
+            &EvaluatedCompositionPlan::Advanced(Box::new(plan.clone())),
+            &retry_products
+        ));
+        let fallback_plan = EvaluatedCompositionPlan::Advanced(Box::new(unavailable_plan.clone()));
+        retain_exact_export_codec_fields(&fallback_plan, &mut retry_products);
+        assert!(retry_products.is_empty());
+        assert!(export_codec_fields_complete(
+            &fallback_plan,
+            &retry_products
+        ));
+        let unavailable_metadata = export_motion_metadata_for_frame_from(
+            &EvaluatedCompositionPlan::Advanced(Box::new(unavailable_plan)),
+            &graph,
+            [(0, None), (1, None), (2, None)],
+            [],
+            25,
+        );
+        let explicit_unavailable = unavailable_metadata
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(explicit_unavailable.field_planned);
+        assert!(!explicit_unavailable.field_attached);
+        assert_eq!(
+            explicit_unavailable.source_origin,
+            crate::motion::MotionFieldOrigin::None
+        );
+        assert_eq!(
+            explicit_unavailable.source_diagnostic,
+            crate::motion::MotionSourceDiagnostic::CodecUnavailable
+        );
 
         let (missing, missing_diagnostics) =
             export_codec_motion_fields_from(&plan, &graph, [(0, None), (1, None), (2, None)]);
@@ -7769,8 +8763,9 @@ layers:
             .iter()
             .any(|message| message.contains("lost its exact codec metadata")));
 
-        let mut malformed = codec.clone();
+        let mut malformed = m4_codec_motion_frame(11, 17);
         malformed.vectors[0].motion_scale = 0;
+        let malformed: CodecMotionProduct = malformed.into();
         let (malformed_products, malformed_diagnostics) = export_codec_motion_fields_from(
             &plan,
             &graph,
@@ -7779,9 +8774,9 @@ layers:
         assert!(malformed_products.is_empty());
         assert!(malformed_diagnostics
             .iter()
-            .any(|message| message.contains("rasterization was rejected")));
+            .any(|message| message.contains("lacks exact adjacent-reference identity")));
 
-        let stale = m4_codec_motion_frame(12, 17);
+        let stale: CodecMotionProduct = m4_codec_motion_frame(12, 17).into();
         let (stale_products, stale_diagnostics) = export_codec_motion_fields_from(
             &plan,
             &graph,
@@ -7791,6 +8786,202 @@ layers:
         assert!(stale_diagnostics
             .iter()
             .any(|message| message.contains("failed exact attachment provenance")));
+
+        let composed_facts = [
+            MotionCodecFrameFacts {
+                available: true,
+                source_generation: 11,
+                frame_ordinal: 18,
+            },
+            MotionCodecFrameFacts::default(),
+            MotionCodecFrameFacts::default(),
+        ];
+        let composed_inputs = export_motion_layer_plan_inputs(
+            &graph,
+            &params,
+            composed_facts.into_iter().enumerate(),
+        )
+        .unwrap();
+        let composed_plan = m4_motion_plan(&evaluated, &graph, master, &composed_inputs);
+        let mut sequence =
+            crate::video::CodecMotionSequence::from_frame(m4_codec_motion_frame(11, 17)).unwrap();
+        sequence
+            .push_contiguous(m4_codec_motion_frame(11, 18))
+            .unwrap();
+        let composed: CodecMotionProduct = sequence.into();
+        let (composed_products, composed_diagnostics) = export_codec_motion_fields_from(
+            &composed_plan,
+            &graph,
+            [(0, Some(&composed)), (1, None), (2, None)],
+        );
+        assert!(composed_diagnostics.is_empty());
+        assert_eq!(composed_products.len(), 1);
+        assert_eq!(composed.transition_count(), 2);
+        let composed_metadata = export_motion_metadata_for_frame_from(
+            &EvaluatedCompositionPlan::Advanced(Box::new(composed_plan.clone())),
+            &graph,
+            [(0, Some(&composed)), (1, None), (2, None)],
+            [ExportRenderedMotionField {
+                scope: composed_products[0].scope,
+                source_scope: composed_products[0].scope,
+                origin: crate::motion::MotionFieldOrigin::CodecVectors,
+                source_generation: Some(composed_products[0].source_generation),
+                frame_ordinal: Some(composed_products[0].frame_ordinal),
+                product_content_sha256: Some(composed_products[0].codec_identity.content_sha256),
+            }],
+            24,
+        );
+        assert_eq!(
+            composed_metadata
+                .scopes
+                .iter()
+                .find(|scope| matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 0,
+                        ..
+                    }
+                ))
+                .and_then(|scope| scope.codec_transition_count),
+            Some(2)
+        );
+        assert_eq!(
+            composed_metadata
+                .scopes
+                .iter()
+                .find(|scope| matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 0,
+                        ..
+                    }
+                ))
+                .and_then(|scope| scope.codec_elapsed_seconds),
+            Some(2.0 / 30.0)
+        );
+        assert!(composed_plan
+            .motion()
+            .advanced()
+            .unwrap()
+            .fields()
+            .iter()
+            .any(|field| field.accepts(composed_products[0].attachment())));
+    }
+
+    #[test]
+    fn m4_export_two_pass_mixed_codec_failure_retains_good_product_before_gpu() {
+        use crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts;
+        use crate::motion::MotionFieldOrigin;
+
+        let graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        let (master, params) = m4_motion_params(&graph);
+        let evaluated = m4_motion_evaluated_frame(&graph, 30);
+        let initial_facts = [
+            MotionCodecFrameFacts {
+                available: true,
+                source_generation: 11,
+                frame_ordinal: 17,
+            },
+            MotionCodecFrameFacts {
+                available: true,
+                source_generation: 11,
+                frame_ordinal: 17,
+            },
+            MotionCodecFrameFacts::default(),
+        ];
+        let initial_inputs =
+            export_motion_layer_plan_inputs(&graph, &params, initial_facts.into_iter().enumerate())
+                .unwrap();
+        let initial_plan = m4_motion_plan(&evaluated, &graph, master, &initial_inputs);
+        let initial = EvaluatedCompositionPlan::Advanced(Box::new(initial_plan.clone()));
+        assert_eq!(planned_export_codec_scopes(&initial).len(), 2);
+
+        let good: CodecMotionProduct = m4_codec_motion_frame(11, 17).into();
+        let mut malformed = m4_codec_motion_frame(11, 17);
+        malformed.vectors[0].motion_scale = 0;
+        let malformed: CodecMotionProduct = malformed.into();
+        let (mut products, diagnostics) = export_codec_motion_fields_from(
+            &initial_plan,
+            &graph,
+            [(0, Some(&good)), (1, Some(&malformed)), (2, None)],
+        );
+        assert_eq!(products.len(), 1);
+        assert_eq!(
+            products[0].scope,
+            crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0])
+        );
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("lacks exact adjacent-reference identity")));
+        assert!(
+            !export_codec_fields_complete(&initial, &products),
+            "the first pass must detect the missing second codec field before GPU encode"
+        );
+        let retained_digest = products[0].codec_identity.content_sha256;
+
+        // This is the immutable production retry shape: exact availability is
+        // recomputed from successfully rasterized products, the plan retries
+        // once, and the successful first-pass product is retained rather than
+        // rasterized a second time.
+        let attached = products
+            .iter()
+            .map(|product| product.scope)
+            .collect::<std::collections::BTreeSet<_>>();
+        let retry_facts = graph
+            .layer_ids
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, layer_id)| {
+                let available =
+                    attached.contains(&crate::visual_rack::VisualScopeId::Layer(layer_id));
+                MotionCodecFrameFacts {
+                    available,
+                    source_generation: if available {
+                        initial_facts[index].source_generation
+                    } else {
+                        0
+                    },
+                    frame_ordinal: if available {
+                        initial_facts[index].frame_ordinal
+                    } else {
+                        0
+                    },
+                }
+            });
+        let retry_inputs =
+            export_motion_layer_plan_inputs(&graph, &params, retry_facts.enumerate()).unwrap();
+        let retry_plan = m4_motion_plan(&evaluated, &graph, master, &retry_inputs);
+        let retry = EvaluatedCompositionPlan::Advanced(Box::new(retry_plan.clone()));
+        retain_exact_export_codec_fields(&retry, &mut products);
+
+        assert_eq!(products.len(), 1);
+        assert_eq!(products[0].codec_identity.content_sha256, retained_digest);
+        assert!(export_codec_fields_complete(&retry, &products));
+        assert_eq!(
+            planned_export_codec_scopes(&retry),
+            products
+                .iter()
+                .map(|product| product.scope)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let motion = retry_plan.motion().advanced().unwrap();
+        assert_eq!(
+            motion
+                .scope(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+                .unwrap()
+                .source
+                .origin,
+            MotionFieldOrigin::CodecVectors
+        );
+        assert_eq!(
+            motion
+                .scope(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[1]))
+                .unwrap()
+                .source
+                .origin,
+            MotionFieldOrigin::LatticeFallback
+        );
     }
 
     #[test]
@@ -7813,14 +9004,14 @@ layers:
         let output = directory.join("artifact.mp4");
         std::fs::write(&output, b"accepted-video").unwrap();
 
+        let mut export_config = config(1.0);
+        export_config.width = 64;
+        export_config.height = 32;
+        export_config.fps = 30;
+        export_config.output_path = output.to_string_lossy().into_owned();
+        export_config.shutter_samples = ExportShutterSamples::Samples16;
         let mut accumulator = ExportMotionSidecarAccumulator {
-            artifact: MotionSidecarArtifact {
-                file_name: "artifact.mp4".to_owned(),
-                width: 64,
-                height: 32,
-                fps: 30,
-                duration_seconds: 1.0,
-            },
+            artifact: MotionSidecarArtifact::from_config(&export_config),
             sources: vec![MotionSidecarSource {
                 saved_position: 0,
                 stable_id: 1,
@@ -7851,18 +9042,24 @@ layers:
             requested_source: MotionFieldSource::CodecVectors,
             lattice_quality: MotionLatticeQuality::Live,
             source_origin: MotionFieldOrigin::CodecVectors,
+            rendered_source_origin: MotionFieldOrigin::CodecVectors,
+            field_planned: true,
+            field_attached: true,
             source_diagnostic: MotionSourceDiagnostic::None,
             codec_provenance: Some(crate::video::CodecMotionProvenance::FfmpegExportMvs),
             source_generation: Some(1),
             frame_ordinal: Some(7),
+            codec_product_sha256: Some([7; 32]),
+            codec_transition_count: Some(4),
+            codec_elapsed_seconds: Some(4.0 / 30.0),
             donor_saved_position: Some(0),
             donor_stable_id: Some(1),
             carrier: MotionCarrier::FirstSourceFrame,
             transplant_admitted: true,
             shutter_active: true,
             shutter_angle_degrees: 180.0,
-            shutter_quality: CurvedShutterQuality::Draft,
-            shutter_sample_count: CurvedShutterQuality::Draft.sample_count(),
+            shutter_quality: CurvedShutterQuality::High,
+            shutter_sample_count: CurvedShutterQuality::High.sample_count(),
         };
         accumulator.observe_accepted(&ExportMotionMetadata {
             accepted_frame: Some(0),
@@ -7873,6 +9070,7 @@ layers:
         let mut same_dynamic_state = scope.clone();
         same_dynamic_state.source_generation = Some(2);
         same_dynamic_state.frame_ordinal = Some(8);
+        same_dynamic_state.codec_product_sha256 = Some([8; 32]);
         accumulator.observe_accepted(&ExportMotionMetadata {
             accepted_frame: Some(1),
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
@@ -7881,10 +9079,15 @@ layers:
         });
         let mut fallback = scope.clone();
         fallback.source_origin = MotionFieldOrigin::LatticeFallback;
+        fallback.rendered_source_origin = MotionFieldOrigin::LatticeFallback;
+        fallback.field_attached = true;
         fallback.source_diagnostic = MotionSourceDiagnostic::CodecUnavailableFallback;
         fallback.codec_provenance = None;
         fallback.source_generation = None;
         fallback.frame_ordinal = None;
+        fallback.codec_product_sha256 = None;
+        fallback.codec_transition_count = None;
+        fallback.codec_elapsed_seconds = None;
         accumulator.observe_accepted(&ExportMotionMetadata {
             accepted_frame: Some(2),
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
@@ -7917,10 +9120,36 @@ layers:
         let bytes = std::fs::read(&sidecar_path).unwrap();
         assert!(bytes.len() <= MAX_EXPORT_MOTION_SIDECAR_BYTES);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["cross_gpu_pixel_identity_guaranteed"], false);
+        assert_eq!(
+            json["artifact"]["requested_shutter_sample_policy"],
+            "samples_16"
+        );
+        assert_eq!(json["artifact"]["requested_shutter_sample_count"], 16);
+        assert_eq!(json["authored_scopes"][0]["shutter_sample_count"], 1);
         assert_eq!(json["sources"][0]["fingerprint_bytes"], 1234);
         assert_eq!(json["last_accepted_frame"]["accepted_frame"], 3);
+        assert_eq!(
+            json["last_accepted_frame"]["scopes"][0]["shutter_sample_count"],
+            16
+        );
+        assert_eq!(
+            json["last_accepted_frame"]["scopes"][0]["codec_transition_count"],
+            4
+        );
+        assert_eq!(
+            json["last_accepted_frame"]["scopes"][0]["rendered_source_origin"],
+            "codec_vectors"
+        );
+        assert_eq!(
+            json["last_accepted_frame"]["scopes"][0]["field_attached"],
+            true
+        );
+        let codec_elapsed = json["last_accepted_frame"]["scopes"][0]["codec_elapsed_seconds"]
+            .as_f64()
+            .unwrap();
+        assert!((codec_elapsed - f64::from(4.0_f32 / 30.0)).abs() < 1.0e-7);
         assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -8649,6 +9878,7 @@ layers:
                 },
                 decoder: None,
                 codec_motion: None,
+                codec_motion_predecessor: None,
                 _still_source: None,
                 texture,
                 texture_view,
@@ -9126,7 +10356,7 @@ layers:
         let EvaluatedCompositionPlan::Advanced(advanced) = &evaluated_composition else {
             return Err("active export GPU motion fixture delegated LegacyExact".to_owned());
         };
-        let codec = CodecMotionFrame {
+        let codec: CodecMotionProduct = CodecMotionFrame {
             source_dimensions: [4, 3],
             frame_delta_seconds: 1.0 / 30.0,
             source_generation: facts.source_generation,
@@ -9135,6 +10365,12 @@ layers:
             provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
             frame_type: crate::video::CodecMotionFrameType::Predictive,
             status: crate::video::CodecMotionStatus::Available,
+            past_reference_proof: Some(m4_codec_past_reference_proof(
+                facts.source_generation,
+                facts.frame_ordinal,
+                1,
+                4,
+            )),
             vectors: vec![crate::motion::CodecMotionVector {
                 destination: [2, 1],
                 block: [4, 3],
@@ -9144,7 +10380,8 @@ layers:
                 reference: crate::motion::CodecReferenceDirection::Past,
                 visibility: 1.0,
             }],
-        };
+        }
+        .into();
         let (products, diagnostics) =
             export_codec_motion_fields_from(advanced, &graph, [(0, Some(&codec))]);
         if !diagnostics.is_empty() || products.len() != 1 {
@@ -9216,6 +10453,18 @@ layers:
         if metrics.valid_fields != 1 {
             return Err(format!("export motion field did not commit: {metrics:?}"));
         }
+        if metrics.field_origin != crate::motion::MotionFieldOrigin::CodecVectors
+            || metrics.field_source_scope
+                != Some(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+            || metrics.field_source_generation != Some(facts.source_generation)
+            || metrics.field_frame_ordinal != Some(facts.frame_ordinal)
+            || metrics.field_product_content_sha256
+                != Some(products[0].codec_identity.content_sha256)
+        {
+            return Err(format!(
+                "export motion field committed mismatched provenance: {metrics:?}"
+            ));
+        }
         let pixels = readback_pixels(
             &harness.device,
             &harness.queue,
@@ -9227,6 +10476,321 @@ layers:
             &AtomicBool::new(false),
         )?;
         Ok((pixels, metrics.shutter_samples))
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; accepted export motion metadata stays offscreen"]
+    fn m4_export_runtime_metadata_tracks_prime_freeze_hold_and_codec_donor_truth() {
+        use crate::evaluated_frame::evaluated_composition::{
+            MotionCodecFrameFacts, MotionFieldAttachment,
+        };
+        use crate::motion::{
+            FaradayParams, MotionCarrier, MotionDonor, MotionFieldOrigin, MotionParams,
+        };
+        use crate::temporal::{TemporalFrameEvents, TemporalFrameInput, TemporalFreezeState};
+        use crate::visual_rack::VisualScopeId;
+
+        fn submit_motion_frame(
+            harness: &SpatialShaderHarness,
+            executor: &mut CompositionGpuExecutor,
+            plan: &EvaluatedCompositionPlan,
+            freeze: TemporalFreezeState,
+            attachments: &[MotionFieldAttachment<'_>],
+            held_scopes: &[VisualScopeId],
+        ) -> Result<Vec<ExportRenderedMotionField>, String> {
+            let mut encoder =
+                harness
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Export Motion Metadata Transaction"),
+                    });
+            executor
+                .encode_with_motion(
+                    &harness.queue,
+                    &mut encoder,
+                    plan,
+                    CompositionFrameTiming::from_temporal_input(TemporalFrameInput::new(
+                        1.0 / 30.0,
+                        freeze,
+                        false,
+                        TemporalFrameEvents::default(),
+                    )),
+                    CompositionMotionFrameInput {
+                        attachments,
+                        held_scopes,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            harness.queue.submit(std::iter::once(encoder.finish()));
+            harness
+                .device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|error| error.to_string())?;
+            executor.commit_frame_history();
+            Ok(export_rendered_motion_fields(plan, Some(executor)))
+        }
+
+        fn layer_scope(
+            metadata: &ExportMotionMetadata,
+            saved_position: u32,
+        ) -> &ExportMotionScopeMetadata {
+            metadata
+                .scopes
+                .iter()
+                .find(|scope| {
+                    matches!(
+                        scope.scope,
+                        ExportMotionScopeIdentity::Layer {
+                            saved_position: candidate,
+                            ..
+                        } if candidate == saved_position
+                    )
+                })
+                .unwrap()
+        }
+
+        fn assert_held_codec_truth(metadata: &ExportMotionMetadata, expected_digest: [u8; 32]) {
+            let codec = layer_scope(metadata, 1);
+            assert!(codec.field_attached);
+            assert_eq!(
+                codec.rendered_source_origin,
+                MotionFieldOrigin::CodecVectors
+            );
+            assert_eq!(codec.source_generation, Some(11));
+            assert_eq!(codec.frame_ordinal, Some(17));
+            assert_eq!(codec.codec_product_sha256, Some(expected_digest));
+            assert_eq!(
+                codec.codec_provenance,
+                Some(crate::video::CodecMotionProvenance::FfmpegExportMvs)
+            );
+
+            let recipient = layer_scope(metadata, 2);
+            assert!(recipient.field_attached);
+            assert_eq!(
+                recipient.rendered_source_origin,
+                MotionFieldOrigin::CodecVectors
+            );
+            assert_eq!(recipient.source_generation, Some(11));
+            assert_eq!(recipient.frame_ordinal, Some(17));
+            assert_eq!(recipient.codec_product_sha256, Some(expected_digest));
+            assert_eq!(recipient.donor_saved_position, Some(1));
+            assert_eq!(
+                recipient.codec_provenance,
+                Some(crate::video::CodecMotionProvenance::FfmpegExportMvs)
+            );
+        }
+
+        let harness = SpatialShaderHarness::new(64, 32).unwrap();
+        let mut graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        graph.composition = crate::composition::RuntimeComposition::try_from_parts(
+            Vec::new(),
+            graph
+                .layer_ids
+                .iter()
+                .copied()
+                .map(|layer_id| crate::composition::RuntimeRootItem::Layer {
+                    layer_id,
+                    bus: crate::composition::BusAssignment::Program,
+                })
+                .collect(),
+            None,
+            0.5,
+        )
+        .unwrap();
+        let (master, mut params) = m4_motion_params(&graph);
+        let codec_params = params[0];
+        let auto_params = params[1];
+        params[0] = auto_params;
+        params[1] = codec_params;
+        params[2] = MotionParams {
+            transplant: FaradayParams {
+                amount: 0.75,
+                donor: MotionDonor::Selected {
+                    layer_id: graph.layer_ids[1],
+                    saved_position: SavedLayerPosition::new(1).unwrap(),
+                },
+                carrier: MotionCarrier::FirstSourceFrame,
+                ..FaradayParams::default()
+            },
+            ..MotionParams::default()
+        };
+        let evaluated = m4_motion_evaluated_frame(&graph, 30);
+        let facts = [
+            MotionCodecFrameFacts::default(),
+            MotionCodecFrameFacts {
+                available: true,
+                source_generation: 11,
+                frame_ordinal: 17,
+            },
+            MotionCodecFrameFacts::default(),
+        ];
+        let inputs =
+            export_motion_layer_plan_inputs(&graph, &params, facts.into_iter().enumerate())
+                .unwrap();
+        let advanced = m4_motion_plan(&evaluated, &graph, master, &inputs);
+        let plan = EvaluatedCompositionPlan::Advanced(Box::new(advanced.clone()));
+
+        let codec: CodecMotionProduct = m4_codec_motion_frame(11, 17).into();
+        let (products, diagnostics) = export_codec_motion_fields_from(
+            &advanced,
+            &graph,
+            [(0, None), (1, Some(&codec)), (2, None)],
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(products.len(), 1);
+        let accepted_digest = products[0].codec_identity.content_sha256;
+        let attachments = products
+            .iter()
+            .map(ExportMotionFieldProduct::attachment)
+            .collect::<Vec<_>>();
+
+        let mut changed_frame = m4_codec_motion_frame(11, 17);
+        changed_frame.vectors[0].motion[0] = -8;
+        let changed_codec: CodecMotionProduct = changed_frame.into();
+        let (changed_products, changed_diagnostics) = export_codec_motion_fields_from(
+            &advanced,
+            &graph,
+            [(0, None), (1, Some(&changed_codec)), (2, None)],
+        );
+        assert!(changed_diagnostics.is_empty(), "{changed_diagnostics:?}");
+        assert_eq!(changed_products.len(), 1);
+        assert_ne!(
+            changed_products[0].codec_identity.content_sha256,
+            accepted_digest
+        );
+        let changed_attachments = changed_products
+            .iter()
+            .map(ExportMotionFieldProduct::attachment)
+            .collect::<Vec<_>>();
+
+        let sources = graph
+            .layer_ids
+            .iter()
+            .copied()
+            .map(|layer_id| {
+                CompositionSourceDescriptor::new(layer_id, &harness.source_view, [64, 32])
+            })
+            .collect::<Vec<_>>();
+        let mut executor =
+            CompositionGpuExecutor::new(&harness.device, &harness.queue, [64, 32]).unwrap();
+        executor
+            .prepare(&harness.device, &harness.queue, &plan, &sources)
+            .unwrap();
+
+        let frozen_empty = submit_motion_frame(
+            &harness,
+            &mut executor,
+            &plan,
+            TemporalFreezeState::ProgramFrozen,
+            &attachments,
+            &[],
+        )
+        .unwrap();
+        assert!(frozen_empty.is_empty());
+        let frozen_empty_metadata = export_motion_metadata_for_frame_from(
+            &plan,
+            &graph,
+            [(0, None), (1, Some(&codec)), (2, None)],
+            frozen_empty,
+            0,
+        );
+        let unprimed_codec = layer_scope(&frozen_empty_metadata, 1);
+        assert!(unprimed_codec.field_planned);
+        assert!(!unprimed_codec.field_attached);
+        assert_eq!(unprimed_codec.codec_provenance, None);
+        assert_eq!(unprimed_codec.codec_product_sha256, None);
+
+        let first_running = submit_motion_frame(
+            &harness,
+            &mut executor,
+            &plan,
+            TemporalFreezeState::Running,
+            &attachments,
+            &[],
+        )
+        .unwrap();
+        let first_metadata = export_motion_metadata_for_frame_from(
+            &plan,
+            &graph,
+            [(0, None), (1, Some(&codec)), (2, None)],
+            first_running,
+            1,
+        );
+        assert_held_codec_truth(&first_metadata, accepted_digest);
+        let priming_lattice = layer_scope(&first_metadata, 0);
+        assert!(priming_lattice.field_planned);
+        assert!(!priming_lattice.field_attached);
+        assert_eq!(
+            priming_lattice.rendered_source_origin,
+            MotionFieldOrigin::None
+        );
+
+        let second_running = submit_motion_frame(
+            &harness,
+            &mut executor,
+            &plan,
+            TemporalFreezeState::Running,
+            &attachments,
+            &[],
+        )
+        .unwrap();
+        let second_metadata = export_motion_metadata_for_frame_from(
+            &plan,
+            &graph,
+            [(0, None), (1, Some(&codec)), (2, None)],
+            second_running,
+            2,
+        );
+        assert_held_codec_truth(&second_metadata, accepted_digest);
+        let published_lattice = layer_scope(&second_metadata, 0);
+        assert!(published_lattice.field_attached);
+        assert_eq!(
+            published_lattice.rendered_source_origin,
+            MotionFieldOrigin::LatticeFallback
+        );
+        assert_eq!(published_lattice.codec_provenance, None);
+
+        for (frame_num, freeze) in [
+            (3, TemporalFreezeState::ProgramFrozen),
+            (4, TemporalFreezeState::MediaFrozen),
+        ] {
+            let frozen = submit_motion_frame(
+                &harness,
+                &mut executor,
+                &plan,
+                freeze,
+                &changed_attachments,
+                &[],
+            )
+            .unwrap();
+            let metadata = export_motion_metadata_for_frame_from(
+                &plan,
+                &graph,
+                [(0, None), (1, Some(&codec)), (2, None)],
+                frozen,
+                frame_num,
+            );
+            assert_held_codec_truth(&metadata, accepted_digest);
+        }
+
+        let held_scope = [VisualScopeId::Layer(graph.layer_ids[1])];
+        let held = submit_motion_frame(
+            &harness,
+            &mut executor,
+            &plan,
+            TemporalFreezeState::Running,
+            &changed_attachments,
+            &held_scope,
+        )
+        .unwrap();
+        let held_metadata = export_motion_metadata_for_frame_from(
+            &plan,
+            &graph,
+            [(0, None), (1, Some(&codec)), (2, None)],
+            held,
+            5,
+        );
+        assert_held_codec_truth(&held_metadata, accepted_digest);
     }
 
     #[test]
@@ -9253,17 +10817,21 @@ layers:
         assert_ne!(one, two);
         assert_ne!(two, four);
 
-        for (quality, expected) in [
-            (CurvedShutterQuality::Sharp, 1),
-            (CurvedShutterQuality::Draft, 4),
-            (CurvedShutterQuality::Live, 8),
-            (CurvedShutterQuality::High, 16),
+        for (policy, expected) in [
+            (ExportShutterSamples::Samples1, 1),
+            (ExportShutterSamples::Samples4, 4),
+            (ExportShutterSamples::Samples8, 8),
+            (ExportShutterSamples::Samples16, 16),
         ] {
+            let quality = policy
+                .quality_override()
+                .expect("explicit export sample policy has a fixed tier");
             let (first, samples) = m4_gpu_export_motion_velocity(&harness, 2, quality).unwrap();
             let replay = m4_gpu_export_motion_velocity(&harness, 2, quality)
                 .unwrap()
                 .0;
             assert_eq!(samples, expected);
+            assert_eq!(policy.requested_count(), Some(samples));
             // Same-adapter deterministic replay only. The durable report is
             // explicit that cross-GPU pixel identity is not guaranteed.
             assert_eq!(first, replay);
@@ -11670,6 +13238,37 @@ layers:
     }
 
     #[test]
+    fn recorded_manual_temporal_events_replay_on_one_reference_timeline() {
+        let mut track = crate::temporal::TemporalEventTrack::default();
+        assert!(track.record_accepted(
+            700,
+            crate::temporal::TemporalFrameEvents {
+                manual_events: 2,
+                ..crate::temporal::TemporalFrameEvents::default()
+            }
+        ));
+        assert!(track.record_accepted(
+            730,
+            crate::temporal::TemporalFrameEvents {
+                garden_refresh_events: 3,
+                ..crate::temporal::TemporalFrameEvents::default()
+            }
+        ));
+        for fps in [24, 30, 60] {
+            let mut replay = track.replay();
+            let first = replay.events_due(export_temporal_reference_tick(0, fps));
+            assert_eq!(first.manual_events, 2, "{fps} fps");
+            let one_second = replay.events_due(export_temporal_reference_tick(fps.into(), fps));
+            assert_eq!(one_second.garden_refresh_events, 3, "{fps} fps");
+            assert_eq!(
+                replay.events_due(export_temporal_reference_tick((fps * 2).into(), fps)),
+                crate::temporal::TemporalFrameEvents::default(),
+                "{fps} fps"
+            );
+        }
+    }
+
+    #[test]
     fn master_pause_does_not_initialize_transient_modulation_only_offline() {
         use crate::modulation::{ModMatrix, ModSource, Routing};
 
@@ -12225,7 +13824,9 @@ layers:
             layer_source_hints: Vec::new(),
             analysis_audio_path_hint: None,
             ntsc_quality: NtscExportQuality::LiveParity,
+            shutter_samples: ExportShutterSamples::Authored,
             media_safety_policy: MediaSafetyPolicy::default(),
+            temporal_event_track: crate::temporal::TemporalEventTrack::default(),
         };
         let mut job = ExportJob::start(patch, config, "videos");
 
@@ -12333,7 +13934,9 @@ mod effects_audit {
             layer_source_hints: Vec::new(),
             analysis_audio_path_hint: None,
             ntsc_quality: NtscExportQuality::LiveParity,
+            shutter_samples: ExportShutterSamples::Authored,
             media_safety_policy: MediaSafetyPolicy::default(),
+            temporal_event_track: crate::temporal::TemporalEventTrack::default(),
         };
         let job = ExportJob::start(patch, config, "videos");
         while !job.is_done() {

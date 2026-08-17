@@ -25,11 +25,13 @@ pub(crate) const MOTION_VECTOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat
 pub(crate) const MOTION_GATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg8Unorm;
 pub(crate) const MOTION_LUMA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 pub(crate) const MOTION_CARRIER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(crate) const MOTION_GARDEN_SIGNAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MotionGpuFieldSpec {
     pub grid: MotionGrid,
     pub requires_luma: bool,
+    pub required_as_garden_signal: bool,
 }
 
 pub(crate) struct MotionGpuFieldSource<'a> {
@@ -73,6 +75,14 @@ pub(crate) struct MotionRuntimeMetrics {
     pub persistent_carriers: u32,
     pub valid_fields: u32,
     pub valid_luma_fields: u32,
+    /// Exact field currently committed in the rendered slot for this scope.
+    /// A Faraday recipient reports its admitted donor field, not its own
+    /// authored source decision. Invalid/unprimed fields report `None`.
+    pub field_origin: MotionFieldOrigin,
+    pub field_source_scope: Option<VisualScopeId>,
+    pub field_source_generation: Option<u64>,
+    pub field_frame_ordinal: Option<u64>,
+    pub field_product_content_sha256: Option<[u8; 32]>,
     pub carrier_valid: bool,
     pub frame_staged: bool,
     pub committed_carrier_index: u8,
@@ -201,7 +211,42 @@ struct MotionGpuField {
     gate_upload: Vec<u8>,
     memory: MotionMemoryState,
     frame_stage: Option<MotionMemoryStage>,
+    committed_field: Option<MotionAcceptedField>,
+    /// Outer `Option` means a Program frame was staged; the inner value is
+    /// the exact field identity that will become resident on commit.
+    staged_field: Option<Option<MotionAcceptedField>>,
     bindings: Option<MotionFieldBindings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MotionAcceptedField {
+    origin: MotionFieldOrigin,
+    source_scope: VisualScopeId,
+    source_generation: Option<u64>,
+    frame_ordinal: Option<u64>,
+    product_content_sha256: Option<[u8; 32]>,
+}
+
+impl MotionAcceptedField {
+    fn codec(attachment: MotionFieldAttachment<'_>) -> Self {
+        Self {
+            origin: MotionFieldOrigin::CodecVectors,
+            source_scope: attachment.scope,
+            source_generation: Some(attachment.source_generation),
+            frame_ordinal: Some(attachment.frame_ordinal),
+            product_content_sha256: Some(attachment.product_content_sha256),
+        }
+    }
+
+    const fn lattice(origin: MotionFieldOrigin, source_scope: VisualScopeId) -> Self {
+        Self {
+            origin,
+            source_scope,
+            source_generation: None,
+            frame_ordinal: None,
+            product_content_sha256: None,
+        }
+    }
 }
 
 struct MotionFieldBindings {
@@ -296,7 +341,8 @@ impl MotionGpuField {
         let dimensions = [spec.grid.width, spec.grid.height];
         let field_usage = wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::COPY_DST;
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC;
         let vectors = std::array::from_fn(|_| {
             MotionTexture::new(
                 device,
@@ -335,6 +381,8 @@ impl MotionGpuField {
             gate_upload: vec![0; gate_len],
             memory: MotionMemoryState::default(),
             frame_stage: None,
+            committed_field: None,
+            staged_field: None,
             bindings: None,
         })
     }
@@ -388,6 +436,9 @@ impl MotionGpuField {
 pub(crate) struct MotionGpuResources {
     fields: Vec<MotionGpuField>,
     carriers: Option<[MotionTexture; 2]>,
+    garden_signal: Option<MotionTexture>,
+    garden_signal_bindings: Option<[wgpu::BindGroup; 2]>,
+    garden_signal_field_slot: Option<u8>,
     output_dimensions: [u32; 2],
     #[allow(dead_code, reason = "read by resource and telemetry snapshot seams")]
     plan: MotionResourcePlan,
@@ -406,9 +457,11 @@ struct MotionPipelines {
     lattice: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     refresh: wgpu::RenderPipeline,
+    garden_signal: wgpu::RenderPipeline,
     luma_layout: wgpu::BindGroupLayout,
     lattice_layout: wgpu::BindGroupLayout,
     image_layout: wgpu::BindGroupLayout,
+    garden_signal_layout: wgpu::BindGroupLayout,
     linear_sampler: wgpu::Sampler,
     nearest_sampler: wgpu::Sampler,
 }
@@ -442,7 +495,7 @@ impl MotionPipelines {
             entries: &[
                 sampled_texture_entry(0),
                 sampled_texture_entry(1),
-                nonfiltering_sampler_entry(2),
+                filtering_sampler_entry(2),
                 uniform_entry(3),
             ],
         });
@@ -457,6 +510,15 @@ impl MotionPipelines {
                 uniform_entry(5),
             ],
         });
+        let garden_signal_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Motion Garden signal BGL"),
+                entries: &[
+                    sampled_texture_entry(0),
+                    sampled_texture_entry(1),
+                    nonfiltering_sampler_entry(2),
+                ],
+            });
         let luma_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Motion luma shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_luma.wgsl").into()),
@@ -472,6 +534,12 @@ impl MotionPipelines {
         let refresh_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Motion refresh shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_refresh.wgsl").into()),
+        });
+        let garden_signal_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Motion Garden signal shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/motion_garden_signal.wgsl").into(),
+            ),
         });
         let luma = create_motion_pipeline(
             device,
@@ -501,14 +569,23 @@ impl MotionPipelines {
             &refresh_module,
             &[MOTION_CARRIER_FORMAT],
         );
+        let garden_signal = create_motion_pipeline(
+            device,
+            "Motion Garden signal pipeline",
+            &garden_signal_layout,
+            &garden_signal_module,
+            &[MOTION_GARDEN_SIGNAL_FORMAT],
+        );
         Self {
             luma,
             lattice,
             apply,
             refresh,
+            garden_signal,
             luma_layout,
             lattice_layout,
             image_layout,
+            garden_signal_layout,
             linear_sampler,
             nearest_sampler,
         }
@@ -630,6 +707,22 @@ impl MotionGpuResources {
                 plan.persistent_carriers,
             ));
         }
+        let garden_signal_slots = field_specs
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, spec)| spec.required_as_garden_signal.then_some(slot))
+            .collect::<Vec<_>>();
+        if u32::try_from(garden_signal_slots.len()).ok() != Some(plan.active_garden_signals)
+            || plan.active_garden_signals > 1
+        {
+            return Err(MotionGpuError::ResourcePlanMismatch);
+        }
+        let expected_garden_signal_bytes = garden_signal_slots
+            .first()
+            .map_or(0, |slot| field_specs[*slot].grid.vector_count);
+        if expected_garden_signal_bytes != plan.garden_signal_bytes {
+            return Err(MotionGpuError::ResourcePlanMismatch);
+        }
         let (vector_bytes, gate_bytes, luma_bytes) = field_specs
             .iter()
             .try_fold((0_u64, 0_u64, 0_u64), |(vectors, gates, luma), spec| {
@@ -681,9 +774,52 @@ impl MotionGpuResources {
             })
         });
         let pipelines = MotionPipelines::new(device);
+        let garden_signal_field_slot = garden_signal_slots
+            .first()
+            .copied()
+            .map(|slot| u8::try_from(slot).map_err(|_| MotionGpuError::ArithmeticOverflow))
+            .transpose()?;
+        let garden_signal = garden_signal_field_slot.map(|slot| {
+            let grid = fields[usize::from(slot)].spec.grid;
+            MotionTexture::new(
+                device,
+                "Motion routed Garden signal R8",
+                [grid.width, grid.height],
+                MOTION_GARDEN_SIGNAL_FORMAT,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            )
+        });
+        let garden_signal_bindings = garden_signal_field_slot.map(|slot| {
+            let field = &fields[usize::from(slot)];
+            std::array::from_fn(|parity| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Motion prepared routed Garden signal BG"),
+                    layout: &pipelines.garden_signal_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                &field.vectors[parity].view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&field.gates[parity].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&pipelines.nearest_sampler),
+                        },
+                    ],
+                })
+            })
+        });
         Ok(Some(Self {
             fields,
             carriers,
+            garden_signal,
+            garden_signal_bindings,
+            garden_signal_field_slot,
             output_dimensions,
             plan,
             pipelines,
@@ -706,6 +842,47 @@ impl MotionGpuResources {
     )]
     pub(crate) fn plan(&self) -> MotionResourcePlan {
         self.plan
+    }
+
+    pub(crate) fn garden_signal_view(&self) -> Option<&wgpu::TextureView> {
+        self.garden_signal.as_ref().map(|signal| &signal.view)
+    }
+
+    /// Materialize the routed scalar from the same staged field parity used by
+    /// motion rendering. An unavailable first lattice observation is an honest
+    /// closed (zero) signal, never an unrelated fallback.
+    pub(crate) fn encode_garden_signal(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), MotionGpuError> {
+        let (Some(slot), Some(signal), Some(bindings)) = (
+            self.garden_signal_field_slot,
+            &self.garden_signal,
+            &self.garden_signal_bindings,
+        ) else {
+            return Ok(());
+        };
+        if !self.program_advances {
+            return Ok(());
+        }
+        let field = self
+            .fields
+            .get(usize::from(slot))
+            .ok_or(MotionGpuError::FieldIndex(usize::from(slot)))?;
+        let stage = field.frame_stage.ok_or(MotionGpuError::FrameNotStaged)?;
+        if !stage.render_field_valid {
+            clear_target(encoder, &signal.view, wgpu::Color::TRANSPARENT);
+            return Ok(());
+        }
+        encode_single_target_pass(
+            encoder,
+            "Motion routed Garden signal",
+            &self.pipelines.garden_signal,
+            &bindings[usize::from(stage.render_field_index)],
+            &signal.view,
+            None,
+        );
+        Ok(())
     }
 
     /// Builds every source/field/carrier bind group once. Warm frames only
@@ -792,7 +969,7 @@ impl MotionGpuResources {
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: wgpu::BindingResource::Sampler(
-                                &self.pipelines.nearest_sampler,
+                                &self.pipelines.linear_sampler,
                             ),
                         },
                         wgpu::BindGroupEntry {
@@ -901,7 +1078,10 @@ impl MotionGpuResources {
         temporal: TemporalFrameInput,
         input: MotionFrameInput<'_>,
     ) -> Result<(), MotionGpuError> {
-        if self.fields.iter().any(|field| field.frame_stage.is_some())
+        if self
+            .fields
+            .iter()
+            .any(|field| field.frame_stage.is_some() || field.staged_field.is_some())
             || self.carrier_stage.is_some()
             || self
                 .scopes
@@ -910,7 +1090,11 @@ impl MotionGpuResources {
         {
             return Err(MotionGpuError::FrameAlreadyStaged);
         }
-        if self.scopes.is_empty() && !plan.scopes().is_empty() {
+        let needs_scope_bindings = plan.scopes().iter().any(|scope| {
+            !scope.params.is_exact_zero()
+                && (scope.transplant_admitted || scope.field_slot.is_some())
+        });
+        if self.scopes.is_empty() && needs_scope_bindings {
             return Err(MotionGpuError::BindingsNotPrepared);
         }
         self.runtime_diagnostics.clear();
@@ -973,7 +1157,19 @@ impl MotionGpuResources {
                     field.upload_field(queue, attachment.field, stage.write_field_index)?;
                 }
             }
+            let mut staged_field = field.committed_field;
+            if self.program_advances && acquisition_advances {
+                if let Some(attachment) = accepted_attachment {
+                    staged_field = Some(MotionAcceptedField::codec(attachment));
+                } else if lattice && stage.update_lattice && stage.render_field_valid {
+                    staged_field = Some(MotionAcceptedField::lattice(
+                        field_plan.source.origin,
+                        field_plan.scope,
+                    ));
+                }
+            }
             field.frame_stage = self.program_advances.then_some(stage);
+            field.staged_field = self.program_advances.then_some(staged_field);
         }
         for attachment in input.attachments.iter().copied() {
             if !plan
@@ -1096,7 +1292,7 @@ impl MotionGpuResources {
                     } else {
                         shutter.quality.sample_count()
                     }),
-                    u32::from(scope.transplant_admitted),
+                    0,
                     u32::from(field_valid),
                 ],
                 spatial_samples: spatial_samples.unwrap_or_else(identity_spatial_samples),
@@ -1336,6 +1532,9 @@ impl MotionGpuResources {
         for field in &mut self.fields {
             if field.frame_stage.take().is_some() {
                 field.memory.commit();
+                if let Some(accepted) = field.staged_field.take() {
+                    field.committed_field = accepted;
+                }
             }
         }
         if self.carrier_stage.take().is_some() {
@@ -1353,6 +1552,7 @@ impl MotionGpuResources {
     pub(crate) fn discard_frame(&mut self) {
         for field in &mut self.fields {
             field.frame_stage = None;
+            field.staged_field = None;
             field.memory.discard();
         }
         self.carrier_stage = None;
@@ -1389,6 +1589,10 @@ impl MotionGpuResources {
         let field_state = field_slot
             .and_then(|slot| self.fields.get(usize::from(slot)))
             .map(|field| field.memory.metrics());
+        let accepted_field = field_slot
+            .and_then(|slot| self.fields.get(usize::from(slot)))
+            .and_then(|field| field.committed_field)
+            .filter(|_| field_state.is_some_and(|state| state.field_valid));
         let uses_carrier = scope_bindings.is_some_and(|bindings| bindings.uses_carrier);
         let carrier = self.carrier_memory.metrics();
         let mut metrics = MotionRuntimeMetrics {
@@ -1397,6 +1601,12 @@ impl MotionGpuResources {
             persistent_carriers: u32::from(uses_carrier),
             valid_fields: u32::from(field_state.is_some_and(|state| state.field_valid)),
             valid_luma_fields: u32::from(field_state.is_some_and(|state| state.luma_valid)),
+            field_origin: accepted_field.map_or(MotionFieldOrigin::None, |field| field.origin),
+            field_source_scope: accepted_field.map(|field| field.source_scope),
+            field_source_generation: accepted_field.and_then(|field| field.source_generation),
+            field_frame_ordinal: accepted_field.and_then(|field| field.frame_ordinal),
+            field_product_content_sha256: accepted_field
+                .and_then(|field| field.product_content_sha256),
             carrier_valid: uses_carrier && carrier.carrier_valid,
             frame_staged: field_state.is_some_and(|state| state.frame_staged)
                 || (uses_carrier && carrier.frame_staged),
@@ -1436,6 +1646,8 @@ impl MotionGpuResources {
         for field in &mut self.fields {
             field.memory.reset();
             field.frame_stage = None;
+            field.committed_field = None;
+            field.staged_field = None;
         }
         self.carrier_memory.reset();
         self.carrier_stage = None;
@@ -2229,9 +2441,10 @@ mod tests {
     use super::*;
     use crate::{
         motion::{
-            CurvedShutterParams, MotionDeviceLimits, MotionField, MotionFieldOrigin, MotionGrid,
-            MotionLatticeQuality, MotionParams, MotionResourcePlan, MotionScopeResourceRequest,
-            MotionVectorSample, MOTION_FIELD_MAX_BYTES,
+            deterministic_motion_lattice, CurvedShutterParams, LumaPlane, MotionDeviceLimits,
+            MotionField, MotionFieldOrigin, MotionGrid, MotionLatticeQuality, MotionParams,
+            MotionResourcePlan, MotionScopeResourceRequest, MotionVectorSample,
+            MOTION_FIELD_MAX_BYTES,
         },
         spatial::SpatialTransform,
     };
@@ -2256,6 +2469,7 @@ mod tests {
                 is_master: true,
                 codec_vectors_available: false,
                 required_as_donor: false,
+                required_as_garden_signal: false,
             }],
             MotionDeviceLimits::new(8_192, u64::MAX),
         )
@@ -2585,6 +2799,8 @@ mod tests {
         let apply = include_str!("../shaders/motion_apply.wgsl");
         let refresh = include_str!("../shaders/motion_refresh.wgsl");
         let luma = include_str!("../shaders/motion_luma.wgsl");
+        let lattice = include_str!("../shaders/motion_lattice.wgsl");
+        let garden_signal = include_str!("../shaders/motion_garden_signal.wgsl");
         assert_eq!(apply.matches("textureLoad(carrier_texture").count(), 4);
         assert!(apply.contains("sample.rgb * clamp(sample.a"));
         assert!(apply.contains("straight_from_premultiplied_filter(accumulated"));
@@ -2595,6 +2811,502 @@ mod tests {
         );
         assert_eq!(luma.matches("textureLoad(source_texture").count(), 4);
         assert!(luma.contains("return dot(covered.rgb"));
+        let zero_first = lattice.find("var best_offset = vec2<i32>(0)").unwrap();
+        let ring_search = lattice.find("for (var ring = 1").unwrap();
+        assert!(zero_first < ring_search);
+        assert!(lattice.contains("if (cost < best_cost)"));
+        assert!(!lattice.contains("if (cost <= best_cost)"));
+        assert!(lattice.contains("let displaced = uv - vec2<f32>(offset) / source_dimensions"));
+        assert!(garden_signal.contains("length(velocity) * gate.x * gate.y"));
+        assert!(garden_signal.contains("@group(0) @binding(0) var vectors"));
+        assert!(garden_signal.contains("@group(0) @binding(1) var gates"));
+        assert!(!garden_signal.contains("@binding(3)"));
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct MotionWarmAllocationFingerprint {
+        plan: MotionResourcePlan,
+        field_count: usize,
+        field_capacity: usize,
+        vector_upload: (usize, usize, usize),
+        gate_upload: (usize, usize, usize),
+        vector_textures: [usize; 2],
+        gate_textures: [usize; 2],
+        luma_textures: [usize; 2],
+        bindings: usize,
+    }
+
+    struct MotionLatticeGpuHarness {
+        resources: MotionGpuResources,
+        source: MotionTexture,
+        dimensions: [u32; 2],
+        grid: MotionGrid,
+    }
+
+    impl MotionLatticeGpuHarness {
+        fn new(device: &wgpu::Device, queue: &wgpu::Queue, dimensions: [u32; 2]) -> Self {
+            let quality = MotionLatticeQuality::High;
+            let params = MotionParams {
+                lattice_quality: quality,
+                shutter: CurvedShutterParams {
+                    angle_degrees: 1.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let plan = MotionResourcePlan::preflight(
+                &[MotionScopeResourceRequest {
+                    source_dimensions: dimensions,
+                    output_dimensions: dimensions,
+                    params,
+                    is_master: true,
+                    codec_vectors_available: false,
+                    required_as_donor: false,
+                    required_as_garden_signal: false,
+                }],
+                MotionDeviceLimits::new(device.limits().max_texture_dimension_2d, u64::MAX),
+            )
+            .unwrap();
+            let grid = MotionGrid::for_source(dimensions, quality).unwrap();
+            let mut resources = MotionGpuResources::prepare(
+                device,
+                plan,
+                &[MotionGpuFieldSpec {
+                    grid,
+                    requires_luma: true,
+                    required_as_garden_signal: false,
+                }],
+                dimensions,
+            )
+            .unwrap()
+            .unwrap();
+            let source = MotionTexture::new(
+                device,
+                "Motion lattice canonical source fixture",
+                dimensions,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            );
+            let uniform = fixed_uniform_buffer(
+                device,
+                queue,
+                "Motion lattice canonical fixture uniform",
+                &LatticeGpuUniforms {
+                    field_size: [grid.width, grid.height],
+                    source_size: dimensions,
+                    search_radius: quality.search_radius() as u32,
+                    update_hz: quality.update_hz(),
+                    algorithm_version: u32::from(MOTION_ALGORITHM_VERSION),
+                    _reserved: 0,
+                },
+            );
+            let field = &mut resources.fields[0];
+            let luma = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Motion lattice canonical fixture luma BG"),
+                layout: &resources.pipelines.luma_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&source.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(
+                            &resources.pipelines.linear_sampler,
+                        ),
+                    },
+                ],
+            });
+            let luma_views = field.luma.as_ref().unwrap();
+            let lattice = std::array::from_fn(|read_index| {
+                let write_index = 1 - read_index;
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Motion lattice canonical fixture parity BG"),
+                    layout: &resources.pipelines.lattice_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                &luma_views[write_index].view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &luma_views[read_index].view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(
+                                &resources.pipelines.linear_sampler,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: uniform.as_entire_binding(),
+                        },
+                    ],
+                })
+            });
+            field.bindings = Some(MotionFieldBindings { luma, lattice });
+            Self {
+                resources,
+                source,
+                dimensions,
+                grid,
+            }
+        }
+
+        fn allocation_fingerprint(&self) -> MotionWarmAllocationFingerprint {
+            let field = &self.resources.fields[0];
+            let luma = field.luma.as_ref().unwrap();
+            MotionWarmAllocationFingerprint {
+                plan: self.resources.plan(),
+                field_count: self.resources.fields.len(),
+                field_capacity: self.resources.fields.capacity(),
+                vector_upload: (
+                    field.vector_upload.as_ptr() as usize,
+                    field.vector_upload.len(),
+                    field.vector_upload.capacity(),
+                ),
+                gate_upload: (
+                    field.gate_upload.as_ptr() as usize,
+                    field.gate_upload.len(),
+                    field.gate_upload.capacity(),
+                ),
+                vector_textures: std::array::from_fn(|index| {
+                    std::ptr::from_ref(&field.vectors[index].texture) as usize
+                }),
+                gate_textures: std::array::from_fn(|index| {
+                    std::ptr::from_ref(&field.gates[index].texture) as usize
+                }),
+                luma_textures: std::array::from_fn(|index| {
+                    std::ptr::from_ref(&luma[index].texture) as usize
+                }),
+                bindings: std::ptr::from_ref(field.bindings.as_ref().unwrap()) as usize,
+            }
+        }
+
+        fn write_source(&self, queue: &wgpu::Queue, luma: &[u8]) {
+            assert_eq!(
+                luma.len(),
+                (self.dimensions[0] * self.dimensions[1]) as usize
+            );
+            let rgba = luma
+                .iter()
+                .flat_map(|value| [*value, *value, *value, 255])
+                .collect::<Vec<_>>();
+            queue.write_texture(
+                self.source.texture.as_image_copy(),
+                &rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(self.dimensions[0] * 4),
+                    rows_per_image: Some(self.dimensions[1]),
+                },
+                wgpu::Extent3d {
+                    width: self.dimensions[0],
+                    height: self.dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        fn encode_observation(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            source: &[u8],
+        ) {
+            self.write_source(queue, source);
+            let field = &mut self.resources.fields[0];
+            let stage = field.memory.stage(
+                1.0 / MotionLatticeQuality::High.update_hz() as f32,
+                MotionLatticeQuality::High.update_hz(),
+                true,
+                true,
+                true,
+                false,
+                false,
+            );
+            assert!(stage.update_lattice);
+            field.frame_stage = Some(stage);
+            let bindings = field.bindings.as_ref().unwrap();
+            let luma = field.luma.as_ref().unwrap();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Motion lattice canonical fixture encoder"),
+            });
+            encode_single_target_pass(
+                &mut encoder,
+                "Motion lattice canonical fixture luma",
+                &self.resources.pipelines.luma,
+                &bindings.luma,
+                &luma[usize::from(stage.write_luma_index)].view,
+                None,
+            );
+            if stage.luma_read_valid {
+                encode_lattice_pass(
+                    &mut encoder,
+                    &self.resources.pipelines.lattice,
+                    &bindings.lattice[usize::from(stage.read_luma_index)],
+                    &field.vectors[usize::from(stage.write_field_index)].view,
+                    &field.gates[usize::from(stage.write_field_index)].view,
+                );
+            }
+            queue.submit(Some(encoder.finish()));
+            self.resources.commit_frame();
+        }
+
+        fn run_fixture(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            previous: &[u8],
+            current: &[u8],
+        ) -> Vec<u8> {
+            self.resources.reset();
+            self.encode_observation(device, queue, previous);
+            self.encode_observation(device, queue, current);
+            let metrics = self.resources.fields[0].memory.metrics();
+            assert!(metrics.field_valid);
+            read_motion_vectors(
+                device,
+                queue,
+                &self.resources.fields[0].vectors[usize::from(metrics.committed_field_index)]
+                    .texture,
+                self.grid,
+            )
+        }
+    }
+
+    fn read_motion_vectors(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        grid: MotionGrid,
+    ) -> Vec<u8> {
+        let compact_row_bytes = grid.width * 4;
+        let padded_row_bytes = compact_row_bytes.next_multiple_of(256);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Motion lattice canonical vector readback"),
+            size: u64::from(padded_row_bytes) * u64::from(grid.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Motion lattice canonical vector readback encoder"),
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row_bytes),
+                    rows_per_image: Some(grid.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: grid.width,
+                height: grid.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (send, receive) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = send.send(result);
+        });
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("motion lattice vector readback wait");
+        receive.recv().expect("map callback").expect("map result");
+        let mapped = slice.get_mapped_range();
+        let compact_row_bytes = compact_row_bytes as usize;
+        let padded_row_bytes = padded_row_bytes as usize;
+        let mut compact = Vec::with_capacity(compact_row_bytes * grid.height as usize);
+        for row in mapped.chunks_exact(padded_row_bytes) {
+            compact.extend_from_slice(&row[..compact_row_bytes]);
+        }
+        drop(mapped);
+        buffer.unmap();
+        compact
+    }
+
+    fn canonical_luma_fixture(width: u32, height: u32) -> Vec<u8> {
+        (0..width * height)
+            .map(|index| {
+                let x = (index % width) as f32;
+                let y = (index / width) as f32;
+                let signal = 0.5
+                    + 0.18 * (x * 0.13).sin()
+                    + 0.17 * (y * 0.17).cos()
+                    + 0.12 * ((x + y) * 0.09).sin();
+                (signal.clamp(0.0, 1.0) * 255.0).round() as u8
+            })
+            .collect()
+    }
+
+    fn shifted_luma_fixture(previous: &[u8], width: u32, height: u32, dx: i32, dy: i32) -> Vec<u8> {
+        let mut current = vec![0; previous.len()];
+        for y in 0..height {
+            for x in 0..width {
+                let source_x = i64::from(x) - i64::from(dx);
+                let source_y = i64::from(y) - i64::from(dy);
+                if source_x >= 0
+                    && source_y >= 0
+                    && source_x < i64::from(width)
+                    && source_y < i64::from(height)
+                {
+                    current[(y * width + x) as usize] = previous[(u32::try_from(source_y).unwrap()
+                        * width
+                        + u32::try_from(source_x).unwrap())
+                        as usize];
+                }
+            }
+        }
+        current
+    }
+
+    fn canonical_cpu_vectors(previous: &[u8], current: &[u8], dimensions: [u32; 2]) -> Vec<u8> {
+        let plane = |pixels| LumaPlane {
+            width: dimensions[0],
+            height: dimensions[1],
+            stride: dimensions[0] as usize,
+            pixels,
+        };
+        let field = deterministic_motion_lattice(
+            plane(previous),
+            plane(current),
+            MotionLatticeQuality::High,
+        )
+        .unwrap();
+        let mut vectors = vec![0; field.packed_vectors().len() * 4];
+        let mut gates = vec![0; field.packed_vectors().len() * 2];
+        encode_field_upload(&field, &mut vectors, &mut gates).unwrap();
+        vectors
+    }
+
+    fn motion_half_to_f32(value: u16) -> f32 {
+        let sign = u32::from(value & 0x8000) << 16;
+        let exponent = (value >> 10) & 0x1f;
+        let fraction = value & 0x03ff;
+        let bits = if exponent == 0 {
+            if fraction == 0 {
+                sign
+            } else {
+                let mut fraction = u32::from(fraction);
+                let mut exponent = -14_i32;
+                while fraction & 0x0400 == 0 {
+                    fraction <<= 1;
+                    exponent -= 1;
+                }
+                fraction &= 0x03ff;
+                sign | (((exponent + 127) as u32) << 23) | (fraction << 13)
+            }
+        } else if exponent == 0x1f {
+            sign | 0x7f80_0000 | (u32::from(fraction) << 13)
+        } else {
+            sign | (u32::from(exponent + 112) << 23) | (u32::from(fraction) << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    #[test]
+    #[ignore = "requires an opted-in physical GPU readback adapter"]
+    fn gpu_motion_lattice_matches_cpu_known_shifts_static_zero_live_export_and_warm_law() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("motion lattice physical GPU adapter");
+        let adapter_info = adapter.get_info();
+        println!(
+            "motion lattice physical adapter: {} ({:?}, {:?})",
+            adapter_info.name, adapter_info.backend, adapter_info.device_type
+        );
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Motion lattice physical acceptance device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("motion lattice physical GPU device");
+        let dimensions = [64, 48];
+        let previous = canonical_luma_fixture(dimensions[0], dimensions[1]);
+        let uniform = vec![127; previous.len()];
+        let fixtures = [
+            (
+                "one-pixel",
+                previous.clone(),
+                shifted_luma_fixture(&previous, 64, 48, 1, 0),
+                1,
+                0,
+            ),
+            (
+                "two-pixel",
+                previous.clone(),
+                shifted_luma_fixture(&previous, 64, 48, 0, 2),
+                0,
+                2,
+            ),
+            (
+                "four-pixel",
+                previous.clone(),
+                shifted_luma_fixture(&previous, 64, 48, 4, -4),
+                4,
+                -4,
+            ),
+            ("static-uniform", uniform.clone(), uniform, 0, 0),
+        ];
+        let mut live = MotionLatticeGpuHarness::new(&device, &queue, dimensions);
+        let mut export = MotionLatticeGpuHarness::new(&device, &queue, dimensions);
+        let live_allocation = live.allocation_fingerprint();
+        let export_allocation = export.allocation_fingerprint();
+        assert_eq!(live_allocation.plan, export_allocation.plan);
+        assert_eq!(live_allocation.plan.active_field_slots, 1);
+        assert_eq!(live_allocation.plan.vector_bytes, 16 * 12 * 8);
+        assert_eq!(live_allocation.plan.gate_bytes, 16 * 12 * 4);
+        assert_eq!(live_allocation.plan.luma_bytes, 16 * 12 * 2);
+
+        for (label, previous, current, dx, dy) in fixtures {
+            let expected = canonical_cpu_vectors(&previous, &current, dimensions);
+            let live_vectors = live.run_fixture(&device, &queue, &previous, &current);
+            let export_vectors = export.run_fixture(&device, &queue, &previous, &current);
+            assert_eq!(live_vectors, export_vectors, "{label} live/export parity");
+            let center = ((6 * 16 + 8) * 4) as usize;
+            for (vectors, path) in [(&expected, "CPU oracle"), (&live_vectors, "GPU renderer")] {
+                let velocity = [
+                    motion_half_to_f32(u16::from_le_bytes([vectors[center], vectors[center + 1]])),
+                    motion_half_to_f32(u16::from_le_bytes([
+                        vectors[center + 2],
+                        vectors[center + 3],
+                    ])),
+                ];
+                let recovered = [velocity[0] * 64.0 / 60.0, velocity[1] * 48.0 / 60.0];
+                assert!(
+                    (recovered[0] - dx as f32).abs() < 0.01
+                        && (recovered[1] - dy as f32).abs() < 0.01,
+                    "{label} {path} recovered {recovered:?}, expected [{dx}, {dy}]"
+                );
+            }
+            if label == "static-uniform" {
+                assert!(
+                    live_vectors.iter().all(|byte| *byte == 0),
+                    "static uniform field must publish literal +0 RG16F vectors"
+                );
+            }
+        }
+        assert_eq!(live.allocation_fingerprint(), live_allocation);
+        assert_eq!(export.allocation_fingerprint(), export_allocation);
+        assert_eq!(live.resources.memory_generation, 2);
+        assert_eq!(export.resources.memory_generation, 2);
     }
 
     #[test]
@@ -2633,6 +3345,7 @@ mod tests {
             is_master: true,
             codec_vectors_available: false,
             required_as_donor: false,
+            required_as_garden_signal: true,
         };
         let plan = MotionResourcePlan::preflight(
             &[request],
@@ -2646,6 +3359,7 @@ mod tests {
             &[MotionGpuFieldSpec {
                 grid,
                 requires_luma: true,
+                required_as_garden_signal: true,
             }],
             dimensions,
         )
@@ -2667,6 +3381,7 @@ mod tests {
         .unwrap();
         resources.upload_codec_field(&queue, 0, &field, 1).unwrap();
         assert_eq!(resources.plan(), plan);
+        assert!(resources.garden_signal_view().is_some());
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("motion fixture wait");
@@ -2708,6 +3423,7 @@ mod tests {
                 is_master: false,
                 codec_vectors_available: false,
                 required_as_donor: false,
+                required_as_garden_signal: false,
             }],
             MotionDeviceLimits::new(device.limits().max_texture_dimension_2d, u64::MAX),
         )

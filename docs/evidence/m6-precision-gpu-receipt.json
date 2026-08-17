@@ -1,6 +1,6 @@
 {
   "schema": "collide-o-scope-m6-gpu-precision-receipt/2",
-  "measured_at": "2026-08-17T13:27:10.2750887-04:00",
+  "measured_at": "2026-08-17T17:50:17.9576854-04:00",
   "command": "cargo test --locked gpu_precision_receipt_measures_real_still_and_temporal_workloads -- --ignored --nocapture",
   "host": {
     "os": "windows",
@@ -13,7 +13,7 @@
   "source_identity": {
     "crate_version": "0.1.0",
     "shader_bundle_sha256": "1c30e098763ff6b1a89c56b89ca0af4fc98d489bebd03a41e5870bd940dab29c",
-    "cargo_lock_and_m6_sources_sha256": "a8e977baa8f21e50dc76712513d35f0f80b1748a3a225dbcbc4d28ec6277214f",
+    "cargo_lock_and_m6_sources_sha256": "71f44f14adea9f99006a0ea917b6760e1502a07572c10d20d067c62ccd2e2a64",
     "manifest_scope": "length-prefixed Cargo.toml, Cargo.lock, production Rust encode/resource/uniform paths, receipt helpers, and every measured WGSL source"
   },
   "adapter": {
@@ -69,8 +69,8 @@
       "reference_gradient_events": 260,
       "retained_gradient_events": 260
     },
-    "compat8_fixture_wall_ns_per_frame": 607812,
-    "advanced_fixture_wall_ns_per_frame": 282737
+    "compat8_fixture_wall_ns_per_frame": 740375,
+    "advanced_fixture_wall_ns_per_frame": 272625
   },
   "temporal": {
     "frames": 12,
@@ -115,8 +115,8 @@
       "reference_gradient_events": 311,
       "retained_gradient_events": 311
     },
-    "compat8_fixture_wall_ns_per_frame": 2567000,
-    "advanced_fixture_wall_ns_per_frame": 23489850
+    "compat8_fixture_wall_ns_per_frame": 2606458,
+    "advanced_fixture_wall_ns_per_frame": 23284483
   },
   "timing_scope": "fixture-local wall time with a per-frame GPU wait; Compat8 writes its final target in the core pass while Advanced includes its required encode_present pass; smoke evidence only, not a renderer-throughput comparison",
   "acceptance_gates": [
@@ -142,7 +142,7 @@
       "command": "cargo test --locked exact_temporal_originals_keep_frozen_pixels_while_advanced_is_deterministic_at_24_30_and_60_fps -- --ignored --nocapture",
       "result": "1 passed; 0 failed",
       "adapter": "AMD Radeon RX 6950 XT / Vulkan",
-      "facts": "Exact temporal originals retained SHA-256 27eac2e718096ca775866d507ee1fd8445e2429e18db79b36e5d8c163294525c; Advanced remained deterministic at SHA-256 059b344976e75138526079dc65614f2e3f88f34b34f24ca7796c863d18c3553a across the 24/30/60-fps matrix."
+      "facts": "Exact temporal originals retained SHA-256 27eac2e718096ca775866d507ee1fd8445e2429e18db79b36e5d8c163294525c; Advanced remained deterministic at SHA-256 b6b23cfdc9edd4a4d2653abc84327b85f407b06f69d1467bc745571c6bae1f81 across the 24/30/60-fps matrix."
     },
     {
       "command": "cargo test --locked legacy_logical_lookup_1025_rejects_while_advanced_128_shader_ops_fit",

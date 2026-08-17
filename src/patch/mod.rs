@@ -33,7 +33,10 @@ use crate::performance::{
     SceneReferenceIssue, Scenes,
 };
 use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
-use crate::temporal::{CollisionScoreLoopDriver, TemporalEventResetMode, TemporalResetPolicy};
+use crate::temporal::{
+    CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
+    TemporalEventResetMode, TemporalResetPolicy,
+};
 use crate::visual_rack::{
     EdgeTiming, GroupId, ImageDependency, ImageDependencyGraph, ImageGraphMode, ImageOrderingEdge,
     LegacyRackScope, MaskParams, NodeId, RuntimeImageMatte, RuntimeVisualRack, SavedImageSource,
@@ -567,6 +570,7 @@ pub enum RefreshGardenGateConfig {
     AudioEnergy,
     AudioOnset,
     Matte,
+    Motion,
 }
 
 impl RefreshGardenGateConfig {
@@ -579,6 +583,7 @@ impl RefreshGardenGateConfig {
             RefreshGardenGate::AudioEnergy => Self::AudioEnergy,
             RefreshGardenGate::AudioOnset => Self::AudioOnset,
             RefreshGardenGate::Matte => Self::Matte,
+            RefreshGardenGate::Motion => Self::Motion,
         }
     }
 
@@ -591,6 +596,7 @@ impl RefreshGardenGateConfig {
             Self::AudioEnergy => RefreshGardenGate::AudioEnergy,
             Self::AudioOnset => RefreshGardenGate::AudioOnset,
             Self::Matte => RefreshGardenGate::Matte,
+            Self::Motion => RefreshGardenGate::Motion,
         }
     }
 }
@@ -772,6 +778,196 @@ pub struct RefreshGardenConfig {
     pub softness: f32,
     pub decay: f32,
     pub max_hold_ticks: u32,
+    pub matte_route: RefreshGardenMatteRouteConfig,
+    pub motion_route: RefreshGardenMotionRouteConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RefreshGardenMatteRouteConfig {
+    #[default]
+    None,
+    SelectedLayer {
+        saved_position: SavedLayerPosition,
+        #[serde(default)]
+        stage: LayerImageStage,
+    },
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+        #[serde(default)]
+        stage: LayerImageStage,
+    },
+}
+
+impl RefreshGardenMatteRouteConfig {
+    fn from_runtime(value: RefreshGardenMatteRoute) -> Self {
+        match value {
+            RefreshGardenMatteRoute::None => Self::None,
+            RefreshGardenMatteRoute::SelectedLayer {
+                saved_position,
+                stage,
+                ..
+            } => Self::SelectedLayer {
+                saved_position,
+                stage,
+            },
+            RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position,
+                stage,
+            } => Self::MissingSelectedLayer {
+                saved_position,
+                stage,
+            },
+        }
+    }
+
+    pub(crate) fn from_runtime_for_capture(
+        value: RefreshGardenMatteRoute,
+        layer_ids: &[StableLayerId],
+    ) -> Self {
+        match value {
+            RefreshGardenMatteRoute::SelectedLayer {
+                layer_id,
+                saved_position,
+                stage,
+            } => layer_ids
+                .iter()
+                .position(|candidate| *candidate == layer_id)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(SavedLayerPosition::new)
+                .map_or(
+                    Self::MissingSelectedLayer {
+                        saved_position,
+                        stage,
+                    },
+                    |saved_position| Self::SelectedLayer {
+                        saved_position,
+                        stage,
+                    },
+                ),
+            other => Self::from_runtime(other),
+        }
+    }
+
+    pub(crate) fn resolve_runtime(self, layer_ids: &[StableLayerId]) -> RefreshGardenMatteRoute {
+        match self {
+            Self::None => RefreshGardenMatteRoute::None,
+            Self::SelectedLayer {
+                saved_position,
+                stage,
+            } => saved_position.resolve(layer_ids).copied().map_or(
+                RefreshGardenMatteRoute::MissingSelectedLayer {
+                    saved_position,
+                    stage,
+                },
+                |layer_id| RefreshGardenMatteRoute::SelectedLayer {
+                    layer_id,
+                    saved_position,
+                    stage,
+                },
+            ),
+            Self::MissingSelectedLayer {
+                saved_position,
+                stage,
+            } => RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position,
+                stage,
+            },
+        }
+    }
+
+    fn unresolved_runtime(self) -> RefreshGardenMatteRoute {
+        match self {
+            Self::None => RefreshGardenMatteRoute::None,
+            Self::SelectedLayer {
+                saved_position,
+                stage,
+            }
+            | Self::MissingSelectedLayer {
+                saved_position,
+                stage,
+            } => RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position,
+                stage,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RefreshGardenMotionRouteConfig {
+    #[default]
+    None,
+    SelectedLayer {
+        saved_position: SavedLayerPosition,
+    },
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+    },
+}
+
+impl RefreshGardenMotionRouteConfig {
+    fn from_runtime(value: RefreshGardenMotionRoute) -> Self {
+        match value {
+            RefreshGardenMotionRoute::None => Self::None,
+            RefreshGardenMotionRoute::SelectedLayer { saved_position, .. } => {
+                Self::SelectedLayer { saved_position }
+            }
+            RefreshGardenMotionRoute::MissingSelectedLayer { saved_position } => {
+                Self::MissingSelectedLayer { saved_position }
+            }
+        }
+    }
+
+    pub(crate) fn from_runtime_for_capture(
+        value: RefreshGardenMotionRoute,
+        layer_ids: &[StableLayerId],
+    ) -> Self {
+        match value {
+            RefreshGardenMotionRoute::SelectedLayer {
+                layer_id,
+                saved_position,
+            } => layer_ids
+                .iter()
+                .position(|candidate| *candidate == layer_id)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(SavedLayerPosition::new)
+                .map_or(
+                    Self::MissingSelectedLayer { saved_position },
+                    |saved_position| Self::SelectedLayer { saved_position },
+                ),
+            other => Self::from_runtime(other),
+        }
+    }
+
+    pub(crate) fn resolve_runtime(self, layer_ids: &[StableLayerId]) -> RefreshGardenMotionRoute {
+        match self {
+            Self::None => RefreshGardenMotionRoute::None,
+            Self::SelectedLayer { saved_position } => {
+                saved_position.resolve(layer_ids).copied().map_or(
+                    RefreshGardenMotionRoute::MissingSelectedLayer { saved_position },
+                    |layer_id| RefreshGardenMotionRoute::SelectedLayer {
+                        layer_id,
+                        saved_position,
+                    },
+                )
+            }
+            Self::MissingSelectedLayer { saved_position } => {
+                RefreshGardenMotionRoute::MissingSelectedLayer { saved_position }
+            }
+        }
+    }
+
+    fn unresolved_runtime(self) -> RefreshGardenMotionRoute {
+        match self {
+            Self::None => RefreshGardenMotionRoute::None,
+            Self::SelectedLayer { saved_position }
+            | Self::MissingSelectedLayer { saved_position } => {
+                RefreshGardenMotionRoute::MissingSelectedLayer { saved_position }
+            }
+        }
+    }
 }
 
 impl Default for RefreshGardenConfig {
@@ -789,6 +985,8 @@ impl RefreshGardenConfig {
             softness: value.softness,
             decay: value.decay,
             max_hold_ticks: value.max_hold_ticks,
+            matte_route: RefreshGardenMatteRouteConfig::from_runtime(value.matte_route),
+            motion_route: RefreshGardenMotionRouteConfig::from_runtime(value.motion_route),
         }
     }
 
@@ -800,6 +998,8 @@ impl RefreshGardenConfig {
             softness: finite_or(self.softness, 0.03).clamp(0.0, 0.5),
             decay: finite_or(self.decay, 1.0).clamp(0.0, 1.0),
             max_hold_ticks: self.max_hold_ticks,
+            matte_route: self.matte_route.unresolved_runtime(),
+            motion_route: self.motion_route.unresolved_runtime(),
         }
     }
 }
@@ -961,8 +1161,12 @@ impl TemporalOriginalsConfig {
     /// conversion cannot carry that distinction until live layer IDs exist.
     pub fn sanitized(self) -> Self {
         let loop_driver = self.score.loop_driver;
+        let garden_matte_route = self.garden.matte_route;
+        let garden_motion_route = self.garden.motion_route;
         let mut sanitized = Self::from_params(self.to_params());
         sanitized.score.loop_driver = loop_driver;
+        sanitized.garden.matte_route = garden_matte_route;
+        sanitized.garden.motion_route = garden_motion_route;
         sanitized
     }
 
@@ -997,6 +1201,24 @@ impl TemporalConfig {
 
     fn from_params_for_capture(p: &TemporalParams, layer_ids: &[StableLayerId]) -> Self {
         let mut config = Self::from_params(p);
+        let matte_route = RefreshGardenMatteRouteConfig::from_runtime_for_capture(
+            p.originals.garden.matte_route,
+            layer_ids,
+        );
+        let motion_route = RefreshGardenMotionRouteConfig::from_runtime_for_capture(
+            p.originals.garden.motion_route,
+            layer_ids,
+        );
+        if !matches!(matte_route, RefreshGardenMatteRouteConfig::None)
+            || !matches!(motion_route, RefreshGardenMotionRouteConfig::None)
+        {
+            let garden = &mut config
+                .originals
+                .get_or_insert_with(TemporalOriginalsConfig::default)
+                .garden;
+            garden.matte_route = matte_route;
+            garden.motion_route = motion_route;
+        }
         let driver = CollisionScoreLoopDriverConfig::from_runtime_for_capture(
             p.originals.score.loop_driver,
             layer_ids,
@@ -1368,6 +1590,12 @@ impl MotionConfig {
         }
     }
 
+    pub(crate) fn resolve_runtime(self, layer_ids: &[StableLayerId]) -> MotionParams {
+        let mut params = self.to_params().sanitized();
+        params.transplant.donor = self.transplant.donor.resolve_runtime(layer_ids);
+        params
+    }
+
     /// Clamp continuous values while retaining Selected versus Missing donor
     /// intent until a complete live layer stack is available.
     pub fn sanitized(self) -> Self {
@@ -1385,7 +1613,7 @@ impl MotionConfig {
 fn apply_motion_look(config: MotionConfig, live: &mut MotionParams) {
     let donor = live.transplant.donor;
     *live = config.to_params().sanitized();
-    // A Look transfers bounded values, never donor-route topology.
+    // A Look transfers bounded values and recipe laws, never donor-route topology.
     live.transplant.donor = donor;
 }
 
@@ -4244,7 +4472,7 @@ impl PatchState {
         let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         for (config, layer) in self.layers.iter().zip(layers.iter_mut()) {
             if let Some(motion) = config.motion {
-                layer.motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+                layer.motion = motion.resolve_runtime(&layer_ids);
             }
         }
         if let Some(ref ntsc) = self.ntsc {
@@ -4256,6 +4484,10 @@ impl PatchState {
         if let Some(ref temporal_cfg) = self.temporal {
             let mut restored = temporal_cfg.to_params();
             if let Some(originals) = temporal_cfg.originals {
+                restored.originals.garden.matte_route =
+                    originals.garden.matte_route.resolve_runtime(&layer_ids);
+                restored.originals.garden.motion_route =
+                    originals.garden.motion_route.resolve_runtime(&layer_ids);
                 restored.originals.score.loop_driver =
                     originals.score.loop_driver.resolve_runtime(&layer_ids);
             }
@@ -4283,11 +4515,11 @@ impl PatchState {
             mod_matrix,
             temporal,
         );
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         *master_motion = self
             .master_motion
             .unwrap_or_default()
-            .to_params()
-            .sanitized();
+            .resolve_runtime(&layer_ids);
     }
 
     /// Resolve and apply the complete persisted creative graph atomically.
@@ -4424,11 +4656,11 @@ impl PatchState {
             mod_matrix,
             temporal,
         )?;
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         *master_motion = self
             .master_motion
             .unwrap_or_default()
-            .to_params()
-            .sanitized();
+            .resolve_runtime(&layer_ids);
         Ok(())
     }
 
@@ -4455,10 +4687,14 @@ impl PatchState {
         }
         if let Some(ref temporal_cfg) = self.temporal {
             let loop_driver = temporal.originals.score.loop_driver;
+            let garden_matte_route = temporal.originals.garden.matte_route;
+            let garden_motion_route = temporal.originals.garden.motion_route;
             *temporal = temporal_cfg.to_params();
             // A Look transfers values, not donor-route topology. Preserve an
             // exact live Selected identity and an authored tombstone alike.
             temporal.originals.score.loop_driver = loop_driver;
+            temporal.originals.garden.matte_route = garden_matte_route;
+            temporal.originals.garden.motion_route = garden_motion_route;
         }
         summary
     }
@@ -5585,6 +5821,91 @@ scenes:
             restored.originals.unwrap().score.loop_driver,
             CollisionScoreLoopDriverConfig::MissingSelectedLayer { .. }
         ));
+    }
+
+    #[test]
+    fn refresh_garden_routes_capture_positions_resolve_ids_and_preserve_tombstones() {
+        let other = StableLayerId::new(44).unwrap();
+        let wanted = StableLayerId::new(91).unwrap();
+        let ids = [other, wanted];
+        let stale = SavedLayerPosition::new(7).unwrap();
+        let matte = RefreshGardenMatteRoute::SelectedLayer {
+            layer_id: wanted,
+            saved_position: stale,
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let motion = RefreshGardenMotionRoute::SelectedLayer {
+            layer_id: wanted,
+            saved_position: stale,
+        };
+        let config = RefreshGardenConfig {
+            matte_route: RefreshGardenMatteRouteConfig::from_runtime_for_capture(matte, &ids),
+            motion_route: RefreshGardenMotionRouteConfig::from_runtime_for_capture(motion, &ids),
+            ..RefreshGardenConfig::default()
+        };
+        assert!(matches!(
+            config.matte_route,
+            RefreshGardenMatteRouteConfig::SelectedLayer {
+                saved_position,
+                stage: LayerImageStage::PostLocalEffects,
+            } if saved_position.get() == 1
+        ));
+        assert!(matches!(
+            config.motion_route,
+            RefreshGardenMotionRouteConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 1
+        ));
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("layer_id"));
+        let restored: RefreshGardenConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored, config);
+        let sanitized = TemporalOriginalsConfig {
+            garden: config,
+            ..TemporalOriginalsConfig::default()
+        }
+        .sanitized();
+        assert_eq!(sanitized.garden.matte_route, config.matte_route);
+        assert_eq!(sanitized.garden.motion_route, config.motion_route);
+        let captured_position = SavedLayerPosition::new(1).unwrap();
+        assert_eq!(
+            restored.matte_route.resolve_runtime(&ids),
+            RefreshGardenMatteRoute::SelectedLayer {
+                layer_id: wanted,
+                saved_position: captured_position,
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            restored.motion_route.resolve_runtime(&ids),
+            RefreshGardenMotionRoute::SelectedLayer {
+                layer_id: wanted,
+                saved_position: captured_position,
+            }
+        );
+
+        let missing_matte = RefreshGardenMatteRouteConfig::MissingSelectedLayer {
+            saved_position: stale,
+            stage: LayerImageStage::PreLocalEffects,
+        };
+        let missing_motion = RefreshGardenMotionRouteConfig::MissingSelectedLayer {
+            saved_position: stale,
+        };
+        assert!(matches!(
+            missing_matte.resolve_runtime(&ids),
+            RefreshGardenMatteRoute::MissingSelectedLayer { saved_position, .. }
+                if saved_position == stale
+        ));
+        assert_eq!(
+            missing_motion.resolve_runtime(&ids),
+            RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: stale,
+            }
+        );
+        assert!(serde_yaml::from_str::<RefreshGardenConfig>(
+            "matte_route:\n  kind: selected_layer\n  saved_position: 1\n  layer_id: 91\n"
+        )
+        .is_err());
     }
 
     #[test]

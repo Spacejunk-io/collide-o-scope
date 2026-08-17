@@ -420,8 +420,13 @@ reuse that bounded memory:
 - **Collision Atlas** assigns seeded territories and mixes their temporal
   collisions. The seed and territory count are authored, deterministic state.
 - **Refresh Garden** admits/holds memory through Temporal Δ, Luma, Chroma,
-  Cellular ridge, Audio energy, Audio onset, or Matte gates, with bounded
-  threshold, softness, decay, and maximum hold.
+  Cellular ridge, Audio energy, Audio onset, Matte, or Motion gates, with
+  bounded threshold, softness, decay, and maximum hold. **Matte layer** selects
+  one stable layer plus its pre- or post-local current-frame stage. **Motion
+  layer** selects that layer's actually admitted motion field—not a luma proxy—
+  so codec/lattice source resolution and an admitted Faraday donor are the same
+  live signal Garden observes. The route status reports None and saved-layer
+  tombstones as closed zero gates.
 - **Collision Score** walks a seeded 2–16-state score on loop boundary,
   downbeat, audio onset, or the explicit **Trigger score** event. A loop driver
   names one stable layer; a removed layer becomes visibly missing and does not
@@ -434,6 +439,22 @@ paused audience hold. Freeze Program stops temporal ticks and events; Freeze
 Media keeps them advancing while source images remain held. Zero amounts retain
 the legacy temporal path, and the same frame-indexed law is used by offline
 rendering.
+
+Garden route changes are ordered, revision-protected topology actions. They are
+manual-history edits rather than coalesced or beat-quantized values. Reorder
+keeps the selected stable identity and refreshes only saved-position provenance;
+removal creates a missing tombstone that cannot bind a replacement at the old
+position. Patch, Morph, reset, and offline export preserve that law. Export maps
+saved selections to deterministic job-local identities and publishes a warning
+when a Matte or Motion route resolves to zero. The routed signal is applied by
+the same dedicated post-temporal pass used live, capped at three sampled
+textures per pass.
+
+**Refresh now** emits one ordered counted Garden event. Accepted Score and
+Garden events are stored in a bounded reference-tick track and replayed by
+offline export at the same accepted-frame boundaries. **Clear event recording**
+clears that track only; it does not clear authored controls, Garden/Score
+memory, Program history, or the audience hold.
 
 ### Motion fields
 
@@ -667,6 +688,16 @@ Both modes preserve keyed alpha and the same global/selective routing and
 composition order; quality changes only VHS spatial resolution. When VHS is
 off, the choice has no effect.
 
+**Shutter samples** is an exact, closed offline policy. **Authored per scope**
+keeps each master/layer Sharp, Draft, Live, or High tier. The other accepted
+wire values are `samples_1`, `samples_4`, `samples_8`, and `samples_16`; they
+replace only the quality tier after that frame's Morph/modulation values are
+resolved. Candidate and final immutable plans consume the same resulting count
+before resource preflight. An explicit count does not activate a 0° shutter,
+so the exact zero/legacy path remains delegated. Omitted fields default to
+`authored`; for example, `"shutter_samples":"samples_16"` requests exactly 16.
+Arbitrary counts and unknown strings are rejected.
+
 Expert media mode may admit a larger source while reconstructing an offline
 patch, but it does not enlarge the selected export output. Export-output
 dimensions retain the established UHD-area validation, and selective export
@@ -679,13 +710,22 @@ duration. Live Spout layers cannot be selected for audio and render as black
 offline because an external live sender is not reproducible.
 
 After the MP4 succeeds, offline Render atomically publishes
-`<video>.motion.json`. The bounded schema-v1 provenance report records source
-fingerprints when available; authored motion scopes, algorithm/quality,
-donor/carrier and shutter choices; observed field origins/diagnostics and
-dynamic-state changes; the last accepted frame; and warnings. It explicitly
-does not guarantee cross-GPU pixel identity. Cancel/failure removes partial
-video/sidecar work, and unavailable codec vectors or fingerprints remain
-warnings rather than being rewritten as proof.
+`<video>.motion.json`. The bounded schema-v3 provenance report records source
+fingerprints when available; requested shutter policy and exact count;
+separate authored and effective motion scope/algorithm/quality/donor/carrier
+values; the final planner source, actual rendered source, and field-attachment
+truth (including planned-but-unprimed fields); codec transition count, elapsed
+source time, and exact proof/vector digest only when a proven codec field was
+attached; diagnostics and dynamic-state changes; the last accepted
+frame; and warnings. It explicitly does not guarantee cross-GPU pixel identity.
+Cancel/failure removes partial video/sidecar work, and unavailable codec vectors
+or fingerprints remain warnings rather than being rewritten as proof.
+
+Live Motion cards use the same distinction: `planned` is the immutable source
+decision, while `rendered` is published only after a matching field parity slot
+commits. Lattice frame one can therefore say priming/unavailable; Media Freeze
+retains the prior committed field identity; and Faraday recipients report the
+admitted donor field and grid.
 
 ## Patch controls
 

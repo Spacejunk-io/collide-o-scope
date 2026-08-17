@@ -1714,6 +1714,9 @@ fn accumulate_temporal_events(
         .audio_onset_events
         .saturating_add(observed.audio_onset_events);
     pending.manual_events = pending.manual_events.saturating_add(observed.manual_events);
+    pending.garden_refresh_events = pending
+        .garden_refresh_events
+        .saturating_add(observed.garden_refresh_events);
 }
 
 fn selected_layer_after_remove(
@@ -2457,6 +2460,7 @@ fn stage_composition_remove(
 
 struct LiveMotionFieldCache {
     scope: visual_rack::VisualScopeId,
+    codec_identity: video::CodecMotionProductIdentity,
     source_generation: u64,
     frame_ordinal: u64,
     algorithm_version: u16,
@@ -2471,6 +2475,7 @@ impl LiveMotionFieldCache {
             scope: self.scope,
             source_generation: self.source_generation,
             frame_ordinal: self.frame_ordinal,
+            product_content_sha256: self.codec_identity.content_sha256,
             algorithm_version: self.algorithm_version,
             source_dimensions: self.source_dimensions,
             grid: self.grid,
@@ -2479,18 +2484,19 @@ impl LiveMotionFieldCache {
     }
 }
 
-/// Rasterize a decoder product at most once per accepted source generation /
-/// frame ordinal / evaluated grid. The bounded cache owns only canonical
+/// Rasterize a decoder product at most once per exact adjacent-reference
+/// identity and evaluated grid. The bounded cache owns only canonical
 /// low-resolution fields; sparse codec records remain paired with Layer's
 /// exact uploaded RGBA frame and no per-layer full-resolution history exists.
 fn refresh_live_codec_motion_cache(
     layers: &[Layer],
     plan: &evaluated_frame::evaluated_composition::AdvancedMotionPlan,
     cache: &mut Vec<LiveMotionFieldCache>,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<visual_rack::VisualScopeId>) {
     let mut previous = std::mem::take(cache);
     let mut next = Vec::with_capacity(plan.fields().len());
     let mut diagnostics = Vec::new();
+    let mut unavailable = Vec::new();
     for field_plan in plan
         .fields()
         .iter()
@@ -2499,6 +2505,7 @@ fn refresh_live_codec_motion_cache(
     {
         let visual_rack::VisualScopeId::Layer(layer_id) = field_plan.scope else {
             diagnostics.push("master Motion cannot consume codec vectors".to_string());
+            unavailable.push(field_plan.scope);
             continue;
         };
         let Some(layer) = layers
@@ -2509,19 +2516,28 @@ fn refresh_live_codec_motion_cache(
                 "motion codec scope layer {} disappeared before encode",
                 layer_id.get()
             ));
+            unavailable.push(field_plan.scope);
             continue;
         };
-        let Some(codec) = layer.codec_motion() else {
+        let Some(codec) = layer.codec_motion_product() else {
             diagnostics.push(format!(
                 "layer {} has no codec motion product for the evaluated frame",
                 layer_id.get()
             ));
+            unavailable.push(field_plan.scope);
             continue;
         };
+        let Some(codec_identity) = codec.exact_identity() else {
+            diagnostics.push(format!(
+                "layer {} codec motion product lacks a complete adjacent-reference identity",
+                layer_id.get()
+            ));
+            unavailable.push(field_plan.scope);
+            continue;
+        };
+        let latest = codec.latest();
         if let Some(index) = previous.iter().position(|cached| {
-            field_plan.accepts(cached.attachment())
-                && cached.source_generation == codec.source_generation
-                && cached.frame_ordinal == codec.frame_ordinal
+            field_plan.accepts(cached.attachment()) && cached.codec_identity == codec_identity
         }) {
             next.push(previous.swap_remove(index));
             continue;
@@ -2531,20 +2547,18 @@ fn refresh_live_codec_motion_cache(
                 "motion codec scope {:?} has no evaluated scope plan",
                 field_plan.scope
             ));
+            unavailable.push(field_plan.scope);
             continue;
         };
-        match motion::rasterize_codec_motion_vectors(
-            codec.source_dimensions,
-            scope_plan.params.lattice_quality,
-            &codec.vectors,
-        ) {
+        match codec.rasterize(scope_plan.params.lattice_quality) {
             Ok(Some(field)) => {
                 let cached = LiveMotionFieldCache {
                     scope: field_plan.scope,
-                    source_generation: codec.source_generation,
-                    frame_ordinal: codec.frame_ordinal,
-                    algorithm_version: codec.algorithm_version,
-                    source_dimensions: codec.source_dimensions,
+                    codec_identity,
+                    source_generation: latest.source_generation,
+                    frame_ordinal: latest.frame_ordinal,
+                    algorithm_version: latest.algorithm_version,
+                    source_dimensions: latest.source_dimensions,
                     grid: field.grid(),
                     field,
                 };
@@ -2555,20 +2569,29 @@ fn refresh_live_codec_motion_cache(
                         "layer {} codec motion product does not match its immutable field plan",
                         layer_id.get()
                     ));
+                    unavailable.push(field_plan.scope);
                 }
             }
-            Ok(None) => diagnostics.push(format!(
-                "layer {} codec motion product contains no usable past-reference vectors",
-                layer_id.get()
-            )),
-            Err(error) => diagnostics.push(format!(
-                "layer {} codec motion rasterization rejected: {error}",
-                layer_id.get()
-            )),
+            Ok(None) => {
+                diagnostics.push(format!(
+                    "layer {} codec motion product contains no usable proven past-reference vectors",
+                    layer_id.get()
+                ));
+                unavailable.push(field_plan.scope);
+            }
+            Err(error) => {
+                diagnostics.push(format!(
+                    "layer {} codec motion composition/rasterization rejected: {error}",
+                    layer_id.get()
+                ));
+                unavailable.push(field_plan.scope);
+            }
         }
     }
     *cache = next;
-    diagnostics
+    unavailable.sort_unstable();
+    unavailable.dedup();
+    (diagnostics, unavailable)
 }
 
 fn motion_scope_diagnostic(
@@ -2643,13 +2666,25 @@ fn motion_telemetry_from_plan(
     plan.scopes()
         .iter()
         .map(|scope| {
-            let field = scope.field_slot.and_then(|slot| plan.field(slot));
+            let field = scope
+                .admitted_field_slot()
+                .and_then(|slot| plan.field(slot));
             let runtime = executor.and_then(|executor| executor.motion_metrics(scope.scope));
             let runtime_diagnostic = executor.and_then(|executor| {
                 motion_runtime_diagnostic(scope.scope, executor.motion_diagnostics())
             });
             let planned_diagnostic = motion_scope_diagnostic(scope.scope, plan.diagnostics());
             let effective_source = match scope.source.origin {
+                motion::MotionFieldOrigin::None => "none",
+                motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
+                motion::MotionFieldOrigin::Lattice => "lattice",
+                motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+            };
+            let rendered_source = match runtime
+                .filter(|runtime| runtime.valid_fields > 0)
+                .map_or(motion::MotionFieldOrigin::None, |runtime| {
+                    runtime.field_origin
+                }) {
                 motion::MotionFieldOrigin::None => "none",
                 motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
                 motion::MotionFieldOrigin::Lattice => "lattice",
@@ -2668,12 +2703,15 @@ fn motion_telemetry_from_plan(
                 scope.scope,
                 web::state::MotionTelemetrySnapshot {
                     effective_source: effective_source.to_string(),
+                    rendered_source: rendered_source.to_string(),
                     codec_vectors_available: scope.codec.available,
                     fallback_active: scope.source.origin
                         == motion::MotionFieldOrigin::LatticeFallback,
                     field_dimensions: field
                         .map_or([0, 0], |field| [field.grid.width, field.grid.height]),
                     vector_count: field.map_or(0, |field| field.grid.vector_count),
+                    field_planned: field.is_some(),
+                    field_attached: runtime.is_some_and(|runtime| runtime.valid_fields > 0),
                     required_as_donor: scope.required_as_donor,
                     transplant_admitted: scope.transplant_admitted,
                     donor_missing,
@@ -3062,6 +3100,10 @@ struct App {
     /// is accepted. A rejected/safe-held encoder cannot silently consume a
     /// loop, downbeat, audio onset, or operator gesture.
     pending_temporal_events: temporal::TemporalFrameEvents,
+    /// Accepted manual Score/Garden events retained as a bounded 30 Hz track
+    /// for deterministic offline replay. Automatic events are regenerated
+    /// from their authoritative loop/beat/audio inputs instead.
+    temporal_event_recorder: temporal::TemporalEventRecorder,
     /// Ordered M4 clear/topology edits are consumed by the Advanced executor
     /// at the next encode boundary. This never clears Temporal,
     /// ProgramHistory, image taps, or the held audience frame.
@@ -3421,6 +3463,7 @@ impl App {
             performance_boundaries: performance::BeatBoundaryTracker::default(),
             temporal_boundaries: performance::BeatBoundaryTracker::default(),
             pending_temporal_events: temporal::TemporalFrameEvents::default(),
+            temporal_event_recorder: temporal::TemporalEventRecorder::default(),
             pending_motion_memory_clear: false,
             temporal_audio_onsets: temporal::TemporalAudioOnsetTracker::default(),
             image_routing_diagnostics: Vec::new(),
@@ -3806,6 +3849,7 @@ impl App {
             }
         });
         self.morph.remap_layers_after_move(from, to);
+        self.refresh_refresh_garden_route_saved_positions();
     }
 
     fn commit_creative_graph(
@@ -4628,6 +4672,99 @@ impl App {
             };
     }
 
+    /// Preserve Garden's two selected-layer routes as explicit tombstones
+    /// before their stable producer is removed. Saved stack positions are
+    /// serialization provenance only, never live positional fallbacks.
+    fn preserve_refresh_garden_routes_before_remove(
+        &mut self,
+        removed_index: usize,
+        removed_id: image_routing::StableLayerId,
+    ) {
+        let Some(saved_position) = u32::try_from(removed_index)
+            .ok()
+            .and_then(performance::SavedLayerPosition::new)
+        else {
+            log::error!(
+                "removed Refresh Garden route at layer position {removed_index}, outside the persisted position bound"
+            );
+            return;
+        };
+        self.temporal_params
+            .originals
+            .garden
+            .matte_route
+            .mark_layer_missing(removed_id, saved_position);
+        self.temporal_params
+            .originals
+            .garden
+            .motion_route
+            .mark_layer_missing(removed_id, saved_position);
+    }
+
+    /// Refresh route provenance after every stack reorder/removal while the
+    /// live relationship remains keyed exclusively by StableLayerId.
+    fn refresh_refresh_garden_route_saved_positions(&mut self) {
+        let positions: Vec<_> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(position, layer)| {
+                u32::try_from(position)
+                    .ok()
+                    .and_then(performance::SavedLayerPosition::new)
+                    .map(|saved_position| (layer.stable_layer_id(), saved_position))
+            })
+            .collect();
+        let position_of = |wanted| {
+            positions
+                .iter()
+                .find_map(|(layer_id, position)| (*layer_id == wanted).then_some(*position))
+        };
+        self.temporal_params
+            .originals
+            .garden
+            .matte_route
+            .refresh_saved_position(position_of);
+        self.temporal_params
+            .originals
+            .garden
+            .motion_route
+            .refresh_saved_position(position_of);
+    }
+
+    fn resolve_refresh_garden_route_layer(
+        &self,
+        layer_id: Option<&str>,
+        layer_stack_revision: u64,
+    ) -> Result<
+        Option<(
+            image_routing::StableLayerId,
+            performance::SavedLayerPosition,
+        )>,
+        String,
+    > {
+        if layer_stack_revision == 0 || layer_stack_revision != self.layer_stack_revision {
+            return Err(format!(
+                "Refresh Garden route revision {layer_stack_revision} is stale; current layer revision is {}",
+                self.layer_stack_revision
+            ));
+        }
+        let Some(layer_id) = layer_id else {
+            return Ok(None);
+        };
+        let stable_id = parse_nonzero_decimal(layer_id)
+            .and_then(image_routing::StableLayerId::new)
+            .ok_or_else(|| "Refresh Garden layer ID is malformed".to_string())?;
+        let saved_position = self
+            .layers
+            .iter()
+            .position(|layer| layer.stable_layer_id() == stable_id)
+            .and_then(|position| u32::try_from(position).ok())
+            .and_then(performance::SavedLayerPosition::new)
+            .ok_or_else(|| format!("Refresh Garden layer {} is absent", stable_id.get()))?;
+        Ok(Some((stable_id, saved_position)))
+    }
+
     /// Preserve every M4 Faraday donor as a stable relationship before the
     /// selected live layer is destroyed. The saved position is provenance for
     /// patch/Morph serialization only; it must never become a positional
@@ -4703,11 +4840,13 @@ impl App {
         let invalidated_scenes = self.remap_scenes_after_layer_remove(removed_index);
         self.preserve_matte_routes_before_remove(removed_index);
         self.preserve_temporal_driver_before_remove(removed_index, removed_id);
+        self.preserve_refresh_garden_routes_before_remove(removed_index, removed_id);
         self.preserve_motion_donors_before_remove(removed_index, removed_id);
         self.install_layer_racks(staged_layer_racks);
         self.master_rack = staged_master_rack;
         self.layers.remove(removed_index);
         self.refresh_temporal_driver_saved_position();
+        self.refresh_refresh_garden_route_saved_positions();
         self.refresh_motion_donor_saved_positions();
         self.composition = staged_composition;
         self.mod_matrix
@@ -4747,6 +4886,7 @@ impl App {
         let layer = self.layers.remove(from);
         self.layers.insert(to, layer);
         self.refresh_temporal_driver_saved_position();
+        self.refresh_refresh_garden_route_saved_positions();
         self.refresh_motion_donor_saved_positions();
         self.composition = staged;
         self.mod_matrix.remap_layer_targets_after_move(from, to);
@@ -4833,6 +4973,7 @@ impl App {
         self.web_state.actions.blocking_lock().clear();
         self.quantized_bar = Some((self.mod_matrix.current_beat / 4.0).floor() as i64);
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        self.temporal_event_recorder.clear();
         self.temporal_boundaries
             .reanchor(self.mod_matrix.current_beat);
         self.temporal_audio_onsets
@@ -6356,6 +6497,7 @@ impl App {
         self.selective_hold_spout_barrier_epoch = None;
         self.selective_hold_spout_readback_epoch = None;
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        self.temporal_event_recorder.clear();
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_visual_generation_for(temporal::TemporalResetCause::ApplyLook);
         }
@@ -8047,6 +8189,7 @@ impl App {
                         | "audio_energy"
                         | "audio_onset"
                         | "matte"
+                        | "motion"
                 )
             ),
             "score_enabled" => value.as_bool().is_some(),
@@ -8126,6 +8269,17 @@ impl App {
             WebAction::SetParam { param, value } => Self::valid_effect_edit(param, value),
             WebAction::SetNtscParam { param, value } => Self::valid_ntsc_edit(param, value),
             WebAction::SetTemporal { param, value } => Self::valid_temporal_edit(param, value),
+            WebAction::SetRefreshGardenMatteRoute {
+                layer_id,
+                layer_stack_revision,
+                ..
+            }
+            | WebAction::SetRefreshGardenMotionRoute {
+                layer_id,
+                layer_stack_revision,
+            } => self
+                .resolve_refresh_garden_route_layer(layer_id.as_deref(), *layer_stack_revision)
+                .is_ok(),
             WebAction::ResetGroup { group } if group == "transform" => {
                 self.morph.controls_master_transform()
             }
@@ -8337,6 +8491,8 @@ impl App {
                         | web::state::WebAction::SetTemporal { .. }
                         | web::state::WebAction::ClearTemporalMemory
                         | web::state::WebAction::TriggerCollisionScore
+                        | web::state::WebAction::TriggerRefreshGarden
+                        | web::state::WebAction::ClearTemporalEventTrack
                         | web::state::WebAction::SetMorph { .. }
                         | web::state::WebAction::SetMorphLaw { .. }
                         | web::state::WebAction::MorphCapture { .. }
@@ -8355,6 +8511,7 @@ impl App {
         self.selective_hold_spout_barrier_epoch = None;
         self.selective_hold_spout_readback_epoch = None;
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        self.temporal_event_recorder.clear();
         // A broad revert starts a new visual generation. If a blackout is
         // already requested, consider its audience edge consumed so the next
         // frame cannot capture (and later restore) pre-revert pixels.
@@ -8409,9 +8566,13 @@ impl App {
         if matches!(
             action,
             web::state::WebAction::SetMotionDonor { .. }
+                | web::state::WebAction::SetRefreshGardenMatteRoute { .. }
+                | web::state::WebAction::SetRefreshGardenMotionRoute { .. }
                 | web::state::WebAction::ClearMotionMemory
                 | web::state::WebAction::ClearTemporalMemory
                 | web::state::WebAction::TriggerCollisionScore
+                | web::state::WebAction::TriggerRefreshGarden
+                | web::state::WebAction::ClearTemporalEventTrack
         ) {
             self.composition_status =
                 "Ordered memory/event and donor actions cannot be quantized".to_string();
@@ -10522,6 +10683,7 @@ impl App {
                 | WebAction::ActivateClipSlot { .. }
                 | WebAction::TriggerClipCue { .. }
                 | WebAction::SeekClipSlot { .. }
+                | WebAction::SeekClipSlotTimecode { .. }
                 | WebAction::PrepareScene { .. }
                 | WebAction::TriggerScene { .. }
                 | WebAction::TapTempo
@@ -10530,6 +10692,8 @@ impl App {
                 | WebAction::GyroCalibrate
                 | WebAction::Pad { .. }
                 | WebAction::TriggerCollisionScore
+                | WebAction::TriggerRefreshGarden
+                | WebAction::ClearTemporalEventTrack
                 | WebAction::ClearTemporalMemory
                 | WebAction::ClearMotionMemory
                 | WebAction::SetOutputWindow { .. }
@@ -12482,6 +12646,55 @@ impl App {
                     }
                 }
             }
+            WebAction::SeekClipSlotTimecode {
+                layer_id,
+                slot_id,
+                timecode,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    let slot_present = self.layers[index].clip_slots.get(slot_id).is_some();
+                    if !slot_present {
+                        self.source_staging_status = format!(
+                            "Slot {} is absent from layer {}",
+                            slot_id.get(),
+                            self.layers[index].layer_id()
+                        );
+                    } else if self.layers[index].active_clip_slot != slot_id {
+                        self.source_staging_status = format!(
+                            "Timecode seek requires active slot {} on layer {}",
+                            slot_id.get(),
+                            self.layers[index].layer_id()
+                        );
+                    } else {
+                        let duration = self.layers[index].source_duration_seconds();
+                        match timecode.normalized_for_duration(duration) {
+                            Ok(position) => {
+                                self.clear_performance_transactions();
+                                let layer = &mut self.layers[index];
+                                if let Some(slot) = layer.clip_slots.get_mut(slot_id) {
+                                    slot.saved_playhead = position;
+                                }
+                                layer.request_transport_seek(position);
+                                self.source_staging_status = format!(
+                                    "Sought layer {} slot {} to {:.3} source seconds",
+                                    layer.layer_id(),
+                                    slot_id.get(),
+                                    timecode.source_seconds()
+                                );
+                            }
+                            Err(error) => {
+                                self.source_staging_status = format!(
+                                    "Timecode seek rejected for layer {} slot {}: {error}",
+                                    self.layers[index].layer_id(),
+                                    slot_id.get()
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    self.source_staging_status = format!("Layer {layer_id} is absent");
+                }
+            }
             WebAction::PrepareScene { scene_id } => {
                 let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
                 if self.cached_performance_position(&key).is_some() {
@@ -13438,6 +13651,7 @@ impl App {
                             Some("audio_energy") => temporal::RefreshGardenGate::AudioEnergy,
                             Some("audio_onset") => temporal::RefreshGardenGate::AudioOnset,
                             Some("matte") => temporal::RefreshGardenGate::Matte,
+                            Some("motion") => temporal::RefreshGardenGate::Motion,
                             _ => p.originals.garden.gate,
                         };
                     }
@@ -13516,6 +13730,62 @@ impl App {
             WebAction::TriggerCollisionScore => {
                 self.pending_temporal_events.manual_events =
                     self.pending_temporal_events.manual_events.saturating_add(1);
+            }
+            WebAction::TriggerRefreshGarden => {
+                self.pending_temporal_events.garden_refresh_events = self
+                    .pending_temporal_events
+                    .garden_refresh_events
+                    .saturating_add(1);
+            }
+            WebAction::SetRefreshGardenMatteRoute {
+                layer_id,
+                stage,
+                layer_stack_revision,
+            } => match self
+                .resolve_refresh_garden_route_layer(layer_id.as_deref(), layer_stack_revision)
+            {
+                Ok(Some((layer_id, saved_position))) => {
+                    self.temporal_params.originals.garden.matte_route =
+                        temporal::RefreshGardenMatteRoute::SelectedLayer {
+                            layer_id,
+                            saved_position,
+                            stage,
+                        };
+                    self.composition_status =
+                        format!("Refresh Garden Matte routed to layer {}", layer_id.get());
+                }
+                Ok(None) => {
+                    self.temporal_params.originals.garden.matte_route =
+                        temporal::RefreshGardenMatteRoute::None;
+                    self.composition_status = "Refresh Garden Matte route cleared".to_string();
+                }
+                Err(error) => self.composition_status = error,
+            },
+            WebAction::SetRefreshGardenMotionRoute {
+                layer_id,
+                layer_stack_revision,
+            } => match self
+                .resolve_refresh_garden_route_layer(layer_id.as_deref(), layer_stack_revision)
+            {
+                Ok(Some((layer_id, saved_position))) => {
+                    self.temporal_params.originals.garden.motion_route =
+                        temporal::RefreshGardenMotionRoute::SelectedLayer {
+                            layer_id,
+                            saved_position,
+                        };
+                    self.composition_status =
+                        format!("Refresh Garden Motion routed to layer {}", layer_id.get());
+                }
+                Ok(None) => {
+                    self.temporal_params.originals.garden.motion_route =
+                        temporal::RefreshGardenMotionRoute::None;
+                    self.composition_status = "Refresh Garden Motion route cleared".to_string();
+                }
+                Err(error) => self.composition_status = error,
+            },
+            WebAction::ClearTemporalEventTrack => {
+                self.temporal_event_recorder.clear();
+                self.composition_status = "Cleared recorded temporal event track".to_string();
             }
             WebAction::SetMotion { .. }
             | WebAction::SetMotionDonor { .. }
@@ -13952,6 +14222,7 @@ impl App {
                 fps,
                 duration_secs,
                 ntsc_quality,
+                shutter_samples,
                 audio_layer,
                 audio_layer_id,
             } => {
@@ -14032,7 +14303,9 @@ impl App {
                             .as_ref()
                             .map(|_| self.mod_matrix.audio_clip_path.clone()),
                         ntsc_quality,
+                        shutter_samples,
                         media_safety_policy: self.media_safety_policy.clone(),
+                        temporal_event_track: self.temporal_event_recorder.track().clone(),
                     };
                     for layer in self.layers.iter().filter(|layer| !layer.is_file_media()) {
                         log::warn!(
@@ -14495,6 +14768,11 @@ impl App {
             total_reference_ticks: temporal_metrics.total_reference_ticks,
             score_state: temporal_metrics.score_state,
             score_event_ordinal: temporal_metrics.score_event_ordinal,
+            recorded_event_points: u32::try_from(
+                self.temporal_event_recorder.track().events().len(),
+            )
+            .unwrap_or(u32::MAX),
+            event_track_truncated: self.temporal_event_recorder.track().truncated(),
             frame_staged: temporal_metrics.frame_staged,
             last_reset: temporal_metrics
                 .last_reset
@@ -16331,6 +16609,7 @@ impl ApplicationHandler for App {
                             downbeat_events: temporal_crossings.bars,
                             audio_onset_events: temporal_audio_onsets,
                             manual_events: 0,
+                            garden_refresh_events: 0,
                         },
                     );
 
@@ -16470,7 +16749,7 @@ impl ApplicationHandler for App {
                         self.layers.iter().map(|layer| layer.matte).collect();
                     let evaluated_master_motion =
                         modulation_frame.modulate_motion(&self.master_motion);
-                    let evaluated_layer_motion = self
+                    let mut evaluated_layer_motion = self
                         .layers
                         .iter()
                         .enumerate()
@@ -16533,6 +16812,93 @@ impl ApplicationHandler for App {
                                 None
                             }
                         };
+                    // Decoder status is only an optimistic planning hint. A
+                    // codec source is renderable only after its exact proven
+                    // product has successfully rasterized and matched the
+                    // immutable field slot. If that preparation fails, rerun
+                    // the pure planner with codec availability removed so
+                    // Auto selects its deterministic lattice fallback and
+                    // explicit CodecVectors remains honest zero.
+                    let mut motion_source_diagnostics = Vec::new();
+                    let unavailable_codec_scopes = evaluated_creative
+                        .as_ref()
+                        .and_then(|plan| match plan {
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                advanced,
+                            ) => advanced.motion().advanced(),
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::LegacyExact(_) => None,
+                        })
+                        .map_or_else(Vec::new, |motion_plan| {
+                            let (diagnostics, unavailable) = refresh_live_codec_motion_cache(
+                                &self.layers,
+                                motion_plan,
+                                &mut self.motion_field_cache,
+                            );
+                            motion_source_diagnostics.extend(diagnostics);
+                            unavailable
+                        });
+                    if !unavailable_codec_scopes.is_empty() {
+                        for layer in &mut evaluated_layer_motion {
+                            if unavailable_codec_scopes
+                                .contains(&visual_rack::VisualScopeId::Layer(layer.stable_id))
+                            {
+                                layer.codec.available = false;
+                            }
+                        }
+                        let mut retry_input =
+                            evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                                &evaluated_composition,
+                                &evaluated_master_rack,
+                                &evaluated_layer_racks,
+                            )
+                            .with_layer_mattes(
+                                &authored_layer_mattes,
+                                advanced_program_history_initialized,
+                            )
+                            .with_motion(
+                                evaluated_master_motion,
+                                &evaluated_layer_motion,
+                                motion_limits,
+                            );
+                        retry_input.resource_limits.max_texture_dimension_2d =
+                            limits.max_texture_dimension_2d;
+                        retry_input.resource_limits.max_texture_array_layers =
+                            limits.max_texture_array_layers;
+                        retry_input
+                            .resource_limits
+                            .max_sampled_textures_per_shader_stage =
+                            limits.max_sampled_textures_per_shader_stage;
+                        evaluated_creative = match evaluated_frame.plan_composition(retry_input) {
+                            Ok(plan) => Some(plan),
+                            Err(error) => {
+                                let diagnostic =
+                                    format!("Creative codec fallback plan rejected: {error}");
+                                if diagnostic != self.composition_status {
+                                    log::error!("{diagnostic}");
+                                    self.composition_status.clone_from(&diagnostic);
+                                }
+                                self.motion_field_cache.clear();
+                                None
+                            }
+                        };
+                        if let Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                advanced,
+                            ),
+                        ) = evaluated_creative.as_ref()
+                        {
+                            if let Some(motion_plan) = advanced.motion().advanced() {
+                                let (diagnostics, still_unavailable) =
+                                    refresh_live_codec_motion_cache(
+                                        &self.layers,
+                                        motion_plan,
+                                        &mut self.motion_field_cache,
+                                    );
+                                motion_source_diagnostics.extend(diagnostics);
+                                debug_assert!(still_unavailable.is_empty());
+                            }
+                        }
+                    }
                     if advanced_program_history_initialized {
                         let warmed_identity_matches = evaluated_creative.as_ref().is_some_and(
                             |plan| {
@@ -16656,13 +17022,8 @@ impl ApplicationHandler for App {
                                 plan,
                             ),
                         ) => {
-                            if let Some(motion_plan) = plan.motion().advanced() {
-                                let motion_diagnostics = refresh_live_codec_motion_cache(
-                                    &self.layers,
-                                    motion_plan,
-                                    &mut self.motion_field_cache,
-                                );
-                                if let Some(diagnostic) = motion_diagnostics.first() {
+                            if plan.motion().advanced().is_some() {
+                                if let Some(diagnostic) = motion_source_diagnostics.first() {
                                     let diagnostic =
                                         format!("Motion source diagnostic: {diagnostic}");
                                     if diagnostic != self.composition_status {
@@ -16713,6 +17074,7 @@ impl ApplicationHandler for App {
                             }
                         }
                         None => {
+                            self.motion_field_cache.clear();
                             self.image_routing_diagnostics = self
                                 .layers
                                 .iter()
@@ -17651,6 +18013,15 @@ impl ApplicationHandler for App {
                             }
                         }
                         if temporal_frame_accepted && temporal_input.freeze.program_advances() {
+                            if !self
+                                .temporal_event_recorder
+                                .record_accepted(program_delta, self.pending_temporal_events)
+                            {
+                                self.composition_status = format!(
+                                    "Temporal event track reached its {}-point cap; newer explicit events remain live-only",
+                                    temporal::MAX_RECORDED_TEMPORAL_EVENT_POINTS
+                                );
+                            }
                             self.pending_temporal_events = temporal::TemporalFrameEvents::default();
                         }
                         if selective_required {
@@ -18727,6 +19098,208 @@ mod app_state_tests {
     }
 
     #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn live_motion_cache_does_not_alias_distinct_codec_payloads_with_equal_endpoints() {
+        use evaluated_frame::evaluated_composition::{
+            CompositionPlanInput, EvaluatedCompositionPlan, LayerMotionPlanInput,
+            MotionCodecFrameFacts,
+        };
+        use motion::{
+            CurvedShutterParams, MotionDeviceLimits, MotionFieldSource, MotionLatticeQuality,
+            MotionParams,
+        };
+        use video::threaded::ReadyFrame;
+        use video::{
+            AdjacentReferencePolicy, CodecFrameIdentity, CodecMotionFrame, CodecMotionFrameType,
+            CodecMotionProduct, CodecMotionProvenance, CodecMotionStatus, CodecPastReferenceProof,
+            CodecTimeBase,
+        };
+
+        fn codec_product(motion_x: i32) -> CodecMotionProduct {
+            CodecMotionFrame {
+                source_dimensions: [1, 1],
+                frame_delta_seconds: 1.0 / 30.0,
+                source_generation: 7,
+                frame_ordinal: 9,
+                algorithm_version: motion::MOTION_ALGORITHM_VERSION,
+                provenance: CodecMotionProvenance::FfmpegExportMvs,
+                frame_type: CodecMotionFrameType::Predictive,
+                status: CodecMotionStatus::Available,
+                past_reference_proof: Some(CodecPastReferenceProof {
+                    policy: AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp,
+                    reference: CodecFrameIdentity {
+                        source_generation: 7,
+                        pts: 8,
+                        presentation_ordinal: 8,
+                    },
+                    destination: CodecFrameIdentity {
+                        source_generation: 7,
+                        pts: 9,
+                        presentation_ordinal: 9,
+                    },
+                    elapsed_ticks: 1,
+                    time_base: CodecTimeBase::new(1, 30).unwrap(),
+                }),
+                vectors: vec![motion::CodecMotionVector {
+                    destination: [0, 0],
+                    block: [1, 1],
+                    motion: [motion_x, 0],
+                    motion_scale: 1,
+                    seconds_from_reference: 1.0 / 30.0,
+                    reference: motion::CodecReferenceDirection::Past,
+                    visibility: 1.0,
+                }],
+            }
+            .into()
+        }
+
+        fn ready(product: CodecMotionProduct) -> ReadyFrame {
+            ReadyFrame {
+                rgba: vec![255, 0, 0, 255],
+                codec_motion: Some(product),
+                loops_advanced: 0,
+                source_generation: 7,
+                pts: Some(9),
+                codec_identity: None,
+                source_seconds: 9.0 / 30.0,
+                duration_seconds: 1.0,
+            }
+        }
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter for live motion cache regression");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Live Motion Cache Identity Test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device for live motion cache regression");
+
+        let mut layer = Layer::new_spout_with_media_policy(
+            "motion-cache-digest-regression",
+            &device,
+            &queue,
+            &media_safety::MediaSafetyPolicy::safe(),
+        )
+        .unwrap();
+        let layer_id = layer.stable_layer_id();
+        let composition = legacy_runtime_composition(&[layer_id]).unwrap();
+        let master_rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layer_racks = [(
+            layer_id,
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        let effects = effects::EffectUniforms::default();
+        let transform = spatial::SpatialTransform::default();
+        let ntsc = ntsc::NtscParams::default();
+        let temporal = effects::params::TemporalParams::default();
+        let modulation = modulation::ModMatrix::new().frame(1);
+        let evaluated = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(1, 1, 0.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(layer_id.get(), 0, 1, 1),
+                effects: &effects,
+                transform: &transform,
+                opacity: 1.0,
+                speed: 1.0,
+                fps: 30.0,
+                blend_mode: layers::BlendMode::Normal,
+                visible: true,
+                paused: false,
+                bypass_master_fx: false,
+            }],
+        );
+        let layer_motion = [LayerMotionPlanInput {
+            stable_id: layer_id,
+            params: MotionParams {
+                field_source: MotionFieldSource::CodecVectors,
+                lattice_quality: MotionLatticeQuality::Live,
+                shutter: CurvedShutterParams {
+                    angle_degrees: 180.0,
+                    ..CurvedShutterParams::default()
+                },
+                ..MotionParams::default()
+            },
+            codec: MotionCodecFrameFacts {
+                available: true,
+                source_generation: 7,
+                frame_ordinal: 9,
+            },
+        }];
+        let mattes = [image_routing::LayerMatte::default()];
+        let plan = evaluated
+            .plan_composition(
+                CompositionPlanInput::new(&composition, &master_rack, &layer_racks)
+                    .with_layer_mattes(&mattes, false)
+                    .with_motion(
+                        MotionParams::default(),
+                        &layer_motion,
+                        MotionDeviceLimits::new(
+                            device.limits().max_texture_dimension_2d,
+                            device.limits().max_buffer_size,
+                        ),
+                    ),
+            )
+            .unwrap();
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            panic!("active codec motion fixture delegated LegacyExact")
+        };
+        let motion_plan = plan.motion().advanced().unwrap();
+
+        let first = codec_product(-1);
+        let first_identity = first.exact_identity().unwrap();
+        layer
+            .upload_ready_media_frame(&device, &queue, &mut ready(first))
+            .unwrap();
+        let mut cache = Vec::new();
+        let (diagnostics, unavailable) =
+            refresh_live_codec_motion_cache(std::slice::from_ref(&layer), motion_plan, &mut cache);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(unavailable.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].codec_identity, first_identity);
+        assert!(cache[0].field.sample(0, 0).unwrap().velocity_uv_per_second[0] > 0.0);
+
+        let second = codec_product(1);
+        let second_identity = second.exact_identity().unwrap();
+        assert_eq!(
+            first_identity.first_reference,
+            second_identity.first_reference
+        );
+        assert_eq!(
+            first_identity.latest_destination,
+            second_identity.latest_destination
+        );
+        assert_ne!(
+            first_identity.content_sha256,
+            second_identity.content_sha256
+        );
+        layer
+            .upload_ready_media_frame(&device, &queue, &mut ready(second))
+            .unwrap();
+        let (diagnostics, unavailable) =
+            refresh_live_codec_motion_cache(std::slice::from_ref(&layer), motion_plan, &mut cache);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(unavailable.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].codec_identity, second_identity);
+        assert!(cache[0].field.sample(0, 0).unwrap().velocity_uv_per_second[0] < 0.0);
+    }
+
+    #[test]
     fn m3_event_acceptance_rejected_exact_retains_events_and_manual_clear_holds() {
         use renderer::state::TemporalState;
         use temporal::{
@@ -18772,10 +19345,15 @@ mod app_state_tests {
             trigger: CollisionScoreTrigger::Manual,
             ..CollisionScoreParams::default()
         };
+        app.temporal_params.originals.garden.amount = 0.5;
         for _ in 0..3 {
             app.handle_web_action(WebAction::TriggerCollisionScore);
         }
+        for _ in 0..2 {
+            app.handle_web_action(WebAction::TriggerRefreshGarden);
+        }
         assert_eq!(app.pending_temporal_events.manual_events, 3);
+        assert_eq!(app.pending_temporal_events.garden_refresh_events, 2);
 
         let mut state = TemporalState::default();
         state.stage_frame(
@@ -18796,6 +19374,7 @@ mod app_state_tests {
         assert!(!state.has_staged_frame());
         assert_eq!(state.metrics(), before_rejection);
         assert_eq!(app.pending_temporal_events.manual_events, 3);
+        assert_eq!(app.pending_temporal_events.garden_refresh_events, 2);
 
         // An accepted Program Freeze frame may maintain the held image but may
         // neither consume Score events nor release the pending batch.
@@ -18811,12 +19390,14 @@ mod app_state_tests {
             TemporalFrameAction::HoldFrozenOutput
         ));
         assert_eq!(frozen_plan.score_events_consumed, 0);
+        assert_eq!(frozen_plan.garden_refresh_events_consumed, 0);
         state.commit_staged();
         if frozen_input.freeze.program_advances() {
             app.pending_temporal_events = TemporalFrameEvents::default();
         }
         assert_eq!(state.metrics(), before_rejection);
         assert_eq!(app.pending_temporal_events.manual_events, 3);
+        assert_eq!(app.pending_temporal_events.garden_refresh_events, 2);
 
         // The next accepted advancing frame consumes all three events exactly
         // once and only then releases the live pending batch.
@@ -18828,6 +19409,8 @@ mod app_state_tests {
         );
         let accepted_plan = state.stage_frame(&app.temporal_params, accepted_input, [64, 36]);
         assert_eq!(accepted_plan.score_events_consumed, 3);
+        assert_eq!(accepted_plan.garden_refresh_events_consumed, 2);
+        assert!(accepted_plan.garden_force_refresh);
         state.commit_staged();
         if accepted_input.freeze.program_advances() {
             app.pending_temporal_events = TemporalFrameEvents::default();
@@ -18838,8 +19421,11 @@ mod app_state_tests {
         // Trigger is saturating; Clear is domain-specific and preserves the
         // already materialized Program Freeze audience image.
         app.pending_temporal_events.manual_events = u32::MAX;
+        app.pending_temporal_events.garden_refresh_events = u32::MAX;
         app.handle_web_action(WebAction::TriggerCollisionScore);
+        app.handle_web_action(WebAction::TriggerRefreshGarden);
         assert_eq!(app.pending_temporal_events.manual_events, u32::MAX);
+        assert_eq!(app.pending_temporal_events.garden_refresh_events, u32::MAX);
         let held_before_clear = state.metrics().freeze_hold_valid;
         assert!(held_before_clear);
         state.reset_for(TemporalResetCause::ManualClear);
@@ -19328,6 +19914,102 @@ mod app_state_tests {
             motion::MotionDonor::Missing {
                 saved_position: one
             }
+        );
+    }
+
+    #[test]
+    fn refresh_garden_route_actions_are_revisioned_historic_and_broad_reset_closed() {
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let saved_position = performance::SavedLayerPosition::new(2).unwrap();
+        app.temporal_params.originals.garden.gate = temporal::RefreshGardenGate::Matte;
+        app.temporal_params.originals.garden.matte_route =
+            temporal::RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position,
+                stage: image_routing::LayerImageStage::PreLocalEffects,
+            };
+        let revision = app.layer_stack_revision;
+
+        app.handle_web_action(WebAction::SetRefreshGardenMatteRoute {
+            layer_id: None,
+            stage: image_routing::LayerImageStage::PostLocalEffects,
+            layer_stack_revision: revision,
+        });
+        assert_eq!(
+            app.temporal_params.originals.garden.matte_route,
+            temporal::RefreshGardenMatteRoute::None
+        );
+        app.handle_web_action(WebAction::UndoManual);
+        assert_eq!(
+            app.temporal_params.originals.garden.matte_route,
+            temporal::RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position,
+                stage: image_routing::LayerImageStage::PreLocalEffects,
+            }
+        );
+        app.handle_web_action(WebAction::RedoManual);
+        assert_eq!(
+            app.temporal_params.originals.garden.matte_route,
+            temporal::RefreshGardenMatteRoute::None
+        );
+
+        app.temporal_params.originals.garden.motion_route =
+            temporal::RefreshGardenMotionRoute::MissingSelectedLayer { saved_position };
+        app.handle_web_action(WebAction::SetRefreshGardenMotionRoute {
+            layer_id: None,
+            layer_stack_revision: revision.wrapping_add(1),
+        });
+        assert_eq!(
+            app.temporal_params.originals.garden.motion_route,
+            temporal::RefreshGardenMotionRoute::MissingSelectedLayer { saved_position }
+        );
+        assert!(app.composition_status.contains("stale"));
+
+        let removed = stable_layer(91);
+        app.temporal_params.originals.garden.matte_route =
+            temporal::RefreshGardenMatteRoute::SelectedLayer {
+                layer_id: removed,
+                saved_position,
+                stage: image_routing::LayerImageStage::PostLocalEffects,
+            };
+        app.temporal_params.originals.garden.motion_route =
+            temporal::RefreshGardenMotionRoute::SelectedLayer {
+                layer_id: removed,
+                saved_position,
+            };
+        app.preserve_refresh_garden_routes_before_remove(1, removed);
+        assert_eq!(
+            app.temporal_params.originals.garden.matte_route,
+            temporal::RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position: performance::SavedLayerPosition::new(1).unwrap(),
+                stage: image_routing::LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            app.temporal_params.originals.garden.motion_route,
+            temporal::RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: performance::SavedLayerPosition::new(1).unwrap(),
+            }
+        );
+        app.refresh_refresh_garden_route_saved_positions();
+        assert!(matches!(
+            app.temporal_params.originals.garden.motion_route,
+            temporal::RefreshGardenMotionRoute::MissingSelectedLayer { .. }
+        ));
+
+        app.handle_web_action(WebAction::SetTemporal {
+            param: "garden_gate".into(),
+            value: serde_json::json!("motion"),
+        });
+        assert_eq!(
+            app.temporal_params.originals.garden.gate,
+            temporal::RefreshGardenGate::Motion
+        );
+        app.handle_web_action(WebAction::ResetVisualProgram);
+        assert_eq!(
+            app.temporal_params.originals.garden,
+            temporal::RefreshGardenParams::default()
         );
     }
 
@@ -20151,6 +20833,7 @@ mod app_state_tests {
             loops_advanced: 0,
             source_generation,
             pts: None,
+            codec_identity: None,
             source_seconds,
             duration_seconds: 10.0,
         };

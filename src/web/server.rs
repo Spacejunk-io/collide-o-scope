@@ -904,7 +904,9 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
             );
         }
         // These are topology/routing fields and use barrier actions.
-        "variant" | "image_tap" | "image_channel" | "image_invert" => return false,
+        "variant" | "image_tap" | "image_channel" | "image_invert" | "donor_tap" => {
+            return false;
+        }
         _ => {}
     }
     let Some(descriptor) = crate::visual_rack::NODE_PARAM_DESCRIPTORS
@@ -1060,6 +1062,7 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
                     | "audio_energy"
                     | "audio_onset"
                     | "matte"
+                    | "motion"
             )
         ),
         "score_enabled" => value.is_boolean(),
@@ -1297,6 +1300,10 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     | WebAction::SetNewLayerFit { .. }
                     | WebAction::ClearTemporalMemory
                     | WebAction::TriggerCollisionScore
+                    | WebAction::TriggerRefreshGarden
+                    | WebAction::SetRefreshGardenMatteRoute { .. }
+                    | WebAction::SetRefreshGardenMotionRoute { .. }
+                    | WebAction::ClearTemporalEventTrack
                     | WebAction::SetMotionDonor { .. }
                     | WebAction::ClearMotionMemory
                     | WebAction::BeginHistoryGesture { .. }
@@ -1490,7 +1497,8 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         | WebAction::SetClipCue { layer_id, .. }
         | WebAction::RemoveClipCue { layer_id, .. }
         | WebAction::TriggerClipCue { layer_id, .. }
-        | WebAction::SeekClipSlot { layer_id, .. } => valid_required_stable_id(layer_id),
+        | WebAction::SeekClipSlot { layer_id, .. }
+        | WebAction::SeekClipSlotTimecode { layer_id, .. } => valid_required_stable_id(layer_id),
         WebAction::SetClipTransport {
             layer_id,
             param,
@@ -1628,7 +1636,19 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         WebAction::SetTemporal { param, value } => {
             valid_identifier(param, 64) && valid_temporal_edit(param, value)
         }
-        WebAction::ClearTemporalMemory | WebAction::TriggerCollisionScore => true,
+        WebAction::ClearTemporalMemory
+        | WebAction::TriggerCollisionScore
+        | WebAction::TriggerRefreshGarden
+        | WebAction::ClearTemporalEventTrack => true,
+        WebAction::SetRefreshGardenMatteRoute {
+            layer_id,
+            layer_stack_revision,
+            ..
+        }
+        | WebAction::SetRefreshGardenMotionRoute {
+            layer_id,
+            layer_stack_revision,
+        } => layer_id.as_deref().is_none_or(valid_required_stable_id) && *layer_stack_revision != 0,
         WebAction::SetMotion {
             scope,
             param,
@@ -1777,6 +1797,7 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             height,
             fps,
             duration_secs,
+            shutter_samples,
             audio_layer_id,
             ..
         } => {
@@ -1791,6 +1812,7 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && duration_secs.is_finite()
                 && *duration_secs > 0.0
                 && *duration_secs <= 3600.0
+                && shutter_samples.is_valid()
                 && valid_optional_layer_id(audio_layer_id)
         }
         _ => true,
@@ -2347,6 +2369,7 @@ mod tests {
             fps: 240,
             duration_secs: 1.0,
             ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+            shutter_samples: crate::render_export::ExportShutterSamples::Authored,
             audio_layer: None,
             audio_layer_id: None,
         };
@@ -2357,6 +2380,7 @@ mod tests {
             fps: 60,
             duration_secs: 0.0,
             ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+            shutter_samples: crate::render_export::ExportShutterSamples::Authored,
             audio_layer: None,
             audio_layer_id: None,
         };
@@ -2367,6 +2391,7 @@ mod tests {
             fps: 60,
             duration_secs: 1.0,
             ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+            shutter_samples: crate::render_export::ExportShutterSamples::Samples16,
             audio_layer: None,
             audio_layer_id: None,
         };
@@ -2377,6 +2402,7 @@ mod tests {
             fps: 60,
             duration_secs: 1.0,
             ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+            shutter_samples: crate::render_export::ExportShutterSamples::Authored,
             audio_layer: None,
             audio_layer_id: None,
         };
@@ -2685,7 +2711,6 @@ mod tests {
             "wet",
             &serde_json::json!(0.5)
         ));
-
         let missing_layer = CreativeImageTapSnapshot {
             input: CreativeImageSourceSnapshot::MissingSelectedLayer {
                 saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
@@ -2882,6 +2907,7 @@ mod tests {
             ("atlas_collision", serde_json::json!(1.0)),
             ("garden_amount", serde_json::json!(1.0)),
             ("garden_gate", serde_json::json!("audio_onset")),
+            ("garden_gate", serde_json::json!("motion")),
             ("garden_threshold", serde_json::json!(1.0)),
             ("garden_softness", serde_json::json!(0.5)),
             ("garden_decay", serde_json::json!(1.0)),
@@ -2915,7 +2941,7 @@ mod tests {
             ("loom_quantization", serde_json::json!(25)),
             ("atlas_seed", serde_json::json!(u64::from(u32::MAX) + 1)),
             ("atlas_territories", serde_json::json!(0)),
-            ("garden_gate", serde_json::json!("motion")),
+            ("garden_gate", serde_json::json!("flow")),
             ("garden_softness", serde_json::json!(0.501)),
             ("score_enabled", serde_json::json!(1)),
             ("score_state_count", serde_json::json!(1)),
@@ -2937,6 +2963,8 @@ mod tests {
 
         assert!(valid_action(&WebAction::ClearTemporalMemory, 0));
         assert!(valid_action(&WebAction::TriggerCollisionScore, 0));
+        assert!(valid_action(&WebAction::TriggerRefreshGarden, 0));
+        assert!(valid_action(&WebAction::ClearTemporalEventTrack, 0));
         assert!(!valid_action(
             &WebAction::Quantized {
                 inner: Box::new(WebAction::ClearTemporalMemory)
@@ -2946,6 +2974,18 @@ mod tests {
         assert!(!valid_action(
             &WebAction::Quantized {
                 inner: Box::new(WebAction::TriggerCollisionScore)
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(WebAction::TriggerRefreshGarden)
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(WebAction::ClearTemporalEventTrack)
             },
             0
         ));
@@ -3051,6 +3091,55 @@ mod tests {
             assert!(!valid_action(
                 &WebAction::Quantized {
                     inner: Box::new(barrier)
+                },
+                0
+            ));
+        }
+    }
+
+    #[test]
+    fn refresh_garden_routes_require_stable_ids_revisions_and_known_stages() {
+        let matte: WebAction = serde_json::from_str(
+            r#"{"action":"set_refresh_garden_matte_route","layer_id":"91","stage":"pre_local_effects","layer_stack_revision":4}"#,
+        )
+        .unwrap();
+        let motion: WebAction = serde_json::from_str(
+            r#"{"action":"set_refresh_garden_motion_route","layer_id":"77","layer_stack_revision":4}"#,
+        )
+        .unwrap();
+        let clear: WebAction = serde_json::from_str(
+            r#"{"action":"set_refresh_garden_motion_route","layer_id":null,"layer_stack_revision":4}"#,
+        )
+        .unwrap();
+        assert!(valid_action(&matte, 0));
+        assert!(valid_action(&motion, 0));
+        assert!(valid_action(&clear, 0));
+
+        for invalid in [
+            WebAction::SetRefreshGardenMatteRoute {
+                layer_id: Some("0".into()),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                layer_stack_revision: 4,
+            },
+            WebAction::SetRefreshGardenMotionRoute {
+                layer_id: Some("missing:2".into()),
+                layer_stack_revision: 4,
+            },
+            WebAction::SetRefreshGardenMotionRoute {
+                layer_id: None,
+                layer_stack_revision: 0,
+            },
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_refresh_garden_matte_route","layer_id":"91","stage":"raw","layer_stack_revision":4}"#
+        )
+        .is_err());
+        for barrier in [matte, motion, clear] {
+            assert!(!valid_action(
+                &WebAction::Quantized {
+                    inner: Box::new(barrier),
                 },
                 0
             ));

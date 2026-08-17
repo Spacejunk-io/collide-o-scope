@@ -1593,6 +1593,15 @@ mod tests {
         left.loom.interpolation = crate::effects::params::TemporalInterpolation::Linear;
         left.atlas.seed = 0xdead_beef;
         left.garden.gate = crate::effects::params::RefreshGardenGate::AudioOnset;
+        left.garden.matte_route = crate::temporal::RefreshGardenMatteRoute::SelectedLayer {
+            layer_id: crate::image_routing::StableLayerId::new(91).unwrap(),
+            saved_position: crate::performance::SavedLayerPosition::new(3).unwrap(),
+            stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+        };
+        left.garden.motion_route =
+            crate::temporal::RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: crate::performance::SavedLayerPosition::new(5).unwrap(),
+            };
         left.score.enabled = true;
         left.score.seed = 0x1234_5678;
         left.score.trigger = crate::effects::params::CollisionScoreTrigger::Manual;
@@ -1622,6 +1631,8 @@ mod tests {
         assert_eq!(left.loom.interpolation, authored.loom.interpolation);
         assert_eq!(left.atlas.seed, authored.atlas.seed);
         assert_eq!(left.garden.gate, authored.garden.gate);
+        assert_eq!(left.garden.matte_route, authored.garden.matte_route);
+        assert_eq!(left.garden.motion_route, authored.garden.motion_route);
         assert_eq!(left.score, authored.score);
         assert_eq!(left.reset, authored.reset);
 

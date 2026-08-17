@@ -113,9 +113,8 @@ fn trajectory_sample(
     );
     let offset = velocity * uniforms.frame_values.x * exposure * trajectory(value);
     let transformed_uv = mapped_uv(uv, row_0, row_1);
-    return sample_carrier_premultiplied_linear(
-        clamp(transformed_uv - offset, vec2<f32>(0.0), vec2<f32>(1.0)),
-    );
+    let coordinate = clamp(transformed_uv - offset, vec2<f32>(0.0), vec2<f32>(1.0));
+    return sample_carrier_premultiplied_linear(coordinate);
 }
 
 @fragment

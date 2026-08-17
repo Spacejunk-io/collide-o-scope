@@ -17,7 +17,8 @@ use crate::transport::{
 };
 use crate::video::threaded::{DecoderHealth, DecoderTelemetry, ReadyFrame};
 use crate::video::{
-    decode_still_image_with_media_policy, CodecMotionFrame, StillImage, ThreadedDecoder,
+    decode_still_image_with_media_policy, CodecMotionFrame, CodecMotionProduct, StillImage,
+    ThreadedDecoder,
 };
 use crate::visual_rack::{LegacyRackScope, RuntimeVisualRack};
 
@@ -71,7 +72,7 @@ fn reset_layer_motion(motion: &mut MotionParams) {
 fn take_matching_codec_motion(
     frame: &mut ReadyFrame,
     source_dimensions: [u32; 2],
-) -> Option<CodecMotionFrame> {
+) -> Option<CodecMotionProduct> {
     frame.codec_motion.take().filter(|motion| {
         motion.source_generation == frame.source_generation
             && motion.source_dimensions == source_dimensions
@@ -213,7 +214,7 @@ pub(crate) struct LayerSourceActivation {
     preload_bytes: u64,
     source_error: String,
     source_frame_initialized: bool,
-    codec_motion: Option<CodecMotionFrame>,
+    codec_motion: Option<CodecMotionProduct>,
 }
 
 /// Ownership returned when an already-live source is displaced by a prepared
@@ -375,7 +376,7 @@ pub struct Layer {
     source_frame_initialized: bool,
     /// Decoder metadata committed with the exact RGBA upload currently held
     /// by `texture`. Runtime-only: patches and prepared authoring never see it.
-    codec_motion: Option<CodecMotionFrame>,
+    codec_motion: Option<CodecMotionProduct>,
     /// Conservative CPU/GPU working-set charge used while this source is an
     /// inactive prepared slot. Active sources are deliberately outside that
     /// evictable ledger, but the exact charge follows ownership on a swap.
@@ -1041,6 +1042,13 @@ impl Layer {
     /// texture. Intra/unavailable/rejected products remain visible here for
     /// truthful source diagnostics; only `Available` products yield vectors.
     pub fn codec_motion(&self) -> Option<&CodecMotionFrame> {
+        self.codec_motion.as_ref().map(CodecMotionProduct::latest)
+    }
+
+    /// Exact direct-or-skipped-frame codec product paired with the currently
+    /// uploaded RGBA image. Motion rasterization consumes this richer value;
+    /// metadata-only callers can continue using [`Self::codec_motion`].
+    pub fn codec_motion_product(&self) -> Option<&CodecMotionProduct> {
         self.codec_motion.as_ref()
     }
 
@@ -1075,7 +1083,12 @@ impl Layer {
         let upload_duration = upload_started.elapsed();
         if upload_result.is_ok() {
             if let LayerSource::Video(decoder) = &mut self.source {
-                decoder.record_upload_duration(upload_duration);
+                decoder.record_accepted_upload(
+                    frame.source_generation,
+                    frame.source_seconds,
+                    frame.codec_identity,
+                    upload_duration,
+                );
             }
         }
         upload_result?;
@@ -1664,20 +1677,25 @@ mod tests {
         fn ready(source_generation: u64, motion_generation: u64) -> ReadyFrame {
             ReadyFrame {
                 rgba: vec![0; 16 * 16 * 4],
-                codec_motion: Some(CodecMotionFrame {
-                    source_dimensions: [16, 16],
-                    frame_delta_seconds: 1.0 / 30.0,
-                    source_generation: motion_generation,
-                    frame_ordinal: 3,
-                    algorithm_version: MOTION_ALGORITHM_VERSION,
-                    provenance: CodecMotionProvenance::FfmpegExportMvs,
-                    frame_type: CodecMotionFrameType::Intra,
-                    status: CodecMotionStatus::Intra,
-                    vectors: Vec::new(),
-                }),
+                codec_motion: Some(
+                    CodecMotionFrame {
+                        source_dimensions: [16, 16],
+                        frame_delta_seconds: 1.0 / 30.0,
+                        source_generation: motion_generation,
+                        frame_ordinal: 3,
+                        algorithm_version: MOTION_ALGORITHM_VERSION,
+                        provenance: CodecMotionProvenance::FfmpegExportMvs,
+                        frame_type: CodecMotionFrameType::Intra,
+                        status: CodecMotionStatus::Intra,
+                        past_reference_proof: None,
+                        vectors: Vec::new(),
+                    }
+                    .into(),
+                ),
                 loops_advanced: 0,
                 source_generation,
                 pts: Some(3),
+                codec_identity: None,
                 source_seconds: 0.1,
                 duration_seconds: 1.0,
             }

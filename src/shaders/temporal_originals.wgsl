@@ -336,7 +336,15 @@ fn legacy_originals(uv: vec2f) -> vec4f {
             } else if gate_mode == 5u {
                 signal = select(0.0, 1.0, audio_onset);
             } else if gate_mode == 6u {
+                // Preserve the frozen LegacyExact active-Matte law. Advanced
+                // routed Matte is evaluated by the dedicated post-temporal
+                // pass; changing this branch would alter pre-M6 Compat8 pixels.
                 signal = current.a;
+            } else if gate_mode == 7u {
+                // A routed motion field is bound by the dedicated Garden
+                // signal path. Until that binding is admitted, Motion is an
+                // honest closed gate rather than falling back to delta.
+                signal = 0.0;
             }
             let opened = select(garden_gate(signal), 1.0, force_refresh);
             let admission = clamp(garden_amount * opened, 0.0, 1.0);
@@ -504,7 +512,9 @@ fn advanced_originals(uv: vec2f) -> vec4f {
             } else if gate_mode == 5u {
                 signal = select(0.0, 1.0, audio_onset);
             } else if gate_mode == 6u {
-                signal = current.a;
+                signal = 0.0;
+            } else if gate_mode == 7u {
+                signal = 0.0;
             }
             let opened = select(garden_gate(signal), 1.0, force_refresh);
             let admission = clamp(garden_amount * opened, 0.0, 1.0);

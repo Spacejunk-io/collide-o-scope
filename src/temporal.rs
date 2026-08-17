@@ -11,7 +11,7 @@
 )]
 
 use crate::effects::params::{normalized_slit_direction, TemporalParams, TEMPORAL_REFERENCE_FPS};
-use crate::image_routing::StableLayerId;
+use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::performance::SavedLayerPosition;
 
 /// Frames of clean output history retained at the 30 Hz authoring rate.
@@ -151,6 +151,109 @@ pub enum RefreshGardenGate {
     AudioEnergy,
     AudioOnset,
     Matte,
+    Motion,
+}
+
+/// Stable current-frame image route used only by the Garden Matte gate.
+///
+/// The saved position is provenance for patch/Morph capture. Live routing is
+/// always by `layer_id`; a removed donor becomes the explicit Missing variant
+/// and can never bind a replacement that later occupies the old position.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RefreshGardenMatteRoute {
+    #[default]
+    None,
+    SelectedLayer {
+        layer_id: StableLayerId,
+        saved_position: SavedLayerPosition,
+        stage: LayerImageStage,
+    },
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+        stage: LayerImageStage,
+    },
+}
+
+impl RefreshGardenMatteRoute {
+    pub(crate) fn mark_layer_missing(
+        &mut self,
+        removed: StableLayerId,
+        removed_position: SavedLayerPosition,
+    ) {
+        let Self::SelectedLayer {
+            layer_id, stage, ..
+        } = *self
+        else {
+            return;
+        };
+        if layer_id == removed {
+            *self = Self::MissingSelectedLayer {
+                saved_position: removed_position,
+                stage,
+            };
+        }
+    }
+
+    pub(crate) fn refresh_saved_position(
+        &mut self,
+        mut position_of: impl FnMut(StableLayerId) -> Option<SavedLayerPosition>,
+    ) {
+        let Self::SelectedLayer {
+            layer_id,
+            saved_position,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if let Some(position) = position_of(*layer_id) {
+            *saved_position = position;
+        }
+    }
+}
+
+/// Stable selected-layer route used by the Garden Motion gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RefreshGardenMotionRoute {
+    #[default]
+    None,
+    SelectedLayer {
+        layer_id: StableLayerId,
+        saved_position: SavedLayerPosition,
+    },
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+    },
+}
+
+impl RefreshGardenMotionRoute {
+    pub(crate) fn mark_layer_missing(
+        &mut self,
+        removed: StableLayerId,
+        removed_position: SavedLayerPosition,
+    ) {
+        if matches!(self, Self::SelectedLayer { layer_id, .. } if *layer_id == removed) {
+            *self = Self::MissingSelectedLayer {
+                saved_position: removed_position,
+            };
+        }
+    }
+
+    pub(crate) fn refresh_saved_position(
+        &mut self,
+        mut position_of: impl FnMut(StableLayerId) -> Option<SavedLayerPosition>,
+    ) {
+        let Self::SelectedLayer {
+            layer_id,
+            saved_position,
+        } = self
+        else {
+            return;
+        };
+        if let Some(position) = position_of(*layer_id) {
+            *saved_position = position;
+        }
+    }
 }
 
 impl RefreshGardenGate {
@@ -163,6 +266,7 @@ impl RefreshGardenGate {
             Self::AudioEnergy => 4,
             Self::AudioOnset => 5,
             Self::Matte => 6,
+            Self::Motion => 7,
         }
     }
 }
@@ -177,6 +281,8 @@ pub struct RefreshGardenParams {
     pub decay: f32,
     /// Zero disables forced periodic admission.
     pub max_hold_ticks: u32,
+    pub matte_route: RefreshGardenMatteRoute,
+    pub motion_route: RefreshGardenMotionRoute,
 }
 
 impl Default for RefreshGardenParams {
@@ -188,6 +294,8 @@ impl Default for RefreshGardenParams {
             softness: 0.03,
             decay: 1.0,
             max_hold_ticks: 0,
+            matte_route: RefreshGardenMatteRoute::None,
+            motion_route: RefreshGardenMotionRoute::None,
         }
     }
 }
@@ -201,6 +309,8 @@ impl RefreshGardenParams {
             softness: finite_or(self.softness, 0.03).clamp(0.0, 0.5),
             decay: finite_or(self.decay, 1.0).clamp(0.0, 1.0),
             max_hold_ticks: self.max_hold_ticks,
+            matte_route: self.matte_route,
+            motion_route: self.motion_route,
         }
     }
 }
@@ -241,6 +351,32 @@ pub struct CollisionScoreParams {
     pub loop_driver: CollisionScoreLoopDriver,
 }
 
+/// The bounded laws selected by one Collision Score state. This is a true
+/// finite-state table: revisiting a state produces the same law for the same
+/// authored seed, independent of render cadence and wall time. The event
+/// ordinal remains available to Collision Atlas as its established seeded
+/// territory stream, but it is not allowed to make the state table unbounded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CollisionScoreMemoryLaw {
+    pub loom_depth_scale: f32,
+    pub loom_phase_offset: f32,
+    pub atlas_collision_offset: f32,
+    pub garden_threshold_offset: f32,
+    pub garden_decay_scale: f32,
+}
+
+impl Default for CollisionScoreMemoryLaw {
+    fn default() -> Self {
+        Self {
+            loom_depth_scale: 1.0,
+            loom_phase_offset: 0.0,
+            atlas_collision_offset: 0.0,
+            garden_threshold_offset: 0.0,
+            garden_decay_scale: 1.0,
+        }
+    }
+}
+
 impl Default for CollisionScoreParams {
     fn default() -> Self {
         Self {
@@ -263,6 +399,43 @@ impl CollisionScoreParams {
             loop_driver: self.loop_driver,
         }
     }
+}
+
+/// Resolve the deterministic bounded law for one Score state. Five isolated
+/// hash lanes prevent adding a law from perturbing the established lanes.
+pub(crate) fn collision_score_memory_law(
+    params: CollisionScoreParams,
+    state: CollisionScoreState,
+) -> CollisionScoreMemoryLaw {
+    let params = params.sanitized();
+    if !params.enabled {
+        return CollisionScoreMemoryLaw::default();
+    }
+    let state = u32::from(state.state_index % params.state_count);
+    let base = params.seed ^ state.wrapping_mul(0x9e37_79b9);
+    let lane = |domain: u32| hash_unit(mix_u32(base ^ domain));
+    CollisionScoreMemoryLaw {
+        loom_depth_scale: 0.5 + lane(0x10d3_71a5) * 0.5,
+        loom_phase_offset: lane(0x8f4c_2bd7) - 0.5,
+        atlas_collision_offset: (lane(0x6a09_e667) - 0.5) * 0.5,
+        garden_threshold_offset: (lane(0xbb67_ae85) - 0.5) * 0.5,
+        garden_decay_scale: 0.75 + lane(0x3c6e_f372) * 0.25,
+    }
+}
+
+fn score_effective_originals(
+    params: TemporalOriginalsParams,
+    state: CollisionScoreState,
+) -> TemporalOriginalsParams {
+    let mut params = params.sanitized();
+    let law = collision_score_memory_law(params.score, state);
+    params.loom.depth = (params.loom.depth * law.loom_depth_scale).clamp(0.0, 1.0);
+    params.loom.phase = (params.loom.phase + law.loom_phase_offset).clamp(-1_000.0, 1_000.0);
+    params.atlas.collision = (params.atlas.collision + law.atlas_collision_offset).clamp(0.0, 1.0);
+    params.garden.threshold =
+        (params.garden.threshold + law.garden_threshold_offset).clamp(0.0, 1.0);
+    params.garden.decay = (params.garden.decay * law.garden_decay_scale).clamp(0.0, 1.0);
+    params
 }
 
 /// Event-local memory reset selected by the temporal originals authoring
@@ -319,6 +492,149 @@ pub(crate) struct TemporalFrameEvents {
     pub downbeat_events: u32,
     pub audio_onset_events: u32,
     pub manual_events: u32,
+    /// Explicit all-pixel Refresh Garden admissions. Multiple events in one
+    /// rendered frame are counted for replay/telemetry, while the pixel law
+    /// needs only one open gate for that batch of reference ticks.
+    pub garden_refresh_events: u32,
+}
+
+/// Hard cap for explicit performance events retained for deterministic
+/// offline replay. Boundary/downbeat/audio events are regenerated from their
+/// authoritative sources and therefore do not consume this track.
+pub(crate) const MAX_RECORDED_TEMPORAL_EVENT_POINTS: usize = 4_096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordedTemporalEventPoint {
+    /// Reference tick relative to the first recorded explicit event.
+    pub reference_tick: u64,
+    pub manual_score_events: u32,
+    pub garden_refresh_events: u32,
+}
+
+/// Portable, bounded explicit-event track passed by value into an export job.
+/// It contains no wall time, GPU state, source path, or runtime identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TemporalEventTrack {
+    origin_tick: Option<u64>,
+    events: Vec<RecordedTemporalEventPoint>,
+    truncated: bool,
+}
+
+impl TemporalEventTrack {
+    pub(crate) fn clear(&mut self) {
+        self.origin_tick = None;
+        self.events.clear();
+        self.truncated = false;
+    }
+
+    pub(crate) fn events(&self) -> &[RecordedTemporalEventPoint] {
+        &self.events
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub(crate) fn record_accepted(
+        &mut self,
+        absolute_reference_tick: u64,
+        events: TemporalFrameEvents,
+    ) -> bool {
+        if events.manual_events == 0 && events.garden_refresh_events == 0 {
+            return true;
+        }
+        let origin = *self.origin_tick.get_or_insert(absolute_reference_tick);
+        let reference_tick = absolute_reference_tick.saturating_sub(origin);
+        if let Some(last) = self
+            .events
+            .last_mut()
+            .filter(|last| last.reference_tick == reference_tick)
+        {
+            last.manual_score_events = last
+                .manual_score_events
+                .saturating_add(events.manual_events);
+            last.garden_refresh_events = last
+                .garden_refresh_events
+                .saturating_add(events.garden_refresh_events);
+            return true;
+        }
+        if self.events.len() >= MAX_RECORDED_TEMPORAL_EVENT_POINTS {
+            self.truncated = true;
+            return false;
+        }
+        self.events.push(RecordedTemporalEventPoint {
+            reference_tick,
+            manual_score_events: events.manual_events,
+            garden_refresh_events: events.garden_refresh_events,
+        });
+        true
+    }
+
+    pub(crate) fn replay(&self) -> TemporalEventReplay<'_> {
+        TemporalEventReplay {
+            events: &self.events,
+            cursor: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TemporalEventReplay<'a> {
+    events: &'a [RecordedTemporalEventPoint],
+    cursor: usize,
+}
+
+impl TemporalEventReplay<'_> {
+    /// Consume every explicit event whose reference tick is due. A low display
+    /// rate may cross several points in one frame; counts are saturated rather
+    /// than silently dropping intermediate gestures.
+    pub(crate) fn events_due(&mut self, reference_tick: u64) -> TemporalFrameEvents {
+        let mut due = TemporalFrameEvents::default();
+        while let Some(point) = self
+            .events
+            .get(self.cursor)
+            .filter(|point| point.reference_tick <= reference_tick)
+        {
+            due.manual_events = due.manual_events.saturating_add(point.manual_score_events);
+            due.garden_refresh_events = due
+                .garden_refresh_events
+                .saturating_add(point.garden_refresh_events);
+            self.cursor += 1;
+        }
+        due
+    }
+}
+
+/// Accepted-frame clock for live event recording. Rejected frames do not
+/// advance it; Program Freeze does not call it. Its only output is a 30 Hz
+/// integer address, matching the temporal authoring reference.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct TemporalEventRecorder {
+    track: TemporalEventTrack,
+    accepted_seconds: f64,
+}
+
+impl TemporalEventRecorder {
+    pub(crate) fn record_accepted(
+        &mut self,
+        delta_seconds: f32,
+        events: TemporalFrameEvents,
+    ) -> bool {
+        let tick = (self.accepted_seconds * f64::from(TEMPORAL_REFERENCE_FPS))
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        let recorded = self.track.record_accepted(tick, events);
+        self.accepted_seconds += f64::from(sanitize_delta(delta_seconds));
+        recorded
+    }
+
+    pub(crate) fn track(&self) -> &TemporalEventTrack {
+        &self.track
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl TemporalFrameEvents {
@@ -618,7 +934,7 @@ impl TemporalOriginalsGpuUniforms {
         audio_onset: bool,
         force_garden_refresh: bool,
     ) -> Self {
-        let params = params.sanitized();
+        let params = score_effective_originals(params, score);
         let aspect = dimensions[0].max(1) as f32 / dimensions[1].max(1) as f32;
         let ordinal = score.event_ordinal;
         Self {
@@ -708,6 +1024,7 @@ pub(crate) struct TemporalFramePlan {
     pub history_write_target: Option<usize>,
     pub observation_ticks: u32,
     pub score_events_consumed: u32,
+    pub garden_refresh_events_consumed: u32,
     pub garden_force_refresh: bool,
 }
 
@@ -900,6 +1217,7 @@ impl TemporalState {
                 history_write_target: None,
                 observation_ticks: 0,
                 score_events_consumed: 0,
+                garden_refresh_events_consumed: 0,
                 garden_force_refresh: false,
             };
         }
@@ -911,8 +1229,10 @@ impl TemporalState {
             self.history_write
         });
 
-        let garden_force_refresh =
+        let periodic_garden_refresh =
             self.advance_garden_hold(frame_params.originals.garden, observation_ticks);
+        let garden_refresh_events_consumed = input.events.garden_refresh_events;
+        let garden_force_refresh = periodic_garden_refresh || garden_refresh_events_consumed > 0;
 
         let score_events_consumed = if frame_params.originals.score.enabled {
             let score = frame_params.originals.score;
@@ -948,6 +1268,7 @@ impl TemporalState {
             history_write_target,
             observation_ticks,
             score_events_consumed,
+            garden_refresh_events_consumed,
             garden_force_refresh,
         }
     }
@@ -1216,8 +1537,10 @@ pub(crate) fn collision_atlas_age(
     score_params: CollisionScoreParams,
     score: CollisionScoreState,
 ) -> f32 {
-    let params = params.sanitized();
+    let mut params = params.sanitized();
     let score_params = score_params.sanitized();
+    let score_law = collision_score_memory_law(score_params, score);
+    params.collision = (params.collision + score_law.atlas_collision_offset).clamp(0.0, 1.0);
     let aspect = finite_or(aspect_ratio, 1.0).clamp(1.0 / 100.0, 100.0);
     let grid_scale = f32::from(params.territories).sqrt().max(1.0);
     let p = [
@@ -1263,6 +1586,7 @@ pub(crate) struct RefreshGardenSignals {
     pub audio_energy: f32,
     pub audio_onset: bool,
     pub matte: f32,
+    pub motion: f32,
     pub force_refresh: bool,
 }
 
@@ -1276,6 +1600,7 @@ impl RefreshGardenSignals {
             RefreshGardenGate::AudioEnergy => self.audio_energy,
             RefreshGardenGate::AudioOnset => f32::from(self.audio_onset),
             RefreshGardenGate::Matte => self.matte,
+            RefreshGardenGate::Motion => self.motion,
         }
     }
 }
@@ -1947,6 +2272,72 @@ mod tests {
     }
 
     #[test]
+    fn garden_routes_refresh_provenance_and_tombstone_removed_stable_ids() {
+        let selected = StableLayerId::new(91).unwrap();
+        let unrelated = StableLayerId::new(44).unwrap();
+        let original_position = SavedLayerPosition::new(3).unwrap();
+        let moved_position = SavedLayerPosition::new(1).unwrap();
+        let removed_position = SavedLayerPosition::new(7).unwrap();
+        let mut matte = RefreshGardenMatteRoute::SelectedLayer {
+            layer_id: selected,
+            saved_position: original_position,
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let mut motion = RefreshGardenMotionRoute::SelectedLayer {
+            layer_id: selected,
+            saved_position: original_position,
+        };
+        matte.refresh_saved_position(|id| (id == selected).then_some(moved_position));
+        motion.refresh_saved_position(|id| (id == selected).then_some(moved_position));
+        assert!(matches!(
+            matte,
+            RefreshGardenMatteRoute::SelectedLayer { saved_position, .. }
+                if saved_position == moved_position
+        ));
+        assert!(matches!(
+            motion,
+            RefreshGardenMotionRoute::SelectedLayer { saved_position, .. }
+                if saved_position == moved_position
+        ));
+        matte.mark_layer_missing(unrelated, removed_position);
+        motion.mark_layer_missing(unrelated, removed_position);
+        assert!(matches!(
+            matte,
+            RefreshGardenMatteRoute::SelectedLayer { .. }
+        ));
+        assert!(matches!(
+            motion,
+            RefreshGardenMotionRoute::SelectedLayer { .. }
+        ));
+        matte.mark_layer_missing(selected, removed_position);
+        motion.mark_layer_missing(selected, removed_position);
+        assert_eq!(
+            matte,
+            RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position: removed_position,
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            motion,
+            RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: removed_position,
+            }
+        );
+
+        let sanitized = RefreshGardenParams {
+            amount: f32::NAN,
+            matte_route: matte,
+            motion_route: motion,
+            ..RefreshGardenParams::default()
+        }
+        .sanitized();
+        assert_eq!(sanitized.amount, 0.0);
+        assert_eq!(sanitized.matte_route, matte);
+        assert_eq!(sanitized.motion_route, motion);
+    }
+
+    #[test]
     fn garden_gate_laws_cover_pixel_analytical_and_audio_signals() {
         let params = RefreshGardenParams {
             amount: 0.8,
@@ -1962,6 +2353,7 @@ mod tests {
             audio_energy: 0.9,
             audio_onset: true,
             matte: 0.2,
+            motion: 0.75,
             force_refresh: false,
         };
         for (gate, expected) in [
@@ -1972,6 +2364,7 @@ mod tests {
             (RefreshGardenGate::AudioEnergy, 0.8),
             (RefreshGardenGate::AudioOnset, 0.8),
             (RefreshGardenGate::Matte, 0.0),
+            (RefreshGardenGate::Motion, 0.8),
         ] {
             assert_eq!(
                 refresh_garden_admission(RefreshGardenParams { gate, ..params }, signals),
@@ -2004,6 +2397,7 @@ mod tests {
                 softness: 0.0,
                 decay: 0.97,
                 max_hold_ticks: 0,
+                ..RefreshGardenParams::default()
             };
             let params = TemporalParams {
                 originals: TemporalOriginalsParams {
@@ -2195,6 +2589,220 @@ mod tests {
     }
 
     #[test]
+    fn explicit_event_track_is_bounded_counted_and_display_rate_invariant() {
+        fn record_at(fps: u32) -> TemporalEventTrack {
+            let mut recorder = TemporalEventRecorder::default();
+            for frame in 0..fps * 3 {
+                let events = TemporalFrameEvents {
+                    manual_events: u32::from(frame == 0) + u32::from(frame == fps * 2),
+                    garden_refresh_events: u32::from(frame == fps),
+                    ..TemporalFrameEvents::default()
+                };
+                assert!(recorder.record_accepted(1.0 / fps as f32, events));
+            }
+            recorder.track().clone()
+        }
+
+        let expected = [
+            RecordedTemporalEventPoint {
+                reference_tick: 0,
+                manual_score_events: 1,
+                garden_refresh_events: 0,
+            },
+            RecordedTemporalEventPoint {
+                reference_tick: 30,
+                manual_score_events: 0,
+                garden_refresh_events: 1,
+            },
+            RecordedTemporalEventPoint {
+                reference_tick: 60,
+                manual_score_events: 1,
+                garden_refresh_events: 0,
+            },
+        ];
+        for fps in [24, 30, 60] {
+            assert_eq!(record_at(fps).events(), expected, "{fps} fps");
+        }
+
+        let track = record_at(60);
+        let mut replay = track.replay();
+        assert_eq!(replay.events_due(0).manual_events, 1);
+        assert_eq!(replay.events_due(29), TemporalFrameEvents::default());
+        let tick_60 = replay.events_due(60);
+        assert_eq!(tick_60.garden_refresh_events, 1);
+        assert_eq!(tick_60.manual_events, 1);
+        assert_eq!(replay.events_due(u64::MAX), TemporalFrameEvents::default());
+
+        let mut capped = TemporalEventTrack::default();
+        for tick in 0..MAX_RECORDED_TEMPORAL_EVENT_POINTS as u64 {
+            assert!(capped.record_accepted(
+                tick,
+                TemporalFrameEvents {
+                    manual_events: 1,
+                    ..TemporalFrameEvents::default()
+                }
+            ));
+        }
+        assert!(!capped.record_accepted(
+            MAX_RECORDED_TEMPORAL_EVENT_POINTS as u64,
+            TemporalFrameEvents {
+                manual_events: 1,
+                ..TemporalFrameEvents::default()
+            }
+        ));
+        assert!(capped.truncated());
+        assert_eq!(capped.events().len(), MAX_RECORDED_TEMPORAL_EVENT_POINTS);
+        capped.clear();
+        assert!(capped.events().is_empty());
+        assert!(!capped.truncated());
+    }
+
+    #[test]
+    fn collision_score_selects_repeatable_bounded_multi_law_states() {
+        let disabled = CollisionScoreParams::default();
+        assert_eq!(
+            collision_score_memory_law(
+                disabled,
+                CollisionScoreState {
+                    state_index: 9,
+                    event_ordinal: u64::MAX,
+                },
+            ),
+            CollisionScoreMemoryLaw::default()
+        );
+
+        let params = CollisionScoreParams {
+            enabled: true,
+            seed: 0x5eed_c011,
+            state_count: 5,
+            ..CollisionScoreParams::default()
+        };
+        let first = collision_score_memory_law(
+            params,
+            CollisionScoreState {
+                state_index: 2,
+                event_ordinal: 1,
+            },
+        );
+        let repeated = collision_score_memory_law(
+            params,
+            CollisionScoreState {
+                state_index: 7,
+                event_ordinal: u64::MAX,
+            },
+        );
+        let next = collision_score_memory_law(
+            params,
+            CollisionScoreState {
+                state_index: 3,
+                event_ordinal: 2,
+            },
+        );
+        assert_eq!(first, repeated, "the finite state table wraps exactly");
+        assert_ne!(first, next, "adjacent states select distinct bounded laws");
+        for law in [first, next] {
+            assert!((0.5..=1.0).contains(&law.loom_depth_scale));
+            assert!((-0.5..=0.5).contains(&law.loom_phase_offset));
+            assert!((-0.25..=0.25).contains(&law.atlas_collision_offset));
+            assert!((-0.25..=0.25).contains(&law.garden_threshold_offset));
+            assert!((0.75..=1.0).contains(&law.garden_decay_scale));
+        }
+
+        let authored = TemporalOriginalsParams {
+            loom: TemporalLoomParams {
+                amount: 1.0,
+                depth: 1.0,
+                ..TemporalLoomParams::default()
+            },
+            atlas: CollisionAtlasParams {
+                amount: 1.0,
+                collision: 0.5,
+                ..CollisionAtlasParams::default()
+            },
+            garden: RefreshGardenParams {
+                amount: 1.0,
+                threshold: 0.5,
+                decay: 1.0,
+                ..RefreshGardenParams::default()
+            },
+            score: params,
+            ..TemporalOriginalsParams::default()
+        };
+        let effective = score_effective_originals(
+            authored,
+            CollisionScoreState {
+                state_index: 2,
+                event_ordinal: 999,
+            },
+        );
+        assert_eq!(effective.loom.depth, first.loom_depth_scale);
+        assert_eq!(effective.loom.phase, first.loom_phase_offset);
+        assert_eq!(
+            effective.atlas.collision,
+            (0.5 + first.atlas_collision_offset).clamp(0.0, 1.0)
+        );
+        assert_eq!(
+            effective.garden.threshold,
+            (0.5 + first.garden_threshold_offset).clamp(0.0, 1.0)
+        );
+        assert_eq!(effective.garden.decay, first.garden_decay_scale);
+    }
+
+    #[test]
+    fn explicit_garden_refresh_is_counted_freeze_safe_and_transactional() {
+        let params = TemporalParams {
+            originals: TemporalOriginalsParams {
+                garden: RefreshGardenParams {
+                    amount: 0.75,
+                    max_hold_ticks: 0,
+                    ..RefreshGardenParams::default()
+                },
+                ..TemporalOriginalsParams::default()
+            },
+            ..TemporalParams::default()
+        };
+        let events = TemporalFrameEvents {
+            garden_refresh_events: 3,
+            ..TemporalFrameEvents::default()
+        };
+        let mut state = TemporalState::default();
+        let frozen = state.stage_frame(
+            &params,
+            TemporalFrameInput::new(
+                1.0 / 60.0,
+                TemporalFreezeState::ProgramFrozen,
+                false,
+                events,
+            ),
+            [64, 36],
+        );
+        assert_eq!(frozen.garden_refresh_events_consumed, 0);
+        assert!(!frozen.garden_force_refresh);
+        state.commit_staged();
+
+        let advancing = state.stage_frame(
+            &params,
+            TemporalFrameInput::new(1.0 / 60.0, TemporalFreezeState::Running, false, events),
+            [64, 36],
+        );
+        assert_eq!(advancing.garden_refresh_events_consumed, 3);
+        assert!(advancing.garden_force_refresh);
+        assert_ne!(
+            advancing.originals_uniforms.garden_modes[3] & GARDEN_FORCE_REFRESH_BIT,
+            0
+        );
+        state.discard_staged();
+        assert_eq!(state.metrics().total_reference_ticks, 0);
+
+        let replay = state.stage_frame(
+            &params,
+            TemporalFrameInput::new(1.0 / 60.0, TemporalFreezeState::Running, false, events),
+            [64, 36],
+        );
+        assert_eq!(replay.garden_refresh_events_consumed, 3);
+    }
+
+    #[test]
     fn temporal_zero_and_originals_sequences_have_fixed_24_30_60_hashes() {
         use sha2::{Digest, Sha256};
 
@@ -2301,9 +2909,9 @@ mod tests {
         assert_eq!(
             originals,
             [
-                "d3e7fef535d9302210ddd2bf86c5b39b79c3ff083e1edf1e7095271cde4c1c67",
-                "8a08e33e55014f398c84b4638fa7e7cb48a1f62ca0736b6ebd48e47fd3e5a184",
-                "a7a8e3d965adcaa2ece191274d7280d8c1dafde21c3323bbcdd7fa17d81d529e",
+                "a1891de9ed1ce055d199298e2f8d7ea898e2a4fc750a7c139b1f1f0490b5a3c3",
+                "deab90dbae86952f7a32056d2fe50114f5d83562096bd9aa586e96cffa41dd64",
+                "332c187ce0c7be98314b5ad483af48b0d756c1c77deb990ed265e4333359fc5e",
             ]
             .map(str::to_string)
         );

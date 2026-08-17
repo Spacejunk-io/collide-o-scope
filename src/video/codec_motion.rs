@@ -44,6 +44,80 @@ pub enum CodecMotionFrameType {
     Other,
 }
 
+/// Exact decoded-picture identity used to prove codec reference continuity.
+/// Floating source seconds are presentation metadata only and never establish
+/// adjacency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodecFrameIdentity {
+    pub source_generation: u64,
+    pub pts: i64,
+    pub presentation_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodecTimeBase {
+    pub numerator: i32,
+    pub denominator: i32,
+}
+
+impl CodecTimeBase {
+    pub fn new(numerator: i32, denominator: i32) -> Option<Self> {
+        if numerator <= 0 || denominator <= 0 {
+            return None;
+        }
+        let divisor = greatest_common_divisor(numerator, denominator);
+        Some(Self {
+            numerator: numerator / divisor,
+            denominator: denominator / divisor,
+        })
+    }
+
+    pub fn elapsed_seconds(self, ticks: i64) -> Option<f32> {
+        if ticks <= 0 {
+            return None;
+        }
+        let seconds = ticks as f64 * f64::from(self.numerator) / f64::from(self.denominator);
+        (seconds.is_finite() && seconds > 0.0 && seconds <= f64::from(MAX_CODEC_REFERENCE_SECONDS))
+            .then_some(seconds as f32)
+    }
+}
+
+fn greatest_common_divisor(mut left: i32, mut right: i32) -> i32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AdjacentReferencePolicy {
+    Mpeg4Part2SimpleProgressiveIp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodecPastReferenceProof {
+    pub policy: AdjacentReferencePolicy,
+    pub reference: CodecFrameIdentity,
+    pub destination: CodecFrameIdentity,
+    pub elapsed_ticks: i64,
+    pub time_base: CodecTimeBase,
+}
+
+impl CodecPastReferenceProof {
+    pub fn elapsed_seconds(self) -> Option<f32> {
+        if self.reference.source_generation != self.destination.source_generation
+            || self.destination.presentation_ordinal
+                != self.reference.presentation_ordinal.saturating_add(1)
+            || self.elapsed_ticks != self.destination.pts.checked_sub(self.reference.pts)?
+        {
+            return None;
+        }
+        self.time_base.elapsed_seconds(self.elapsed_ticks)
+    }
+}
+
 /// Bounded rejection vocabulary; hostile side data never allocates an error
 /// string proportional to its contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +145,9 @@ pub enum CodecMotionStatus {
     Intra,
     Available,
     FutureOnly,
+    /// Valid past-directed records exist, but their exact reference picture
+    /// and elapsed time could not be proven from FFmpeg's direction-only ABI.
+    ReferenceUnproven,
     Unavailable,
     Rejected(CodecMotionRejectReason),
 }
@@ -88,6 +165,7 @@ pub struct CodecMotionFrame {
     pub provenance: CodecMotionProvenance,
     pub frame_type: CodecMotionFrameType,
     pub status: CodecMotionStatus,
+    pub past_reference_proof: Option<CodecPastReferenceProof>,
     pub vectors: Vec<CodecMotionVector>,
 }
 
@@ -97,17 +175,77 @@ impl CodecMotionFrame {
         reason = "M4 host source selection consumes this frozen availability predicate"
     )]
     pub fn codec_vectors_available(&self) -> bool {
-        self.status == CodecMotionStatus::Available
+        if self.status != CodecMotionStatus::Available
+            || self.frame_type != CodecMotionFrameType::Predictive
+            || self.algorithm_version != MOTION_ALGORITHM_VERSION
+            || !valid_source_dimensions(self.source_dimensions)
+            || self.vectors.is_empty()
+            || self.vectors.len() > MOTION_CODEC_VECTOR_MAX_RECORDS
+        {
+            return false;
+        }
+        let Some(elapsed) = self
+            .past_reference_proof
+            .filter(|proof| {
+                proof.destination.source_generation == self.source_generation
+                    && proof.destination.presentation_ordinal == self.frame_ordinal
+            })
+            .and_then(CodecPastReferenceProof::elapsed_seconds)
+        else {
+            return false;
+        };
+        let tolerance = (elapsed * 0.001).max(1.0e-6);
+        if !self.frame_delta_seconds.is_finite()
+            || (self.frame_delta_seconds - elapsed).abs() > tolerance
+        {
+            return false;
+        }
+        let coordinate_limit = i64::from(self.source_dimensions[0].max(self.source_dimensions[1]))
+            + i64::from(MAX_CODEC_BLOCK_PIXELS);
+        self.vectors
+            .iter()
+            .any(|vector| vector.reference == CodecReferenceDirection::Past)
+            && self.vectors.iter().all(|vector| {
+                vector.block[0] > 0
+                    && vector.block[1] > 0
+                    && vector.block[0] <= MAX_CODEC_BLOCK_PIXELS
+                    && vector.block[1] <= MAX_CODEC_BLOCK_PIXELS
+                    && vector.motion_scale > 0
+                    && vector.seconds_from_reference.is_finite()
+                    && (vector.seconds_from_reference - elapsed).abs() <= tolerance
+                    && vector.visibility.is_finite()
+                    && (0.0..=1.0).contains(&vector.visibility)
+                    && vector
+                        .destination
+                        .iter()
+                        .all(|coordinate| i64::from(*coordinate).abs() <= coordinate_limit)
+                    && vector.motion.iter().zip(self.source_dimensions).all(
+                        |(component, dimension)| {
+                            let displacement =
+                                *component as f64 / f64::from(vector.motion_scale.max(1));
+                            displacement.is_finite()
+                                && displacement.abs()
+                                    <= f64::from(
+                                        dimension.saturating_add(u32::from(MAX_CODEC_BLOCK_PIXELS)),
+                                    )
+                        },
+                    )
+            })
     }
 
     pub(crate) fn retag_source_generation(&mut self, source_generation: u64) {
         self.source_generation = source_generation;
+        if let Some(proof) = self.past_reference_proof.as_mut() {
+            proof.reference.source_generation = source_generation;
+            proof.destination.source_generation = source_generation;
+        }
     }
 
     pub(crate) fn from_decoded_frame(
         frame: &VideoFrame,
         source_dimensions: [u32; 2],
         frame_delta_seconds: f32,
+        past_reference_proof: Option<CodecPastReferenceProof>,
         source_generation: u64,
         frame_ordinal: u64,
     ) -> Self {
@@ -118,6 +256,7 @@ impl CodecMotionFrame {
             frame_type,
             source_dimensions,
             frame_delta_seconds,
+            past_reference_proof,
             source_generation,
             frame_ordinal,
             side_data_bytes,
@@ -128,6 +267,7 @@ impl CodecMotionFrame {
         frame_type: CodecMotionFrameType,
         source_dimensions: [u32; 2],
         frame_delta_seconds: f32,
+        past_reference_proof: Option<CodecPastReferenceProof>,
         source_generation: u64,
         frame_ordinal: u64,
         side_data: Option<&[u8]>,
@@ -142,6 +282,7 @@ impl CodecMotionFrame {
             provenance: CodecMotionProvenance::FfmpegExportMvs,
             frame_type,
             status: CodecMotionStatus::Unavailable,
+            past_reference_proof: None,
             vectors: Vec::new(),
         };
         if !valid_source_dimensions(source_dimensions) {
@@ -161,18 +302,54 @@ impl CodecMotionFrame {
         let Some(side_data) = side_data else {
             return product;
         };
-        match parse_motion_side_data(side_data, source_dimensions, frame_delta_seconds) {
+        let inspection = match inspect_motion_side_data(side_data, source_dimensions) {
+            Ok(inspection) => inspection,
+            Err(reason) => {
+                product.status = CodecMotionStatus::Rejected(reason);
+                return product;
+            }
+        };
+        if inspection.past_records == 0 {
+            product.status = if inspection.future_records > 0 {
+                CodecMotionStatus::FutureOnly
+            } else {
+                CodecMotionStatus::Unavailable
+            };
+            return product;
+        }
+        if frame_type != CodecMotionFrameType::Predictive {
+            product.status = CodecMotionStatus::ReferenceUnproven;
+            return product;
+        }
+        // FFmpeg's public AVMotionVector ABI exposes `source` only as a
+        // direction sign (-1 past, +1 future), not as a reference-frame
+        // distance. A decoder that cannot prove the actual past-reference
+        // interval must leave codec motion unavailable rather than inventing
+        // one frame of elapsed time. Future records remain ignored by the M4
+        // adapter, so the proven past interval is the only admitted clock.
+        let Some((past_reference_proof, past_reference_seconds)) = past_reference_proof
+            .filter(|proof| {
+                proof.destination.source_generation == source_generation
+                    && proof.destination.presentation_ordinal == frame_ordinal
+            })
+            .and_then(|proof| proof.elapsed_seconds().map(|seconds| (proof, seconds)))
+        else {
+            product.status = CodecMotionStatus::ReferenceUnproven;
+            return product;
+        };
+        match parse_past_motion_side_data(
+            side_data,
+            source_dimensions,
+            past_reference_seconds,
+            inspection.past_records,
+        ) {
             Ok(vectors) => {
-                let observed_past = vectors
-                    .iter()
-                    .any(|vector| vector.reference == CodecReferenceDirection::Past);
-                product.status = if observed_past {
-                    CodecMotionStatus::Available
-                } else if vectors.is_empty() {
-                    CodecMotionStatus::Unavailable
-                } else {
-                    CodecMotionStatus::FutureOnly
-                };
+                product.status = CodecMotionStatus::Available;
+                // Once the typed proof is admitted, it is the sole clock for
+                // this product. Do not preserve a nominal/fallback frame delta
+                // that can disagree on variable-frame-rate input.
+                product.frame_delta_seconds = past_reference_seconds;
+                product.past_reference_proof = Some(past_reference_proof);
                 product.vectors = vectors;
             }
             Err(reason) => product.status = CodecMotionStatus::Rejected(reason),
@@ -182,7 +359,7 @@ impl CodecMotionFrame {
 }
 
 impl CodecMotionFrameType {
-    fn from_ffmpeg(kind: ffmpeg::util::picture::Type) -> Self {
+    pub(crate) fn from_ffmpeg(kind: ffmpeg::util::picture::Type) -> Self {
         use ffmpeg::util::picture::Type;
         match kind {
             Type::I | Type::SI | Type::BI => Self::Intra,
@@ -230,31 +407,52 @@ fn validate_motion_side_data_len(bytes: usize) -> Result<usize, CodecMotionRejec
     Ok(count)
 }
 
-fn parse_motion_side_data(
+#[derive(Debug, Clone, Copy)]
+struct MotionSideDataInspection {
+    past_records: usize,
+    future_records: usize,
+}
+
+fn inspect_motion_side_data(
     bytes: &[u8],
     source_dimensions: [u32; 2],
-    frame_delta_seconds: f32,
-) -> Result<Vec<CodecMotionVector>, CodecMotionRejectReason> {
+) -> Result<MotionSideDataInspection, CodecMotionRejectReason> {
     let count = validate_motion_side_data_len(bytes.len())?;
-
-    // Validate every record before allocating. One invalid record rejects the
-    // complete metadata atomically while the separately decoded pixels remain
-    // usable. This also makes the eventual allocation exact-sized.
+    let mut past_records = 0usize;
+    let mut future_records = 0usize;
     for index in 0..count {
         let raw = read_raw_motion_vector(bytes, index);
-        canonical_motion_vector(raw, source_dimensions, frame_delta_seconds)?;
+        match validate_raw_motion_vector(raw, source_dimensions)?.reference {
+            CodecReferenceDirection::Past => past_records += 1,
+            CodecReferenceDirection::Future => future_records += 1,
+        }
     }
+    Ok(MotionSideDataInspection {
+        past_records,
+        future_records,
+    })
+}
+
+fn parse_past_motion_side_data(
+    bytes: &[u8],
+    source_dimensions: [u32; 2],
+    past_reference_seconds: f32,
+    past_records: usize,
+) -> Result<Vec<CodecMotionVector>, CodecMotionRejectReason> {
+    let count = validate_motion_side_data_len(bytes.len())?;
     let mut vectors = Vec::new();
     vectors
-        .try_reserve_exact(count)
+        .try_reserve_exact(past_records)
         .map_err(|_| CodecMotionRejectReason::Allocation)?;
     for index in 0..count {
         let raw = read_raw_motion_vector(bytes, index);
-        vectors.push(canonical_motion_vector(
-            raw,
-            source_dimensions,
-            frame_delta_seconds,
-        )?);
+        if raw.source < 0 {
+            vectors.push(canonical_past_motion_vector(
+                raw,
+                source_dimensions,
+                past_reference_seconds,
+            )?);
+        }
     }
     Ok(vectors)
 }
@@ -268,11 +466,16 @@ fn read_raw_motion_vector(bytes: &[u8], index: usize) -> ffmpeg::ffi::AVMotionVe
     unsafe { ptr::read_unaligned(bytes.as_ptr().add(offset).cast()) }
 }
 
-fn canonical_motion_vector(
+#[derive(Debug, Clone, Copy)]
+struct ValidatedRawMotionVector {
+    block: [u16; 2],
+    reference: CodecReferenceDirection,
+}
+
+fn validate_raw_motion_vector(
     raw: ffmpeg::ffi::AVMotionVector,
     source_dimensions: [u32; 2],
-    frame_delta_seconds: f32,
-) -> Result<CodecMotionVector, CodecMotionRejectReason> {
+) -> Result<ValidatedRawMotionVector, CodecMotionRejectReason> {
     let block = [u16::from(raw.w), u16::from(raw.h)];
     if block[0] == 0
         || block[1] == 0
@@ -289,14 +492,6 @@ fn canonical_motion_vector(
         std::cmp::Ordering::Greater => CodecReferenceDirection::Future,
         std::cmp::Ordering::Equal => return Err(CodecMotionRejectReason::InvalidReference),
     };
-    let seconds_from_reference = raw.source.unsigned_abs() as f64 * f64::from(frame_delta_seconds);
-    if !seconds_from_reference.is_finite()
-        || seconds_from_reference <= 0.0
-        || seconds_from_reference > f64::from(MAX_CODEC_REFERENCE_SECONDS)
-    {
-        return Err(CodecMotionRejectReason::InvalidReference);
-    }
-
     let coordinate_limit = i64::from(source_dimensions[0].max(source_dimensions[1]))
         + i64::from(MAX_CODEC_BLOCK_PIXELS);
     for coordinate in [raw.src_x, raw.src_y, raw.dst_x, raw.dst_y] {
@@ -331,19 +526,33 @@ fn canonical_motion_vector(
         return Err(CodecMotionRejectReason::InconsistentCoordinates);
     }
 
+    Ok(ValidatedRawMotionVector { block, reference })
+}
+
+fn canonical_past_motion_vector(
+    raw: ffmpeg::ffi::AVMotionVector,
+    source_dimensions: [u32; 2],
+    past_reference_seconds: f32,
+) -> Result<CodecMotionVector, CodecMotionRejectReason> {
+    let validated = validate_raw_motion_vector(raw, source_dimensions)?;
+    if validated.reference != CodecReferenceDirection::Past
+        || !valid_frame_delta(past_reference_seconds)
+    {
+        return Err(CodecMotionRejectReason::InvalidReference);
+    }
     // AVMotionVector flags are currently unspecified by FFmpeg. Deliberately
     // do not let opaque bits influence direction, visibility, or confidence.
     let _opaque_flags = raw.flags;
     Ok(CodecMotionVector {
         destination: [i32::from(raw.dst_x), i32::from(raw.dst_y)],
-        block,
+        block: validated.block,
         motion: [raw.motion_x, raw.motion_y],
         motion_scale: raw.motion_scale,
-        seconds_from_reference: seconds_from_reference as f32,
-        reference,
+        seconds_from_reference: past_reference_seconds,
+        reference: validated.reference,
         visibility: destination_visibility(
             [i32::from(raw.dst_x), i32::from(raw.dst_y)],
-            block,
+            validated.block,
             source_dimensions,
         ),
     })
@@ -406,12 +615,38 @@ mod tests {
         unsafe { std::slice::from_raw_parts(vectors.as_ptr().cast(), byte_len).to_vec() }
     }
 
+    fn proof(elapsed_ticks: i64) -> CodecPastReferenceProof {
+        CodecPastReferenceProof {
+            policy: AdjacentReferencePolicy::Mpeg4Part2SimpleProgressiveIp,
+            reference: CodecFrameIdentity {
+                source_generation: 7,
+                pts: 10,
+                presentation_ordinal: 10,
+            },
+            destination: CodecFrameIdentity {
+                source_generation: 7,
+                pts: 10 + elapsed_ticks,
+                presentation_ordinal: 11,
+            },
+            elapsed_ticks,
+            time_base: CodecTimeBase::new(1, 30).unwrap(),
+        }
+    }
+
     fn parsed(
         frame_type: CodecMotionFrameType,
         vectors: &[ffmpeg::ffi::AVMotionVector],
     ) -> CodecMotionFrame {
         let bytes = raw_bytes(vectors);
-        CodecMotionFrame::from_side_data(frame_type, [64, 64], 1.0 / 30.0, 7, 11, Some(&bytes))
+        CodecMotionFrame::from_side_data(
+            frame_type,
+            [64, 64],
+            1.0 / 30.0,
+            Some(proof(1)),
+            7,
+            11,
+            Some(&bytes),
+        )
     }
 
     #[test]
@@ -448,6 +683,13 @@ mod tests {
     }
 
     #[test]
+    fn exact_time_base_has_one_canonical_hashable_representation() {
+        assert_eq!(CodecTimeBase::new(2, 60), CodecTimeBase::new(1, 30));
+        assert_eq!(CodecTimeBase::new(0, 30), None);
+        assert_eq!(CodecTimeBase::new(1, -30), None);
+    }
+
+    #[test]
     fn intra_is_explicitly_empty_and_future_only_is_unavailable() {
         let malformed = raw_vector(-1, [16, 16], [i32::MAX, 0], 0);
         let intra = parsed(CodecMotionFrameType::Intra, &[malformed]);
@@ -460,7 +702,10 @@ mod tests {
         );
         assert_eq!(future.status, CodecMotionStatus::FutureOnly);
         assert!(!future.codec_vectors_available());
-        assert_eq!(future.vectors[0].reference, CodecReferenceDirection::Future);
+        assert!(
+            future.vectors.is_empty(),
+            "direction-only future records are never assigned a false elapsed time"
+        );
 
         let mixed = parsed(
             CodecMotionFrameType::Bidirectional,
@@ -469,7 +714,8 @@ mod tests {
                 raw_vector(-1, [24, 16], [-2, 0], 1),
             ],
         );
-        assert_eq!(mixed.status, CodecMotionStatus::Available);
+        assert_eq!(mixed.status, CodecMotionStatus::ReferenceUnproven);
+        assert!(mixed.vectors.is_empty());
     }
 
     #[test]
@@ -525,6 +771,7 @@ mod tests {
             CodecMotionFrameType::Predictive,
             [64, 64],
             f32::NAN,
+            Some(proof(1)),
             3,
             4,
             None,
@@ -535,5 +782,39 @@ mod tests {
         );
         assert_eq!(product.frame_delta_seconds, DEFAULT_FRAME_DELTA_SECONDS);
         assert!(product.vectors.is_empty());
+    }
+
+    #[test]
+    fn unproven_reference_interval_never_invents_avmotionvector_distance() {
+        let bytes = raw_bytes(&[raw_vector(-7, [16, 16], [-1, 0], 1)]);
+        let product = CodecMotionFrame::from_side_data(
+            CodecMotionFrameType::Predictive,
+            [64, 64],
+            1.0 / 30.0,
+            None,
+            7,
+            11,
+            Some(&bytes),
+        );
+        assert_eq!(product.status, CodecMotionStatus::ReferenceUnproven);
+        assert!(product.vectors.is_empty());
+
+        let proven = CodecMotionFrame::from_side_data(
+            CodecMotionFrameType::Predictive,
+            [64, 64],
+            1.0 / 30.0,
+            Some(proof(3)),
+            7,
+            11,
+            Some(&bytes),
+        );
+        assert_eq!(proven.status, CodecMotionStatus::Available);
+        assert_eq!(proven.frame_delta_seconds, 3.0 / 30.0);
+        assert_eq!(proven.vectors[0].seconds_from_reference, 3.0 / 30.0);
+        assert!(proven.codec_vectors_available());
+
+        let mut nominal_clock_forgery = proven;
+        nominal_clock_forgery.frame_delta_seconds = 1.0 / 30.0;
+        assert!(!nominal_clock_forgery.codec_vectors_available());
     }
 }

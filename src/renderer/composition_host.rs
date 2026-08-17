@@ -365,8 +365,23 @@ struct HostBusUniforms {
     _pad: [f32; 3],
 }
 
+/// Dedicated post-temporal Refresh Garden ABI. Keeping this independent from
+/// the frozen TemporalOriginals ABI lets the pre-Garden temporal pass upload a
+/// literal zero Garden amount while this pass retains the staged recurrence.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HostRoutedGardenUniforms {
+    /// feedback zoom, feedback rotation degrees, feedback validity, reserved
+    feedback_values: [f32; 4],
+    /// amount, threshold, softness, decay
+    garden_values: [f32; 4],
+    /// observation ticks, packed runtime, gate code, reserved
+    garden_modes: [u32; 4],
+}
+
 const _: () = assert!(std::mem::size_of::<HostCompositeUniforms>() == 16);
 const _: () = assert!(std::mem::size_of::<HostBusUniforms>() == 16);
+const _: () = assert!(std::mem::size_of::<HostRoutedGardenUniforms>() == 48);
 
 pub(crate) struct HostEffectSource {
     bind_group: wgpu::BindGroup,
@@ -388,6 +403,10 @@ pub(crate) struct HostTemporalInput {
     bind_group: wgpu::BindGroup,
     current_copy_group: wgpu::BindGroup,
     output_copy_group: wgpu::BindGroup,
+}
+
+pub(crate) struct HostRoutedGardenInput {
+    bind_group: wgpu::BindGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -428,6 +447,7 @@ pub(crate) struct CompositionHost {
     composite_texture_layout: wgpu::BindGroupLayout,
     matte_texture_layout: wgpu::BindGroupLayout,
     temporal_texture_layout: wgpu::BindGroupLayout,
+    routed_garden_texture_layout: wgpu::BindGroupLayout,
     effect_pipeline: wgpu::RenderPipeline,
     copy_pipeline: wgpu::RenderPipeline,
     compat8_copy_pipeline: wgpu::RenderPipeline,
@@ -436,6 +456,7 @@ pub(crate) struct CompositionHost {
     bus_pipeline: wgpu::RenderPipeline,
     temporal_pipeline: wgpu::RenderPipeline,
     temporal_originals_pipeline: wgpu::RenderPipeline,
+    routed_garden_pipeline: wgpu::RenderPipeline,
     present_pipeline: wgpu::RenderPipeline,
     effect_uniforms: HostUniformArena,
     composite_uniforms: HostUniformArena,
@@ -446,6 +467,8 @@ pub(crate) struct CompositionHost {
     temporal_uniform_group: wgpu::BindGroup,
     temporal_originals_uniform_buffer: wgpu::Buffer,
     temporal_originals_uniform_group: wgpu::BindGroup,
+    routed_garden_uniform_buffer: wgpu::Buffer,
+    routed_garden_uniform_group: wgpu::BindGroup,
     _temporal_history_texture: wgpu::Texture,
     temporal_history_view: wgpu::TextureView,
     temporal_history_layer_views: Box<[wgpu::TextureView]>,
@@ -846,6 +869,17 @@ impl CompositionHost {
             ],
             &counters,
         );
+        let routed_garden_texture_layout = create_layout(
+            device,
+            "Advanced composition routed Garden textures",
+            &[
+                sampled_texture_entry(0),
+                sampled_texture_entry(1),
+                sampled_texture_entry(2),
+                sampler_entry(3),
+            ],
+            &counters,
+        );
         let effect_uniform_layout = create_layout(
             device,
             "Advanced composition effects uniform arena",
@@ -908,6 +942,15 @@ impl CompositionHost {
             ],
             &counters,
         );
+        let routed_garden_uniform_layout = create_layout(
+            device,
+            "Advanced composition routed Garden uniform",
+            &[uniform_layout_entry(
+                std::mem::size_of::<HostRoutedGardenUniforms>() as u64,
+                false,
+            )],
+            &counters,
+        );
 
         let vertex = create_shader(
             device,
@@ -951,6 +994,12 @@ impl CompositionHost {
             wgpu::ShaderSource::Wgsl(include_str!("../shaders/temporal_originals.wgsl").into()),
             &counters,
         );
+        let routed_garden = create_shader(
+            device,
+            "Advanced composition routed Garden",
+            wgpu::ShaderSource::Wgsl(include_str!("../shaders/refresh_garden_routed.wgsl").into()),
+            &counters,
+        );
 
         let effect_pipeline_layout = create_pipeline_layout(
             device,
@@ -992,6 +1041,12 @@ impl CompositionHost {
             device,
             "Advanced composition temporal originals pipeline layout",
             &[&temporal_texture_layout, &temporal_originals_uniform_layout],
+            &counters,
+        );
+        let routed_garden_pipeline_layout = create_pipeline_layout(
+            device,
+            "Advanced composition routed Garden pipeline layout",
+            &[&routed_garden_texture_layout, &routed_garden_uniform_layout],
             &counters,
         );
 
@@ -1085,6 +1140,16 @@ impl CompositionHost {
             HOST_WORKING_FORMAT,
             &counters,
         );
+        let routed_garden_pipeline = create_pipeline(
+            device,
+            "Advanced composition routed Garden pipeline",
+            &routed_garden_pipeline_layout,
+            &vertex,
+            &routed_garden,
+            "fs_main",
+            HOST_WORKING_FORMAT,
+            &counters,
+        );
 
         let effect_uniforms = HostUniformArena::new(
             device,
@@ -1128,6 +1193,13 @@ impl CompositionHost {
                 device,
                 &temporal_originals_uniform_layout,
                 &temporal_uniform_buffer,
+                &counters,
+            );
+        let (routed_garden_uniform_buffer, routed_garden_uniform_group) =
+            create_fixed_uniform::<HostRoutedGardenUniforms>(
+                device,
+                &routed_garden_uniform_layout,
+                "Advanced composition routed Garden uniform",
                 &counters,
             );
 
@@ -1238,6 +1310,7 @@ impl CompositionHost {
             composite_texture_layout,
             matte_texture_layout,
             temporal_texture_layout,
+            routed_garden_texture_layout,
             effect_pipeline,
             copy_pipeline,
             compat8_copy_pipeline,
@@ -1246,6 +1319,7 @@ impl CompositionHost {
             bus_pipeline,
             temporal_pipeline,
             temporal_originals_pipeline,
+            routed_garden_pipeline,
             present_pipeline,
             effect_uniforms,
             composite_uniforms,
@@ -1256,6 +1330,8 @@ impl CompositionHost {
             temporal_uniform_group,
             temporal_originals_uniform_buffer,
             temporal_originals_uniform_group,
+            routed_garden_uniform_buffer,
+            routed_garden_uniform_group,
             _temporal_history_texture: temporal_history_texture,
             temporal_history_view,
             temporal_history_layer_views,
@@ -1473,6 +1549,42 @@ impl CompositionHost {
         }
     }
 
+    /// Preparation-time binding for the dedicated post-temporal Garden pass.
+    /// `current` is the pre-Garden Pong output; feedback is host-owned and the
+    /// routed signal may be either a full-frame matte image or low-res R8
+    /// motion scalar. All three are fixed before warmed encoding.
+    pub fn prepare_routed_garden_input(
+        &self,
+        device: &wgpu::Device,
+        current: &wgpu::TextureView,
+        signal: &wgpu::TextureView,
+    ) -> HostRoutedGardenInput {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Advanced composition prepared routed Garden input"),
+            layout: &self.routed_garden_texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(current),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.temporal_feedback_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(signal),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.linear_sampler),
+                },
+            ],
+        });
+        self.allocations.bind_groups.fetch_add(1, Ordering::Relaxed);
+        HostRoutedGardenInput { bind_group }
+    }
+
     pub fn write_effect_uniform(
         &self,
         queue: &wgpu::Queue,
@@ -1634,6 +1746,63 @@ impl CompositionHost {
         params: &TemporalParams,
         timing: HostFrameTiming,
     ) {
+        let wrote_current = self.encode_temporal_impl(
+            queue,
+            encoder,
+            input,
+            current_texture,
+            output_texture,
+            output_view,
+            params,
+            timing,
+            None,
+        );
+        debug_assert!(!wrote_current);
+    }
+
+    /// Routed Garden is a post-temporal boundary. Advancing frames finish in
+    /// `current_view`; Prime/Hold retain the ordinary Pong result and return
+    /// `false` so the caller performs its established Pong-to-Ping copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_temporal_routed(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &HostTemporalInput,
+        current_texture: &wgpu::Texture,
+        current_view: &wgpu::TextureView,
+        output_texture: &wgpu::Texture,
+        output_view: &wgpu::TextureView,
+        routed: &HostRoutedGardenInput,
+        params: &TemporalParams,
+        timing: HostFrameTiming,
+    ) -> bool {
+        self.encode_temporal_impl(
+            queue,
+            encoder,
+            input,
+            current_texture,
+            output_texture,
+            output_view,
+            params,
+            timing,
+            Some((routed, current_view)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_temporal_impl(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &HostTemporalInput,
+        current_texture: &wgpu::Texture,
+        output_texture: &wgpu::Texture,
+        output_view: &wgpu::TextureView,
+        params: &TemporalParams,
+        timing: HostFrameTiming,
+        routed: Option<(&HostRoutedGardenInput, &wgpu::TextureView)>,
+    ) -> bool {
         let extent = wgpu::Extent3d {
             width: self.dimensions[0],
             height: self.dimensions[1],
@@ -1683,7 +1852,7 @@ impl CompositionHost {
                     &input.current_copy_group,
                     &self.temporal_feedback_view,
                 );
-                return;
+                return false;
             }
             TemporalFrameAction::HoldFrozenOutput => {
                 render_copy(
@@ -1693,9 +1862,101 @@ impl CompositionHost {
                     &self.temporal_feedback_copy_group,
                     output_view,
                 );
-                return;
+                return false;
             }
             TemporalFrameAction::Advance { .. } => {}
+        }
+
+        if let Some((routed, current_view)) = routed {
+            let mut advanced_uniforms = plan.uniforms;
+            advanced_uniforms._pad = 1.0;
+            queue.write_buffer(
+                &self.temporal_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&advanced_uniforms),
+            );
+
+            let mut pre_garden_originals = plan.originals_uniforms;
+            pre_garden_originals.garden_values[0] = 0.0;
+            let pre_garden_originals_active = pre_garden_originals.loom_values[0] > 0.0
+                || pre_garden_originals.atlas_values[0] > 0.0;
+            if pre_garden_originals_active {
+                queue.write_buffer(
+                    &self.temporal_originals_uniform_buffer,
+                    0,
+                    bytemuck::bytes_of(&pre_garden_originals),
+                );
+                let mut pass = begin_replace_pass(
+                    encoder,
+                    "Advanced composition pre-Garden temporal originals",
+                    output_view,
+                );
+                pass.set_pipeline(&self.temporal_originals_pipeline);
+                pass.set_bind_group(0, &input.bind_group, &[]);
+                pass.set_bind_group(1, &self.temporal_originals_uniform_group, &[]);
+                pass.draw(0..3, 0..1);
+            } else if plan.legacy_shader_active {
+                let mut pass = begin_replace_pass(
+                    encoder,
+                    "Advanced composition pre-Garden temporal",
+                    output_view,
+                );
+                pass.set_pipeline(&self.temporal_pipeline);
+                pass.set_bind_group(0, &input.bind_group, &[]);
+                pass.set_bind_group(1, &self.temporal_uniform_group, &[]);
+                pass.draw(0..3, 0..1);
+            } else {
+                copy(encoder, current_texture, output_texture);
+            }
+
+            if let Some(history_write_target) = plan.history_write_target {
+                render_copy(
+                    encoder,
+                    "Advanced composition record Compat8 clean history",
+                    &self.compat8_copy_pipeline,
+                    &input.current_copy_group,
+                    &self.temporal_history_layer_views[history_write_target],
+                );
+            }
+
+            queue.write_buffer(
+                &self.routed_garden_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&HostRoutedGardenUniforms {
+                    feedback_values: [
+                        plan.uniforms.fb_zoom,
+                        plan.uniforms.fb_rotate,
+                        plan.uniforms.feedback_valid,
+                        0.0,
+                    ],
+                    garden_values: plan.originals_uniforms.garden_values,
+                    garden_modes: [
+                        plan.originals_uniforms.garden_modes[2],
+                        plan.originals_uniforms.garden_modes[3],
+                        plan.originals_uniforms.garden_modes[0],
+                        0,
+                    ],
+                }),
+            );
+            {
+                let mut pass = begin_replace_pass(
+                    encoder,
+                    "Advanced composition routed Refresh Garden",
+                    current_view,
+                );
+                pass.set_pipeline(&self.routed_garden_pipeline);
+                pass.set_bind_group(0, &routed.bind_group, &[]);
+                pass.set_bind_group(1, &self.routed_garden_uniform_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            render_copy(
+                encoder,
+                "Advanced composition commit routed Garden Compat8 feedback",
+                &self.compat8_copy_pipeline,
+                &input.current_copy_group,
+                &self.temporal_feedback_view,
+            );
+            return true;
         }
 
         if !plan.legacy_shader_active && !plan.originals_shader_active {
@@ -1718,7 +1979,7 @@ impl CompositionHost {
                 &input.current_copy_group,
                 &self.temporal_feedback_view,
             );
-            return;
+            return false;
         }
         let mut advanced_uniforms = plan.uniforms;
         // The legacy ABI's final padding float remains zero in every shared
@@ -1767,6 +2028,7 @@ impl CompositionHost {
             &input.output_copy_group,
             &self.temporal_feedback_view,
         );
+        false
     }
 
     #[allow(dead_code, reason = "compatibility wrapper for host tests/embedders")]
@@ -2816,6 +3078,7 @@ mod tests {
                                     softness: 0.05,
                                     decay: 0.97,
                                     max_hold_ticks: 7,
+                                    ..RefreshGardenParams::default()
                                 },
                                 ..TemporalOriginalsParams::default()
                             },
@@ -3003,7 +3266,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:x}", advanced_digest.finalize()),
-            "059b344976e75138526079dc65614f2e3f88f34b34f24ca7796c863d18c3553a",
+            "b6b23cfdc9edd4a4d2653abc84327b85f407b06f69d1467bc745571c6bae1f81",
             "Advanced premultiplied temporal Originals pixels changed"
         );
         drop(mapped);
@@ -3079,6 +3342,39 @@ mod tests {
         ] {
             assert!(shader.contains(law), "missing Compat8 dither law: {law}");
         }
+    }
+
+    #[test]
+    fn routed_garden_shader_is_post_temporal_premultiplied_and_binds_only_three_textures() {
+        let routed = include_str!("../shaders/refresh_garden_routed.wgsl");
+        assert!(routed.contains("@group(0) @binding(0) var current_tex"));
+        assert!(routed.contains("@group(0) @binding(1) var feedback_tex"));
+        assert!(routed.contains("@group(0) @binding(2) var signal_tex"));
+        assert!(!routed.contains("@group(0) @binding(4)"));
+        assert_eq!(routed.matches("textureLoad(feedback_tex").count(), 4);
+        assert!(routed.contains("let current = premultiply(textureSampleLevel(current_tex"));
+        assert!(routed.contains("let signal = select(routed.r, routed.a"));
+        assert!(
+            routed.contains("straight_from_premultiplied(carrier * retained + current * injected)")
+        );
+
+        let inline = include_str!("../shaders/temporal_originals.wgsl");
+        assert_eq!(
+            inline.matches("else if gate_mode == 6u").count(),
+            2,
+            "legacy and Advanced inline paths must both recognize Matte"
+        );
+        let (legacy_inline, advanced_inline) = inline
+            .split_once("fn premultiply_originals")
+            .expect("legacy and Advanced Originals source boundary");
+        assert!(
+            legacy_inline.contains("signal = current.a"),
+            "LegacyExact must retain its frozen current-alpha Matte law"
+        );
+        assert!(
+            !advanced_inline.contains("signal = current.a"),
+            "Advanced Matte must remain closed until the routed pass supplies it"
+        );
     }
 
     #[test]
@@ -4014,11 +4310,14 @@ mod tests {
             include_bytes!("../shaders/effects.wgsl"),
             include_bytes!("../shaders/temporal.wgsl"),
             include_bytes!("../shaders/temporal_originals.wgsl"),
+            include_bytes!("../shaders/refresh_garden_routed.wgsl"),
             include_bytes!("../shaders/composition_host.wgsl"),
             include_bytes!("../shaders/rack_node.wgsl"),
             include_bytes!("../shaders/motion_apply.wgsl"),
             include_bytes!("../shaders/motion_refresh.wgsl"),
             include_bytes!("../shaders/motion_luma.wgsl"),
+            include_bytes!("../shaders/motion_lattice.wgsl"),
+            include_bytes!("../shaders/motion_garden_signal.wgsl"),
         ]);
         let still_fixture_sha256 =
             digest_parts(&[&still_fixture_bytes, bytemuck::bytes_of(&still_uniforms)]);
@@ -4362,5 +4661,128 @@ mod tests {
         assert_eq!(host.program_history_write_index(), 0);
         host.reset_program_history();
         assert_eq!(host.program_history_read_index(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn routed_garden_gpu_uses_selected_signal_and_preserves_warm_allocation_law() {
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter for routed Garden proof");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Routed Garden proof device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device for routed Garden proof");
+        let dimensions = [2, 1];
+        let host =
+            CompositionHost::new(&device, dimensions, capacities(dimensions, false)).unwrap();
+        let ping = host.surface(HostSurface::Ping);
+        let pong = host.surface(HostSurface::Pong);
+        let closed_signal = host.surface(HostSurface::A);
+        let open_signal = host.surface(HostSurface::B);
+        let temporal = host.prepare_temporal_input(&device, ping.view, pong.view);
+        let closed = host.prepare_routed_garden_input(&device, pong.view, closed_signal.view);
+        let open = host.prepare_routed_garden_input(&device, pong.view, open_signal.view);
+        let warmed = host.allocation_snapshot();
+
+        let mut initialize =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        host.encode_clear(
+            &mut initialize,
+            closed_signal.view,
+            wgpu::Color::TRANSPARENT,
+        );
+        host.encode_clear(&mut initialize, open_signal.view, wgpu::Color::WHITE);
+        queue.submit(Some(initialize.finish()));
+
+        let mut params = TemporalParams::default();
+        params.originals.garden.amount = 1.0;
+        params.originals.garden.gate = crate::temporal::RefreshGardenGate::Matte;
+        params.originals.garden.threshold = 0.5;
+        params.originals.garden.softness = 0.0;
+        params.originals.garden.decay = 1.0;
+        let timing = HostFrameTiming::new(1.0 / 30.0, true);
+        let red = repeated_half_rgba([0x3c00, 0, 0, 0x3c00], 2);
+        let blue = repeated_half_rgba([0, 0, 0x3c00, 0x3c00], 2);
+
+        upload_texture_bytes(&queue, ping.texture, dimensions, 8, &red);
+        let mut prime =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        assert!(host.encode_temporal_routed(
+            &queue,
+            &mut prime,
+            &temporal,
+            ping.texture,
+            ping.view,
+            pong.texture,
+            pong.view,
+            &closed,
+            &params,
+            timing,
+        ));
+        queue.submit(Some(prime.finish()));
+        host.commit_temporal_frame();
+
+        upload_texture_bytes(&queue, ping.texture, dimensions, 8, &blue);
+        let mut held =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        assert!(host.encode_temporal_routed(
+            &queue,
+            &mut held,
+            &temporal,
+            ping.texture,
+            ping.view,
+            pong.texture,
+            pong.view,
+            &closed,
+            &params,
+            timing,
+        ));
+        queue.submit(Some(held.finish()));
+        host.commit_temporal_frame();
+        let held = advanced_linear_samples(&read_texture_bytes(
+            &device,
+            &queue,
+            ping.texture,
+            dimensions,
+            8,
+            "Routed Garden closed readback",
+        ));
+        assert_near(held[0], [1.0, 0.0, 0.0, 1.0]);
+
+        upload_texture_bytes(&queue, ping.texture, dimensions, 8, &blue);
+        let mut admitted =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        assert!(host.encode_temporal_routed(
+            &queue,
+            &mut admitted,
+            &temporal,
+            ping.texture,
+            ping.view,
+            pong.texture,
+            pong.view,
+            &open,
+            &params,
+            timing,
+        ));
+        queue.submit(Some(admitted.finish()));
+        host.commit_temporal_frame();
+        let admitted = advanced_linear_samples(&read_texture_bytes(
+            &device,
+            &queue,
+            ping.texture,
+            dimensions,
+            8,
+            "Routed Garden open readback",
+        ));
+        assert_near(admitted[0], [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(host.allocation_snapshot(), warmed);
     }
 }

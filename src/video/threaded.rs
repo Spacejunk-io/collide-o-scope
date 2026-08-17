@@ -19,7 +19,12 @@ use super::decoder::validate_media_dimensions;
 use super::decoder::validate_media_dimensions_with_policy as plan_media_dimensions;
 use super::decoder::KeyframeIndexBuildRequest;
 use super::indexed::KeyframeIndex;
-use super::{CodecMotionFrame, DecodeWorkError, DecodedVideoFrame, FrameMetadata, VideoDecoder};
+#[cfg(test)]
+use super::CodecMotionFrame;
+use super::{
+    CodecFrameIdentity, CodecMotionProduct, DecodeWorkError, DecodedVideoFrame, FrameMetadata,
+    VideoDecoder,
+};
 
 const DECODER_OPEN_TIMEOUT: Duration = Duration::from_secs(7);
 pub const DECODER_TELEMETRY_WINDOW_SAMPLES: usize = 64;
@@ -161,13 +166,14 @@ fn install_ready_keyframe_index(
 #[derive(Debug)]
 pub struct DecodedFrame {
     pub rgba: Vec<u8>,
-    pub codec_motion: Option<CodecMotionFrame>,
+    pub codec_motion: Option<CodecMotionProduct>,
     /// Loop progress 0.0..1.0 at the time this frame was decoded.
     pub progress: f32,
     /// Cumulative successful EOF reopens at the time this frame was decoded.
     pub loop_generation: u64,
     pub source_generation: u64,
     pub pts: Option<i64>,
+    pub codec_identity: Option<CodecFrameIdentity>,
     pub source_seconds: f64,
     pub duration_seconds: f64,
     command_epoch: u64,
@@ -190,9 +196,18 @@ impl DecodedFrame {
             pts,
             source_seconds,
             duration_seconds,
+            codec_identity,
         } = metadata;
-        let codec_motion =
-            codec_motion.filter(|motion| motion.source_generation == source_generation);
+        let codec_identity = codec_identity.filter(|identity| {
+            identity.source_generation == source_generation && Some(identity.pts) == pts
+        });
+        let codec_motion = codec_motion.filter(|motion| {
+            motion.source_generation == source_generation
+                && (motion.latest().status != super::CodecMotionStatus::Available
+                    || motion.exact_identity().is_some_and(|identity| {
+                        Some(identity.latest_destination) == codec_identity
+                    }))
+        });
         Self {
             rgba,
             codec_motion,
@@ -200,6 +215,7 @@ impl DecodedFrame {
             loop_generation,
             source_generation,
             pts,
+            codec_identity,
             source_seconds,
             duration_seconds,
             command_epoch,
@@ -215,6 +231,11 @@ impl DecodedFrame {
             loop_generation,
             source_generation,
             pts: Some(i64::from(value)),
+            codec_identity: Some(CodecFrameIdentity {
+                source_generation,
+                pts: i64::from(value),
+                presentation_ordinal: u64::from(value),
+            }),
             source_seconds: f64::from(value) / 30.0,
             duration_seconds: 10.0,
             command_epoch: 1,
@@ -226,10 +247,11 @@ impl DecodedFrame {
 #[derive(Debug, PartialEq)]
 pub struct ReadyFrame {
     pub rgba: Vec<u8>,
-    pub codec_motion: Option<CodecMotionFrame>,
+    pub codec_motion: Option<CodecMotionProduct>,
     pub loops_advanced: u64,
     pub source_generation: u64,
     pub pts: Option<i64>,
+    pub codec_identity: Option<CodecFrameIdentity>,
     pub source_seconds: f64,
     pub duration_seconds: f64,
 }
@@ -243,6 +265,7 @@ impl ReadyFrame {
             loops_advanced: 0,
             source_generation: metadata.source_generation,
             pts: metadata.pts,
+            codec_identity: metadata.codec_identity,
             source_seconds: metadata.source_seconds,
             duration_seconds: metadata.duration_seconds,
         }
@@ -363,6 +386,7 @@ pub enum DecodeCommand {
 struct QueuedCommand {
     command: DecodeCommand,
     epoch: u64,
+    previous_accepted_codec_identity: Option<CodecFrameIdentity>,
 }
 
 #[derive(Debug)]
@@ -402,7 +426,17 @@ impl DecodeCommandMailbox {
         })
     }
 
+    #[cfg(test)]
     fn select(&self, generation: u64, target_seconds: f64) -> Result<bool, String> {
+        self.select_after(generation, target_seconds, None)
+    }
+
+    fn select_after(
+        &self,
+        generation: u64,
+        target_seconds: f64,
+        previous_accepted_codec_identity: Option<CodecFrameIdentity>,
+    ) -> Result<bool, String> {
         if !target_seconds.is_finite() {
             return Err(format!(
                 "source-time selection must be finite, got {target_seconds}"
@@ -425,6 +459,8 @@ impl DecodeCommandMailbox {
                 target_seconds,
             },
             epoch,
+            previous_accepted_codec_identity: previous_accepted_codec_identity
+                .filter(|identity| identity.source_generation == generation),
         });
         if replaced.is_some() {
             self.command_overwrites.fetch_add(1, Ordering::Relaxed);
@@ -447,6 +483,7 @@ impl DecodeCommandMailbox {
         let replaced = state.pending.replace(QueuedCommand {
             command: DecodeCommand::Stop,
             epoch,
+            previous_accepted_codec_identity: None,
         });
         if replaced.is_some() {
             self.command_overwrites.fetch_add(1, Ordering::Relaxed);
@@ -500,9 +537,20 @@ pub struct ThreadedDecoder {
     progress: f32,
     consumed_loop_generation: u64,
     consumed_source_generation: u64,
+    accepted_source_generation: Option<u64>,
+    accepted_source_seconds: Option<f64>,
+    accepted_codec_identity: Option<CodecFrameIdentity>,
+    last_consumed_upload_token: Option<ConsumedUploadToken>,
     failure_revision_reported: u64,
     last_consumed_at: Option<Instant>,
     consumed_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConsumedUploadToken {
+    source_generation: u64,
+    source_seconds_bits: u64,
+    codec_identity: Option<CodecFrameIdentity>,
 }
 
 impl ThreadedDecoder {
@@ -620,12 +668,13 @@ impl ThreadedDecoder {
                     run_decode_commands(
                         worker_mailbox,
                         worker_shared,
-                        |generation, target_seconds, epoch| {
+                        |generation, target_seconds, previous_accepted_source_seconds, epoch| {
                             install_ready_keyframe_index(&decoder, &index_result, &path_owned);
                             let mut decoder = decoder.borrow_mut();
-                            let frame = decoder.seek_decode_interruptible(
+                            let frame = decoder.seek_decode_after_interruptible(
                                 target_seconds,
                                 generation,
+                                previous_accepted_source_seconds,
                                 || select_mailbox.is_current(epoch),
                             )?;
                             Ok(DecodedFrame::from_video(
@@ -673,6 +722,10 @@ impl ThreadedDecoder {
             progress: 0.0,
             consumed_loop_generation: 0,
             consumed_source_generation: 0,
+            accepted_source_generation: None,
+            accepted_source_seconds: None,
+            accepted_codec_identity: None,
+            last_consumed_upload_token: None,
             failure_revision_reported: 0,
             last_consumed_at: None,
             consumed_frames: 0,
@@ -689,7 +742,16 @@ impl ThreadedDecoder {
         if let Some(error) = self.terminal_error_once() {
             return Err(error);
         }
-        self.mailbox.select(generation, target_seconds)
+        let forward_tolerance = 0.25 / f64::from(self.fps.max(1.0));
+        let previous_accepted_codec_identity = (Some(generation)
+            == self.accepted_source_generation
+            && self
+                .accepted_source_seconds
+                .is_some_and(|accepted| target_seconds > accepted + forward_tolerance))
+        .then_some(self.accepted_codec_identity)
+        .flatten();
+        self.mailbox
+            .select_after(generation, target_seconds, previous_accepted_codec_identity)
     }
 
     /// Compatibility convenience for callers without their own source
@@ -746,6 +808,11 @@ impl ThreadedDecoder {
             self.last_consumed_at = Some(consumed_at);
             self.consumed_frames = self.consumed_frames.saturating_add(1);
             self.progress = frame.progress;
+            self.last_consumed_upload_token = Some(ConsumedUploadToken {
+                source_generation: frame.source_generation,
+                source_seconds_bits: frame.source_seconds.to_bits(),
+                codec_identity: frame.codec_identity,
+            });
             let loops_advanced = if frame.source_generation != self.consumed_source_generation {
                 self.consumed_source_generation = frame.source_generation;
                 self.consumed_loop_generation = frame.loop_generation;
@@ -764,6 +831,7 @@ impl ThreadedDecoder {
                 loops_advanced,
                 source_generation: frame.source_generation,
                 pts: frame.pts,
+                codec_identity: frame.codec_identity,
                 source_seconds: frame.source_seconds,
                 duration_seconds: frame.duration_seconds,
             }));
@@ -835,11 +903,35 @@ impl ThreadedDecoder {
         }
     }
 
-    /// Record one successful validated CPU-to-GPU upload. The caller measures
-    /// the complete queue-write/error-scope wall interval; no staging buffer or
-    /// timestamp query is allocated for telemetry.
-    pub fn record_upload_duration(&mut self, duration: Duration) {
+    /// Commit one successfully uploaded source image as the predecessor for
+    /// skipped-frame motion composition. Merely removing a decoded frame from
+    /// the mailbox is not acceptance: a failed GPU upload must leave the prior
+    /// predecessor intact. The caller also supplies the complete
+    /// queue-write/error-scope wall interval for telemetry; no staging buffer
+    /// or timestamp query is allocated.
+    pub fn record_accepted_upload(
+        &mut self,
+        source_generation: u64,
+        source_seconds: f64,
+        codec_identity: Option<CodecFrameIdentity>,
+        duration: Duration,
+    ) {
         lock_state(&self.shared).upload_durations.record(duration);
+        let upload_matches_consumed_frame = self.last_consumed_upload_token.is_some_and(|token| {
+            token.source_generation == source_generation
+                && token.source_seconds_bits == source_seconds.to_bits()
+                && token.codec_identity == codec_identity
+        });
+        if source_seconds.is_finite() && source_seconds >= 0.0 && upload_matches_consumed_frame {
+            self.accepted_source_generation = Some(source_generation);
+            self.accepted_source_seconds = Some(source_seconds);
+            self.accepted_codec_identity =
+                codec_identity.filter(|identity| identity.source_generation == source_generation);
+        } else {
+            self.accepted_source_generation = None;
+            self.accepted_source_seconds = None;
+            self.accepted_codec_identity = None;
+        }
     }
 
     fn terminal_error_once(&mut self) -> Option<String> {
@@ -893,7 +985,7 @@ fn run_decode_commands<S>(
     shared: Arc<Mutex<SharedState>>,
     mut select_frame: S,
 ) where
-    S: FnMut(u64, f64, u64) -> Result<DecodedFrame, DecodeWorkError>,
+    S: FnMut(u64, f64, Option<CodecFrameIdentity>, u64) -> Result<DecodedFrame, DecodeWorkError>,
 {
     loop {
         let queued = mailbox.recv();
@@ -911,7 +1003,12 @@ fn run_decode_commands<S>(
                 target_seconds,
             } => {
                 let decode_started = Instant::now();
-                let result = select_frame(generation, target_seconds, queued.epoch);
+                let result = select_frame(
+                    generation,
+                    target_seconds,
+                    queued.previous_accepted_codec_identity,
+                    queued.epoch,
+                );
                 (generation, result, decode_started.elapsed())
             }
             DecodeCommand::Stop => unreachable!("stop returned above"),
@@ -925,8 +1022,22 @@ fn run_decode_commands<S>(
         match result {
             Ok(mut frame) => {
                 frame.source_generation = generation;
+                if let Some(identity) = frame.codec_identity.as_mut() {
+                    identity.source_generation = generation;
+                }
+                frame.codec_identity = frame
+                    .codec_identity
+                    .filter(|identity| Some(identity.pts) == frame.pts);
                 if let Some(codec_motion) = frame.codec_motion.as_mut() {
                     codec_motion.retag_source_generation(generation);
+                }
+                if frame.codec_motion.as_ref().is_some_and(|motion| {
+                    motion.latest().status == super::CodecMotionStatus::Available
+                        && !motion.exact_identity().is_some_and(|identity| {
+                            Some(identity.latest_destination) == frame.codec_identity
+                        })
+                }) {
+                    frame.codec_motion = None;
                 }
                 frame.command_epoch = queued.epoch;
                 state.publish(frame, Instant::now(), decode_duration);
@@ -976,13 +1087,15 @@ mod tests {
             provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
             frame_type: crate::video::CodecMotionFrameType::Intra,
             status: crate::video::CodecMotionStatus::Intra,
+            past_reference_proof: None,
             vectors: Vec::new(),
         }
     }
 
     fn synthetic_frame_with_motion(value: u8, source_generation: u64) -> DecodedFrame {
         let mut frame = DecodedFrame::synthetic(value, source_generation, 0);
-        frame.codec_motion = Some(synthetic_codec_motion(source_generation, u64::from(value)));
+        frame.codec_motion =
+            Some(synthetic_codec_motion(source_generation, u64::from(value)).into());
         frame
     }
 
@@ -1013,10 +1126,145 @@ mod tests {
             progress: 0.0,
             consumed_loop_generation: 0,
             consumed_source_generation: 0,
+            accepted_source_generation: None,
+            accepted_source_seconds: None,
+            accepted_codec_identity: None,
+            last_consumed_upload_token: None,
             failure_revision_reported: 0,
             last_consumed_at: None,
             consumed_frames: 0,
         }
+    }
+
+    #[test]
+    fn newest_selection_keeps_its_accepted_motion_predecessor_in_the_same_slot() {
+        let mailbox = DecodeCommandMailbox::new();
+        let first = CodecFrameIdentity {
+            source_generation: 7,
+            pts: 45,
+            presentation_ordinal: 45,
+        };
+        let newest = CodecFrameIdentity {
+            source_generation: 7,
+            pts: 75,
+            presentation_ordinal: 75,
+        };
+        assert!(mailbox.select_after(7, 2.0, Some(first)).unwrap());
+        assert!(mailbox.select_after(7, 3.0, Some(newest)).unwrap());
+        let queued = mailbox.recv();
+        assert_eq!(
+            queued.command,
+            DecodeCommand::Select {
+                generation: 7,
+                target_seconds: 3.0,
+            }
+        );
+        assert_eq!(queued.previous_accepted_codec_identity, Some(newest));
+        assert_eq!(mailbox.command_overwrites.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn only_a_successful_upload_advances_the_motion_predecessor() {
+        let mut decoder = synthetic_decoder(DecodedFrame::synthetic(3, 0, 0));
+        let consumed = decoder
+            .try_next_ready_frame_result()
+            .unwrap()
+            .expect("seed frame");
+        assert_eq!(consumed.source_generation, 0);
+
+        assert!(decoder.request_source_time(0, 1.0).unwrap());
+        let before_upload = decoder.mailbox.recv();
+        assert_eq!(before_upload.previous_accepted_codec_identity, None);
+
+        decoder.record_accepted_upload(
+            0,
+            consumed.source_seconds,
+            consumed.codec_identity,
+            Duration::from_micros(10),
+        );
+        assert!(decoder.request_source_time(0, 2.0).unwrap());
+        let after_upload = decoder.mailbox.recv();
+        assert_eq!(
+            after_upload.previous_accepted_codec_identity,
+            consumed.codec_identity
+        );
+    }
+
+    #[test]
+    fn hostile_upload_identity_cannot_become_the_motion_predecessor() {
+        let mut decoder = synthetic_decoder(DecodedFrame::synthetic(3, 0, 0));
+        let consumed = decoder
+            .try_next_ready_frame_result()
+            .unwrap()
+            .expect("seed frame");
+        let mut forged = consumed.codec_identity.unwrap();
+        forged.pts += 1;
+        forged.presentation_ordinal += 1;
+
+        decoder.record_accepted_upload(
+            consumed.source_generation,
+            consumed.source_seconds,
+            Some(forged),
+            Duration::from_micros(10),
+        );
+        assert!(decoder.request_source_time(0, 1.0).unwrap());
+        assert_eq!(
+            decoder.mailbox.recv().previous_accepted_codec_identity,
+            None,
+            "a same-generation token that was not paired with the consumed pixels was accepted"
+        );
+
+        decoder.record_accepted_upload(
+            consumed.source_generation,
+            consumed.source_seconds,
+            consumed.codec_identity,
+            Duration::from_micros(10),
+        );
+        assert!(decoder.request_source_time(0, 2.0).unwrap());
+        assert_eq!(
+            decoder.mailbox.recv().previous_accepted_codec_identity,
+            consumed.codec_identity
+        );
+    }
+
+    #[test]
+    fn accepted_identity_free_upload_clears_the_prior_motion_predecessor() {
+        let published_at = Instant::now();
+        let mut decoder = synthetic_decoder_at(DecodedFrame::synthetic(3, 0, 0), published_at);
+        let first = decoder
+            .try_next_ready_frame_result_at(published_at)
+            .unwrap()
+            .unwrap();
+        decoder.record_accepted_upload(
+            first.source_generation,
+            first.source_seconds,
+            first.codec_identity,
+            Duration::from_micros(10),
+        );
+
+        let mut identity_free = DecodedFrame::synthetic(4, 0, 0);
+        identity_free.codec_identity = None;
+        lock_state(&decoder.shared).publish(
+            identity_free,
+            published_at + Duration::from_millis(1),
+            Duration::from_micros(50),
+        );
+        let second = decoder
+            .try_next_ready_frame_result_at(published_at + Duration::from_millis(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.codec_identity, None);
+        decoder.record_accepted_upload(
+            second.source_generation,
+            second.source_seconds,
+            second.codec_identity,
+            Duration::from_micros(10),
+        );
+        assert!(decoder.request_source_time(0, 1.0).unwrap());
+        assert_eq!(
+            decoder.mailbox.recv().previous_accepted_codec_identity,
+            None
+        );
     }
 
     #[test]
@@ -1096,8 +1344,8 @@ mod tests {
             decoder.try_next_ready_frame_result_at(published_at),
             Ok(None)
         );
-        decoder.record_upload_duration(Duration::from_micros(800));
-        decoder.record_upload_duration(Duration::from_micros(250));
+        decoder.record_accepted_upload(3, 0.0, None, Duration::from_micros(800));
+        decoder.record_accepted_upload(3, 0.0, None, Duration::from_micros(250));
         let dropped = decoder.telemetry_at(published_at);
         assert_eq!(dropped.frame_drops, 1);
         assert_eq!((dropped.published_frames, dropped.consumed_frames), (1, 0));
@@ -1203,7 +1451,7 @@ mod tests {
         let worker_started = started.clone();
         let worker_release = release.clone();
         let worker = std::thread::spawn(move || {
-            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _| {
+            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _| {
                 if generation == 0 {
                     *lock_recover(&worker_started.0) = true;
                     worker_started.1.notify_one();
@@ -1279,7 +1527,7 @@ mod tests {
         let worker_started = started.clone();
         let worker_release = release.clone();
         let worker = std::thread::spawn(move || {
-            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _| {
+            run_decode_commands(worker_mailbox, worker_shared, |generation, _, _, _| {
                 if generation == 10 {
                     *lock_recover(&worker_started.0) = true;
                     worker_started.1.notify_one();
@@ -1338,7 +1586,7 @@ mod tests {
         let decoded = DecodedVideoFrame {
             rgba: vec![7],
             metadata: FrameMetadata::sanitized(42, Some(7), 0.25, 1.0),
-            codec_motion: Some(synthetic_codec_motion(41, 7)),
+            codec_motion: Some(synthetic_codec_motion(41, 7).into()),
         };
         let frame = DecodedFrame::from_video(decoded, 0.25, 0, 1);
         assert_eq!(frame.source_generation, 42);

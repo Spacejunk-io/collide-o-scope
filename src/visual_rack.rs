@@ -37,6 +37,9 @@ pub const MAX_CURRENT_IMAGE_TAPS: usize = 64;
 pub const MAX_PREVIOUS_IMAGE_TAPS: usize = 8;
 pub const MAX_IMAGE_DEPENDENCIES: usize = MAX_CURRENT_IMAGE_TAPS + MAX_PREVIOUS_IMAGE_TAPS;
 pub const MAX_GRAPH_SCOPES: usize = 274;
+/// The fixed Collision Rack bind layout remains capped at three sampled
+/// textures. Dedicated creative passes are split by the composition planner
+/// and preflight against their own declared ceiling.
 pub const MAX_SAMPLED_TEXTURES_PER_PASS: u32 = 3;
 pub const MAX_CREATIVE_GPU_BYTES: u64 = 512 * 1024 * 1024;
 /// Rack ping/pong, A lane, B lane, Program lane, and one shared group-local
@@ -1882,10 +1885,9 @@ impl VisualRack {
     )]
     pub fn mark_group_output_missing(&mut self, removed: GroupId) {
         for node in &mut self.nodes {
-            let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
-                continue;
-            };
-            matte.mark_group_output_missing(removed);
+            if let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind {
+                matte.mark_group_output_missing(removed);
+            }
         }
     }
 }
@@ -2687,21 +2689,17 @@ impl RuntimeVisualRack {
 
     pub fn mark_layer_output_missing(&mut self, removed: StableLayerId) {
         for node in &mut self.nodes {
-            let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = &mut node.kind
-            else {
-                continue;
-            };
-            matte.tap.mark_layer_missing(removed);
+            if let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = &mut node.kind {
+                matte.tap.mark_layer_missing(removed);
+            }
         }
     }
 
     pub fn mark_group_output_missing(&mut self, removed: GroupId) {
         for node in &mut self.nodes {
-            let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = &mut node.kind
-            else {
-                continue;
-            };
-            matte.tap.mark_group_missing(removed);
+            if let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = &mut node.kind {
+                matte.tap.mark_group_missing(removed);
+            }
         }
     }
 

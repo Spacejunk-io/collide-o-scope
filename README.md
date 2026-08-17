@@ -83,6 +83,13 @@ and Legacy Temporal markers retain the established order during migration.
 Unsafe sample counts, image dependencies, current-frame cycles, or GPU resource
 plans are rejected before the live graph changes.
 
+Entirely new studies and operators are intentionally not half-shipped in this
+repair release. The dependency order, frozen candidate APIs, resource ledgers,
+state-integration matrix, and acceptance gates for named Displace, Residual
+Counterpoint, Gesture-Field Etching, Symmetry Field, Field Collider, the native
+transform gizmo, and evidence-gated scale runtimes are recorded in the
+[successor-session implementation plan](docs/successor-session-enrichment-implementation-plan.md).
+
 The composition root can contain layers and up to 16 one-level groups. Groups
 own contiguous members, opacity, transform, rack, matte, solo/bypass, and a
 Program/A/B bus assignment. Root order and stable `GroupId`/`NodeId` references
@@ -114,7 +121,11 @@ The fixed 30 Hz, 24-sample program history also powers four original studies:
 - **Collision Atlas** assigns seeded temporal territories and controls their
   collisions.
 - **Refresh Garden** admits and holds memory through temporal-delta, luma,
-  chroma, cellular-ridge, audio-energy, audio-onset, or matte gates.
+  chroma, cellular-ridge, audio-energy, audio-onset, matte, or motion gates.
+  Matte selects a stable layer's pre- or post-local current-frame image;
+  Motion reads the selected layer's actually admitted motion field, including
+  its resolved lattice/codec source and any admitted donor transplant. Missing
+  or unselected routes are explicit zero signals and never positional fallbacks.
 - **Collision Score** advances a deterministic seeded state on a selected loop
   boundary, downbeat, audio onset, or explicit manual event. Separate reset law
   chooses whether loop/downbeat events clear Score, memory, both, or neither.
@@ -122,6 +133,17 @@ The fixed 30 Hz, 24-sample program history also powers four original studies:
 Temporal zero modes preserve the earlier renderer. Freeze, reset, event, patch,
 Morph, modulation, Dice, and offline-frame laws are explicit and covered by
 deterministic fixtures; this is software evidence, not a claim about every GPU.
+Routed Garden admission runs in one dedicated post-temporal pass with at most
+three sampled textures. Route identity and tombstones survive patch, Morph,
+undo/redo, and layer reorder; removal cannot retarget a replacement layer, and
+offline export resolves the same saved route against deterministic job-local
+IDs while warning when a route remains closed.
+
+**Refresh now** is an ordered counted Garden event, not an untracked UI pulse.
+Accepted temporal events enter a bounded reference-tick track that offline
+export replays at the same accepted-frame boundaries. **Clear event recording**
+clears only that replay track; it does not alter authored temporal controls,
+Garden/Score memory, or the audience image.
 
 At master and layer scope, **Motion Fields** selects valid codec vectors,
 deterministic Motion Lattice block matching, or Auto (visible lattice fallback
@@ -130,13 +152,23 @@ than silently degraded under load. A layer can donate stable-ID motion to the
 single admitted **Faraday Motion Transplant** carrier, and **Curved Shutter**
 uses fixed Sharp/Draft/Live/High sample counts. Field, carrier, and transplant
 resources are hard-bounded and a zero amount/angle is an exact bypass.
+The live Motion status distinguishes the planned source from the field
+actually committed by the renderer. First-frame lattice priming and an
+unavailable source that has never committed remain visibly unattached; Media
+Freeze retains and identifies the prior committed field. A Faraday recipient
+reports the admitted donor field and its grid rather than inventing
+recipient-local truth.
 
 Offline export writes `<video>.motion.json` only after the video succeeds. The
-bounded schema-v1 report records source fingerprints when available, authored
-scope/algorithm/quality/carrier choices, observed field origin and diagnostics,
-dynamic-state changes, the last accepted frame, and warnings. It explicitly
-sets cross-GPU pixel identity to false; it is provenance, not a promise that
-different drivers render identical pixels.
+bounded schema-v3 report records source fingerprints when available; the
+requested export shutter policy and literal count; distinct authored and
+effective scope/algorithm/quality/carrier choices; the final planner source,
+the source actually rendered, and whether its field was attached; codec
+transition count and elapsed source time only for an attached proven codec
+field; an exact codec proof/vector digest; planned-but-unattached field truth;
+dynamic-state changes; the last accepted frame; diagnostics; and
+warnings. It explicitly sets cross-GPU pixel identity to false; it is
+provenance, not a promise that different drivers render identical pixels.
 
 ## Spatial transforms
 
@@ -597,6 +629,15 @@ matches the real-time path by processing at half width and height, then
 upscaling. **Native (full resolution)** processes at the selected export size;
 it avoids that downscale/upscale step but is slower and more memory-intensive.
 This choice does not change Bypass Master FX routing or pipeline order.
+
+**Shutter samples** is a closed export request: **Authored per scope**, or an
+exact **1 / 4 / 8 / 16 samples** for every active Curved Shutter scope. An
+explicit count replaces only the authored quality tier after the frame's
+Morph/modulation values are resolved; the same resulting count is used by the
+candidate and final immutable plans before resource preflight. It cannot turn
+on a 0° shutter, so zero angle retains exact delegation. Older clients omit the
+field and therefore preserve authored per-scope tiers; arbitrary counts and
+silent quality substitution are rejected.
 
 An optional video layer can supply its first audio stream. That audio starts at
 source time zero, plays once at 1×, and is independent of visual pause, speed,

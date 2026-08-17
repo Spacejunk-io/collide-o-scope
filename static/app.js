@@ -616,9 +616,11 @@ function creativeRouteFromToken(token, timing) {
   return { input, timing: normalizedTiming };
 }
 
-function creativeRouteEditorHtml(route, channel = 'alpha', invert = false) {
+function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, fieldOnly = false) {
   const token = creativeRouteToken(route);
   const timing = route?.timing || 'current_frame';
+  const channelControls = fieldOnly ? '' : `<label>Channel <select class="creative-route-channel">${creativeOptionHtml([['alpha', 'Alpha'], ['luma', 'Luma'], ['red', 'Red'], ['green', 'Green'], ['blue', 'Blue']], channel)}</select></label>
+      <label><input class="creative-route-invert" type="checkbox" ${invert ? 'checked' : ''}> Invert</label>`;
   return `<div class="creative-route-editor">
     <div class="creative-route-row">
       <label>Donor <select class="creative-route-source">${creativeOptionHtml(creativeRouteOptions(route), token)}</select></label>
@@ -626,8 +628,7 @@ function creativeRouteEditorHtml(route, channel = 'alpha', invert = false) {
         <option value="current_frame" ${timing === 'current_frame' ? 'selected' : ''}>Current frame</option>
         <option value="previous_frame" ${timing === 'previous_frame' ? 'selected' : ''}>Previous frame N−1</option>
       </select></label>
-      <label>Channel <select class="creative-route-channel">${creativeOptionHtml([['alpha', 'Alpha'], ['luma', 'Luma'], ['red', 'Red'], ['green', 'Green'], ['blue', 'Blue']], channel)}</select></label>
-      <label><input class="creative-route-invert" type="checkbox" ${invert ? 'checked' : ''}> Invert</label>
+      ${channelControls}
     </div>
     <div class="creative-node-diagnostic">Current-frame routes participate in cycle rejection. Clean Program is deliberately previous-frame only.</div>
   </div>`;
@@ -643,12 +644,12 @@ function wireCreativeRouteEditor(editor, onChange, selfGroupId = '') {
     if (selfGroupId && source.value === `group:${selfGroupId}` && timing.value === 'current_frame') {
       timing.value = 'previous_frame';
     }
-    onChange(creativeRouteFromToken(source.value, timing.value), channel.value, invert.checked);
+    onChange(creativeRouteFromToken(source.value, timing.value), channel?.value || 'alpha', invert?.checked || false);
   };
   source.addEventListener('change', submit);
   timing.addEventListener('change', submit);
-  channel.addEventListener('change', submit);
-  invert.addEventListener('change', submit);
+  channel?.addEventListener('change', submit);
+  invert?.addEventListener('change', submit);
 }
 
 function creativeNodeVisibleDefs(node) {
@@ -725,13 +726,16 @@ function renderCreativeRack() {
     const imageRoute = node.kind === 'mask' && node.params?.variant === 'image'
       ? creativeRouteEditorHtml(node.params.image_tap, node.params.image_channel, node.params.image_invert)
       : '';
+    const nodeDiagnostic = node.params?.diagnostic
+      ? `<div class="creative-node-diagnostic">${escapeHtml(node.params.diagnostic)}</div>`
+      : '';
     card.innerHTML = `<div class="creative-node-head">
       <span class="creative-node-title">${escapeHtml(info.label)}</span>
       <span class="creative-node-id">#${escapeHtml(node.node_id)}</span>
       <button class="creative-node-up" type="button" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeHtml(info.label)} earlier">↑</button>
       <button class="creative-node-down" type="button" ${index + 1 === nodes.length ? 'disabled' : ''} aria-label="Move ${escapeHtml(info.label)} later">↓</button>
       <button class="creative-node-remove" type="button" ${marker ? 'disabled title="Legacy execution markers are immutable"' : ''} aria-label="Remove ${escapeHtml(info.label)}">×</button>
-    </div><div class="creative-node-controls">${common}${maskVariant}${params}${imageRoute}</div>${marker ? '<div class="creative-node-diagnostic">Frozen compatibility marker · values are supplied by the established engine path.</div>' : ''}`;
+    </div><div class="creative-node-controls">${common}${maskVariant}${params}${imageRoute}</div>${nodeDiagnostic}${marker ? '<div class="creative-node-diagnostic">Frozen compatibility marker · values are supplied by the established engine path.</div>' : ''}`;
     creativeRackNodes.appendChild(card);
     card.querySelector('.creative-node-up')?.addEventListener('click', () => creativeSend({ action: 'move_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), to: index - 1, composition_revision: compositionRevision }, 'Moving rack node…'));
     card.querySelector('.creative-node-down')?.addEventListener('click', () => creativeSend({ action: 'move_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), to: index + 1, composition_revision: compositionRevision }, 'Moving rack node…'));
@@ -1875,6 +1879,67 @@ function syncTemporalLoopDriver(driver) {
   select.value = [...select.options].some(option => option.value === desired) ? desired : 'none';
 }
 
+function gardenRouteDesired(route) {
+  if (route?.kind === 'selected_layer') return String(route.layer_id || '');
+  if (route?.kind === 'missing_selected_layer') {
+    return `missing:${Number(route.saved_position) || 0}`;
+  }
+  return 'none';
+}
+
+function syncGardenLayerRoute(select, route, label) {
+  if (!select || !canSync(select)) return;
+  const desired = gardenRouteDesired(route);
+  select.replaceChildren(new Option('None', 'none'));
+  latestLayers.forEach((layer, index) => {
+    const id = stableLayerId(layer);
+    if (!id) return;
+    const name = layer.filename || layer.source_kind || id;
+    select.add(new Option(`Layer ${index + 1}: ${name}`, id));
+  });
+  if (desired.startsWith('missing:')) {
+    const position = Number(desired.slice(8)) + 1;
+    const missing = new Option(`Missing saved layer ${position}`, desired, true, true);
+    missing.disabled = true;
+    select.add(missing);
+  } else if (route?.kind === 'selected_layer'
+      && ![...select.options].some(option => option.value === desired)) {
+    const unavailable = new Option(`${label} layer ${desired} unavailable`, desired, true, true);
+    unavailable.disabled = true;
+    select.add(unavailable);
+  }
+  select.value = [...select.options].some(option => option.value === desired) ? desired : 'none';
+}
+
+function gardenRouteDiagnostic(label, route) {
+  if (route?.kind === 'selected_layer') {
+    const index = latestLayers.findIndex(layer => stableLayerId(layer) === String(route.layer_id));
+    return index >= 0 ? `${label} Layer ${index + 1}` : `${label} selected layer unavailable`;
+  }
+  if (route?.kind === 'missing_selected_layer') {
+    return `${label} missing saved layer ${(Number(route.saved_position) || 0) + 1} · gate zero`;
+  }
+  return `${label} not selected · gate zero`;
+}
+
+function syncRefreshGardenRoutes(garden) {
+  const matteRoute = garden?.matte_route || { kind: 'none' };
+  const motionRoute = garden?.motion_route || { kind: 'none' };
+  const matteSelect = document.getElementById('temporal-garden-matte-route');
+  const motionSelect = document.getElementById('temporal-garden-motion-route');
+  const stageSelect = document.getElementById('temporal-garden-matte-stage');
+  syncGardenLayerRoute(matteSelect, matteRoute, 'Matte');
+  syncGardenLayerRoute(motionSelect, motionRoute, 'Motion');
+  if (stageSelect) {
+    if (canSync(stageSelect)) stageSelect.value = matteRoute.stage || 'post_local_effects';
+    stageSelect.disabled = matteRoute.kind !== 'selected_layer';
+  }
+  const status = document.getElementById('temporal-garden-route-status');
+  if (status) {
+    status.textContent = `${gardenRouteDiagnostic('Matte', matteRoute)} · ${gardenRouteDiagnostic('Motion', motionRoute)}`;
+  }
+}
+
 function syncTemporal(t) {
   if (!t) return;
   const originals = t.originals || {};
@@ -1944,6 +2009,7 @@ function syncTemporal(t) {
     if (number && canSync(number)) number.value = String(value);
   }
   syncTemporalLoopDriver(score.loop_driver);
+  syncRefreshGardenRoutes(garden);
 
   const telemetry = t.telemetry || {};
   const telemetryEl = document.getElementById('temporal-telemetry');
@@ -1955,14 +2021,58 @@ function syncTemporal(t) {
     const ticks = Number(telemetry.total_reference_ticks) || 0;
     const scoreState = Number(telemetry.score_state) || 0;
     const ordinal = Number(telemetry.score_event_ordinal) || 0;
+    const recorded = Number(telemetry.recorded_event_points) || 0;
+    const track = telemetry.event_track_truncated ? `${recorded}+ recorded` : `${recorded} recorded`;
     const staged = telemetry.frame_staged ? ' · staged' : '';
     const resetText = telemetry.last_reset ? ` · reset ${telemetry.last_reset}` : '';
-    telemetryEl.textContent = `History ${valid}/${capacity} · ${carrier} · ${hold} · tick ${ticks} · Score ${scoreState} · event ${ordinal}${staged}${resetText}`;
+    telemetryEl.textContent = `History ${valid}/${capacity} · ${carrier} · ${hold} · tick ${ticks} · Score ${scoreState} · event ${ordinal} · ${track}${staged}${resetText}`;
   }
 }
 
 document.getElementById('temporal-clear-memory')?.addEventListener('click', () => {
   sendAction({ action: 'clear_temporal_memory' });
+});
+
+document.getElementById('temporal-clear-event-track')?.addEventListener('click', () => {
+  sendAction({ action: 'clear_temporal_event_track' });
+});
+
+document.getElementById('temporal-garden-trigger')?.addEventListener('click', () => {
+  sendAction({ action: 'trigger_refresh_garden' });
+});
+
+document.getElementById('temporal-garden-matte-route')?.addEventListener('change', (event) => {
+  const value = String(event.currentTarget.value || 'none');
+  const layerId = /^(?:[1-9][0-9]*)$/.test(value) ? value : null;
+  const stage = document.getElementById('temporal-garden-matte-stage')?.value || 'post_local_effects';
+  sendAction({
+    action: 'set_refresh_garden_matte_route',
+    layer_id: layerId,
+    stage,
+    layer_stack_revision: layerStackRevision,
+  });
+});
+
+document.getElementById('temporal-garden-matte-stage')?.addEventListener('change', (event) => {
+  const route = document.getElementById('temporal-garden-matte-route');
+  const layerId = String(route?.value || '');
+  if (!/^(?:[1-9][0-9]*)$/.test(layerId)) return;
+  sendAction({
+    action: 'set_refresh_garden_matte_route',
+    layer_id: layerId,
+    stage: event.currentTarget.value,
+    layer_stack_revision: layerStackRevision,
+  });
+});
+
+document.getElementById('temporal-garden-motion-route')?.addEventListener('change', (event) => {
+  const value = String(event.currentTarget.value || 'none');
+  const layerId = /^(?:[1-9][0-9]*)$/.test(value) ? value : null;
+  sendAction({
+    action: 'set_refresh_garden_motion_route',
+    layer_id: layerId,
+    layer_stack_revision: layerStackRevision,
+  });
 });
 
 document.getElementById('temporal-score-trigger')?.addEventListener('click', () => {
@@ -2004,13 +2114,17 @@ function motionTelemetryText(motion = {}) {
   const telemetry = motion.telemetry || {};
   const dimensions = telemetry.field_dimensions || [0, 0];
   const source = telemetry.effective_source || 'idle';
+  const rendered = telemetry.rendered_source || 'none';
   const fallback = telemetry.fallback_active ? ' · lattice fallback' : '';
   const missing = telemetry.donor_missing ? ' · donor missing' : '';
   const admitted = telemetry.transplant_admitted ? ' · transplant admitted' : '';
   const carrier = telemetry.carrier_valid ? 'carrier ready' : 'carrier empty';
   const field = dimensions[0] && dimensions[1] ? ` · ${dimensions[0]}×${dimensions[1]}` : '';
   const diagnostic = telemetry.diagnostic ? ` · ${telemetry.diagnostic}` : '';
-  return `v${Number(motion.algorithm_version || 1)} · ${source}${fallback}${field} · ${Number(telemetry.vector_count || 0)} vectors · ${carrier}${admitted}${missing}${diagnostic}`;
+  const attachment = telemetry.field_planned
+    ? (telemetry.field_attached ? ` · rendered ${rendered}` : ' · field priming/unavailable')
+    : ' · no field planned';
+  return `v${Number(motion.algorithm_version || 1)} · planned ${source}${fallback}${field} · ${Number(telemetry.vector_count || 0)} vectors${attachment} · ${carrier}${admitted}${missing}${diagnostic}`;
 }
 
 function wireMotionPanel(panel, scopeProvider) {
@@ -2830,6 +2944,21 @@ function layerPerformanceHtml(layer, index) {
       <div class="performance-status clip-slot-status" role="status" aria-live="polite">${escapeHtml(slot?.status || (slot?.prepared ? 'Prepared' : slot ? 'Staging…' : 'No prepared source'))}</div>
       <div class="transport-grid" ${slot ? '' : 'hidden'}>
         <label>Playhead <input class="clip-seek" type="range" min="0" max="1" step="0.001" value="${Number(slot?.playhead || 0)}" aria-label="Layer ${index + 1} clip playhead"></label>
+        <fieldset class="clip-timecode-controls">
+          <legend>Timecode seek</legend>
+          <label>HH <input class="clip-timecode-hours" type="number" min="0" max="99" step="1" value="0" aria-label="Timecode hours"></label>
+          <label>MM <input class="clip-timecode-minutes" type="number" min="0" max="59" step="1" value="0" aria-label="Timecode minutes"></label>
+          <label>SS <input class="clip-timecode-seconds" type="number" min="0" max="59" step="1" value="0" aria-label="Timecode seconds"></label>
+          <label>FF <input class="clip-timecode-frames" type="number" min="0" max="59" step="1" value="0" aria-label="Timecode frames"></label>
+          <label>Rate <select class="clip-timecode-rate" aria-label="Timecode rate">
+            <option value="fps24">24</option><option value="ntsc24">23.976 NDF</option>
+            <option value="fps25">25</option><option value="fps30">30</option>
+            <option value="ntsc30">29.97 NDF</option><option value="ntsc30_drop">29.97 DF</option>
+            <option value="fps50">50</option><option value="fps60">60</option>
+            <option value="ntsc60">59.94 NDF</option><option value="ntsc60_drop">59.94 DF</option>
+          </select></label>
+          <button type="button" class="clip-timecode-seek">Seek</button>
+        </fieldset>
         <label>Direction <select data-clip-transport="direction"><option value="forward">Forward</option><option value="reverse">Reverse</option></select></label>
         <label>End <select data-clip-transport="end_behavior"><option value="loop">Loop</option><option value="ping_pong">Ping pong</option><option value="one_shot">One shot</option><option value="hold">Hold</option></select></label>
         <label>In <input data-clip-transport="in_point" type="number" min="0" max="1" step="0.001" value="${Number(transport.in_point ?? 0)}"></label>
@@ -3101,6 +3230,23 @@ function wireLayerPerformance(card, layer, index) {
   // request for this stable layer/slot; change supplies the exact final value.
   clipSeek.addEventListener('input', sendSeek);
   clipSeek.addEventListener('change', sendSeek);
+  card.querySelector('.clip-timecode-seek').addEventListener('click', () => {
+    const selected = target();
+    const controls = {
+      hours: card.querySelector('.clip-timecode-hours'),
+      minutes: card.querySelector('.clip-timecode-minutes'),
+      seconds: card.querySelector('.clip-timecode-seconds'),
+      frames: card.querySelector('.clip-timecode-frames'),
+    };
+    if (!selected || Object.values(controls).some((control) => !control.checkValidity())) {
+      return status('Choose an active prepared slot and a valid bounded timecode.', true);
+    }
+    const timecode = Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, Number(control.value)]));
+    timecode.rate = card.querySelector('.clip-timecode-rate').value;
+    if (sendAction({ action: 'seek_clip_slot_timecode', layer_id: selected.layerId, slot_id: selected.slotId, timecode })) {
+      status('Timecode seek queued for the active source.');
+    } else status('Control connection is offline.', true);
+  });
   card.querySelectorAll('[data-clip-transport]').forEach((control) => {
     const param = control.dataset.clipTransport;
     control.addEventListener(control.type === 'range' ? 'input' : 'change', () => {
@@ -4263,6 +4409,9 @@ document.getElementById('export-start').addEventListener('click', () => {
   const requestedNtscQuality = document.getElementById('export-ntsc-quality').value;
   const ntscQuality = ['live_parity', 'native'].includes(requestedNtscQuality)
     ? requestedNtscQuality : 'live_parity';
+  const requestedShutterSamples = document.getElementById('export-shutter-samples').value;
+  const shutterSamples = ['authored', 'samples_1', 'samples_4', 'samples_8', 'samples_16'].includes(requestedShutterSamples)
+    ? requestedShutterSamples : 'authored';
   const audioSelect = document.getElementById('export-audio');
   const audioOption = audioSelect.selectedOptions[0];
   const audioLayerId = audioSelect.value === '' || audioSelect.value.startsWith('legacy-index:')
@@ -4274,7 +4423,7 @@ document.getElementById('export-start').addEventListener('click', () => {
   document.getElementById('export-progress').style.display = '';
   document.getElementById('export-status').textContent = 'Starting render…';
   syncExportWarnings([]);
-  if (!sendAction({ action: 'start_export', width: w, height: h, fps, duration_secs: duration, ntsc_quality: ntscQuality, audio_layer: audioLayer, audio_layer_id: audioLayerId })) {
+  if (!sendAction({ action: 'start_export', width: w, height: h, fps, duration_secs: duration, ntsc_quality: ntscQuality, shutter_samples: shutterSamples, audio_layer: audioLayer, audio_layer_id: audioLayerId })) {
     exportActive = false;
     document.getElementById('export-start').style.display = '';
     document.getElementById('export-cancel').style.display = 'none';
@@ -4322,10 +4471,11 @@ function syncExportMotion(motion = {}) {
     element.textContent = '';
     return;
   }
-  const fallbackCount = scopes.filter(scope => scope.source_origin === 'lattice_fallback').length;
+  const fallbackCount = scopes.filter(scope => scope.field_attached && scope.rendered_source_origin === 'lattice_fallback').length;
+  const unattachedCount = scopes.filter(scope => scope.field_planned && !scope.field_attached).length;
   const admittedCount = scopes.filter(scope => scope.transplant_admitted).length;
   const suffix = motion.scopes_truncated ? ' · scope list truncated' : '';
-  element.textContent = `Motion metadata v${Number(motion.schema_version || 1)} · frame ${Number(accepted)} · ${scopes.length} scope${scopes.length === 1 ? '' : 's'} · ${fallbackCount} fallback · ${admittedCount} transplant · cross-GPU pixel identity not claimed${suffix}`;
+  element.textContent = `Motion metadata v${Number(motion.schema_version || 1)} · frame ${Number(accepted)} · ${scopes.length} scope${scopes.length === 1 ? '' : 's'} · ${fallbackCount} rendered fallback · ${unattachedCount} unattached · ${admittedCount} transplant · cross-GPU pixel identity not claimed${suffix}`;
 }
 
 function syncExport(progress, error, status = '', warnings = [], motion = {}) {

@@ -14,7 +14,7 @@ use crate::composition::{
     BusAssignment, FlattenedGroupSpan, GroupOutputStage, RuntimeComposition,
     RuntimeCompositionError, RuntimeRootItem,
 };
-use crate::effects::params::TemporalParams;
+use crate::effects::params::{RefreshGardenGate, TemporalParams};
 use crate::effects::EffectUniforms;
 use crate::image_routing::{
     ImageInput, ImageRouteCycle, ImageRouteDiagnostic, LayerImageStage, LayerMatte,
@@ -29,6 +29,7 @@ use crate::performance::SavedLayerPosition;
 use crate::renderer::compositor::{MatteChannelCode, ResolvedMatteParams};
 use crate::renderer::rack::{CollisionRackPlan, RackCompileError};
 use crate::spatial::{EffectPassUniforms, SpatialGpuUniforms, SpatialTransform};
+use crate::temporal::{RefreshGardenMatteRoute, RefreshGardenMotionRoute};
 use crate::visual_rack::{
     CreativeResourceLimits, CreativeResourcePlan, EdgeTiming, GroupId, ImageDependency,
     ImageDependencyGraph, ImageGraphError, ImageGraphMode, ImageGraphPlan, LegacyRackScope, NodeId,
@@ -416,6 +417,7 @@ pub enum ImageTapConsumer {
     LayerMatte {
         layer_id: StableLayerId,
     },
+    RefreshGardenMatte,
 }
 
 impl ImageTapConsumer {
@@ -424,6 +426,7 @@ impl ImageTapConsumer {
             Self::RackNode { scope, .. } => scope,
             Self::GroupMatte { group_id } => VisualScopeId::Group(group_id),
             Self::LayerMatte { layer_id } => VisualScopeId::Layer(layer_id),
+            Self::RefreshGardenMatte => VisualScopeId::Master,
         }
     }
 }
@@ -515,6 +518,7 @@ pub enum CompositionPlanDiagnostic {
     ProgramHistoryUninitialized {
         consumer: ImageTapConsumer,
     },
+    RefreshGardenMatteNotSelected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,6 +539,11 @@ pub enum MotionPlanDiagnostic {
         recipient: StableLayerId,
         admitted_recipient: StableLayerId,
     },
+    RefreshGardenMotionNotSelected,
+    MissingRefreshGardenMotion {
+        saved_position: SavedLayerPosition,
+    },
+    RefreshGardenMotionUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,6 +556,7 @@ pub struct EvaluatedMotionFieldPlan {
     pub source: MotionSourceDecision,
     pub codec: MotionCodecFrameFacts,
     pub required_as_donor: bool,
+    pub required_as_garden_signal: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -562,10 +572,44 @@ pub struct EvaluatedMotionScopePlan {
     pub source: MotionSourceDecision,
     pub field_slot: Option<u8>,
     pub required_as_donor: bool,
+    pub required_as_garden_signal: bool,
     pub donor_scope: Option<VisualScopeId>,
     pub donor_field_slot: Option<u8>,
     pub transplant_admitted: bool,
     pub codec: MotionCodecFrameFacts,
+}
+
+impl EvaluatedMotionScopePlan {
+    /// The canonical field actually admitted by this scope. An admitted
+    /// Faraday transplant replaces the recipient's own field with its donor;
+    /// routed consumers must observe the same choice as motion rendering.
+    pub const fn admitted_field_slot(self) -> Option<u8> {
+        if self.transplant_admitted {
+            self.donor_field_slot
+        } else {
+            self.field_slot
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EvaluatedRefreshGardenSignalPlan {
+    #[default]
+    Inline,
+    Matte {
+        valid: bool,
+    },
+    Motion {
+        layer_id: Option<StableLayerId>,
+        field_slot: Option<u8>,
+        valid: bool,
+    },
+}
+
+impl EvaluatedRefreshGardenSignalPlan {
+    pub const fn is_routed(self) -> bool {
+        matches!(self, Self::Matte { .. } | Self::Motion { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -574,6 +618,35 @@ pub struct MotionFrameBudget {
     pub logical_texture_lookups_per_pixel: u32,
     pub texture_samples_per_pixel: u32,
     pub max_sampled_textures_in_pass: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefreshGardenResourcePlan {
+    pub full_frame_passes: u32,
+    pub low_resolution_passes: u32,
+    pub logical_texture_lookups_per_pixel: u32,
+    pub texture_operations_per_pixel: u32,
+    pub max_sampled_textures_in_pass: u32,
+}
+
+fn refresh_garden_resource_plan(
+    signal: EvaluatedRefreshGardenSignalPlan,
+) -> RefreshGardenResourcePlan {
+    if !signal.is_routed() {
+        return RefreshGardenResourcePlan::default();
+    }
+    RefreshGardenResourcePlan {
+        full_frame_passes: 1,
+        low_resolution_passes: u32::from(matches!(
+            signal,
+            EvaluatedRefreshGardenSignalPlan::Motion { valid: true, .. }
+        )),
+        logical_texture_lookups_per_pixel: 3,
+        // Current and signal each use one operation. Advanced feedback uses
+        // four explicit covered-color textureLoad operations.
+        texture_operations_per_pixel: 6,
+        max_sampled_textures_in_pass: 3,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -675,6 +748,10 @@ pub struct MotionFieldAttachment<'a> {
     pub scope: VisualScopeId,
     pub source_generation: u64,
     pub frame_ordinal: u64,
+    /// Exact digest of the validated adjacent-reference proof chain and its
+    /// sparse vector payload. Production codec adapters always provide the
+    /// product identity digest; fixed values are used only by GPU fixtures.
+    pub product_content_sha256: [u8; 32],
     pub algorithm_version: u16,
     pub source_dimensions: [u32; 2],
     pub grid: MotionGrid,
@@ -728,6 +805,8 @@ pub struct AdvancedCompositionPlan {
     execution_order: Box<[VisualScopeId]>,
     resources: CreativeResourcePlan,
     motion: EvaluatedMotionPlan,
+    refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
+    refresh_garden_resources: RefreshGardenResourcePlan,
     topology_signature: u64,
 }
 
@@ -807,6 +886,14 @@ impl AdvancedCompositionPlan {
 
     pub const fn motion(&self) -> &EvaluatedMotionPlan {
         &self.motion
+    }
+
+    pub const fn refresh_garden_signal(&self) -> EvaluatedRefreshGardenSignalPlan {
+        self.refresh_garden_signal
+    }
+
+    pub const fn refresh_garden_resources(&self) -> RefreshGardenResourcePlan {
+        self.refresh_garden_resources
     }
 
     pub const fn topology_signature(&self) -> u64 {
@@ -1201,7 +1288,23 @@ impl<'a> Planner<'a> {
             .map(|layer| layer.layer_id)
             .collect();
         let motion = self.evaluate_motion(&flat_ids)?;
-        if self.is_global_legacy_exact(&flat_ids) && motion.is_legacy_exact() {
+        let garden = self.base.temporal().originals.garden;
+        let temporal_marker_present = self
+            .input
+            .master_rack
+            .iter()
+            .any(|node| matches!(node.kind, RuntimeVisualNodeKind::LegacyTemporal));
+        let routed_garden_active = temporal_marker_present
+            && garden.amount.is_finite()
+            && garden.amount > 0.0
+            && matches!(
+                garden.gate,
+                RefreshGardenGate::Matte | RefreshGardenGate::Motion
+            );
+        if self.is_global_legacy_exact(&flat_ids)
+            && motion.is_legacy_exact()
+            && !routed_garden_active
+        {
             let topology_signature =
                 legacy_topology_signature(&flat_ids, self.input.master_rack, &self.racks);
             return Ok(EvaluatedCompositionPlan::LegacyExact(Box::new(
@@ -1519,6 +1622,88 @@ impl<'a> Planner<'a> {
             &mut prefix_constraints,
         )?;
 
+        if routed_garden_active && garden.gate == RefreshGardenGate::Matte {
+            match garden.matte_route {
+                RefreshGardenMatteRoute::None => {
+                    diagnostics.push(CompositionPlanDiagnostic::RefreshGardenMatteNotSelected);
+                }
+                RefreshGardenMatteRoute::SelectedLayer {
+                    layer_id,
+                    saved_position,
+                    stage,
+                } => collect_tap(
+                    ImageTapConsumer::RefreshGardenMatte,
+                    PlannedImageTapOrigin::Rack(ResolvedImageTap {
+                        source: ResolvedImageSource::SelectedLayer {
+                            layer_id,
+                            saved_position,
+                            stage,
+                        },
+                        timing: EdgeTiming::CurrentFrame,
+                    }),
+                    &below,
+                    &known_scopes,
+                    &mut taps,
+                    &mut diagnostics,
+                    &mut dependencies,
+                    &mut route_edges,
+                    &mut prefix_constraints,
+                )?,
+                RefreshGardenMatteRoute::MissingSelectedLayer {
+                    saved_position,
+                    stage,
+                } => collect_tap(
+                    ImageTapConsumer::RefreshGardenMatte,
+                    PlannedImageTapOrigin::Rack(ResolvedImageTap {
+                        source: ResolvedImageSource::MissingSelectedLayer {
+                            saved_position,
+                            stage,
+                        },
+                        timing: EdgeTiming::CurrentFrame,
+                    }),
+                    &below,
+                    &known_scopes,
+                    &mut taps,
+                    &mut diagnostics,
+                    &mut dependencies,
+                    &mut route_edges,
+                    &mut prefix_constraints,
+                )?,
+            }
+        }
+
+        let refresh_garden_signal = match garden.gate {
+            RefreshGardenGate::Matte if routed_garden_active => {
+                EvaluatedRefreshGardenSignalPlan::Matte {
+                    valid: taps.iter().any(|tap| {
+                        tap.consumer == ImageTapConsumer::RefreshGardenMatte
+                            && !matches!(tap.resolved, PlannedImageSource::Transparent)
+                    }),
+                }
+            }
+            RefreshGardenGate::Motion if routed_garden_active => {
+                let layer_id = match garden.motion_route {
+                    RefreshGardenMotionRoute::SelectedLayer { layer_id, .. } => Some(layer_id),
+                    RefreshGardenMotionRoute::None
+                    | RefreshGardenMotionRoute::MissingSelectedLayer { .. } => None,
+                };
+                let field_slot = layer_id.and_then(|layer_id| {
+                    motion.advanced().and_then(|motion| {
+                        motion
+                            .scope(VisualScopeId::Layer(layer_id))
+                            .and_then(|scope| scope.admitted_field_slot())
+                    })
+                });
+                EvaluatedRefreshGardenSignalPlan::Motion {
+                    layer_id,
+                    field_slot,
+                    valid: field_slot.is_some(),
+                }
+            }
+            _ => EvaluatedRefreshGardenSignalPlan::Inline,
+        };
+        let refresh_garden_resources = refresh_garden_resource_plan(refresh_garden_signal);
+
         // The logical image graph is sparse: unused direct-root layers remain
         // dynamically supported and never consume the bounded graph address
         // space. Actual execution order below still includes every real scope.
@@ -1550,6 +1735,7 @@ impl<'a> Planner<'a> {
             &graph,
             &taps,
             &motion,
+            refresh_garden_signal,
         )?;
         let topology_signature = advanced_topology_signature(
             self.input.composition,
@@ -1559,6 +1745,7 @@ impl<'a> Planner<'a> {
             &group_plans,
             &taps,
             &motion,
+            refresh_garden_signal,
         );
 
         Ok(EvaluatedCompositionPlan::Advanced(Box::new(
@@ -1576,6 +1763,8 @@ impl<'a> Planner<'a> {
                 execution_order: execution_order.into_boxed_slice(),
                 resources,
                 motion,
+                refresh_garden_signal,
+                refresh_garden_resources,
                 topology_signature,
             },
         )))
@@ -1585,7 +1774,44 @@ impl<'a> Planner<'a> {
         &self,
         flat_ids: &[StableLayerId],
     ) -> Result<EvaluatedMotionPlan, CompositionPlanError> {
+        let temporal_marker_present = self
+            .input
+            .master_rack
+            .iter()
+            .any(|node| matches!(node.kind, RuntimeVisualNodeKind::LegacyTemporal));
+        let garden = self.base.temporal().originals.garden;
+        let garden_motion_active = temporal_marker_present
+            && garden.amount.is_finite()
+            && garden.amount > 0.0
+            && garden.gate == RefreshGardenGate::Motion;
         let Some(input) = self.input.motion else {
+            if garden_motion_active {
+                let diagnostics = match garden.motion_route {
+                    RefreshGardenMotionRoute::None => {
+                        vec![MotionPlanDiagnostic::RefreshGardenMotionNotSelected]
+                    }
+                    RefreshGardenMotionRoute::SelectedLayer { .. } => {
+                        vec![MotionPlanDiagnostic::RefreshGardenMotionUnavailable]
+                    }
+                    RefreshGardenMotionRoute::MissingSelectedLayer { saved_position } => {
+                        vec![MotionPlanDiagnostic::MissingRefreshGardenMotion { saved_position }]
+                    }
+                };
+                return Ok(EvaluatedMotionPlan::Advanced(Box::new(
+                    AdvancedMotionPlan {
+                        scopes: Box::new([]),
+                        fields: Box::new([]),
+                        resources: MotionResourcePlan::default(),
+                        diagnostics: diagnostics.into_boxed_slice(),
+                        budget: MotionFrameBudget::default(),
+                        topology_signature: motion_topology_signature(
+                            &[],
+                            &[],
+                            MotionResourcePlan::default(),
+                        ),
+                    },
+                )));
+            }
             return Ok(EvaluatedMotionPlan::LegacyExact);
         };
         let mut supplied = BTreeMap::new();
@@ -1621,6 +1847,7 @@ impl<'a> Planner<'a> {
             source: resolve_motion_source(master_params.field_source, true, false),
             field_slot: None,
             required_as_donor: false,
+            required_as_garden_signal: false,
             donor_scope: None,
             donor_field_slot: None,
             transplant_admitted: false,
@@ -1639,17 +1866,41 @@ impl<'a> Planner<'a> {
                 source: resolve_motion_source(params.field_source, false, authored.codec.available),
                 field_slot: None,
                 required_as_donor: false,
+                required_as_garden_signal: false,
                 donor_scope: None,
                 donor_field_slot: None,
                 transplant_admitted: false,
                 codec: authored.codec,
             });
         }
-        if scopes.iter().all(|scope| scope.params.is_exact_zero()) {
-            return Ok(EvaluatedMotionPlan::LegacyExact);
-        }
-
         let mut diagnostics = Vec::new();
+        let mut garden_recipient_index = None;
+        if garden_motion_active {
+            match garden.motion_route {
+                RefreshGardenMotionRoute::None => {
+                    diagnostics.push(MotionPlanDiagnostic::RefreshGardenMotionNotSelected);
+                }
+                RefreshGardenMotionRoute::MissingSelectedLayer { saved_position } => {
+                    diagnostics
+                        .push(MotionPlanDiagnostic::MissingRefreshGardenMotion { saved_position });
+                }
+                RefreshGardenMotionRoute::SelectedLayer {
+                    layer_id,
+                    saved_position,
+                } => {
+                    if let Some(index) = scopes
+                        .iter()
+                        .position(|scope| scope.scope == VisualScopeId::Layer(layer_id))
+                    {
+                        garden_recipient_index = Some(index);
+                    } else {
+                        diagnostics.push(MotionPlanDiagnostic::MissingRefreshGardenMotion {
+                            saved_position,
+                        });
+                    }
+                }
+            }
+        }
         if master_params.transplant.amount > 0.0 {
             diagnostics.push(MotionPlanDiagnostic::MasterTransplantRejected);
         }
@@ -1711,9 +1962,35 @@ impl<'a> Planner<'a> {
             scopes[donor_index].required_as_donor = true;
         }
 
+        if let Some(recipient_index) = garden_recipient_index {
+            let signal_scope = if scopes[recipient_index].transplant_admitted {
+                scopes[recipient_index]
+                    .donor_scope
+                    .and_then(|donor| scopes.iter().position(|scope| scope.scope == donor))
+                    .ok_or(CompositionPlanError::Internal(
+                        "admitted Garden motion recipient lost its donor scope",
+                    ))?
+            } else {
+                recipient_index
+            };
+            scopes[signal_scope].required_as_garden_signal = true;
+        }
+
+        if !garden_motion_active
+            && scopes.iter().all(|scope| {
+                scope.params.is_exact_zero()
+                    && !scope.required_as_donor
+                    && !scope.required_as_garden_signal
+            })
+        {
+            return Ok(EvaluatedMotionPlan::LegacyExact);
+        }
+
         let mut fields = Vec::new();
         for scope in &mut scopes {
-            let field_required = scope.required_as_donor || !scope.params.shutter.is_exact_zero();
+            let field_required = scope.required_as_donor
+                || scope.required_as_garden_signal
+                || !scope.params.shutter.is_exact_zero();
             if !field_required {
                 continue;
             }
@@ -1738,6 +2015,7 @@ impl<'a> Planner<'a> {
                 source: scope.source,
                 codec: scope.codec,
                 required_as_donor: scope.required_as_donor,
+                required_as_garden_signal: scope.required_as_garden_signal,
             });
         }
         for scope in &mut scopes {
@@ -1761,6 +2039,7 @@ impl<'a> Planner<'a> {
                     is_master: scope.scope == VisualScopeId::Master,
                     codec_vectors_available: scope.codec.available,
                     required_as_donor: scope.required_as_donor,
+                    required_as_garden_signal: scope.required_as_garden_signal,
                 }
             })
             .collect::<Vec<_>>();
@@ -2013,18 +2292,18 @@ fn collect_rack_taps(
         if !node.enabled || node.wet <= 0.0 {
             continue;
         }
-        let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = node.kind else {
-            continue;
+        let tap = match node.kind {
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) if matte.amount > 0.0 => {
+                matte.tap
+            }
+            _ => continue,
         };
-        if matte.amount <= 0.0 {
-            continue;
-        }
         collect_tap(
             ImageTapConsumer::RackNode {
                 scope,
                 node_id: node.stable_id,
             },
-            PlannedImageTapOrigin::Rack(matte.tap),
+            PlannedImageTapOrigin::Rack(tap),
             below,
             known_scopes,
             taps,
@@ -2552,6 +2831,7 @@ fn resource_preflight(
     graph: &ImageGraphPlan,
     taps: &[PlannedImageTap],
     motion: &EvaluatedMotionPlan,
+    refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
 ) -> Result<CreativeResourcePlan, CompositionPlanError> {
     let mut racks = Vec::with_capacity(
         input
@@ -2652,6 +2932,7 @@ fn resource_preflight(
         input.resource_limits,
     )
     .map_err(CompositionPlanError::Resource)?;
+    let garden_budget = refresh_garden_resource_plan(refresh_garden_signal);
     if let Some(motion) = motion.advanced() {
         let combined_bytes = creative
             .creative_bytes
@@ -2672,6 +2953,7 @@ fn resource_preflight(
         let combined_logical_lookups = creative
             .logical_texture_lookups_per_pixel
             .checked_add(motion.budget.logical_texture_lookups_per_pixel)
+            .and_then(|value| value.checked_add(garden_budget.logical_texture_lookups_per_pixel))
             .ok_or(CompositionPlanError::Resource(
                 ResourcePreflightError::ArithmeticOverflow,
             ))?;
@@ -2686,6 +2968,7 @@ fn resource_preflight(
         let combined_samples = creative
             .texture_samples_per_pixel
             .checked_add(motion.budget.texture_samples_per_pixel)
+            .and_then(|value| value.checked_add(garden_budget.texture_operations_per_pixel))
             .ok_or(CompositionPlanError::Resource(
                 ResourcePreflightError::ArithmeticOverflow,
             ))?;
@@ -2699,10 +2982,53 @@ fn resource_preflight(
             .resource_limits
             .max_sampled_textures_per_shader_stage
             .min(crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_PASS);
-        if motion.budget.max_sampled_textures_in_pass > texture_limit {
+        let maximum_textures = motion
+            .budget
+            .max_sampled_textures_in_pass
+            .max(garden_budget.max_sampled_textures_in_pass);
+        if maximum_textures > texture_limit {
             return Err(CompositionPlanError::Resource(
                 ResourcePreflightError::SampledTextureLimit {
-                    requested: motion.budget.max_sampled_textures_in_pass,
+                    requested: maximum_textures,
+                    limit: texture_limit,
+                },
+            ));
+        }
+    } else if garden_budget.max_sampled_textures_in_pass > 0 {
+        let combined_logical_lookups = creative
+            .logical_texture_lookups_per_pixel
+            .checked_add(garden_budget.logical_texture_lookups_per_pixel)
+            .ok_or(CompositionPlanError::Resource(
+                ResourcePreflightError::ArithmeticOverflow,
+            ))?;
+        if combined_logical_lookups > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_FRAME {
+            return Err(CompositionPlanError::Resource(
+                ResourcePreflightError::FrameLogicalLookupBudget {
+                    lookups: combined_logical_lookups,
+                    limit: MAX_LOGICAL_TEXTURE_LOOKUPS_PER_FRAME,
+                },
+            ));
+        }
+        let combined_samples = creative
+            .texture_samples_per_pixel
+            .checked_add(garden_budget.texture_operations_per_pixel)
+            .ok_or(CompositionPlanError::Resource(
+                ResourcePreflightError::ArithmeticOverflow,
+            ))?;
+        if combined_samples > MAX_TEXTURE_SAMPLES_PER_FRAME {
+            return Err(CompositionPlanError::MotionCombinedSampleBudget {
+                samples: combined_samples,
+                limit: MAX_TEXTURE_SAMPLES_PER_FRAME,
+            });
+        }
+        let texture_limit = input
+            .resource_limits
+            .max_sampled_textures_per_shader_stage
+            .min(crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_PASS);
+        if garden_budget.max_sampled_textures_in_pass > texture_limit {
+            return Err(CompositionPlanError::Resource(
+                ResourcePreflightError::SampledTextureLimit {
+                    requested: garden_budget.max_sampled_textures_in_pass,
                     limit: texture_limit,
                 },
             ));
@@ -2777,6 +3103,10 @@ fn legacy_topology_signature(
     hash
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "signature hashes each immutable composition domain explicitly, including routed Garden"
+)]
 fn advanced_topology_signature(
     composition: &RuntimeComposition,
     master: &RuntimeVisualRack,
@@ -2785,6 +3115,7 @@ fn advanced_topology_signature(
     groups: &[EvaluatedGroupScopePlan],
     taps: &[PlannedImageTap],
     motion: &EvaluatedMotionPlan,
+    refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4144_5641_4e43_4544);
     hash = hash_value(hash, master.topology_signature());
@@ -2855,6 +3186,22 @@ fn advanced_topology_signature(
         hash = hash_value(hash, 0x4d4f_5449_4f4e);
         hash = hash_value(hash, motion.topology_signature());
     }
+    hash = hash_value(
+        hash,
+        match refresh_garden_signal {
+            EvaluatedRefreshGardenSignalPlan::Inline => 0,
+            EvaluatedRefreshGardenSignalPlan::Matte { valid } => 1 + u64::from(valid),
+            EvaluatedRefreshGardenSignalPlan::Motion {
+                layer_id,
+                field_slot,
+                valid,
+            } => {
+                let mut value = 3 + u64::from(valid);
+                value = hash_value(value, layer_id.map_or(0, StableLayerId::get));
+                hash_value(value, u64::from(field_slot.unwrap_or(u8::MAX)))
+            }
+        },
+    );
     hash
 }
 
@@ -2920,6 +3267,8 @@ fn motion_topology_signature(
     let mut hash = hash_value(FNV_OFFSET, 0x4d4f_5449_4f4e_0001);
     hash = hash_value(hash, u64::from(resources.active_field_slots));
     hash = hash_value(hash, u64::from(resources.persistent_carriers));
+    hash = hash_value(hash, u64::from(resources.active_garden_signals));
+    hash = hash_value(hash, resources.garden_signal_bytes);
     hash = hash_value(hash, u64::from(resources.max_shutter_samples));
     for scope in scopes {
         hash = hash_scope(hash, scope.scope);
@@ -2943,6 +3292,7 @@ fn motion_topology_signature(
         hash = hash_value(hash, u64::from(field.grid.height));
         hash = hash_value(hash, u64::from(field.grid.block_pixels));
         hash = hash_value(hash, u64::from(field.required_as_donor));
+        hash = hash_value(hash, u64::from(field.required_as_garden_signal));
         hash = hash_value(
             hash,
             match field.source.origin {
@@ -2971,6 +3321,7 @@ fn hash_consumer(mut hash: u64, consumer: ImageTapConsumer) -> u64 {
             hash = hash_value(hash, 3);
             hash_value(hash, layer_id.get())
         }
+        ImageTapConsumer::RefreshGardenMatte => hash_value(hash, 4),
     }
 }
 
@@ -3181,13 +3532,20 @@ mod tests {
     }
 
     fn base_with_temporal(temporal: &TemporalParams) -> EvaluatedFramePlan {
-        let effects = EffectUniforms::default();
-        let transform = SpatialTransform::new_layer_default();
+        base_with_temporal_for(&[1], temporal)
+    }
+
+    fn base_with_temporal_for(
+        ids_front_to_back: &[u64],
+        temporal: &TemporalParams,
+    ) -> EvaluatedFramePlan {
+        let effects = vec![EffectUniforms::default(); ids_front_to_back.len()];
+        let transforms = vec![SpatialTransform::new_layer_default(); ids_front_to_back.len()];
         let master_effects = EffectUniforms::default();
         let master_transform = SpatialTransform::default();
         let ntsc = NtscParams::default();
         let matrix = ModMatrix::new();
-        let modulation = matrix.frame(1);
+        let modulation = matrix.frame(ids_front_to_back.len());
         EvaluatedFramePlan::evaluate(
             &modulation,
             FramePlanContext::new(64, 64, 1.25),
@@ -3197,18 +3555,21 @@ mod tests {
                 ntsc: &ntsc,
                 temporal,
             },
-            [LayerFrameInput {
-                source: SourceTap::new(1, 0, 64, 64),
-                effects: &effects,
-                transform: &transform,
-                opacity: 1.0,
-                speed: 1.0,
-                fps: 30.0,
-                blend_mode: BlendMode::Normal,
-                visible: true,
-                paused: false,
-                bypass_master_fx: false,
-            }],
+            ids_front_to_back
+                .iter()
+                .enumerate()
+                .map(|(index, id)| LayerFrameInput {
+                    source: SourceTap::new(*id, index, 64, 64),
+                    effects: &effects[index],
+                    transform: &transforms[index],
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }),
         )
     }
 
@@ -3534,11 +3895,13 @@ mod tests {
                 frame_ordinal: 9,
             },
             required_as_donor: false,
+            required_as_garden_signal: false,
         };
         let attachment = MotionFieldAttachment {
             scope: plan.scope,
             source_generation: 7,
             frame_ordinal: 9,
+            product_content_sha256: [7; 32],
             algorithm_version: MOTION_ALGORITHM_VERSION,
             source_dimensions: [64, 64],
             grid,
@@ -3714,6 +4077,289 @@ mod tests {
         };
         assert_eq!(params.originals, originals);
         assert!(matches!(steps[3], EvaluatedScopeStep::CollisionRack { .. }));
+    }
+
+    #[test]
+    fn routed_garden_matte_is_a_stable_current_frame_tap_with_a_three_texture_pass() {
+        let mut temporal = TemporalParams::default();
+        temporal.originals.garden.amount = 0.8;
+        temporal.originals.garden.gate = RefreshGardenGate::Matte;
+        temporal.originals.garden.matte_route = RefreshGardenMatteRoute::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let base = base_with_temporal(&temporal);
+        let composition = legacy_composition(&[1]);
+        let racks = legacy_racks(&[1]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());
+
+        assert_eq!(
+            advanced.refresh_garden_signal(),
+            EvaluatedRefreshGardenSignalPlan::Matte { valid: true }
+        );
+        assert_eq!(
+            advanced.refresh_garden_resources(),
+            RefreshGardenResourcePlan {
+                full_frame_passes: 1,
+                low_resolution_passes: 0,
+                logical_texture_lookups_per_pixel: 3,
+                texture_operations_per_pixel: 6,
+                max_sampled_textures_in_pass: 3,
+            }
+        );
+        let tap = advanced
+            .image_taps()
+            .iter()
+            .find(|tap| tap.consumer == ImageTapConsumer::RefreshGardenMatte)
+            .expect("selected Garden matte tap");
+        assert_eq!(tap.origin.timing(), EdgeTiming::CurrentFrame);
+        assert_eq!(
+            tap.resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(1),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert!(advanced.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn routed_garden_motion_admits_the_selected_zero_effect_field_and_signal_ledger() {
+        let mut temporal = TemporalParams::default();
+        temporal.originals.garden.amount = 1.0;
+        temporal.originals.garden.gate = RefreshGardenGate::Motion;
+        temporal.originals.garden.motion_route = RefreshGardenMotionRoute::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+        };
+        let base = base_with_temporal(&temporal);
+        let composition = legacy_composition(&[1]);
+        let racks = legacy_racks(&[1]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = [LayerMotionPlanInput {
+            stable_id: layer_id(1),
+            params: MotionParams::default(),
+            codec: MotionCodecFrameFacts::default(),
+        }];
+        let advanced = advanced(
+            plan_with_motion(
+                &base,
+                &composition,
+                &master,
+                &racks,
+                MotionParams::default(),
+                &layers,
+            )
+            .unwrap(),
+        );
+        let motion = advanced.motion().advanced().expect("Garden motion plan");
+        assert_eq!(motion.fields().len(), 1);
+        assert_eq!(motion.fields()[0].scope, VisualScopeId::Layer(layer_id(1)));
+        assert!(motion.fields()[0].required_as_garden_signal);
+        assert!(!motion.fields()[0].required_as_donor);
+        assert_eq!(motion.resources().active_garden_signals, 1);
+        assert_eq!(
+            motion.resources().garden_signal_bytes,
+            motion.fields()[0].grid.vector_count
+        );
+        assert_eq!(motion.resources().persistent_carriers, 0);
+        assert!(matches!(
+            advanced.refresh_garden_signal(),
+            EvaluatedRefreshGardenSignalPlan::Motion {
+                layer_id: Some(id),
+                field_slot: Some(0),
+                valid: true,
+            } if id == layer_id(1)
+        ));
+        assert_eq!(advanced.refresh_garden_resources().low_resolution_passes, 1);
+        assert_eq!(
+            advanced
+                .refresh_garden_resources()
+                .max_sampled_textures_in_pass,
+            3
+        );
+    }
+
+    #[test]
+    fn routed_garden_motion_observes_the_selected_layers_admitted_donor_field() {
+        let mut temporal = TemporalParams::default();
+        temporal.originals.garden.amount = 1.0;
+        temporal.originals.garden.gate = RefreshGardenGate::Motion;
+        temporal.originals.garden.motion_route = RefreshGardenMotionRoute::SelectedLayer {
+            layer_id: layer_id(10),
+            saved_position: saved_position(0),
+        };
+        let base = base_with_temporal_for(&[10, 20], &temporal);
+        let composition = legacy_composition(&[10, 20]);
+        let racks = legacy_racks(&[10, 20]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = [
+            LayerMotionPlanInput {
+                stable_id: layer_id(10),
+                params: MotionParams {
+                    transplant: crate::motion::FaradayParams {
+                        amount: 0.8,
+                        donor: MotionDonor::Selected {
+                            layer_id: layer_id(20),
+                            saved_position: saved_position(1),
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: layer_id(20),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        let advanced = advanced(
+            plan_with_motion(
+                &base,
+                &composition,
+                &master,
+                &racks,
+                MotionParams::default(),
+                &layers,
+            )
+            .unwrap(),
+        );
+        let motion = advanced.motion().advanced().expect("Garden motion plan");
+        assert_eq!(motion.fields().len(), 1);
+        assert_eq!(motion.fields()[0].scope, VisualScopeId::Layer(layer_id(20)));
+        assert!(motion.fields()[0].required_as_donor);
+        assert!(motion.fields()[0].required_as_garden_signal);
+        let selected = motion
+            .scope(VisualScopeId::Layer(layer_id(10)))
+            .expect("selected recipient scope");
+        assert!(selected.transplant_admitted);
+        assert_eq!(selected.admitted_field_slot(), Some(0));
+        assert!(matches!(
+            advanced.refresh_garden_signal(),
+            EvaluatedRefreshGardenSignalPlan::Motion {
+                layer_id: Some(id),
+                field_slot: Some(0),
+                valid: true,
+            } if id == layer_id(10)
+        ));
+        assert_eq!(motion.resources().active_garden_signals, 1);
+    }
+
+    #[test]
+    fn routed_garden_missing_and_unavailable_routes_are_explicit_closed_signals() {
+        let mut temporal = TemporalParams::default();
+        temporal.originals.garden.amount = 1.0;
+        temporal.originals.garden.gate = RefreshGardenGate::Motion;
+        temporal.originals.garden.motion_route = RefreshGardenMotionRoute::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+        };
+        let base = base_with_temporal(&temporal);
+        let composition = legacy_composition(&[1]);
+        let racks = legacy_racks(&[1]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let unavailable = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        assert!(matches!(
+            unavailable.refresh_garden_signal(),
+            EvaluatedRefreshGardenSignalPlan::Motion {
+                layer_id: Some(id),
+                field_slot: None,
+                valid: false,
+            } if id == layer_id(1)
+        ));
+        assert!(unavailable
+            .motion()
+            .advanced()
+            .unwrap()
+            .diagnostics()
+            .contains(&MotionPlanDiagnostic::RefreshGardenMotionUnavailable));
+        assert_eq!(
+            unavailable.refresh_garden_resources().low_resolution_passes,
+            0
+        );
+
+        temporal.originals.garden.motion_route = RefreshGardenMotionRoute::MissingSelectedLayer {
+            saved_position: saved_position(0),
+        };
+        let missing_base = base_with_temporal(&temporal);
+        let missing = advanced(plan(&missing_base, &composition, &master, &racks).unwrap());
+        assert_eq!(
+            missing.refresh_garden_signal(),
+            EvaluatedRefreshGardenSignalPlan::Motion {
+                layer_id: None,
+                field_slot: None,
+                valid: false,
+            }
+        );
+        assert!(missing.motion().advanced().unwrap().diagnostics().contains(
+            &MotionPlanDiagnostic::MissingRefreshGardenMotion {
+                saved_position: saved_position(0),
+            }
+        ));
+        assert_eq!(missing.refresh_garden_resources().low_resolution_passes, 0);
+    }
+
+    #[test]
+    fn routed_garden_is_dormant_when_the_master_temporal_marker_is_absent() {
+        let mut temporal = TemporalParams::default();
+        temporal.originals.garden.amount = 1.0;
+        temporal.originals.garden.gate = RefreshGardenGate::Motion;
+        temporal.originals.garden.motion_route = RefreshGardenMotionRoute::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+        };
+        let base = base_with_temporal(&temporal);
+        let composition = legacy_composition(&[1]);
+        let racks = legacy_racks(&[1]);
+        let master = RuntimeVisualRack::empty();
+        let layers = [LayerMotionPlanInput {
+            stable_id: layer_id(1),
+            params: MotionParams::default(),
+            codec: MotionCodecFrameFacts::default(),
+        }];
+        let advanced = advanced(
+            plan_with_motion(
+                &base,
+                &composition,
+                &master,
+                &racks,
+                MotionParams::default(),
+                &layers,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            advanced.refresh_garden_signal(),
+            EvaluatedRefreshGardenSignalPlan::Inline
+        );
+        assert_eq!(
+            advanced.refresh_garden_resources(),
+            RefreshGardenResourcePlan::default()
+        );
+        assert!(advanced.motion().is_legacy_exact());
+    }
+
+    #[test]
+    fn authored_routes_at_zero_garden_amount_preserve_literal_legacy_exact() {
+        let mut temporal = TemporalParams::default();
+        temporal.originals.garden.gate = RefreshGardenGate::Matte;
+        temporal.originals.garden.matte_route = RefreshGardenMatteRoute::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let base = base_with_temporal(&temporal);
+        let composition = legacy_composition(&[1]);
+        let racks = legacy_racks(&[1]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        assert!(matches!(
+            plan(&base, &composition, &master, &racks).unwrap(),
+            EvaluatedCompositionPlan::LegacyExact(_)
+        ));
     }
 
     #[test]

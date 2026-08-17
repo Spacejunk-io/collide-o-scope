@@ -16,6 +16,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub const MAX_CUE_POINTS: usize = 64;
 /// Largest numeric cue identity accepted on disk or over the control protocol.
 pub const MAX_CUE_ID: u16 = 4095;
+/// Largest authored SMPTE hour. Keeping this below three digits makes the
+/// browser/native wire shape fixed-width and bounds every conversion.
+pub const MAX_TIMECODE_HOURS: u8 = 99;
 
 const DEFAULT_CLIP_BPM: f64 = 120.0;
 const MIN_CLIP_BPM: f64 = 1.0;
@@ -60,6 +63,200 @@ pub enum TriggerMode {
     Immediate,
     NextBeat,
     NextBar,
+}
+
+/// Closed source-time rates accepted by the transport console. Fractional
+/// NTSC rates retain exact rational arithmetic; drop-frame is a numbering law,
+/// not a rounded playback speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimecodeRate {
+    Fps24,
+    Fps25,
+    Fps30,
+    Fps50,
+    Fps60,
+    Ntsc24,
+    Ntsc30,
+    Ntsc30Drop,
+    Ntsc60,
+    Ntsc60Drop,
+}
+
+impl TimecodeRate {
+    /// Display-frame modulus used by the final `frames` field.
+    pub const fn nominal_fps(self) -> u8 {
+        match self {
+            Self::Fps24 | Self::Ntsc24 => 24,
+            Self::Fps25 => 25,
+            Self::Fps30 | Self::Ntsc30 | Self::Ntsc30Drop => 30,
+            Self::Fps50 => 50,
+            Self::Fps60 | Self::Ntsc60 | Self::Ntsc60Drop => 60,
+        }
+    }
+
+    /// Exact source-frame rate as numerator / denominator.
+    pub const fn rational(self) -> (u32, u32) {
+        match self {
+            Self::Fps24 => (24, 1),
+            Self::Fps25 => (25, 1),
+            Self::Fps30 => (30, 1),
+            Self::Fps50 => (50, 1),
+            Self::Fps60 => (60, 1),
+            Self::Ntsc24 => (24_000, 1_001),
+            Self::Ntsc30 | Self::Ntsc30Drop => (30_000, 1_001),
+            Self::Ntsc60 | Self::Ntsc60Drop => (60_000, 1_001),
+        }
+    }
+
+    const fn dropped_labels_per_minute(self) -> u8 {
+        match self {
+            Self::Ntsc30Drop => 2,
+            Self::Ntsc60Drop => 4,
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimecodeError {
+    Hours,
+    Minutes,
+    Seconds,
+    Frames { requested: u8, nominal_fps: u8 },
+    DroppedLabel,
+    InvalidDuration,
+}
+
+impl fmt::Display for TimecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hours => write!(
+                formatter,
+                "timecode hours must be no greater than {MAX_TIMECODE_HOURS}"
+            ),
+            Self::Minutes => formatter.write_str("timecode minutes must be within 0..=59"),
+            Self::Seconds => formatter.write_str("timecode seconds must be within 0..=59"),
+            Self::Frames {
+                requested,
+                nominal_fps,
+            } => write!(
+                formatter,
+                "timecode frame {requested} is outside 0..{} for this rate",
+                nominal_fps.saturating_sub(1)
+            ),
+            Self::DroppedLabel => formatter.write_str(
+                "drop-frame timecode uses a skipped frame label at this minute boundary",
+            ),
+            Self::InvalidDuration => formatter.write_str(
+                "timecode seek requires a finite active source duration greater than zero",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TimecodeError {}
+
+/// Bounded SMPTE-style source address. The semicolon convention is presented
+/// by the UI for drop-frame rates, while the wire format remains a typed map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SourceTimecode {
+    pub hours: u8,
+    pub minutes: u8,
+    pub seconds: u8,
+    pub frames: u8,
+    pub rate: TimecodeRate,
+}
+
+impl SourceTimecode {
+    pub fn new(
+        hours: u8,
+        minutes: u8,
+        seconds: u8,
+        frames: u8,
+        rate: TimecodeRate,
+    ) -> Result<Self, TimecodeError> {
+        if hours > MAX_TIMECODE_HOURS {
+            return Err(TimecodeError::Hours);
+        }
+        if minutes > 59 {
+            return Err(TimecodeError::Minutes);
+        }
+        if seconds > 59 {
+            return Err(TimecodeError::Seconds);
+        }
+        let nominal_fps = rate.nominal_fps();
+        if frames >= nominal_fps {
+            return Err(TimecodeError::Frames {
+                requested: frames,
+                nominal_fps,
+            });
+        }
+        let dropped = rate.dropped_labels_per_minute();
+        if dropped != 0 && !minutes.is_multiple_of(10) && seconds == 0 && frames < dropped {
+            return Err(TimecodeError::DroppedLabel);
+        }
+        Ok(Self {
+            hours,
+            minutes,
+            seconds,
+            frames,
+            rate,
+        })
+    }
+
+    /// Zero-based real source-frame ordinal represented by this label.
+    pub fn frame_number(self) -> u64 {
+        let nominal = u64::from(self.rate.nominal_fps());
+        let total_seconds =
+            u64::from(self.hours) * 3_600 + u64::from(self.minutes) * 60 + u64::from(self.seconds);
+        let nominal_frames = total_seconds * nominal + u64::from(self.frames);
+        let drop = u64::from(self.rate.dropped_labels_per_minute());
+        if drop == 0 {
+            return nominal_frames;
+        }
+        let total_minutes = u64::from(self.hours) * 60 + u64::from(self.minutes);
+        let dropped = drop * (total_minutes - total_minutes / 10);
+        nominal_frames.saturating_sub(dropped)
+    }
+
+    pub fn source_seconds(self) -> f64 {
+        let (numerator, denominator) = self.rate.rational();
+        self.frame_number() as f64 * f64::from(denominator) / f64::from(numerator)
+    }
+
+    pub fn normalized_for_duration(
+        self,
+        source_duration_seconds: f64,
+    ) -> Result<NormalizedTime, TimecodeError> {
+        if !source_duration_seconds.is_finite() || source_duration_seconds <= 0.0 {
+            return Err(TimecodeError::InvalidDuration);
+        }
+        Ok(NormalizedTime::clamped(
+            self.source_seconds() / source_duration_seconds,
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceTimecode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            hours: u8,
+            minutes: u8,
+            seconds: u8,
+            frames: u8,
+            rate: TimecodeRate,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.hours, raw.minutes, raw.seconds, raw.frames, raw.rate)
+            .map_err(de::Error::custom)
+    }
 }
 
 /// A finite, inclusive normalized source position.
@@ -1246,6 +1443,51 @@ mod tests {
         assert_eq!(NormalizedTime::clamped(f64::NAN), NormalizedTime::ZERO);
         assert_eq!(NormalizedTime::clamped(4.0), NormalizedTime::ONE);
         assert_eq!(NormalizedTime::new(-0.0).unwrap().get().to_bits(), 0);
+    }
+
+    #[test]
+    fn typed_timecode_uses_exact_rates_and_drop_frame_numbering() {
+        let frame = SourceTimecode::new(0, 0, 1, 0, TimecodeRate::Fps24).unwrap();
+        assert_eq!(frame.frame_number(), 24);
+        assert_eq!(frame.source_seconds(), 1.0);
+        assert_eq!(
+            frame.normalized_for_duration(4.0).unwrap(),
+            NormalizedTime::new(0.25).unwrap()
+        );
+
+        let one_hour = SourceTimecode::new(1, 0, 0, 0, TimecodeRate::Ntsc30Drop).unwrap();
+        assert_eq!(one_hour.frame_number(), 107_892);
+        assert!((one_hour.source_seconds() - 3_599.996_4).abs() < 0.000_001);
+
+        let ten_minutes = SourceTimecode::new(0, 10, 0, 0, TimecodeRate::Ntsc60Drop).unwrap();
+        assert_eq!(ten_minutes.frame_number(), 35_964);
+        assert!((ten_minutes.source_seconds() - 599.999_4).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn typed_timecode_rejects_skipped_labels_hostile_fields_and_unknown_keys() {
+        assert_eq!(
+            SourceTimecode::new(0, 1, 0, 0, TimecodeRate::Ntsc30Drop),
+            Err(TimecodeError::DroppedLabel)
+        );
+        assert!(SourceTimecode::new(0, 1, 0, 2, TimecodeRate::Ntsc30Drop).is_ok());
+        assert!(SourceTimecode::new(0, 10, 0, 0, TimecodeRate::Ntsc30Drop).is_ok());
+        assert!(SourceTimecode::new(0, 0, 0, 24, TimecodeRate::Fps24).is_err());
+        assert!(SourceTimecode::new(100, 0, 0, 0, TimecodeRate::Fps24).is_err());
+
+        for hostile in [
+            r#"{"hours":0,"minutes":60,"seconds":0,"frames":0,"rate":"fps24"}"#,
+            r#"{"hours":0,"minutes":0,"seconds":0,"frames":0,"rate":"unknown"}"#,
+            r#"{"hours":0,"minutes":0,"seconds":0,"frames":0,"rate":"fps24","path":"C:\\\\private.mov"}"#,
+        ] {
+            assert!(serde_json::from_str::<SourceTimecode>(hostile).is_err());
+        }
+        assert_eq!(
+            SourceTimecode::new(0, 0, 1, 0, TimecodeRate::Fps24)
+                .unwrap()
+                .normalized_for_duration(0.0),
+            Err(TimecodeError::InvalidDuration)
+        );
     }
 
     #[test]

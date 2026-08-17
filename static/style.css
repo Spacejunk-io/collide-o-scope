@@ -569,6 +569,21 @@ body {
 .cue-controls input,
 .cue-controls select { width: 100%; }
 
+.clip-timecode-controls {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(36px, .6fr)) minmax(110px, 1.5fr) auto;
+  gap: 4px;
+  margin: 0;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+
+.clip-timecode-controls legend { padding: 0 3px; color: var(--text-dim); font-size: 9px; }
+.clip-timecode-controls label { display: grid; gap: 2px; color: var(--text-dim); font-size: 9px; }
+.clip-timecode-controls button { align-self: end; }
+
 .cue-controls {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;

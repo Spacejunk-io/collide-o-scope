@@ -576,7 +576,7 @@
                 <select aria-label="Master curved shutter quality"><option value="sharp" selected>Sharp · 1</option><option value="draft">Draft · 4</option><option value="live">Live · 8</option><option value="high">High · 16</option></select>
               </div>
               <div class="temporal-command-row"><button type="button" id="motion-clear-memory">Clear motion memory</button></div>
-              <div class="audio-status motion-telemetry" id="master-motion-telemetry" role="status" aria-live="polite">v1 · field idle · 0 vectors · carrier empty</div>
+              <div class="audio-status motion-telemetry" id="master-motion-telemetry" role="status" aria-live="polite">v1 · planned idle · 0 vectors · no field planned · carrier empty</div>
               <div class="audio-status">Auto uses codec vectors when valid on layers and visibly falls back to the deterministic lattice. Master Auto is lattice. Codec-only never falls back.</div>
             </div>
           </div>
@@ -696,9 +696,25 @@
                         <option value="temporal_delta">Temporal Δ</option><option value="luma">Luma</option>
                         <option value="chroma">Chroma</option><option value="cellular_ridge">Cellular ridge</option>
                         <option value="audio_energy">Audio energy</option><option value="audio_onset">Audio onset</option>
-                        <option value="matte">Matte</option>
+                        <option value="matte">Matte</option><option value="motion">Motion</option>
                       </select>
                     </div>
+                    <div class="param-row select-row">
+                      <label for="temporal-garden-matte-route">Matte layer</label>
+                      <select id="temporal-garden-matte-route" aria-label="Refresh Garden Matte route"><option value="none">None</option></select>
+                    </div>
+                    <div class="param-row select-row">
+                      <label for="temporal-garden-matte-stage">Matte stage</label>
+                      <select id="temporal-garden-matte-stage" aria-label="Refresh Garden Matte source stage">
+                        <option value="post_local_effects">Post-local effects</option>
+                        <option value="pre_local_effects">Pre-local effects</option>
+                      </select>
+                    </div>
+                    <div class="param-row select-row">
+                      <label for="temporal-garden-motion-route">Motion layer</label>
+                      <select id="temporal-garden-motion-route" aria-label="Refresh Garden admitted Motion route"><option value="none">None</option></select>
+                    </div>
+                    <div class="audio-status" id="temporal-garden-route-status" role="status" aria-live="polite">Matte not selected · Motion not selected</div>
                     <div class="param-row" data-temporal="garden_threshold" data-min="0" data-max="1" data-step="0.01">
                       <label>Threshold</label><input type="range"><span class="value">0.1</span>
                     </div>
@@ -710,6 +726,9 @@
                     </div>
                     <div class="param-row temporal-number-row" data-temporal="garden_max_hold_ticks" data-default="0">
                       <label for="temporal-garden-hold">Max hold</label><input id="temporal-garden-hold" type="number" min="0" max="4294967295" step="1" value="0">
+                    </div>
+                    <div class="temporal-command-row">
+                      <button type="button" id="temporal-garden-trigger">Refresh now</button>
                     </div>
                   </div>
                 </details>
@@ -762,6 +781,7 @@
                     </div>
                     <div class="temporal-command-row">
                       <button type="button" id="temporal-clear-memory">Clear temporal memory</button>
+                      <button type="button" id="temporal-clear-event-track">Clear event recording</button>
                     </div>
                     <div class="audio-status temporal-telemetry" id="temporal-telemetry" role="status" aria-live="polite">History 0/24 · carrier empty · hold empty · tick 0 · Score 0 · event 0</div>
                     <div class="audio-status">Clear is an ordered memory barrier. It preserves authored controls and a paused audience hold.</div>
@@ -1156,6 +1176,16 @@
                 <select id="export-ntsc-quality">
                   <option value="live_parity" selected>Live parity (half)</option>
                   <option value="native">Native (full resolution)</option>
+                </select>
+              </div>
+              <div class="param-row select-row">
+                <label title="Authored preserves each scope's live tier. Explicit choices request the exact stated sample count for every active Curved Shutter scope after Morph/modulation and before export preflight.">Shutter samples</label>
+                <select id="export-shutter-samples">
+                  <option value="authored" selected>Authored per scope</option>
+                  <option value="samples_1">1 sample (Sharp)</option>
+                  <option value="samples_4">4 samples (Draft)</option>
+                  <option value="samples_8">8 samples (Live)</option>
+                  <option value="samples_16">16 samples (High)</option>
                 </select>
               </div>
               <div class="param-row select-row">

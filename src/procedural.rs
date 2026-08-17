@@ -1249,7 +1249,8 @@ fn mutate_saved_rack_values(
             VisualNodeKind::Mask(MaskParams::Image(matte)) => Some(matte.amount),
             _ => None,
         };
-        if prior_wet <= 0.0 && node.wet > 0.0 && current_image_amount.is_some_and(|v| v > 0.0) {
+        let route_effect_active = current_image_amount.is_some_and(|value| value > 0.0);
+        if prior_wet <= 0.0 && node.wet > 0.0 && route_effect_active {
             edge_fallbacks.push(CreativeEdgeFallback::NodeWet {
                 owner,
                 node_id,
@@ -3016,6 +3017,14 @@ mod tests {
         authored.loom.interpolation = crate::patch::TemporalInterpolationConfig::Linear;
         authored.atlas.seed = 0xdead_beef;
         authored.garden.gate = crate::patch::RefreshGardenGateConfig::Matte;
+        authored.garden.matte_route = crate::patch::RefreshGardenMatteRouteConfig::SelectedLayer {
+            saved_position: crate::performance::SavedLayerPosition::new(1).unwrap(),
+            stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+        };
+        authored.garden.motion_route =
+            crate::patch::RefreshGardenMotionRouteConfig::MissingSelectedLayer {
+                saved_position: crate::performance::SavedLayerPosition::new(3).unwrap(),
+            };
         authored.score.enabled = true;
         authored.score.seed = 0x1234_5678;
         authored.score.trigger = crate::patch::CollisionScoreTriggerConfig::Manual;
@@ -3047,6 +3056,8 @@ mod tests {
         assert_eq!(left.loom.interpolation, authored.loom.interpolation);
         assert_eq!(left.atlas.seed, authored.atlas.seed);
         assert_eq!(left.garden.gate, authored.garden.gate);
+        assert_eq!(left.garden.matte_route, authored.garden.matte_route);
+        assert_eq!(left.garden.motion_route, authored.garden.motion_route);
         assert_eq!(left.score, authored.score);
         assert_eq!(left.reset, authored.reset);
 

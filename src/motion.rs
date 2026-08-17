@@ -43,6 +43,7 @@ pub const MOTION_CODEC_VECTOR_MAX_RECORDS: usize = 262_144;
 // logical carrier count remains one even though it owns two parity surfaces.
 const VECTOR_TEXTURE_BYTES_PER_CELL: u64 = 8; // two RG16Float surfaces
 const GATE_TEXTURE_BYTES_PER_CELL: u64 = 4; // two RG8Unorm surfaces
+const GARDEN_SIGNAL_BYTES_PER_CELL: u64 = 1; // one transient R8Unorm surface
 const LUMA_PING_PONG_BYTES_PER_CELL: u64 = 2; // two R8Unorm surfaces
 const CARRIER_BYTES_PER_PIXEL: u64 = 16; // two RGBA16Float surfaces
 const PACKED_VECTOR_BYTES: u64 = 8;
@@ -424,6 +425,10 @@ pub struct MotionScopeResourceRequest {
     /// A transplant recipient selected this scope as its donor. Donor fields
     /// are budgeted even when the donor's own authored effects are exact-zero.
     pub required_as_donor: bool,
+    /// Refresh Garden selected this scope as its routed motion signal. This
+    /// admits the same canonical field even when the layer's own Motion
+    /// effects are exact-zero.
+    pub required_as_garden_signal: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -435,6 +440,8 @@ pub struct MotionResourcePlan {
     pub gate_bytes: u64,
     pub luma_bytes: u64,
     pub carrier_bytes: u64,
+    pub garden_signal_bytes: u64,
+    pub active_garden_signals: u32,
     pub total_bytes: u64,
     pub max_field_dimensions: [u32; 2],
     pub max_shutter_samples: u8,
@@ -450,7 +457,8 @@ impl MotionResourcePlan {
             let params = request.params.sanitized();
             let transplant_active = params.transplant.amount > 0.0;
             let shutter_active = !params.shutter.is_exact_zero();
-            let field_required = request.required_as_donor || shutter_active;
+            let field_required =
+                request.required_as_donor || request.required_as_garden_signal || shutter_active;
             if !transplant_active && !field_required {
                 continue;
             }
@@ -497,9 +505,15 @@ impl MotionResourcePlan {
                 } else {
                     0
                 };
+                let garden_signal_bytes = if request.required_as_garden_signal {
+                    checked_bytes(grid.vector_count, GARDEN_SIGNAL_BYTES_PER_CELL)?
+                } else {
+                    0
+                };
                 let field_bytes = vector_bytes
                     .checked_add(gate_bytes)
                     .and_then(|value| value.checked_add(luma_bytes))
+                    .and_then(|value| value.checked_add(garden_signal_bytes))
                     .ok_or(MotionPlanError::ArithmeticOverflow)?;
                 if field_bytes > MOTION_FIELD_MAX_BYTES {
                     return Err(MotionPlanError::FieldBytes {
@@ -532,6 +546,19 @@ impl MotionResourcePlan {
                     .ok_or(MotionPlanError::ArithmeticOverflow)?;
                 plan.max_field_dimensions[0] = plan.max_field_dimensions[0].max(grid.width);
                 plan.max_field_dimensions[1] = plan.max_field_dimensions[1].max(grid.height);
+                if request.required_as_garden_signal {
+                    plan.active_garden_signals = plan
+                        .active_garden_signals
+                        .checked_add(1)
+                        .ok_or(MotionPlanError::ArithmeticOverflow)?;
+                    if plan.active_garden_signals > 1 {
+                        return Err(MotionPlanError::TooManyGardenSignals {
+                            count: plan.active_garden_signals,
+                            limit: 1,
+                        });
+                    }
+                    plan.garden_signal_bytes = garden_signal_bytes;
+                }
             }
             if shutter_active {
                 plan.max_shutter_samples = plan
@@ -563,12 +590,12 @@ impl MotionResourcePlan {
             .checked_add(plan.gate_bytes)
             .and_then(|value| value.checked_add(plan.luma_bytes))
             .and_then(|value| value.checked_add(plan.carrier_bytes))
+            .and_then(|value| value.checked_add(plan.garden_signal_bytes))
             .ok_or(MotionPlanError::ArithmeticOverflow)?;
-        let aggregate_limit = limits.max_motion_bytes.min(MOTION_RESOURCE_MAX_BYTES);
-        if plan.total_bytes > aggregate_limit {
+        if plan.total_bytes > limits.max_motion_bytes {
             return Err(MotionPlanError::AggregateBytes {
                 bytes: plan.total_bytes,
-                limit: aggregate_limit,
+                limit: limits.max_motion_bytes,
             });
         }
         Ok(plan)
@@ -579,6 +606,22 @@ fn checked_bytes(count: u64, bytes_per_element: u64) -> Result<u64, MotionPlanEr
     count
         .checked_mul(bytes_per_element)
         .ok_or(MotionPlanError::ArithmeticOverflow)
+}
+
+/// Canonical scalar consumed by Refresh Garden's routed Motion gate. Motion
+/// vectors are normalized image-space velocity per second; confidence and
+/// visibility are the two admitted field gates stored alongside that vector.
+pub fn refresh_garden_motion_signal(
+    velocity_uv_per_second: [f32; 2],
+    confidence: f32,
+    visibility: f32,
+) -> f32 {
+    let finite = |value: f32| if value.is_finite() { value } else { 0.0 };
+    let x = finite(velocity_uv_per_second[0]);
+    let y = finite(velocity_uv_per_second[1]);
+    let confidence = finite(confidence).clamp(0.0, 1.0);
+    let visibility = finite(visibility).clamp(0.0, 1.0);
+    (x.hypot(y) * confidence * visibility).clamp(0.0, 1.0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,6 +635,7 @@ pub enum MotionPlanError {
     DeviceBuffer { bytes: u64, limit: u64 },
     TooManyActiveFields { count: u32, limit: u32 },
     TooManyTransplants { count: u32, limit: u32 },
+    TooManyGardenSignals { count: u32, limit: u32 },
     MasterTransplant,
     ArithmeticOverflow,
 }
@@ -634,6 +678,10 @@ impl fmt::Display for MotionPlanError {
             Self::TooManyTransplants { count, limit } => write!(
                 f,
                 "motion plan requests {count} transplants; limit is {limit}"
+            ),
+            Self::TooManyGardenSignals { count, limit } => write!(
+                f,
+                "motion plan requests {count} routed Garden signals; limit is {limit}"
             ),
             Self::MasterTransplant => write!(f, "Faraday transplant requires a layer recipient"),
             Self::ArithmeticOverflow => write!(f, "motion resource arithmetic overflow"),
@@ -710,7 +758,7 @@ pub struct MotionField {
     grid: MotionGrid,
     algorithm_version: u16,
     origin: MotionFieldOrigin,
-    vectors: Box<[PackedMotionVector]>,
+    vectors: Vec<PackedMotionVector>,
 }
 
 impl MotionField {
@@ -721,16 +769,28 @@ impl MotionField {
         samples: impl IntoIterator<Item = MotionVectorSample>,
     ) -> Result<Self, MotionFieldError> {
         validate_grid(source_dimensions, grid)?;
-        let vectors: Vec<_> = samples
-            .into_iter()
-            .map(PackedMotionVector::from_sample)
-            .collect();
         let expected =
             usize::try_from(grid.vector_count).map_err(|_| MotionFieldError::ArithmeticOverflow)?;
-        if vectors.len() != expected {
+        let mut vectors = Vec::new();
+        vectors
+            .try_reserve_exact(expected)
+            .map_err(|_| MotionFieldError::Allocation)?;
+        let mut samples = samples.into_iter();
+        for _ in 0..expected {
+            let Some(sample) = samples.next() else {
+                return Err(MotionFieldError::SampleCount {
+                    expected,
+                    actual: vectors.len(),
+                });
+            };
+            vectors.push(PackedMotionVector::from_sample(sample));
+        }
+        if samples.next().is_some() {
             return Err(MotionFieldError::SampleCount {
                 expected,
-                actual: vectors.len(),
+                // The ingress contract is bounded: observe only the first
+                // excess sample instead of exhausting a hostile iterator.
+                actual: expected.saturating_add(1),
             });
         }
         Ok(Self {
@@ -738,7 +798,7 @@ impl MotionField {
             grid,
             algorithm_version: MOTION_ALGORITHM_VERSION,
             origin,
-            vectors: vectors.into_boxed_slice(),
+            vectors,
         })
     }
 
@@ -829,6 +889,7 @@ pub enum MotionFieldError {
     SampleCount { expected: usize, actual: usize },
     TooManyCodecVectors { count: usize, limit: usize },
     InvalidCodecVector { index: usize, reason: &'static str },
+    Allocation,
     ArithmeticOverflow,
 }
 
@@ -849,6 +910,7 @@ impl fmt::Display for MotionFieldError {
             Self::InvalidCodecVector { index, reason } => {
                 write!(f, "invalid codec motion vector {index}: {reason}")
             }
+            Self::Allocation => write!(f, "motion field allocation failed"),
             Self::ArithmeticOverflow => write!(f, "motion field arithmetic overflow"),
         }
     }
@@ -894,9 +956,11 @@ impl LumaPlane<'_> {
     }
 }
 
-/// Deterministic integer block matching. Candidate zero is evaluated first,
-/// followed by increasing Chebyshev rings in row-major order. Equal costs keep
-/// the first candidate, making static and ambiguous blocks prefer zero motion.
+/// Deterministic source-pixel matching over the same low-resolution R8
+/// observation grid used by the production GPU path. Candidate zero is
+/// evaluated first, followed by increasing Chebyshev rings in row-major order.
+/// Five fixed cross taps and strict first-wins ties are part of the algorithm,
+/// making static and ambiguous observations prefer exact zero motion.
 pub fn deterministic_motion_lattice(
     previous: LumaPlane<'_>,
     current: LumaPlane<'_>,
@@ -910,40 +974,33 @@ pub fn deterministic_motion_lattice(
     let source_dimensions = [current.width, current.height];
     let grid = MotionGrid::for_source(source_dimensions, quality)
         .map_err(|_| MotionFieldError::GridLimit)?;
+    let previous_observations = lattice_observations(previous, grid)?;
+    let current_observations = lattice_observations(current, grid)?;
     let candidates = lattice_candidates(quality.search_radius());
     let count =
         usize::try_from(grid.vector_count).map_err(|_| MotionFieldError::ArithmeticOverflow)?;
-    let mut samples = Vec::with_capacity(count);
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(count)
+        .map_err(|_| MotionFieldError::Allocation)?;
     for block_y in 0..grid.height {
         for block_x in 0..grid.width {
-            let origin_x = block_x * grid.block_pixels;
-            let origin_y = block_y * grid.block_pixels;
-            let block_width = grid.block_pixels.min(current.width - origin_x);
-            let block_height = grid.block_pixels.min(current.height - origin_y);
-            let mut best_cost = u64::MAX;
-            let mut second_cost = u64::MAX;
+            let mut best_cost = f32::INFINITY;
+            let mut second_cost = f32::INFINITY;
             let mut best = (0_i32, 0_i32);
             for &(dx, dy) in &candidates {
-                let previous_x = i64::from(origin_x) - i64::from(dx);
-                let previous_y = i64::from(origin_y) - i64::from(dy);
-                if previous_x < 0
-                    || previous_y < 0
-                    || previous_x + i64::from(block_width) > i64::from(previous.width)
-                    || previous_y + i64::from(block_height) > i64::from(previous.height)
-                {
+                let Some(cost) = lattice_candidate_cost(
+                    &previous_observations,
+                    &current_observations,
+                    grid,
+                    source_dimensions,
+                    block_x,
+                    block_y,
+                    dx,
+                    dy,
+                ) else {
                     continue;
-                }
-                let mut cost = 0_u64;
-                for y in 0..block_height {
-                    for x in 0..block_width {
-                        let now = current.pixel(origin_x + x, origin_y + y);
-                        let then = previous.pixel(
-                            u32::try_from(previous_x).unwrap() + x,
-                            u32::try_from(previous_y).unwrap() + y,
-                        );
-                        cost += u64::from(now.abs_diff(then));
-                    }
-                }
+                };
                 if cost < best_cost {
                     second_cost = best_cost;
                     best_cost = cost;
@@ -952,10 +1009,10 @@ pub fn deterministic_motion_lattice(
                     second_cost = cost;
                 }
             }
-            let confidence = if second_cost == u64::MAX || second_cost == 0 {
+            let confidence = if !second_cost.is_finite() || second_cost <= f32::EPSILON {
                 0.0
             } else {
-                (second_cost.saturating_sub(best_cost) as f32 / second_cost as f32).clamp(0.0, 1.0)
+                ((second_cost - best_cost).max(0.0) / second_cost).clamp(0.0, 1.0)
             };
             let hz = quality.update_hz() as f32;
             samples.push(MotionVectorSample {
@@ -969,6 +1026,129 @@ pub fn deterministic_motion_lattice(
         }
     }
     MotionField::from_samples(source_dimensions, grid, MotionFieldOrigin::Lattice, samples)
+}
+
+const LATTICE_CROSS_TAPS: [(i32, i32); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+
+fn lattice_observations(
+    plane: LumaPlane<'_>,
+    grid: MotionGrid,
+) -> Result<Vec<f32>, MotionFieldError> {
+    let count =
+        usize::try_from(grid.vector_count).map_err(|_| MotionFieldError::ArithmeticOverflow)?;
+    let mut observations = Vec::new();
+    observations
+        .try_reserve_exact(count)
+        .map_err(|_| MotionFieldError::Allocation)?;
+    for y in 0..grid.height {
+        for x in 0..grid.width {
+            let uv = [
+                (x as f32 + 0.5) / grid.width as f32,
+                (y as f32 + 0.5) / grid.height as f32,
+            ];
+            let sampled = sample_luma_plane_linear(plane, uv);
+            // The production observation target is R8Unorm. Quantizing here
+            // makes the CPU oracle consume the same bounded evidence.
+            observations.push((sampled * 255.0).round().clamp(0.0, 255.0) / 255.0);
+        }
+    }
+    Ok(observations)
+}
+
+fn sample_luma_plane_linear(plane: LumaPlane<'_>, uv: [f32; 2]) -> f32 {
+    let coordinate = [
+        uv[0] * plane.width as f32 - 0.5,
+        uv[1] * plane.height as f32 - 0.5,
+    ];
+    let base = [coordinate[0].floor() as i64, coordinate[1].floor() as i64];
+    let fraction = [
+        coordinate[0] - base[0] as f32,
+        coordinate[1] - base[1] as f32,
+    ];
+    let maximum = [i64::from(plane.width) - 1, i64::from(plane.height) - 1];
+    let sample = |x: i64, y: i64| {
+        f32::from(plane.pixel(
+            u32::try_from(x.clamp(0, maximum[0])).unwrap(),
+            u32::try_from(y.clamp(0, maximum[1])).unwrap(),
+        )) / 255.0
+    };
+    let upper = [base[0] + 1, base[1] + 1];
+    let row_0 = sample(base[0], base[1])
+        + (sample(upper[0], base[1]) - sample(base[0], base[1])) * fraction[0];
+    let row_1 = sample(base[0], upper[1])
+        + (sample(upper[0], upper[1]) - sample(base[0], upper[1])) * fraction[0];
+    row_0 + (row_1 - row_0) * fraction[1]
+}
+
+fn sample_observation_linear(observations: &[f32], grid: MotionGrid, uv: [f32; 2]) -> f32 {
+    let coordinate = [
+        uv[0] * grid.width as f32 - 0.5,
+        uv[1] * grid.height as f32 - 0.5,
+    ];
+    let base = [coordinate[0].floor() as i64, coordinate[1].floor() as i64];
+    let fraction = [
+        coordinate[0] - base[0] as f32,
+        coordinate[1] - base[1] as f32,
+    ];
+    let maximum = [i64::from(grid.width) - 1, i64::from(grid.height) - 1];
+    let sample = |x: i64, y: i64| {
+        let x = u64::try_from(x.clamp(0, maximum[0])).unwrap();
+        let y = u64::try_from(y.clamp(0, maximum[1])).unwrap();
+        observations[usize::try_from(y * u64::from(grid.width) + x).unwrap()]
+    };
+    let upper = [base[0] + 1, base[1] + 1];
+    let row_0 = sample(base[0], base[1])
+        + (sample(upper[0], base[1]) - sample(base[0], base[1])) * fraction[0];
+    let row_1 = sample(base[0], upper[1])
+        + (sample(upper[0], upper[1]) - sample(base[0], upper[1])) * fraction[0];
+    row_0 + (row_1 - row_0) * fraction[1]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lattice_candidate_cost(
+    previous: &[f32],
+    current: &[f32],
+    grid: MotionGrid,
+    source_dimensions: [u32; 2],
+    cell_x: u32,
+    cell_y: u32,
+    dx: i32,
+    dy: i32,
+) -> Option<f32> {
+    let center = [
+        (cell_x as f32 + 0.5) / grid.width as f32,
+        (cell_y as f32 + 0.5) / grid.height as f32,
+    ];
+    let displacement = [
+        dx as f32 / source_dimensions[0] as f32,
+        dy as f32 / source_dimensions[1] as f32,
+    ];
+    let displaced = [center[0] - displacement[0], center[1] - displacement[1]];
+    if displaced
+        .iter()
+        .any(|coordinate| !(0.0..=1.0).contains(coordinate))
+    {
+        return None;
+    }
+    let step = [1.0 / grid.width as f32, 1.0 / grid.height as f32];
+    Some(
+        LATTICE_CROSS_TAPS
+            .into_iter()
+            .fold(0.0, |cost, (tap_x, tap_y)| {
+                let tap = [tap_x as f32 * step[0], tap_y as f32 * step[1]];
+                let current_sample = sample_observation_linear(
+                    current,
+                    grid,
+                    [center[0] + tap[0], center[1] + tap[1]],
+                );
+                let previous_sample = sample_observation_linear(
+                    previous,
+                    grid,
+                    [displaced[0] + tap[0], displaced[1] + tap[1]],
+                );
+                cost + (current_sample - previous_sample).abs()
+            }),
+    )
 }
 
 fn lattice_candidates(radius: i32) -> Vec<(i32, i32)> {
@@ -1036,8 +1216,16 @@ pub fn rasterize_codec_motion_vectors(
     }
     let count =
         usize::try_from(grid.vector_count).map_err(|_| MotionFieldError::ArithmeticOverflow)?;
-    let mut samples = vec![MotionVectorSample::default(); count];
-    let mut best_area = vec![u32::MAX; count];
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(count)
+        .map_err(|_| MotionFieldError::Allocation)?;
+    samples.resize(count, MotionVectorSample::default());
+    let mut best_area = Vec::new();
+    best_area
+        .try_reserve_exact(count)
+        .map_err(|_| MotionFieldError::Allocation)?;
+    best_area.resize(count, u32::MAX);
     let mut observed_past = false;
     for (index, vector) in vectors.iter().copied().enumerate() {
         validate_codec_vector(index, vector, source_dimensions)?;
@@ -1257,6 +1445,76 @@ mod tests {
     }
 
     #[test]
+    fn packed_field_collection_is_fallible_and_stops_at_the_first_excess_sample() {
+        let grid = MotionGrid::for_source([4, 4], MotionLatticeQuality::High).unwrap();
+        assert_eq!(grid.vector_count, 1);
+        assert_eq!(
+            MotionField::from_samples(
+                [4, 4],
+                grid,
+                MotionFieldOrigin::CodecVectors,
+                std::iter::empty(),
+            ),
+            Err(MotionFieldError::SampleCount {
+                expected: 1,
+                actual: 0,
+            })
+        );
+        assert_eq!(
+            MotionField::from_samples(
+                [4, 4],
+                grid,
+                MotionFieldOrigin::CodecVectors,
+                std::iter::repeat(MotionVectorSample::default()),
+            ),
+            Err(MotionFieldError::SampleCount {
+                expected: 1,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn routed_garden_scalar_and_low_resolution_resource_are_bounded_and_truthful() {
+        assert_eq!(refresh_garden_motion_signal([0.0, 0.0], 1.0, 1.0), 0.0);
+        assert_eq!(refresh_garden_motion_signal([3.0, 4.0], 0.5, 0.5), 1.0);
+        assert!(
+            (refresh_garden_motion_signal([0.6, 0.8], 0.5, 0.25) - 0.125).abs() <= f32::EPSILON
+        );
+        assert_eq!(
+            refresh_garden_motion_signal([f32::NAN, f32::INFINITY], 2.0, -1.0),
+            0.0
+        );
+
+        let request = MotionScopeResourceRequest {
+            source_dimensions: [1920, 1080],
+            output_dimensions: [1920, 1080],
+            params: MotionParams::default(),
+            is_master: false,
+            codec_vectors_available: false,
+            required_as_donor: false,
+            required_as_garden_signal: true,
+        };
+        let grid = MotionGrid::for_source([1920, 1080], MotionLatticeQuality::Live).unwrap();
+        let plan = MotionResourcePlan::preflight(&[request], generous_limits()).unwrap();
+        assert_eq!(plan.active_field_slots, 1);
+        assert_eq!(plan.active_garden_signals, 1);
+        assert_eq!(plan.garden_signal_bytes, grid.vector_count);
+        assert_eq!(
+            plan.total_bytes,
+            plan.vector_bytes
+                + plan.gate_bytes
+                + plan.luma_bytes
+                + plan.carrier_bytes
+                + plan.garden_signal_bytes
+        );
+        assert!(matches!(
+            MotionResourcePlan::preflight(&[request, request], generous_limits()),
+            Err(MotionPlanError::TooManyGardenSignals { count: 2, limit: 1 })
+        ));
+    }
+
+    #[test]
     fn resource_preflight_is_bounded_and_rejects_a_second_transplant() {
         let active = MotionParams {
             transplant: FaradayParams {
@@ -1280,6 +1538,7 @@ mod tests {
             is_master: false,
             codec_vectors_available: false,
             required_as_donor: false,
+            required_as_garden_signal: false,
         };
         let plan = MotionResourcePlan::preflight(&[request], generous_limits()).unwrap();
         assert_eq!(plan.active_field_slots, 1);
@@ -1348,6 +1607,7 @@ mod tests {
             is_master: false,
             codec_vectors_available: false,
             required_as_donor: false,
+            required_as_garden_signal: false,
         };
         let donor = MotionScopeResourceRequest {
             source_dimensions: [1280, 720],
@@ -1356,6 +1616,7 @@ mod tests {
             is_master: false,
             codec_vectors_available: false,
             required_as_donor: true,
+            required_as_garden_signal: false,
         };
         let plan = MotionResourcePlan::preflight(&[recipient, donor], generous_limits()).unwrap();
         assert_eq!(plan.active_transplants, 1);
@@ -1399,6 +1660,7 @@ mod tests {
             is_master: false,
             codec_vectors_available: false,
             required_as_donor: false,
+            required_as_garden_signal: false,
         };
         let plan = MotionResourcePlan::preflight(&[request], generous_limits()).unwrap();
         let field_bytes = plan.vector_bytes + plan.gate_bytes + plan.luma_bytes;
@@ -1410,9 +1672,13 @@ mod tests {
     fn textured(width: u32, height: u32) -> Vec<u8> {
         (0..width * height)
             .map(|index| {
-                let x = index % width;
-                let y = index / width;
-                ((x * 37 + y * 71 + x * y * 3 + 19) & 0xff) as u8
+                let x = (index % width) as f32;
+                let y = (index / width) as f32;
+                let signal = 0.5
+                    + 0.18 * (x * 0.13).sin()
+                    + 0.17 * (y * 0.17).cos()
+                    + 0.12 * ((x + y) * 0.09).sin();
+                (signal.clamp(0.0, 1.0) * 255.0).round() as u8
             })
             .collect()
     }
@@ -1479,6 +1745,34 @@ mod tests {
         assert_lattice_shift(1, 0);
         assert_lattice_shift(0, 2);
         assert_lattice_shift(4, -4);
+    }
+
+    #[test]
+    fn deterministic_lattice_candidate_and_kernel_law_is_frozen() {
+        assert_eq!(
+            &lattice_candidates(2)[..9],
+            &[
+                (0, 0),
+                (-1, -1),
+                (0, -1),
+                (1, -1),
+                (-1, 0),
+                (1, 0),
+                (-1, 1),
+                (0, 1),
+                (1, 1),
+            ]
+        );
+        let high = lattice_candidates(MotionLatticeQuality::High.search_radius());
+        assert_eq!(high.len(), 17 * 17);
+        let mut unique = high.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), high.len());
+        assert_eq!(
+            LATTICE_CROSS_TAPS,
+            [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+        );
     }
 
     #[test]

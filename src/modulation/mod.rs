@@ -4182,6 +4182,16 @@ mod tests {
         base.originals.garden.gate = crate::temporal::RefreshGardenGate::Matte;
         base.originals.garden.decay = 0.2;
         base.originals.garden.max_hold_ticks = 47;
+        base.originals.garden.matte_route =
+            crate::temporal::RefreshGardenMatteRoute::SelectedLayer {
+                layer_id: StableLayerId::new(91).unwrap(),
+                saved_position: SavedLayerPosition::new(3).unwrap(),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            };
+        base.originals.garden.motion_route =
+            crate::temporal::RefreshGardenMotionRoute::MissingSelectedLayer {
+                saved_position: SavedLayerPosition::new(5).unwrap(),
+            };
         base.originals.score.enabled = true;
         base.originals.score.seed = 0x1234_5678;
         base.originals.score.state_count = 11;
@@ -4231,6 +4241,14 @@ mod tests {
             base.originals.atlas.territories
         );
         assert_eq!(modulated.originals.garden.gate, base.originals.garden.gate);
+        assert_eq!(
+            modulated.originals.garden.matte_route,
+            base.originals.garden.matte_route
+        );
+        assert_eq!(
+            modulated.originals.garden.motion_route,
+            base.originals.garden.motion_route
+        );
         assert_eq!(
             modulated.originals.garden.max_hold_ticks,
             base.originals.garden.max_hold_ticks

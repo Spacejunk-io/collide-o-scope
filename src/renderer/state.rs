@@ -1256,6 +1256,7 @@ mod temporal_state_tests {
                     softness: 0.07,
                     decay: 0.98,
                     max_hold_ticks: 0,
+                    ..RefreshGardenParams::default()
                 },
                 ..TemporalOriginalsParams::default()
             },
@@ -1270,6 +1271,7 @@ mod temporal_state_tests {
             RefreshGardenGate::AudioEnergy,
             RefreshGardenGate::AudioOnset,
             RefreshGardenGate::Matte,
+            RefreshGardenGate::Motion,
         ] {
             let params = garden_params(gate);
             let mut state = TemporalState::default();
@@ -1302,7 +1304,10 @@ mod temporal_state_tests {
                 "4409bae76a57060b3252cd9b8608853bcc40a90b3d222c66008922a3706bfd27",
                 "1ec23f37246c24d4ec875fd975df0804f676028fd9e22674f5b554702ab914c8",
                 "1ec23f37246c24d4ec875fd975df0804f676028fd9e22674f5b554702ab914c8",
+                // LegacyExact retains its frozen current-alpha Matte gate;
+                // Advanced stable-route Matte is covered by the routed pass.
                 "1ec23f37246c24d4ec875fd975df0804f676028fd9e22674f5b554702ab914c8",
+                "16bf9582362dcb852f5e3e13cc715b9b0db0660d85b1a48ebf1711ad6a0b8613",
             ]
             .map(str::to_string),
             "{gate_hashes:?}"
@@ -1317,6 +1322,7 @@ mod temporal_state_tests {
                     softness: 0.0,
                     decay: 1.0,
                     max_hold_ticks: 3,
+                    ..RefreshGardenParams::default()
                 },
                 ..TemporalOriginalsParams::default()
             },

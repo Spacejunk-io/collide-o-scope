@@ -15,7 +15,8 @@ use ffmpeg_next::format::context::Input;
 
 use crate::media_safety::{ReverseCacheLease, ReverseCacheLedger};
 
-use super::codec_motion::CodecMotionFrame;
+use super::codec_motion::CodecFrameIdentity;
+use super::codec_motion_sequence::CodecMotionProduct;
 
 /// Hard entry bound for one source's in-memory keyframe index.
 pub const MAX_KEYFRAME_INDEX_ENTRIES: usize = 4_096;
@@ -40,6 +41,9 @@ pub struct FrameMetadata {
     pub source_seconds: f64,
     /// Total source duration, or zero when the container cannot report one.
     pub duration_seconds: f64,
+    /// Exact identity is present only for decoded video frames with an integer
+    /// source PTS. It is the sole predecessor token for codec-motion proof.
+    pub codec_identity: Option<CodecFrameIdentity>,
 }
 
 impl FrameMetadata {
@@ -49,6 +53,7 @@ impl FrameMetadata {
             pts: None,
             source_seconds: 0.0,
             duration_seconds: 0.0,
+            codec_identity: None,
         }
     }
 
@@ -63,7 +68,13 @@ impl FrameMetadata {
             pts,
             source_seconds: finite_nonnegative(source_seconds),
             duration_seconds: finite_nonnegative(duration_seconds),
+            codec_identity: None,
         }
+    }
+
+    pub fn with_codec_identity(mut self, identity: Option<CodecFrameIdentity>) -> Self {
+        self.codec_identity = identity;
+        self
     }
 }
 
@@ -80,7 +91,7 @@ pub struct DecodedVideoFrame {
     pub metadata: FrameMetadata,
     /// Sparse codec records paired with this exact image/generation. Still
     /// sources and reverse-cache hits are explicitly absent.
-    pub codec_motion: Option<CodecMotionFrame>,
+    pub codec_motion: Option<CodecMotionProduct>,
 }
 
 /// Recoverable decoder-work outcome used by generation-aware workers.
@@ -269,6 +280,9 @@ impl ReverseFrameCache {
             self.clear();
             return Ok(());
         }
+        self.frames
+            .try_reserve(1)
+            .map_err(|error| format!("could not reserve reverse-frame cache slot: {error}"))?;
         while self.frames.len() >= self.max_frames
             || self
                 .bytes
@@ -298,9 +312,19 @@ impl ReverseFrameCache {
         self.bytes = self.bytes.checked_add(frame_bytes).ok_or_else(|| {
             "reverse-frame cache byte accounting overflowed unexpectedly".to_string()
         })?;
+        let metadata = FrameMetadata {
+            // A cache may retag an exact decoded identity for a newer request
+            // generation, but it must not launder a mismatched/forged token
+            // into an upload predecessor first.
+            codec_identity: frame.metadata.codec_identity.filter(|identity| {
+                identity.source_generation == frame.metadata.source_generation
+                    && Some(identity.pts) == frame.metadata.pts
+            }),
+            ..frame.metadata
+        };
         self.frames.push_back(CachedFrame {
             rgba,
-            metadata: frame.metadata,
+            metadata,
             _lease: lease,
         });
         Ok(())
@@ -333,6 +357,10 @@ impl ReverseFrameCache {
             rgba,
             metadata: FrameMetadata {
                 source_generation,
+                codec_identity: frame.metadata.codec_identity.map(|mut identity| {
+                    identity.source_generation = source_generation;
+                    identity
+                }),
                 ..frame.metadata
             },
             codec_motion: None,
@@ -380,25 +408,34 @@ mod tests {
 
     fn frame_with_motion(id: u8, seconds: f64, bytes: usize) -> DecodedVideoFrame {
         let mut frame = frame(id, seconds, bytes);
-        frame.codec_motion = Some(crate::video::CodecMotionFrame {
-            source_dimensions: [64, 64],
-            frame_delta_seconds: 1.0 / 30.0,
-            source_generation: 7,
-            frame_ordinal: u64::from(id),
-            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
-            provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
-            frame_type: crate::video::CodecMotionFrameType::Predictive,
-            status: crate::video::CodecMotionStatus::Available,
-            vectors: vec![crate::motion::CodecMotionVector {
-                destination: [16, 16],
-                block: [8, 8],
-                motion: [-1, 0],
-                motion_scale: 1,
-                seconds_from_reference: 1.0 / 30.0,
-                reference: crate::motion::CodecReferenceDirection::Past,
-                visibility: 1.0,
-            }],
+        frame.metadata.codec_identity = Some(CodecFrameIdentity {
+            source_generation: frame.metadata.source_generation,
+            pts: i64::from(id),
+            presentation_ordinal: u64::from(id),
         });
+        frame.codec_motion = Some(
+            crate::video::CodecMotionFrame {
+                source_dimensions: [64, 64],
+                frame_delta_seconds: 1.0 / 30.0,
+                source_generation: 7,
+                frame_ordinal: u64::from(id),
+                algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+                provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
+                frame_type: crate::video::CodecMotionFrameType::Predictive,
+                status: crate::video::CodecMotionStatus::Available,
+                past_reference_proof: None,
+                vectors: vec![crate::motion::CodecMotionVector {
+                    destination: [16, 16],
+                    block: [8, 8],
+                    motion: [-1, 0],
+                    motion_scale: 1,
+                    seconds_from_reference: 1.0 / 30.0,
+                    reference: crate::motion::CodecReferenceDirection::Past,
+                    visibility: 1.0,
+                }],
+            }
+            .into(),
+        );
         frame
     }
 
@@ -413,8 +450,40 @@ mod tests {
         assert_eq!(ledger.reserved_bytes(), 12);
         let retrieved = cache.near_at_or_before(1.0, 99, 0.1).unwrap().unwrap();
         assert_eq!(retrieved.metadata.source_generation, 99);
+        assert_eq!(
+            retrieved.metadata.codec_identity,
+            Some(CodecFrameIdentity {
+                source_generation: 99,
+                pts: 1,
+                presentation_ordinal: 1,
+            })
+        );
         assert!(retrieved.codec_motion.is_none());
         assert_eq!(cache.bytes(), 12, "motion bytes entered the RGBA lease");
+    }
+
+    #[test]
+    fn reverse_cache_never_launders_a_hostile_upload_identity() {
+        for hostile_identity in [
+            CodecFrameIdentity {
+                source_generation: 8,
+                pts: 1,
+                presentation_ordinal: 1,
+            },
+            CodecFrameIdentity {
+                source_generation: 7,
+                pts: 2,
+                presentation_ordinal: 1,
+            },
+        ] {
+            let mut hostile = frame(1, 1.0, 4);
+            hostile.metadata.codec_identity = Some(hostile_identity);
+            let mut cache = ReverseFrameCache::new(8, 1);
+            cache.insert(&hostile).unwrap();
+            let retrieved = cache.near_at_or_before(1.0, 99, 0.1).unwrap().unwrap();
+            assert_eq!(retrieved.metadata.source_generation, 99);
+            assert_eq!(retrieved.metadata.codec_identity, None);
+        }
     }
 
     #[test]

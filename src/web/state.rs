@@ -12,7 +12,7 @@ use crate::effects::EffectUniforms;
 use crate::image_routing::{LayerImageStage, MatteChannel};
 use crate::performance::{ClipSlotId, SavedLayerPosition, SceneId};
 use crate::spatial::{FitMode, SpatialTransform};
-use crate::transport::{ClipTransportConfig, CueId, NormalizedTime, TriggerMode};
+use crate::transport::{ClipTransportConfig, CueId, NormalizedTime, SourceTimecode, TriggerMode};
 use crate::visual_rack::EdgeTiming;
 
 /// Maximum UTF-8 payload for a browser-authored optional Scene name.
@@ -730,7 +730,7 @@ pub fn recovery_snapshot_fields(scan: &crate::recovery_journal::RecoveryScan) ->
     (scan.recovery_available(), status)
 }
 
-pub const EXPORT_MOTION_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+pub const EXPORT_MOTION_SNAPSHOT_SCHEMA_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExportMotionScopeSnapshot {
@@ -751,6 +751,12 @@ pub struct ExportMotionScopeSnapshot {
     #[serde(default)]
     pub source_origin: String,
     #[serde(default)]
+    pub rendered_source_origin: String,
+    #[serde(default)]
+    pub field_planned: bool,
+    #[serde(default)]
+    pub field_attached: bool,
+    #[serde(default)]
     pub source_diagnostic: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codec_provenance: String,
@@ -758,6 +764,12 @@ pub struct ExportMotionScopeSnapshot {
     pub source_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_ordinal: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codec_product_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_transition_count: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_elapsed_seconds: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub donor_saved_position: Option<u32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -843,6 +855,9 @@ impl ExportMotionSnapshot {
                     requested_source: motion_source_key(scope.requested_source).into(),
                     lattice_quality: lattice_quality_key(scope.lattice_quality).into(),
                     source_origin: motion_origin_key(scope.source_origin).into(),
+                    rendered_source_origin: motion_origin_key(scope.rendered_source_origin).into(),
+                    field_planned: scope.field_planned,
+                    field_attached: scope.field_attached,
                     source_diagnostic: motion_diagnostic_key(scope.source_diagnostic).into(),
                     codec_provenance: scope
                         .codec_provenance
@@ -851,6 +866,12 @@ impl ExportMotionSnapshot {
                         .into(),
                     source_generation: scope.source_generation,
                     frame_ordinal: scope.frame_ordinal,
+                    codec_product_sha256: scope
+                        .codec_product_sha256
+                        .map(crate::render_export::sha256_bytes_hex)
+                        .unwrap_or_default(),
+                    codec_transition_count: scope.codec_transition_count,
+                    codec_elapsed_seconds: scope.codec_elapsed_seconds,
                     donor_saved_position: scope.donor_saved_position,
                     donor_stable_id: scope
                         .donor_stable_id
@@ -1909,6 +1930,10 @@ pub struct RefreshGardenSnapshot {
     pub softness: f32,
     pub decay: f32,
     pub max_hold_ticks: u32,
+    #[serde(default)]
+    pub matte_route: RefreshGardenMatteRouteSnapshot,
+    #[serde(default)]
+    pub motion_route: RefreshGardenMotionRouteSnapshot,
 }
 
 impl Default for RefreshGardenSnapshot {
@@ -1920,8 +1945,40 @@ impl Default for RefreshGardenSnapshot {
             softness: 0.03,
             decay: 1.0,
             max_hold_ticks: 0,
+            matte_route: RefreshGardenMatteRouteSnapshot::None,
+            motion_route: RefreshGardenMotionRouteSnapshot::None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RefreshGardenMatteRouteSnapshot {
+    #[default]
+    None,
+    SelectedLayer {
+        layer_id: String,
+        saved_position: u32,
+        stage: LayerImageStage,
+    },
+    MissingSelectedLayer {
+        saved_position: u32,
+        stage: LayerImageStage,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RefreshGardenMotionRouteSnapshot {
+    #[default]
+    None,
+    SelectedLayer {
+        layer_id: String,
+        saved_position: u32,
+    },
+    MissingSelectedLayer {
+        saved_position: u32,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1992,6 +2049,10 @@ pub struct TemporalTelemetrySnapshot {
     pub total_reference_ticks: u64,
     pub score_state: u8,
     pub score_event_ordinal: u64,
+    #[serde(default)]
+    pub recorded_event_points: u32,
+    #[serde(default)]
+    pub event_track_truncated: bool,
     pub frame_staged: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub last_reset: String,
@@ -2007,6 +2068,8 @@ impl Default for TemporalTelemetrySnapshot {
             total_reference_ticks: 0,
             score_state: 0,
             score_event_ordinal: 0,
+            recorded_event_points: 0,
+            event_track_truncated: false,
             frame_staged: false,
             last_reset: String::new(),
         }
@@ -2049,7 +2112,10 @@ impl TemporalSnapshot {
         use crate::effects::params::{
             CollisionScoreTrigger, RefreshGardenGate, TemporalInterpolation, TemporalTopology,
         };
-        use crate::temporal::{CollisionScoreLoopDriver, TemporalEventResetMode};
+        use crate::temporal::{
+            CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
+            TemporalEventResetMode,
+        };
 
         let topology = match p.originals.loom.topology {
             TemporalTopology::Linear => "linear",
@@ -2071,6 +2137,7 @@ impl TemporalSnapshot {
             RefreshGardenGate::AudioEnergy => "audio_energy",
             RefreshGardenGate::AudioOnset => "audio_onset",
             RefreshGardenGate::Matte => "matte",
+            RefreshGardenGate::Motion => "motion",
         };
         let trigger = match p.originals.score.trigger {
             CollisionScoreTrigger::Boundary => "boundary",
@@ -2095,6 +2162,40 @@ impl TemporalSnapshot {
             },
             CollisionScoreLoopDriver::MissingSelectedLayer { saved_position } => {
                 CollisionScoreLoopDriverSnapshot::MissingSelectedLayer {
+                    saved_position: saved_position.get(),
+                }
+            }
+        };
+        let matte_route = match p.originals.garden.matte_route {
+            RefreshGardenMatteRoute::None => RefreshGardenMatteRouteSnapshot::None,
+            RefreshGardenMatteRoute::SelectedLayer {
+                layer_id,
+                saved_position,
+                stage,
+            } => RefreshGardenMatteRouteSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                saved_position: saved_position.get(),
+                stage,
+            },
+            RefreshGardenMatteRoute::MissingSelectedLayer {
+                saved_position,
+                stage,
+            } => RefreshGardenMatteRouteSnapshot::MissingSelectedLayer {
+                saved_position: saved_position.get(),
+                stage,
+            },
+        };
+        let motion_route = match p.originals.garden.motion_route {
+            RefreshGardenMotionRoute::None => RefreshGardenMotionRouteSnapshot::None,
+            RefreshGardenMotionRoute::SelectedLayer {
+                layer_id,
+                saved_position,
+            } => RefreshGardenMotionRouteSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                saved_position: saved_position.get(),
+            },
+            RefreshGardenMotionRoute::MissingSelectedLayer { saved_position } => {
+                RefreshGardenMotionRouteSnapshot::MissingSelectedLayer {
                     saved_position: saved_position.get(),
                 }
             }
@@ -2135,6 +2236,8 @@ impl TemporalSnapshot {
                     softness: p.originals.garden.softness,
                     decay: p.originals.garden.decay,
                     max_hold_ticks: p.originals.garden.max_hold_ticks,
+                    matte_route,
+                    motion_route,
                 },
                 score: CollisionScoreSnapshot {
                     enabled: p.originals.score.enabled,
@@ -2226,12 +2329,15 @@ impl Default for CurvedShutterSnapshot {
     }
 }
 
-/// Read-only renderer truth. Zero placeholders are truthful before a planner
-/// has admitted resources and never imply hidden field/carrier history.
+/// Read-only planner plus committed-renderer truth. Planned fields describe
+/// immutable admission; rendered fields remain `none`/unattached until the
+/// matching GPU parity slot has actually committed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MotionTelemetrySnapshot {
     #[serde(default)]
     pub effective_source: String,
+    #[serde(default)]
+    pub rendered_source: String,
     #[serde(default)]
     pub codec_vectors_available: bool,
     #[serde(default)]
@@ -2240,6 +2346,10 @@ pub struct MotionTelemetrySnapshot {
     pub field_dimensions: [u32; 2],
     #[serde(default)]
     pub vector_count: u64,
+    #[serde(default)]
+    pub field_planned: bool,
+    #[serde(default)]
+    pub field_attached: bool,
     #[serde(default)]
     pub required_as_donor: bool,
     #[serde(default)]
@@ -3150,6 +3260,15 @@ pub enum WebAction {
         slot_id: ClipSlotId,
         position: NormalizedTime,
     },
+    /// SMPTE-style discontinuous seek. Main resolves this typed address only
+    /// against the exact active source duration, then sends the same
+    /// generation-tagged normalized request used by scratching.
+    #[serde(rename = "seek_clip_slot_timecode")]
+    SeekClipSlotTimecode {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        timecode: SourceTimecode,
+    },
     /// Decode/upload every source required by a scene without changing output.
     #[serde(rename = "prepare_scene")]
     PrepareScene { scene_id: SceneId },
@@ -3528,6 +3647,32 @@ pub enum WebAction {
     /// never a coalesced scalar edit.
     #[serde(rename = "trigger_collision_score")]
     TriggerCollisionScore,
+    /// Emit one explicit all-pixel Refresh Garden admission. Like Score
+    /// events, this is counted, ordered, and never coalesced into a scalar.
+    #[serde(rename = "trigger_refresh_garden")]
+    TriggerRefreshGarden,
+    /// Select or clear the stable current-frame layer route used by the
+    /// Refresh Garden Matte gate. This is an ordered topology barrier.
+    #[serde(rename = "set_refresh_garden_matte_route")]
+    SetRefreshGardenMatteRoute {
+        #[serde(default)]
+        layer_id: Option<String>,
+        #[serde(default)]
+        stage: LayerImageStage,
+        layer_stack_revision: u64,
+    },
+    /// Select or clear the stable admitted-motion route used by the Refresh
+    /// Garden Motion gate. This is an ordered topology barrier.
+    #[serde(rename = "set_refresh_garden_motion_route")]
+    SetRefreshGardenMotionRoute {
+        #[serde(default)]
+        layer_id: Option<String>,
+        layer_stack_revision: u64,
+    },
+    /// Clear only the portable explicit-event recording. Authored controls and
+    /// live Temporal/Garden/Score memory are unchanged.
+    #[serde(rename = "clear_temporal_event_track")]
+    ClearTemporalEventTrack,
     /// Coalescible bounded Motion value/tier edit. Donor identity uses the
     /// separate ordered action below and algorithm provenance is read-only.
     #[serde(rename = "set_motion")]
@@ -3669,6 +3814,10 @@ pub enum WebAction {
         /// clients. Native processes VHS at the selected export dimensions.
         #[serde(default)]
         ntsc_quality: crate::ntsc::NtscExportQuality,
+        /// Explicit offline Curved Shutter sample request. Omitted legacy
+        /// clients preserve each scope's authored live tier.
+        #[serde(default)]
+        shutter_samples: crate::render_export::ExportShutterSamples,
         #[serde(default)]
         audio_layer: Option<usize>,
         #[serde(default)]
@@ -3854,6 +4003,7 @@ impl WebAction {
                 | Self::ActivateClipSlot { .. }
                 | Self::TriggerClipCue { .. }
                 | Self::SeekClipSlot { .. }
+                | Self::SeekClipSlotTimecode { .. }
                 | Self::PrepareScene { .. }
                 | Self::TriggerScene { .. }
                 | Self::TapTempo
@@ -3862,6 +4012,8 @@ impl WebAction {
                 | Self::GyroCalibrate
                 | Self::Pad { .. }
                 | Self::TriggerCollisionScore
+                | Self::TriggerRefreshGarden
+                | Self::ClearTemporalEventTrack
                 | Self::ClearTemporalMemory
                 | Self::ClearMotionMemory
                 | Self::SetOutputWindow { .. }
@@ -3919,6 +4071,10 @@ impl WebAction {
             | Self::ResetVisualProgram
             | Self::ClearTemporalMemory
             | Self::TriggerCollisionScore
+            | Self::TriggerRefreshGarden
+            | Self::SetRefreshGardenMatteRoute { .. }
+            | Self::SetRefreshGardenMotionRoute { .. }
+            | Self::ClearTemporalEventTrack
             | Self::SetMotionDonor { .. }
             | Self::ClearMotionMemory
             | Self::SetLayerPaused { .. }
@@ -3929,6 +4085,7 @@ impl WebAction {
             | Self::RemoveClipCue { .. }
             | Self::TriggerClipCue { .. }
             | Self::SeekClipSlot { .. }
+            | Self::SeekClipSlotTimecode { .. }
             | Self::PrepareScene { .. }
             | Self::CaptureScene { .. }
             | Self::RemoveScene { .. }
@@ -3974,18 +4131,29 @@ fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutc
     {
         return EnqueueOutcome::Coalesced;
     }
-    if let WebAction::SeekClipSlot {
-        layer_id, slot_id, ..
-    } = &action
-    {
-        let replaces_last = matches!(
-            queue.last(),
+    let seek_target = match &action {
+        WebAction::SeekClipSlot {
+            layer_id, slot_id, ..
+        }
+        | WebAction::SeekClipSlotTimecode {
+            layer_id, slot_id, ..
+        } => Some((layer_id, slot_id)),
+        _ => None,
+    };
+    if let Some((layer_id, slot_id)) = seek_target {
+        let replaces_last = match queue.last() {
             Some(WebAction::SeekClipSlot {
                 layer_id: pending_layer,
                 slot_id: pending_slot,
                 ..
-            }) if pending_layer == layer_id && pending_slot == slot_id
-        );
+            })
+            | Some(WebAction::SeekClipSlotTimecode {
+                layer_id: pending_layer,
+                slot_id: pending_slot,
+                ..
+            }) => pending_layer == layer_id && pending_slot == slot_id,
+            _ => false,
+        };
         if replaces_last {
             *queue.last_mut().expect("the matching final seek exists") = action;
             return EnqueueOutcome::Coalesced;
@@ -4850,6 +5018,17 @@ mod protocol_tests {
 
     #[test]
     fn temporal_originals_snapshot_is_additive_exact_and_reports_runtime_identity() {
+        let mut legacy_garden = serde_json::to_value(RefreshGardenSnapshot::default()).unwrap();
+        legacy_garden.as_object_mut().unwrap().remove("matte_route");
+        legacy_garden
+            .as_object_mut()
+            .unwrap()
+            .remove("motion_route");
+        assert_eq!(
+            serde_json::from_value::<RefreshGardenSnapshot>(legacy_garden).unwrap(),
+            RefreshGardenSnapshot::default()
+        );
+
         let mut legacy = serde_json::to_value(TemporalSnapshot::default()).unwrap();
         let object = legacy.as_object_mut().unwrap();
         object.remove("originals");
@@ -4868,6 +5047,14 @@ mod protocol_tests {
         params.originals.score.trigger = crate::effects::params::CollisionScoreTrigger::Manual;
         let layer_id = crate::image_routing::StableLayerId::new(91).unwrap();
         let saved_position = SavedLayerPosition::new(3).unwrap();
+        params.originals.garden.matte_route =
+            crate::temporal::RefreshGardenMatteRoute::SelectedLayer {
+                layer_id,
+                saved_position,
+                stage: LayerImageStage::PreLocalEffects,
+            };
+        params.originals.garden.motion_route =
+            crate::temporal::RefreshGardenMotionRoute::MissingSelectedLayer { saved_position };
         params.originals.score.loop_driver =
             crate::temporal::CollisionScoreLoopDriver::SelectedLayer {
                 layer_id,
@@ -4881,6 +5068,20 @@ mod protocol_tests {
         assert_eq!(snapshot.originals.loom.interpolation, "linear");
         assert_eq!(snapshot.originals.atlas.seed, 0xdead_beef);
         assert_eq!(snapshot.originals.garden.gate, "audio_onset");
+        assert_eq!(
+            snapshot.originals.garden.matte_route,
+            RefreshGardenMatteRouteSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                saved_position: saved_position.get(),
+                stage: LayerImageStage::PreLocalEffects,
+            }
+        );
+        assert_eq!(
+            snapshot.originals.garden.motion_route,
+            RefreshGardenMotionRouteSnapshot::MissingSelectedLayer {
+                saved_position: saved_position.get(),
+            }
+        );
         assert_eq!(snapshot.originals.score.trigger, "manual");
         assert_eq!(snapshot.originals.reset.loop_boundary, "memory");
         assert_eq!(
@@ -4897,6 +5098,18 @@ mod protocol_tests {
             "selected_layer"
         );
         assert_eq!(value["originals"]["score"]["loop_driver"]["layer_id"], "91");
+        assert_eq!(
+            value["originals"]["garden"]["matte_route"]["kind"],
+            "selected_layer"
+        );
+        assert_eq!(
+            value["originals"]["garden"]["matte_route"]["stage"],
+            "pre_local_effects"
+        );
+        assert_eq!(
+            value["originals"]["garden"]["motion_route"]["kind"],
+            "missing_selected_layer"
+        );
     }
 
     #[test]
@@ -4913,7 +5126,6 @@ mod protocol_tests {
         assert_eq!(defaults.transplant, FaradayMotionSnapshot::default());
         assert_eq!(defaults.shutter, CurvedShutterSnapshot::default());
         assert_eq!(defaults.telemetry, MotionTelemetrySnapshot::default());
-
         let layer_id = crate::image_routing::StableLayerId::new(91).unwrap();
         let saved_position = SavedLayerPosition::new(3).unwrap();
         let snapshot = MotionSnapshot::from_params(MotionParams {
@@ -4970,12 +5182,22 @@ mod protocol_tests {
             serde_json::from_str(r#"{"action":"clear_temporal_memory"}"#).unwrap();
         let trigger: WebAction =
             serde_json::from_str(r#"{"action":"trigger_collision_score"}"#).unwrap();
+        let refresh: WebAction =
+            serde_json::from_str(r#"{"action":"trigger_refresh_garden"}"#).unwrap();
+        let clear_track: WebAction =
+            serde_json::from_str(r#"{"action":"clear_temporal_event_track"}"#).unwrap();
         assert!(matches!(clear, WebAction::ClearTemporalMemory));
         assert!(matches!(trigger, WebAction::TriggerCollisionScore));
+        assert!(matches!(refresh, WebAction::TriggerRefreshGarden));
+        assert!(matches!(clear_track, WebAction::ClearTemporalEventTrack));
         assert!(clear.is_priority());
         assert!(trigger.is_priority());
+        assert!(refresh.is_priority());
+        assert!(clear_track.is_priority());
         assert!(clear.coalesce_key().is_none());
         assert!(trigger.coalesce_key().is_none());
+        assert!(refresh.coalesce_key().is_none());
+        assert!(clear_track.coalesce_key().is_none());
 
         let edit = |value| WebAction::SetTemporal {
             param: "loom_amount".into(),
@@ -4992,7 +5214,12 @@ mod protocol_tests {
             EnqueueOutcome::Added
         );
         assert_eq!(enqueue_bounded(&mut queue, trigger), EnqueueOutcome::Added);
-        assert_eq!(queue.len(), 4);
+        assert_eq!(enqueue_bounded(&mut queue, refresh), EnqueueOutcome::Added);
+        assert_eq!(
+            enqueue_bounded(&mut queue, clear_track),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(queue.len(), 6);
         assert!(
             matches!(&queue[0], WebAction::SetTemporal { value, .. } if value == &serde_json::json!(0.2))
         );
@@ -5001,6 +5228,8 @@ mod protocol_tests {
             matches!(&queue[2], WebAction::SetTemporal { value, .. } if value == &serde_json::json!(0.8))
         );
         assert!(matches!(queue[3], WebAction::TriggerCollisionScore));
+        assert!(matches!(queue[4], WebAction::TriggerRefreshGarden));
+        assert!(matches!(queue[5], WebAction::ClearTemporalEventTrack));
     }
 
     #[test]
@@ -5088,9 +5317,15 @@ mod protocol_tests {
             r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"audio_layer":2,"audio_layer_id":"layer-abc"}"#,
         )
         .unwrap();
-        assert!(
-            matches!(export, WebAction::StartExport { audio_layer_id: Some(id), ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity, .. } if id == "layer-abc")
-        );
+        assert!(matches!(
+            export,
+            WebAction::StartExport {
+                audio_layer_id: Some(id),
+                ntsc_quality: crate::ntsc::NtscExportQuality::LiveParity,
+                shutter_samples: crate::render_export::ExportShutterSamples::Authored,
+                ..
+            } if id == "layer-abc"
+        ));
 
         let native: WebAction = serde_json::from_str(
             r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"ntsc_quality":"native"}"#,
@@ -5107,6 +5342,21 @@ mod protocol_tests {
         ));
         assert!(serde_json::from_str::<WebAction>(
             r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"ntsc_quality":"unknown"}"#
+        )
+        .is_err());
+        let exact_shutter: WebAction = serde_json::from_str(
+            r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"shutter_samples":"samples_16"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            exact_shutter,
+            WebAction::StartExport {
+                shutter_samples: crate::render_export::ExportShutterSamples::Samples16,
+                ..
+            }
+        ));
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"start_export","width":1280,"height":720,"fps":30,"duration_secs":1,"shutter_samples":"samples_2"}"#
         )
         .is_err());
     }
@@ -5449,20 +5699,41 @@ mod protocol_tests {
     }
 
     #[test]
-    fn export_panel_exposes_safe_ntsc_quality_choices() {
+    fn export_panel_exposes_safe_ntsc_and_exact_shutter_choices() {
         let html = include_str!("../../static/index.html");
         let js = include_str!("../../static/app.js");
         assert!(html.contains("id=\"export-ntsc-quality\""));
         assert!(html.contains("value=\"live_parity\" selected"));
         assert!(html.contains("value=\"native\""));
+        assert!(html.contains("id=\"export-shutter-samples\""));
+        for value in [
+            "authored",
+            "samples_1",
+            "samples_4",
+            "samples_8",
+            "samples_16",
+        ] {
+            assert!(html.contains(&format!("value=\"{value}\"")));
+        }
         assert!(html.contains("id=\"export-warnings\""));
         assert!(html.contains("id=\"export-warnings-list\""));
         assert!(js.contains("['live_parity', 'native'].includes(requestedNtscQuality)"));
         assert!(js.contains("ntsc_quality: ntscQuality"));
+        assert!(js.contains("requestedShutterSamples"));
+        assert!(js.contains(
+            "['authored', 'samples_1', 'samples_4', 'samples_8', 'samples_16'].includes(requestedShutterSamples)"
+        ));
+        assert!(js.contains("shutter_samples: shutterSamples"));
         assert!(js.contains("msg.export_warnings"));
         assert!(js.contains("function syncExportWarnings(warnings = [])"));
         assert!(js.contains("item.textContent = message"));
         assert!(js.contains("if (warningsKey === exportWarningsKey) return"));
+        assert!(js.contains(
+            "scope.field_attached && scope.rendered_source_origin === 'lattice_fallback'"
+        ));
+        assert!(js.contains("scope.field_planned && !scope.field_attached"));
+        assert!(js.contains("rendered fallback"));
+        assert!(js.contains("unattached"));
     }
 
     #[test]
@@ -5832,6 +6103,48 @@ mod protocol_tests {
     }
 
     #[test]
+    fn refresh_garden_browser_controls_publish_stable_ordered_routes_and_diagnostics() {
+        let js = include_str!("../../static/app.js");
+        let html = include_str!("../../static/index.html");
+        for contract in [
+            "value=\"motion\">Motion</option>",
+            "id=\"temporal-garden-matte-route\"",
+            "id=\"temporal-garden-matte-stage\"",
+            "id=\"temporal-garden-motion-route\"",
+            "id=\"temporal-garden-route-status\" role=\"status\" aria-live=\"polite\"",
+        ] {
+            assert!(
+                html.contains(contract),
+                "missing Garden HTML contract: {contract}"
+            );
+        }
+        for contract in [
+            "function syncRefreshGardenRoutes(garden)",
+            "garden?.matte_route || { kind: 'none' }",
+            "garden?.motion_route || { kind: 'none' }",
+            "action: 'set_refresh_garden_matte_route'",
+            "action: 'set_refresh_garden_motion_route'",
+            "layer_stack_revision: layerStackRevision",
+            "Missing saved layer ${position}",
+            "gate zero",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing Garden JS contract: {contract}"
+            );
+        }
+        let quantizable = js
+            .split_once("const QUANTIZABLE_ACTIONS")
+            .unwrap()
+            .1
+            .split_once("]);")
+            .unwrap()
+            .0;
+        assert!(!quantizable.contains("set_refresh_garden_matte_route"));
+        assert!(!quantizable.contains("set_refresh_garden_motion_route"));
+    }
+
+    #[test]
     fn every_range_control_has_a_complete_editable_numeric_contract() {
         fn assert_range_tags_are_bounded(source: &str, allow_row_metadata: bool) -> usize {
             let marker = "<input type=\"range\"";
@@ -5972,6 +6285,8 @@ mod protocol_tests {
             "id=\"temporal-score-loop-driver\" aria-label=\"Collision Score loop driver\"",
             "id=\"temporal-clear-memory\"",
             "id=\"temporal-score-trigger\"",
+            "id=\"temporal-garden-trigger\"",
+            "id=\"temporal-clear-event-track\"",
             "id=\"temporal-telemetry\" role=\"status\" aria-live=\"polite\"",
         ] {
             assert!(html.contains(contract), "missing temporal HTML: {contract}");
@@ -5980,6 +6295,8 @@ mod protocol_tests {
             "sendAction({ action: 'set_temporal', param, value",
             "sendAction({ action: 'clear_temporal_memory' })",
             "sendAction({ action: 'trigger_collision_score' })",
+            "sendAction({ action: 'trigger_refresh_garden' })",
+            "sendAction({ action: 'clear_temporal_event_track' })",
             "syncTemporalLoopDriver(score.loop_driver)",
             "const telemetry = t.telemetry || {}",
             "telemetry.freeze_hold_valid",
@@ -6004,7 +6321,7 @@ mod protocol_tests {
             "data-motion-param=\"shutter_angle\" data-min=\"0\" data-max=\"360\"",
             "id=\"motion-clear-memory\"",
             "id=\"master-motion-telemetry\" role=\"status\" aria-live=\"polite\"",
-            "v1 · field idle · 0 vectors · carrier empty",
+            "v1 · planned idle · 0 vectors · no field planned · carrier empty",
         ] {
             assert!(html.contains(contract), "missing Motion HTML: {contract}");
         }
@@ -6019,6 +6336,9 @@ mod protocol_tests {
             "function syncLayerMotion(card, layer)",
             "donor.kind === 'missing'",
             "motion.telemetry?.diagnostic",
+            "telemetry.field_attached ? ` · rendered ${rendered}`",
+            "' · field priming/unavailable'",
+            "' · no field planned'",
             "motion_shutter_angle",
             "motion_transplant_amount",
         ] {
@@ -7229,6 +7549,7 @@ mod protocol_tests {
         for barrier in [
             r#"{"action":"activate_clip_slot","layer_id":"7","slot_id":3}"#,
             r#"{"action":"seek_clip_slot","layer_id":"7","slot_id":3,"position":0.5}"#,
+            r#"{"action":"seek_clip_slot_timecode","layer_id":"7","slot_id":3,"timecode":{"hours":0,"minutes":1,"seconds":0,"frames":2,"rate":"ntsc30_drop"}}"#,
             r#"{"action":"trigger_clip_cue","layer_id":"7","slot_id":3,"cue_id":12}"#,
             r#"{"action":"prepare_scene","scene_id":4}"#,
             r#"{"action":"capture_scene","name":"Opening study","trigger_mode":"next_bar"}"#,
@@ -7276,6 +7597,20 @@ mod protocol_tests {
             scratches.as_slice(),
             [WebAction::SeekClipSlot { layer_id, slot_id, position }]
                 if layer_id == "7" && slot_id.get() == 3 && position.get() == 0.7
+        ));
+        let timecode_seek: WebAction = serde_json::from_str(
+            r#"{"action":"seek_clip_slot_timecode","layer_id":"7","slot_id":3,"timecode":{"hours":0,"minutes":0,"seconds":2,"frames":12,"rate":"fps24"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            enqueue_bounded(&mut scratches, timecode_seek),
+            EnqueueOutcome::Coalesced,
+            "adjacent normalized and timecode scratches share one newest-only slot"
+        );
+        assert!(matches!(
+            scratches.as_slice(),
+            [WebAction::SeekClipSlotTimecode { layer_id, slot_id, .. }]
+                if layer_id == "7" && slot_id.get() == 3
         ));
         enqueue_bounded(
             &mut scratches,
@@ -7419,6 +7754,8 @@ mod protocol_tests {
         }
         assert!(js.contains("clipSeek.addEventListener('input', sendSeek)"));
         assert!(js.contains("clipSeek.addEventListener('change', sendSeek)"));
+        assert!(js.contains("class=\"clip-timecode-hours\""));
+        assert!(js.contains("class=\"clip-timecode-rate\""));
         for action in [
             "action: 'load_clip_into_slot'",
             "action: 'activate_clip_slot'",
@@ -7426,6 +7763,7 @@ mod protocol_tests {
             "action: 'set_clip_cue'",
             "action: 'trigger_clip_cue'",
             "action: 'seek_clip_slot'",
+            "action: 'seek_clip_slot_timecode'",
             "action: 'prepare_scene'",
             "action: 'capture_scene'",
             "action: 'remove_scene'",
@@ -7764,10 +8102,16 @@ mod protocol_tests {
                 requested_source: crate::motion::MotionFieldSource::Auto,
                 lattice_quality: crate::motion::MotionLatticeQuality::Live,
                 source_origin: crate::motion::MotionFieldOrigin::LatticeFallback,
+                rendered_source_origin: crate::motion::MotionFieldOrigin::LatticeFallback,
+                field_planned: true,
+                field_attached: true,
                 source_diagnostic: crate::motion::MotionSourceDiagnostic::CodecUnavailableFallback,
-                codec_provenance: Some(crate::video::CodecMotionProvenance::FfmpegExportMvs),
-                source_generation: Some(4),
-                frame_ordinal: Some(8),
+                codec_provenance: None,
+                source_generation: None,
+                frame_ordinal: None,
+                codec_product_sha256: None,
+                codec_transition_count: None,
+                codec_elapsed_seconds: None,
                 donor_saved_position: Some(1),
                 donor_stable_id: Some(7),
                 carrier: crate::motion::MotionCarrier::Transparent,
@@ -7782,12 +8126,84 @@ mod protocol_tests {
         let snapshot = ExportMotionSnapshot::from_export(&metadata, &["fallback".into()]);
         assert_eq!(snapshot.accepted_frame, Some(12));
         assert_eq!(snapshot.scopes[0].source_origin, "lattice_fallback");
+        assert_eq!(
+            snapshot.scopes[0].rendered_source_origin,
+            "lattice_fallback"
+        );
+        assert!(snapshot.scopes[0].field_attached);
         assert_eq!(snapshot.scopes[0].stable_id, "9");
+        assert_eq!(snapshot.scopes[0].codec_transition_count, None);
+        assert_eq!(snapshot.scopes[0].codec_elapsed_seconds, None);
         assert!(snapshot.scopes_truncated);
         assert!(!snapshot.cross_gpu_pixel_identity_guaranteed);
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("vectors"));
         assert!(!json.contains("pixels"));
+    }
+
+    #[test]
+    fn export_motion_snapshot_omits_codec_provenance_when_explicit_codec_is_unattached() {
+        let metadata = crate::render_export::ExportMotionMetadata {
+            accepted_frame: Some(31),
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: vec![crate::render_export::ExportMotionScopeMetadata {
+                scope: crate::render_export::ExportMotionScopeIdentity::Layer {
+                    saved_position: 0,
+                    stable_id: 41,
+                    source_tap_id: 73,
+                },
+                algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+                requested_source: crate::motion::MotionFieldSource::CodecVectors,
+                lattice_quality: crate::motion::MotionLatticeQuality::Live,
+                source_origin: crate::motion::MotionFieldOrigin::None,
+                rendered_source_origin: crate::motion::MotionFieldOrigin::None,
+                field_planned: true,
+                field_attached: false,
+                source_diagnostic: crate::motion::MotionSourceDiagnostic::CodecUnavailable,
+                codec_provenance: None,
+                source_generation: None,
+                frame_ordinal: None,
+                codec_product_sha256: None,
+                codec_transition_count: None,
+                codec_elapsed_seconds: None,
+                donor_saved_position: None,
+                donor_stable_id: None,
+                carrier: crate::motion::MotionCarrier::Transparent,
+                transplant_admitted: false,
+                shutter_active: true,
+                shutter_angle_degrees: 180.0,
+                shutter_quality: crate::motion::CurvedShutterQuality::Live,
+                shutter_sample_count: crate::motion::CurvedShutterQuality::Live.sample_count(),
+            }],
+            scopes_truncated: false,
+        };
+        let snapshot = ExportMotionSnapshot::from_export(&metadata, &[]);
+        let scope = &snapshot.scopes[0];
+        assert_eq!(scope.requested_source, "codec_vectors");
+        assert_eq!(scope.source_origin, "none");
+        assert_eq!(scope.rendered_source_origin, "none");
+        assert!(scope.field_planned);
+        assert!(!scope.field_attached);
+        assert!(scope.codec_provenance.is_empty());
+        assert!(scope.codec_product_sha256.is_empty());
+        assert_eq!(scope.source_generation, None);
+        assert_eq!(scope.frame_ordinal, None);
+
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let scope_json = &json["scopes"][0];
+        for absent in [
+            "codec_provenance",
+            "source_generation",
+            "frame_ordinal",
+            "codec_product_sha256",
+            "codec_transition_count",
+            "codec_elapsed_seconds",
+        ] {
+            assert!(
+                scope_json.get(absent).is_none(),
+                "unattached explicit-codec snapshot serialized {absent}: {scope_json}"
+            );
+        }
     }
 
     #[test]
