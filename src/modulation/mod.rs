@@ -13,13 +13,30 @@
 //! produces a value in [-1, 1], a routing scales it into a parameter range.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 use crate::audio::{AudioBandConfig, AudioLevels, MAX_AUDIO_BANDS};
+use crate::composition::RuntimeComposition;
 use crate::effects::params::TemporalParams;
 use crate::effects::EffectUniforms;
+use crate::image_routing::StableLayerId;
+use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
+use crate::performance::SavedLayerPosition;
+use crate::spatial::{
+    SpatialTransform, ANCHOR_MAX, ANCHOR_MIN, CROP_MAX, POSITION_MAX, POSITION_MIN, SCALE_MAX,
+    SCALE_MIN, SKEW_LIMIT_DEGREES,
+};
+use crate::visual_rack::{
+    GroupId, NodeId, NodeKindTag, NodeParamType, RuntimeMaskParams, RuntimeVisualNode,
+    RuntimeVisualNodeKind, RuntimeVisualRack, NODE_PARAM_DESCRIPTORS,
+};
 
 pub const NUM_LFOS: usize = 4;
 pub const MAX_ROUTINGS: usize = 64;
@@ -89,6 +106,42 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("temporal_key_threshold", 0.0, 1.0),
     ("temporal_key_softness", 0.0, 0.5),
     ("temporal_key_history", 1.0, 23.0),
+    // M3 originals expose only continuous bounded values. Topology/gate,
+    // seeds, fold/count controls, and Collision Score configuration remain
+    // discrete authored endpoint state.
+    ("temporal_loom_amount", 0.0, 1.0),
+    ("temporal_loom_depth", 0.0, 1.0),
+    ("temporal_loom_phase", -1_000.0, 1_000.0),
+    ("temporal_loom_scale", 0.01, 100.0),
+    ("temporal_loom_angle", -180.0, 180.0),
+    ("temporal_atlas_amount", 0.0, 1.0),
+    ("temporal_atlas_collision", 0.0, 1.0),
+    ("temporal_garden_amount", 0.0, 1.0),
+    ("temporal_garden_threshold", 0.0, 1.0),
+    ("temporal_garden_softness", 0.0, 0.5),
+    ("temporal_garden_decay", 0.0, 1.0),
+    // Program-wide spatial controls. Continuous geometry is modulatable;
+    // discrete fit/edge/sampling choices remain explicitly authored.
+    ("position_x", POSITION_MIN, POSITION_MAX),
+    ("position_y", POSITION_MIN, POSITION_MAX),
+    ("scale_x", SCALE_MIN, SCALE_MAX),
+    ("scale_y", SCALE_MIN, SCALE_MAX),
+    ("anchor_x", ANCHOR_MIN, ANCHOR_MAX),
+    ("anchor_y", ANCHOR_MIN, ANCHOR_MAX),
+    ("rotation_deg", -180.0, 180.0),
+    ("skew_deg", -SKEW_LIMIT_DEGREES, SKEW_LIMIT_DEGREES),
+    ("skew_axis_deg", -180.0, 180.0),
+    ("crop_left", 0.0, CROP_MAX),
+    ("crop_top", 0.0, CROP_MAX),
+    ("crop_right", 0.0, CROP_MAX),
+    ("crop_bottom", 0.0, CROP_MAX),
+    // Master Motion exposes only Curved Shutter's continuous authored
+    // controls. Faraday is a layer-recipient law; source, quality, carrier,
+    // donor identity, and algorithm provenance remain discrete authored state.
+    ("motion_shutter_angle", 0.0, 360.0),
+    ("motion_shutter_phase", -1.0, 1.0),
+    ("motion_shutter_curvature", -2.0, 2.0),
+    ("motion_shutter_chromatic_lag", 0.0, 1.0),
     // The patch-morph crossfader; applied by the app, not apply_offset.
     ("morph", 0.0, 1.0),
 ];
@@ -115,6 +168,1257 @@ pub fn canonical_target(target: &str) -> Cow<'_, str> {
     Cow::Owned(format!("layer{layer}_key_threshold"))
 }
 
+/// Component selected from a vector/color descriptor. It is encoded in the
+/// compact address rather than retained as an unbounded string at frame rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StableModComponent {
+    Scalar,
+    X,
+    Y,
+    Red,
+    Green,
+    Blue,
+}
+
+/// One validated modulatable parameter in the authoritative rack registry.
+/// Descriptor indices are compact process-local addresses; patch and web
+/// persistence always use the descriptor key rendered by [`fmt::Display`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StableNodeParameter {
+    Wet,
+    Descriptor {
+        descriptor_index: u16,
+        component: StableModComponent,
+    },
+}
+
+impl StableNodeParameter {
+    fn parse(value: &str) -> Option<Self> {
+        if value == "wet" {
+            return Some(Self::Wet);
+        }
+        let (key, suffix) = value
+            .rsplit_once('.')
+            .map_or((value, None), |(key, suffix)| (key, Some(suffix)));
+        let (index, descriptor) = NODE_PARAM_DESCRIPTORS
+            .iter()
+            .enumerate()
+            .find(|(_, descriptor)| descriptor.key == key && descriptor.modulatable)?;
+        let component = match (descriptor.value_type, suffix) {
+            (NodeParamType::Float, None) => StableModComponent::Scalar,
+            (NodeParamType::Vec2, Some("x")) => StableModComponent::X,
+            (NodeParamType::Vec2, Some("y")) => StableModComponent::Y,
+            (NodeParamType::Color, Some("r")) => StableModComponent::Red,
+            (NodeParamType::Color, Some("g")) => StableModComponent::Green,
+            (NodeParamType::Color, Some("b")) => StableModComponent::Blue,
+            _ => return None,
+        };
+        Some(Self::Descriptor {
+            descriptor_index: u16::try_from(index).ok()?,
+            component,
+        })
+    }
+
+    fn descriptor(self) -> Option<&'static crate::visual_rack::NodeParamDescriptor> {
+        match self {
+            Self::Wet => None,
+            Self::Descriptor {
+                descriptor_index, ..
+            } => NODE_PARAM_DESCRIPTORS.get(usize::from(descriptor_index)),
+        }
+    }
+
+    pub fn range(self) -> [f32; 2] {
+        match self {
+            Self::Wet => [0.0, 1.0],
+            Self::Descriptor { .. } => self
+                .descriptor()
+                .and_then(|descriptor| descriptor.range)
+                .unwrap_or([0.0, 1.0]),
+        }
+    }
+
+    fn is_valid_for_kind(self, kind: NodeKindTag) -> bool {
+        match self {
+            Self::Wet => !matches!(
+                kind,
+                NodeKindTag::LegacyCanonical | NodeKindTag::LegacyTemporal
+            ),
+            Self::Descriptor { .. } => self
+                .descriptor()
+                .is_some_and(|descriptor| descriptor.kind == kind && descriptor.modulatable),
+        }
+    }
+
+    /// Parameters are serialized by descriptor key, while the compact typed
+    /// representation retains the registry index needed for direct mutation.
+    /// Several node kinds intentionally share keys such as `amount` and
+    /// `speed`; compare their wire identity when resolving against a rack,
+    /// then canonicalize to that rack's concrete descriptor index.
+    fn same_wire_parameter(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Wet, Self::Wet) => true,
+            (
+                Self::Descriptor {
+                    descriptor_index: left,
+                    component: left_component,
+                },
+                Self::Descriptor {
+                    descriptor_index: right,
+                    component: right_component,
+                },
+            ) => {
+                left_component == right_component
+                    && NODE_PARAM_DESCRIPTORS
+                        .get(usize::from(left))
+                        .zip(NODE_PARAM_DESCRIPTORS.get(usize::from(right)))
+                        .is_some_and(|(left, right)| left.key == right.key)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for StableNodeParameter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Wet => formatter.write_str("wet"),
+            Self::Descriptor {
+                descriptor_index,
+                component,
+            } => {
+                let descriptor = NODE_PARAM_DESCRIPTORS
+                    .get(usize::from(descriptor_index))
+                    .ok_or(fmt::Error)?;
+                formatter.write_str(descriptor.key)?;
+                match component {
+                    StableModComponent::Scalar => Ok(()),
+                    StableModComponent::X => formatter.write_str(".x"),
+                    StableModComponent::Y => formatter.write_str(".y"),
+                    StableModComponent::Red => formatter.write_str(".r"),
+                    StableModComponent::Green => formatter.write_str(".g"),
+                    StableModComponent::Blue => formatter.write_str(".b"),
+                }
+            }
+        }
+    }
+}
+
+impl Serialize for StableNodeParameter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for StableNodeParameter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| de::Error::custom("invalid modulatable node parameter"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StableModScope {
+    Master,
+    Layer(StableLayerId),
+    Group(GroupId),
+}
+
+/// Direct group values which are not owned by a node in the group's rack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GroupModParameter {
+    Opacity,
+    PositionX,
+    PositionY,
+    ScaleX,
+    ScaleY,
+    AnchorX,
+    AnchorY,
+    RotationDeg,
+    SkewDeg,
+    SkewAxisDeg,
+    CropLeft,
+    CropTop,
+    CropRight,
+    CropBottom,
+    MatteAmount,
+    MatteThreshold,
+    MatteSoftness,
+}
+
+impl GroupModParameter {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "opacity" => Self::Opacity,
+            "position.x" => Self::PositionX,
+            "position.y" => Self::PositionY,
+            "scale.x" => Self::ScaleX,
+            "scale.y" => Self::ScaleY,
+            "anchor.x" => Self::AnchorX,
+            "anchor.y" => Self::AnchorY,
+            "rotation_deg" => Self::RotationDeg,
+            "skew_deg" => Self::SkewDeg,
+            "skew_axis_deg" => Self::SkewAxisDeg,
+            "crop_left" => Self::CropLeft,
+            "crop_top" => Self::CropTop,
+            "crop_right" => Self::CropRight,
+            "crop_bottom" => Self::CropBottom,
+            "matte.amount" => Self::MatteAmount,
+            "matte.threshold" => Self::MatteThreshold,
+            "matte.softness" => Self::MatteSoftness,
+            _ => return None,
+        })
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Opacity => "opacity",
+            Self::PositionX => "position.x",
+            Self::PositionY => "position.y",
+            Self::ScaleX => "scale.x",
+            Self::ScaleY => "scale.y",
+            Self::AnchorX => "anchor.x",
+            Self::AnchorY => "anchor.y",
+            Self::RotationDeg => "rotation_deg",
+            Self::SkewDeg => "skew_deg",
+            Self::SkewAxisDeg => "skew_axis_deg",
+            Self::CropLeft => "crop_left",
+            Self::CropTop => "crop_top",
+            Self::CropRight => "crop_right",
+            Self::CropBottom => "crop_bottom",
+            Self::MatteAmount => "matte.amount",
+            Self::MatteThreshold => "matte.threshold",
+            Self::MatteSoftness => "matte.softness",
+        }
+    }
+
+    pub const fn range(self) -> [f32; 2] {
+        match self {
+            Self::Opacity => [0.0, 1.0],
+            Self::PositionX | Self::PositionY => [POSITION_MIN, POSITION_MAX],
+            Self::ScaleX | Self::ScaleY => [SCALE_MIN, SCALE_MAX],
+            Self::AnchorX | Self::AnchorY => [ANCHOR_MIN, ANCHOR_MAX],
+            Self::RotationDeg | Self::SkewAxisDeg => [-180.0, 180.0],
+            Self::SkewDeg => [-SKEW_LIMIT_DEGREES, SKEW_LIMIT_DEGREES],
+            Self::CropLeft | Self::CropTop | Self::CropRight | Self::CropBottom => [0.0, CROP_MAX],
+            Self::MatteAmount | Self::MatteThreshold => [0.0, 1.0],
+            Self::MatteSoftness => [0.0, 0.5],
+        }
+    }
+}
+
+/// Composition-wide continuous values which are not owned by a group or rack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompositionModParameter {
+    BusCrossfade,
+}
+
+impl CompositionModParameter {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "bus_crossfade" => Some(Self::BusCrossfade),
+            _ => None,
+        }
+    }
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::BusCrossfade => "bus_crossfade",
+        }
+    }
+
+    pub const fn range(self) -> [f32; 2] {
+        match self {
+            Self::BusCrossfade => [0.0, 1.0],
+        }
+    }
+}
+
+impl Serialize for CompositionModParameter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.key())
+    }
+}
+
+impl<'de> Deserialize<'de> for CompositionModParameter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value)
+            .ok_or_else(|| de::Error::custom("invalid modulatable composition parameter"))
+    }
+}
+
+impl Serialize for GroupModParameter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.key())
+    }
+}
+
+impl<'de> Deserialize<'de> for GroupModParameter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| de::Error::custom("invalid modulatable group parameter"))
+    }
+}
+
+/// Saved scope uses a bounded layer position and therefore never persists a
+/// process-local [`StableLayerId`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum SavedStableModScope {
+    Master,
+    SavedLayer { position: SavedLayerPosition },
+    Group { group_id: GroupId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum SavedMissingTarget {
+    Node {
+        node_id: NodeId,
+        parameter: StableNodeParameter,
+    },
+    GroupValue {
+        parameter: GroupModParameter,
+    },
+}
+
+/// Stable modulation target persisted in a patch. Explicit missing variants
+/// preserve authored intent after deletion/failed mapping and can never
+/// retarget a newly inserted layer, group, or node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SavedStableModTarget {
+    Node {
+        scope: SavedStableModScope,
+        node_id: NodeId,
+        parameter: StableNodeParameter,
+    },
+    GroupValue {
+        group_id: GroupId,
+        parameter: GroupModParameter,
+    },
+    CompositionValue {
+        parameter: CompositionModParameter,
+    },
+    MissingSavedLayer {
+        saved_position: SavedLayerPosition,
+        node_id: NodeId,
+        parameter: StableNodeParameter,
+    },
+    MissingGroup {
+        group_id: GroupId,
+        missing_target: SavedMissingTarget,
+    },
+    MissingNode {
+        scope: SavedStableModScope,
+        node_id: NodeId,
+        parameter: StableNodeParameter,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedStableModTarget {
+    Live(StableModTarget),
+    Missing(SavedStableModTarget),
+}
+
+/// Typed form of the stable web/persistence grammar. IDs are numeric domain
+/// values here and decimal strings only at the browser boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StableModTarget {
+    Node {
+        scope: StableModScope,
+        node_id: NodeId,
+        parameter: StableNodeParameter,
+    },
+    GroupValue {
+        group_id: GroupId,
+        parameter: GroupModParameter,
+    },
+    CompositionValue {
+        parameter: CompositionModParameter,
+    },
+}
+
+impl StableModTarget {
+    pub fn parse(value: &str) -> Option<Self> {
+        let parts = value.split('/').collect::<Vec<_>>();
+        match parts.as_slice() {
+            ["node", "master", node, parameter] => Some(Self::Node {
+                scope: StableModScope::Master,
+                node_id: parse_node_id(node)?,
+                parameter: StableNodeParameter::parse(parameter)?,
+            }),
+            ["node", "layer", layer_id, node, parameter] => Some(Self::Node {
+                scope: StableModScope::Layer(parse_stable_layer_id(layer_id)?),
+                node_id: parse_node_id(node)?,
+                parameter: StableNodeParameter::parse(parameter)?,
+            }),
+            ["node", "group", group, node, parameter] => Some(Self::Node {
+                scope: StableModScope::Group(parse_group_id(group)?),
+                node_id: parse_node_id(node)?,
+                parameter: StableNodeParameter::parse(parameter)?,
+            }),
+            ["group", group, parameter] => Some(Self::GroupValue {
+                group_id: parse_group_id(group)?,
+                parameter: GroupModParameter::parse(parameter)?,
+            }),
+            ["composition", parameter] => Some(Self::CompositionValue {
+                parameter: CompositionModParameter::parse(parameter)?,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn range(self) -> [f32; 2] {
+        match self {
+            Self::Node { parameter, .. } => parameter.range(),
+            Self::GroupValue { parameter, .. } => parameter.range(),
+            Self::CompositionValue { parameter } => parameter.range(),
+        }
+    }
+}
+
+impl fmt::Display for StableModTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Node {
+                scope: StableModScope::Master,
+                node_id,
+                parameter,
+            } => write!(
+                formatter,
+                "node/master/{node_id}/{parameter}",
+                node_id = node_id.get()
+            ),
+            Self::Node {
+                scope: StableModScope::Layer(layer_id),
+                node_id,
+                parameter,
+            } => write!(
+                formatter,
+                "node/layer/{}/{}/{parameter}",
+                layer_id.get(),
+                node_id.get()
+            ),
+            Self::Node {
+                scope: StableModScope::Group(group_id),
+                node_id,
+                parameter,
+            } => write!(
+                formatter,
+                "node/group/{}/{}/{parameter}",
+                group_id.get(),
+                node_id.get()
+            ),
+            Self::GroupValue {
+                group_id,
+                parameter,
+            } => write!(formatter, "group/{}/{}", group_id.get(), parameter.key()),
+            Self::CompositionValue { parameter } => {
+                write!(formatter, "composition/{}", parameter.key())
+            }
+        }
+    }
+}
+
+fn decimal_u64(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+fn parse_node_id(value: &str) -> Option<NodeId> {
+    NodeId::new(decimal_u64(value)?)
+}
+
+fn parse_group_id(value: &str) -> Option<GroupId> {
+    GroupId::new(decimal_u64(value)?)
+}
+
+fn parse_stable_layer_id(value: &str) -> Option<StableLayerId> {
+    StableLayerId::new(decimal_u64(value)?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StableModAddress(u16);
+
+impl StableModAddress {
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Dense lookup rebuilt only when creative topology changes. Missing stable
+/// targets never allocate sparse ID-sized arrays and simply resolve to None.
+#[derive(Debug, Clone, Default)]
+pub struct StableModAddressBook {
+    addresses: BTreeMap<StableModTarget, StableModAddress>,
+    targets: Vec<StableModTarget>,
+}
+
+impl StableModAddressBook {
+    pub fn from_composition(
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[(StableLayerId, RuntimeVisualRack)],
+        composition: &RuntimeComposition,
+    ) -> Result<Self, String> {
+        let mut book = Self::default();
+        book.add_rack(StableModScope::Master, master_rack)?;
+        for (layer_id, rack) in layer_racks {
+            book.add_rack(StableModScope::Layer(*layer_id), rack)?;
+        }
+        book.insert(StableModTarget::CompositionValue {
+            parameter: CompositionModParameter::BusCrossfade,
+        })?;
+        for group in composition.groups() {
+            let direct_parameters = [
+                GroupModParameter::Opacity,
+                GroupModParameter::PositionX,
+                GroupModParameter::PositionY,
+                GroupModParameter::ScaleX,
+                GroupModParameter::ScaleY,
+                GroupModParameter::AnchorX,
+                GroupModParameter::AnchorY,
+                GroupModParameter::RotationDeg,
+                GroupModParameter::SkewDeg,
+                GroupModParameter::SkewAxisDeg,
+                GroupModParameter::CropLeft,
+                GroupModParameter::CropTop,
+                GroupModParameter::CropRight,
+                GroupModParameter::CropBottom,
+            ];
+            for parameter in direct_parameters {
+                book.insert(StableModTarget::GroupValue {
+                    group_id: group.id,
+                    parameter,
+                })?;
+            }
+            if group.matte.is_some() {
+                for parameter in [
+                    GroupModParameter::MatteAmount,
+                    GroupModParameter::MatteThreshold,
+                    GroupModParameter::MatteSoftness,
+                ] {
+                    book.insert(StableModTarget::GroupValue {
+                        group_id: group.id,
+                        parameter,
+                    })?;
+                }
+            }
+            book.add_rack(StableModScope::Group(group.id), &group.rack)?;
+        }
+        Ok(book)
+    }
+
+    fn add_rack(&mut self, scope: StableModScope, rack: &RuntimeVisualRack) -> Result<(), String> {
+        for node in rack.iter() {
+            let kind = node.kind.tag();
+            let wet = StableNodeParameter::Wet;
+            if wet.is_valid_for_kind(kind) {
+                self.insert(StableModTarget::Node {
+                    scope,
+                    node_id: node.stable_id,
+                    parameter: wet,
+                })?;
+            }
+            for (index, descriptor) in NODE_PARAM_DESCRIPTORS.iter().enumerate() {
+                if descriptor.kind != kind
+                    || !descriptor.modulatable
+                    || !runtime_node_supports_descriptor(node, descriptor.key)
+                {
+                    continue;
+                }
+                let components: &[StableModComponent] = match descriptor.value_type {
+                    NodeParamType::Float => &[StableModComponent::Scalar],
+                    NodeParamType::Vec2 => &[StableModComponent::X, StableModComponent::Y],
+                    NodeParamType::Color => &[
+                        StableModComponent::Red,
+                        StableModComponent::Green,
+                        StableModComponent::Blue,
+                    ],
+                    _ => continue,
+                };
+                let descriptor_index = u16::try_from(index)
+                    .map_err(|_| "node parameter registry exceeds compact address space")?;
+                for &component in components {
+                    self.insert(StableModTarget::Node {
+                        scope,
+                        node_id: node.stable_id,
+                        parameter: StableNodeParameter::Descriptor {
+                            descriptor_index,
+                            component,
+                        },
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn insert(&mut self, target: StableModTarget) -> Result<(), String> {
+        if self.addresses.contains_key(&target) {
+            return Err(format!("duplicate stable modulation target {target}"));
+        }
+        let index = u16::try_from(self.targets.len())
+            .map_err(|_| "stable modulation address space exceeds 65535 entries")?;
+        let address = StableModAddress(index);
+        self.targets.push(target);
+        self.addresses.insert(target, address);
+        Ok(())
+    }
+
+    pub fn address(&self, target: StableModTarget) -> Option<StableModAddress> {
+        self.addresses.get(&target).copied().or_else(|| {
+            self.targets
+                .iter()
+                .position(|candidate| candidate.same_wire_target(target))
+                .and_then(|index| u16::try_from(index).ok())
+                .map(StableModAddress)
+        })
+    }
+
+    pub fn target(&self, address: StableModAddress) -> Option<StableModTarget> {
+        self.targets.get(address.index()).copied()
+    }
+
+    fn canonical_target(&self, target: StableModTarget) -> Option<StableModTarget> {
+        self.address(target)
+            .and_then(|address| self.target(address))
+    }
+
+    pub fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "stable address-book inspection is exercised by persistence tests"
+        )
+    )]
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+impl StableModTarget {
+    fn same_wire_target(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::Node {
+                    scope: left_scope,
+                    node_id: left_node,
+                    parameter: left_parameter,
+                },
+                Self::Node {
+                    scope: right_scope,
+                    node_id: right_node,
+                    parameter: right_parameter,
+                },
+            ) => {
+                left_scope == right_scope
+                    && left_node == right_node
+                    && left_parameter.same_wire_parameter(right_parameter)
+            }
+            (
+                Self::GroupValue {
+                    group_id: left_group,
+                    parameter: left_parameter,
+                },
+                Self::GroupValue {
+                    group_id: right_group,
+                    parameter: right_parameter,
+                },
+            ) => left_group == right_group && left_parameter == right_parameter,
+            (
+                Self::CompositionValue {
+                    parameter: left_parameter,
+                },
+                Self::CompositionValue {
+                    parameter: right_parameter,
+                },
+            ) => left_parameter == right_parameter,
+            _ => false,
+        }
+    }
+
+    /// Capture a runtime target without ever persisting a process-local layer
+    /// identity. The address book distinguishes a missing node from a valid
+    /// node whose current modulation contribution merely happens to be zero.
+    pub fn capture(
+        self,
+        book: &StableModAddressBook,
+        mut position_of_layer: impl FnMut(StableLayerId) -> Option<SavedLayerPosition>,
+        group_exists: impl Fn(GroupId) -> bool,
+    ) -> Result<SavedStableModTarget, String> {
+        let canonical = book.canonical_target(self);
+        Ok(match self {
+            Self::Node {
+                scope,
+                node_id,
+                parameter,
+            } => {
+                let parameter = match canonical {
+                    Some(Self::Node {
+                        parameter: canonical,
+                        ..
+                    }) => canonical,
+                    _ => parameter,
+                };
+                let saved_scope = match scope {
+                    StableModScope::Master => SavedStableModScope::Master,
+                    StableModScope::Layer(layer_id) => {
+                        let position = position_of_layer(layer_id).ok_or_else(|| {
+                            format!(
+                                "runtime modulation layer {} cannot be captured atomically",
+                                layer_id.get()
+                            )
+                        })?;
+                        SavedStableModScope::SavedLayer { position }
+                    }
+                    StableModScope::Group(group_id) => {
+                        if !group_exists(group_id) {
+                            return Ok(SavedStableModTarget::MissingGroup {
+                                group_id,
+                                missing_target: SavedMissingTarget::Node { node_id, parameter },
+                            });
+                        }
+                        SavedStableModScope::Group { group_id }
+                    }
+                };
+                if book.address(self).is_none() {
+                    SavedStableModTarget::MissingNode {
+                        scope: saved_scope,
+                        node_id,
+                        parameter,
+                    }
+                } else {
+                    SavedStableModTarget::Node {
+                        scope: saved_scope,
+                        node_id,
+                        parameter,
+                    }
+                }
+            }
+            Self::GroupValue {
+                group_id,
+                parameter,
+            } => {
+                if group_exists(group_id) && book.address(self).is_some() {
+                    SavedStableModTarget::GroupValue {
+                        group_id,
+                        parameter,
+                    }
+                } else {
+                    SavedStableModTarget::MissingGroup {
+                        group_id,
+                        missing_target: SavedMissingTarget::GroupValue { parameter },
+                    }
+                }
+            }
+            Self::CompositionValue { parameter } => {
+                SavedStableModTarget::CompositionValue { parameter }
+            }
+        })
+    }
+}
+
+impl SavedStableModTarget {
+    /// Resolve a saved target atomically against current stable identities.
+    /// Every explicit missing form remains missing even if its old numeric
+    /// position/ID has since been reused.
+    pub fn resolve(
+        self,
+        book: &StableModAddressBook,
+        mut layer_at_position: impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+        group_exists: impl Fn(GroupId) -> bool,
+    ) -> ResolvedStableModTarget {
+        match self {
+            Self::MissingSavedLayer { .. }
+            | Self::MissingGroup { .. }
+            | Self::MissingNode { .. } => ResolvedStableModTarget::Missing(self),
+            Self::CompositionValue { parameter } => {
+                let live = StableModTarget::CompositionValue { parameter };
+                if book.address(live).is_some() {
+                    ResolvedStableModTarget::Live(book.canonical_target(live).unwrap_or(live))
+                } else {
+                    // The composition address is an invariant of every current
+                    // address book. Retain the typed value rather than
+                    // inventing an impossible group/node tombstone if a future
+                    // bounded book deliberately omits it.
+                    ResolvedStableModTarget::Missing(self)
+                }
+            }
+            Self::GroupValue {
+                group_id,
+                parameter,
+            } => {
+                let live = StableModTarget::GroupValue {
+                    group_id,
+                    parameter,
+                };
+                if !group_exists(group_id) || book.address(live).is_none() {
+                    ResolvedStableModTarget::Missing(Self::MissingGroup {
+                        group_id,
+                        missing_target: SavedMissingTarget::GroupValue { parameter },
+                    })
+                } else {
+                    ResolvedStableModTarget::Live(book.canonical_target(live).unwrap_or(live))
+                }
+            }
+            Self::Node {
+                scope,
+                node_id,
+                parameter,
+            } => {
+                let live_scope = match scope {
+                    SavedStableModScope::Master => StableModScope::Master,
+                    SavedStableModScope::SavedLayer { position } => {
+                        let Some(layer_id) = layer_at_position(position) else {
+                            return ResolvedStableModTarget::Missing(Self::MissingSavedLayer {
+                                saved_position: position,
+                                node_id,
+                                parameter,
+                            });
+                        };
+                        StableModScope::Layer(layer_id)
+                    }
+                    SavedStableModScope::Group { group_id } => {
+                        if !group_exists(group_id) {
+                            return ResolvedStableModTarget::Missing(Self::MissingGroup {
+                                group_id,
+                                missing_target: SavedMissingTarget::Node { node_id, parameter },
+                            });
+                        }
+                        StableModScope::Group(group_id)
+                    }
+                };
+                let live = StableModTarget::Node {
+                    scope: live_scope,
+                    node_id,
+                    parameter,
+                };
+                if book.address(live).is_none() {
+                    ResolvedStableModTarget::Missing(Self::MissingNode {
+                        scope,
+                        node_id,
+                        parameter,
+                    })
+                } else {
+                    ResolvedStableModTarget::Live(book.canonical_target(live).unwrap_or(live))
+                }
+            }
+        }
+    }
+
+    /// Non-routable diagnostic key retained in runtime Routing when a saved
+    /// target cannot resolve. It is intentionally outside the accepted live
+    /// web grammar and round-trips only through the typed patch field.
+    pub fn persistence_key(self) -> String {
+        match self {
+            Self::Node {
+                scope,
+                node_id,
+                parameter,
+            } => match scope {
+                SavedStableModScope::Master => {
+                    format!("node/master/{}/{parameter}", node_id.get())
+                }
+                SavedStableModScope::SavedLayer { position } => format!(
+                    "node/saved_layer/{}/{}/{parameter}",
+                    position.get(),
+                    node_id.get()
+                ),
+                SavedStableModScope::Group { group_id } => format!(
+                    "node/group/{}/{}/{parameter}",
+                    group_id.get(),
+                    node_id.get()
+                ),
+            },
+            Self::GroupValue {
+                group_id,
+                parameter,
+            } => format!("group/{}/{}", group_id.get(), parameter.key()),
+            Self::CompositionValue { parameter } => {
+                format!("composition/{}", parameter.key())
+            }
+            Self::MissingSavedLayer {
+                saved_position,
+                node_id,
+                parameter,
+            } => format!(
+                "missing/saved_layer/{}/{}/{parameter}",
+                saved_position.get(),
+                node_id.get()
+            ),
+            Self::MissingGroup {
+                group_id,
+                missing_target,
+            } => match missing_target {
+                SavedMissingTarget::Node { node_id, parameter } => format!(
+                    "missing/group/{}/{}/{parameter}",
+                    group_id.get(),
+                    node_id.get()
+                ),
+                SavedMissingTarget::GroupValue { parameter } => {
+                    format!("missing/group/{}/{}", group_id.get(), parameter.key())
+                }
+            },
+            Self::MissingNode {
+                scope,
+                node_id,
+                parameter,
+            } => format!(
+                "missing/node/{}/{}/{parameter}",
+                saved_scope_key(scope),
+                node_id.get()
+            ),
+        }
+    }
+}
+
+fn saved_scope_key(scope: SavedStableModScope) -> String {
+    match scope {
+        SavedStableModScope::Master => "master".to_string(),
+        SavedStableModScope::SavedLayer { position } => {
+            format!("saved_layer/{}", position.get())
+        }
+        SavedStableModScope::Group { group_id } => format!("group/{}", group_id.get()),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StableModulationFrame {
+    offsets: Vec<f32>,
+}
+
+impl StableModulationFrame {
+    /// Full value offset after depth and half-range scaling. Missing addresses
+    /// are inert by construction.
+    pub fn offset(&self, address: StableModAddress) -> f32 {
+        self.offsets.get(address.index()).copied().unwrap_or(0.0)
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "target-oriented lookup is retained for editor and test adapters"
+        )
+    )]
+    pub fn target_offset(&self, book: &StableModAddressBook, target: StableModTarget) -> f32 {
+        book.address(target)
+            .map_or(0.0, |address| self.offset(address))
+    }
+}
+
+fn runtime_node_supports_descriptor(node: &RuntimeVisualNode, key: &str) -> bool {
+    match node.kind {
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(_)) => {
+            key.starts_with("rectangle_")
+        }
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(_)) => key.starts_with("ellipse_"),
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_)) => key.starts_with("image_"),
+        _ => true,
+    }
+}
+
+fn stable_component_slot<'a>(
+    component: StableModComponent,
+    scalar: Option<&'a mut f32>,
+    vector: Option<&'a mut [f32]>,
+) -> Option<&'a mut f32> {
+    match component {
+        StableModComponent::Scalar => scalar,
+        StableModComponent::X | StableModComponent::Red => vector?.get_mut(0),
+        StableModComponent::Y | StableModComponent::Green => vector?.get_mut(1),
+        StableModComponent::Blue => vector?.get_mut(2),
+    }
+}
+
+fn add_stable_offset(slot: &mut f32, offset: f32, range: [f32; 2]) {
+    *slot = (finite_or(*slot, range[0]) + finite_or(offset, 0.0)).clamp(range[0], range[1]);
+}
+
+fn wrap_stable_degrees(value: f32) -> f32 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    let wrapped = (value + 180.0).rem_euclid(360.0) - 180.0;
+    if wrapped == -180.0 && value.is_sign_positive() {
+        180.0
+    } else {
+        wrapped
+    }
+}
+
+fn apply_stable_node_offset(
+    node: &mut RuntimeVisualNode,
+    parameter: StableNodeParameter,
+    offset: f32,
+) {
+    if offset == 0.0 || !parameter.is_valid_for_kind(node.kind.tag()) {
+        return;
+    }
+    if parameter == StableNodeParameter::Wet {
+        add_stable_offset(&mut node.wet, offset, [0.0, 1.0]);
+        return;
+    }
+    let StableNodeParameter::Descriptor {
+        descriptor_index,
+        component,
+    } = parameter
+    else {
+        return;
+    };
+    let Some(descriptor) = NODE_PARAM_DESCRIPTORS.get(usize::from(descriptor_index)) else {
+        return;
+    };
+    if !runtime_node_supports_descriptor(node, descriptor.key) {
+        return;
+    }
+    let Some(range) = descriptor.range else {
+        return;
+    };
+
+    let slot = match &mut node.kind {
+        RuntimeVisualNodeKind::LegacyCanonical | RuntimeVisualNodeKind::LegacyTemporal => None,
+        RuntimeVisualNodeKind::Transform(value) => match descriptor.key {
+            "position" => stable_component_slot(component, None, Some(&mut value.position)),
+            "scale" => stable_component_slot(component, None, Some(&mut value.scale)),
+            "anchor" => stable_component_slot(component, None, Some(&mut value.anchor)),
+            "rotation_deg" => Some(&mut value.rotation_deg),
+            "skew_deg" => Some(&mut value.skew_deg),
+            "skew_axis_deg" => Some(&mut value.skew_axis_deg),
+            "crop_left" => Some(&mut value.crop[0]),
+            "crop_top" => Some(&mut value.crop[1]),
+            "crop_right" => Some(&mut value.crop[2]),
+            "crop_bottom" => Some(&mut value.crop[3]),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::DigitalColor(value) => match descriptor.key {
+            "pixelate_size" => Some(&mut value.pixelate_size),
+            "rgb_split" => Some(&mut value.rgb_split),
+            "downsample" => Some(&mut value.downsample),
+            "hue_shift" => Some(&mut value.hue_shift),
+            "saturation" => Some(&mut value.saturation),
+            "brightness" => Some(&mut value.brightness),
+            "contrast" => Some(&mut value.contrast),
+            "posterize" => Some(&mut value.posterize),
+            "invert" => Some(&mut value.invert),
+            "vignette" => Some(&mut value.vignette),
+            "color_drift" => Some(&mut value.color_drift),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Key(value) => match descriptor.key {
+            "threshold" => Some(&mut value.threshold),
+            "softness" => Some(&mut value.softness),
+            "color" => stable_component_slot(component, None, Some(&mut value.color)),
+            "tolerance" => Some(&mut value.tolerance),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Cellular(value) => match descriptor.key {
+            "amount" => Some(&mut value.amount),
+            "scale" => Some(&mut value.scale),
+            "warp" => Some(&mut value.warp),
+            "speed" => Some(&mut value.speed),
+            "gap_amount" => Some(&mut value.gap_amount),
+            "gap_threshold" => Some(&mut value.gap_threshold),
+            "gap_softness" => Some(&mut value.gap_softness),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Shift(value) => match descriptor.key {
+            "amount" => Some(&mut value.amount),
+            "block_size" => Some(&mut value.block_size),
+            "density" => Some(&mut value.density),
+            "speed" => Some(&mut value.speed),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Grain(value) => match descriptor.key {
+            "intensity" => Some(&mut value.intensity),
+            "size" => Some(&mut value.size),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(value)) => match descriptor.key {
+            "rectangle_center" => stable_component_slot(component, None, Some(&mut value.center)),
+            "rectangle_size" => stable_component_slot(component, None, Some(&mut value.size)),
+            "rectangle_rotation_deg" => Some(&mut value.rotation_deg),
+            "rectangle_feather" => Some(&mut value.feather),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(value)) => match descriptor.key {
+            "ellipse_center" => stable_component_slot(component, None, Some(&mut value.center)),
+            "ellipse_radii" => stable_component_slot(component, None, Some(&mut value.radii)),
+            "ellipse_rotation_deg" => Some(&mut value.rotation_deg),
+            "ellipse_feather" => Some(&mut value.feather),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(value)) => match descriptor.key {
+            "image_amount" => Some(&mut value.amount),
+            "image_threshold" => Some(&mut value.threshold),
+            "image_softness" => Some(&mut value.softness),
+            _ => None,
+        },
+    };
+    if let Some(slot) = slot {
+        if matches!(
+            descriptor.key,
+            "rotation_deg" | "skew_axis_deg" | "rectangle_rotation_deg" | "ellipse_rotation_deg"
+        ) {
+            *slot = wrap_stable_degrees(finite_or(*slot, 0.0) + finite_or(offset, 0.0));
+        } else {
+            add_stable_offset(slot, offset, range);
+        }
+    }
+}
+
+fn apply_stable_rack_modulation(
+    book: &StableModAddressBook,
+    frame: &StableModulationFrame,
+    scope: StableModScope,
+    rack: &mut RuntimeVisualRack,
+) {
+    for (index, target) in book.targets.iter().copied().enumerate() {
+        let StableModTarget::Node {
+            scope: target_scope,
+            node_id,
+            parameter,
+        } = target
+        else {
+            continue;
+        };
+        if target_scope != scope {
+            continue;
+        }
+        let Some(node) = rack.get_mut(node_id) else {
+            continue;
+        };
+        apply_stable_node_offset(
+            node,
+            parameter,
+            frame.offset(StableModAddress(index as u16)),
+        );
+    }
+    for node_id in rack.iter().map(|node| node.stable_id).collect::<Vec<_>>() {
+        if let Some(node) = rack.get_mut(node_id) {
+            if let RuntimeVisualNodeKind::Transform(value) = &mut node.kind {
+                *value = value.sanitized();
+            }
+        }
+    }
+}
+
+/// Project one immutable stable modulation sample into caller-owned creative
+/// value clones. Missing/deleted targets are inert and topology, routes,
+/// enabled state, blend, group membership/bus/solo/bypass and authored bases
+/// are never changed.
+pub fn apply_stable_modulation(
+    book: &StableModAddressBook,
+    frame: &StableModulationFrame,
+    master_rack: &mut RuntimeVisualRack,
+    layer_racks: &mut [(StableLayerId, RuntimeVisualRack)],
+    composition: &mut RuntimeComposition,
+) {
+    apply_stable_rack_modulation(book, frame, StableModScope::Master, master_rack);
+    for (layer_id, rack) in layer_racks {
+        apply_stable_rack_modulation(book, frame, StableModScope::Layer(*layer_id), rack);
+    }
+    for (index, target) in book.targets.iter().copied().enumerate() {
+        let StableModTarget::CompositionValue { parameter } = target else {
+            continue;
+        };
+        let offset = frame.offset(StableModAddress(index as u16));
+        match parameter {
+            CompositionModParameter::BusCrossfade => composition.set_bus_crossfade(
+                finite_or(composition.bus_crossfade(), 0.5) + finite_or(offset, 0.0),
+            ),
+        }
+    }
+    let group_ids: Vec<_> = composition.groups().map(|group| group.id).collect();
+    for group_id in group_ids {
+        let Some(group) = composition.group_mut(group_id) else {
+            continue;
+        };
+        for (index, target) in book.targets.iter().copied().enumerate() {
+            let StableModTarget::GroupValue {
+                group_id: target_group,
+                parameter,
+            } = target
+            else {
+                continue;
+            };
+            if target_group != group_id {
+                continue;
+            }
+            let offset = frame.offset(StableModAddress(index as u16));
+            let slot = match parameter {
+                GroupModParameter::Opacity => Some(&mut group.opacity),
+                GroupModParameter::PositionX => Some(&mut group.transform.position[0]),
+                GroupModParameter::PositionY => Some(&mut group.transform.position[1]),
+                GroupModParameter::ScaleX => Some(&mut group.transform.scale[0]),
+                GroupModParameter::ScaleY => Some(&mut group.transform.scale[1]),
+                GroupModParameter::AnchorX => Some(&mut group.transform.anchor[0]),
+                GroupModParameter::AnchorY => Some(&mut group.transform.anchor[1]),
+                GroupModParameter::RotationDeg => Some(&mut group.transform.rotation_deg),
+                GroupModParameter::SkewDeg => Some(&mut group.transform.skew_deg),
+                GroupModParameter::SkewAxisDeg => Some(&mut group.transform.skew_axis_deg),
+                GroupModParameter::CropLeft => Some(&mut group.transform.crop[0]),
+                GroupModParameter::CropTop => Some(&mut group.transform.crop[1]),
+                GroupModParameter::CropRight => Some(&mut group.transform.crop[2]),
+                GroupModParameter::CropBottom => Some(&mut group.transform.crop[3]),
+                GroupModParameter::MatteAmount => {
+                    group.matte.as_mut().map(|matte| &mut matte.amount)
+                }
+                GroupModParameter::MatteThreshold => {
+                    group.matte.as_mut().map(|matte| &mut matte.threshold)
+                }
+                GroupModParameter::MatteSoftness => {
+                    group.matte.as_mut().map(|matte| &mut matte.softness)
+                }
+            };
+            let Some(slot) = slot else {
+                continue;
+            };
+            if matches!(
+                parameter,
+                GroupModParameter::RotationDeg | GroupModParameter::SkewAxisDeg
+            ) {
+                *slot = wrap_stable_degrees(finite_or(*slot, 0.0) + finite_or(offset, 0.0));
+            } else {
+                add_stable_offset(slot, offset, parameter.range());
+            }
+        }
+        group.transform = group.transform.sanitized();
+        apply_stable_rack_modulation(
+            book,
+            frame,
+            StableModScope::Group(group_id),
+            &mut group.rack,
+        );
+    }
+}
+
 /// Resolve a target's legal value range, including any positive, dynamically
 /// named one-based layer target. Actual-stack bounds are enforced when a
 /// frame-sized routing accumulator is built, not while parsing persisted
@@ -122,6 +1426,10 @@ pub fn canonical_target(target: &str) -> Cow<'_, str> {
 pub fn target_range(target: &str) -> Option<(f32, f32)> {
     let target = canonical_target(target);
     let target = target.as_ref();
+    if let Some(stable) = StableModTarget::parse(target) {
+        let [min, max] = stable.range();
+        return Some((min, max));
+    }
     if let Some((_, min, max)) = TARGETS.iter().find(|(key, _, _)| *key == target) {
         return Some((*min, *max));
     }
@@ -162,6 +1470,22 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "shift_block_size" => Some((2.0, 256.0)),
         "shift_density" => Some((0.0, 1.0)),
         "shift_speed" => Some((0.0, 20.0)),
+        "position_x" | "position_y" => Some((POSITION_MIN, POSITION_MAX)),
+        "scale_x" | "scale_y" => Some((SCALE_MIN, SCALE_MAX)),
+        "anchor_x" | "anchor_y" => Some((ANCHOR_MIN, ANCHOR_MAX)),
+        "rotation_deg" | "skew_axis_deg" => Some((-180.0, 180.0)),
+        "skew_deg" => Some((-SKEW_LIMIT_DEGREES, SKEW_LIMIT_DEGREES)),
+        "crop_left" | "crop_top" | "crop_right" | "crop_bottom" => Some((0.0, CROP_MAX)),
+        "motion_transplant_amount"
+        | "motion_confidence_threshold"
+        | "motion_refresh"
+        | "motion_decay"
+        | "motion_occlusion"
+        | "motion_shutter_chromatic_lag" => Some((0.0, 1.0)),
+        "motion_confidence_softness" => Some((0.0, 0.5)),
+        "motion_shutter_angle" => Some((0.0, 360.0)),
+        "motion_shutter_phase" => Some((-1.0, 1.0)),
+        "motion_shutter_curvature" => Some((-2.0, 2.0)),
         _ => None,
     }
 }
@@ -177,6 +1501,7 @@ pub struct LayerModulation {
     pub speed: f32,
     pub fps: f32,
     pub effects: EffectUniforms,
+    pub transform: SpatialTransform,
 }
 
 /// One-frame modulation cache. Every route is accumulated exactly once; all
@@ -198,23 +1523,32 @@ impl ModulationFrame {
     pub fn modulate(
         &self,
         effects: &EffectUniforms,
+        transform: &SpatialTransform,
         ntsc: &NtscParams,
         temporal: &TemporalParams,
-    ) -> (EffectUniforms, NtscParams, TemporalParams) {
-        ModMatrix::modulate_from_offsets(effects, ntsc, temporal, &self.offsets)
+    ) -> (EffectUniforms, SpatialTransform, NtscParams, TemporalParams) {
+        ModMatrix::modulate_from_offsets(effects, transform, ntsc, temporal, &self.offsets)
     }
 
+    /// Apply only bounded continuous Motion destinations to an authored
+    /// master. Base state and every discrete/provenance field remain intact.
+    pub fn modulate_motion(&self, motion: &MotionParams) -> MotionParams {
+        ModMatrix::modulate_master_motion_from_offsets(motion, &self.offsets)
+    }
+
+    #[cfg(test)]
     pub fn modulate_layers<'a>(
         &self,
-        layers: impl IntoIterator<Item = (&'a EffectUniforms, f32, f32, f32)>,
+        layers: impl IntoIterator<Item = (&'a EffectUniforms, &'a SpatialTransform, f32, f32, f32)>,
     ) -> Vec<LayerModulation> {
         layers
             .into_iter()
             .enumerate()
-            .map(|(index, (effects, opacity, speed, fps))| {
+            .map(|(index, (effects, transform, opacity, speed, fps))| {
                 ModMatrix::modulate_layer_from_offsets(
                     index,
                     effects,
+                    transform,
                     opacity,
                     speed,
                     fps,
@@ -222,6 +1556,42 @@ impl ModulationFrame {
                 )
             })
             .collect()
+    }
+
+    /// Resolve one slot from this already-accumulated frame sample.
+    ///
+    /// Unlike [`ModMatrix::modulate_layer_full`], this does not rescan routes
+    /// or allocate from an authored target index. Shared frame planners use it
+    /// while walking richer layer descriptors so render and transport values
+    /// can be emitted together without first building an intermediate vector.
+    pub(crate) fn modulate_layer(
+        &self,
+        index: usize,
+        effects: &EffectUniforms,
+        transform: &SpatialTransform,
+        opacity: f32,
+        speed: f32,
+        fps: f32,
+    ) -> LayerModulation {
+        ModMatrix::modulate_layer_from_offsets(
+            index,
+            effects,
+            transform,
+            opacity,
+            speed,
+            fps,
+            &self.offsets,
+        )
+    }
+
+    /// Resolve one layer's Motion values from the same frame-local routing
+    /// accumulator used by effects and transport.
+    pub(crate) fn modulate_layer_motion(
+        &self,
+        index: usize,
+        motion: &MotionParams,
+    ) -> MotionParams {
+        ModMatrix::modulate_layer_motion_from_offsets(index, motion, &self.offsets)
     }
 }
 
@@ -231,6 +1601,7 @@ impl ModulationFrame {
 enum CompiledTarget {
     Master(usize),
     Layer { index: usize, suffix: usize },
+    Stable(StableModTarget),
     Invalid,
 }
 
@@ -242,6 +1613,9 @@ fn compile_target(target: &str) -> CompiledTarget {
     let target = canonical_target(target);
     if let Some(index) = master_target_index(target.as_ref()) {
         return CompiledTarget::Master(index);
+    }
+    if let Some(target) = StableModTarget::parse(target.as_ref()) {
+        return CompiledTarget::Stable(target);
     }
     let Some((layer, suffix)) = parse_layer_target(target.as_ref()) else {
         return CompiledTarget::Invalid;
@@ -559,6 +1933,9 @@ pub struct Routing {
     /// Seconds to follow a falling source. Zero is instantaneous.
     pub release: f32,
     compiled_target: CompiledTarget,
+    /// Typed patch diagnostic retained when saved identity cannot resolve.
+    /// It never contributes and is cleared by an authored live target edit.
+    saved_missing_target: Option<SavedStableModTarget>,
     state: f32,
     cached: f32,
 }
@@ -580,6 +1957,7 @@ impl Routing {
             source,
             compiled_target: compile_target(&target),
             target,
+            saved_missing_target: None,
             depth,
             curve: Curve::Linear,
             curve_amount: 0.0,
@@ -602,6 +1980,24 @@ impl Routing {
         &self.target
     }
 
+    pub fn stable_target(&self) -> Option<StableModTarget> {
+        match self.compiled_target {
+            CompiledTarget::Stable(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    pub fn saved_missing_target(&self) -> Option<SavedStableModTarget> {
+        self.saved_missing_target
+    }
+
+    pub fn new_missing(source: ModSource, target: SavedStableModTarget, depth: f32) -> Self {
+        let mut routing = Self::new(source, target.persistence_key(), depth);
+        routing.compiled_target = CompiledTarget::Invalid;
+        routing.saved_missing_target = Some(target);
+        routing
+    }
+
     /// Clear transient state after replacing a route's identity/configuration.
     pub fn reset_runtime(&mut self) {
         self.state = 0.0;
@@ -619,8 +2015,20 @@ impl Routing {
         }
         self.compiled_target = compile_target(&target);
         self.target = target;
+        self.saved_missing_target = None;
         self.reset_runtime();
         true
+    }
+
+    /// Retain an authored stable destination as an explicit, non-routable
+    /// persistence tombstone. Route identity and response configuration stay
+    /// intact; only the vanished destination and its transient signal state
+    /// change.
+    fn set_missing_target(&mut self, target: SavedStableModTarget) {
+        self.target = target.persistence_key();
+        self.compiled_target = CompiledTarget::Invalid;
+        self.saved_missing_target = Some(target);
+        self.reset_runtime();
     }
 
     fn advance(&mut self, desired: f32, dt: f32) {
@@ -1029,41 +2437,90 @@ impl ModMatrix {
     pub fn modulate(
         &self,
         effects: &EffectUniforms,
+        transform: &SpatialTransform,
         ntsc: &NtscParams,
         temporal: &TemporalParams,
-    ) -> (EffectUniforms, NtscParams, TemporalParams) {
-        Self::modulate_from_offsets(effects, ntsc, temporal, &self.accumulate_offsets(0))
+    ) -> (EffectUniforms, SpatialTransform, NtscParams, TemporalParams) {
+        Self::modulate_from_offsets(
+            effects,
+            transform,
+            ntsc,
+            temporal,
+            &self.accumulate_offsets(0),
+        )
     }
 
     fn modulate_from_offsets(
         effects: &EffectUniforms,
+        transform: &SpatialTransform,
         ntsc: &NtscParams,
         temporal: &TemporalParams,
         offsets: &RoutingOffsets,
-    ) -> (EffectUniforms, NtscParams, TemporalParams) {
+    ) -> (EffectUniforms, SpatialTransform, NtscParams, TemporalParams) {
         let mut fx = *effects;
+        let mut spatial = transform.sanitized();
         let mut np = ntsc.clone();
         let mut tp = *temporal;
 
         for (index, &(target, min, max)) in TARGETS.iter().enumerate() {
             let offset = offsets.master[index] * (max - min) * 0.5;
             if offset != 0.0 {
-                apply_offset(&mut fx, &mut np, &mut tp, target, offset, min, max);
+                apply_offset(
+                    &mut fx,
+                    &mut spatial,
+                    &mut np,
+                    &mut tp,
+                    target,
+                    offset,
+                    (min, max),
+                );
             }
         }
 
-        (fx, np, tp)
+        (fx, spatial.sanitized(), np, tp)
+    }
+
+    fn modulate_master_motion_from_offsets(
+        base: &MotionParams,
+        offsets: &RoutingOffsets,
+    ) -> MotionParams {
+        let mut motion = base.sanitized();
+        let offset = |target: &'static str, min: f32, max: f32| {
+            master_target_index(target)
+                .and_then(|index| offsets.master.get(index))
+                .copied()
+                .unwrap_or(0.0)
+                * (max - min)
+                * 0.5
+        };
+        apply_motion_offsets(&mut motion, offset, false);
+        motion.sanitized()
+    }
+
+    fn modulate_layer_motion_from_offsets(
+        index: usize,
+        base: &MotionParams,
+        offsets: &RoutingOffsets,
+    ) -> MotionParams {
+        let mut motion = base.sanitized();
+        let offset = |target: &'static str, min: f32, max: f32| {
+            offsets.layer_value(index, target) * (max - min) * 0.5
+        };
+        apply_motion_offsets(&mut motion, offset, true);
+        motion.sanitized()
     }
 
     fn modulate_layer_from_offsets(
         index: usize,
         base_effects: &EffectUniforms,
+        base_transform: &SpatialTransform,
         base_opacity: f32,
         base_speed: f32,
         base_fps: f32,
         offsets: &RoutingOffsets,
     ) -> LayerModulation {
         let mut effects = *base_effects;
+        let mut transform = base_transform.sanitized();
         let offset = |suffix: &'static str, min: f32, max: f32| {
             offsets.layer_value(index, suffix) * (max - min) * 0.5
         };
@@ -1114,11 +2571,14 @@ impl ModMatrix {
         apply!(shift_density, "shift_density", 0.0, 1.0);
         apply!(shift_speed, "shift_speed", 0.0, 20.0);
 
+        apply_spatial_offsets(&mut transform, offset);
+
         LayerModulation {
             opacity,
             speed,
             fps,
             effects,
+            transform: transform.sanitized(),
         }
     }
 
@@ -1136,6 +2596,27 @@ impl ModMatrix {
         }
     }
 
+    /// Accumulate stable rack/group routes into the caller's compact topology
+    /// address book. A persisted route whose scope, node, or parameter is
+    /// currently missing remains stored in `routings` but contributes zero.
+    pub fn stable_frame(&self, book: &StableModAddressBook) -> StableModulationFrame {
+        let mut offsets = vec![0.0; book.len()];
+        for routing in &self.routings {
+            let CompiledTarget::Stable(target) = routing.compiled_target else {
+                continue;
+            };
+            let Some(address) = book.address(target) else {
+                continue;
+            };
+            let [min, max] = book.target(address).unwrap_or(target).range();
+            let amount = routing.cached_value() * finite_or(routing.depth, 0.0) * (max - min) * 0.5;
+            if let Some(slot) = offsets.get_mut(address.index()) {
+                *slot += amount;
+            }
+        }
+        StableModulationFrame { offsets }
+    }
+
     /// Modulate one layer. Batch callers should prefer [`Self::modulate_layers`]
     /// so all layer destinations share one routing accumulator pass.
     #[cfg(test)]
@@ -1143,6 +2624,7 @@ impl ModMatrix {
         &self,
         index: usize,
         base_effects: &EffectUniforms,
+        base_transform: &SpatialTransform,
         base_opacity: f32,
         base_speed: f32,
         base_fps: f32,
@@ -1169,6 +2651,7 @@ impl ModMatrix {
         Self::modulate_layer_from_offsets(
             0,
             base_effects,
+            base_transform,
             base_opacity,
             base_speed,
             base_fps,
@@ -1226,6 +2709,77 @@ impl ModMatrix {
             let _ = routing.set_target(format!("layer{}_{suffix}", remapped + 1));
             true
         });
+    }
+
+    /// Tombstone typed targets owned by the removed stable layer, then apply
+    /// the established positional-target permutation. A newly inserted layer
+    /// can therefore never inherit a deleted typed destination, while legacy
+    /// `layerN_*` routes retain their historical remove/remap behavior.
+    pub fn remap_layer_targets_after_remove_with_stable_id(
+        &mut self,
+        removed: usize,
+        removed_layer_id: StableLayerId,
+    ) {
+        let saved_position = u32::try_from(removed)
+            .ok()
+            .and_then(SavedLayerPosition::new);
+        self.routings.retain_mut(|routing| {
+            let Some(StableModTarget::Node {
+                scope: StableModScope::Layer(layer_id),
+                node_id,
+                parameter,
+            }) = routing.stable_target()
+            else {
+                return true;
+            };
+            if layer_id != removed_layer_id {
+                return true;
+            }
+            let Some(saved_position) = saved_position else {
+                // The persisted layer-position domain is deliberately
+                // bounded. Such a route cannot be represented truthfully and
+                // follows the legacy removed-owner law rather than remaining
+                // live with a dangling process identity.
+                return false;
+            };
+            routing.set_missing_target(SavedStableModTarget::MissingSavedLayer {
+                saved_position,
+                node_id,
+                parameter,
+            });
+            true
+        });
+        self.remap_layer_targets_after_remove(removed);
+    }
+
+    /// Tombstone every typed destination owned by an explicitly deleted
+    /// group. Group IDs are monotonic and never reused, but retaining the
+    /// missing identity is still essential for truthful patch diagnostics and
+    /// prevents any future import/editor path from rebinding by root order.
+    pub fn tombstone_group_targets_after_remove(&mut self, removed_group_id: GroupId) {
+        for routing in &mut self.routings {
+            let missing = match routing.stable_target() {
+                Some(StableModTarget::Node {
+                    scope: StableModScope::Group(group_id),
+                    node_id,
+                    parameter,
+                }) if group_id == removed_group_id => Some(SavedStableModTarget::MissingGroup {
+                    group_id,
+                    missing_target: SavedMissingTarget::Node { node_id, parameter },
+                }),
+                Some(StableModTarget::GroupValue {
+                    group_id,
+                    parameter,
+                }) if group_id == removed_group_id => Some(SavedStableModTarget::MissingGroup {
+                    group_id,
+                    missing_target: SavedMissingTarget::GroupValue { parameter },
+                }),
+                _ => None,
+            };
+            if let Some(missing) = missing {
+                routing.set_missing_target(missing);
+            }
+        }
     }
 
     /// Apply the same stable permutation as moving an element in a Vec.
@@ -1312,6 +2866,31 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "shift_block_size",
     "shift_density",
     "shift_speed",
+    // Appended so all established compiled suffix indices remain stable.
+    "position_x",
+    "position_y",
+    "scale_x",
+    "scale_y",
+    "anchor_x",
+    "anchor_y",
+    "rotation_deg",
+    "skew_deg",
+    "skew_axis_deg",
+    "crop_left",
+    "crop_top",
+    "crop_right",
+    "crop_bottom",
+    // Appended so every established compiled suffix index remains stable.
+    "motion_transplant_amount",
+    "motion_confidence_threshold",
+    "motion_confidence_softness",
+    "motion_refresh",
+    "motion_decay",
+    "motion_occlusion",
+    "motion_shutter_angle",
+    "motion_shutter_phase",
+    "motion_shutter_curvature",
+    "motion_shutter_chromatic_lag",
 ];
 
 impl RoutingOffsets {
@@ -1339,6 +2918,7 @@ impl RoutingOffsets {
                 }
             }
             CompiledTarget::Invalid => {}
+            CompiledTarget::Stable(_) => {}
         }
     }
 
@@ -1353,6 +2933,7 @@ impl RoutingOffsets {
                 .copied()
                 .unwrap_or(0.0),
             CompiledTarget::Invalid => 0.0,
+            CompiledTarget::Stable(_) => 0.0,
         }
     }
 
@@ -1405,6 +2986,29 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "shift_block_size" => 32,
         "shift_density" => 33,
         "shift_speed" => 34,
+        "position_x" => 35,
+        "position_y" => 36,
+        "scale_x" => 37,
+        "scale_y" => 38,
+        "anchor_x" => 39,
+        "anchor_y" => 40,
+        "rotation_deg" => 41,
+        "skew_deg" => 42,
+        "skew_axis_deg" => 43,
+        "crop_left" => 44,
+        "crop_top" => 45,
+        "crop_right" => 46,
+        "crop_bottom" => 47,
+        "motion_transplant_amount" => 48,
+        "motion_confidence_threshold" => 49,
+        "motion_confidence_softness" => 50,
+        "motion_refresh" => 51,
+        "motion_decay" => 52,
+        "motion_occlusion" => 53,
+        "motion_shutter_angle" => 54,
+        "motion_shutter_phase" => 55,
+        "motion_shutter_curvature" => 56,
+        "motion_shutter_chromatic_lag" => 57,
         _ => return None,
     })
 }
@@ -1423,6 +3027,83 @@ fn finite_f64_or(value: f64, fallback: f64) -> f64 {
     } else {
         fallback
     }
+}
+
+/// Apply every continuous spatial destination, then let the caller sanitize
+/// the transform once so paired crop limits are resolved atomically.
+fn apply_spatial_offsets(
+    transform: &mut SpatialTransform,
+    mut offset: impl FnMut(&'static str, f32, f32) -> f32,
+) {
+    transform.position[0] += offset("position_x", POSITION_MIN, POSITION_MAX);
+    transform.position[1] += offset("position_y", POSITION_MIN, POSITION_MAX);
+    transform.scale[0] += offset("scale_x", SCALE_MIN, SCALE_MAX);
+    transform.scale[1] += offset("scale_y", SCALE_MIN, SCALE_MAX);
+    transform.anchor[0] += offset("anchor_x", ANCHOR_MIN, ANCHOR_MAX);
+    transform.anchor[1] += offset("anchor_y", ANCHOR_MIN, ANCHOR_MAX);
+    transform.rotation_deg += offset("rotation_deg", -180.0, 180.0);
+    transform.skew_deg += offset("skew_deg", -SKEW_LIMIT_DEGREES, SKEW_LIMIT_DEGREES);
+    transform.skew_axis_deg += offset("skew_axis_deg", -180.0, 180.0);
+    transform.crop[0] += offset("crop_left", 0.0, CROP_MAX);
+    transform.crop[1] += offset("crop_top", 0.0, CROP_MAX);
+    transform.crop[2] += offset("crop_right", 0.0, CROP_MAX);
+    transform.crop[3] += offset("crop_bottom", 0.0, CROP_MAX);
+    *transform = transform.sanitized();
+}
+
+/// Apply only the bounded numeric Motion law. The caller chooses whether the
+/// scope is a layer recipient; master Faraday values are never routable.
+fn apply_motion_offsets(
+    motion: &mut MotionParams,
+    mut offset: impl FnMut(&'static str, f32, f32) -> f32,
+    include_faraday: bool,
+) {
+    if include_faraday {
+        motion.transplant.amount += offset("motion_transplant_amount", 0.0, 1.0);
+        motion.transplant.confidence_threshold += offset("motion_confidence_threshold", 0.0, 1.0);
+        motion.transplant.confidence_softness += offset("motion_confidence_softness", 0.0, 0.5);
+        motion.transplant.refresh += offset("motion_refresh", 0.0, 1.0);
+        motion.transplant.decay += offset("motion_decay", 0.0, 1.0);
+        motion.transplant.occlusion += offset("motion_occlusion", 0.0, 1.0);
+    }
+    motion.shutter.angle_degrees += offset("motion_shutter_angle", 0.0, 360.0);
+    motion.shutter.phase += offset("motion_shutter_phase", -1.0, 1.0);
+    motion.shutter.curvature += offset("motion_shutter_curvature", -2.0, 2.0);
+    motion.shutter.chromatic_lag += offset("motion_shutter_chromatic_lag", 0.0, 1.0);
+    *motion = motion.sanitized();
+}
+
+fn apply_spatial_offset(
+    transform: &mut SpatialTransform,
+    target: &str,
+    offset: f32,
+    min: f32,
+    max: f32,
+) -> bool {
+    let slot = match target {
+        "position_x" => &mut transform.position[0],
+        "position_y" => &mut transform.position[1],
+        "scale_x" => &mut transform.scale[0],
+        "scale_y" => &mut transform.scale[1],
+        "anchor_x" => &mut transform.anchor[0],
+        "anchor_y" => &mut transform.anchor[1],
+        "skew_deg" => &mut transform.skew_deg,
+        "crop_left" => &mut transform.crop[0],
+        "crop_top" => &mut transform.crop[1],
+        "crop_right" => &mut transform.crop[2],
+        "crop_bottom" => &mut transform.crop[3],
+        "rotation_deg" => {
+            transform.rotation_deg += offset;
+            return true;
+        }
+        "skew_axis_deg" => {
+            transform.skew_axis_deg += offset;
+            return true;
+        }
+        _ => return false,
+    };
+    *slot = (*slot + offset).clamp(min, max);
+    true
 }
 
 /// Shape a signed value without ever discarding its polarity.
@@ -1457,13 +3138,17 @@ fn exponential_follow(current: f32, desired: f32, dt: f32, tau: f32) -> f32 {
 
 fn apply_offset(
     fx: &mut EffectUniforms,
+    spatial: &mut SpatialTransform,
     np: &mut NtscParams,
     tp: &mut TemporalParams,
     target: &str,
     offset: f32,
-    min: f32,
-    max: f32,
+    range: (f32, f32),
 ) {
+    let (min, max) = range;
+    if apply_spatial_offset(spatial, target, offset, min, max) {
+        return;
+    }
     let slot: &mut f32 = match target {
         "pixelate" => &mut fx.pixelate_size,
         "rgb_split" => &mut fx.rgb_split,
@@ -1517,6 +3202,17 @@ fn apply_offset(
         "temporal_key_threshold" => &mut tp.key_threshold,
         "temporal_key_softness" => &mut tp.key_softness,
         "temporal_key_history" => &mut tp.key_history,
+        "temporal_loom_amount" => &mut tp.originals.loom.amount,
+        "temporal_loom_depth" => &mut tp.originals.loom.depth,
+        "temporal_loom_phase" => &mut tp.originals.loom.phase,
+        "temporal_loom_scale" => &mut tp.originals.loom.scale,
+        "temporal_loom_angle" => &mut tp.originals.loom.angle,
+        "temporal_atlas_amount" => &mut tp.originals.atlas.amount,
+        "temporal_atlas_collision" => &mut tp.originals.atlas.collision,
+        "temporal_garden_amount" => &mut tp.originals.garden.amount,
+        "temporal_garden_threshold" => &mut tp.originals.garden.threshold,
+        "temporal_garden_softness" => &mut tp.originals.garden.softness,
+        "temporal_garden_decay" => &mut tp.originals.garden.decay,
         _ => return,
     };
     *slot = (*slot + offset).clamp(min, max);
@@ -1769,8 +3465,12 @@ mod tests {
                 brightness: 0.9,
                 ..Default::default()
             };
-            let (modulated, _, _) =
-                matrix.modulate(&base, &NtscParams::default(), &TemporalParams::default());
+            let (modulated, _, _, _) = matrix.modulate(
+                &base,
+                &SpatialTransform::default(),
+                &NtscParams::default(),
+                &TemporalParams::default(),
+            );
             (base.brightness, modulated.brightness)
         }
 
@@ -1797,10 +3497,18 @@ mod tests {
         let _ = matrix.target_offset("contrast", 0);
         let _ = matrix.modulate(
             &EffectUniforms::default(),
+            &SpatialTransform::default(),
             &NtscParams::default(),
             &TemporalParams::default(),
         );
-        let _ = matrix.modulate_layer_full(0, &EffectUniforms::default(), 1.0, 1.0, 30.0);
+        let _ = matrix.modulate_layer_full(
+            0,
+            &EffectUniforms::default(),
+            &SpatialTransform::default(),
+            1.0,
+            1.0,
+            30.0,
+        );
         approx(matrix.routings[1].cached, cached);
 
         matrix.remove_routing(0);
@@ -1824,12 +3532,14 @@ mod tests {
         matrix.update_at_beat(0.0, 0.0);
         let first = EffectUniforms::default();
         let second = EffectUniforms::default();
-        let expected_first = matrix.modulate_layer_full(0, &first, 0.9, 1.0, 30.0);
-        let expected_second = matrix.modulate_layer_full(1, &second, 0.7, 1.5, 24.0);
+        let spatial = SpatialTransform::default();
+        let expected_first = matrix.modulate_layer_full(0, &first, &spatial, 0.9, 1.0, 30.0);
+        let expected_second = matrix.modulate_layer_full(1, &second, &spatial, 0.7, 1.5, 24.0);
 
-        let batched = matrix
-            .frame(2)
-            .modulate_layers([(&first, 0.9, 1.0, 30.0), (&second, 0.7, 1.5, 24.0)]);
+        let batched = matrix.frame(2).modulate_layers([
+            (&first, &spatial, 0.9, 1.0, 30.0),
+            (&second, &spatial, 0.7, 1.5, 24.0),
+        ]);
 
         approx(batched[0].opacity, expected_first.opacity);
         approx(
@@ -1842,11 +3552,15 @@ mod tests {
             expected_second.effects.cellular_gap_softness,
         );
         let frame = matrix.frame(2);
-        let cached = frame.modulate_layers([(&first, 0.9, 1.0, 30.0), (&second, 0.7, 1.5, 24.0)]);
+        let cached = frame.modulate_layers([
+            (&first, &spatial, 0.9, 1.0, 30.0),
+            (&second, &spatial, 0.7, 1.5, 24.0),
+        ]);
         approx(cached[0].opacity, batched[0].opacity);
         approx(cached[1].fps, batched[1].fps);
-        let (master, _, _) = frame.modulate(
+        let (master, _, _, _) = frame.modulate(
             &EffectUniforms::default(),
+            &SpatialTransform::default(),
             &NtscParams::default(),
             &TemporalParams::default(),
         );
@@ -1883,8 +3597,9 @@ mod tests {
         let mut matrix = ModMatrix::new();
         matrix.routings.push(route);
         let frame = matrix.frame(0);
-        let (effects, _, _) = frame.modulate(
+        let (effects, _, _, _) = frame.modulate(
             &EffectUniforms::default(),
+            &SpatialTransform::default(),
             &NtscParams::default(),
             &TemporalParams::default(),
         );
@@ -2016,8 +3731,16 @@ mod tests {
 
         let frame = matrix.frame(17);
         assert_eq!(frame.offsets.layer.len(), 17);
-        let modulated =
-            ModMatrix::modulate_layer_from_offsets(16, &base, 1.0, 1.0, 30.0, &frame.offsets);
+        let spatial = SpatialTransform::default();
+        let modulated = ModMatrix::modulate_layer_from_offsets(
+            16,
+            &base,
+            &spatial,
+            1.0,
+            1.0,
+            30.0,
+            &frame.offsets,
+        );
         approx(modulated.effects.brightness, 1.0);
 
         // A forged, parseable destination does not influence allocation and
@@ -2025,13 +3748,13 @@ mod tests {
         let one_layer_frame = matrix.frame(1);
         assert_eq!(one_layer_frame.offsets.layer.len(), 1);
         let first = one_layer_frame
-            .modulate_layers([(&base, 1.0, 1.0, 30.0)])
+            .modulate_layers([(&base, &spatial, 1.0, 1.0, 30.0)])
             .remove(0);
         approx(first.effects.brightness, 0.0);
 
         // The single-layer test/tooling adapter also uses one local slot,
         // even when asked to inspect the largest representable parsed index.
-        let huge = matrix.modulate_layer_full(usize::MAX - 1, &base, 1.0, 1.0, 30.0);
+        let huge = matrix.modulate_layer_full(usize::MAX - 1, &base, &spatial, 1.0, 1.0, 30.0);
         approx(huge.effects.brightness, 1.0);
         approx(base.brightness, 0.0);
     }
@@ -2082,8 +3805,12 @@ mod tests {
         matrix.update_at_beat(0.0, 0.0);
 
         let base = EffectUniforms::default();
-        let (master, _, _) =
-            matrix.modulate(&base, &NtscParams::default(), &TemporalParams::default());
+        let (master, _, _, _) = matrix.modulate(
+            &base,
+            &SpatialTransform::default(),
+            &NtscParams::default(),
+            &TemporalParams::default(),
+        );
         approx(master.cellular_amount, 0.5);
         approx(master.cellular_scale, 25.0);
         approx(master.cellular_warp, 0.85);
@@ -2092,7 +3819,8 @@ mod tests {
         approx(master.cellular_gap_threshold, 1.0);
         approx(master.cellular_gap_softness, 0.33);
 
-        let layer = matrix.modulate_layer_full(0, &base, 1.0, 1.0, 30.0);
+        let layer =
+            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
         approx(layer.effects.cellular_amount, 0.5);
         approx(layer.effects.cellular_scale, 25.0);
         approx(layer.effects.cellular_warp, 0.85);
@@ -2144,16 +3872,27 @@ mod tests {
         matrix.update_at_beat(0.0, 0.0);
 
         let base = EffectUniforms::default();
-        let (master, _, _) =
-            matrix.modulate(&base, &NtscParams::default(), &TemporalParams::default());
+        let (master, _, _, _) = matrix.modulate(
+            &base,
+            &SpatialTransform::default(),
+            &NtscParams::default(),
+            &TemporalParams::default(),
+        );
         approx(master.shift_amount, 0.5);
         approx(master.shift_block_size, 135.0);
         approx(master.shift_density, 1.0);
         approx(master.shift_speed, 13.0);
 
         let frame = matrix.frame(17);
-        let layer =
-            ModMatrix::modulate_layer_from_offsets(16, &base, 1.0, 1.0, 30.0, &frame.offsets);
+        let layer = ModMatrix::modulate_layer_from_offsets(
+            16,
+            &base,
+            &SpatialTransform::default(),
+            1.0,
+            1.0,
+            30.0,
+            &frame.offsets,
+        );
         approx(layer.effects.shift_amount, 0.5);
         approx(layer.effects.shift_block_size, 135.0);
         approx(layer.effects.shift_density, 1.0);
@@ -2216,6 +3955,71 @@ mod tests {
     }
 
     #[test]
+    fn stable_layer_removal_tombstones_typed_owner_without_changing_legacy_law() {
+        let removed_layer_id = StableLayerId::new(41).unwrap();
+        let surviving_layer_id = StableLayerId::new(42).unwrap();
+        let removed_target = StableModTarget::parse("node/layer/41/3/wet").unwrap();
+        let surviving_target = StableModTarget::parse("node/layer/42/4/wet").unwrap();
+
+        let mut removed = Routing::new(ModSource::Lfo(1), removed_target.to_string(), 0.37);
+        removed.curve = Curve::SCurve;
+        removed.curve_amount = -0.65;
+        removed.attack = 1.25;
+        removed.release = 2.5;
+        removed.state = 0.4;
+        removed.cached = -0.2;
+        let removed_route_id = removed.route_id();
+
+        let surviving = Routing::new(ModSource::Lfo(2), surviving_target.to_string(), -0.2);
+        let surviving_route_id = surviving.route_id();
+        let legacy_removed = Routing::new(ModSource::Lfo(3), "layer2_opacity", 0.1);
+        let legacy_after = Routing::new(ModSource::AudioBass, "layer3_brightness", 0.3);
+        let legacy_after_id = legacy_after.route_id();
+
+        let mut matrix = ModMatrix::new();
+        matrix.routings = vec![removed, surviving, legacy_removed, legacy_after];
+        matrix.remap_layer_targets_after_remove_with_stable_id(1, removed_layer_id);
+
+        assert_eq!(
+            matrix.routings.len(),
+            3,
+            "legacy removed-owner route is dropped"
+        );
+        let tombstone = &matrix.routings[0];
+        let expected = SavedStableModTarget::MissingSavedLayer {
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            node_id: NodeId::new(3).unwrap(),
+            parameter: StableNodeParameter::Wet,
+        };
+        assert_eq!(tombstone.route_id(), removed_route_id);
+        assert_eq!(tombstone.source, ModSource::Lfo(1));
+        assert_eq!(tombstone.depth, 0.37);
+        assert_eq!(tombstone.curve, Curve::SCurve);
+        assert_eq!(tombstone.curve_amount, -0.65);
+        assert_eq!(tombstone.attack, 1.25);
+        assert_eq!(tombstone.release, 2.5);
+        assert_eq!(tombstone.state, 0.0);
+        assert_eq!(tombstone.cached, 0.0);
+        assert_eq!(tombstone.target(), expected.persistence_key());
+        assert_eq!(tombstone.stable_target(), None);
+        assert_eq!(tombstone.saved_missing_target(), Some(expected));
+        assert!(matches!(
+            expected.resolve(
+                &StableModAddressBook::default(),
+                |_| Some(surviving_layer_id),
+                |_| true,
+            ),
+            ResolvedStableModTarget::Missing(value) if value == expected
+        ));
+
+        assert_eq!(matrix.routings[1].route_id(), surviving_route_id);
+        assert_eq!(matrix.routings[1].stable_target(), Some(surviving_target));
+        assert_eq!(matrix.routings[1].saved_missing_target(), None);
+        assert_eq!(matrix.routings[2].route_id(), legacy_after_id);
+        assert_eq!(matrix.routings[2].target(), "layer2_brightness");
+    }
+
+    #[test]
     fn expanded_continuous_targets_include_key_temporal_ntsc_and_layer_fps() {
         for (target, range) in [
             ("key_color_r", (0.0, 1.0)),
@@ -2229,6 +4033,17 @@ mod tests {
             ("temporal_key_threshold", (0.0, 1.0)),
             ("temporal_key_softness", (0.0, 0.5)),
             ("temporal_key_history", (1.0, 23.0)),
+            ("temporal_loom_amount", (0.0, 1.0)),
+            ("temporal_loom_depth", (0.0, 1.0)),
+            ("temporal_loom_phase", (-1_000.0, 1_000.0)),
+            ("temporal_loom_scale", (0.01, 100.0)),
+            ("temporal_loom_angle", (-180.0, 180.0)),
+            ("temporal_atlas_amount", (0.0, 1.0)),
+            ("temporal_atlas_collision", (0.0, 1.0)),
+            ("temporal_garden_amount", (0.0, 1.0)),
+            ("temporal_garden_threshold", (0.0, 1.0)),
+            ("temporal_garden_softness", (0.0, 0.5)),
+            ("temporal_garden_decay", (0.0, 1.0)),
             ("layer1_fps", (1.0, 240.0)),
             ("layer1_key", (0.0, 1.0)),
             ("layer1_key_threshold", (0.0, 1.0)),
@@ -2243,8 +4058,630 @@ mod tests {
             .push(Routing::new(ModSource::Midi(0), "layer1_fps", 1.0));
         matrix.update_at_beat(0.0, 1.0 / 30.0);
         let base = EffectUniforms::default();
-        let layer = matrix.modulate_layer_full(0, &base, 1.0, 1.0, 30.0);
+        let layer =
+            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
         approx(layer.fps, 149.5);
         approx(base.key_threshold, EffectUniforms::default().key_threshold);
+    }
+
+    #[test]
+    fn motion_modulation_is_bounded_continuous_and_preserves_discrete_laws() {
+        use crate::motion::{
+            CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier, MotionDonor,
+            MotionFieldSource, MotionLatticeQuality, MOTION_ALGORITHM_VERSION,
+        };
+
+        for (target, range) in [
+            ("motion_shutter_angle", (0.0, 360.0)),
+            ("motion_shutter_phase", (-1.0, 1.0)),
+            ("motion_shutter_curvature", (-2.0, 2.0)),
+            ("motion_shutter_chromatic_lag", (0.0, 1.0)),
+            ("layer1_motion_transplant_amount", (0.0, 1.0)),
+            ("layer1_motion_confidence_softness", (0.0, 0.5)),
+            ("layer1_motion_shutter_angle", (0.0, 360.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+        for discrete in [
+            "motion_algorithm_version",
+            "motion_field_source",
+            "motion_lattice_quality",
+            "layer1_motion_donor",
+            "layer1_motion_carrier",
+            "layer1_motion_shutter_quality",
+        ] {
+            assert_eq!(target_range(discrete), None, "{discrete}");
+        }
+
+        let layer_id = StableLayerId::new(91).unwrap();
+        let saved_position = SavedLayerPosition::new(2).unwrap();
+        let base = MotionParams {
+            field_source: MotionFieldSource::CodecVectors,
+            lattice_quality: MotionLatticeQuality::High,
+            transplant: FaradayParams {
+                amount: 0.25,
+                donor: MotionDonor::Selected {
+                    layer_id,
+                    saved_position,
+                },
+                carrier: MotionCarrier::FirstSourceFrame,
+                confidence_softness: 0.1,
+                ..FaradayParams::default()
+            },
+            shutter: CurvedShutterParams {
+                angle_degrees: 20.0,
+                quality: CurvedShutterQuality::High,
+                ..CurvedShutterParams::default()
+            },
+            ..MotionParams::default()
+        };
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = [
+            "motion_shutter_angle",
+            "motion_shutter_phase",
+            "layer1_motion_transplant_amount",
+            "layer1_motion_confidence_softness",
+            "layer1_motion_shutter_angle",
+        ]
+        .into_iter()
+        .map(|target| Routing::new(ModSource::Midi(0), target, 1.0))
+        .collect();
+        matrix.update_at_beat(0.0, 0.0);
+        let frame = matrix.frame(1);
+        let master = frame.modulate_motion(&base);
+        let layer = frame.modulate_layer_motion(0, &base);
+
+        approx(master.shutter.angle_degrees, 200.0);
+        approx(master.shutter.phase, 1.0);
+        approx(master.transplant.amount, 0.25);
+        approx(layer.transplant.amount, 0.75);
+        approx(layer.transplant.confidence_softness, 0.35);
+        approx(layer.shutter.angle_degrees, 200.0);
+        assert_eq!(layer.algorithm_version, MOTION_ALGORITHM_VERSION);
+        assert_eq!(layer.field_source, MotionFieldSource::CodecVectors);
+        assert_eq!(layer.lattice_quality, MotionLatticeQuality::High);
+        assert_eq!(layer.transplant.donor, base.transplant.donor);
+        assert_eq!(layer.transplant.carrier, MotionCarrier::FirstSourceFrame);
+        assert_eq!(layer.shutter.quality, CurvedShutterQuality::High);
+        assert_eq!(base.transplant.amount, 0.25, "base state is immutable");
+        assert_eq!(base.shutter.angle_degrees, 20.0);
+    }
+
+    #[test]
+    fn temporal_originals_modulation_changes_only_continuous_bounded_values() {
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = [
+            "temporal_loom_amount",
+            "temporal_loom_depth",
+            "temporal_loom_phase",
+            "temporal_loom_scale",
+            "temporal_loom_angle",
+            "temporal_atlas_amount",
+            "temporal_atlas_collision",
+            "temporal_garden_amount",
+            "temporal_garden_threshold",
+            "temporal_garden_softness",
+            "temporal_garden_decay",
+        ]
+        .into_iter()
+        .map(|target| Routing::new(ModSource::Midi(0), target, 1.0))
+        .collect();
+        matrix.update_at_beat(0.0, 0.0);
+
+        let mut base = TemporalParams::default();
+        base.originals.loom.depth = 0.25;
+        base.originals.loom.topology = crate::temporal::TemporalTopology::Radial;
+        base.originals.loom.interpolation = crate::temporal::TemporalInterpolation::Linear;
+        base.originals.loom.folds = 7;
+        base.originals.loom.quantization = 8;
+        base.originals.atlas.seed = 0xdead_beef;
+        base.originals.atlas.territories = 9;
+        base.originals.garden.gate = crate::temporal::RefreshGardenGate::Matte;
+        base.originals.garden.decay = 0.2;
+        base.originals.garden.max_hold_ticks = 47;
+        base.originals.score.enabled = true;
+        base.originals.score.seed = 0x1234_5678;
+        base.originals.score.state_count = 11;
+        base.originals.score.trigger = crate::temporal::CollisionScoreTrigger::Manual;
+        base.originals.score.loop_driver =
+            crate::temporal::CollisionScoreLoopDriver::SelectedLayer {
+                layer_id: StableLayerId::new(91).unwrap(),
+                saved_position: SavedLayerPosition::new(3).unwrap(),
+            };
+        base.originals.reset.loop_boundary = crate::temporal::TemporalEventResetMode::Memory;
+        base.originals.reset.downbeat = crate::temporal::TemporalEventResetMode::Score;
+
+        let (_, _, _, modulated) = matrix.frame(0).modulate(
+            &EffectUniforms::default(),
+            &SpatialTransform::default(),
+            &NtscParams::default(),
+            &base,
+        );
+        approx(modulated.originals.loom.amount, 0.5);
+        approx(modulated.originals.loom.depth, 0.75);
+        approx(modulated.originals.loom.phase, 1_000.0);
+        approx(modulated.originals.loom.scale, 50.995);
+        approx(modulated.originals.loom.angle, 180.0);
+        approx(modulated.originals.atlas.amount, 0.5);
+        approx(modulated.originals.atlas.collision, 0.5);
+        approx(modulated.originals.garden.amount, 0.5);
+        approx(modulated.originals.garden.threshold, 0.6);
+        approx(modulated.originals.garden.softness, 0.28);
+        approx(modulated.originals.garden.decay, 0.7);
+
+        assert_eq!(
+            modulated.originals.loom.topology,
+            base.originals.loom.topology
+        );
+        assert_eq!(
+            modulated.originals.loom.interpolation,
+            base.originals.loom.interpolation
+        );
+        assert_eq!(modulated.originals.loom.folds, base.originals.loom.folds);
+        assert_eq!(
+            modulated.originals.loom.quantization,
+            base.originals.loom.quantization
+        );
+        assert_eq!(modulated.originals.atlas.seed, base.originals.atlas.seed);
+        assert_eq!(
+            modulated.originals.atlas.territories,
+            base.originals.atlas.territories
+        );
+        assert_eq!(modulated.originals.garden.gate, base.originals.garden.gate);
+        assert_eq!(
+            modulated.originals.garden.max_hold_ticks,
+            base.originals.garden.max_hold_ticks
+        );
+        assert_eq!(modulated.originals.score, base.originals.score);
+        assert_eq!(modulated.originals.reset, base.originals.reset);
+        approx(base.originals.loom.amount, 0.0);
+        approx(base.originals.garden.decay, 0.2);
+
+        for discrete in [
+            "temporal_loom_topology",
+            "temporal_atlas_seed",
+            "temporal_garden_gate",
+            "temporal_score_seed",
+            "temporal_score_state_count",
+        ] {
+            assert_eq!(
+                target_range(discrete),
+                None,
+                "{discrete} must stay authored"
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_targets_modulate_master_and_arbitrary_layers_without_mutating_bases() {
+        for (target, range) in [
+            ("position_x", (POSITION_MIN, POSITION_MAX)),
+            ("scale_y", (SCALE_MIN, SCALE_MAX)),
+            ("anchor_x", (ANCHOR_MIN, ANCHOR_MAX)),
+            ("rotation_deg", (-180.0, 180.0)),
+            ("skew_deg", (-SKEW_LIMIT_DEGREES, SKEW_LIMIT_DEGREES)),
+            ("crop_left", (0.0, CROP_MAX)),
+            ("layer17_position_x", (POSITION_MIN, POSITION_MAX)),
+            ("layer17_scale_x", (SCALE_MIN, SCALE_MAX)),
+            ("layer17_crop_right", (0.0, CROP_MAX)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = vec![
+            Routing::new(ModSource::Midi(0), "position_x", 0.25),
+            Routing::new(ModSource::Midi(0), "rotation_deg", 0.2),
+            Routing::new(ModSource::Midi(0), "crop_left", 0.4),
+            Routing::new(ModSource::Midi(0), "layer17_scale_x", 0.1),
+            Routing::new(ModSource::Midi(0), "layer17_rotation_deg", 0.2),
+            Routing::new(ModSource::Midi(0), "layer17_crop_right", 0.4),
+        ];
+        matrix.update_at_beat(0.0, 0.0);
+        let base = SpatialTransform {
+            position: [0.1, 0.2],
+            rotation_deg: 170.0,
+            fit: crate::spatial::FitMode::Fill,
+            edge: crate::spatial::EdgeMode::Repeat,
+            sampling: crate::spatial::SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let frame = matrix.frame(17);
+        let (_, master, _, _) = frame.modulate(
+            &EffectUniforms::default(),
+            &base,
+            &NtscParams::default(),
+            &TemporalParams::default(),
+        );
+        approx(master.position[0], 1.1);
+        approx(master.position[1], 0.2);
+        approx(master.rotation_deg, -154.0);
+        approx(master.crop[0], CROP_MAX * 0.2);
+        assert_eq!(master.fit, base.fit);
+        assert_eq!(master.edge, base.edge);
+        assert_eq!(master.sampling, base.sampling);
+
+        let layer = ModMatrix::modulate_layer_from_offsets(
+            16,
+            &EffectUniforms::default(),
+            &base,
+            1.0,
+            1.0,
+            30.0,
+            &frame.offsets,
+        );
+        approx(layer.transform.scale[0], 2.6);
+        approx(layer.transform.rotation_deg, -154.0);
+        approx(layer.transform.crop[2], CROP_MAX * 0.2);
+        assert_eq!(layer.transform.fit, base.fit);
+        assert_eq!(layer.transform.edge, base.edge);
+        assert_eq!(layer.transform.sampling, base.sampling);
+        assert_eq!(base.position, [0.1, 0.2]);
+        assert_eq!(base.rotation_deg, 170.0);
+        assert_eq!(base.crop, [0.0; 4]);
+    }
+
+    #[test]
+    fn stable_node_application_covers_every_registered_component() {
+        use crate::visual_rack::{
+            ImageMatte, RuntimeImageMatte, RuntimeMaskParams, RuntimeVisualNode,
+            RuntimeVisualNodeKind,
+        };
+
+        let kinds = [
+            RuntimeVisualNodeKind::Transform(SpatialTransform::default()),
+            RuntimeVisualNodeKind::DigitalColor(crate::visual_rack::DigitalColorParams::default()),
+            RuntimeVisualNodeKind::Key(crate::visual_rack::KeyParams::default()),
+            RuntimeVisualNodeKind::Cellular(crate::visual_rack::CellularParams::default()),
+            RuntimeVisualNodeKind::Shift(crate::visual_rack::ShiftParams::default()),
+            RuntimeVisualNodeKind::Grain(crate::visual_rack::GrainParams::default()),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(
+                crate::visual_rack::RectangleMask::default(),
+            )),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(
+                crate::visual_rack::EllipseMask::default(),
+            )),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(
+                RuntimeImageMatte::resolve_routes(ImageMatte::default(), &mut |_| None, &|_| false),
+            )),
+        ];
+        let empty_composition =
+            RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap();
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let node_id = NodeId::new(3 + index as u64).unwrap();
+            let rack = RuntimeVisualRack::try_from_parts(
+                vec![RuntimeVisualNode::authored(node_id, kind)],
+                Some(node_id.get() + 1),
+            )
+            .unwrap();
+            let book =
+                StableModAddressBook::from_composition(&rack, &[], &empty_composition).unwrap();
+            assert!(!book.is_empty());
+            for target in book.targets.iter().copied() {
+                let StableModTarget::Node {
+                    node_id: target_node,
+                    parameter,
+                    ..
+                } = target
+                else {
+                    continue;
+                };
+                assert_eq!(target_node, node_id);
+                let original = *rack.get(node_id).unwrap();
+                let mut changed = original;
+                apply_stable_node_offset(&mut changed, parameter, 0.123);
+                if changed == original {
+                    apply_stable_node_offset(&mut changed, parameter, -0.123);
+                }
+                assert_ne!(
+                    changed, original,
+                    "registered stable target {target} did not reach its value"
+                );
+                assert_eq!(changed.stable_id, original.stable_id);
+                assert_eq!(changed.enabled, original.enabled);
+                assert_eq!(changed.blend, original.blend);
+            }
+        }
+    }
+
+    #[test]
+    fn stable_address_and_application_support_the_257th_layer_and_reorder() {
+        use crate::visual_rack::{RuntimeVisualNode, RuntimeVisualNodeKind, ShiftParams};
+
+        let node_id = NodeId::new(3).unwrap();
+        let target_layer = StableLayerId::new(257).unwrap();
+        let target_rack = RuntimeVisualRack::try_from_parts(
+            vec![RuntimeVisualNode::authored(
+                node_id,
+                RuntimeVisualNodeKind::Shift(ShiftParams::default()),
+            )],
+            Some(4),
+        )
+        .unwrap();
+        let mut layers: Vec<_> = (1..=257)
+            .map(|id| {
+                let layer_id = StableLayerId::new(id).unwrap();
+                let rack = if layer_id == target_layer {
+                    target_rack.clone()
+                } else {
+                    RuntimeVisualRack::empty()
+                };
+                (layer_id, rack)
+            })
+            .collect();
+        let master = RuntimeVisualRack::empty();
+        let composition =
+            RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap();
+        let target = StableModTarget::parse("node/layer/257/3/amount").unwrap();
+
+        let book = StableModAddressBook::from_composition(&master, &layers, &composition).unwrap();
+        let mut frame = StableModulationFrame {
+            offsets: vec![0.0; book.len()],
+        };
+        frame.offsets[book.address(target).unwrap().index()] = 0.25;
+        let authored = layers.clone();
+        let mut modulated_master = master.clone();
+        let mut modulated_composition = composition.clone();
+        apply_stable_modulation(
+            &book,
+            &frame,
+            &mut modulated_master,
+            &mut layers,
+            &mut modulated_composition,
+        );
+        let amount = |racks: &[(StableLayerId, RuntimeVisualRack)]| {
+            let node = racks
+                .iter()
+                .find(|(layer_id, _)| *layer_id == target_layer)
+                .unwrap()
+                .1
+                .get(node_id)
+                .unwrap();
+            let RuntimeVisualNodeKind::Shift(value) = node.kind else {
+                panic!("shift topology changed");
+            };
+            value.amount
+        };
+        approx(amount(&layers), 0.25);
+        approx(amount(&authored), 0.0);
+
+        layers.reverse();
+        let reordered_book =
+            StableModAddressBook::from_composition(&master, &layers, &composition).unwrap();
+        let mut reordered_frame = StableModulationFrame {
+            offsets: vec![0.0; reordered_book.len()],
+        };
+        reordered_frame.offsets[reordered_book.address(target).unwrap().index()] = 0.2;
+        apply_stable_modulation(
+            &reordered_book,
+            &reordered_frame,
+            &mut modulated_master,
+            &mut layers,
+            &mut modulated_composition,
+        );
+        approx(amount(&layers), 0.45);
+
+        let removed = layers
+            .iter_mut()
+            .find(|(layer_id, _)| *layer_id == target_layer)
+            .unwrap()
+            .1
+            .remove(node_id);
+        assert!(removed.is_some());
+        let before_missing = layers.clone();
+        apply_stable_modulation(
+            &reordered_book,
+            &reordered_frame,
+            &mut modulated_master,
+            &mut layers,
+            &mut modulated_composition,
+        );
+        assert_eq!(layers, before_missing, "deleted stable node must be inert");
+    }
+
+    fn runtime_group_with_matte(
+        id: u64,
+        matte: Option<crate::visual_rack::RuntimeImageMatte>,
+    ) -> crate::composition::RuntimeGroup {
+        use crate::composition::{BusAssignment, GroupName, RuntimeGroup, RuntimeGroupMembers};
+
+        RuntimeGroup {
+            id: GroupId::new(id).unwrap(),
+            name: GroupName::new(format!("Group {id}")).unwrap(),
+            members: RuntimeGroupMembers::try_from_vec(Vec::new()).unwrap(),
+            opacity: 1.0,
+            transform: SpatialTransform::default(),
+            rack: RuntimeVisualRack::empty(),
+            matte,
+            solo: false,
+            bypass: false,
+            bus: BusAssignment::Program,
+        }
+    }
+
+    fn default_runtime_matte() -> crate::visual_rack::RuntimeImageMatte {
+        crate::visual_rack::RuntimeImageMatte::resolve_routes(
+            crate::visual_rack::ImageMatte::default(),
+            &mut |_| None,
+            &|_| false,
+        )
+    }
+
+    #[test]
+    fn group_matte_and_bus_targets_are_bounded_stable_and_inert_when_missing() {
+        use crate::composition::RuntimeRootItem;
+        use crate::visual_rack::MatteChannel;
+
+        let first_id = GroupId::new(7).unwrap();
+        let target_id = GroupId::new(9).unwrap();
+        let mut target_matte = default_runtime_matte();
+        target_matte.channel = MatteChannel::Red;
+        target_matte.invert = true;
+        target_matte.amount = 0.2;
+        target_matte.threshold = 0.6;
+        target_matte.softness = 0.1;
+        let first = runtime_group_with_matte(first_id.get(), Some(default_runtime_matte()));
+        let target_group = runtime_group_with_matte(target_id.get(), Some(target_matte));
+        let composition = RuntimeComposition::try_from_parts(
+            vec![first.clone(), target_group.clone()],
+            vec![
+                RuntimeRootItem::Group { group_id: first_id },
+                RuntimeRootItem::Group {
+                    group_id: target_id,
+                },
+            ],
+            Some(10),
+            0.25,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::empty();
+        let book = StableModAddressBook::from_composition(&master, &[], &composition).unwrap();
+        let amount_target = StableModTarget::parse("group/9/matte.amount").unwrap();
+        let threshold_target = StableModTarget::parse("group/9/matte.threshold").unwrap();
+        let softness_target = StableModTarget::parse("group/9/matte.softness").unwrap();
+        let bus_target = StableModTarget::parse("composition/bus_crossfade").unwrap();
+        assert_eq!(amount_target.range(), [0.0, 1.0]);
+        assert_eq!(threshold_target.range(), [0.0, 1.0]);
+        assert_eq!(softness_target.range(), [0.0, 0.5]);
+        assert_eq!(bus_target.range(), [0.0, 1.0]);
+
+        let mut frame = StableModulationFrame {
+            offsets: vec![0.0; book.len()],
+        };
+        for (target, offset) in [
+            (amount_target, 0.25),
+            (threshold_target, -0.3),
+            (softness_target, 0.2),
+            (bus_target, 0.4),
+        ] {
+            frame.offsets[book.address(target).unwrap().index()] = offset;
+            approx(frame.target_offset(&book, target), offset);
+        }
+        let mut evaluated = composition.clone();
+        apply_stable_modulation(
+            &book,
+            &frame,
+            &mut RuntimeVisualRack::empty(),
+            &mut [],
+            &mut evaluated,
+        );
+        let matte = evaluated.group(target_id).unwrap().matte.unwrap();
+        approx(matte.amount, 0.45);
+        approx(matte.threshold, 0.3);
+        approx(matte.softness, 0.3);
+        approx(evaluated.bus_crossfade(), 0.65);
+        assert_eq!(matte.channel, MatteChannel::Red);
+        assert!(matte.invert);
+        assert_eq!(
+            composition.group(target_id).unwrap().matte,
+            Some(target_matte)
+        );
+
+        // Rebuilding in the opposite internal group order must still bind by
+        // GroupId, never by address order or root position.
+        let reordered = RuntimeComposition::try_from_parts(
+            vec![target_group, first],
+            vec![
+                RuntimeRootItem::Group { group_id: first_id },
+                RuntimeRootItem::Group {
+                    group_id: target_id,
+                },
+            ],
+            Some(10),
+            0.25,
+        )
+        .unwrap();
+        let reordered_book =
+            StableModAddressBook::from_composition(&master, &[], &reordered).unwrap();
+        let mut reordered_frame = StableModulationFrame {
+            offsets: vec![0.0; reordered_book.len()],
+        };
+        reordered_frame.offsets[reordered_book.address(amount_target).unwrap().index()] = 0.1;
+        let mut reordered_evaluated = reordered.clone();
+        apply_stable_modulation(
+            &reordered_book,
+            &reordered_frame,
+            &mut RuntimeVisualRack::empty(),
+            &mut [],
+            &mut reordered_evaluated,
+        );
+        approx(
+            reordered_evaluated
+                .group(target_id)
+                .unwrap()
+                .matte
+                .unwrap()
+                .amount,
+            0.3,
+        );
+        approx(
+            reordered_evaluated
+                .group(first_id)
+                .unwrap()
+                .matte
+                .unwrap()
+                .amount,
+            1.0,
+        );
+
+        let no_matte = RuntimeComposition::try_from_parts(
+            vec![runtime_group_with_matte(target_id.get(), None)],
+            vec![RuntimeRootItem::Group {
+                group_id: target_id,
+            }],
+            Some(10),
+            0.5,
+        )
+        .unwrap();
+        let missing_book = StableModAddressBook::from_composition(&master, &[], &no_matte).unwrap();
+        assert!(missing_book.address(amount_target).is_none());
+        assert!(missing_book.address(bus_target).is_some());
+    }
+
+    #[test]
+    fn deleted_group_targets_become_typed_tombstones_without_touching_composition_values() {
+        let removed = GroupId::new(9).unwrap();
+        let survivor = GroupId::new(7).unwrap();
+        let mut matrix = ModMatrix::new();
+        matrix.routings = vec![
+            Routing::new(ModSource::Lfo(0), "group/9/matte.amount", 0.4),
+            Routing::new(ModSource::Lfo(1), "group/9/opacity", -0.2),
+            Routing::new(ModSource::Lfo(2), "group/7/matte.softness", 0.3),
+            Routing::new(ModSource::Lfo(3), "composition/bus_crossfade", 0.5),
+        ];
+
+        matrix.tombstone_group_targets_after_remove(removed);
+
+        for (index, parameter) in [GroupModParameter::MatteAmount, GroupModParameter::Opacity]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(matrix.routings[index].stable_target(), None);
+            assert_eq!(
+                matrix.routings[index].saved_missing_target(),
+                Some(SavedStableModTarget::MissingGroup {
+                    group_id: removed,
+                    missing_target: SavedMissingTarget::GroupValue { parameter },
+                })
+            );
+            assert_eq!(matrix.routings[index].cached_value(), 0.0);
+        }
+        assert_eq!(
+            matrix.routings[2].stable_target(),
+            Some(StableModTarget::GroupValue {
+                group_id: survivor,
+                parameter: GroupModParameter::MatteSoftness,
+            })
+        );
+        assert_eq!(
+            matrix.routings[3].stable_target(),
+            Some(StableModTarget::CompositionValue {
+                parameter: CompositionModParameter::BusCrossfade,
+            })
+        );
     }
 }

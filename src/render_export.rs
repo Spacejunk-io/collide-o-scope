@@ -10,7 +10,16 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::composition::{CompositionTree, RuntimeComposition};
 use crate::effects::EffectUniforms;
+use crate::evaluated_frame::evaluated_composition::{
+    AdvancedNtscPath, CompositionPlanInput, EvaluatedCompositionPlan,
+};
+use crate::evaluated_frame::{
+    EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, ResolvedImageInput,
+    SourceTap,
+};
+use crate::image_routing::{LayerMatte, StableLayerId};
 use crate::layers::BlendMode;
 use crate::media_safety::{MediaDeviceLimits, MediaSafetyPolicy};
 use crate::ntsc::{
@@ -19,12 +28,30 @@ use crate::ntsc::{
     SelectiveNtscBatch, SelectiveNtscGeneration, SelectiveNtscLayerDescriptor, SelectiveNtscPlan,
 };
 use crate::patch::PatchState;
+use crate::performance::SavedLayerPosition;
+use crate::renderer::blend::composite_shader_source;
+use crate::renderer::composition::{
+    CompositionEncodeKind, CompositionFrameTiming, CompositionGpuExecutor,
+    CompositionMotionFrameInput, CompositionPreparedKind, CompositionSourceDescriptor,
+    COMPOSITION_PRESENT_FORMAT,
+};
+use crate::renderer::compositor::{
+    encode_matte_composite, encode_program_history_copy, validate_selective_matte_topology,
+    ImageRoutingGpuResources, ImageTapTexture, MatteCompositePipeline, MatteCompositeUniforms,
+    MatteResourceLimits, MatteResourcePlan,
+};
 use crate::renderer::state::{
     conditional_layer_slots, master_fx_composition_path, visible_stack_indices,
     MasterFxCompositionPath,
 };
+use crate::spatial::{EffectPassUniforms, SpatialTransform};
+use crate::transport::{
+    ClipTransportConfig, ClipTransportState, FrameSelection, ProgramTransportTick,
+    TransportTimeline,
+};
 use crate::video::decoder::{validate_media_dimensions, MAX_MEDIA_PIXELS};
-use crate::video::{DecodedStillImage, VideoDecoder};
+use crate::video::{CodecMotionFrame, DecodedStillImage, VideoDecoder};
+use crate::visual_rack::{CreativeResourceLimits, RuntimeVisualRack};
 
 /// App shutdown must not wait forever on a wedged graphics backend. By the
 /// time this expires ExportJob::cancel has already killed/reaped ffmpeg,
@@ -42,6 +69,11 @@ const OUTCOME_CANCELLED: u8 = 4;
 /// contains an excessive number of unavailable layers.
 const MAX_EXPORT_WARNINGS: usize = 128;
 const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 1;
+const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
+const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
+const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
+const MAX_EXPORT_MOTION_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
 
 const fn transparent_accumulation_clear() -> wgpu::Color {
     wgpu::Color {
@@ -85,6 +117,166 @@ pub struct ExportConfig {
     pub media_safety_policy: MediaSafetyPolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportMotionScopeIdentity {
+    Master,
+    Layer {
+        saved_position: u32,
+        stable_id: u64,
+        source_tap_id: u64,
+    },
+}
+
+/// Bounded, frame-local motion provenance published only after the
+/// corresponding encoded frame is accepted. Hidden field/carrier pixels and
+/// raw codec records never enter this report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportMotionScopeMetadata {
+    pub scope: ExportMotionScopeIdentity,
+    pub algorithm_version: u16,
+    pub requested_source: crate::motion::MotionFieldSource,
+    pub lattice_quality: crate::motion::MotionLatticeQuality,
+    pub source_origin: crate::motion::MotionFieldOrigin,
+    pub source_diagnostic: crate::motion::MotionSourceDiagnostic,
+    pub codec_provenance: Option<crate::video::CodecMotionProvenance>,
+    pub source_generation: Option<u64>,
+    pub frame_ordinal: Option<u64>,
+    pub donor_saved_position: Option<u32>,
+    pub donor_stable_id: Option<u64>,
+    pub carrier: crate::motion::MotionCarrier,
+    pub transplant_admitted: bool,
+    pub shutter_active: bool,
+    pub shutter_angle_degrees: f32,
+    pub shutter_quality: crate::motion::CurvedShutterQuality,
+    pub shutter_sample_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportMotionMetadata {
+    pub accepted_frame: Option<u64>,
+    pub algorithm_version: u16,
+    pub scopes: Vec<ExportMotionScopeMetadata>,
+    pub scopes_truncated: bool,
+}
+
+impl Default for ExportMotionMetadata {
+    fn default() -> Self {
+        Self {
+            accepted_frame: None,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: Vec::new(),
+            scopes_truncated: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MotionSidecarArtifact {
+    file_name: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    duration_seconds: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum MotionSidecarScopeIdentity {
+    Master,
+    Layer {
+        saved_position: u32,
+        stable_id: u64,
+        source_tap_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MotionSidecarSource {
+    saved_position: u32,
+    stable_id: u64,
+    source_tap_id: u64,
+    kind: String,
+    logical_name: String,
+    persisted_reference: String,
+    fingerprint_sha256: Option<String>,
+    fingerprint_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MotionSidecarAuthoredScope {
+    scope: MotionSidecarScopeIdentity,
+    algorithm_version: u16,
+    requested_source: String,
+    lattice_quality: String,
+    carrier: String,
+    donor_saved_position: Option<u32>,
+    donor_stable_id: Option<u64>,
+    shutter_angle_degrees: f32,
+    shutter_quality: String,
+    shutter_sample_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct MotionSidecarScopeState {
+    scope: MotionSidecarScopeIdentity,
+    algorithm_version: u16,
+    requested_source: String,
+    lattice_quality: String,
+    source_origin: String,
+    source_diagnostic: String,
+    codec_provenance: Option<String>,
+    source_generation: Option<u64>,
+    frame_ordinal: Option<u64>,
+    donor_saved_position: Option<u32>,
+    donor_stable_id: Option<u64>,
+    carrier: String,
+    transplant_admitted: bool,
+    shutter_active: bool,
+    shutter_angle_degrees: f32,
+    shutter_quality: String,
+    shutter_sample_count: u8,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MotionSidecarDistinctState {
+    first_accepted_frame: u64,
+    state: MotionSidecarScopeState,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct MotionSidecarLastFrame {
+    accepted_frame: u64,
+    scopes: Vec<MotionSidecarScopeState>,
+    scopes_truncated: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExportMotionSidecar {
+    schema_version: u16,
+    artifact: MotionSidecarArtifact,
+    algorithm_version: u16,
+    cross_gpu_pixel_identity_guaranteed: bool,
+    sources: Vec<MotionSidecarSource>,
+    sources_truncated: bool,
+    authored_scopes: Vec<MotionSidecarAuthoredScope>,
+    authored_scopes_truncated: bool,
+    distinct_dynamic_states: Vec<MotionSidecarDistinctState>,
+    distinct_dynamic_states_truncated: bool,
+    last_accepted_frame: Option<MotionSidecarLastFrame>,
+    warnings: Vec<String>,
+}
+
+struct ExportMotionSidecarAccumulator {
+    artifact: MotionSidecarArtifact,
+    sources: Vec<MotionSidecarSource>,
+    sources_truncated: bool,
+    authored_scopes: Vec<MotionSidecarAuthoredScope>,
+    authored_scopes_truncated: bool,
+    distinct: Vec<MotionSidecarDistinctState>,
+    distinct_truncated: bool,
+    last: Option<MotionSidecarLastFrame>,
+}
+
 /// Shared state for progress/cancellation between the render thread and the UI.
 pub struct ExportProgress {
     /// 0..10000 representing 0.0%..100.0%
@@ -101,6 +293,7 @@ pub struct ExportProgress {
     /// not change a successful export into a failure; callers surface the
     /// messages separately from `error`.
     warnings: Mutex<Vec<String>>,
+    motion_metadata: Mutex<ExportMotionMetadata>,
     /// Atomic arbitration between a cancellation request and success/failure.
     /// Public cancellation changes RUNNING -> CANCEL_REQUESTED without locks;
     /// only an owner that has completed external cleanup may publish a
@@ -134,6 +327,7 @@ impl ExportProgress {
             done: AtomicBool::new(false),
             error: std::sync::Mutex::new(String::new()),
             warnings: Mutex::new(Vec::new()),
+            motion_metadata: Mutex::new(ExportMotionMetadata::default()),
             outcome: AtomicU8::new(OUTCOME_RUNNING),
             terminal: Mutex::new(()),
             output_started: AtomicBool::new(false),
@@ -157,6 +351,24 @@ impl ExportProgress {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "bounded M4 export telemetry is a frozen UI seam pending control-panel publication"
+    )]
+    pub fn motion_metadata(&self) -> ExportMotionMetadata {
+        self.motion_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn publish_motion_metadata(&self, metadata: ExportMotionMetadata) {
+        *self
+            .motion_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = metadata;
     }
 
     fn record_warning(&self, warning: impl AsRef<str>) {
@@ -460,7 +672,16 @@ fn remove_started_output(progress: &ExportProgress, output_path: Option<&str>) -
     if !progress.output_started.load(Ordering::Acquire) {
         return None;
     }
-    output_path.and_then(|path| remove_partial_output(path).err())
+    let path = output_path?;
+    let mut errors = Vec::new();
+    if let Err(error) = remove_partial_output(path) {
+        errors.push(error);
+    }
+    let sidecar = motion_sidecar_path(path);
+    if let Err(error) = remove_partial_path(&sidecar, "motion sidecar") {
+        errors.push(error);
+    }
+    (!errors.is_empty()).then(|| errors.join("; "))
 }
 
 /// Publish cancellation after process/file cleanup but before the large wgpu
@@ -488,17 +709,153 @@ fn publish_cancelled_terminal(progress: &ExportProgress, output_path: Option<&st
 }
 
 fn remove_partial_output(path: &str) -> Result<(), String> {
+    remove_partial_path(std::path::Path::new(path), "partial output")
+}
+
+fn remove_partial_path(path: &std::path::Path, label: &str) -> Result<(), String> {
     for attempt in 0..5 {
         match std::fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) if attempt == 4 => {
-                return Err(format!("failed to remove partial output '{path}': {error}"));
+                return Err(format!(
+                    "failed to remove {label} '{}': {error}",
+                    path.display()
+                ));
             }
             Err(_) => std::thread::sleep(Duration::from_millis(20)),
         }
     }
     unreachable!()
+}
+
+fn motion_sidecar_path(output_path: &str) -> std::path::PathBuf {
+    let mut path = std::ffi::OsString::from(output_path);
+    path.push(".motion.json");
+    std::path::PathBuf::from(path)
+}
+
+fn motion_sidecar_temp_path(sidecar: &std::path::Path) -> std::path::PathBuf {
+    let parent = sidecar
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut file_name = sidecar
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("motion.json"))
+        .to_os_string();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    file_name.push(format!(".tmp-{}-{nonce}", std::process::id()));
+    parent.join(file_name)
+}
+
+#[cfg(windows)]
+fn atomic_replace_motion_sidecar(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Same-directory MoveFileEx with replacement is the Windows atomic
+    // publication primitive. WRITE_THROUGH keeps the rename from being
+    // reported before the filesystem receives it.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_motion_sidecar(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+fn write_motion_sidecar_atomic(
+    output_path: &str,
+    sidecar: &ExportMotionSidecar,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(sidecar)
+        .map_err(|error| format!("serialize export motion sidecar: {error}"))?;
+    if bytes.len() > MAX_EXPORT_MOTION_SIDECAR_BYTES {
+        return Err(format!(
+            "export motion sidecar is {} bytes; limit is {}",
+            bytes.len(),
+            MAX_EXPORT_MOTION_SIDECAR_BYTES
+        ));
+    }
+    let sidecar_path = motion_sidecar_path(output_path);
+    let temp_path = motion_sidecar_temp_path(&sidecar_path);
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| {
+                format!(
+                    "create temporary export motion sidecar '{}': {error}",
+                    temp_path.display()
+                )
+            })?;
+        file.write_all(&bytes).map_err(|error| {
+            format!(
+                "write temporary export motion sidecar '{}': {error}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            format!(
+                "sync temporary export motion sidecar '{}': {error}",
+                temp_path.display()
+            )
+        })?;
+        drop(file);
+        atomic_replace_motion_sidecar(&temp_path, &sidecar_path).map_err(|error| {
+            format!(
+                "commit export motion sidecar '{}': {error}",
+                sidecar_path.display()
+            )
+        })?;
+        if let Some(parent) = sidecar_path.parent() {
+            if let Ok(directory) = std::fs::File::open(parent) {
+                directory.sync_all().map_err(|error| {
+                    format!(
+                        "sync export motion sidecar directory '{}': {error}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result
 }
 
 fn check_cancelled(progress: &ExportProgress) -> Result<(), String> {
@@ -873,13 +1230,50 @@ fn scoped_export_gpu_operation<T>(
 }
 
 /// Internal layer state for offline rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportMotionSourceKind {
+    Video,
+    Still,
+    SpoutBlack,
+    UnavailableBlack,
+}
+
+#[derive(Debug, Clone)]
+struct ExportMotionSourceRecord {
+    kind: ExportMotionSourceKind,
+    logical_name: String,
+    persisted_reference: String,
+    fingerprint: Option<crate::media_source::ContentIdentity>,
+}
+
+impl ExportMotionSourceRecord {
+    fn unavailable(layer: &crate::patch::LayerConfig) -> Self {
+        let (logical_name, persisted_reference) = active_export_clip_source(layer);
+        Self {
+            kind: if crate::layers::spout_sender_from_source_path(persisted_reference).is_some() {
+                ExportMotionSourceKind::SpoutBlack
+            } else {
+                ExportMotionSourceKind::UnavailableBlack
+            },
+            logical_name: logical_name.to_owned(),
+            persisted_reference: persisted_reference.to_owned(),
+            fingerprint: None,
+        }
+    }
+}
+
 struct ExportLayer {
     /// Index in the saved patch. Failed-to-open layers must not shift
     /// layer-specific modulation routes onto a different video.
     source_index: usize,
+    motion_source: ExportMotionSourceRecord,
     /// `None` is an explicit deterministic-black placeholder for a live,
     /// missing, or undecodable source that cannot be sampled offline.
     decoder: Option<VideoDecoder>,
+    /// Sparse decoder metadata committed only after the matching RGBA upload
+    /// succeeds. Stills, offline Spout substitutions, and reverse-cache hits
+    /// remain explicitly absent rather than inventing a lattice here.
+    codec_motion: Option<CodecMotionFrame>,
     /// Retain the still's Expert reservation for the lifetime of its uploaded
     /// texture. The decoded bytes are also retained within the conservative
     /// six-RGBA-buffer planning estimate.
@@ -887,11 +1281,17 @@ struct ExportLayer {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     effects: EffectUniforms,
+    transform: SpatialTransform,
     opacity: f32,
     blend_mode: BlendMode,
     bypass_master_fx: bool,
+    matte: LayerMatte,
     reroll_on_loop: bool,
     consumed_loop_generation: u64,
+    /// Pure source-time state shared with live playback. Offline rendering
+    /// owns no wall-clock pacer: every output frame supplies one exact program
+    /// tick and decodes the returned absolute source selection.
+    transport: ExportClipTransport,
     speed: f32,
     visible: bool,
     paused: bool,
@@ -900,12 +1300,416 @@ struct ExportLayer {
     height: u32,
 }
 
+fn motion_field_source_key(value: crate::motion::MotionFieldSource) -> &'static str {
+    match value {
+        crate::motion::MotionFieldSource::Auto => "auto",
+        crate::motion::MotionFieldSource::CodecVectors => "codec_vectors",
+        crate::motion::MotionFieldSource::Lattice => "lattice",
+    }
+}
+
+fn motion_lattice_quality_key(value: crate::motion::MotionLatticeQuality) -> &'static str {
+    match value {
+        crate::motion::MotionLatticeQuality::Draft => "draft",
+        crate::motion::MotionLatticeQuality::Live => "live",
+        crate::motion::MotionLatticeQuality::High => "high",
+    }
+}
+
+fn motion_carrier_key(value: crate::motion::MotionCarrier) -> &'static str {
+    match value {
+        crate::motion::MotionCarrier::Transparent => "transparent",
+        crate::motion::MotionCarrier::Black => "black",
+        crate::motion::MotionCarrier::FirstSourceFrame => "first_source_frame",
+    }
+}
+
+fn shutter_quality_key(value: crate::motion::CurvedShutterQuality) -> &'static str {
+    match value {
+        crate::motion::CurvedShutterQuality::Sharp => "sharp",
+        crate::motion::CurvedShutterQuality::Draft => "draft",
+        crate::motion::CurvedShutterQuality::Live => "live",
+        crate::motion::CurvedShutterQuality::High => "high",
+    }
+}
+
+fn motion_origin_key(value: crate::motion::MotionFieldOrigin) -> &'static str {
+    match value {
+        crate::motion::MotionFieldOrigin::None => "none",
+        crate::motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
+        crate::motion::MotionFieldOrigin::Lattice => "lattice",
+        crate::motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+    }
+}
+
+fn motion_diagnostic_key(value: crate::motion::MotionSourceDiagnostic) -> &'static str {
+    match value {
+        crate::motion::MotionSourceDiagnostic::None => "none",
+        crate::motion::MotionSourceDiagnostic::CodecUnavailable => "codec_unavailable",
+        crate::motion::MotionSourceDiagnostic::CodecUnavailableFallback => {
+            "codec_unavailable_fallback"
+        }
+    }
+}
+
+fn codec_provenance_key(value: crate::video::CodecMotionProvenance) -> &'static str {
+    match value {
+        crate::video::CodecMotionProvenance::FfmpegExportMvs => "ffmpeg_export_mvs",
+    }
+}
+
+fn export_motion_source_kind_key(value: ExportMotionSourceKind) -> &'static str {
+    match value {
+        ExportMotionSourceKind::Video => "video",
+        ExportMotionSourceKind::Still => "still",
+        ExportMotionSourceKind::SpoutBlack => "spout_deterministic_black",
+        ExportMotionSourceKind::UnavailableBlack => "unavailable_deterministic_black",
+    }
+}
+
+fn sidecar_scope_identity(value: ExportMotionScopeIdentity) -> MotionSidecarScopeIdentity {
+    match value {
+        ExportMotionScopeIdentity::Master => MotionSidecarScopeIdentity::Master,
+        ExportMotionScopeIdentity::Layer {
+            saved_position,
+            stable_id,
+            source_tap_id,
+        } => MotionSidecarScopeIdentity::Layer {
+            saved_position,
+            stable_id,
+            source_tap_id,
+        },
+    }
+}
+
+fn donor_identity(params: crate::motion::MotionParams) -> (Option<u32>, Option<u64>) {
+    match params.transplant.donor {
+        crate::motion::MotionDonor::None => (None, None),
+        crate::motion::MotionDonor::Selected {
+            layer_id,
+            saved_position,
+        } => (Some(saved_position.get()), Some(layer_id.get())),
+        crate::motion::MotionDonor::Missing { saved_position } => {
+            (Some(saved_position.get()), None)
+        }
+    }
+}
+
+fn sidecar_authored_scope(
+    scope: MotionSidecarScopeIdentity,
+    params: crate::motion::MotionParams,
+) -> MotionSidecarAuthoredScope {
+    let params = params.sanitized();
+    let (donor_saved_position, donor_stable_id) = donor_identity(params);
+    MotionSidecarAuthoredScope {
+        scope,
+        algorithm_version: params.algorithm_version,
+        requested_source: motion_field_source_key(params.field_source).to_owned(),
+        lattice_quality: motion_lattice_quality_key(params.lattice_quality).to_owned(),
+        carrier: motion_carrier_key(params.transplant.carrier).to_owned(),
+        donor_saved_position,
+        donor_stable_id,
+        shutter_angle_degrees: params.shutter.angle_degrees,
+        shutter_quality: shutter_quality_key(params.shutter.quality).to_owned(),
+        shutter_sample_count: params.shutter.quality.sample_count(),
+    }
+}
+
+fn sidecar_scope_state(value: &ExportMotionScopeMetadata) -> MotionSidecarScopeState {
+    MotionSidecarScopeState {
+        scope: sidecar_scope_identity(value.scope),
+        algorithm_version: value.algorithm_version,
+        requested_source: motion_field_source_key(value.requested_source).to_owned(),
+        lattice_quality: motion_lattice_quality_key(value.lattice_quality).to_owned(),
+        source_origin: motion_origin_key(value.source_origin).to_owned(),
+        source_diagnostic: motion_diagnostic_key(value.source_diagnostic).to_owned(),
+        codec_provenance: value
+            .codec_provenance
+            .map(codec_provenance_key)
+            .map(str::to_owned),
+        source_generation: value.source_generation,
+        frame_ordinal: value.frame_ordinal,
+        donor_saved_position: value.donor_saved_position,
+        donor_stable_id: value.donor_stable_id,
+        carrier: motion_carrier_key(value.carrier).to_owned(),
+        transplant_admitted: value.transplant_admitted,
+        shutter_active: value.shutter_active,
+        shutter_angle_degrees: value.shutter_angle_degrees,
+        shutter_quality: shutter_quality_key(value.shutter_quality).to_owned(),
+        shutter_sample_count: value.shutter_sample_count,
+    }
+}
+
+fn same_distinct_motion_state(
+    left: &MotionSidecarScopeState,
+    right: &MotionSidecarScopeState,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.source_generation = None;
+    left.frame_ordinal = None;
+    right.source_generation = None;
+    right.frame_ordinal = None;
+    left == right
+}
+
+impl ExportMotionSidecarAccumulator {
+    fn new(
+        config: &ExportConfig,
+        graph: &ExportCreativeGraph,
+        layers: &[ExportLayer],
+        master: crate::motion::MotionParams,
+        layer_motion: &[crate::motion::MotionParams],
+    ) -> Self {
+        let mut sources = Vec::new();
+        let mut sources_truncated = false;
+        for layer in layers {
+            if sources.len() == MAX_EXPORT_MOTION_SIDECAR_SOURCES {
+                sources_truncated = true;
+                break;
+            }
+            let Some(stable_id) = graph.layer_ids.get(layer.source_index).copied() else {
+                sources_truncated = true;
+                continue;
+            };
+            let fingerprint = layer.motion_source.fingerprint.as_ref();
+            sources.push(MotionSidecarSource {
+                saved_position: u32::try_from(layer.source_index).unwrap_or(u32::MAX),
+                stable_id: stable_id.get(),
+                source_tap_id: export_selective_layer_id(layer.source_index),
+                kind: export_motion_source_kind_key(layer.motion_source.kind).to_owned(),
+                logical_name: bounded_export_warning(&layer.motion_source.logical_name),
+                persisted_reference: bounded_export_warning(
+                    &layer.motion_source.persisted_reference,
+                ),
+                fingerprint_sha256: fingerprint.map(|identity| identity.sha256.clone()),
+                fingerprint_bytes: fingerprint.map(|identity| identity.byte_len),
+            });
+        }
+
+        let mut authored_scopes = vec![sidecar_authored_scope(
+            MotionSidecarScopeIdentity::Master,
+            master,
+        )];
+        let mut authored_scopes_truncated = false;
+        for (layer, params) in layers.iter().zip(layer_motion) {
+            if authored_scopes.len() == MAX_EXPORT_MOTION_SIDECAR_SCOPES {
+                authored_scopes_truncated = true;
+                break;
+            }
+            let Some(stable_id) = graph.layer_ids.get(layer.source_index).copied() else {
+                authored_scopes_truncated = true;
+                continue;
+            };
+            authored_scopes.push(sidecar_authored_scope(
+                MotionSidecarScopeIdentity::Layer {
+                    saved_position: u32::try_from(layer.source_index).unwrap_or(u32::MAX),
+                    stable_id: stable_id.get(),
+                    source_tap_id: export_selective_layer_id(layer.source_index),
+                },
+                *params,
+            ));
+        }
+        Self {
+            artifact: MotionSidecarArtifact {
+                file_name: std::path::Path::new(&config.output_path)
+                    .file_name()
+                    .map(|name| bounded_export_warning(&name.to_string_lossy()))
+                    .unwrap_or_default(),
+                width: config.width,
+                height: config.height,
+                fps: config.fps,
+                duration_seconds: config.duration_secs,
+            },
+            sources,
+            sources_truncated,
+            authored_scopes,
+            authored_scopes_truncated,
+            distinct: Vec::new(),
+            distinct_truncated: false,
+            last: None,
+        }
+    }
+
+    fn observe_accepted(&mut self, metadata: &ExportMotionMetadata) {
+        let Some(frame) = metadata.accepted_frame else {
+            return;
+        };
+        let scopes_truncated =
+            metadata.scopes_truncated || metadata.scopes.len() > MAX_EXPORT_MOTION_SIDECAR_SCOPES;
+        let scopes = metadata
+            .scopes
+            .iter()
+            .take(MAX_EXPORT_MOTION_SIDECAR_SCOPES)
+            .map(sidecar_scope_state)
+            .collect::<Vec<_>>();
+        for state in &scopes {
+            if self
+                .distinct
+                .iter()
+                .any(|existing| same_distinct_motion_state(&existing.state, state))
+            {
+                continue;
+            }
+            if self.distinct.len() == MAX_EXPORT_MOTION_DISTINCT_STATES {
+                self.distinct_truncated = true;
+                continue;
+            }
+            self.distinct.push(MotionSidecarDistinctState {
+                first_accepted_frame: frame,
+                state: state.clone(),
+            });
+        }
+        self.last = Some(MotionSidecarLastFrame {
+            accepted_frame: frame,
+            scopes,
+            scopes_truncated,
+        });
+    }
+
+    fn finish(self, warnings: Vec<String>) -> ExportMotionSidecar {
+        ExportMotionSidecar {
+            schema_version: EXPORT_MOTION_SIDECAR_SCHEMA_VERSION,
+            artifact: self.artifact,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            cross_gpu_pixel_identity_guaranteed: false,
+            sources: self.sources,
+            sources_truncated: self.sources_truncated,
+            authored_scopes: self.authored_scopes,
+            authored_scopes_truncated: self.authored_scopes_truncated,
+            distinct_dynamic_states: self.distinct,
+            distinct_dynamic_states_truncated: self.distinct_truncated,
+            last_accepted_frame: self.last,
+            warnings: warnings
+                .into_iter()
+                .take(MAX_EXPORT_WARNINGS)
+                .map(|warning| bounded_export_warning(&warning))
+                .collect(),
+        }
+    }
+}
+
+/// Export-side storage around the engine-wide pure transport contract.
+/// Decoder/GPU ownership remains on [`ExportLayer`]; this value contains only
+/// the active Slot's authored law, saved phase, and immutable source facts.
+#[derive(Debug, Clone, Copy)]
+struct ExportClipTransport {
+    authored: ClipTransportConfig,
+    state: ClipTransportState,
+    source_duration_seconds: f64,
+    source_frame_count: u64,
+}
+
+impl ExportClipTransport {
+    fn new(
+        authored: ClipTransportConfig,
+        saved_playhead: crate::transport::NormalizedTime,
+        source_duration_seconds: f64,
+        source_frame_count: u64,
+    ) -> Self {
+        let authored = authored.sanitized();
+        Self {
+            authored,
+            state: ClipTransportState::at(saved_playhead, authored.direction),
+            source_duration_seconds: finite_nonnegative_export(source_duration_seconds),
+            source_frame_count: source_frame_count.min(u64::from(u32::MAX)),
+        }
+    }
+
+    fn from_layer_config(
+        layer: &crate::patch::LayerConfig,
+        source_duration_seconds: f64,
+        source_frame_count: u64,
+    ) -> Self {
+        let selected = layer
+            .active_clip_slot
+            .and_then(|id| layer.clip_slots.get(id))
+            .or_else(|| layer.clip_slots.iter().next());
+        let (authored, saved_playhead) = selected.map_or_else(
+            || {
+                let fallback = crate::performance::ClipSlotConfig::from_legacy(
+                    layer.filename.clone(),
+                    layer.source_path.clone(),
+                    layer.speed,
+                    layer.fps,
+                );
+                (fallback.transport, fallback.saved_playhead)
+            },
+            |slot| (slot.transport.sanitized(), slot.saved_playhead),
+        );
+        Self::new(
+            authored,
+            saved_playhead,
+            source_duration_seconds,
+            source_frame_count,
+        )
+    }
+
+    fn select(
+        &mut self,
+        config: ClipTransportConfig,
+        mut tick: ProgramTransportTick,
+    ) -> FrameSelection {
+        tick.source_duration_seconds = self.source_duration_seconds;
+        tick.source_frame_count = self.source_frame_count;
+        let (state, selection) = TransportTimeline::select(&config, self.state, tick);
+        self.state = state;
+        selection
+    }
+
+    /// Select the exact first image before any GPU render can observe the
+    /// source texture. This establishes in/out and beat-loop clamping while
+    /// retaining the persisted playhead and without advancing program time.
+    fn seed_selection(&mut self) -> FrameSelection {
+        self.select(
+            self.authored,
+            ProgramTransportTick {
+                program_running: false,
+                media_running: false,
+                ..ProgramTransportTick::default()
+            },
+        )
+    }
+}
+
+fn finite_nonnegative_export(value: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn estimated_export_source_frames(duration_seconds: f64, fps: f32) -> u64 {
+    let frames = finite_nonnegative_export(duration_seconds) * f64::from(fps.max(0.0));
+    if frames.is_finite() && frames > 0.0 {
+        frames.round().clamp(1.0, f64::from(u32::MAX)) as u64
+    } else {
+        0
+    }
+}
+
+fn export_transport_fps(transport: &ExportClipTransport, fallback: f32) -> f32 {
+    transport
+        .authored
+        .sample_fps
+        .unwrap_or_else(|| {
+            if fallback.is_finite() && fallback > 0.0 {
+                f64::from(fallback)
+            } else {
+                30.0
+            }
+        })
+        .clamp(0.25, 480.0) as f32
+}
+
 /// Frame-local, morphable render values detached from decoder/GPU ownership.
 /// Keeping these values named prevents positional mistakes as the persisted
 /// layer state grows.
 #[derive(Clone, Copy)]
 struct ExportFrameLayerBase {
     effects: EffectUniforms,
+    transform: SpatialTransform,
     opacity: f32,
     speed: f32,
     fps: f32,
@@ -919,6 +1723,7 @@ impl From<&ExportLayer> for ExportFrameLayerBase {
     fn from(layer: &ExportLayer) -> Self {
         Self {
             effects: layer.effects,
+            transform: layer.transform,
             opacity: layer.opacity,
             speed: layer.speed,
             fps: layer.fps,
@@ -928,6 +1733,56 @@ impl From<&ExportLayer> for ExportFrameLayerBase {
             bypass_master_fx: layer.bypass_master_fx,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ExportMorphOverrides {
+    fps: bool,
+    effects: bool,
+}
+
+/// Retain the historical additive `layerN_speed`/`layerN_fps` modulation
+/// response without narrowing the canonical transport law. The modulation
+/// engine still evaluates its legacy proxy domains (0.25..4 and 1..240); only
+/// that signed delta is applied around the Slot's wider 0..16 / 0.25..480
+/// authored value. A zero route is therefore bit-stable even at rate 8.
+fn modulated_export_transport_config(
+    modulation: &crate::modulation::ModulationFrame,
+    layer_index: usize,
+    authored: ClipTransportConfig,
+    base: &ExportFrameLayerBase,
+    morph: ExportMorphOverrides,
+) -> ClipTransportConfig {
+    let authored_rate = finite_nonnegative_export(f64::from(base.speed)).clamp(0.0, 16.0);
+    let rate_proxy = authored_rate.clamp(0.25, 4.0) as f32;
+
+    let authored_fps = if base.fps.is_finite() && base.fps > 0.0 {
+        f64::from(base.fps).clamp(0.25, 480.0)
+    } else {
+        authored.sample_fps.unwrap_or(30.0)
+    };
+    let fps_proxy = authored_fps.clamp(1.0, 240.0) as f32;
+    let proxy = modulation.modulate_layer(
+        layer_index,
+        &base.effects,
+        &base.transform,
+        base.opacity,
+        rate_proxy,
+        fps_proxy,
+    );
+    let rate_delta = f64::from(proxy.speed - rate_proxy);
+    let fps_delta = f64::from(proxy.fps - fps_proxy);
+
+    let mut config = authored;
+    config.rate = (authored_rate + rate_delta).clamp(0.0, 16.0);
+    config.sample_fps = if config.sample_fps.is_some() || morph.fps || fps_delta != 0.0 {
+        Some((authored_fps + fps_delta).clamp(0.25, 480.0))
+    } else {
+        None
+    };
+    // A Morph speed sample is already reflected in `authored_rate`; the
+    // additive modulation delta above is intentionally applied after it.
+    config.sanitized()
 }
 
 /// Source admission proves dimensions and a conservative host-memory plan, but
@@ -1109,12 +1964,18 @@ fn resolve_export_visual_source(
 }
 
 fn configured_blend_mode(value: &str) -> BlendMode {
-    match value {
-        "screen" => BlendMode::Screen,
-        "multiply" => BlendMode::Multiply,
-        "difference" => BlendMode::Difference,
-        _ => BlendMode::Normal,
-    }
+    BlendMode::from_key(value).unwrap_or(BlendMode::Normal)
+}
+
+fn active_export_clip_source(layer: &crate::patch::LayerConfig) -> (&str, &str) {
+    layer
+        .active_clip_slot
+        .and_then(|id| layer.clip_slots.get(id))
+        .or_else(|| layer.clip_slots.iter().next())
+        .map_or(
+            (layer.filename.as_str(), layer.source_path.as_str()),
+            |slot| (slot.filename.as_str(), slot.source_path.as_str()),
+        )
 }
 
 fn upload_export_texture_checked(
@@ -1164,6 +2025,21 @@ fn upload_export_texture_checked(
     )
 }
 
+/// Admit only metadata that belongs to the exact source image just uploaded.
+/// Decoder rejection/status remains intact for the shared motion evaluator;
+/// this seam checks pairing/provenance, not source selection.
+fn matching_export_codec_motion(
+    motion: Option<CodecMotionFrame>,
+    source_generation: u64,
+    source_dimensions: [u32; 2],
+) -> Option<CodecMotionFrame> {
+    motion.filter(|motion| {
+        motion.source_generation == source_generation
+            && motion.source_dimensions == source_dimensions
+            && motion.algorithm_version == crate::motion::MOTION_ALGORITHM_VERSION
+    })
+}
+
 /// Retain an unavailable source as a one-pixel opaque-black texture. Keeping
 /// the layer visible preserves the saved compositing stack (including Normal
 /// or Multiply darkening) instead of silently changing the patch by omission.
@@ -1192,26 +2068,29 @@ fn black_placeholder_layer(
         ..Default::default()
     };
     layer_cfg.effects.apply_to_uniforms(&mut effects);
+    let transport = ExportClipTransport::from_layer_config(layer_cfg, 0.0, 0);
+    let fps = export_transport_fps(&transport, layer_cfg.fps);
     Ok(ExportLayer {
         source_index,
+        motion_source: ExportMotionSourceRecord::unavailable(layer_cfg),
         decoder: None,
+        codec_motion: None,
         _still_source: None,
         texture,
         texture_view,
         effects,
+        transform: layer_cfg.transform.sanitized(),
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        matte: LayerMatte::default(),
         reroll_on_loop: false,
         consumed_loop_generation: 0,
-        speed: layer_cfg.speed,
+        transport,
+        speed: transport.authored.rate as f32,
         visible: layer_cfg.visible,
         paused: true,
-        fps: if layer_cfg.fps.is_finite() && layer_cfg.fps > 0.0 {
-            layer_cfg.fps.clamp(1.0, 240.0)
-        } else {
-            30.0
-        },
+        fps,
         width,
         height,
     })
@@ -1226,6 +2105,7 @@ fn still_export_layer(
     source_index: usize,
     layer_cfg: &crate::patch::LayerConfig,
     decoded: DecodedStillImage,
+    fingerprint: Option<crate::media_source::ContentIdentity>,
 ) -> Result<ExportLayer, String> {
     let width = decoded.width;
     let height = decoded.height;
@@ -1246,26 +2126,37 @@ fn still_export_layer(
         ..Default::default()
     };
     layer_cfg.effects.apply_to_uniforms(&mut effects);
+    let transport = ExportClipTransport::from_layer_config(layer_cfg, 0.0, 1);
+    let fps = export_transport_fps(&transport, layer_cfg.fps);
     Ok(ExportLayer {
         source_index,
+        motion_source: {
+            let (logical_name, persisted_reference) = active_export_clip_source(layer_cfg);
+            ExportMotionSourceRecord {
+                kind: ExportMotionSourceKind::Still,
+                logical_name: logical_name.to_owned(),
+                persisted_reference: persisted_reference.to_owned(),
+                fingerprint,
+            }
+        },
         decoder: None,
+        codec_motion: None,
         _still_source: Some(decoded),
         texture,
         texture_view,
         effects,
+        transform: layer_cfg.transform.sanitized(),
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        matte: LayerMatte::default(),
         reroll_on_loop: false,
         consumed_loop_generation: 0,
-        speed: layer_cfg.speed,
+        transport,
+        speed: transport.authored.rate as f32,
         visible: layer_cfg.visible,
         paused: layer_cfg.paused,
-        fps: if layer_cfg.fps.is_finite() && layer_cfg.fps > 0.0 {
-            layer_cfg.fps.clamp(1.0, 240.0)
-        } else {
-            30.0
-        },
+        fps,
         width,
         height,
     })
@@ -1424,17 +2315,28 @@ fn update_export_modulation(
 /// Live Pause holds the materialized patch bases. Re-sampling an active morph
 /// only in export would produce a different held frame, especially when the
 /// morph target has transient routing state.
+#[cfg(test)]
 fn export_morph_sample(
     morph: Option<&crate::morph::Morph>,
     beat: f64,
     offset: f32,
     paused: bool,
 ) -> Option<crate::morph::MorphSample> {
+    let position = export_morph_position(morph, beat, offset, paused)?;
+    morph?.sample(position)
+}
+
+fn export_morph_position(
+    morph: Option<&crate::morph::Morph>,
+    beat: f64,
+    offset: f32,
+    paused: bool,
+) -> Option<f32> {
     if paused {
         return None;
     }
     let morph = morph.filter(|morph| morph.active())?;
-    morph.sample((morph.position_at_beat(beat) + offset).clamp(0.0, 1.0))
+    Some((morph.position_at_beat(beat) + offset).clamp(0.0, 1.0))
 }
 
 /// The export stack has no live layer IDs, but patch source positions are
@@ -1444,25 +2346,795 @@ fn export_selective_layer_id(source_index: usize) -> u64 {
     source_index as u64 + 1
 }
 
+/// Detached stable creative state for one export job. Saved positions are
+/// resolved exactly once at admission; every frame clones this small bounded
+/// value graph before Morph and stable modulation are projected into it.
+#[derive(Debug, Clone)]
+struct ExportCreativeGraph {
+    layer_ids: Box<[StableLayerId]>,
+    master_rack: RuntimeVisualRack,
+    layer_racks: Vec<(StableLayerId, RuntimeVisualRack)>,
+    composition: RuntimeComposition,
+    address_book: crate::modulation::StableModAddressBook,
+}
+
+fn export_saved_position(position: usize) -> Result<SavedLayerPosition, String> {
+    u32::try_from(position)
+        .ok()
+        .and_then(SavedLayerPosition::new)
+        .ok_or_else(|| format!("export layer position {position} exceeds saved-position bounds"))
+}
+
+fn export_stable_layer_id(position: usize) -> Result<StableLayerId, String> {
+    u64::try_from(position)
+        .ok()
+        .and_then(|position| position.checked_add(1))
+        .and_then(StableLayerId::new)
+        .ok_or_else(|| format!("export layer position {position} exceeds stable-ID bounds"))
+}
+
+/// Resolve the same persisted rack/composition model used by live loading,
+/// but against deterministic job-local IDs. The patch layer vector remains
+/// front-to-back; only omitted legacy composition is synthesized in the
+/// documented back-to-front root order.
+fn resolve_export_creative_graph(patch: &PatchState) -> Result<ExportCreativeGraph, String> {
+    let layer_ids = (0..patch.layers.len())
+        .map(export_stable_layer_id)
+        .collect::<Result<Vec<_>, _>>()?;
+    let saved_positions = (0..patch.layers.len())
+        .map(export_saved_position)
+        .collect::<Result<Vec<_>, _>>()?;
+    let synthesized;
+    let saved_composition = match patch.composition.as_ref() {
+        Some(composition) => composition,
+        None => {
+            let back_to_front = saved_positions.iter().rev().copied().collect::<Vec<_>>();
+            synthesized = CompositionTree::legacy_for_layers(&back_to_front)
+                .map_err(|error| format!("synthesize export composition: {error}"))?;
+            &synthesized
+        }
+    };
+    let resolve_position =
+        |position: SavedLayerPosition| layer_ids.get(position.get() as usize).copied();
+    let composition = saved_composition
+        .resolve(resolve_position)
+        .map_err(|error| format!("resolve export composition: {error}"))?;
+    let group_exists = |group_id| composition.contains_group(group_id);
+    let master_rack = patch.effective_master_rack().resolve_routes(
+        |position| layer_ids.get(position.get() as usize).copied(),
+        group_exists,
+    );
+    let layer_racks = patch
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(position, _)| {
+            let id = layer_ids[position];
+            let rack = patch.effective_layer_rack(position).ok_or_else(|| {
+                format!("export layer rack {position} is outside the saved stack")
+            })?;
+            Ok((
+                id,
+                rack.resolve_routes(
+                    |saved| layer_ids.get(saved.get() as usize).copied(),
+                    group_exists,
+                ),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let address_book = crate::modulation::StableModAddressBook::from_composition(
+        &master_rack,
+        &layer_racks,
+        &composition,
+    )
+    .map_err(|error| format!("resolve export stable modulation: {error}"))?;
+    Ok(ExportCreativeGraph {
+        layer_ids: layer_ids.into_boxed_slice(),
+        master_rack,
+        layer_racks,
+        composition,
+        address_book,
+    })
+}
+
+/// Apply only topology-compatible creative Morph values. Stable identities,
+/// membership, routes, enabled state, and monotonic cursors stay owned by the
+/// job's resolved patch graph, exactly as in the live frame boundary.
+fn apply_export_creative_morph(
+    sample: &crate::morph::MorphSample,
+    graph: &mut ExportCreativeGraph,
+) {
+    let group_exists = |group_id| graph.composition.contains_group(group_id);
+    if let Some(saved) = &sample.master_rack {
+        let sampled = saved.resolve_routes(
+            |position| graph.layer_ids.get(position.get() as usize).copied(),
+            group_exists,
+        );
+        let _ = crate::morph::apply_runtime_rack_values_strict(&sampled, &mut graph.master_rack);
+    }
+    if let Some(saved_racks) = &sample.layer_racks {
+        if saved_racks.len() == graph.layer_racks.len() {
+            for (saved, (_, live)) in saved_racks.iter().zip(&mut graph.layer_racks) {
+                let sampled = saved.resolve_routes(
+                    |position| graph.layer_ids.get(position.get() as usize).copied(),
+                    group_exists,
+                );
+                let _ = crate::morph::apply_runtime_rack_values_strict(&sampled, live);
+            }
+        }
+    }
+    if let Some(saved) = &sample.composition {
+        if let Ok(sampled) =
+            saved.resolve(|position| graph.layer_ids.get(position.get() as usize).copied())
+        {
+            let _ = crate::morph::apply_runtime_composition_values_strict(
+                &sampled,
+                &mut graph.composition,
+            );
+        }
+    }
+}
+
+fn resolve_export_score_loop_driver(
+    driver: crate::patch::CollisionScoreLoopDriverConfig,
+    layer_ids: &[crate::image_routing::StableLayerId],
+) -> crate::temporal::CollisionScoreLoopDriver {
+    use crate::patch::CollisionScoreLoopDriverConfig as Saved;
+    use crate::temporal::CollisionScoreLoopDriver as Runtime;
+    match driver {
+        Saved::None => Runtime::None,
+        Saved::MissingSelectedLayer { saved_position } => {
+            Runtime::MissingSelectedLayer { saved_position }
+        }
+        Saved::SelectedLayer { saved_position } => layer_ids
+            .get(saved_position.get() as usize)
+            .copied()
+            .map_or(
+                Runtime::MissingSelectedLayer { saved_position },
+                |layer_id| Runtime::SelectedLayer {
+                    layer_id,
+                    saved_position,
+                },
+            ),
+    }
+}
+
+#[derive(Clone)]
+struct ExportFrameMorphWorld {
+    creative_graph: ExportCreativeGraph,
+    master: EffectUniforms,
+    master_transform: SpatialTransform,
+    master_motion: crate::motion::MotionParams,
+    ntsc: crate::ntsc::NtscParams,
+    temporal: crate::effects::params::TemporalParams,
+    layer_bases: Vec<ExportFrameLayerBase>,
+    layer_motion: Vec<crate::motion::MotionParams>,
+    morph_overrides: Vec<ExportMorphOverrides>,
+}
+
+fn resolved_export_motion(
+    config: Option<crate::patch::MotionConfig>,
+    layer_ids: &[StableLayerId],
+) -> crate::motion::MotionParams {
+    let config = config.unwrap_or_default().sanitized();
+    let mut params = config.to_params().sanitized();
+    params.transplant.donor = config.transplant.donor.resolve_runtime(layer_ids);
+    params
+}
+
+fn apply_export_morph_world(
+    sample: &crate::morph::MorphSample,
+    layers: &[ExportLayer],
+    world: &mut ExportFrameMorphWorld,
+) {
+    apply_export_creative_morph(sample, &mut world.creative_graph);
+    sample.master.apply_to(&mut world.master);
+    if let Some(transform) = sample.master_transform {
+        world.master_transform = transform.sanitized();
+    }
+    if let Some(motion) = sample.master_motion {
+        world.master_motion = resolved_export_motion(Some(motion), &world.creative_graph.layer_ids);
+    }
+    world.ntsc = sample.ntsc.to_params();
+    world.temporal = sample.temporal.to_params();
+    world.temporal.originals.score.loop_driver = resolve_export_score_loop_driver(
+        sample.temporal.originals.score.loop_driver,
+        &world.creative_graph.layer_ids,
+    );
+    for sampled in &sample.layers {
+        if let Some((position, _)) = layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| layer.source_index == sampled.position)
+        {
+            world.layer_bases[position].opacity = sampled.opacity;
+            world.layer_bases[position].speed = sampled.speed;
+            if let Some(fps) = sampled.fps {
+                world.layer_bases[position].fps = fps;
+                world.morph_overrides[position].fps = true;
+            }
+            if let Some(effects) = sampled.effects {
+                effects.apply_to(&mut world.layer_bases[position].effects);
+                world.morph_overrides[position].effects = true;
+            }
+            if let Some(transform) = sampled.transform {
+                world.layer_bases[position].transform = transform.sanitized();
+            }
+            if let Some(motion) = sampled.motion {
+                world.layer_motion[position] =
+                    resolved_export_motion(Some(motion), &world.creative_graph.layer_ids);
+            }
+            if let Some(key_threshold) = sampled.key_threshold {
+                world.layer_bases[position].effects.key_threshold = key_threshold;
+            }
+            if let Some(blend_mode) = sampled.blend_mode {
+                world.layer_bases[position].blend_mode = blend_mode.to_blend_mode();
+            }
+            if let Some(visible) = sampled.visible {
+                world.layer_bases[position].visible = visible;
+            }
+            if let Some(paused) = sampled.paused {
+                world.layer_bases[position].paused = paused;
+            }
+            if let Some(bypass_master_fx) = sampled.bypass_master_fx {
+                world.layer_bases[position].bypass_master_fx = bypass_master_fx;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedMorphCandidate<T> {
+    requested_position: f32,
+    selected_position: f32,
+    requested_error: Option<String>,
+    value: T,
+}
+
+/// Shared deterministic fallback law used by offline Morph preflight. The
+/// exact requested interpolation is always tried first; then the nearest
+/// captured endpoint (ties choose B), then the other endpoint. It never
+/// depends on a prior rendered frame.
+fn select_valid_morph_candidate<T>(
+    requested_position: f32,
+    mut validate: impl FnMut(f32) -> Result<T, String>,
+) -> Result<ValidatedMorphCandidate<T>, String> {
+    let requested_position = requested_position.clamp(0.0, 1.0);
+
+    let mut requested_error = None;
+    for position in crate::morph::preflight_sample_positions(requested_position) {
+        match validate(position) {
+            Ok(value) => {
+                return Ok(ValidatedMorphCandidate {
+                    requested_position,
+                    selected_position: position,
+                    requested_error,
+                    value,
+                });
+            }
+            Err(error) if requested_error.is_none() => requested_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    Err(format!(
+        "Morph sample {requested_position:.4} and both captured endpoints were rejected: {}",
+        requested_error
+            .as_deref()
+            .unwrap_or("creative graph rejected")
+    ))
+}
+
+fn evaluate_export_morph_world(
+    world: &ExportFrameMorphWorld,
+    layers: &[ExportLayer],
+    modulation: &crate::modulation::ModulationFrame,
+    context: FramePlanContext,
+) -> EvaluatedFramePlan {
+    EvaluatedFramePlan::evaluate(
+        modulation,
+        context,
+        MasterFrameInput {
+            effects: &world.master,
+            transform: &world.master_transform,
+            ntsc: &world.ntsc,
+            temporal: &world.temporal,
+        },
+        layers
+            .iter()
+            .zip(&world.layer_bases)
+            .enumerate()
+            .map(|(slot, (layer, base))| LayerFrameInput {
+                source: SourceTap::new(
+                    export_selective_layer_id(layer.source_index),
+                    slot,
+                    layer.width,
+                    layer.height,
+                ),
+                effects: &base.effects,
+                transform: &base.transform,
+                opacity: base.opacity,
+                speed: base.speed,
+                fps: base.fps,
+                blend_mode: base.blend_mode,
+                visible: base.visible,
+                paused: base.paused,
+                bypass_master_fx: base.bypass_master_fx,
+            }),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ExportMotionPlanAdapter<'a> {
+    master: crate::motion::MotionParams,
+    layers: &'a [crate::motion::MotionParams],
+    sources: &'a [ExportLayer],
+    limits: crate::motion::MotionDeviceLimits,
+}
+
+struct ExportMotionFieldProduct {
+    scope: crate::visual_rack::VisualScopeId,
+    source_generation: u64,
+    frame_ordinal: u64,
+    field: crate::motion::MotionField,
+}
+
+impl ExportMotionFieldProduct {
+    fn attachment(
+        &self,
+    ) -> crate::evaluated_frame::evaluated_composition::MotionFieldAttachment<'_> {
+        crate::evaluated_frame::evaluated_composition::MotionFieldAttachment {
+            scope: self.scope,
+            source_generation: self.source_generation,
+            frame_ordinal: self.frame_ordinal,
+            algorithm_version: self.field.algorithm_version(),
+            source_dimensions: self.field.source_dimensions(),
+            grid: self.field.grid(),
+            field: &self.field,
+        }
+    }
+}
+
+fn export_codec_motion_fields(
+    plan: &crate::evaluated_frame::evaluated_composition::AdvancedCompositionPlan,
+    graph: &ExportCreativeGraph,
+    layers: &[ExportLayer],
+) -> (Vec<ExportMotionFieldProduct>, Vec<String>) {
+    export_codec_motion_fields_from(
+        plan,
+        graph,
+        layers
+            .iter()
+            .map(|layer| (layer.source_index, layer.codec_motion.as_ref())),
+    )
+}
+
+fn export_codec_motion_fields_from<'a>(
+    plan: &crate::evaluated_frame::evaluated_composition::AdvancedCompositionPlan,
+    graph: &ExportCreativeGraph,
+    sources: impl IntoIterator<Item = (usize, Option<&'a CodecMotionFrame>)>,
+) -> (Vec<ExportMotionFieldProduct>, Vec<String>) {
+    let Some(motion_plan) = plan.motion().advanced() else {
+        return (Vec::new(), Vec::new());
+    };
+    let sources = sources
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut products = Vec::new();
+    let mut diagnostics = Vec::new();
+    for field_plan in motion_plan.fields() {
+        if field_plan.source.origin != crate::motion::MotionFieldOrigin::CodecVectors {
+            continue;
+        }
+        let crate::visual_rack::VisualScopeId::Layer(layer_id) = field_plan.scope else {
+            diagnostics.push(format!(
+                "Motion field {:?} selected codec vectors without a layer source; rendered zero.",
+                field_plan.scope
+            ));
+            continue;
+        };
+        let Some(saved_position) = graph
+            .layer_ids
+            .iter()
+            .position(|candidate| *candidate == layer_id)
+        else {
+            diagnostics.push(format!(
+                "Motion field {:?} has no export source identity; rendered zero.",
+                field_plan.scope
+            ));
+            continue;
+        };
+        let codec = match sources.get(&saved_position).copied() {
+            None => {
+                diagnostics.push(format!(
+                    "Motion field {:?} has no prepared export source; rendered zero.",
+                    field_plan.scope
+                ));
+                continue;
+            }
+            Some(None) => {
+                diagnostics.push(format!(
+                    "Motion field {:?} lost its exact codec metadata before attachment; rendered zero.",
+                    field_plan.scope
+                ));
+                continue;
+            }
+            Some(Some(codec)) => codec,
+        };
+        let Some(scope_plan) = motion_plan.scope(field_plan.scope) else {
+            diagnostics.push(format!(
+                "Motion field {:?} has no evaluated scope; rendered zero.",
+                field_plan.scope
+            ));
+            continue;
+        };
+        let field = match crate::motion::rasterize_codec_motion_vectors(
+            codec.source_dimensions,
+            scope_plan.params.lattice_quality,
+            &codec.vectors,
+        ) {
+            Ok(Some(field)) => field,
+            Ok(None) => {
+                diagnostics.push(format!(
+                    "Motion field {:?} codec records contained no past-reference field; rendered zero.",
+                    field_plan.scope
+                ));
+                continue;
+            }
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Motion field {:?} codec rasterization was rejected ({error}); rendered zero.",
+                    field_plan.scope
+                ));
+                continue;
+            }
+        };
+        let product = ExportMotionFieldProduct {
+            scope: field_plan.scope,
+            source_generation: codec.source_generation,
+            frame_ordinal: codec.frame_ordinal,
+            field,
+        };
+        if field_plan.accepts(product.attachment()) {
+            products.push(product);
+        } else {
+            diagnostics.push(format!(
+                "Motion field {:?} failed exact attachment provenance; rendered zero.",
+                field_plan.scope
+            ));
+        }
+    }
+    (products, diagnostics)
+}
+
+fn export_motion_metadata_for_frame(
+    plan: &EvaluatedCompositionPlan,
+    graph: &ExportCreativeGraph,
+    layers: &[ExportLayer],
+    frame_num: u64,
+) -> ExportMotionMetadata {
+    export_motion_metadata_for_frame_from(
+        plan,
+        graph,
+        layers
+            .iter()
+            .map(|layer| (layer.source_index, layer.codec_motion.as_ref())),
+        frame_num,
+    )
+}
+
+fn export_motion_metadata_for_frame_from<'a>(
+    plan: &EvaluatedCompositionPlan,
+    graph: &ExportCreativeGraph,
+    sources: impl IntoIterator<Item = (usize, Option<&'a CodecMotionFrame>)>,
+    frame_num: u64,
+) -> ExportMotionMetadata {
+    let mut metadata = ExportMotionMetadata {
+        accepted_frame: Some(frame_num),
+        ..ExportMotionMetadata::default()
+    };
+    let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+        return metadata;
+    };
+    let Some(motion) = plan.motion().advanced() else {
+        return metadata;
+    };
+    metadata.scopes_truncated = motion.scopes().len() > MAX_EXPORT_MOTION_SIDECAR_SCOPES;
+    metadata
+        .scopes
+        .reserve(motion.scopes().len().min(MAX_EXPORT_MOTION_SIDECAR_SCOPES));
+    let sources = sources
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for scope in motion
+        .scopes()
+        .iter()
+        .take(MAX_EXPORT_MOTION_SIDECAR_SCOPES)
+    {
+        let (identity, codec) = match scope.scope {
+            crate::visual_rack::VisualScopeId::Master => (ExportMotionScopeIdentity::Master, None),
+            crate::visual_rack::VisualScopeId::Layer(layer_id) => {
+                let Some(saved_position) = graph
+                    .layer_ids
+                    .iter()
+                    .position(|candidate| *candidate == layer_id)
+                else {
+                    continue;
+                };
+                let codec = sources.get(&saved_position).copied().flatten();
+                (
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: u32::try_from(saved_position).unwrap_or(u32::MAX),
+                        stable_id: layer_id.get(),
+                        source_tap_id: export_selective_layer_id(saved_position),
+                    },
+                    codec,
+                )
+            }
+            crate::visual_rack::VisualScopeId::Group(_)
+            | crate::visual_rack::VisualScopeId::Program => continue,
+        };
+        let (donor_saved_position, donor_stable_id) = match scope.params.transplant.donor {
+            crate::motion::MotionDonor::None => (None, None),
+            crate::motion::MotionDonor::Selected {
+                layer_id,
+                saved_position,
+            } => (Some(saved_position.get()), Some(layer_id.get())),
+            crate::motion::MotionDonor::Missing { saved_position } => {
+                (Some(saved_position.get()), None)
+            }
+        };
+        metadata.scopes.push(ExportMotionScopeMetadata {
+            scope: identity,
+            algorithm_version: scope.params.algorithm_version,
+            requested_source: scope.params.field_source,
+            lattice_quality: scope.params.lattice_quality,
+            source_origin: scope.source.origin,
+            source_diagnostic: scope.source.diagnostic,
+            codec_provenance: codec.map(|codec| codec.provenance),
+            source_generation: codec.map(|codec| codec.source_generation),
+            frame_ordinal: codec.map(|codec| codec.frame_ordinal),
+            donor_saved_position,
+            donor_stable_id,
+            carrier: scope.params.transplant.carrier,
+            transplant_admitted: scope.transplant_admitted,
+            shutter_active: !scope.params.shutter.is_exact_zero(),
+            shutter_angle_degrees: scope.params.shutter.angle_degrees,
+            shutter_quality: scope.params.shutter.quality,
+            shutter_sample_count: scope.params.shutter.quality.sample_count(),
+        });
+    }
+    metadata
+}
+
+fn export_motion_plan_warnings(plan: &EvaluatedCompositionPlan) -> Vec<String> {
+    use crate::evaluated_frame::evaluated_composition::MotionPlanDiagnostic;
+
+    let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+        return Vec::new();
+    };
+    let Some(motion) = plan.motion().advanced() else {
+        return Vec::new();
+    };
+    motion
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| match *diagnostic {
+            MotionPlanDiagnostic::Source { scope, diagnostic } => format!(
+                "Motion field {scope:?} resolved with {diagnostic:?}; the fixed authored source law remains visible."
+            ),
+            MotionPlanDiagnostic::MasterTransplantRejected => {
+                "Master Faraday transplant has no layer recipient and was rendered inactive."
+                    .to_owned()
+            }
+            MotionPlanDiagnostic::DonorNotSelected { recipient } => format!(
+                "Motion recipient layer {} has no selected donor; Faraday transplant was rendered inactive.",
+                recipient.get()
+            ),
+            MotionPlanDiagnostic::MissingDonor {
+                recipient,
+                saved_position,
+            } => format!(
+                "Motion recipient layer {} is missing saved donor position {}; Faraday transplant was rendered inactive.",
+                recipient.get(),
+                saved_position.get()
+            ),
+            MotionPlanDiagnostic::ExcessTransplantRejected {
+                recipient,
+                admitted_recipient,
+            } => format!(
+                "Motion recipient layer {} exceeded the single-carrier law; layer {} retained the admitted Faraday transplant.",
+                recipient.get(),
+                admitted_recipient.get()
+            ),
+        })
+        .collect()
+}
+
+fn export_codec_frame_facts(
+    layer: &ExportLayer,
+) -> crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts {
+    layer.codec_motion.as_ref().map_or_else(
+        crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts::default,
+        |motion| crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts {
+            available: motion.codec_vectors_available(),
+            source_generation: motion.source_generation,
+            frame_ordinal: motion.frame_ordinal,
+        },
+    )
+}
+
+fn export_motion_held_scope(
+    graph: &ExportCreativeGraph,
+    source_index: usize,
+    selection: FrameSelection,
+) -> Option<crate::visual_rack::VisualScopeId> {
+    if !selection.held {
+        return None;
+    }
+    graph
+        .layer_ids
+        .get(source_index)
+        .copied()
+        .map(crate::visual_rack::VisualScopeId::Layer)
+}
+
+fn export_motion_layer_plan_inputs(
+    graph: &ExportCreativeGraph,
+    params: &[crate::motion::MotionParams],
+    sources: impl IntoIterator<
+        Item = (
+            usize,
+            crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts,
+        ),
+    >,
+) -> Result<Vec<crate::evaluated_frame::evaluated_composition::LayerMotionPlanInput>, String> {
+    let sources = sources.into_iter().collect::<Vec<_>>();
+    if params.len() != sources.len() {
+        return Err(format!(
+            "export motion layer count {} does not match source count {}",
+            params.len(),
+            sources.len()
+        ));
+    }
+    sources
+        .into_iter()
+        .zip(params.iter().copied())
+        .map(|((source_index, codec), params)| {
+            let stable_id = graph.layer_ids.get(source_index).copied().ok_or_else(|| {
+                format!("export motion source {source_index} has no stable layer identity")
+            })?;
+            Ok(
+                crate::evaluated_frame::evaluated_composition::LayerMotionPlanInput {
+                    stable_id,
+                    params,
+                    codec,
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "legacy motion-omitted adapter remains a supported exact-path test seam"
+    )
+)]
+fn plan_export_composition(
+    evaluated: &EvaluatedFramePlan,
+    graph: &ExportCreativeGraph,
+    layer_mattes: &[LayerMatte],
+    program_history_initialized: bool,
+    resource_limits: CreativeResourceLimits,
+) -> Result<EvaluatedCompositionPlan, String> {
+    plan_export_composition_inner(
+        evaluated,
+        graph,
+        layer_mattes,
+        program_history_initialized,
+        resource_limits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_export_composition_with_motion(
+    evaluated: &EvaluatedFramePlan,
+    graph: &ExportCreativeGraph,
+    layer_mattes: &[LayerMatte],
+    program_history_initialized: bool,
+    resource_limits: CreativeResourceLimits,
+    motion: ExportMotionPlanAdapter<'_>,
+) -> Result<EvaluatedCompositionPlan, String> {
+    plan_export_composition_inner(
+        evaluated,
+        graph,
+        layer_mattes,
+        program_history_initialized,
+        resource_limits,
+        Some(motion),
+    )
+}
+
+fn plan_export_composition_inner(
+    evaluated: &EvaluatedFramePlan,
+    graph: &ExportCreativeGraph,
+    layer_mattes: &[LayerMatte],
+    program_history_initialized: bool,
+    resource_limits: CreativeResourceLimits,
+    motion: Option<ExportMotionPlanAdapter<'_>>,
+) -> Result<EvaluatedCompositionPlan, String> {
+    let motion_layers = motion
+        .map(|motion| {
+            export_motion_layer_plan_inputs(
+                graph,
+                motion.layers,
+                motion
+                    .sources
+                    .iter()
+                    .map(|source| (source.source_index, export_codec_frame_facts(source))),
+            )
+        })
+        .transpose()?;
+    let mut input =
+        CompositionPlanInput::new(&graph.composition, &graph.master_rack, &graph.layer_racks)
+            .with_layer_mattes(layer_mattes, program_history_initialized);
+    input.resource_limits = resource_limits;
+    if let (Some(motion), Some(layers)) = (motion, motion_layers.as_deref()) {
+        input = input.with_motion(motion.master, layers, motion.limits);
+    }
+    evaluated
+        .plan_composition(input)
+        .map_err(|error| format!("export creative frame plan rejected: {error}"))
+}
+
+fn advanced_export_skips_global_ntsc(
+    path: AdvancedNtscPath,
+    applying: usize,
+    bypassing: usize,
+) -> Result<bool, String> {
+    match path {
+        AdvancedNtscPath::Disabled | AdvancedNtscPath::AllApplying => Ok(false),
+        AdvancedNtscPath::AllBypass => Ok(true),
+        AdvancedNtscPath::Mixed => Err(format!(
+            "advanced composition cannot enter selective NTSC: {applying} applying layer(s), {bypassing} bypassing layer(s)"
+        )),
+    }
+}
+
+/// Resolve a persisted, zero-based patch position into the deterministic ID
+/// used by this export job. Keeping the mapping independent of the current
+/// resource-vector order prevents failed media opens or future scheduling
+/// reorder from silently retargeting an authored donor.
+fn export_runtime_matte(
+    saved: crate::image_routing::LayerMatteConfig,
+    patch_layer_count: usize,
+) -> LayerMatte {
+    saved.to_runtime(|saved_position| {
+        let source_index = saved_position.get() as usize;
+        (source_index < patch_layer_count).then(|| {
+            StableLayerId::new(export_selective_layer_id(source_index))
+                .expect("export layer IDs are offset from zero")
+        })
+    })
+}
+
 /// Reproduce the live planner input from frame-local, post-morph/post-Mod
 /// values. `layers` remains in UI order (top to bottom); the shared planner is
 /// the sole authority that reverses contributing entries into compositor
-/// order and forces only the bottom contribution to Normal.
+/// order while preserving the curated blend law for every contribution.
 #[allow(clippy::too_many_arguments)]
 fn plan_export_selective_ntsc(
     frame_num: u64,
-    width: u32,
-    height: u32,
     fps: u32,
     paused: bool,
-    params: &crate::ntsc::NtscParams,
-    layers: &[ExportLayer],
-    layer_mods: &[(EffectUniforms, f32)],
-    master: &EffectUniforms,
+    evaluated: &EvaluatedFramePlan,
 ) -> Option<SelectiveNtscPlan> {
-    if layers.len() != layer_mods.len() {
+    if evaluated.layers().len() != evaluated.layer_passes().len() {
         return None;
     }
+    let [width, height] = evaluated.context().output_size;
     plan_selective_ntsc(
         SelectiveNtscGeneration {
             visual_epoch: 1,
@@ -1472,24 +3144,27 @@ fn plan_export_selective_ntsc(
             sample_sequence: frame_num,
         },
         NtscFrameMetadata {
-            params: params.clone(),
+            params: evaluated.ntsc().clone(),
             reference_frame: export_ntsc_reference_frame(frame_num, fps, paused),
         },
-        layers
+        evaluated
+            .layers()
             .iter()
-            .zip(layer_mods)
-            .map(|(layer, (effects, opacity))| SelectiveNtscLayerDescriptor {
-                layer_id: export_selective_layer_id(layer.source_index),
+            .zip(evaluated.layer_passes())
+            .map(|(layer, pass)| SelectiveNtscLayerDescriptor {
+                layer_id: layer.source.stable_id,
                 visible: layer.visible,
                 bypass_master_fx: layer.bypass_master_fx,
-                opacity: *opacity,
+                opacity: layer.opacity,
                 blend_mode: layer.blend_mode.as_u32(),
                 // Export consumes every generated batch synchronously, so no
                 // stale-control comparison is needed. Keep a deterministic
                 // value in the shared plan nevertheless.
                 transform_fingerprint: export_selective_transform_fingerprint(
-                    effects,
-                    (!layer.bypass_master_fx).then_some(master),
+                    &pass.effects,
+                    &layer.transform,
+                    (!layer.bypass_master_fx).then_some(&evaluated.master_pass().effects),
+                    (!layer.bypass_master_fx).then_some(evaluated.master_transform()),
                 ),
             }),
     )
@@ -1497,7 +3172,9 @@ fn plan_export_selective_ntsc(
 
 fn export_selective_transform_fingerprint(
     effects: &EffectUniforms,
+    transform: &SpatialTransform,
     master: Option<&EffectUniforms>,
+    master_transform: Option<&SpatialTransform>,
 ) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in bytemuck::bytes_of(effects)
@@ -1506,6 +3183,14 @@ fn export_selective_transform_fingerprint(
     {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    for value in std::iter::once(transform.fingerprint())
+        .chain(master_transform.map(|transform| transform.fingerprint()))
+    {
+        for byte in value.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
     }
     hash
 }
@@ -1591,8 +3276,17 @@ fn run_export(
     let h = config.height;
     let raw_device_limits = device.limits();
     let max_dimension = raw_device_limits.max_texture_dimension_2d;
+    let creative_resource_limits = CreativeResourceLimits {
+        max_texture_dimension_2d: max_dimension,
+        max_texture_array_layers: raw_device_limits.max_texture_array_layers,
+        max_sampled_textures_per_shader_stage: raw_device_limits
+            .max_sampled_textures_per_shader_stage,
+        ..CreativeResourceLimits::default()
+    };
     let media_device_limits =
         MediaDeviceLimits::new(max_dimension, raw_device_limits.max_buffer_size);
+    let motion_device_limits =
+        crate::motion::MotionDeviceLimits::new(max_dimension, raw_device_limits.max_buffer_size);
     if w > max_dimension || h > max_dimension {
         return Err(format!(
             "export dimensions {w}x{h} exceed this GPU's {max_dimension}px texture limit"
@@ -1614,6 +3308,12 @@ fn run_export(
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
+    let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    });
 
     let effects_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1631,6 +3331,12 @@ fn run_export(
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -1752,7 +3458,7 @@ fn run_export(
 
     let composite_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Export Composite Fragment"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/composite.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(composite_shader_source()),
     });
 
     let composite_pipeline_layout =
@@ -1793,6 +3499,12 @@ fn run_export(
         multiview_mask: None,
         cache: None,
     });
+    let matte_composite = MatteCompositePipeline::build(&device, &vertex_shader);
+    let mut image_routing_gpu: Option<ImageRoutingGpuResources> = None;
+    // Exact legacy export never constructs this value. Its RGBA16F arena and
+    // histories are admitted lazily only after the immutable planner selects
+    // Advanced, preserving the established legacy allocation/render path.
+    let mut composition_gpu: Option<CompositionGpuExecutor> = None;
 
     // --- Composite textures (same 3-texture scheme as live renderer) ---
     let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -1838,6 +3550,15 @@ fn run_export(
         crate::renderer::state::build_history_texture(&device, w, h);
     let (feedback_texture, feedback_view) =
         crate::renderer::state::build_feedback_texture(&device, w, h);
+    let temporal_prepared = crate::renderer::state::build_prepared_temporal_gpu_resources(
+        &device,
+        &temporal_bgl,
+        &temporal_ubl,
+        &composite_views[0],
+        &history_view,
+        &sampler,
+        &feedback_view,
+    );
 
     // --- Readback staging buffer ---
     let bytes_per_row = (w * 4 + 255) & !255;
@@ -1880,9 +3601,10 @@ fn run_export(
     let mut layers: Vec<ExportLayer> = Vec::new();
     for (source_index, layer_cfg) in patch.layers.iter().enumerate() {
         check_cancelled(progress)?;
+        let (clip_filename, clip_source_path) = active_export_clip_source(layer_cfg);
         let resolved = resolve_export_visual_source(
-            &layer_cfg.source_path,
-            &layer_cfg.filename,
+            clip_source_path,
+            clip_filename,
             config
                 .layer_source_hints
                 .get(source_index)
@@ -1890,11 +3612,11 @@ fn run_export(
             &source_context,
             &mut source_fingerprints,
         );
-        let path = match resolved {
+        let resolved_file = match resolved {
             Ok(crate::media_source::ResolvedVisualSource::Spout { .. }) => {
                 progress.record_warning(black_substitution_warning(
                     source_index,
-                    &layer_cfg.filename,
+                    clip_filename,
                     "is a live Spout source unavailable to offline export",
                 ));
                 layers.push(black_placeholder_layer(
@@ -1905,17 +3627,17 @@ fn run_export(
                 )?);
                 continue;
             }
-            Ok(crate::media_source::ResolvedVisualSource::File(resolved)) => resolved.path,
-            Err(error) if strict_content_addressed_export_source(&layer_cfg.source_path) => {
+            Ok(crate::media_source::ResolvedVisualSource::File(resolved)) => resolved,
+            Err(error) if strict_content_addressed_export_source(clip_source_path) => {
                 return Err(format!(
                     "content-addressed export layer '{}' could not be resolved: {error}",
-                    layer_cfg.filename
+                    clip_filename
                 ));
             }
             Err(error) => {
                 progress.record_warning(black_substitution_warning(
                     source_index,
-                    &layer_cfg.filename,
+                    clip_filename,
                     &format!("could not be resolved ({error})"),
                 ));
                 layers.push(black_placeholder_layer(
@@ -1927,6 +3649,26 @@ fn run_export(
                 continue;
             }
         };
+        let source_fingerprint = match resolved_file.identity {
+            Some(identity) => Some(identity),
+            None => match source_fingerprints.fingerprint(&resolved_file.path) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    if progress.cancel.load(Ordering::Acquire) {
+                        return Err(
+                            "export cancelled while fingerprinting a visual source".to_string()
+                        );
+                    }
+                    progress.record_warning(format!(
+                        "Layer {} ('{}') source fingerprint is unavailable ({error}); the motion sidecar records that omission.",
+                        source_index + 1,
+                        clip_filename
+                    ));
+                    None
+                }
+            },
+        };
+        let path = resolved_file.path;
         let path_text = path.to_string_lossy();
         if crate::layers::is_still_image_file(&path) {
             match crate::video::decode_still_image_with_media_policy(
@@ -1941,13 +3683,14 @@ fn run_export(
                         source_index,
                         layer_cfg,
                         decoded,
+                        source_fingerprint.clone(),
                     )?);
                     continue;
                 }
                 Err(error) => {
                     progress.record_warning(black_substitution_warning(
                         source_index,
-                        &layer_cfg.filename,
+                        clip_filename,
                         &format!("could not open as a still image ({error})"),
                     ));
                     layers.push(black_placeholder_layer(
@@ -1970,7 +3713,7 @@ fn run_export(
             Err(e) => {
                 progress.record_warning(black_substitution_warning(
                     source_index,
-                    &layer_cfg.filename,
+                    clip_filename,
                     &format!("could not open as video ({e})"),
                 ));
                 layers.push(black_placeholder_layer(
@@ -1985,28 +3728,64 @@ fn run_export(
 
         let lw = decoder.width;
         let lh = decoder.height;
-        let fps = if layer_cfg.fps.is_finite() && layer_cfg.fps > 0.0 {
-            layer_cfg.fps
-        } else {
-            decoder.fps
-        }
-        .clamp(1.0, 240.0);
 
         check_cancelled(progress)?;
 
         let (texture, texture_view) =
             create_export_source_texture(&device, lw, lh, "Export Layer Tex")?;
 
-        // Seed every layer texture before frame zero. This makes paused layers
-        // show a stable first frame and avoids reading uninitialized GPU memory
-        // when the export rate is higher than the source rate.
-        let first_frame = match decoder.next_frame_result() {
-            Ok(frame) => frame,
+        // Build the bounded source-wide index once on the export worker. Every
+        // later presentation is an absolute seek from a known preceding
+        // keyframe (or the bounded reverse cache), never an EOF reopen or a
+        // render-thread scan from frame zero.
+        if let Err(error) = decoder.build_keyframe_index() {
+            if progress.cancel.load(Ordering::Acquire) {
+                return Err("export cancelled while indexing a video source".to_string());
+            }
+            progress.record_warning(format!(
+                "Layer {} ('{}') could not build its bounded keyframe index ({error}); using the decoder's deterministic fallback index.",
+                source_index + 1,
+                clip_filename
+            ));
+        }
+        check_cancelled(progress)?;
+
+        let duration_seconds = decoder.duration_seconds();
+        let source_frame_count = estimated_export_source_frames(duration_seconds, decoder.fps);
+        let mut transport =
+            ExportClipTransport::from_layer_config(layer_cfg, duration_seconds, source_frame_count);
+        let fps = export_transport_fps(&transport, decoder.fps);
+        let seed_selection = transport.seed_selection();
+
+        // Seed every layer texture with the exact saved-playhead selection
+        // before frame zero. Paused/Frozen exports therefore hold the authored
+        // frame rather than silently falling back to source frame zero.
+        let first_frame = match decoder
+            .seek_decode_for_generation(seed_selection.source_seconds, seed_selection.generation)
+        {
+            Ok(frame) if frame.metadata.source_generation == seed_selection.generation => frame,
+            Ok(frame) => {
+                progress.record_warning(black_substitution_warning(
+                    source_index,
+                    clip_filename,
+                    &format!(
+                        "returned stale generation {} while seeding requested generation {}",
+                        frame.metadata.source_generation, seed_selection.generation
+                    ),
+                ));
+                layers.push(black_placeholder_layer(
+                    &device,
+                    &queue,
+                    source_index,
+                    layer_cfg,
+                )?);
+                continue;
+            }
             Err(error) => {
                 progress.record_warning(black_substitution_warning(
                     source_index,
-                    &layer_cfg.filename,
-                    &format!("could not decode its first frame ({error})"),
+                    clip_filename,
+                    &format!("could not decode its saved playhead ({error})"),
                 ));
                 layers.push(black_placeholder_layer(
                     &device,
@@ -2022,11 +3801,16 @@ fn run_export(
             &device,
             &queue,
             &texture,
-            &first_frame,
+            &first_frame.rgba,
             lw,
             lh,
             "Export Video Layer",
         )?;
+        let codec_motion = matching_export_codec_motion(
+            first_frame.codec_motion,
+            first_frame.metadata.source_generation,
+            [lw, lh],
+        );
 
         let mut effects = EffectUniforms {
             resolution: [lw as f32, lh as f32],
@@ -2036,17 +3820,29 @@ fn run_export(
 
         layers.push(ExportLayer {
             source_index,
-            consumed_loop_generation: decoder.loop_generation(),
+            motion_source: ExportMotionSourceRecord {
+                kind: ExportMotionSourceKind::Video,
+                logical_name: clip_filename.to_owned(),
+                persisted_reference: clip_source_path.to_owned(),
+                fingerprint: source_fingerprint,
+            },
+            // Offline loop authority is the pure timeline's boundary count;
+            // absolute seeks deliberately do not consult decoder EOF state.
+            consumed_loop_generation: 0,
             decoder: Some(decoder),
+            codec_motion,
             _still_source: None,
             texture,
             texture_view,
             effects,
+            transform: layer_cfg.transform.sanitized(),
             opacity: layer_cfg.opacity,
             blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
             bypass_master_fx: layer_cfg.bypass_master_fx,
+            matte: LayerMatte::default(),
             reroll_on_loop: layer_cfg.reroll_on_loop,
-            speed: layer_cfg.speed,
+            transport,
+            speed: transport.authored.rate as f32,
             visible: layer_cfg.visible,
             paused: layer_cfg.paused,
             fps,
@@ -2055,12 +3851,44 @@ fn run_export(
         });
     }
 
+    // Saved matte donors are positional by design. Export assigns each patch
+    // position the same deterministic nonzero ID used by SourceTap, so failed
+    // media opens (which become black placeholders) never retarget a route.
+    for layer in &mut layers {
+        let layer_cfg = &patch.layers[layer.source_index];
+        layer.matte = export_runtime_matte(layer_cfg.matte, patch.layers.len());
+    }
+
+    // Resolve saved composition/rack positions once against deterministic
+    // export IDs. Missing media still owns its black placeholder ID, so a
+    // failed decoder can never retarget a selected-layer image route.
+    let base_creative_graph = resolve_export_creative_graph(patch)?;
+
     // --- Master effects ---
     let mut master_effects = EffectUniforms {
         resolution: [w as f32, h as f32],
         ..Default::default()
     };
     patch.master.apply_to_uniforms(&mut master_effects);
+    let master_transform = patch.master_transform.sanitized();
+    let base_master_motion =
+        resolved_export_motion(patch.master_motion, &base_creative_graph.layer_ids);
+    let base_layer_motion = layers
+        .iter()
+        .map(|layer| {
+            resolved_export_motion(
+                patch.layers[layer.source_index].motion,
+                &base_creative_graph.layer_ids,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut motion_sidecar = ExportMotionSidecarAccumulator::new(
+        config,
+        &base_creative_graph,
+        &layers,
+        base_master_motion,
+        &base_layer_motion,
+    );
 
     // --- NTSC state ---
     let mut ntsc_state = NtscState::new();
@@ -2079,7 +3907,12 @@ fn run_export(
     // identically for the same patch every time.
     let mut mod_matrix = crate::modulation::ModMatrix::new();
     if let Some(ref mod_cfg) = patch.modulation {
-        mod_cfg.apply_to_matrix(&mut mod_matrix);
+        mod_cfg.apply_to_matrix_with_composition(
+            &mut mod_matrix,
+            &base_creative_graph.address_book,
+            &base_creative_graph.layer_ids,
+            &base_creative_graph.composition,
+        );
     }
     let analysis_clip = if mod_matrix.audio_enabled
         && mod_matrix.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
@@ -2119,12 +3952,47 @@ fn run_export(
     let export_morph = patch.morph.clone().map(crate::morph::Morph::from_snapshot);
 
     // --- Temporal effects (feedback/slit-scan), same pass as live ---
-    let base_temporal = patch
+    let mut base_temporal = patch
         .temporal
         .as_ref()
         .map(|t| t.to_params())
         .unwrap_or_default();
+    if let Some(originals) = patch
+        .temporal
+        .as_ref()
+        .and_then(|temporal| temporal.originals.as_ref())
+    {
+        base_temporal.originals.score.loop_driver = resolve_export_score_loop_driver(
+            originals.score.loop_driver,
+            &base_creative_graph.layer_ids,
+        );
+    }
     let mut temporal_state = crate::renderer::state::TemporalState::default();
+    let mut temporal_boundaries = crate::performance::BeatBoundaryTracker::default();
+    let mut temporal_audio_onsets = crate::temporal::TemporalAudioOnsetTracker::default();
+    if base_temporal.originals.score.enabled {
+        match base_temporal.originals.score.trigger {
+            crate::temporal::CollisionScoreTrigger::Manual => progress.record_warning(
+                "Collision Score manual events have no recorded offline event stream; deterministic export supplies zero manual events.",
+            ),
+            crate::temporal::CollisionScoreTrigger::AudioOnset if analysis_clip.is_none() => {
+                progress.record_warning(
+                    "Collision Score audio-onset events require a deterministic imported analysis clip; export supplies zero live-input onset events.",
+                );
+            }
+            crate::temporal::CollisionScoreTrigger::Boundary
+                if !matches!(
+                    base_temporal.originals.score.loop_driver,
+                    crate::temporal::CollisionScoreLoopDriver::SelectedLayer { .. }
+                ) =>
+            {
+                progress.record_warning(
+                    "Collision Score loop driver is missing; export supplies zero boundary events.",
+                );
+            }
+            _ => {}
+        }
+    }
     let mut previous_selective_frame: Option<bool> = None;
     let mut previous_selective_topology: Option<u64> = None;
 
@@ -2198,9 +4066,8 @@ fn run_export(
     // --- Frame loop ---
     let frame_interval = 1.0 / config.fps as f32;
     let mut write_error = None;
+    let mut emitted_motion_warnings = std::collections::BTreeSet::new();
 
-    // Track per-layer frame timing (accumulator-based)
-    let mut layer_accumulators: Vec<f32> = vec![0.0; layers.len()];
     let frame_gpu_errors = Arc::new(Mutex::new(Vec::new()));
 
     for frame_num in 0..total_frames {
@@ -2231,85 +4098,369 @@ fn run_export(
         }
         update_export_modulation(&mut mod_matrix, beat, program_dt, patch.master_paused);
         let modulation_frame = mod_matrix.frame(layers.len());
-        let mut frame_master = master_effects;
-        let mut frame_ntsc = base_ntsc.clone();
-        let mut frame_temporal = base_temporal;
         // Keep render parameters detached from decoder/runtime handles. A
         // full morph sample can then drive exactly the same layer world as
         // live rendering without mutating the saved patch bases.
-        let mut frame_layer_bases: Vec<ExportFrameLayerBase> =
-            layers.iter().map(ExportFrameLayerBase::from).collect();
+        let baseline_morph_world = ExportFrameMorphWorld {
+            creative_graph: base_creative_graph.clone(),
+            master: master_effects,
+            master_transform,
+            master_motion: base_master_motion,
+            ntsc: base_ntsc.clone(),
+            temporal: base_temporal,
+            layer_bases: layers.iter().map(ExportFrameLayerBase::from).collect(),
+            layer_motion: base_layer_motion.clone(),
+            morph_overrides: vec![ExportMorphOverrides::default(); layers.len()],
+        };
+        let frame_mattes = layers.iter().map(|layer| layer.matte).collect::<Vec<_>>();
+        let mut composition_history_ready = composition_gpu
+            .as_ref()
+            .is_some_and(CompositionGpuExecutor::program_history_initialized);
+        let mut frame_morph_world = baseline_morph_world.clone();
 
         // Live Pause holds the already-materialized patch bases and does not
         // re-apply a morph. Mirror that exact held-state contract offline.
-        if let Some(sample) = export_morph_sample(
+        if let Some(requested_position) = export_morph_position(
             export_morph.as_ref(),
             beat,
             modulation_frame.morph_offset(),
             patch.master_paused,
         ) {
-            sample.master.apply_to(&mut frame_master);
-            frame_ntsc = sample.ntsc.to_params();
-            frame_temporal = sample.temporal.to_params();
-            for sampled in sample.layers {
-                if let Some((position, _)) = layers
-                    .iter()
-                    .enumerate()
-                    .find(|(_, layer)| layer.source_index == sampled.position)
-                {
-                    frame_layer_bases[position].opacity = sampled.opacity;
-                    frame_layer_bases[position].speed = sampled.speed;
-                    if let Some(fps) = sampled.fps {
-                        frame_layer_bases[position].fps = fps;
+            let Some(morph) = export_morph.as_ref() else {
+                write_error = Some("active export Morph disappeared during sampling".to_string());
+                break;
+            };
+            let selected = select_valid_morph_candidate(requested_position, |sample_position| {
+                let sample = morph.sample(sample_position).ok_or_else(|| {
+                    format!("Morph has no complete sample at {sample_position:.4}")
+                })?;
+                let mut candidate = baseline_morph_world.clone();
+                apply_export_morph_world(&sample, &layers, &mut candidate);
+                let evaluated = evaluate_export_morph_world(
+                    &candidate,
+                    &layers,
+                    &modulation_frame,
+                    FramePlanContext::new(w, h, time),
+                );
+                plan_export_composition_with_motion(
+                    &evaluated,
+                    &candidate.creative_graph,
+                    &frame_mattes,
+                    composition_history_ready,
+                    creative_resource_limits,
+                    ExportMotionPlanAdapter {
+                        master: candidate.master_motion,
+                        layers: &candidate.layer_motion,
+                        sources: &layers,
+                        limits: motion_device_limits,
+                    },
+                )?;
+                Ok(candidate)
+            });
+            match selected {
+                Ok(selected) => {
+                    if (selected.selected_position - selected.requested_position).abs()
+                        > f32::EPSILON
+                    {
+                        progress.record_warning(format!(
+                            "Morph sample {:.4} was invalid ({}); used captured endpoint {:.1}",
+                            selected.requested_position,
+                            selected
+                                .requested_error
+                                .as_deref()
+                                .unwrap_or("creative graph rejected"),
+                            selected.selected_position
+                        ));
                     }
-                    if let Some(effects) = sampled.effects {
-                        effects.apply_to(&mut frame_layer_bases[position].effects);
-                    }
-                    if let Some(key_threshold) = sampled.key_threshold {
-                        frame_layer_bases[position].effects.key_threshold = key_threshold;
-                    }
-                    if let Some(blend_mode) = sampled.blend_mode {
-                        frame_layer_bases[position].blend_mode = blend_mode.to_blend_mode();
-                    }
-                    if let Some(visible) = sampled.visible {
-                        frame_layer_bases[position].visible = visible;
-                    }
-                    if let Some(paused) = sampled.paused {
-                        frame_layer_bases[position].paused = paused;
-                    }
-                    if let Some(bypass_master_fx) = sampled.bypass_master_fx {
-                        frame_layer_bases[position].bypass_master_fx = bypass_master_fx;
-                    }
+                    frame_morph_world = selected.value;
+                }
+                Err(error) => {
+                    write_error = Some(error);
+                    break;
                 }
             }
         }
-        frame_master.time = time;
-        let (mod_master, mod_ntsc, mod_temporal) =
-            modulation_frame.modulate(&frame_master, &frame_ntsc, &frame_temporal);
 
-        // Per-layer modulated values for this frame (bases untouched).
-        let mut layer_mods: Vec<(EffectUniforms, f32)> = Vec::with_capacity(layers.len());
-        let mut frame_speeds = Vec::with_capacity(layers.len());
-        let mut frame_fps = Vec::with_capacity(layers.len());
-        // Keep placeholder slots in the batch so positional layer targets stay
-        // attached to their saved source identity even when media is missing.
-        let frame_modulations = modulation_frame.modulate_layers(
-            frame_layer_bases
-                .iter()
-                .map(|base| (&base.effects, base.opacity, base.speed, base.fps)),
+        let stable_modulation_frame = mod_matrix.stable_frame(&base_creative_graph.address_book);
+        crate::modulation::apply_stable_modulation(
+            &base_creative_graph.address_book,
+            &stable_modulation_frame,
+            &mut frame_morph_world.creative_graph.master_rack,
+            &mut frame_morph_world.creative_graph.layer_racks,
+            &mut frame_morph_world.creative_graph.composition,
         );
-        for lm in frame_modulations {
-            let mut fx = lm.effects;
-            fx.time = time;
-            frame_speeds.push(lm.speed);
-            frame_fps.push(lm.fps);
-            layer_mods.push((fx, lm.opacity));
+        let ExportFrameMorphWorld {
+            creative_graph: frame_creative_graph,
+            master: frame_master,
+            master_transform: frame_master_transform,
+            master_motion: frame_master_motion,
+            ntsc: frame_ntsc,
+            temporal: frame_temporal,
+            layer_bases: mut frame_layer_bases,
+            layer_motion: frame_layer_motion,
+            morph_overrides,
+        } = frame_morph_world;
+
+        // Resolve source time before the immutable visual plan is built so a
+        // OneShot's transparent terminal state is part of the exact plan used
+        // by direct, selective-NTSC, matte, and temporal paths. This is the
+        // same pure TransportTimeline contract used live; export specializes
+        // only by supplying a frame-indexed clock and synchronous indexed
+        // absolute decode.
+        let mut source_discontinuity = false;
+        let mut motion_held_scopes = Vec::with_capacity(layers.len());
+        let score_loop_driver = match frame_temporal.originals.score.loop_driver {
+            crate::temporal::CollisionScoreLoopDriver::SelectedLayer { layer_id, .. } => {
+                Some(layer_id)
+            }
+            crate::temporal::CollisionScoreLoopDriver::None
+            | crate::temporal::CollisionScoreLoopDriver::MissingSelectedLayer { .. } => None,
+        };
+        let mut temporal_loop_events = 0_u32;
+        for index in 0..layers.len() {
+            let transport_config = modulated_export_transport_config(
+                &modulation_frame,
+                index,
+                layers[index].transport.authored,
+                &frame_layer_bases[index],
+                morph_overrides[index],
+            );
+            let selection = layers[index].transport.select(
+                transport_config,
+                ProgramTransportTick {
+                    delta_seconds: f64::from(program_dt),
+                    program_beat: beat,
+                    program_running: !patch.master_paused,
+                    media_running: !patch.media_frozen && !frame_layer_bases[index].paused,
+                    ..ProgramTransportTick::default()
+                },
+            );
+            source_discontinuity |= selection.discontinuity;
+            if let Some(scope) = export_motion_held_scope(
+                &frame_creative_graph,
+                layers[index].source_index,
+                selection,
+            ) {
+                motion_held_scopes.push(scope);
+            }
+
+            // Absolute seeks do not touch VideoDecoder's EOF generation.
+            // Count each pure timeline boundary once and only once, including
+            // multiple wraps/reflections within a large deterministic tick.
+            let layer = &mut layers[index];
+            let loop_boundaries = if matches!(
+                transport_config.end_behavior,
+                crate::transport::EndBehavior::Loop | crate::transport::EndBehavior::PingPong
+            ) {
+                selection.boundary_events
+            } else {
+                0
+            };
+            if frame_creative_graph
+                .layer_ids
+                .get(layer.source_index)
+                .is_some_and(|layer_id| Some(*layer_id) == score_loop_driver)
+            {
+                temporal_loop_events = temporal_loop_events.saturating_add(loop_boundaries);
+            }
+            let next_loop_generation = layer
+                .consumed_loop_generation
+                .saturating_add(u64::from(loop_boundaries));
+            let reroll_on_loop = layer.reroll_on_loop;
+            let rerolled = apply_export_loop_generation(
+                &mut layer.effects,
+                reroll_on_loop,
+                &mut layer.consumed_loop_generation,
+                next_loop_generation,
+            );
+            if rerolled > 0 && !morph_overrides[index].effects {
+                frame_layer_bases[index].effects.random_seed = layer.effects.random_seed;
+            }
+
+            if selection.discontinuity || selection.transparent {
+                // No field from the previous source generation may cross a
+                // seek/cue/loop cut or a transparent OneShot terminal.
+                layer.codec_motion = None;
+            }
+
+            if selection.sample_due && !selection.transparent {
+                if progress.cancel.load(Ordering::Acquire) {
+                    write_error = Some("export cancelled during indexed source decode".to_string());
+                    break;
+                }
+                let decoded = layer.decoder.as_mut().map(|decoder| {
+                    decoder
+                        .seek_decode_for_generation(selection.source_seconds, selection.generation)
+                });
+                if let Some(decoded) = decoded {
+                    match decoded {
+                        Ok(frame) if frame.metadata.source_generation == selection.generation => {
+                            let codec_motion = matching_export_codec_motion(
+                                frame.codec_motion,
+                                frame.metadata.source_generation,
+                                [layer.width, layer.height],
+                            );
+                            if let Err(error) = upload_export_texture_checked(
+                                &device,
+                                &queue,
+                                &layer.texture,
+                                &frame.rgba,
+                                layer.width,
+                                layer.height,
+                                "Export Indexed Video Frame",
+                            ) {
+                                write_error = Some(format!(
+                                    "layer {} GPU upload failed during export: {error}",
+                                    layer.source_index + 1
+                                ));
+                                break;
+                            }
+                            // Pixels and decoder metadata publish as one
+                            // export-side transaction only after upload.
+                            layer.codec_motion = codec_motion;
+                        }
+                        Ok(frame) => {
+                            write_error = Some(format!(
+                                "layer {} decoder returned stale generation {} for requested generation {}",
+                                layer.source_index + 1,
+                                frame.metadata.source_generation,
+                                selection.generation
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            write_error = Some(format!(
+                                "layer {} indexed decode failed during export: {error}",
+                                layer.source_index + 1
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+            frame_layer_bases[index].visible &= !selection.transparent;
         }
-        for (layer, base) in layers.iter_mut().zip(frame_layer_bases.iter()) {
-            layer.blend_mode = base.blend_mode;
-            layer.visible = base.visible;
-            layer.bypass_master_fx = base.bypass_master_fx;
+        if write_error.is_some() {
+            break;
         }
+        if source_discontinuity {
+            // Match live source-cut generation invalidation: no temporal,
+            // ProgramHistory, or previous-scope donor may cross a seek/cue/
+            // loop discontinuity into the next authored source generation.
+            temporal_state.reset_for(crate::temporal::TemporalResetCause::SourceCut);
+            if let Some(resources) = image_routing_gpu.as_mut() {
+                resources.history_valid = false;
+            }
+            if let Some(executor) = composition_gpu.as_mut() {
+                executor.reset_history_for(crate::temporal::TemporalResetCause::SourceCut);
+            }
+            composition_history_ready = false;
+        }
+        let temporal_crossings = temporal_boundaries.observe(beat, 4, patch.master_paused);
+        let temporal_audio_events =
+            temporal_audio_onsets.observe(mod_matrix.audio.onset, !patch.master_paused);
+        let temporal_input = crate::temporal::TemporalFrameInput::new(
+            program_dt,
+            match (patch.master_paused, patch.media_frozen) {
+                (false, false) => crate::temporal::TemporalFreezeState::Running,
+                (false, true) => crate::temporal::TemporalFreezeState::MediaFrozen,
+                (true, false) => crate::temporal::TemporalFreezeState::ProgramFrozen,
+                (true, true) => crate::temporal::TemporalFreezeState::ProgramAndMediaFrozen,
+            },
+            false,
+            crate::temporal::TemporalFrameEvents {
+                boundary_events: temporal_loop_events,
+                downbeat_events: temporal_crossings.bars,
+                audio_onset_events: temporal_audio_events,
+                // Offline renders currently have no authored event recording;
+                // the one-time warning above makes this deterministic zero
+                // substitution visible rather than pretending wall-clock UI.
+                manual_events: 0,
+            },
+        )
+        .with_audio_energy(mod_matrix.audio.level);
+
+        // Live and export cross the same post-morph boundary here. From this
+        // point onward one immutable evaluator owns render, transport, source,
+        // transform, blend, and temporal values for the complete frame.
+        let mut evaluated_frame =
+            EvaluatedFramePlan::evaluate(
+                &modulation_frame,
+                FramePlanContext::new(w, h, time),
+                MasterFrameInput {
+                    effects: &frame_master,
+                    transform: &frame_master_transform,
+                    ntsc: &frame_ntsc,
+                    temporal: &frame_temporal,
+                },
+                layers.iter().zip(frame_layer_bases.iter()).enumerate().map(
+                    |(slot, (layer, base))| LayerFrameInput {
+                        source: SourceTap::new(
+                            export_selective_layer_id(layer.source_index),
+                            slot,
+                            layer.width,
+                            layer.height,
+                        ),
+                        effects: &base.effects,
+                        transform: &base.transform,
+                        opacity: base.opacity,
+                        speed: base.speed,
+                        fps: base.fps,
+                        blend_mode: base.blend_mode,
+                        visible: base.visible,
+                        paused: base.paused,
+                        bypass_master_fx: base.bypass_master_fx,
+                    },
+                ),
+            );
+        let evaluated_composition = match plan_export_composition_with_motion(
+            &evaluated_frame,
+            &frame_creative_graph,
+            &frame_mattes,
+            composition_history_ready,
+            creative_resource_limits,
+            ExportMotionPlanAdapter {
+                master: frame_master_motion,
+                layers: &frame_layer_motion,
+                sources: &layers,
+                limits: motion_device_limits,
+            },
+        ) {
+            Ok(plan) => plan,
+            Err(error) => {
+                write_error = Some(error);
+                break;
+            }
+        };
+        debug_assert_eq!(evaluated_frame.context().output_size, [w, h]);
+        let mod_ntsc = evaluated_frame.ntsc().clone();
+        let mod_temporal = *evaluated_frame.temporal();
+        let frame_motion_metadata = export_motion_metadata_for_frame(
+            &evaluated_composition,
+            &frame_creative_graph,
+            &layers,
+            frame_num,
+        );
+        for warning in export_motion_plan_warnings(&evaluated_composition) {
+            if emitted_motion_warnings.insert(warning.clone()) {
+                progress.record_warning(warning);
+            }
+        }
+        let (motion_field_products, motion_field_diagnostics) = match &evaluated_composition {
+            EvaluatedCompositionPlan::Advanced(plan) => {
+                export_codec_motion_fields(plan, &frame_creative_graph, &layers)
+            }
+            EvaluatedCompositionPlan::LegacyExact(_) => (Vec::new(), Vec::new()),
+        };
+        for warning in motion_field_diagnostics {
+            if emitted_motion_warnings.insert(warning.clone()) {
+                progress.record_warning(warning);
+            }
+        }
+        let motion_field_attachments = motion_field_products
+            .iter()
+            .map(ExportMotionFieldProduct::attachment)
+            .collect::<Vec<_>>();
 
         // --- GPU render ---
         let frame_gpu_scope = ExportGpuErrorCapture::new(
@@ -2321,173 +4472,310 @@ fn run_export(
             label: Some("Export Frame Encoder"),
         });
 
-        let selective_plan = plan_export_selective_ntsc(
-            frame_num,
-            w,
-            h,
-            config.fps,
-            patch.master_paused,
-            &mod_ntsc,
-            &layers,
-            &layer_mods,
-            &mod_master,
-        );
-        let selective_frame = selective_plan.is_some();
-        let selective_topology = selective_plan
-            .as_ref()
-            .map(export_selective_topology_signature);
-        let selective_edge =
-            previous_selective_frame.is_some_and(|previous| previous != selective_frame);
-        let selective_topology_changed = selective_frame
-            && previous_selective_topology
-                .is_some_and(|previous| Some(previous) != selective_topology);
-        if selective_edge || selective_topology_changed {
-            // Match live `reset_visual_generation`: no pre-switch feedback or
-            // slit history may cross a selective-VHS topology/path edge.
-            temporal_state = crate::renderer::state::TemporalState::default();
-        }
-        previous_selective_frame = Some(selective_frame);
-        previous_selective_topology = selective_topology;
-        if let Some(plan) = selective_plan {
-            if selective_staging.is_none() {
-                match create_export_readback_buffer(
-                    &device,
-                    buffer_size,
-                    "Export Selective NTSC Readback",
+        let (selective_frame, advanced_history_staged) = match &evaluated_composition {
+            EvaluatedCompositionPlan::Advanced(advanced) => {
+                let advanced_ntsc_path = advanced.ntsc_path();
+                let skip_global_ntsc = match advanced_export_skips_global_ntsc(
+                    advanced_ntsc_path,
+                    advanced.master().selective_ntsc_layers.len(),
+                    advanced.master().selective_ntsc_bypass_layers.len(),
                 ) {
-                    Ok(buffer) => selective_staging = Some(buffer),
+                    Ok(skip) => skip,
                     Err(error) => {
                         write_error = Some(error);
                         break;
                     }
+                };
+                if composition_gpu.is_none() {
+                    composition_gpu = match CompositionGpuExecutor::new(&device, &queue, [w, h]) {
+                        Ok(executor) => Some(executor),
+                        Err(error) => {
+                            write_error = Some(format!(
+                                "export advanced composition initialization failed: {error}"
+                            ));
+                            break;
+                        }
+                    };
                 }
-            }
-            let Some(selective_staging) = selective_staging.as_ref() else {
-                write_error = Some("selective NTSC staging initialization failed".to_string());
-                break;
-            };
-            // Each slice is rendered through local FX and conditional direct
-            // master FX in one coherent command stream. Composite/VHS stays
-            // on the CPU, so no unprocessed intermediate reaches Temporal.
-            let slices = match render_and_readback_selective_ntsc_slices_export(
-                &device,
-                &queue,
-                &mut encoder,
-                &layers,
-                &layer_mods,
-                &mod_master,
-                &plan,
-                &composite_textures,
-                &composite_views,
-                &effects_pipeline,
-                &effects_bind_group_layout,
-                &effects_uniform_layout,
-                &sampler,
-                selective_staging,
-                w,
-                h,
-                bytes_per_row,
-                &progress.cancel,
-            ) {
-                Ok(slices) => slices,
-                Err(error) => {
-                    write_error = Some(error);
+                let source_descriptors = advanced
+                    .layers()
+                    .iter()
+                    .map(|planned| {
+                        let layer = &layers[planned.base_layer_index];
+                        CompositionSourceDescriptor::new(
+                            planned.stable_id,
+                            &layer.texture_view,
+                            [layer.width, layer.height],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let executor = composition_gpu
+                    .as_mut()
+                    .expect("advanced export executor was initialized above");
+                match executor.prepare(&device, &queue, &evaluated_composition, &source_descriptors)
+                {
+                    Ok(CompositionPreparedKind::Advanced { .. }) => {}
+                    Ok(CompositionPreparedKind::LegacyExact) => {
+                        executor.discard_frame_history();
+                        write_error = Some(
+                            "advanced export planner/executor delegation mismatch".to_string(),
+                        );
+                        break;
+                    }
+                    Err(error) => {
+                        executor.discard_frame_history();
+                        write_error = Some(format!(
+                            "export advanced composition preparation failed: {error}"
+                        ));
+                        break;
+                    }
+                }
+                match executor.encode_with_motion(
+                    &queue,
+                    &mut encoder,
+                    &evaluated_composition,
+                    CompositionFrameTiming::from_temporal_input(temporal_input),
+                    CompositionMotionFrameInput {
+                        attachments: &motion_field_attachments,
+                        held_scopes: &motion_held_scopes,
+                    },
+                ) {
+                    Ok(CompositionEncodeKind::Advanced) => {}
+                    Ok(CompositionEncodeKind::LegacyExact) => {
+                        executor.discard_frame_history();
+                        write_error =
+                            Some("advanced export planner/executor encode mismatch".to_string());
+                        break;
+                    }
+                    Err(error) => {
+                        executor.discard_frame_history();
+                        write_error = Some(format!("export advanced composition failed: {error}"));
+                        break;
+                    }
+                }
+                let output = executor.output();
+                debug_assert_eq!(output.dimensions, [w, h]);
+                debug_assert_eq!(
+                    output.format,
+                    crate::renderer::composition::COMPOSITION_WORKING_FORMAT
+                );
+                let _ = (output.texture, output.view);
+                if let Err(error) = executor.encode_present(
+                    &mut encoder,
+                    &composite_views[0],
+                    COMPOSITION_PRESENT_FORMAT,
+                ) {
+                    executor.discard_frame_history();
+                    write_error = Some(format!(
+                        "export advanced composition presentation failed: {error}"
+                    ));
                     break;
                 }
-            };
-            if progress.cancel.load(Ordering::Acquire) {
-                write_error = Some("export cancelled before selective NTSC processing".into());
-                break;
+
+                // The shared executor owns LegacyTemporal for Advanced and
+                // presents one straight-alpha compatibility image into slot
+                // zero. Reuse the established sole opaque boundary before
+                // readback/NTSC, exactly as the live advanced handoff does.
+                crate::renderer::state::encode_opaque_output(
+                    &mut encoder,
+                    &opaque_output_pipeline,
+                    &opaque_output_bind_group,
+                    &composite_views[2],
+                );
+                // Homogeneous inherited stacks use global post-composite
+                // NTSC. Homogeneous bypass stacks must suppress that call;
+                // `Mixed` was rejected above because the advanced executor
+                // does not silently enter the legacy flat slice path.
+                (skip_global_ntsc, true)
             }
-            let processed = match process_selective_ntsc_batch_with_state_and_resolution(
-                &mut selective_ntsc_state,
-                SelectiveNtscBatch { plan, slices },
-                config.ntsc_quality,
-            ) {
-                Ok(processed) => processed,
-                Err(error) => {
-                    write_error = Some(format!("selective NTSC export failed: {error}"));
+            EvaluatedCompositionPlan::LegacyExact(_) => {
+                // Exact delegation retains the old routing attachment and GPU
+                // sequence byte-for-byte. The unified planner can only select
+                // this branch when every raw authored matte is a no-op.
+                let legacy_history_ready = image_routing_gpu
+                    .as_ref()
+                    .is_some_and(|resources| resources.history_valid);
+                if let Err(error) =
+                    evaluated_frame.attach_image_routing(frame_mattes, legacy_history_ready)
+                {
+                    write_error = Some(format!("export image routing rejected frame: {error}"));
                     break;
                 }
-            };
-            if progress.cancel.load(Ordering::Acquire) {
-                write_error = Some("export cancelled during selective NTSC processing".into());
-                break;
-            }
-            if let Err(error) = upload_engine_composite_export(
-                &device,
-                &queue,
-                &composite_textures[0],
-                &processed.pixels,
-                w,
-                h,
-            ) {
-                write_error = Some(error);
-                break;
-            }
-            // CPU processing and queue upload are complete before Temporal is
-            // encoded. A fresh command stream prevents the earlier layer
-            // passes from overwriting the returned straight-alpha composite.
-            encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Export Selective Post-NTSC Encoder"),
-            });
-        } else {
-            // Byte-for-byte legacy path: VHS-off and all-inherited stacks keep
-            // the established direct render -> Temporal -> opaque -> global
-            // NTSC order without any selective slice allocation or composite.
-            render_layers_and_master_export(
-                &device,
-                &queue,
-                &mut encoder,
-                &layers,
-                &layer_mods,
-                &mod_master,
-                &composite_textures,
-                &composite_views,
-                &effects_pipeline,
-                &effects_bind_group_layout,
-                &effects_uniform_layout,
-                &composite_pipeline,
-                &composite_bind_group_layout,
-                &composite_uniform_layout,
-                &sampler,
-                w,
-                h,
-            );
-        }
+                let selective_plan = plan_export_selective_ntsc(
+                    frame_num,
+                    config.fps,
+                    patch.master_paused,
+                    &evaluated_frame,
+                );
+                if selective_plan.is_some() {
+                    if let Err(error) = validate_selective_matte_topology(
+                        evaluated_frame.image_routing().is_active(),
+                    ) {
+                        write_error = Some(error);
+                        break;
+                    }
+                }
+                let selective_frame = selective_plan.is_some();
+                let selective_topology = selective_plan
+                    .as_ref()
+                    .map(export_selective_topology_signature);
+                let selective_edge =
+                    previous_selective_frame.is_some_and(|previous| previous != selective_frame);
+                let selective_topology_changed = selective_frame
+                    && previous_selective_topology
+                        .is_some_and(|previous| Some(previous) != selective_topology);
+                if selective_edge || selective_topology_changed {
+                    // Match live `reset_visual_generation`: no pre-switch feedback or
+                    // slit history may cross a selective-VHS topology/path edge.
+                    temporal_state = crate::renderer::state::TemporalState::default();
+                }
+                previous_selective_frame = Some(selective_frame);
+                previous_selective_topology = selective_topology;
+                if let Some(plan) = selective_plan {
+                    if selective_staging.is_none() {
+                        match create_export_readback_buffer(
+                            &device,
+                            buffer_size,
+                            "Export Selective NTSC Readback",
+                        ) {
+                            Ok(buffer) => selective_staging = Some(buffer),
+                            Err(error) => {
+                                write_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    let Some(selective_staging) = selective_staging.as_ref() else {
+                        write_error =
+                            Some("selective NTSC staging initialization failed".to_string());
+                        break;
+                    };
+                    // Each slice is rendered through local FX and conditional direct
+                    // master FX in one coherent command stream. Composite/VHS stays
+                    // on the CPU, so no unprocessed intermediate reaches Temporal.
+                    let slices = match render_and_readback_selective_ntsc_slices_export(
+                        &device,
+                        &queue,
+                        &mut encoder,
+                        &layers,
+                        &evaluated_frame,
+                        &plan,
+                        &composite_textures,
+                        &composite_views,
+                        &effects_pipeline,
+                        &effects_bind_group_layout,
+                        &effects_uniform_layout,
+                        &sampler,
+                        &nearest_sampler,
+                        selective_staging,
+                        w,
+                        h,
+                        bytes_per_row,
+                        &progress.cancel,
+                    ) {
+                        Ok(slices) => slices,
+                        Err(error) => {
+                            write_error = Some(error);
+                            break;
+                        }
+                    };
+                    if progress.cancel.load(Ordering::Acquire) {
+                        write_error =
+                            Some("export cancelled before selective NTSC processing".into());
+                        break;
+                    }
+                    let processed = match process_selective_ntsc_batch_with_state_and_resolution(
+                        &mut selective_ntsc_state,
+                        SelectiveNtscBatch { plan, slices },
+                        config.ntsc_quality,
+                    ) {
+                        Ok(processed) => processed,
+                        Err(error) => {
+                            write_error = Some(format!("selective NTSC export failed: {error}"));
+                            break;
+                        }
+                    };
+                    if progress.cancel.load(Ordering::Acquire) {
+                        write_error =
+                            Some("export cancelled during selective NTSC processing".into());
+                        break;
+                    }
+                    if let Err(error) = upload_engine_composite_export(
+                        &device,
+                        &queue,
+                        &composite_textures[0],
+                        &processed.pixels,
+                        w,
+                        h,
+                    ) {
+                        write_error = Some(error);
+                        break;
+                    }
+                    // CPU processing and queue upload are complete before Temporal is
+                    // encoded. A fresh command stream prevents the earlier layer
+                    // passes from overwriting the returned straight-alpha composite.
+                    encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Export Selective Post-NTSC Encoder"),
+                    });
+                } else {
+                    // Byte-for-byte legacy path: VHS-off and all-inherited stacks keep
+                    // the established direct render -> Temporal -> opaque -> global
+                    // NTSC order without any selective slice allocation or composite.
+                    if let Err(error) = render_layers_and_master_export_routed(
+                        &device,
+                        &queue,
+                        &mut encoder,
+                        &layers,
+                        &evaluated_frame,
+                        &composite_textures,
+                        &composite_views,
+                        &effects_pipeline,
+                        &effects_bind_group_layout,
+                        &effects_uniform_layout,
+                        &composite_pipeline,
+                        &composite_bind_group_layout,
+                        &composite_uniform_layout,
+                        &sampler,
+                        &nearest_sampler,
+                        &matte_composite,
+                        &mut image_routing_gpu,
+                        w,
+                        h,
+                    ) {
+                        write_error = Some(error);
+                        break;
+                    }
+                }
 
-        // Temporal effects + history recording (identical pass to live)
-        crate::renderer::state::encode_temporal_with_dt(
-            &device,
-            &queue,
-            &mut encoder,
-            &mod_temporal,
-            &temporal_pipeline,
-            &temporal_bgl,
-            &temporal_ubl,
-            &sampler,
-            &composite_textures,
-            &composite_views,
-            &history_texture,
-            &history_view,
-            &feedback_texture,
-            &feedback_view,
-            &mut temporal_state,
-            program_dt,
-            !patch.master_paused,
-            w,
-            h,
-        );
+                // Temporal effects + history recording (identical pass to live)
+                crate::renderer::state::encode_temporal_prepared_frame(
+                    &queue,
+                    &mut encoder,
+                    &mod_temporal,
+                    &temporal_pipeline,
+                    &temporal_prepared,
+                    &composite_textures,
+                    &composite_views,
+                    &history_texture,
+                    &feedback_texture,
+                    &mut temporal_state,
+                    temporal_input,
+                    w,
+                    h,
+                );
 
-        // Export consumes the same opaque SDR program image as live preview,
-        // projector, Spout, and NTSC. Keep key alpha inside the engine and
-        // flatten it over black exactly once at this boundary.
-        crate::renderer::state::encode_opaque_output(
-            &mut encoder,
-            &opaque_output_pipeline,
-            &opaque_output_bind_group,
-            &composite_views[2],
-        );
+                // Export consumes the same opaque SDR program image as live preview,
+                // projector, Spout, and NTSC. Keep key alpha inside the engine and
+                // flatten it over black exactly once at this boundary.
+                crate::renderer::state::encode_opaque_output(
+                    &mut encoder,
+                    &opaque_output_pipeline,
+                    &opaque_output_bind_group,
+                    &composite_views[2],
+                );
+                (selective_frame, false)
+            }
+        };
 
         // Submit GPU work
         queue.submit(std::iter::once(encoder.finish()));
@@ -2505,6 +4793,12 @@ fn run_export(
         ) {
             Ok(pixels) => pixels,
             Err(error) => {
+                temporal_state.discard_staged();
+                if advanced_history_staged {
+                    if let Some(executor) = composition_gpu.as_mut() {
+                        executor.discard_frame_history();
+                    }
+                }
                 write_error = Some(error);
                 break;
             }
@@ -2525,77 +4819,14 @@ fn run_export(
 
         // Write to ffmpeg
         if let Err(error) = ffmpeg_stdin.write_all(&pixels) {
-            write_error = Some(format!("failed to write video frame to ffmpeg: {error}"));
-            break;
-        }
-
-        // Advance after rendering so frame zero always contains each source's
-        // first decoded frame. The accumulator preserves source cadence when
-        // source and export frame rates differ.
-        if frame_num + 1 < total_frames {
-            for (i, layer) in layers.iter_mut().enumerate() {
-                let base = frame_layer_bases[i];
-                let fps = frame_fps[i];
-                let paused = base.paused;
-                if patch.master_paused || patch.media_frozen || paused {
-                    // Live transport resets fractional debt while paused, so
-                    // a morph-driven pause/unpause must resume from a fresh
-                    // cadence boundary offline as well.
-                    layer_accumulators[i] = 0.0;
-                    continue;
-                }
-                let speed = frame_speeds[i];
-                layer_accumulators[i] += frame_interval * speed;
-                let layer_interval = 1.0 / fps;
-                while layer_accumulators[i] >= layer_interval {
-                    if progress.cancel.load(Ordering::Acquire) {
-                        write_error = Some("export cancelled during source decode".to_string());
-                        break;
-                    }
-                    layer_accumulators[i] -= layer_interval;
-                    let Some(decoder) = layer.decoder.as_mut() else {
-                        continue;
-                    };
-                    match decoder
-                        .next_frame_result()
-                        .map(|rgba| (rgba, decoder.loop_generation()))
-                    {
-                        Ok((rgba, loop_generation)) => {
-                            apply_export_loop_generation(
-                                &mut layer.effects,
-                                layer.reroll_on_loop,
-                                &mut layer.consumed_loop_generation,
-                                loop_generation,
-                            );
-                            if let Err(error) = upload_export_texture_checked(
-                                &device,
-                                &queue,
-                                &layer.texture,
-                                &rgba,
-                                layer.width,
-                                layer.height,
-                                "Export Video Frame",
-                            ) {
-                                write_error = Some(format!(
-                                    "layer {} GPU upload failed during export: {error}",
-                                    layer.source_index + 1
-                                ));
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            write_error = Some(format!(
-                                "layer {} decode failed during export: {error}",
-                                layer.source_index + 1
-                            ));
-                            break;
-                        }
-                    }
-                }
-                if write_error.is_some() {
-                    break;
+            temporal_state.discard_staged();
+            if advanced_history_staged {
+                if let Some(executor) = composition_gpu.as_mut() {
+                    executor.discard_frame_history();
                 }
             }
+            write_error = Some(format!("failed to write video frame to ffmpeg: {error}"));
+            break;
         }
 
         drop(frame_gpu_scope);
@@ -2603,8 +4834,22 @@ fn run_export(
             write_error = Some(error);
         }
         if write_error.is_some() {
+            temporal_state.discard_staged();
+            if advanced_history_staged {
+                if let Some(executor) = composition_gpu.as_mut() {
+                    executor.discard_frame_history();
+                }
+            }
             break;
         }
+        temporal_state.commit_staged();
+        if advanced_history_staged {
+            if let Some(executor) = composition_gpu.as_mut() {
+                executor.commit_frame_history();
+            }
+        }
+        motion_sidecar.observe_accepted(&frame_motion_metadata);
+        progress.publish_motion_metadata(frame_motion_metadata);
 
         // Update progress
         progress.progress.store(
@@ -2642,6 +4887,7 @@ fn run_export(
         drop(layers);
         drop(staging);
         drop(selective_staging);
+        drop(temporal_prepared);
         drop(history_view);
         drop(history_texture);
         drop(feedback_view);
@@ -2665,6 +4911,7 @@ fn run_export(
         drop(vertex_shader);
         drop(effects_uniform_layout);
         drop(effects_bind_group_layout);
+        drop(nearest_sampler);
         drop(sampler);
         drop(queue);
         drop(device);
@@ -2672,7 +4919,6 @@ fn run_export(
         drop(selective_ntsc_state);
         drop(mod_matrix);
         drop(export_morph);
-        drop(layer_accumulators);
         return Err("export cancelled".to_string());
     }
 
@@ -2699,6 +4945,14 @@ fn run_export(
             stderr.chars().take(300).collect::<String>()
         ));
     }
+
+    check_cancelled(progress)?;
+    let sidecar = motion_sidecar.finish(progress.warnings());
+    write_motion_sidecar_atomic(&config.output_path, &sidecar)?;
+    // A cancellation that wins immediately after atomic sidecar publication
+    // still owns terminal cleanup; `finalize_export_worker` removes both the
+    // video and its paired report.
+    check_cancelled(progress)?;
 
     Ok(())
 }
@@ -2828,6 +5082,40 @@ fn upload_engine_composite_export(
     )
 }
 
+/// Resolve only the pinned export texture selected by the immutable plan.
+/// Every render/control value lives in `EvaluatedFramePlan`; mutable decoder
+/// fields on `ExportLayer` are never render authority after evaluation.
+fn export_layer_resource(
+    layers: &[ExportLayer],
+    source: SourceTap,
+) -> Result<&ExportLayer, String> {
+    let layer = layers.get(source.slot).ok_or_else(|| {
+        format!(
+            "evaluated export layer {} refers to missing resource slot {}",
+            source.stable_id, source.slot
+        )
+    })?;
+    let captured = SourceTap::new(
+        export_selective_layer_id(layer.source_index),
+        source.slot,
+        layer.width,
+        layer.height,
+    );
+    if captured != source {
+        return Err(format!(
+            "evaluated export resource mismatch at slot {}: planned id {} at {}x{}, captured id {} at {}x{}",
+            source.slot,
+            source.stable_id,
+            source.size[0],
+            source.size[1],
+            captured.stable_id,
+            captured.size[0],
+            captured.size[1]
+        ));
+    }
+    Ok(layer)
+}
+
 /// Render all planned straight-alpha slices and synchronously collect them in
 /// the shared plan's bottom-to-top order. Export is intentionally synchronous:
 /// it must write each exact requested frame to ffmpeg, unlike live preview's
@@ -2838,8 +5126,7 @@ fn render_and_readback_selective_ntsc_slices_export(
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
-    layer_mods: &[(EffectUniforms, f32)],
-    master_uniforms: &EffectUniforms,
+    evaluated: &EvaluatedFramePlan,
     plan: &SelectiveNtscPlan,
     composite_textures: &[wgpu::Texture; 3],
     composite_views: &[wgpu::TextureView; 3],
@@ -2847,14 +5134,17 @@ fn render_and_readback_selective_ntsc_slices_export(
     effects_bind_group_layout: &wgpu::BindGroupLayout,
     effects_uniform_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
     staging: &wgpu::Buffer,
     width: u32,
     height: u32,
     bytes_per_row: u32,
     cancel: &AtomicBool,
 ) -> Result<Vec<Vec<u8>>, String> {
-    if layers.len() != layer_mods.len() {
-        return Err("selective NTSC export layer/modulation alignment mismatch".into());
+    if layers.len() != evaluated.layers().len()
+        || evaluated.layers().len() != evaluated.layer_passes().len()
+    {
+        return Err("selective NTSC export resource/plan alignment mismatch".into());
     }
     if plan.generation.width != width || plan.generation.height != height {
         return Err("selective NTSC export plan dimensions changed before rendering".into());
@@ -2864,7 +5154,7 @@ fn render_and_readback_selective_ntsc_slices_export(
         device,
         queue,
         "Export Selective NTSC Master FX Uniforms",
-        master_uniforms,
+        evaluated.master_pass(),
     );
     let master_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Export Selective NTSC Master FX Input"),
@@ -2877,6 +5167,10 @@ fn render_and_readback_selective_ntsc_slices_export(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(nearest_sampler),
             },
         ],
     });
@@ -2894,31 +5188,32 @@ fn render_and_readback_selective_ntsc_slices_export(
         if cancel.load(Ordering::Acquire) {
             return Err("export cancelled before selective NTSC slice".to_string());
         }
-        let source_index = layers
+        let source_index = evaluated
+            .layers()
             .iter()
-            .position(|layer| {
-                export_selective_layer_id(layer.source_index) == planned_layer.layer_id
-            })
+            .position(|layer| layer.source.stable_id == planned_layer.layer_id)
             .ok_or_else(|| {
                 format!(
                     "selective NTSC export layer {} disappeared before rendering",
                     planned_layer.layer_id
                 )
             })?;
-        let layer = &layers[source_index];
-        if !layer.visible || layer.bypass_master_fx != planned_layer.bypass_master_fx {
+        let evaluated_layer = &evaluated.layers()[source_index];
+        let layer = export_layer_resource(layers, evaluated_layer.source)?;
+        if !evaluated_layer.visible
+            || evaluated_layer.bypass_master_fx != planned_layer.bypass_master_fx
+        {
             return Err(format!(
                 "selective NTSC export layer {} changed before rendering",
                 planned_layer.layer_id
             ));
         }
 
-        let frame_fx = layer_mods[source_index].0.for_render_target(width, height);
         let fx_buffer = create_uploaded_uniform(
             device,
             queue,
             "Export Selective NTSC Layer FX Uniforms",
-            &frame_fx,
+            &evaluated.layer_passes()[source_index],
         );
         let layer_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Export Selective NTSC Layer FX Input"),
@@ -2931,6 +5226,10 @@ fn render_and_readback_selective_ntsc_slices_export(
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(nearest_sampler),
                 },
             ],
         });
@@ -3079,17 +5378,391 @@ fn map_export_readback(
     Ok(pixels)
 }
 
-/// Mirror [`crate::renderer::state::Renderer::render_layers_and_master`].
-/// The legacy branch deliberately delegates to the two pre-existing export
-/// passes unchanged; only a visible bypass enters the conditional path.
+fn ensure_export_image_routing_resources<'a>(
+    device: &wgpu::Device,
+    evaluated: &EvaluatedFramePlan,
+    resources: &'a mut Option<ImageRoutingGpuResources>,
+) -> Result<&'a mut ImageRoutingGpuResources, String> {
+    let request = evaluated
+        .image_routing()
+        .resource_plan()
+        .ok_or_else(|| "export image-routing resources requested for inactive plan".to_string())?;
+    let adapter_plan = MatteResourcePlan::validate(
+        request.output_size,
+        evaluated.image_routing().taps().len(),
+        MatteResourceLimits::from_wgpu(&device.limits()),
+    )?;
+    if adapter_plan != request {
+        return Err(format!(
+            "evaluated export image-routing plan {request:?} differs from adapter plan {adapter_plan:?}"
+        ));
+    }
+
+    if resources.is_none() {
+        *resources = Some(scoped_export_gpu_operation(
+            device,
+            "export image-routing full-frame allocation",
+            || ImageRoutingGpuResources::build(device, adapter_plan),
+        )?);
+    }
+    let resources = resources
+        .as_mut()
+        .ok_or_else(|| "export image-routing resources were not retained".to_string())?;
+    if resources.output_size != adapter_plan.output_size {
+        return Err("export image-routing output dimensions changed during the job".into());
+    }
+    if resources.tap_layers != adapter_plan.tap_layers {
+        resources.taps =
+            scoped_export_gpu_operation(device, "export image tap array reallocation", || {
+                ImageTapTexture::build(device, adapter_plan.output_size, adapter_plan.tap_layers)
+            })?;
+        resources.tap_layers = adapter_plan.tap_layers;
+    }
+    Ok(resources)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn render_layers_and_master_export(
+fn encode_export_effect_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    input: &wgpu::TextureView,
+    output: &wgpu::TextureView,
+    uniforms: &EffectPassUniforms,
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    label: &'static str,
+) {
+    let buffer = create_uploaded_uniform(device, queue, label, uniforms);
+    let textures = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: effects_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(input),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(nearest_sampler),
+            },
+        ],
+    });
+    let uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: effects_uniform_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: output,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    pass.set_pipeline(effects_pipeline);
+    pass.set_bind_group(0, &textures, &[]);
+    pass.set_bind_group(1, &uniform_group, &[]);
+    pass.draw(0..3, 0..1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_export_image_taps(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
-    layer_mods: &[(EffectUniforms, f32)],
-    master_uniforms: &EffectUniforms,
+    evaluated: &EvaluatedFramePlan,
+    resources: &ImageRoutingGpuResources,
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+) -> Result<(), String> {
+    let Some(tap_texture) = resources.taps.as_ref() else {
+        if evaluated.image_routing().taps().is_empty() {
+            return Ok(());
+        }
+        return Err("export tap plan has no GPU tap array".into());
+    };
+    for tap in evaluated.image_routing().taps() {
+        let evaluated_layer = evaluated
+            .layers()
+            .get(tap.donor_layer_index)
+            .ok_or_else(|| "export tap donor is outside the evaluated stack".to_string())?;
+        let layer = export_layer_resource(layers, evaluated_layer.source)?;
+        let output = tap_texture
+            .views
+            .get(tap.array_layer as usize)
+            .ok_or_else(|| format!("export tap layer {} is missing", tap.array_layer))?;
+        let uniforms = match tap.stage {
+            crate::image_routing::LayerImageStage::PreLocalEffects => {
+                evaluated.layer_pre_passes().get(tap.donor_layer_index)
+            }
+            crate::image_routing::LayerImageStage::PostLocalEffects => {
+                evaluated.layer_passes().get(tap.donor_layer_index)
+            }
+        }
+        .ok_or_else(|| "export tap pass/layer alignment mismatch".to_string())?;
+        encode_export_effect_pass(
+            device,
+            queue,
+            encoder,
+            &layer.texture_view,
+            output,
+            uniforms,
+            effects_pipeline,
+            effects_bind_group_layout,
+            effects_uniform_layout,
+            sampler,
+            nearest_sampler,
+            "Export Materialize Image Tap",
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_routed_layers_export(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    evaluated: &EvaluatedFramePlan,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    matte_composite: &MatteCompositePipeline,
+    routing: &ImageRoutingGpuResources,
+    output_width: u32,
+    output_height: u32,
+) -> Result<(), String> {
+    let path = master_fx_composition_path(
+        evaluated
+            .layers()
+            .iter()
+            .map(|layer| (layer.visible, layer.bypass_master_fx, layer.opacity)),
+    );
+    let visible_layers =
+        visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
+    if visible_layers.is_empty() {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Export Routed Clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &composite_views[0],
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            ..Default::default()
+        });
+        if path == MasterFxCompositionPath::LegacyPostComposite {
+            render_master_effects_export(
+                device,
+                queue,
+                encoder,
+                evaluated.master_pass(),
+                composite_textures,
+                composite_views,
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                sampler,
+                nearest_sampler,
+                output_width,
+                output_height,
+            );
+        }
+        return Ok(());
+    }
+
+    for (stack_index, &layer_index) in visible_layers.iter().enumerate() {
+        let evaluated_layer = &evaluated.layers()[layer_index];
+        let layer = export_layer_resource(layers, evaluated_layer.source)?;
+        encode_export_effect_pass(
+            device,
+            queue,
+            encoder,
+            &layer.texture_view,
+            &composite_views[1],
+            &evaluated.layer_passes()[layer_index],
+            effects_pipeline,
+            effects_bind_group_layout,
+            effects_uniform_layout,
+            sampler,
+            nearest_sampler,
+            "Export Routed Layer FX",
+        );
+
+        let mut overlay_slot = 1;
+        if path == MasterFxCompositionPath::ConditionalPerLayer && !evaluated_layer.bypass_master_fx
+        {
+            encode_export_effect_pass(
+                device,
+                queue,
+                encoder,
+                &composite_views[1],
+                &composite_views[2],
+                evaluated.master_pass(),
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                sampler,
+                nearest_sampler,
+                "Export Routed Conditional Master FX",
+            );
+            overlay_slot = 2;
+        }
+
+        if stack_index == 0 {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Routed Clear Base"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[0],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+
+        let matte = evaluated
+            .image_routing()
+            .mattes()
+            .get(layer_index)
+            .ok_or_else(|| "export matte/layer alignment mismatch".to_string())?;
+        let mut params = matte.params;
+        let donor = match matte.resolved_input {
+            ResolvedImageInput::Disabled => {
+                params.amount = 0.0;
+                params.donor_valid = false;
+                &routing.history.view
+            }
+            ResolvedImageInput::MaterializedTap { tap_index } => {
+                let tap = evaluated
+                    .image_routing()
+                    .taps()
+                    .get(tap_index)
+                    .ok_or_else(|| format!("export matte refers to missing tap {tap_index}"))?;
+                routing
+                    .taps
+                    .as_ref()
+                    .and_then(|texture| texture.views.get(tap.array_layer as usize))
+                    .ok_or_else(|| {
+                        format!(
+                            "export matte tap array layer {} is missing",
+                            tap.array_layer
+                        )
+                    })?
+            }
+            ResolvedImageInput::AllBelow => &composite_views[0],
+            ResolvedImageInput::ProgramHistory => {
+                params.donor_valid &= routing.history_valid;
+                &routing.history.view
+            }
+            ResolvedImageInput::Transparent => {
+                params.donor_valid = false;
+                &routing.history.view
+            }
+        };
+        let output_slot = if overlay_slot == 1 { 2 } else { 1 };
+        encode_matte_composite(
+            device,
+            queue,
+            encoder,
+            matte_composite,
+            sampler,
+            &composite_views[0],
+            &composite_views[overlay_slot],
+            donor,
+            &composite_views[output_slot],
+            MatteCompositeUniforms::new(
+                evaluated_layer.opacity,
+                evaluated_layer.blend_mode.as_u32(),
+                params,
+            ),
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[output_slot],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: output_width,
+                height: output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    if path == MasterFxCompositionPath::LegacyPostComposite {
+        render_master_effects_export(
+            device,
+            queue,
+            encoder,
+            evaluated.master_pass(),
+            composite_textures,
+            composite_views,
+            effects_pipeline,
+            effects_bind_group_layout,
+            effects_uniform_layout,
+            sampler,
+            nearest_sampler,
+            output_width,
+            output_height,
+        );
+    }
+    Ok(())
+}
+
+/// Routed extension of the established export compositor. The inactive arm
+/// invokes the old function literally and performs no tap allocation.
+#[allow(clippy::too_many_arguments)]
+fn render_layers_and_master_export_routed(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    evaluated: &EvaluatedFramePlan,
     composite_textures: &[wgpu::Texture; 3],
     composite_views: &[wgpu::TextureView; 3],
     effects_pipeline: &wgpu::RenderPipeline,
@@ -3099,14 +5772,114 @@ fn render_layers_and_master_export(
     composite_bind_group_layout: &wgpu::BindGroupLayout,
     composite_uniform_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    matte_composite: &MatteCompositePipeline,
+    routing: &mut Option<ImageRoutingGpuResources>,
     output_width: u32,
     output_height: u32,
-) {
+) -> Result<(), String> {
+    if !evaluated.image_routing().is_active() {
+        render_layers_and_master_export(
+            device,
+            queue,
+            encoder,
+            layers,
+            evaluated,
+            composite_textures,
+            composite_views,
+            effects_pipeline,
+            effects_bind_group_layout,
+            effects_uniform_layout,
+            composite_pipeline,
+            composite_bind_group_layout,
+            composite_uniform_layout,
+            sampler,
+            nearest_sampler,
+            output_width,
+            output_height,
+        )?;
+        if let Some(resources) = routing.as_mut() {
+            encode_program_history_copy(encoder, &composite_textures[0], resources);
+        }
+        return Ok(());
+    }
+
+    let resources = ensure_export_image_routing_resources(device, evaluated, routing)?;
+    materialize_export_image_taps(
+        device,
+        queue,
+        encoder,
+        layers,
+        evaluated,
+        resources,
+        effects_pipeline,
+        effects_bind_group_layout,
+        effects_uniform_layout,
+        sampler,
+        nearest_sampler,
+    )?;
+    render_routed_layers_export(
+        device,
+        queue,
+        encoder,
+        layers,
+        evaluated,
+        composite_textures,
+        composite_views,
+        effects_pipeline,
+        effects_bind_group_layout,
+        effects_uniform_layout,
+        sampler,
+        nearest_sampler,
+        matte_composite,
+        resources,
+        output_width,
+        output_height,
+    )?;
+    encode_program_history_copy(encoder, &composite_textures[0], resources);
+    Ok(())
+}
+
+/// Mirror [`crate::renderer::state::Renderer::render_evaluated_frame`].
+/// The legacy branch deliberately delegates to the two pre-existing export
+/// passes unchanged; only a visible bypass enters the conditional path.
+#[allow(clippy::too_many_arguments)]
+fn render_layers_and_master_export(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    evaluated: &EvaluatedFramePlan,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    composite_pipeline: &wgpu::RenderPipeline,
+    composite_bind_group_layout: &wgpu::BindGroupLayout,
+    composite_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    output_width: u32,
+    output_height: u32,
+) -> Result<(), String> {
+    if evaluated.context().output_size != [output_width, output_height] {
+        return Err(format!(
+            "evaluated export frame is {}x{}, target is {output_width}x{output_height}",
+            evaluated.context().output_size[0],
+            evaluated.context().output_size[1]
+        ));
+    }
+    if layers.len() != evaluated.layers().len()
+        || evaluated.layers().len() != evaluated.layer_passes().len()
+    {
+        return Err("evaluated export resource/plan alignment mismatch".into());
+    }
     let path = master_fx_composition_path(
-        layers
+        evaluated
+            .layers()
             .iter()
-            .zip(layer_mods.iter())
-            .map(|(layer, (_, opacity))| (layer.visible, layer.bypass_master_fx, *opacity)),
+            .map(|layer| (layer.visible, layer.bypass_master_fx, layer.opacity)),
     );
     match path {
         MasterFxCompositionPath::LegacyPostComposite => {
@@ -3115,7 +5888,7 @@ fn render_layers_and_master_export(
                 queue,
                 encoder,
                 layers,
-                layer_mods,
+                evaluated,
                 composite_textures,
                 composite_views,
                 effects_pipeline,
@@ -3125,20 +5898,22 @@ fn render_layers_and_master_export(
                 composite_bind_group_layout,
                 composite_uniform_layout,
                 sampler,
+                nearest_sampler,
                 output_width,
                 output_height,
-            );
+            )?;
             render_master_effects_export(
                 device,
                 queue,
                 encoder,
-                master_uniforms,
+                evaluated.master_pass(),
                 composite_textures,
                 composite_views,
                 effects_pipeline,
                 effects_bind_group_layout,
                 effects_uniform_layout,
                 sampler,
+                nearest_sampler,
                 output_width,
                 output_height,
             );
@@ -3149,8 +5924,7 @@ fn render_layers_and_master_export(
                 queue,
                 encoder,
                 layers,
-                layer_mods,
-                master_uniforms,
+                evaluated,
                 composite_textures,
                 composite_views,
                 effects_pipeline,
@@ -3160,11 +5934,13 @@ fn render_layers_and_master_export(
                 composite_bind_group_layout,
                 composite_uniform_layout,
                 sampler,
+                nearest_sampler,
                 output_width,
                 output_height,
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3173,8 +5949,7 @@ fn render_layers_with_conditional_master_export(
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
-    layer_mods: &[(EffectUniforms, f32)],
-    master_uniforms: &EffectUniforms,
+    evaluated: &EvaluatedFramePlan,
     composite_textures: &[wgpu::Texture; 3],
     composite_views: &[wgpu::TextureView; 3],
     effects_pipeline: &wgpu::RenderPipeline,
@@ -3184,27 +5959,21 @@ fn render_layers_with_conditional_master_export(
     composite_bind_group_layout: &wgpu::BindGroupLayout,
     composite_uniform_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
     output_width: u32,
     output_height: u32,
-) {
-    let visible_layers: Vec<(&ExportLayer, &(EffectUniforms, f32))> = visible_stack_indices(
-        layers
-            .iter()
-            .zip(layer_mods.iter())
-            .map(|(layer, _)| layer.visible),
-    )
-    .into_iter()
-    .map(|index| (&layers[index], &layer_mods[index]))
-    .collect();
+) -> Result<(), String> {
+    let visible_layers =
+        visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
     debug_assert!(visible_layers
         .iter()
-        .any(|(layer, _)| layer.bypass_master_fx));
+        .any(|&index| evaluated.layers()[index].bypass_master_fx));
 
     let master_buffer = create_uploaded_uniform(
         device,
         queue,
         "Export Conditional Master FX Uniforms",
-        master_uniforms,
+        evaluated.master_pass(),
     );
     let master_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Export Conditional Master FX Input"),
@@ -3218,6 +5987,10 @@ fn render_layers_with_conditional_master_export(
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(nearest_sampler),
+            },
         ],
     });
     let master_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -3229,13 +6002,14 @@ fn render_layers_with_conditional_master_export(
         }],
     });
 
-    for (stack_index, (layer, (mod_fx, mod_opacity))) in visible_layers.iter().enumerate() {
-        let frame_fx = mod_fx.for_render_target(output_width, output_height);
+    for (stack_index, &layer_index) in visible_layers.iter().enumerate() {
+        let evaluated_layer = &evaluated.layers()[layer_index];
+        let layer = export_layer_resource(layers, evaluated_layer.source)?;
         let layer_buffer = create_uploaded_uniform(
             device,
             queue,
             "Export Conditional Layer FX Uniforms",
-            &frame_fx,
+            &evaluated.layer_passes()[layer_index],
         );
         let layer_tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Export Conditional Layer FX Input"),
@@ -3248,6 +6022,10 @@ fn render_layers_with_conditional_master_export(
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(nearest_sampler),
                 },
             ],
         });
@@ -3281,7 +6059,7 @@ fn render_layers_with_conditional_master_export(
             pass.draw(0..3, 0..1);
         }
 
-        let slots = conditional_layer_slots(layer.bypass_master_fx);
+        let slots = conditional_layer_slots(evaluated_layer.bypass_master_fx);
         if let Some(master_output) = slots.master_output {
             debug_assert_eq!(master_output, 2);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3323,12 +6101,8 @@ fn render_layers_with_conditional_master_export(
 
         let overlay_slot = slots.master_output.unwrap_or(1);
         let comp_uniforms = CompositeUniforms {
-            opacity: *mod_opacity,
-            blend_mode: if stack_index == 0 {
-                0
-            } else {
-                layer.blend_mode.as_u32()
-            },
+            opacity: evaluated_layer.opacity,
+            blend_mode: evaluated_layer.blend_mode.as_u32(),
             _pad: [0.0; 2],
         };
         let comp_buffer = create_uploaded_uniform(
@@ -3405,6 +6179,7 @@ fn render_layers_with_conditional_master_export(
             },
         );
     }
+    Ok(())
 }
 
 /// Render all visible layers composited (mirrors Renderer::render_layers).
@@ -3415,7 +6190,7 @@ fn render_layers_export(
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     layers: &[ExportLayer],
-    layer_mods: &[(EffectUniforms, f32)],
+    evaluated: &EvaluatedFramePlan,
     composite_textures: &[wgpu::Texture; 3],
     composite_views: &[wgpu::TextureView; 3],
     effects_pipeline: &wgpu::RenderPipeline,
@@ -3425,15 +6200,12 @@ fn render_layers_export(
     composite_bind_group_layout: &wgpu::BindGroupLayout,
     composite_uniform_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
     output_width: u32,
     output_height: u32,
-) {
-    let visible_layers: Vec<(&ExportLayer, &(EffectUniforms, f32))> = layers
-        .iter()
-        .zip(layer_mods.iter())
-        .filter(|(l, _)| l.visible)
-        .rev()
-        .collect();
+) -> Result<(), String> {
+    let visible_layers =
+        visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
 
     if visible_layers.is_empty() {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3450,15 +6222,18 @@ fn render_layers_export(
             depth_stencil_attachment: None,
             ..Default::default()
         });
-        return;
+        return Ok(());
     }
 
-    for (i, (layer, (mod_fx, mod_opacity))) in visible_layers.iter().enumerate() {
-        // Mirror the live renderer: this pass maps source UVs into an
-        // output-sized composite, so spatial effects use the export target's
-        // resolution and aspect rather than the decoded source's.
-        let frame_fx = mod_fx.for_render_target(output_width, output_height);
-        let fx_buffer = create_uploaded_uniform(device, queue, "Export Layer FX", &frame_fx);
+    for (i, &layer_index) in visible_layers.iter().enumerate() {
+        let evaluated_layer = &evaluated.layers()[layer_index];
+        let layer = export_layer_resource(layers, evaluated_layer.source)?;
+        let fx_buffer = create_uploaded_uniform(
+            device,
+            queue,
+            "Export Layer FX",
+            &evaluated.layer_passes()[layer_index],
+        );
 
         let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -3471,6 +6246,10 @@ fn render_layers_export(
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(nearest_sampler),
                 },
             ],
         });
@@ -3525,8 +6304,8 @@ fn render_layers_export(
         }
         {
             let comp_uniforms = CompositeUniforms {
-                opacity: *mod_opacity,
-                blend_mode: if i == 0 { 0 } else { layer.blend_mode.as_u32() },
+                opacity: evaluated_layer.opacity,
+                blend_mode: evaluated_layer.blend_mode.as_u32(),
                 _pad: [0.0; 2],
             };
             let comp_buffer =
@@ -3602,6 +6381,7 @@ fn render_layers_export(
             );
         }
     }
+    Ok(())
 }
 
 /// Apply master effects to composite_textures[0] (mirrors Renderer::render_master_effects).
@@ -3611,17 +6391,18 @@ fn render_master_effects_export(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
-    master_uniforms: &EffectUniforms,
+    pass_uniforms: &EffectPassUniforms,
     composite_textures: &[wgpu::Texture; 3],
     composite_views: &[wgpu::TextureView; 3],
     effects_pipeline: &wgpu::RenderPipeline,
     effects_bind_group_layout: &wgpu::BindGroupLayout,
     effects_uniform_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
     output_width: u32,
     output_height: u32,
 ) {
-    let fx_buffer = create_uploaded_uniform(device, queue, "Export Master FX", master_uniforms);
+    let fx_buffer = create_uploaded_uniform(device, queue, "Export Master FX", pass_uniforms);
 
     let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -3634,6 +6415,10 @@ fn render_master_effects_export(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(nearest_sampler),
             },
         ],
     });
@@ -3692,6 +6477,7 @@ fn render_master_effects_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialGpuUniforms};
 
     fn config(duration_secs: f32) -> ExportConfig {
         ExportConfig {
@@ -3707,6 +6493,4702 @@ mod tests {
             ntsc_quality: NtscExportQuality::LiveParity,
             media_safety_policy: MediaSafetyPolicy::default(),
         }
+    }
+
+    fn temporal_event_acceptance_params() -> crate::effects::params::TemporalParams {
+        use crate::temporal::{
+            CollisionAtlasParams, CollisionScoreLoopDriver, CollisionScoreParams,
+            CollisionScoreTrigger, RefreshGardenGate, RefreshGardenParams, TemporalEventResetMode,
+            TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
+            TemporalResetPolicy, TemporalTopology,
+        };
+
+        crate::effects::params::TemporalParams {
+            feedback: 0.63,
+            fb_zoom: 1.01,
+            slitscan: 0.42,
+            originals: TemporalOriginalsParams {
+                loom: TemporalLoomParams {
+                    amount: 0.75,
+                    topology: TemporalTopology::Spiral,
+                    interpolation: TemporalInterpolation::Linear,
+                    depth: 0.8,
+                    phase: 0.125,
+                    scale: 1.4,
+                    angle: 19.0,
+                    folds: 5,
+                    quantization: 9,
+                },
+                atlas: CollisionAtlasParams {
+                    amount: 0.4,
+                    seed: 0,
+                    territories: 11,
+                    collision: 0.7,
+                },
+                garden: RefreshGardenParams {
+                    amount: 0.35,
+                    gate: RefreshGardenGate::AudioOnset,
+                    threshold: 0.45,
+                    softness: 0.1,
+                    decay: 0.91,
+                    max_hold_ticks: 17,
+                },
+                score: CollisionScoreParams {
+                    enabled: true,
+                    seed: 0x51c0_4e11,
+                    state_count: 7,
+                    trigger: CollisionScoreTrigger::Boundary,
+                    loop_driver: CollisionScoreLoopDriver::SelectedLayer {
+                        layer_id: StableLayerId::new(22).unwrap(),
+                        saved_position: SavedLayerPosition::new(1).unwrap(),
+                    },
+                },
+                reset: TemporalResetPolicy {
+                    loop_boundary: TemporalEventResetMode::Memory,
+                    downbeat: TemporalEventResetMode::Score,
+                },
+            },
+            ..crate::effects::params::TemporalParams::default()
+        }
+    }
+
+    fn temporal_acceptance_freeze(frame: u32, fps: u32) -> (bool, bool) {
+        if (fps / 2..fps * 3 / 4).contains(&frame) {
+            (true, false)
+        } else if (fps..fps * 5 / 4).contains(&frame) {
+            (false, true)
+        } else if (fps * 3 / 2..fps * 7 / 4).contains(&frame) {
+            (true, true)
+        } else {
+            (false, false)
+        }
+    }
+
+    /// Exercise independently-owned live/export trackers and states while
+    /// comparing the complete production frame input and staged plan at every
+    /// accepted boundary. The returned bytes make a second run a deterministic
+    /// replay proof rather than merely a final-state comparison.
+    fn temporal_live_export_acceptance_trace(fps: u32) -> Vec<u8> {
+        use crate::performance::BeatBoundaryTracker;
+        use crate::renderer::state::TemporalState;
+        use crate::temporal::{
+            TemporalAudioOnsetTracker, TemporalFrameEvents, TemporalFrameInput, TemporalFreezeState,
+        };
+
+        let params = temporal_event_acceptance_params();
+        let mut live_state = TemporalState::default();
+        let mut export_state = TemporalState::default();
+        let mut live_beats = BeatBoundaryTracker::default();
+        let mut export_beats = BeatBoundaryTracker::default();
+        let mut live_onsets = TemporalAudioOnsetTracker::default();
+        let mut export_onsets = TemporalAudioOnsetTracker::default();
+        live_beats.reanchor(0.0);
+        export_beats.reanchor(0.0);
+        live_onsets.reanchor(0.0);
+        export_onsets.reanchor(0.0);
+        let mut live_beat = 0.0_f64;
+        let mut export_beat = 0.0_f64;
+        let mut trace = Vec::new();
+        let mut saw = [false; 4];
+        let mut consumed_boundaries = 0_u64;
+
+        for frame in 0..fps * 4 {
+            let (master_paused, media_frozen) = temporal_acceptance_freeze(frame, fps);
+            let live_freeze = crate::temporal_freeze_state(!master_paused, media_frozen);
+            let export_freeze = match (master_paused, media_frozen) {
+                (false, false) => TemporalFreezeState::Running,
+                (false, true) => TemporalFreezeState::MediaFrozen,
+                (true, false) => TemporalFreezeState::ProgramFrozen,
+                (true, true) => TemporalFreezeState::ProgramAndMediaFrozen,
+            };
+            assert_eq!(live_freeze, export_freeze);
+            saw[match live_freeze {
+                TemporalFreezeState::Running => 0,
+                TemporalFreezeState::ProgramFrozen => 1,
+                TemporalFreezeState::MediaFrozen => 2,
+                TemporalFreezeState::ProgramAndMediaFrozen => 3,
+            }] = true;
+
+            let delta = 1.0 / fps as f32;
+            if live_freeze.program_advances() {
+                live_beat += 2.0 / f64::from(fps);
+            }
+            if export_freeze.program_advances() {
+                export_beat += 2.0 / f64::from(fps);
+            }
+            let live_crossings = live_beats.observe(live_beat, 4, !live_freeze.program_advances());
+            let export_crossings =
+                export_beats.observe(export_beat, 4, !export_freeze.program_advances());
+            assert_eq!(live_crossings, export_crossings);
+
+            let envelope_phase = frame % (fps / 2);
+            let audio_energy = if (fps / 8..fps / 4).contains(&envelope_phase) {
+                0.8
+            } else {
+                0.1
+            };
+            let live_audio_events =
+                live_onsets.observe(audio_energy, live_freeze.program_advances());
+            let export_audio_events =
+                export_onsets.observe(audio_energy, export_freeze.program_advances());
+            assert_eq!(live_audio_events, export_audio_events);
+
+            // This is the selected stable layer's transport event stream. A
+            // double crossing proves counts are retained, not collapsed.
+            let boundary_events = if frame > 0
+                && frame % (fps / 2) == 0
+                && live_freeze.program_advances()
+                && live_freeze.media_advances()
+            {
+                if frame == fps * 2 {
+                    2
+                } else {
+                    1
+                }
+            } else {
+                0
+            };
+            let events = TemporalFrameEvents {
+                boundary_events,
+                downbeat_events: live_crossings.bars,
+                audio_onset_events: live_audio_events,
+                manual_events: u32::from(frame == fps * 3 + 1),
+            };
+            let blackout = (fps * 2..fps * 9 / 4).contains(&frame);
+            let live_input = TemporalFrameInput::new(delta, live_freeze, blackout, events)
+                .with_audio_energy(audio_energy);
+            let export_input = TemporalFrameInput::new(
+                delta,
+                export_freeze,
+                blackout,
+                TemporalFrameEvents {
+                    boundary_events,
+                    downbeat_events: export_crossings.bars,
+                    audio_onset_events: export_audio_events,
+                    manual_events: u32::from(frame == fps * 3 + 1),
+                },
+            )
+            .with_audio_energy(audio_energy);
+            assert_eq!(live_input, export_input);
+
+            let live_plan = live_state.stage_frame(&params, live_input, [320, 180]);
+            let export_plan = export_state.stage_frame(&params, export_input, [320, 180]);
+            assert_eq!(live_plan, export_plan, "frame {frame} at {fps} fps");
+            consumed_boundaries =
+                consumed_boundaries.saturating_add(u64::from(live_plan.score_events_consumed));
+            live_state.commit_staged();
+            export_state.commit_staged();
+            assert_eq!(live_state.metrics(), export_state.metrics());
+            trace.extend_from_slice(
+                format!(
+                    "{frame}:{live_input:?}:{live_plan:?}:{:?}\n",
+                    live_state.metrics()
+                )
+                .as_bytes(),
+            );
+        }
+
+        assert!(saw.into_iter().all(std::convert::identity));
+        assert!(consumed_boundaries >= 4);
+        trace
+    }
+
+    #[test]
+    fn m3_event_acceptance_live_export_score_resets_and_freezes_replay_at_24_30_60() {
+        for fps in [24_u32, 30, 60] {
+            let first = temporal_live_export_acceptance_trace(fps);
+            let replay = temporal_live_export_acceptance_trace(fps);
+            assert_eq!(first, replay, "non-deterministic {fps} fps trace");
+        }
+    }
+
+    #[test]
+    fn m3_event_acceptance_program_media_freeze_and_blackout_hidden_evolution() {
+        use crate::renderer::state::TemporalState;
+        use crate::temporal::{
+            CollisionScoreParams, CollisionScoreTrigger, TemporalFrameAction, TemporalFrameEvents,
+            TemporalFrameInput, TemporalFreezeState,
+        };
+
+        for (program_running, media_frozen, expected) in [
+            (true, false, TemporalFreezeState::Running),
+            (true, true, TemporalFreezeState::MediaFrozen),
+            (false, false, TemporalFreezeState::ProgramFrozen),
+            (false, true, TemporalFreezeState::ProgramAndMediaFrozen),
+        ] {
+            assert_eq!(
+                crate::temporal_freeze_state(program_running, media_frozen),
+                expected
+            );
+        }
+
+        let mut params = crate::effects::params::TemporalParams::default();
+        params.originals.score = CollisionScoreParams {
+            enabled: true,
+            state_count: 8,
+            trigger: CollisionScoreTrigger::Manual,
+            ..CollisionScoreParams::default()
+        };
+        let mut seeded = TemporalState::default();
+        seeded.stage_frame(
+            &params,
+            TemporalFrameInput::new(
+                1.0 / 30.0,
+                TemporalFreezeState::Running,
+                false,
+                TemporalFrameEvents::default(),
+            ),
+            [64, 36],
+        );
+        seeded.commit_staged();
+        let seeded_metrics = seeded.metrics();
+
+        for freeze in [
+            TemporalFreezeState::ProgramFrozen,
+            TemporalFreezeState::ProgramAndMediaFrozen,
+        ] {
+            let mut state = seeded.clone();
+            let plan = state.stage_frame(
+                &params,
+                TemporalFrameInput::new(
+                    1.0 / 30.0,
+                    freeze,
+                    false,
+                    TemporalFrameEvents {
+                        manual_events: 2,
+                        ..TemporalFrameEvents::default()
+                    },
+                ),
+                [64, 36],
+            );
+            assert!(matches!(plan.action, TemporalFrameAction::HoldFrozenOutput));
+            assert_eq!(plan.score_events_consumed, 0);
+            state.commit_staged();
+            assert_eq!(state.metrics(), seeded_metrics);
+        }
+
+        let mut media_frozen = seeded.clone();
+        let plan = media_frozen.stage_frame(
+            &params,
+            TemporalFrameInput::new(
+                1.0 / 30.0,
+                TemporalFreezeState::MediaFrozen,
+                false,
+                TemporalFrameEvents {
+                    manual_events: 2,
+                    ..TemporalFrameEvents::default()
+                },
+            ),
+            [64, 36],
+        );
+        assert!(matches!(plan.action, TemporalFrameAction::Advance { .. }));
+        assert_eq!(plan.score_events_consumed, 2);
+        assert!(!TemporalFreezeState::MediaFrozen.media_advances());
+        assert!(TemporalFreezeState::MediaFrozen.program_advances());
+        media_frozen.commit_staged();
+        assert_eq!(media_frozen.metrics().score_event_ordinal, 2);
+
+        let mut visible = seeded.clone();
+        let mut hidden = seeded;
+        for events in [
+            TemporalFrameEvents::default(),
+            TemporalFrameEvents {
+                manual_events: 3,
+                ..TemporalFrameEvents::default()
+            },
+        ] {
+            let visible_plan = visible.stage_frame(
+                &params,
+                TemporalFrameInput::new(1.0 / 60.0, TemporalFreezeState::Running, false, events),
+                [64, 36],
+            );
+            let hidden_plan = hidden.stage_frame(
+                &params,
+                TemporalFrameInput::new(1.0 / 60.0, TemporalFreezeState::Running, true, events),
+                [64, 36],
+            );
+            assert_eq!(visible_plan, hidden_plan);
+            visible.commit_staged();
+            hidden.commit_staged();
+            assert_eq!(visible.metrics(), hidden.metrics());
+        }
+    }
+
+    #[test]
+    fn m3_event_acceptance_boundary_driver_reorder_delete_and_tombstone() {
+        use crate::patch::CollisionScoreLoopDriverConfig as Saved;
+        use crate::temporal::CollisionScoreLoopDriver as Runtime;
+
+        let one = StableLayerId::new(11).unwrap();
+        let driver = StableLayerId::new(22).unwrap();
+        let three = StableLayerId::new(33).unwrap();
+        let stale_position = SavedLayerPosition::new(1).unwrap();
+        let selected = Runtime::SelectedLayer {
+            layer_id: driver,
+            saved_position: stale_position,
+        };
+
+        let reordered = [three, one, driver];
+        let captured = Saved::from_runtime_for_capture(selected, &reordered);
+        assert_eq!(
+            captured,
+            Saved::SelectedLayer {
+                saved_position: SavedLayerPosition::new(2).unwrap()
+            }
+        );
+        assert_eq!(
+            resolve_export_score_loop_driver(captured, &reordered),
+            Runtime::SelectedLayer {
+                layer_id: driver,
+                saved_position: SavedLayerPosition::new(2).unwrap(),
+            }
+        );
+
+        let after_unrelated_delete = [one, driver];
+        let captured = Saved::from_runtime_for_capture(selected, &after_unrelated_delete);
+        assert_eq!(
+            resolve_export_score_loop_driver(captured, &after_unrelated_delete),
+            Runtime::SelectedLayer {
+                layer_id: driver,
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            }
+        );
+
+        let without_driver = [three, one];
+        let tombstone = Saved::from_runtime_for_capture(selected, &without_driver);
+        assert_eq!(
+            tombstone,
+            Saved::MissingSelectedLayer {
+                saved_position: stale_position
+            }
+        );
+        assert_eq!(
+            resolve_export_score_loop_driver(
+                tombstone,
+                &[three, one, StableLayerId::new(99).unwrap()],
+            ),
+            Runtime::MissingSelectedLayer {
+                saved_position: stale_position
+            },
+            "a replacement at the old saved position must never steal the conductor"
+        );
+    }
+
+    #[test]
+    fn m3_event_acceptance_export_prepares_exact_once_with_full_originals_input() {
+        let source = include_str!("render_export.rs");
+        let prepared = source
+            .find("let temporal_prepared = crate::renderer::state::build_prepared_temporal_gpu_resources")
+            .expect("prepared Exact resources");
+        let frame_loop = source
+            .find("for frame_num in 0..total_frames")
+            .expect("export frame loop");
+        assert!(
+            prepared < frame_loop,
+            "prepared bindings must precede warmed frames"
+        );
+        let encode = source
+            .find("crate::renderer::state::encode_temporal_prepared_frame(")
+            .expect("prepared full-input encoder");
+        assert!(encode > frame_loop);
+        let call = &source[encode
+            ..source[encode..]
+                .find(");")
+                .map(|end| encode + end + 2)
+                .expect("prepared encoder call terminator")];
+        assert!(call.contains("&mod_temporal"));
+        assert!(call.contains("temporal_input"));
+        assert!(
+            !call.contains("program_dt,\n"),
+            "the compatibility dt/bool adapter must stay out of export"
+        );
+    }
+
+    fn three_layer_legacy_patch() -> PatchState {
+        serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: top.mp4
+  - filename: middle.mp4
+  - filename: bottom.mp4
+"#,
+        )
+        .unwrap()
+    }
+
+    fn dormant_cycle_saved_rack(
+        amount: f32,
+        donor_position: u32,
+    ) -> crate::visual_rack::VisualRack {
+        use crate::image_routing::LayerImageStage;
+        use crate::visual_rack::{
+            EdgeTiming, ImageMatte, MaskParams, SavedImageSource, SavedImageTap, VisualNodeKind,
+            VisualRack,
+        };
+
+        let mut rack = VisualRack::synthetic_legacy(crate::visual_rack::LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Mask(MaskParams::Image(ImageMatte {
+            tap: SavedImageTap {
+                source: SavedImageSource::SelectedLayer {
+                    layer_position: SavedLayerPosition::new(donor_position).unwrap(),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount,
+            ..ImageMatte::default()
+        })))
+        .unwrap();
+        rack
+    }
+
+    fn dormant_cycle_morph_fixture() -> (crate::morph::Morph, ExportCreativeGraph) {
+        use crate::composition::{BusAssignment, RuntimeComposition, RuntimeRootItem};
+        use crate::modulation::StableModAddressBook;
+        use crate::visual_rack::LegacyRackScope;
+
+        let ids = [
+            StableLayerId::new(1).unwrap(),
+            StableLayerId::new(2).unwrap(),
+        ];
+        let a_racks = vec![
+            dormant_cycle_saved_rack(1.0, 1),
+            dormant_cycle_saved_rack(0.0, 0),
+        ];
+        let b_racks = vec![
+            dormant_cycle_saved_rack(0.0, 1),
+            dormant_cycle_saved_rack(1.0, 0),
+        ];
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: ids[1],
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: ids[0],
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let resolve = |position: SavedLayerPosition| ids.get(position.get() as usize).copied();
+        let layer_racks = a_racks
+            .iter()
+            .enumerate()
+            .map(|(index, rack)| (ids[index], rack.resolve_routes(resolve, |_| false)))
+            .collect::<Vec<_>>();
+        let master_rack =
+            crate::visual_rack::RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let address_book =
+            StableModAddressBook::from_composition(&master_rack, &layer_racks, &composition)
+                .unwrap();
+        let graph = ExportCreativeGraph {
+            layer_ids: ids.to_vec().into_boxed_slice(),
+            master_rack,
+            layer_racks,
+            composition,
+            address_book,
+        };
+        let mut a = crate::morph::MorphSlot {
+            layer_racks: Some(a_racks),
+            ..crate::morph::MorphSlot::default()
+        };
+        a.master.brightness = -1.0;
+        let mut b = crate::morph::MorphSlot {
+            layer_racks: Some(b_racks),
+            ..crate::morph::MorphSlot::default()
+        };
+        b.master.brightness = 1.0;
+        (
+            crate::morph::Morph {
+                a: Some(a),
+                b: Some(b),
+                ..crate::morph::Morph::default()
+            },
+            graph,
+        )
+    }
+
+    fn validate_dormant_cycle_sample(
+        morph: &crate::morph::Morph,
+        baseline: &ExportCreativeGraph,
+        position: f32,
+    ) -> Result<(f32, u64, usize), String> {
+        let sample = morph
+            .sample(position)
+            .ok_or_else(|| "missing Morph sample".to_string())?;
+        let mut graph = baseline.clone();
+        apply_export_creative_morph(&sample, &mut graph);
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(2);
+        let evaluated = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(64, 36, position),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            graph
+                .layer_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(slot, id)| LayerFrameInput {
+                    source: SourceTap::new(id.get(), slot, 64, 36),
+                    effects: &effects,
+                    transform: &transform,
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }),
+        );
+        let plan = plan_export_composition(
+            &evaluated,
+            &graph,
+            &[LayerMatte::default(); 2],
+            false,
+            CreativeResourceLimits::default(),
+        )?;
+        let EvaluatedCompositionPlan::Advanced(advanced) = plan else {
+            return Err("dormant cycle fixture unexpectedly delegated legacy".into());
+        };
+        Ok((
+            sample.master.brightness,
+            advanced.topology_signature(),
+            advanced.image_taps().len(),
+        ))
+    }
+
+    #[test]
+    fn morph_dormant_cycle_fallback_is_frame_independent_at_24_30_60() {
+        let (morph, baseline) = dormant_cycle_morph_fixture();
+        assert!(validate_dormant_cycle_sample(&morph, &baseline, 0.5).is_err());
+        assert!(validate_dormant_cycle_sample(&morph, &baseline, 0.0).is_ok());
+        assert!(validate_dormant_cycle_sample(&morph, &baseline, 1.0).is_ok());
+
+        for fps in [24_u32, 30, 60] {
+            for (frame, expected_position, expected_brightness) in
+                [(fps / 3, 0.0_f32, -1.0_f32), (fps / 2, 1.0, 1.0)]
+            {
+                let requested = frame as f32 / fps as f32;
+                let export = select_valid_morph_candidate(requested, |position| {
+                    validate_dormant_cycle_sample(&morph, &baseline, position)
+                })
+                .unwrap();
+
+                // Independent reproduction of Main's detached live attempt
+                // order: requested, nearest (tie B), then other.
+                let nearest = if requested < 0.5 { 0.0 } else { 1.0 };
+                let other = 1.0 - nearest;
+                let live = [requested, nearest, other]
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(index, position)| {
+                        *index == 0
+                            || (*position - requested).abs() > f32::EPSILON
+                                && (*index != 2 || (*position - nearest).abs() > f32::EPSILON)
+                    })
+                    .find_map(|(_, position)| {
+                        validate_dormant_cycle_sample(&morph, &baseline, position)
+                            .ok()
+                            .map(|value| (position, value))
+                    })
+                    .unwrap();
+
+                assert_eq!(export.selected_position, expected_position);
+                assert_eq!(export.value.0, expected_brightness);
+                assert_eq!(
+                    (export.selected_position, export.value),
+                    live,
+                    "live/export Morph fallback diverged at {fps} fps"
+                );
+                assert_eq!(export.value.2, 1, "accepted endpoint has one active edge");
+            }
+        }
+    }
+
+    #[test]
+    fn export_creative_planning_preserves_exact_legacy_at_24_30_and_60_fps() {
+        let patch = three_layer_legacy_patch();
+        let graph = resolve_export_creative_graph(&patch).unwrap();
+        assert_eq!(
+            graph.layer_ids.as_ref(),
+            &[
+                StableLayerId::new(1).unwrap(),
+                StableLayerId::new(2).unwrap(),
+                StableLayerId::new(3).unwrap(),
+            ]
+        );
+        assert_eq!(
+            graph
+                .composition
+                .flatten()
+                .unwrap()
+                .layers
+                .iter()
+                .map(|layer| layer.layer_id)
+                .collect::<Vec<_>>(),
+            vec![
+                StableLayerId::new(3).unwrap(),
+                StableLayerId::new(2).unwrap(),
+                StableLayerId::new(1).unwrap(),
+            ]
+        );
+
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let mut signature = None;
+        let mut advanced_signature = None;
+        for fps in [24_u32, 30, 60] {
+            let modulation = crate::modulation::ModMatrix::new().frame(3);
+            let evaluated = EvaluatedFramePlan::evaluate(
+                &modulation,
+                FramePlanContext::new(64, 36, fps as f32 / fps as f32),
+                MasterFrameInput {
+                    effects: &effects,
+                    transform: &transform,
+                    ntsc: &ntsc,
+                    temporal: &temporal,
+                },
+                graph
+                    .layer_ids
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(slot, id)| LayerFrameInput {
+                        source: SourceTap::new(id.get(), slot, 64, 36),
+                        effects: &effects,
+                        transform: &transform,
+                        opacity: 1.0,
+                        speed: 1.0,
+                        fps: fps as f32,
+                        blend_mode: BlendMode::Normal,
+                        visible: true,
+                        paused: false,
+                        bypass_master_fx: false,
+                    }),
+            );
+            let planned = plan_export_composition(
+                &evaluated,
+                &graph,
+                &[LayerMatte::default(); 3],
+                false,
+                CreativeResourceLimits::default(),
+            )
+            .unwrap();
+            let EvaluatedCompositionPlan::LegacyExact(exact) = planned else {
+                panic!("omitted creative fields must keep the exact legacy export path");
+            };
+            assert_eq!(
+                exact.flattened_layers(),
+                &[
+                    StableLayerId::new(3).unwrap(),
+                    StableLayerId::new(2).unwrap(),
+                    StableLayerId::new(1).unwrap(),
+                ]
+            );
+            if let Some(expected) = signature {
+                assert_eq!(exact.topology_signature(), expected);
+            } else {
+                signature = Some(exact.topology_signature());
+            }
+            assert_eq!(
+                bytemuck::bytes_of(&exact.base().master_pass_uniforms()),
+                bytemuck::bytes_of(&evaluated.master_pass_uniforms())
+            );
+
+            let planned = plan_export_composition(
+                &evaluated,
+                &graph,
+                &[
+                    LayerMatte {
+                        enabled: true,
+                        input: crate::image_routing::ImageInput::OneBelow,
+                        ..LayerMatte::default()
+                    },
+                    LayerMatte::default(),
+                    LayerMatte::default(),
+                ],
+                false,
+                CreativeResourceLimits::default(),
+            )
+            .unwrap();
+            let EvaluatedCompositionPlan::Advanced(advanced) = planned else {
+                panic!("an authored matte must enter the unified advanced plan");
+            };
+            assert!(evaluated.image_routing().mattes().is_empty());
+            assert_eq!(
+                advanced.image_taps()[0].resolved,
+                crate::evaluated_frame::evaluated_composition::PlannedImageSource::OneBelow(
+                    crate::visual_rack::VisualScopeId::Layer(StableLayerId::new(2).unwrap())
+                )
+            );
+            if let Some(expected) = advanced_signature {
+                assert_eq!(advanced.topology_signature(), expected);
+            } else {
+                advanced_signature = Some(advanced.topology_signature());
+            }
+        }
+
+        // Advanced composition cannot enter the legacy selective slice path:
+        // that flat CPU path has no group/rack/bus representation. The shared
+        // executor owns this admission error, and export surfaces it verbatim
+        // instead of rendering a plausible-but-incomplete fallback.
+        let selective_ntsc = crate::ntsc::NtscParams {
+            enabled: true,
+            ..crate::ntsc::NtscParams::default()
+        };
+        let modulation = crate::modulation::ModMatrix::new().frame(0);
+        let selective = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(64, 36, 0.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &selective_ntsc,
+                temporal: &temporal,
+            },
+            graph
+                .layer_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(slot, id)| LayerFrameInput {
+                    source: SourceTap::new(id.get(), slot, 64, 36),
+                    effects: &effects,
+                    transform: &transform,
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: slot == 0,
+                }),
+        );
+        let selective_advanced = plan_export_composition(
+            &selective,
+            &graph,
+            &[
+                LayerMatte {
+                    enabled: true,
+                    input: crate::image_routing::ImageInput::OneBelow,
+                    ..LayerMatte::default()
+                },
+                LayerMatte::default(),
+                LayerMatte::default(),
+            ],
+            false,
+            CreativeResourceLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            CompositionGpuExecutor::validate_plan(&selective_advanced)
+                .unwrap_err()
+                .to_string(),
+            "advanced composition cannot enter selective NTSC: 2 applying layer(s), 1 bypassing layer(s)"
+        );
+    }
+
+    fn m4_motion_evaluated_frame(graph: &ExportCreativeGraph, fps: u32) -> EvaluatedFramePlan {
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(graph.layer_ids.len());
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(64, 32, 1.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            graph
+                .layer_ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(slot, id)| LayerFrameInput {
+                    source: SourceTap::new(id.get(), slot, 64, 32),
+                    effects: &effects,
+                    transform: &transform,
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: fps as f32,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }),
+        )
+    }
+
+    fn m4_motion_params(
+        graph: &ExportCreativeGraph,
+    ) -> (
+        crate::motion::MotionParams,
+        Vec<crate::motion::MotionParams>,
+    ) {
+        use crate::motion::{
+            CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier,
+            MotionFieldSource, MotionLatticeQuality, MotionParams,
+        };
+
+        let master = MotionParams {
+            field_source: MotionFieldSource::Lattice,
+            lattice_quality: MotionLatticeQuality::Draft,
+            shutter: CurvedShutterParams {
+                angle_degrees: 180.0,
+                quality: CurvedShutterQuality::Draft,
+                ..CurvedShutterParams::default()
+            },
+            ..MotionParams::default()
+        };
+        let mut layers = vec![MotionParams::default(); graph.layer_ids.len()];
+        layers[0] = MotionParams {
+            field_source: MotionFieldSource::CodecVectors,
+            lattice_quality: MotionLatticeQuality::Live,
+            shutter: CurvedShutterParams {
+                angle_degrees: 90.0,
+                quality: CurvedShutterQuality::Live,
+                ..CurvedShutterParams::default()
+            },
+            ..MotionParams::default()
+        };
+        layers[1] = MotionParams {
+            field_source: MotionFieldSource::Auto,
+            lattice_quality: MotionLatticeQuality::High,
+            shutter: CurvedShutterParams {
+                angle_degrees: 270.0,
+                quality: CurvedShutterQuality::High,
+                ..CurvedShutterParams::default()
+            },
+            ..MotionParams::default()
+        };
+        let recipient = MotionParams {
+            transplant: FaradayParams {
+                amount: 0.75,
+                carrier: MotionCarrier::FirstSourceFrame,
+                ..FaradayParams::default()
+            },
+            ..MotionParams::default()
+        };
+        let mut saved = crate::patch::MotionConfig::from_params(recipient);
+        saved.transplant.donor = crate::patch::MotionDonorConfig::Selected {
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+        };
+        layers[2] = resolved_export_motion(Some(saved), &graph.layer_ids);
+        (master, layers)
+    }
+
+    fn m4_motion_plan(
+        evaluated: &EvaluatedFramePlan,
+        graph: &ExportCreativeGraph,
+        master: crate::motion::MotionParams,
+        layers: &[crate::evaluated_frame::evaluated_composition::LayerMotionPlanInput],
+    ) -> crate::evaluated_frame::evaluated_composition::AdvancedCompositionPlan {
+        let mattes = vec![LayerMatte::default(); graph.layer_ids.len()];
+        let input =
+            CompositionPlanInput::new(&graph.composition, &graph.master_rack, &graph.layer_racks)
+                .with_layer_mattes(&mattes, false)
+                .with_motion(
+                    master,
+                    layers,
+                    crate::motion::MotionDeviceLimits::new(16_384, u64::MAX),
+                );
+        match evaluated.plan_composition(input).unwrap() {
+            EvaluatedCompositionPlan::Advanced(plan) => *plan,
+            EvaluatedCompositionPlan::LegacyExact(_) => {
+                panic!("active motion fixture unexpectedly delegated LegacyExact")
+            }
+        }
+    }
+
+    fn assert_m4_motion_plans_equal(
+        left: &crate::evaluated_frame::evaluated_composition::AdvancedCompositionPlan,
+        right: &crate::evaluated_frame::evaluated_composition::AdvancedCompositionPlan,
+    ) {
+        let left = left.motion().advanced().unwrap();
+        let right = right.motion().advanced().unwrap();
+        assert_eq!(left.scopes(), right.scopes());
+        assert_eq!(left.fields(), right.fields());
+        assert_eq!(left.resources(), right.resources());
+        assert_eq!(left.diagnostics(), right.diagnostics());
+        assert_eq!(left.budget(), right.budget());
+        assert_eq!(left.topology_signature(), right.topology_signature());
+    }
+
+    #[test]
+    fn m4_live_style_and_export_style_motion_plans_are_equal_at_24_30_60() {
+        use crate::evaluated_frame::evaluated_composition::{
+            LayerMotionPlanInput, MotionCodecFrameFacts,
+        };
+        use crate::motion::{MotionFieldOrigin, MotionSourceDiagnostic};
+
+        let graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        let (master, params) = m4_motion_params(&graph);
+        let facts = [
+            MotionCodecFrameFacts {
+                available: true,
+                source_generation: 11,
+                frame_ordinal: 17,
+            },
+            MotionCodecFrameFacts::default(),
+            MotionCodecFrameFacts::default(),
+        ];
+        let mut canonical = None;
+        for fps in [24_u32, 30, 60] {
+            let evaluated = m4_motion_evaluated_frame(&graph, fps);
+            let export_inputs =
+                export_motion_layer_plan_inputs(&graph, &params, facts.into_iter().enumerate())
+                    .unwrap();
+            let live_inputs = graph
+                .layer_ids
+                .iter()
+                .copied()
+                .zip(params.iter().copied())
+                .zip(facts)
+                .map(|((stable_id, params), codec)| LayerMotionPlanInput {
+                    stable_id,
+                    params,
+                    codec,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(export_inputs, live_inputs);
+
+            let export = m4_motion_plan(&evaluated, &graph, master, &export_inputs);
+            let live = m4_motion_plan(&evaluated, &graph, master, &live_inputs);
+            assert_m4_motion_plans_equal(&live, &export);
+            if let Some(previous) = canonical.as_ref() {
+                assert_m4_motion_plans_equal(previous, &export);
+            } else {
+                canonical = Some(export.clone());
+            }
+
+            let motion = export.motion().advanced().unwrap();
+            assert_eq!(
+                motion
+                    .scope(crate::visual_rack::VisualScopeId::Master)
+                    .unwrap()
+                    .source
+                    .origin,
+                MotionFieldOrigin::Lattice
+            );
+            assert_eq!(
+                motion
+                    .scope(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+                    .unwrap()
+                    .source
+                    .origin,
+                MotionFieldOrigin::CodecVectors
+            );
+            let fallback = motion
+                .scope(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[1]))
+                .unwrap();
+            assert_eq!(fallback.source.origin, MotionFieldOrigin::LatticeFallback);
+            assert_eq!(
+                fallback.source.diagnostic,
+                MotionSourceDiagnostic::CodecUnavailableFallback
+            );
+            let recipient = motion
+                .scope(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[2]))
+                .unwrap();
+            assert!(recipient.transplant_admitted);
+            assert_eq!(
+                recipient.donor_scope,
+                Some(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+            );
+        }
+
+        // A zero shutter angle is literal zero even when every other authored
+        // tier/source selector is non-default, and must preserve delegation.
+        let evaluated = m4_motion_evaluated_frame(&graph, 30);
+        let mut exact_zero = crate::motion::MotionParams::default();
+        exact_zero.shutter.quality = crate::motion::CurvedShutterQuality::High;
+        exact_zero.field_source = crate::motion::MotionFieldSource::CodecVectors;
+        let zero = vec![exact_zero; graph.layer_ids.len()];
+        let zero_inputs = export_motion_layer_plan_inputs(
+            &graph,
+            &zero,
+            (0..zero.len()).map(|index| (index, MotionCodecFrameFacts::default())),
+        )
+        .unwrap();
+        let mattes = vec![LayerMatte::default(); graph.layer_ids.len()];
+        let zero_plan = evaluated
+            .plan_composition(
+                CompositionPlanInput::new(
+                    &graph.composition,
+                    &graph.master_rack,
+                    &graph.layer_racks,
+                )
+                .with_layer_mattes(&mattes, false)
+                .with_motion(
+                    exact_zero,
+                    &zero_inputs,
+                    crate::motion::MotionDeviceLimits::new(16_384, u64::MAX),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            zero_plan,
+            EvaluatedCompositionPlan::LegacyExact(_)
+        ));
+    }
+
+    #[test]
+    fn m4_export_donor_resolution_holds_and_fixed_shutter_tiers_use_authored_laws() {
+        use crate::motion::{CurvedShutterQuality, MotionDonor};
+        use crate::transport::NormalizedTime;
+
+        let graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        let mut saved = crate::patch::MotionConfig::default();
+        saved.transplant.amount = 1.0;
+        saved.transplant.donor = crate::patch::MotionDonorConfig::Selected {
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+        };
+        let resolved = resolved_export_motion(Some(saved), &graph.layer_ids);
+        assert_eq!(
+            resolved.transplant.donor,
+            MotionDonor::Selected {
+                layer_id: graph.layer_ids[1],
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            }
+        );
+
+        saved.transplant.donor = crate::patch::MotionDonorConfig::Selected {
+            saved_position: SavedLayerPosition::new(9).unwrap(),
+        };
+        assert_eq!(
+            resolved_export_motion(Some(saved), &graph.layer_ids)
+                .transplant
+                .donor,
+            MotionDonor::Missing {
+                saved_position: SavedLayerPosition::new(9).unwrap(),
+            }
+        );
+
+        assert_eq!(CurvedShutterQuality::Sharp.sample_count(), 1);
+        assert_eq!(CurvedShutterQuality::Draft.sample_count(), 4);
+        assert_eq!(CurvedShutterQuality::Live.sample_count(), 8);
+        assert_eq!(CurvedShutterQuality::High.sample_count(), 16);
+        let mut zero = crate::motion::MotionParams::default();
+        zero.shutter.quality = CurvedShutterQuality::High;
+        assert!(zero.shutter.is_exact_zero());
+        assert!(zero.is_exact_zero());
+
+        let mut transport = ExportClipTransport::new(
+            ClipTransportConfig {
+                sample_fps: Some(30.0),
+                ..ClipTransportConfig::default()
+            },
+            NormalizedTime::clamped(0.25),
+            1.0,
+            30,
+        );
+        let _ = transport.seed_selection();
+        let advancing = transport.select(
+            transport.authored,
+            ProgramTransportTick {
+                delta_seconds: 1.0 / 30.0,
+                program_running: true,
+                media_running: true,
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert!(!advancing.held);
+        assert_eq!(export_motion_held_scope(&graph, 0, advancing), None);
+        let held = transport.select(
+            transport.authored,
+            ProgramTransportTick {
+                delta_seconds: 1.0,
+                program_running: true,
+                media_running: false,
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert!(held.held);
+        assert_eq!(
+            export_motion_held_scope(&graph, 0, held),
+            Some(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+        );
+
+        let before_seek = m4_codec_motion_frame(held.generation, 4);
+        let seek = transport.select(
+            transport.authored,
+            ProgramTransportTick {
+                program_running: true,
+                media_running: true,
+                seek_to: Some(NormalizedTime::clamped(0.75)),
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert!(seek.discontinuity);
+        assert_ne!(seek.generation, held.generation);
+        assert!(
+            matching_export_codec_motion(Some(before_seek), seek.generation, [64, 32]).is_none()
+        );
+    }
+
+    fn m4_codec_motion_frame(source_generation: u64, frame_ordinal: u64) -> CodecMotionFrame {
+        CodecMotionFrame {
+            source_dimensions: [64, 32],
+            frame_delta_seconds: 1.0 / 30.0,
+            source_generation,
+            frame_ordinal,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
+            frame_type: crate::video::CodecMotionFrameType::Predictive,
+            status: crate::video::CodecMotionStatus::Available,
+            vectors: vec![crate::motion::CodecMotionVector {
+                destination: [8, 8],
+                block: [16, 16],
+                motion: [-4, 0],
+                motion_scale: 1,
+                seconds_from_reference: 0.5,
+                reference: crate::motion::CodecReferenceDirection::Past,
+                visibility: 1.0,
+            }],
+        }
+    }
+
+    #[test]
+    fn m4_export_codec_attachment_is_exact_and_missing_malformed_or_stale_stays_zero() {
+        use crate::evaluated_frame::evaluated_composition::MotionCodecFrameFacts;
+
+        let graph = resolve_export_creative_graph(&three_layer_legacy_patch()).unwrap();
+        let (master, params) = m4_motion_params(&graph);
+        let evaluated = m4_motion_evaluated_frame(&graph, 30);
+        let facts = [
+            MotionCodecFrameFacts {
+                available: true,
+                source_generation: 11,
+                frame_ordinal: 17,
+            },
+            MotionCodecFrameFacts::default(),
+            MotionCodecFrameFacts::default(),
+        ];
+        let inputs =
+            export_motion_layer_plan_inputs(&graph, &params, facts.into_iter().enumerate())
+                .unwrap();
+        let plan = m4_motion_plan(&evaluated, &graph, master, &inputs);
+        let codec = m4_codec_motion_frame(11, 17);
+        let sources = [(0, Some(&codec)), (1, None), (2, None)];
+        let (products, diagnostics) = export_codec_motion_fields_from(&plan, &graph, sources);
+        assert!(diagnostics.is_empty());
+        assert_eq!(products.len(), 1);
+        let attachment = products[0].attachment();
+        let field_plan = plan
+            .motion()
+            .advanced()
+            .unwrap()
+            .fields()
+            .iter()
+            .find(|field| field.scope == attachment.scope)
+            .unwrap();
+        assert!(field_plan.accepts(attachment));
+        let sample = products[0].field.sample(0, 0).unwrap();
+        assert!(sample.velocity_uv_per_second[0] > 0.0);
+        assert_eq!(sample.velocity_uv_per_second[1], 0.0);
+
+        let metadata = export_motion_metadata_for_frame_from(
+            &EvaluatedCompositionPlan::Advanced(Box::new(plan.clone())),
+            &graph,
+            [(0, Some(&codec)), (1, None), (2, None)],
+            23,
+        );
+        assert_eq!(metadata.accepted_frame, Some(23));
+        assert_eq!(
+            metadata.algorithm_version,
+            crate::motion::MOTION_ALGORITHM_VERSION
+        );
+        assert!(!metadata.scopes_truncated);
+        let codec_metadata = metadata
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            codec_metadata.source_origin,
+            crate::motion::MotionFieldOrigin::CodecVectors
+        );
+        assert_eq!(
+            codec_metadata.codec_provenance,
+            Some(crate::video::CodecMotionProvenance::FfmpegExportMvs)
+        );
+        assert_eq!(codec_metadata.source_generation, Some(11));
+        assert_eq!(codec_metadata.frame_ordinal, Some(17));
+        let fallback_metadata = metadata
+            .scopes
+            .iter()
+            .find(|scope| {
+                matches!(
+                    scope.scope,
+                    ExportMotionScopeIdentity::Layer {
+                        saved_position: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            fallback_metadata.source_origin,
+            crate::motion::MotionFieldOrigin::LatticeFallback
+        );
+        assert_eq!(fallback_metadata.codec_provenance, None);
+
+        let (missing, missing_diagnostics) =
+            export_codec_motion_fields_from(&plan, &graph, [(0, None), (1, None), (2, None)]);
+        assert!(missing.is_empty());
+        assert!(missing_diagnostics
+            .iter()
+            .any(|message| message.contains("lost its exact codec metadata")));
+
+        let mut malformed = codec.clone();
+        malformed.vectors[0].motion_scale = 0;
+        let (malformed_products, malformed_diagnostics) = export_codec_motion_fields_from(
+            &plan,
+            &graph,
+            [(0, Some(&malformed)), (1, None), (2, None)],
+        );
+        assert!(malformed_products.is_empty());
+        assert!(malformed_diagnostics
+            .iter()
+            .any(|message| message.contains("rasterization was rejected")));
+
+        let stale = m4_codec_motion_frame(12, 17);
+        let (stale_products, stale_diagnostics) = export_codec_motion_fields_from(
+            &plan,
+            &graph,
+            [(0, Some(&stale)), (1, None), (2, None)],
+        );
+        assert!(stale_products.is_empty());
+        assert!(stale_diagnostics
+            .iter()
+            .any(|message| message.contains("failed exact attachment provenance")));
+    }
+
+    #[test]
+    fn m4_motion_sidecar_is_atomic_bounded_versioned_and_cleanup_coupled() {
+        use crate::motion::{
+            CurvedShutterQuality, MotionCarrier, MotionFieldOrigin, MotionFieldSource,
+            MotionLatticeQuality, MotionSourceDiagnostic,
+        };
+
+        let unique = format!(
+            "collide-o-scope-motion-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("artifact.mp4");
+        std::fs::write(&output, b"accepted-video").unwrap();
+
+        let mut accumulator = ExportMotionSidecarAccumulator {
+            artifact: MotionSidecarArtifact {
+                file_name: "artifact.mp4".to_owned(),
+                width: 64,
+                height: 32,
+                fps: 30,
+                duration_seconds: 1.0,
+            },
+            sources: vec![MotionSidecarSource {
+                saved_position: 0,
+                stable_id: 1,
+                source_tap_id: export_selective_layer_id(0),
+                kind: "video".to_owned(),
+                logical_name: "donor.mov".to_owned(),
+                persisted_reference: "sha256:fixture".to_owned(),
+                fingerprint_sha256: Some("a".repeat(64)),
+                fingerprint_bytes: Some(1234),
+            }],
+            sources_truncated: false,
+            authored_scopes: vec![sidecar_authored_scope(
+                MotionSidecarScopeIdentity::Master,
+                crate::motion::MotionParams::default(),
+            )],
+            authored_scopes_truncated: false,
+            distinct: Vec::new(),
+            distinct_truncated: false,
+            last: None,
+        };
+        let scope = ExportMotionScopeMetadata {
+            scope: ExportMotionScopeIdentity::Layer {
+                saved_position: 0,
+                stable_id: 1,
+                source_tap_id: export_selective_layer_id(0),
+            },
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            requested_source: MotionFieldSource::CodecVectors,
+            lattice_quality: MotionLatticeQuality::Live,
+            source_origin: MotionFieldOrigin::CodecVectors,
+            source_diagnostic: MotionSourceDiagnostic::None,
+            codec_provenance: Some(crate::video::CodecMotionProvenance::FfmpegExportMvs),
+            source_generation: Some(1),
+            frame_ordinal: Some(7),
+            donor_saved_position: Some(0),
+            donor_stable_id: Some(1),
+            carrier: MotionCarrier::FirstSourceFrame,
+            transplant_admitted: true,
+            shutter_active: true,
+            shutter_angle_degrees: 180.0,
+            shutter_quality: CurvedShutterQuality::Draft,
+            shutter_sample_count: CurvedShutterQuality::Draft.sample_count(),
+        };
+        accumulator.observe_accepted(&ExportMotionMetadata {
+            accepted_frame: Some(0),
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: vec![scope.clone()],
+            scopes_truncated: false,
+        });
+        let mut same_dynamic_state = scope.clone();
+        same_dynamic_state.source_generation = Some(2);
+        same_dynamic_state.frame_ordinal = Some(8);
+        accumulator.observe_accepted(&ExportMotionMetadata {
+            accepted_frame: Some(1),
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: vec![same_dynamic_state],
+            scopes_truncated: false,
+        });
+        let mut fallback = scope.clone();
+        fallback.source_origin = MotionFieldOrigin::LatticeFallback;
+        fallback.source_diagnostic = MotionSourceDiagnostic::CodecUnavailableFallback;
+        fallback.codec_provenance = None;
+        fallback.source_generation = None;
+        fallback.frame_ordinal = None;
+        accumulator.observe_accepted(&ExportMotionMetadata {
+            accepted_frame: Some(2),
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: vec![fallback],
+            scopes_truncated: false,
+        });
+        accumulator.observe_accepted(&ExportMotionMetadata {
+            accepted_frame: Some(3),
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: vec![scope; MAX_EXPORT_MOTION_SIDECAR_SCOPES + 3],
+            scopes_truncated: true,
+        });
+        let warnings = (0..MAX_EXPORT_WARNINGS + 5)
+            .map(|index| format!("warning-{index}"))
+            .collect();
+        let sidecar = accumulator.finish(warnings);
+        assert_eq!(sidecar.schema_version, EXPORT_MOTION_SIDECAR_SCHEMA_VERSION);
+        assert!(!sidecar.cross_gpu_pixel_identity_guaranteed);
+        assert_eq!(sidecar.distinct_dynamic_states.len(), 2);
+        assert_eq!(sidecar.warnings.len(), MAX_EXPORT_WARNINGS);
+        let last = sidecar.last_accepted_frame.as_ref().unwrap();
+        assert_eq!(last.accepted_frame, 3);
+        assert_eq!(last.scopes.len(), MAX_EXPORT_MOTION_SIDECAR_SCOPES);
+        assert!(last.scopes_truncated);
+
+        let output_string = output.to_string_lossy().into_owned();
+        let sidecar_path = motion_sidecar_path(&output_string);
+        std::fs::write(&sidecar_path, b"stale-report").unwrap();
+        write_motion_sidecar_atomic(&output_string, &sidecar).unwrap();
+        let bytes = std::fs::read(&sidecar_path).unwrap();
+        assert!(bytes.len() <= MAX_EXPORT_MOTION_SIDECAR_BYTES);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["cross_gpu_pixel_identity_guaranteed"], false);
+        assert_eq!(json["sources"][0]["fingerprint_bytes"], 1234);
+        assert_eq!(json["last_accepted_frame"]["accepted_frame"], 3);
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".motion.json.tmp-")
+        }));
+
+        let progress = ExportProgress::new();
+        progress.output_started.store(true, Ordering::Release);
+        assert_eq!(remove_started_output(&progress, Some(&output_string)), None);
+        assert!(!output.exists());
+        assert!(!sidecar_path.exists());
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    fn map_spatial_uv(uniforms: SpatialGpuUniforms, uv: [f32; 2]) -> [f32; 2] {
+        [
+            uniforms.inverse_row_0[0] * uv[0]
+                + uniforms.inverse_row_0[1] * uv[1]
+                + uniforms.inverse_row_0[2],
+            uniforms.inverse_row_1[0] * uv[0]
+                + uniforms.inverse_row_1[1] * uv[1]
+                + uniforms.inverse_row_1[2],
+        ]
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-5,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_uv_close(actual: [f32; 2], expected: [f32; 2]) {
+        assert_close(actual[0], expected[0]);
+        assert_close(actual[1], expected[1]);
+    }
+
+    #[test]
+    fn spatial_4_by_3_card_fit_fill_stretch_and_native_have_exact_landmarks() {
+        let dimensions = (640, 480, 1920, 1080);
+        let uniforms = |fit| {
+            SpatialTransform {
+                fit,
+                edge: EdgeMode::Transparent,
+                ..SpatialTransform::default()
+            }
+            .gpu_uniforms(dimensions.0, dimensions.1, dimensions.2, dimensions.3)
+        };
+
+        let stretch = uniforms(FitMode::Stretch);
+        assert_uv_close(map_spatial_uv(stretch, [0.0, 0.0]), [0.0, 0.0]);
+        assert_uv_close(map_spatial_uv(stretch, [1.0, 1.0]), [1.0, 1.0]);
+
+        // 4:3 fitted into 16:9 occupies the middle 75% of the width.
+        let fit = uniforms(FitMode::Fit);
+        assert_uv_close(map_spatial_uv(fit, [0.125, 0.0]), [0.0, 0.0]);
+        assert_uv_close(map_spatial_uv(fit, [0.875, 1.0]), [1.0, 1.0]);
+        assert!(map_spatial_uv(fit, [0.0, 0.5])[0] < 0.0);
+        assert!(map_spatial_uv(fit, [1.0, 0.5])[0] > 1.0);
+
+        // Fill crops equal top and bottom source regions while covering every
+        // output pixel: output Y 0..1 maps to source-local Y 1/8..7/8.
+        let fill = uniforms(FitMode::Fill);
+        assert_uv_close(map_spatial_uv(fill, [0.0, 0.0]), [0.0, 0.125]);
+        assert_uv_close(map_spatial_uv(fill, [1.0, 1.0]), [1.0, 0.875]);
+
+        // Native 640x480 pixels occupy exactly that many pixels in 1920x1080.
+        let native = uniforms(FitMode::Native);
+        assert_uv_close(map_spatial_uv(native, [1.0 / 3.0, 5.0 / 18.0]), [0.0, 0.0]);
+        assert_uv_close(map_spatial_uv(native, [2.0 / 3.0, 13.0 / 18.0]), [1.0, 1.0]);
+
+        assert_eq!(
+            stretch.modes[3], 0,
+            "exact Stretch identity must retain the historical shader bypass"
+        );
+        for pass in [fit, fill, native] {
+            assert_eq!(
+                pass.modes[0], 0,
+                "the acceptance card uses transparent edges"
+            );
+            assert_eq!(pass.modes[2], 1, "the transform must remain invertible");
+            assert_eq!(
+                pass.modes[3], 1,
+                "the explicit edge law activates spatial sampling"
+            );
+            assert_uv_close(map_spatial_uv(pass, [0.5, 0.5]), [0.5, 0.5]);
+        }
+    }
+
+    #[test]
+    fn spatial_anchor_skew_axis_and_affine_order_preserve_landmarks() {
+        // Anchor selection alone must be visually inert.
+        let anchor_only = SpatialTransform {
+            anchor: [0.2, 0.8],
+            edge: EdgeMode::Transparent,
+            ..SpatialTransform::default()
+        }
+        .gpu_uniforms(100, 100, 100, 100);
+        assert_uv_close(map_spatial_uv(anchor_only, [0.0, 0.0]), [0.0, 0.0]);
+        assert_uv_close(map_spatial_uv(anchor_only, [1.0, 1.0]), [1.0, 1.0]);
+
+        // After every authored affine operation, the anchor itself lands at
+        // anchor + position for Stretch. This catches accidental translation
+        // before pivoting as well as crop-relative anchor regressions.
+        let pivoted = SpatialTransform {
+            position: [0.1, -0.2],
+            scale: [1.7, 0.8],
+            anchor: [0.25, 0.75],
+            rotation_deg: 31.0,
+            skew_deg: 23.0,
+            skew_axis_deg: -17.0,
+            edge: EdgeMode::Transparent,
+            ..SpatialTransform::default()
+        }
+        .gpu_uniforms(100, 100, 100, 100);
+        assert_uv_close(map_spatial_uv(pivoted, [0.35, 0.55]), [0.25, 0.75]);
+
+        // Canonical forward order is scale, skew, then rotation. Starting at
+        // local (0.5, 0.75): 2x X scale leaves the Y delta .25; 45-degree X
+        // skew makes the delta (.25,.25); clockwise 90-degree rotation makes
+        // it (-.25,.25), hence output (0.25,0.75).
+        let ordered = SpatialTransform {
+            scale: [2.0, 1.0],
+            rotation_deg: 90.0,
+            skew_deg: 45.0,
+            edge: EdgeMode::Transparent,
+            ..SpatialTransform::default()
+        }
+        .gpu_uniforms(100, 100, 100, 100);
+        assert_uv_close(map_spatial_uv(ordered, [0.25, 0.75]), [0.5, 0.75]);
+
+        // Rotating the skew axis by 90 degrees turns X shear into the
+        // corresponding Y shear; this landmark fixes the axis convention.
+        let axis = SpatialTransform {
+            skew_deg: 45.0,
+            skew_axis_deg: 90.0,
+            edge: EdgeMode::Transparent,
+            ..SpatialTransform::default()
+        }
+        .gpu_uniforms(100, 100, 100, 100);
+        assert_uv_close(map_spatial_uv(axis, [0.75, 0.25]), [0.75, 0.5]);
+    }
+
+    #[test]
+    fn spatial_hostile_values_are_finite_bounded_or_explicitly_transparent() {
+        let hostile = SpatialTransform {
+            position: [f32::NAN, f32::INFINITY],
+            scale: [f32::NEG_INFINITY, f32::NAN],
+            anchor: [f32::INFINITY, f32::NEG_INFINITY],
+            rotation_deg: f32::NAN,
+            skew_deg: f32::INFINITY,
+            skew_axis_deg: f32::NEG_INFINITY,
+            crop: [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX],
+            edge: EdgeMode::Transparent,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let clean = hostile.sanitized();
+        for value in clean
+            .position
+            .into_iter()
+            .chain(clean.scale)
+            .chain(clean.anchor)
+            .chain([clean.rotation_deg, clean.skew_deg, clean.skew_axis_deg])
+            .chain(clean.crop)
+        {
+            assert!(value.is_finite());
+        }
+        assert!(clean.crop[0] + clean.crop[2] < 1.0);
+        assert!(clean.crop[1] + clean.crop[3] < 1.0);
+
+        let pass = hostile.gpu_uniforms(u32::MAX, u32::MAX, 1, 1);
+        for value in pass
+            .inverse_row_0
+            .into_iter()
+            .chain(pass.inverse_row_1)
+            .chain(pass.crop)
+        {
+            assert!(value.is_finite());
+        }
+        assert_eq!(pass.modes, [0, 1, 1, 1]);
+
+        for collapsed in [
+            SpatialTransform {
+                scale: [0.0, 1.0],
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                scale: [1.0e-8, 1.0],
+                ..SpatialTransform::default()
+            },
+        ] {
+            let pass = collapsed.gpu_uniforms(640, 480, 1920, 1080);
+            assert_eq!(pass.modes[2], 0, "collapsed geometry must be invalid");
+            assert_eq!(
+                pass.modes[3], 1,
+                "invalid geometry must select transparent output"
+            );
+        }
+        assert_eq!(
+            SpatialTransform::default()
+                .gpu_uniforms(0, 480, 1920, 1080)
+                .modes[2],
+            0
+        );
+    }
+
+    #[test]
+    fn shared_evaluation_and_pass_uniforms_are_exact_at_equal_24_30_and_60_fps_times() {
+        use crate::effects::params::TemporalParams;
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+        use crate::modulation::ModMatrix;
+
+        let transform = SpatialTransform {
+            position: [0.125, -0.25],
+            scale: [1.5, 0.75],
+            anchor: [0.25, 0.8],
+            rotation_deg: 33.0,
+            skew_deg: -12.0,
+            skew_axis_deg: 71.0,
+            fit: FitMode::Fit,
+            crop: [0.1, 0.05, 0.2, 0.15],
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+        };
+        let master_effects = EffectUniforms {
+            cellular_amount: 0.8,
+            cellular_speed: 1.25,
+            shift_amount: 0.7,
+            shift_density: 1.0,
+            shift_speed: 4.0,
+            random_seed: 0x5041_5249,
+            ..EffectUniforms::default()
+        };
+        let layer_effects = EffectUniforms {
+            rgb_split: 7.0,
+            breathe_position: 0.01,
+            ..master_effects
+        };
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = TemporalParams::default();
+        let modulation = ModMatrix::new().frame(1);
+        let mut canonical: Option<Vec<u8>> = None;
+        for fps in [24_u32, 30, 60] {
+            // The same one-second instant has different frame ordinals at
+            // each rate. Both live and export consume this shared immutable
+            // evaluator before specializing the common shader payload.
+            let time_seconds = fps as f32 / fps as f32;
+            let plan = EvaluatedFramePlan::evaluate(
+                &modulation,
+                FramePlanContext::new(1920, 1080, time_seconds),
+                MasterFrameInput {
+                    effects: &master_effects,
+                    transform: &transform,
+                    ntsc: &ntsc,
+                    temporal: &temporal,
+                },
+                [LayerFrameInput {
+                    source: SourceTap::new(7, 0, 640, 480),
+                    effects: &layer_effects,
+                    transform: &transform,
+                    opacity: 0.625,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Difference,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }],
+            );
+            let master_pass = *plan.master_pass();
+            let layer_pass = plan.layer_passes()[0];
+            let mut evidence = Vec::with_capacity(
+                std::mem::size_of::<EffectPassUniforms>() * 2 + std::mem::size_of::<f32>(),
+            );
+            evidence.extend_from_slice(bytemuck::bytes_of(&master_pass));
+            evidence.extend_from_slice(bytemuck::bytes_of(&layer_pass));
+            evidence.extend_from_slice(&plan.layers()[0].opacity.to_ne_bytes());
+            if let Some(expected) = &canonical {
+                assert_eq!(&evidence, expected);
+            } else {
+                canonical = Some(evidence);
+            }
+        }
+    }
+
+    #[test]
+    fn active_spatial_sampling_keeps_cellular_and_shift_under_the_edge_law() {
+        let shader = include_str!("shaders/effects.wgsl");
+        let cellular = shader
+            .split("// --- Cellular / Worley domain warp ---")
+            .nth(1)
+            .unwrap()
+            .split("// --- Shift")
+            .next()
+            .unwrap();
+        assert!(cellular.contains("if uniforms.spatial_modes.w == 0u"));
+        assert!(cellular.contains("sample_uv = clamp(warped_uv"));
+        assert!(cellular.contains("sample_uv = warped_uv"));
+
+        let shift = shader
+            .split("// --- Shift (seeded horizontal block displacement) ---")
+            .nth(1)
+            .unwrap()
+            .split("// --- Downsample")
+            .next()
+            .unwrap();
+        assert!(shift.contains("if uniforms.spatial_modes.w == 0u"));
+        assert!(shift.contains("sample_uv.x = fract"));
+        assert!(shift.contains("sample_uv.x += offset"));
+    }
+
+    /// Minimal offscreen use of the production fullscreen/effects shaders.
+    /// It deliberately owns no filesystem output: every acceptance image is
+    /// read back from a small temporary GPU texture and dropped with the test.
+    struct SpatialShaderHarness {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        pipeline: wgpu::RenderPipeline,
+        texture_layout: wgpu::BindGroupLayout,
+        uniform_layout: wgpu::BindGroupLayout,
+        composite_pipeline: wgpu::RenderPipeline,
+        composite_texture_layout: wgpu::BindGroupLayout,
+        composite_uniform_layout: wgpu::BindGroupLayout,
+        matte_composite: MatteCompositePipeline,
+        sampler: wgpu::Sampler,
+        nearest_sampler: wgpu::Sampler,
+        _source_texture: wgpu::Texture,
+        source_view: wgpu::TextureView,
+        output_texture: wgpu::Texture,
+        output_view: wgpu::TextureView,
+        staging: wgpu::Buffer,
+        width: u32,
+        height: u32,
+        bytes_per_row: u32,
+    }
+
+    impl SpatialShaderHarness {
+        fn new(width: u32, height: u32) -> Result<Self, String> {
+            let instance = wgpu::Instance::default();
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+                .map_err(|error| format!("no GPU adapter for spatial acceptance test: {error}"))?;
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("Spatial Acceptance Device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                }))
+                .map_err(|error| format!("spatial acceptance device request failed: {error}"))?;
+
+            let (
+                pipeline,
+                texture_layout,
+                uniform_layout,
+                sampler,
+                nearest_sampler,
+                source_texture,
+                source_view,
+                output_texture,
+                output_view,
+                staging,
+                bytes_per_row,
+            ) = scoped_export_gpu_operation(&device, "spatial acceptance GPU setup", || {
+                let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("Spatial Acceptance Linear Sampler"),
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                });
+                let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                    label: Some("Spatial Acceptance Nearest Sampler"),
+                    mag_filter: wgpu::FilterMode::Nearest,
+                    min_filter: wgpu::FilterMode::Nearest,
+                    mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                    ..Default::default()
+                });
+                let texture_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("Spatial Acceptance Texture Layout"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Texture {
+                                    sample_type: wgpu::TextureSampleType::Float {
+                                        filterable: true,
+                                    },
+                                    view_dimension: wgpu::TextureViewDimension::D2,
+                                    multisampled: false,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 2,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                        ],
+                    });
+                let uniform_layout =
+                    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("Spatial Acceptance Uniform Layout"),
+                        entries: &[wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        }],
+                    });
+                let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Spatial Acceptance Vertex"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("shaders/fullscreen.wgsl").into(),
+                    ),
+                });
+                let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Spatial Acceptance Effects"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("shaders/effects.wgsl").into()),
+                });
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("Spatial Acceptance Pipeline Layout"),
+                        bind_group_layouts: &[Some(&texture_layout), Some(&uniform_layout)],
+                        immediate_size: 0,
+                    });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Spatial Acceptance Pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &vertex,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &fragment,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+
+                let source_texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Spatial Acceptance 4:3 Card"),
+                    size: wgpu::Extent3d {
+                        width: 4,
+                        height: 3,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let source_view =
+                    source_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let output_texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Spatial Acceptance Output"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let output_view =
+                    output_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let bytes_per_row = (width * 4 + 255) & !255;
+                let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Spatial Acceptance Readback"),
+                    size: u64::from(bytes_per_row) * u64::from(height),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                (
+                    pipeline,
+                    texture_layout,
+                    uniform_layout,
+                    sampler,
+                    nearest_sampler,
+                    source_texture,
+                    source_view,
+                    output_texture,
+                    output_view,
+                    staging,
+                    bytes_per_row,
+                )
+            })?;
+
+            // An opaque, nonuniform card makes both coverage and accidental
+            // edge smearing observable without depending on external media.
+            let card = spatial_acceptance_card();
+            scoped_export_gpu_operation(&device, "spatial acceptance card upload", || {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &source_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &card,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * 4),
+                        rows_per_image: Some(3),
+                    },
+                    wgpu::Extent3d {
+                        width: 4,
+                        height: 3,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            })?;
+            let (composite_pipeline, composite_texture_layout, composite_uniform_layout) =
+                scoped_export_gpu_operation(&device, "spatial acceptance composite setup", || {
+                    build_test_composite_pipeline(&device)
+                })?;
+            let matte_composite = scoped_export_gpu_operation(
+                &device,
+                "spatial acceptance matte composite setup",
+                || {
+                    let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("Spatial Acceptance Matte Vertex"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            include_str!("shaders/fullscreen.wgsl").into(),
+                        ),
+                    });
+                    MatteCompositePipeline::build(&device, &vertex)
+                },
+            )?;
+
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+                texture_layout,
+                uniform_layout,
+                composite_pipeline,
+                composite_texture_layout,
+                composite_uniform_layout,
+                matte_composite,
+                sampler,
+                nearest_sampler,
+                _source_texture: source_texture,
+                source_view,
+                output_texture,
+                output_view,
+                staging,
+                width,
+                height,
+                bytes_per_row,
+            })
+        }
+
+        fn render(
+            &self,
+            transform: SpatialTransform,
+            effects: EffectUniforms,
+        ) -> Result<Vec<u8>, String> {
+            let pass_uniforms = EffectPassUniforms::for_target(
+                effects,
+                transform,
+                (4, 3),
+                (self.width, self.height),
+            );
+            self.render_pass_uniforms(pass_uniforms)
+        }
+
+        fn render_pass_uniforms(
+            &self,
+            pass_uniforms: EffectPassUniforms,
+        ) -> Result<Vec<u8>, String> {
+            let uniform_buffer = create_uploaded_uniform(
+                &self.device,
+                &self.queue,
+                "Spatial Acceptance Pass Uniforms",
+                &pass_uniforms,
+            );
+            let texture_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Spatial Acceptance Texture Bind Group"),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                    },
+                ],
+            });
+            let uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Spatial Acceptance Uniform Bind Group"),
+                layout: &self.uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                }],
+            });
+
+            scoped_export_gpu_operation(&self.device, "spatial acceptance render", || {
+                let mut encoder =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Spatial Acceptance Encoder"),
+                        });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Spatial Acceptance Render Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &self.output_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        ..Default::default()
+                    });
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &texture_bind_group, &[]);
+                    pass.set_bind_group(1, &uniform_bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+                self.queue.submit(std::iter::once(encoder.finish()));
+            })?;
+
+            readback_pixels(
+                &self.device,
+                &self.queue,
+                &self.output_texture,
+                &self.staging,
+                self.width,
+                self.height,
+                self.bytes_per_row,
+                &AtomicBool::new(false),
+            )
+        }
+
+        fn export_layer(
+            &self,
+            source_index: usize,
+            pixels: &[u8],
+            base: ExportFrameLayerBase,
+        ) -> Result<ExportLayer, String> {
+            let (texture, texture_view) = create_export_source_texture(
+                &self.device,
+                4,
+                3,
+                "Spatial Full-Stack Export Source",
+            )?;
+            upload_export_texture_checked(
+                &self.device,
+                &self.queue,
+                &texture,
+                pixels,
+                4,
+                3,
+                "Spatial Full-Stack Export Source",
+            )?;
+            let transport = ExportClipTransport {
+                authored: ClipTransportConfig {
+                    rate: f64::from(base.speed),
+                    sample_fps: Some(f64::from(base.fps)),
+                    ..ClipTransportConfig::default()
+                }
+                .sanitized(),
+                state: ClipTransportState::default(),
+                source_duration_seconds: 0.0,
+                source_frame_count: 1,
+            };
+            Ok(ExportLayer {
+                source_index,
+                motion_source: ExportMotionSourceRecord {
+                    kind: ExportMotionSourceKind::Still,
+                    logical_name: format!("fixture-{source_index}"),
+                    persisted_reference: String::new(),
+                    fingerprint: None,
+                },
+                decoder: None,
+                codec_motion: None,
+                _still_source: None,
+                texture,
+                texture_view,
+                effects: base.effects,
+                transform: base.transform,
+                opacity: base.opacity,
+                blend_mode: base.blend_mode,
+                bypass_master_fx: base.bypass_master_fx,
+                matte: LayerMatte::default(),
+                reroll_on_loop: false,
+                consumed_loop_generation: 0,
+                transport,
+                speed: base.speed,
+                visible: base.visible,
+                paused: base.paused,
+                fps: base.fps,
+                width: 4,
+                height: 3,
+            })
+        }
+
+        fn render_export_full_stack(
+            &self,
+            layers: &mut [ExportLayer],
+            plan: &crate::evaluated_frame::EvaluatedFramePlan,
+            delta_seconds: f32,
+        ) -> Result<Vec<u8>, String> {
+            self.render_export_full_stack_timed(layers, plan, delta_seconds)
+                .map(|(pixels, _)| pixels)
+        }
+
+        fn render_export_full_stack_timed(
+            &self,
+            layers: &mut [ExportLayer],
+            plan: &crate::evaluated_frame::EvaluatedFramePlan,
+            delta_seconds: f32,
+        ) -> Result<(Vec<u8>, std::time::Duration), String> {
+            let mut routing = None;
+            self.render_export_full_stack_timed_with_routing(
+                layers,
+                plan,
+                delta_seconds,
+                &mut routing,
+            )
+        }
+
+        fn render_export_full_stack_with_routing(
+            &self,
+            layers: &mut [ExportLayer],
+            plan: &crate::evaluated_frame::EvaluatedFramePlan,
+            delta_seconds: f32,
+            routing: &mut Option<ImageRoutingGpuResources>,
+        ) -> Result<Vec<u8>, String> {
+            self.render_export_full_stack_timed_with_routing(layers, plan, delta_seconds, routing)
+                .map(|(pixels, _)| pixels)
+        }
+
+        fn render_export_full_stack_timed_with_routing(
+            &self,
+            layers: &mut [ExportLayer],
+            plan: &crate::evaluated_frame::EvaluatedFramePlan,
+            delta_seconds: f32,
+            routing: &mut Option<ImageRoutingGpuResources>,
+        ) -> Result<(Vec<u8>, std::time::Duration), String> {
+            assert!(!plan.ntsc().enabled, "golden explicitly disables NTSC");
+            let temporal = plan.temporal();
+            assert_eq!(temporal.feedback, 0.0);
+            assert_eq!(temporal.slitscan, 0.0);
+            assert_eq!(temporal.key_mode, 0.0);
+            assert_eq!(layers.len(), plan.layers().len());
+
+            let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST;
+            let composite_textures: [wgpu::Texture; 3] = std::array::from_fn(|index| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&format!("Spatial Full-Stack Composite {index}")),
+                    size: wgpu::Extent3d {
+                        width: self.width,
+                        height: self.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage,
+                    view_formats: &[],
+                })
+            });
+            let composite_views: [wgpu::TextureView; 3] = std::array::from_fn(|index| {
+                composite_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+            });
+            let (temporal_pipeline, temporal_layout, temporal_uniform_layout) =
+                crate::renderer::state::build_temporal_pipeline(&self.device);
+            let (history_texture, history_view) = crate::renderer::state::build_history_texture(
+                &self.device,
+                self.width,
+                self.height,
+            );
+            let (feedback_texture, feedback_view) = crate::renderer::state::build_feedback_texture(
+                &self.device,
+                self.width,
+                self.height,
+            );
+            let (opaque_pipeline, opaque_layout) =
+                crate::renderer::state::build_opaque_output_pipeline(&self.device);
+            let opaque_bind_group = crate::renderer::state::build_opaque_output_bind_group(
+                &self.device,
+                &opaque_layout,
+                &composite_views[0],
+                &self.sampler,
+            );
+            let mut temporal_state = crate::renderer::state::TemporalState::default();
+            // Exclude one-time pipeline/texture construction. The sample still
+            // includes CPU encoding, GPU execution, synchronization, and the
+            // complete 8-bit RGBA readback used by the smoke assertion.
+            let started = std::time::Instant::now();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Spatial Full-Stack Export Encoder"),
+                });
+            render_layers_and_master_export_routed(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                layers,
+                plan,
+                &composite_textures,
+                &composite_views,
+                &self.pipeline,
+                &self.texture_layout,
+                &self.uniform_layout,
+                &self.composite_pipeline,
+                &self.composite_texture_layout,
+                &self.composite_uniform_layout,
+                &self.sampler,
+                &self.nearest_sampler,
+                &self.matte_composite,
+                routing,
+                self.width,
+                self.height,
+            )?;
+            crate::renderer::state::encode_temporal_with_dt(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                temporal,
+                &temporal_pipeline,
+                &temporal_layout,
+                &temporal_uniform_layout,
+                &self.sampler,
+                &composite_textures,
+                &composite_views,
+                &history_texture,
+                &history_view,
+                &feedback_texture,
+                &feedback_view,
+                &mut temporal_state,
+                delta_seconds,
+                true,
+                self.width,
+                self.height,
+            );
+            crate::renderer::state::encode_opaque_output(
+                &mut encoder,
+                &opaque_pipeline,
+                &opaque_bind_group,
+                &composite_views[2],
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+            temporal_state.commit_staged();
+
+            let bytes_per_row = (self.width * 4 + 255) & !255;
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Spatial Full-Stack Export Readback"),
+                size: u64::from(bytes_per_row) * u64::from(self.height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let pixels = readback_pixels(
+                &self.device,
+                &self.queue,
+                &composite_textures[2],
+                &staging,
+                self.width,
+                self.height,
+                bytes_per_row,
+                &AtomicBool::new(false),
+            )?;
+            Ok((pixels, started.elapsed()))
+        }
+    }
+
+    fn spatial_acceptance_card() -> Vec<u8> {
+        let mut card = Vec::with_capacity(4 * 3 * 4);
+        for y in 0..3_u8 {
+            for x in 0..4_u8 {
+                card.extend_from_slice(&[40 + x * 50, 30 + y * 70, 210 - x * 30, 255]);
+            }
+        }
+        card
+    }
+
+    fn second_spatial_acceptance_card() -> Vec<u8> {
+        spatial_acceptance_card()
+            .chunks_exact(4)
+            .flat_map(|pixel| {
+                [
+                    220 - pixel[1] / 2,
+                    35 + pixel[2] / 3,
+                    20 + pixel[0] / 2,
+                    255,
+                ]
+            })
+            .collect()
+    }
+
+    fn render_prepared_temporal_originals_pair(
+        harness: &SpatialShaderHarness,
+        params: &crate::effects::params::TemporalParams,
+    ) -> Result<(Vec<u8>, crate::temporal::TemporalStateMetrics), String> {
+        use crate::renderer::state::TemporalState;
+        use crate::temporal::{TemporalFrameEvents, TemporalFrameInput, TemporalFreezeState};
+
+        assert_eq!([harness.width, harness.height], [4, 3]);
+        let usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST;
+        let composite_textures: [wgpu::Texture; 3] = std::array::from_fn(|index| {
+            harness.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("Prepared Originals Export Composite {index}")),
+                size: wgpu::Extent3d {
+                    width: 4,
+                    height: 3,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage,
+                view_formats: &[],
+            })
+        });
+        let composite_views: [wgpu::TextureView; 3] = std::array::from_fn(|index| {
+            composite_textures[index].create_view(&wgpu::TextureViewDescriptor::default())
+        });
+        let (legacy_pipeline, texture_layout, legacy_uniform_layout) =
+            crate::renderer::state::build_temporal_pipeline(&harness.device);
+        let (history_texture, history_view) =
+            crate::renderer::state::build_history_texture(&harness.device, 4, 3);
+        let (feedback_texture, feedback_view) =
+            crate::renderer::state::build_feedback_texture(&harness.device, 4, 3);
+        let prepared = crate::renderer::state::build_prepared_temporal_gpu_resources(
+            &harness.device,
+            &texture_layout,
+            &legacy_uniform_layout,
+            &composite_views[0],
+            &history_view,
+            &harness.sampler,
+            &feedback_view,
+        );
+        let frames = [spatial_acceptance_card(), second_spatial_acceptance_card()];
+        let mut state = TemporalState::default();
+        for (index, pixels) in frames.iter().enumerate() {
+            upload_export_texture_checked(
+                &harness.device,
+                &harness.queue,
+                &composite_textures[0],
+                pixels,
+                4,
+                3,
+                "Prepared Originals Export Input",
+            )?;
+            let mut encoder =
+                harness
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Prepared Originals Export Encoder"),
+                    });
+            crate::renderer::state::encode_temporal_prepared_frame(
+                &harness.queue,
+                &mut encoder,
+                params,
+                &legacy_pipeline,
+                &prepared,
+                &composite_textures,
+                &composite_views,
+                &history_texture,
+                &feedback_texture,
+                &mut state,
+                TemporalFrameInput::new(
+                    1.0 / 30.0,
+                    TemporalFreezeState::Running,
+                    false,
+                    TemporalFrameEvents {
+                        manual_events: if index == 1 { 3 } else { 0 },
+                        ..TemporalFrameEvents::default()
+                    },
+                )
+                .with_audio_energy(if index == 1 { 0.8 } else { 0.1 }),
+                4,
+                3,
+            );
+            harness.queue.submit(std::iter::once(encoder.finish()));
+            state.commit_staged();
+        }
+
+        let bytes_per_row = 256;
+        let staging = harness.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Prepared Originals Export Readback"),
+            size: u64::from(bytes_per_row) * 3,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let pixels = readback_pixels(
+            &harness.device,
+            &harness.queue,
+            &composite_textures[0],
+            &staging,
+            4,
+            3,
+            bytes_per_row,
+            &AtomicBool::new(false),
+        )?;
+        Ok((pixels, state.metrics()))
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; prepared Exact export resources stay offscreen"]
+    fn m3_event_acceptance_gpu_prepared_exact_export_originals_and_counted_events() {
+        use crate::temporal::{
+            CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger,
+            TemporalInterpolation, TemporalLoomParams, TemporalTopology,
+        };
+
+        let harness = SpatialShaderHarness::new(4, 3).unwrap();
+        let (legacy, _) = render_prepared_temporal_originals_pair(
+            &harness,
+            &crate::effects::params::TemporalParams::default(),
+        )
+        .unwrap();
+        assert_eq!(legacy, second_spatial_acceptance_card());
+
+        let originals = crate::effects::params::TemporalParams {
+            originals: crate::temporal::TemporalOriginalsParams {
+                loom: TemporalLoomParams {
+                    amount: 1.0,
+                    topology: TemporalTopology::Linear,
+                    interpolation: TemporalInterpolation::Linear,
+                    depth: 1.0,
+                    ..TemporalLoomParams::default()
+                },
+                atlas: CollisionAtlasParams {
+                    amount: 0.35,
+                    seed: 0,
+                    territories: 7,
+                    collision: 0.8,
+                },
+                score: CollisionScoreParams {
+                    enabled: true,
+                    seed: 0x51c0_4e11,
+                    state_count: 6,
+                    trigger: CollisionScoreTrigger::Manual,
+                    ..CollisionScoreParams::default()
+                },
+                ..crate::temporal::TemporalOriginalsParams::default()
+            },
+            ..crate::effects::params::TemporalParams::default()
+        };
+        let (pixels, metrics) =
+            render_prepared_temporal_originals_pair(&harness, &originals).unwrap();
+        assert_ne!(
+            pixels, legacy,
+            "nonzero Loom/Atlas stayed on the legacy path"
+        );
+        assert_eq!(metrics.score_event_ordinal, 3);
+        assert_eq!(metrics.score_state, 3);
+        assert_eq!(metrics.history_valid, 2);
+    }
+
+    fn m4_gpu_export_motion_velocity(
+        harness: &SpatialShaderHarness,
+        velocity_uv_per_second: i32,
+        quality: crate::motion::CurvedShutterQuality,
+    ) -> Result<(Vec<u8>, u8), String> {
+        use crate::evaluated_frame::evaluated_composition::{
+            LayerMotionPlanInput, MotionCodecFrameFacts, MotionFieldAttachment,
+        };
+        use crate::motion::{
+            CurvedShutterParams, MotionFieldSource, MotionLatticeQuality, MotionParams,
+        };
+        use crate::temporal::{TemporalFrameEvents, TemporalFrameInput, TemporalFreezeState};
+
+        let patch: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: motion-card.mp4
+"#,
+        )
+        .unwrap();
+        let graph = resolve_export_creative_graph(&patch)?;
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(1);
+        let evaluated = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(harness.width, harness.height, 0.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(graph.layer_ids[0].get(), 0, 4, 3),
+                effects: &effects,
+                transform: &transform,
+                opacity: 1.0,
+                speed: 1.0,
+                fps: 30.0,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                paused: false,
+                bypass_master_fx: false,
+            }],
+        );
+        let params = MotionParams {
+            field_source: MotionFieldSource::CodecVectors,
+            lattice_quality: MotionLatticeQuality::Live,
+            shutter: CurvedShutterParams {
+                angle_degrees: 360.0,
+                quality,
+                ..CurvedShutterParams::default()
+            },
+            ..MotionParams::default()
+        };
+        let facts = MotionCodecFrameFacts {
+            available: true,
+            source_generation: 5,
+            frame_ordinal: 9,
+        };
+        let layer_motion = [LayerMotionPlanInput {
+            stable_id: graph.layer_ids[0],
+            params,
+            codec: facts,
+        }];
+        let mattes = [LayerMatte::default()];
+        let evaluated_composition = evaluated
+            .plan_composition(
+                CompositionPlanInput::new(
+                    &graph.composition,
+                    &graph.master_rack,
+                    &graph.layer_racks,
+                )
+                .with_layer_mattes(&mattes, false)
+                .with_motion(
+                    MotionParams::default(),
+                    &layer_motion,
+                    crate::motion::MotionDeviceLimits::new(
+                        harness.device.limits().max_texture_dimension_2d,
+                        harness.device.limits().max_buffer_size,
+                    ),
+                ),
+            )
+            .map_err(|error| error.to_string())?;
+        let EvaluatedCompositionPlan::Advanced(advanced) = &evaluated_composition else {
+            return Err("active export GPU motion fixture delegated LegacyExact".to_owned());
+        };
+        let codec = CodecMotionFrame {
+            source_dimensions: [4, 3],
+            frame_delta_seconds: 1.0 / 30.0,
+            source_generation: facts.source_generation,
+            frame_ordinal: facts.frame_ordinal,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            provenance: crate::video::CodecMotionProvenance::FfmpegExportMvs,
+            frame_type: crate::video::CodecMotionFrameType::Predictive,
+            status: crate::video::CodecMotionStatus::Available,
+            vectors: vec![crate::motion::CodecMotionVector {
+                destination: [2, 1],
+                block: [4, 3],
+                motion: [-velocity_uv_per_second, 0],
+                motion_scale: 1,
+                seconds_from_reference: 0.25,
+                reference: crate::motion::CodecReferenceDirection::Past,
+                visibility: 1.0,
+            }],
+        };
+        let (products, diagnostics) =
+            export_codec_motion_fields_from(advanced, &graph, [(0, Some(&codec))]);
+        if !diagnostics.is_empty() || products.len() != 1 {
+            return Err(format!(
+                "export codec adapter rejected GPU fixture: {diagnostics:?}"
+            ));
+        }
+        let attachments = products
+            .iter()
+            .map(ExportMotionFieldProduct::attachment)
+            .collect::<Vec<MotionFieldAttachment<'_>>>();
+        let mut executor = CompositionGpuExecutor::new(
+            &harness.device,
+            &harness.queue,
+            [harness.width, harness.height],
+        )
+        .map_err(|error| error.to_string())?;
+        let sources = [CompositionSourceDescriptor::new(
+            graph.layer_ids[0],
+            &harness.source_view,
+            [4, 3],
+        )];
+        executor
+            .prepare(
+                &harness.device,
+                &harness.queue,
+                &evaluated_composition,
+                &sources,
+            )
+            .map_err(|error| error.to_string())?;
+        let mut encoder = harness
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("M4 export motion GPU acceptance encoder"),
+            });
+        executor
+            .encode_with_motion(
+                &harness.queue,
+                &mut encoder,
+                &evaluated_composition,
+                CompositionFrameTiming::from_temporal_input(TemporalFrameInput::new(
+                    1.0 / 30.0,
+                    TemporalFreezeState::Running,
+                    false,
+                    TemporalFrameEvents::default(),
+                )),
+                CompositionMotionFrameInput {
+                    attachments: &attachments,
+                    held_scopes: &[],
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        executor
+            .encode_present(
+                &mut encoder,
+                &harness.output_view,
+                COMPOSITION_PRESENT_FORMAT,
+            )
+            .map_err(|error| error.to_string())?;
+        harness.queue.submit(std::iter::once(encoder.finish()));
+        harness
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|error| error.to_string())?;
+        executor.commit_frame_history();
+        let metrics = executor
+            .motion_metrics(crate::visual_rack::VisualScopeId::Layer(graph.layer_ids[0]))
+            .ok_or_else(|| "export motion metrics were not published".to_owned())?;
+        if metrics.valid_fields != 1 {
+            return Err(format!("export motion field did not commit: {metrics:?}"));
+        }
+        let pixels = readback_pixels(
+            &harness.device,
+            &harness.queue,
+            &harness.output_texture,
+            &harness.staging,
+            harness.width,
+            harness.height,
+            harness.bytes_per_row,
+            &AtomicBool::new(false),
+        )?;
+        Ok((pixels, metrics.shutter_samples))
+    }
+
+    #[test]
+    fn m4_gpu_export_adapter_static_1_2_4_fields_and_fixed_tiers_when_opted_in() {
+        if std::env::var_os("COLLIDE_GPU_GOLDENS").is_none() {
+            return;
+        }
+        use crate::motion::CurvedShutterQuality;
+
+        let harness = SpatialShaderHarness::new(32, 24).unwrap();
+        let static_pixels = m4_gpu_export_motion_velocity(&harness, 0, CurvedShutterQuality::Sharp)
+            .unwrap()
+            .0;
+        let one = m4_gpu_export_motion_velocity(&harness, 1, CurvedShutterQuality::Sharp)
+            .unwrap()
+            .0;
+        let two = m4_gpu_export_motion_velocity(&harness, 2, CurvedShutterQuality::Sharp)
+            .unwrap()
+            .0;
+        let four = m4_gpu_export_motion_velocity(&harness, 4, CurvedShutterQuality::Sharp)
+            .unwrap()
+            .0;
+        assert_ne!(static_pixels, one);
+        assert_ne!(one, two);
+        assert_ne!(two, four);
+
+        for (quality, expected) in [
+            (CurvedShutterQuality::Sharp, 1),
+            (CurvedShutterQuality::Draft, 4),
+            (CurvedShutterQuality::Live, 8),
+            (CurvedShutterQuality::High, 16),
+        ] {
+            let (first, samples) = m4_gpu_export_motion_velocity(&harness, 2, quality).unwrap();
+            let replay = m4_gpu_export_motion_velocity(&harness, 2, quality)
+                .unwrap()
+                .0;
+            assert_eq!(samples, expected);
+            // Same-adapter deterministic replay only. The durable report is
+            // explicit that cross-GPU pixel identity is not guaranteed.
+            assert_eq!(first, replay);
+        }
+    }
+
+    fn build_test_composite_pipeline(
+        device: &wgpu::Device,
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::BindGroupLayout,
+        wgpu::BindGroupLayout,
+    ) {
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Spatial Full-Stack Composite Textures"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Spatial Full-Stack Composite Uniforms"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Spatial Full-Stack Composite Vertex"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/fullscreen.wgsl").into()),
+        });
+        let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Spatial Full-Stack Composite Fragment"),
+            source: wgpu::ShaderSource::Wgsl(composite_shader_source()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Spatial Full-Stack Composite Pipeline Layout"),
+            bind_group_layouts: &[Some(&texture_layout), Some(&uniform_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Spatial Full-Stack Composite Pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &vertex,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        (pipeline, texture_layout, uniform_layout)
+    }
+
+    fn rgba_at(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * width + x) * 4) as usize;
+        pixels[offset..offset + 4].try_into().unwrap()
+    }
+
+    fn opaque_pixel_count(pixels: &[u8]) -> usize {
+        pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[3] == 255)
+            .count()
+    }
+
+    fn assert_transparent_pixels_are_clear(pixels: &[u8]) {
+        for pixel in pixels.chunks_exact(4).filter(|pixel| pixel[3] == 0) {
+            assert_eq!(pixel, [0, 0, 0, 0], "transparent coverage smeared edge RGB");
+        }
+    }
+
+    // Frozen from the pre-Spatial `src/shaders/effects.wgsl` at commit
+    // b208cac: default EffectUniforms sampled this same opaque 4x3 card at its
+    // native 4x3 target with no active branches. The historical fragment pass
+    // therefore returned these bytes verbatim. Keep the literal independent
+    // of `spatial_acceptance_card()` so the new shader cannot author its own
+    // expected result at runtime.
+    const PRE_SPATIAL_B208CAC_IDENTITY_GOLDEN_RGBA: [u8; 48] = [
+        40, 30, 210, 255, 90, 30, 180, 255, 140, 30, 150, 255, 190, 30, 120, 255, 40, 100, 210,
+        255, 90, 100, 180, 255, 140, 100, 150, 255, 190, 100, 120, 255, 40, 170, 210, 255, 90, 170,
+        180, 255, 140, 170, 150, 255, 190, 170, 120, 255,
+    ];
+
+    #[test]
+    #[ignore = "requires a GPU adapter; frozen b208cac identity pixels stay offscreen"]
+    fn gpu_inactive_spatial_identity_matches_frozen_b208cac_pixels() {
+        let harness = SpatialShaderHarness::new(4, 3).unwrap();
+        let pixels = harness
+            .render(SpatialTransform::default(), EffectUniforms::default())
+            .unwrap();
+        assert_eq!(pixels, PRE_SPATIAL_B208CAC_IDENTITY_GOLDEN_RGBA);
+    }
+
+    // Frozen from the mode-1 LegacyExact active-spatial branch. This fixture
+    // is intentionally linear-filtered and translated, so Advanced mode 2's
+    // four-load premultiplied filter cannot silently replace legacy sampling.
+    const PRE_M6_ACTIVE_SPATIAL_GOLDEN_RGBA: [u8; 48] = [
+        40, 30, 210, 255, 70, 30, 196, 255, 118, 30, 166, 255, 168, 30, 136, 255, 40, 100, 210,
+        255, 70, 100, 196, 255, 118, 100, 166, 255, 168, 100, 136, 255, 40, 170, 210, 255, 70, 170,
+        196, 255, 118, 170, 166, 255, 168, 170, 136, 255,
+    ];
+
+    #[test]
+    #[ignore = "requires a GPU adapter; freezes LegacyExact active-spatial bytes"]
+    fn gpu_legacy_active_spatial_matches_frozen_pre_m6_pixels() {
+        let harness = SpatialShaderHarness::new(4, 3).unwrap();
+        let pixels = harness
+            .render(
+                SpatialTransform {
+                    position: [0.125, 0.0],
+                    edge: EdgeMode::Clamp,
+                    ..SpatialTransform::default()
+                },
+                EffectUniforms::default(),
+            )
+            .unwrap();
+        assert_eq!(pixels, PRE_M6_ACTIVE_SPATIAL_GOLDEN_RGBA);
+    }
+
+    fn cpu_reference_rotate([x, y]: [f32; 2], degrees: f32) -> [f32; 2] {
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        [cos * x - sin * y, sin * x + cos * y]
+    }
+
+    /// Independent forward implementation of the documented Stretch affine
+    /// law. It intentionally does not call `gpu_uniforms`, invert its rows, or
+    /// share any production matrix helper with the shader payload builder.
+    fn cpu_reference_spatial_landmark(
+        transform: SpatialTransform,
+        local_uv: [f32; 2],
+        output_aspect: f32,
+    ) -> [f32; 2] {
+        assert_eq!(transform.fit, FitMode::Stretch);
+        assert_eq!(transform.crop, [0.0; 4]);
+        let mut physical = [
+            (local_uv[0] - transform.anchor[0]) * transform.scale[0] * output_aspect,
+            (local_uv[1] - transform.anchor[1]) * transform.scale[1],
+        ];
+        physical = cpu_reference_rotate(physical, -transform.skew_axis_deg);
+        physical[0] += transform.skew_deg.to_radians().tan() * physical[1];
+        physical = cpu_reference_rotate(physical, transform.skew_axis_deg);
+        physical = cpu_reference_rotate(physical, transform.rotation_deg);
+        [
+            transform.anchor[0] + transform.position[0] + physical[0] / output_aspect,
+            transform.anchor[1] + transform.position[1] + physical[1],
+        ]
+    }
+
+    fn cpu_reference_rotate_then_scale_landmark(
+        transform: SpatialTransform,
+        local_uv: [f32; 2],
+        output_aspect: f32,
+    ) -> [f32; 2] {
+        assert_eq!(transform.skew_deg, 0.0);
+        let physical = cpu_reference_rotate(
+            [
+                (local_uv[0] - transform.anchor[0]) * output_aspect,
+                local_uv[1] - transform.anchor[1],
+            ],
+            transform.rotation_deg,
+        );
+        [
+            transform.anchor[0]
+                + transform.position[0]
+                + physical[0] * transform.scale[0] / output_aspect,
+            transform.anchor[1] + transform.position[1] + physical[1] * transform.scale[1],
+        ]
+    }
+
+    fn exact_color_centroid(pixels: &[u8], width: u32, color: [u8; 4]) -> [f32; 2] {
+        let mut count = 0_u32;
+        let mut sum = [0.0_f32; 2];
+        for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+            if pixel == color {
+                let x = index as u32 % width;
+                let y = index as u32 / width;
+                sum[0] += x as f32 + 0.5;
+                sum[1] += y as f32 + 0.5;
+                count += 1;
+            }
+        }
+        assert!(count >= 8, "landmark color was not materially rasterized");
+        [sum[0] / count as f32, sum[1] / count as f32]
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; compares offscreen raster landmarks to independent CPU math"]
+    fn gpu_affine_landmarks_match_independent_cpu_and_fix_scale_skew_rotation_order() {
+        const WIDTH: u32 = 80;
+        const HEIGHT: u32 = 60;
+        let harness = SpatialShaderHarness::new(WIDTH, HEIGHT).unwrap();
+        let card = spatial_acceptance_card();
+        let source_x = 2_u32;
+        let source_y = 0_u32;
+        let source_uv = [(source_x as f32 + 0.5) / 4.0, (source_y as f32 + 0.5) / 3.0];
+        let color = rgba_at(&card, 4, source_x, source_y);
+        let aspect = WIDTH as f32 / HEIGHT as f32;
+
+        let assert_landmark = |label: &str, transform: SpatialTransform| -> [f32; 2] {
+            let expected = cpu_reference_spatial_landmark(transform, source_uv, aspect);
+            let pixels = harness
+                .render(transform, EffectUniforms::default())
+                .unwrap();
+            let observed = exact_color_centroid(&pixels, WIDTH, color);
+            let expected_pixels = [expected[0] * WIDTH as f32, expected[1] * HEIGHT as f32];
+            assert!(
+                (observed[0] - expected_pixels[0]).abs() <= 0.5001,
+                "{label} X landmark: observed {}, CPU {}",
+                observed[0],
+                expected_pixels[0]
+            );
+            assert!(
+                (observed[1] - expected_pixels[1]).abs() <= 0.5001,
+                "{label} Y landmark: observed {}, CPU {}",
+                observed[1],
+                expected_pixels[1]
+            );
+            observed
+        };
+
+        // Independent one-axis changes prove X and Y scale are not coupled.
+        for (label, scale) in [("x-scale", [1.35, 1.0]), ("y-scale", [1.0, 0.65])] {
+            assert_landmark(
+                label,
+                SpatialTransform {
+                    scale,
+                    edge: EdgeMode::Transparent,
+                    sampling: SamplingMode::Nearest,
+                    ..SpatialTransform::default()
+                },
+            );
+        }
+
+        // Ninety-degree pivot landmarks cover the upper-left source anchor
+        // (translated/scaled so its rotated footprint remains visible) and
+        // the ordinary center anchor independently.
+        assert_landmark(
+            "top-left-anchor-90",
+            SpatialTransform {
+                position: [0.4, 0.1],
+                scale: [0.5, 0.5],
+                anchor: [0.0, 0.0],
+                rotation_deg: 90.0,
+                edge: EdgeMode::Transparent,
+                sampling: SamplingMode::Nearest,
+                ..SpatialTransform::default()
+            },
+        );
+        assert_landmark(
+            "center-anchor-90",
+            SpatialTransform {
+                scale: [0.5, 0.5],
+                rotation_deg: 90.0,
+                edge: EdgeMode::Transparent,
+                sampling: SamplingMode::Nearest,
+                ..SpatialTransform::default()
+            },
+        );
+
+        for (label, axis) in [("x-skew-axis", 0.0), ("rotated-skew-axis", 90.0)] {
+            assert_landmark(
+                label,
+                SpatialTransform {
+                    scale: [0.7, 0.7],
+                    skew_deg: 22.0,
+                    skew_axis_deg: axis,
+                    edge: EdgeMode::Transparent,
+                    sampling: SamplingMode::Nearest,
+                    ..SpatialTransform::default()
+                },
+            );
+        }
+
+        let ordered = SpatialTransform {
+            scale: [1.3, 0.6],
+            rotation_deg: 30.0,
+            edge: EdgeMode::Transparent,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let observed = assert_landmark("scale-then-rotate", ordered);
+        let wrong = cpu_reference_rotate_then_scale_landmark(ordered, source_uv, aspect);
+        let wrong_pixels = [wrong[0] * WIDTH as f32, wrong[1] * HEIGHT as f32];
+        let wrong_distance = ((observed[0] - wrong_pixels[0]).powi(2)
+            + (observed[1] - wrong_pixels[1]).powi(2))
+        .sqrt();
+        assert!(
+            wrong_distance >= 4.0,
+            "GPU landmark was not distinguishable from rotate-then-scale ({wrong_distance}px)"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; renders only to temporary offscreen textures"]
+    fn gpu_spatial_card_modes_edges_and_hostile_values_match_the_cpu_contract() {
+        let harness = SpatialShaderHarness::new(16, 9).unwrap();
+        let transform = |fit, edge| SpatialTransform {
+            fit,
+            edge,
+            ..SpatialTransform::default()
+        };
+
+        let fit = harness
+            .render(
+                transform(FitMode::Fit, EdgeMode::Transparent),
+                EffectUniforms::default(),
+            )
+            .unwrap();
+        assert_eq!(opaque_pixel_count(&fit), 12 * 9);
+        for y in 0..9 {
+            for x in [0, 1, 14, 15] {
+                assert_eq!(rgba_at(&fit, 16, x, y), [0, 0, 0, 0]);
+            }
+        }
+        assert_transparent_pixels_are_clear(&fit);
+
+        let clamped_fit = harness
+            .render(
+                transform(FitMode::Fit, EdgeMode::Clamp),
+                EffectUniforms::default(),
+            )
+            .unwrap();
+        assert_eq!(opaque_pixel_count(&clamped_fit), 16 * 9);
+
+        for mode in [FitMode::Fill, FitMode::Stretch] {
+            let pixels = harness
+                .render(
+                    transform(mode, EdgeMode::Transparent),
+                    EffectUniforms::default(),
+                )
+                .unwrap();
+            assert_eq!(opaque_pixel_count(&pixels), 16 * 9, "{mode:?}");
+        }
+
+        let native = harness
+            .render(
+                transform(FitMode::Native, EdgeMode::Transparent),
+                EffectUniforms::default(),
+            )
+            .unwrap();
+        assert_eq!(opaque_pixel_count(&native), 4 * 3);
+        for y in 0..9 {
+            for x in 0..16 {
+                let expected_opaque = (6..=9).contains(&x) && (3..=5).contains(&y);
+                assert_eq!(rgba_at(&native, 16, x, y)[3] == 255, expected_opaque);
+            }
+        }
+        assert_transparent_pixels_are_clear(&native);
+
+        let collapsed = harness
+            .render(
+                SpatialTransform {
+                    scale: [0.0, 1.0],
+                    edge: EdgeMode::Transparent,
+                    ..SpatialTransform::default()
+                },
+                EffectUniforms::default(),
+            )
+            .unwrap();
+        assert!(collapsed.iter().all(|byte| *byte == 0));
+
+        let sanitized = harness
+            .render(
+                SpatialTransform {
+                    position: [f32::NAN, f32::INFINITY],
+                    scale: [f32::NEG_INFINITY, f32::NAN],
+                    anchor: [f32::NAN, f32::NEG_INFINITY],
+                    rotation_deg: f32::INFINITY,
+                    skew_deg: f32::NAN,
+                    skew_axis_deg: f32::NEG_INFINITY,
+                    edge: EdgeMode::Transparent,
+                    ..SpatialTransform::default()
+                },
+                EffectUniforms::default(),
+            )
+            .unwrap();
+        assert_eq!(opaque_pixel_count(&sanitized), 16 * 9);
+
+        // Matched half-scale geometry compares the two explicit edge laws.
+        // Cellular/Shift are allowed to move UVs outside and Transparent
+        // must expose transparent coverage instead of inheriting legacy clamp
+        // or fract behavior. Explicit Clamp must remain fully covered.
+        let effects = EffectUniforms {
+            time: 0.75,
+            cellular_amount: 1.0,
+            cellular_scale: 4.0,
+            cellular_warp: 1.0,
+            cellular_speed: 1.5,
+            shift_amount: 1.0,
+            shift_block_size: 2.0,
+            shift_density: 1.0,
+            shift_speed: 7.0,
+            random_seed: 0x4544_4745,
+            ..EffectUniforms::default()
+        };
+        let transparent_effects = harness
+            .render(
+                SpatialTransform {
+                    scale: [0.5, 0.5],
+                    edge: EdgeMode::Transparent,
+                    ..SpatialTransform::default()
+                },
+                effects,
+            )
+            .unwrap();
+        assert!(opaque_pixel_count(&transparent_effects) < 16 * 9);
+        assert!(opaque_pixel_count(&transparent_effects) > 0);
+        assert_transparent_pixels_are_clear(&transparent_effects);
+
+        let clamped_effects = harness
+            .render(
+                SpatialTransform {
+                    scale: [0.5, 0.5],
+                    edge: EdgeMode::Clamp,
+                    sampling: SamplingMode::Nearest,
+                    ..SpatialTransform::default()
+                },
+                effects,
+            )
+            .unwrap();
+        assert_eq!(opaque_pixel_count(&clamped_effects), 16 * 9);
+    }
+
+    struct TemporarySpatialCard {
+        path: std::path::PathBuf,
+    }
+
+    impl TemporarySpatialCard {
+        fn create() -> Self {
+            Self::create_with_pixels("primary", &spatial_acceptance_card())
+        }
+
+        fn create_with_pixels(tag: &str, pixels: &[u8]) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "collideoscope-spatial-parity-{tag}-{}-{}.png",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            image::save_buffer(&path, pixels, 4, 3, image::ColorType::Rgba8).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TemporarySpatialCard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn parity_master_base() -> EffectUniforms {
+        EffectUniforms {
+            brightness: 0.05,
+            cellular_amount: 0.45,
+            cellular_scale: 7.0,
+            cellular_warp: 0.5,
+            cellular_speed: 0.8,
+            shift_amount: 0.35,
+            shift_block_size: 3.0,
+            shift_density: 1.0,
+            shift_speed: 4.0,
+            random_seed: 0x4c49_5645,
+            ..EffectUniforms::default()
+        }
+    }
+
+    fn parity_master_transform_base() -> SpatialTransform {
+        SpatialTransform {
+            position: [0.02, -0.03],
+            scale: [1.05, 0.95],
+            anchor: [0.45, 0.6],
+            rotation_deg: 4.0,
+            skew_deg: -3.0,
+            skew_axis_deg: 12.0,
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        }
+    }
+
+    fn parity_layer_base() -> ExportFrameLayerBase {
+        ExportFrameLayerBase {
+            effects: EffectUniforms {
+                hue_shift: 12.0,
+                rgb_split: 2.0,
+                random_seed: 0x4c41_5945,
+                ..EffectUniforms::default()
+            },
+            transform: SpatialTransform {
+                position: [-0.04, 0.06],
+                scale: [0.9, 1.1],
+                anchor: [0.35, 0.7],
+                rotation_deg: -8.0,
+                skew_deg: 5.0,
+                skew_axis_deg: -20.0,
+                fit: FitMode::Fit,
+                edge: EdgeMode::Transparent,
+                sampling: SamplingMode::Nearest,
+                ..SpatialTransform::default()
+            },
+            opacity: 0.72,
+            speed: 1.0,
+            fps: 30.0,
+            blend_mode: BlendMode::Difference,
+            visible: true,
+            paused: false,
+            bypass_master_fx: false,
+        }
+    }
+
+    fn parity_second_layer_base() -> ExportFrameLayerBase {
+        ExportFrameLayerBase {
+            effects: EffectUniforms {
+                hue_shift: -18.0,
+                brightness: 0.08,
+                random_seed: 0x4c41_5932,
+                ..EffectUniforms::default()
+            },
+            transform: SpatialTransform {
+                position: [0.09, -0.05],
+                scale: [1.15, 0.82],
+                anchor: [0.62, 0.38],
+                rotation_deg: 11.0,
+                skew_deg: -6.0,
+                skew_axis_deg: 28.0,
+                fit: FitMode::Fill,
+                edge: EdgeMode::Mirror,
+                sampling: SamplingMode::Nearest,
+                ..SpatialTransform::default()
+            },
+            opacity: 0.58,
+            speed: 0.9,
+            fps: 24.0,
+            blend_mode: BlendMode::Screen,
+            visible: true,
+            paused: false,
+            bypass_master_fx: false,
+        }
+    }
+
+    fn parity_morph() -> crate::morph::Morph {
+        use crate::morph::{
+            LayerMorphSnapshot, Morph, MorphBlendLaw, MorphGlide, MorphMasterSnapshot,
+            MorphNtscSnapshot, MorphSlot, MorphTemporalSnapshot,
+        };
+
+        let master_a = EffectUniforms {
+            brightness: -0.2,
+            ..EffectUniforms::default()
+        };
+        let master_b = EffectUniforms {
+            brightness: 0.35,
+            ..EffectUniforms::default()
+        };
+        let layer_a = EffectUniforms {
+            hue_shift: -70.0,
+            rgb_split: 3.0,
+            ..EffectUniforms::default()
+        };
+        let layer_b = EffectUniforms {
+            hue_shift: 95.0,
+            rgb_split: 12.0,
+            ..EffectUniforms::default()
+        };
+        let layer2_a = EffectUniforms {
+            hue_shift: 40.0,
+            brightness: -0.08,
+            ..EffectUniforms::default()
+        };
+        let layer2_b = EffectUniforms {
+            hue_shift: -35.0,
+            brightness: 0.16,
+            ..EffectUniforms::default()
+        };
+        let master_transform_a = SpatialTransform {
+            position: [-0.12, 0.08],
+            scale: [0.8, 1.25],
+            anchor: [0.2, 0.75],
+            rotation_deg: -35.0,
+            skew_deg: -14.0,
+            skew_axis_deg: 25.0,
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let master_transform_b = SpatialTransform {
+            position: [0.18, -0.1],
+            scale: [1.7, 0.65],
+            anchor: [0.8, 0.3],
+            rotation_deg: 72.0,
+            skew_deg: 21.0,
+            skew_axis_deg: -48.0,
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let layer_transform_a = SpatialTransform {
+            position: [-0.2, 0.12],
+            scale: [0.65, 1.4],
+            anchor: [0.15, 0.85],
+            rotation_deg: -55.0,
+            skew_deg: 18.0,
+            skew_axis_deg: 33.0,
+            fit: FitMode::Fit,
+            edge: EdgeMode::Transparent,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let layer_transform_b = SpatialTransform {
+            position: [0.22, -0.16],
+            scale: [1.8, 0.72],
+            anchor: [0.78, 0.28],
+            rotation_deg: 88.0,
+            skew_deg: -24.0,
+            skew_axis_deg: -61.0,
+            fit: FitMode::Fit,
+            edge: EdgeMode::Transparent,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let layer2_transform_a = SpatialTransform {
+            position: [0.14, -0.09],
+            scale: [1.3, 0.78],
+            anchor: [0.7, 0.25],
+            rotation_deg: 28.0,
+            skew_deg: -11.0,
+            skew_axis_deg: 52.0,
+            fit: FitMode::Fill,
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let layer2_transform_b = SpatialTransform {
+            position: [-0.1, 0.13],
+            scale: [0.76, 1.32],
+            anchor: [0.3, 0.72],
+            rotation_deg: -42.0,
+            skew_deg: 16.0,
+            skew_axis_deg: -37.0,
+            fit: FitMode::Fill,
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let slot = |master,
+                    master_transform,
+                    effects,
+                    transform,
+                    opacity,
+                    speed,
+                    effects2,
+                    transform2,
+                    opacity2,
+                    speed2| MorphSlot {
+            master: MorphMasterSnapshot::capture(master),
+            master_transform: Some(master_transform),
+            master_motion: None,
+            master_rack: None,
+            layer_racks: None,
+            composition: None,
+            // Gate fixture: these downstream worlds are deliberately present
+            // in both Morph slots but explicitly disabled/no-op.
+            ntsc: MorphNtscSnapshot::capture(&crate::ntsc::NtscParams::default()),
+            temporal: MorphTemporalSnapshot::capture(
+                &crate::effects::params::TemporalParams::default(),
+            ),
+            layers: vec![
+                LayerMorphSnapshot {
+                    position: 0,
+                    opacity,
+                    speed,
+                    fps: Some(30.0),
+                    effects: Some(MorphMasterSnapshot::capture(effects)),
+                    transform: Some(transform),
+                    ..LayerMorphSnapshot::default()
+                },
+                LayerMorphSnapshot {
+                    position: 1,
+                    opacity: opacity2,
+                    speed: speed2,
+                    fps: Some(24.0),
+                    effects: Some(MorphMasterSnapshot::capture(effects2)),
+                    transform: Some(transform2),
+                    ..LayerMorphSnapshot::default()
+                },
+            ],
+        };
+        Morph {
+            a: Some(slot(
+                &master_a,
+                master_transform_a,
+                &layer_a,
+                layer_transform_a,
+                0.35,
+                0.8,
+                &layer2_a,
+                layer2_transform_a,
+                0.82,
+                0.75,
+            )),
+            b: Some(slot(
+                &master_b,
+                master_transform_b,
+                &layer_b,
+                layer_transform_b,
+                0.9,
+                1.6,
+                &layer2_b,
+                layer2_transform_b,
+                0.42,
+                1.25,
+            )),
+            t: 0.15,
+            blend_law: MorphBlendLaw::EqualPower,
+            glide: Some(MorphGlide::new(0.15, 0.85, 0.0, 4.0)),
+        }
+    }
+
+    fn parity_modulation_frame(
+        beat: f64,
+        delta_seconds: f32,
+        layer_count: usize,
+    ) -> crate::modulation::ModulationFrame {
+        use crate::modulation::{ModMatrix, ModSource, Routing};
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 0.6;
+        matrix.lfos[0].beats = 3.0;
+        matrix.lfos[0].set_phase(0.125);
+        matrix.routings = vec![
+            Routing::new(ModSource::Midi(0), "brightness", 0.12),
+            Routing::new(ModSource::Lfo(0), "rotation_deg", 0.08),
+            Routing::new(ModSource::Midi(0), "position_x", 0.025),
+            Routing::new(ModSource::Lfo(0), "layer1_rotation_deg", 0.06),
+            Routing::new(ModSource::Midi(0), "layer1_position_y", 0.04),
+            Routing::new(ModSource::Midi(0), "layer1_opacity", -0.15),
+            Routing::new(ModSource::Lfo(0), "layer2_scale_x", 0.035),
+            Routing::new(ModSource::Midi(0), "layer2_opacity", 0.1),
+            Routing::new(ModSource::Lfo(0), "morph", 0.1),
+        ];
+        matrix.update_at_beat(beat, delta_seconds);
+        matrix.frame(layer_count)
+    }
+
+    fn live_style_parity_plan(
+        device: &wgpu::Device,
+        card_path: &std::path::Path,
+        frame_index: u64,
+        fps: u32,
+    ) -> crate::evaluated_frame::EvaluatedFramePlan {
+        use crate::effects::params::TemporalParams;
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+
+        let time = frame_index as f32 / fps as f32;
+        let beat = time as f64 * 2.0;
+        let modulation = parity_modulation_frame(beat, 1.0 / fps as f32, 1);
+        let mut master = parity_master_base();
+        let mut master_transform = parity_master_transform_base();
+        let mut ntsc = crate::ntsc::NtscParams::default();
+        let mut temporal = TemporalParams::default();
+        let mut layer = crate::layers::Layer::new(card_path.to_str().unwrap(), device).unwrap();
+        let base = parity_layer_base();
+        layer.effects = base.effects;
+        layer.transform = base.transform;
+        layer.opacity = base.opacity;
+        layer.speed = base.speed;
+        layer.fps = base.fps;
+        layer.blend_mode = base.blend_mode;
+        layer.visible = base.visible;
+        layer.paused = base.paused;
+        layer.bypass_master_fx = base.bypass_master_fx;
+
+        // Live materializes Morph into mutable runtime state first, then the
+        // immutable evaluator applies the already-sampled modulation frame.
+        let mut morph = parity_morph();
+        morph.settle_glide_at(beat);
+        let position = (morph.position_at_beat(beat) + modulation.morph_offset()).clamp(0.0, 1.0);
+        morph.apply(
+            position,
+            &mut master,
+            &mut master_transform,
+            &mut ntsc,
+            &mut temporal,
+            std::slice::from_mut(&mut layer),
+        );
+
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(16, 9, time),
+            MasterFrameInput {
+                effects: &master,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(layer.layer_id(), 0, layer.width, layer.height),
+                effects: &layer.effects,
+                transform: &layer.transform,
+                opacity: layer.opacity,
+                speed: layer.speed,
+                fps: layer.fps,
+                blend_mode: layer.blend_mode,
+                visible: layer.visible,
+                paused: layer.paused,
+                bypass_master_fx: layer.bypass_master_fx,
+            }],
+        )
+    }
+
+    fn export_style_parity_plan(
+        frame_index: u64,
+        fps: u32,
+    ) -> crate::evaluated_frame::EvaluatedFramePlan {
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+
+        let (time, delta_seconds) = export_program_transport(frame_index, 1.0 / fps as f32, false);
+        let beat = time as f64 * 2.0;
+        let modulation = parity_modulation_frame(beat, delta_seconds, 1);
+        let mut master = parity_master_base();
+        let mut master_transform = parity_master_transform_base();
+        let mut layer = parity_layer_base();
+
+        // Export independently samples its detached Morph world instead of
+        // borrowing the live materialized payload.
+        let morph = parity_morph();
+        let sample =
+            export_morph_sample(Some(&morph), beat, modulation.morph_offset(), false).unwrap();
+        sample.master.apply_to(&mut master);
+        if let Some(value) = sample.master_transform {
+            master_transform = value.sanitized();
+        }
+        let ntsc = sample.ntsc.to_params();
+        let temporal = sample.temporal.to_params();
+        let sampled = sample
+            .layers
+            .into_iter()
+            .find(|value| value.position == 0)
+            .unwrap();
+        layer.opacity = sampled.opacity;
+        layer.speed = sampled.speed;
+        if let Some(value) = sampled.fps {
+            layer.fps = value;
+        }
+        if let Some(value) = sampled.effects {
+            value.apply_to(&mut layer.effects);
+        }
+        if let Some(value) = sampled.transform {
+            layer.transform = value.sanitized();
+        }
+        if let Some(value) = sampled.key_threshold {
+            layer.effects.key_threshold = value;
+        }
+        if let Some(value) = sampled.blend_mode {
+            layer.blend_mode = value.to_blend_mode();
+        }
+        if let Some(value) = sampled.visible {
+            layer.visible = value;
+        }
+        if let Some(value) = sampled.paused {
+            layer.paused = value;
+        }
+        if let Some(value) = sampled.bypass_master_fx {
+            layer.bypass_master_fx = value;
+        }
+
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(16, 9, time),
+            MasterFrameInput {
+                effects: &master,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(export_selective_layer_id(0), 0, 4, 3),
+                effects: &layer.effects,
+                transform: &layer.transform,
+                opacity: layer.opacity,
+                speed: layer.speed,
+                fps: layer.fps,
+                blend_mode: layer.blend_mode,
+                visible: layer.visible,
+                paused: layer.paused,
+                bypass_master_fx: layer.bypass_master_fx,
+            }],
+        )
+    }
+
+    fn configure_live_layer(layer: &mut crate::layers::Layer, base: ExportFrameLayerBase) {
+        layer.effects = base.effects;
+        layer.transform = base.transform;
+        layer.opacity = base.opacity;
+        layer.speed = base.speed;
+        layer.fps = base.fps;
+        layer.blend_mode = base.blend_mode;
+        layer.visible = base.visible;
+        layer.paused = base.paused;
+        layer.bypass_master_fx = base.bypass_master_fx;
+    }
+
+    fn apply_export_morph_layer(
+        layer: &mut ExportFrameLayerBase,
+        sampled: crate::morph::LayerMorphSnapshot,
+    ) {
+        layer.opacity = sampled.opacity;
+        layer.speed = sampled.speed;
+        if let Some(value) = sampled.fps {
+            layer.fps = value;
+        }
+        if let Some(value) = sampled.effects {
+            value.apply_to(&mut layer.effects);
+        }
+        if let Some(value) = sampled.transform {
+            layer.transform = value.sanitized();
+        }
+        if let Some(value) = sampled.key_threshold {
+            layer.effects.key_threshold = value;
+        }
+        if let Some(value) = sampled.blend_mode {
+            layer.blend_mode = value.to_blend_mode();
+        }
+        if let Some(value) = sampled.visible {
+            layer.visible = value;
+        }
+        if let Some(value) = sampled.paused {
+            layer.paused = value;
+        }
+        if let Some(value) = sampled.bypass_master_fx {
+            layer.bypass_master_fx = value;
+        }
+    }
+
+    /// Build the final two-layer live world through the runtime's mutable
+    /// Morph materialization path, then freeze it through the shared planner.
+    fn live_full_stack_world(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        cards: [&std::path::Path; 2],
+        frame_index: u64,
+        fps: u32,
+    ) -> (
+        crate::evaluated_frame::EvaluatedFramePlan,
+        Vec<crate::layers::Layer>,
+    ) {
+        use crate::effects::params::TemporalParams;
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+
+        let time = frame_index as f32 / fps as f32;
+        let beat = time as f64 * 2.0;
+        let modulation = parity_modulation_frame(beat, 1.0 / fps as f32, 2);
+        let mut master = parity_master_base();
+        let mut master_transform = parity_master_transform_base();
+        let mut ntsc = crate::ntsc::NtscParams::default();
+        let mut temporal = TemporalParams::default();
+        let mut layers: Vec<crate::layers::Layer> = cards
+            .into_iter()
+            .zip([parity_layer_base(), parity_second_layer_base()])
+            .map(|(path, base)| {
+                let mut layer = crate::layers::Layer::new(path.to_str().unwrap(), device).unwrap();
+                let frame = layer
+                    .take_ready_media_frame()
+                    .unwrap()
+                    .expect("temporary still must publish its seed frame");
+                layer.upload_frame(device, queue, &frame.rgba).unwrap();
+                configure_live_layer(&mut layer, base);
+                layer
+            })
+            .collect();
+
+        let mut morph = parity_morph();
+        morph.settle_glide_at(beat);
+        let position = (morph.position_at_beat(beat) + modulation.morph_offset()).clamp(0.0, 1.0);
+        morph.apply(
+            position,
+            &mut master,
+            &mut master_transform,
+            &mut ntsc,
+            &mut temporal,
+            &mut layers,
+        );
+
+        let plan = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(16, 9, time),
+            MasterFrameInput {
+                effects: &master,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            layers
+                .iter()
+                .enumerate()
+                .map(|(slot, layer)| LayerFrameInput {
+                    source: SourceTap::new(layer.layer_id(), slot, layer.width, layer.height),
+                    effects: &layer.effects,
+                    transform: &layer.transform,
+                    opacity: layer.opacity,
+                    speed: layer.speed,
+                    fps: layer.fps,
+                    blend_mode: layer.blend_mode,
+                    visible: layer.visible,
+                    paused: layer.paused,
+                    bypass_master_fx: layer.bypass_master_fx,
+                }),
+        );
+        (plan, layers)
+    }
+
+    /// Independently reconstruct the same final world through export's
+    /// detached Morph sampler. No live payload or mutable Layer is reused.
+    fn export_full_stack_world(
+        frame_index: u64,
+        fps: u32,
+    ) -> (
+        crate::evaluated_frame::EvaluatedFramePlan,
+        Vec<ExportFrameLayerBase>,
+    ) {
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+
+        let (time, delta_seconds) = export_program_transport(frame_index, 1.0 / fps as f32, false);
+        let beat = time as f64 * 2.0;
+        let modulation = parity_modulation_frame(beat, delta_seconds, 2);
+        let mut master = parity_master_base();
+        let mut master_transform = parity_master_transform_base();
+        let mut layers = vec![parity_layer_base(), parity_second_layer_base()];
+        let morph = parity_morph();
+        let sample =
+            export_morph_sample(Some(&morph), beat, modulation.morph_offset(), false).unwrap();
+        sample.master.apply_to(&mut master);
+        if let Some(value) = sample.master_transform {
+            master_transform = value.sanitized();
+        }
+        let ntsc = sample.ntsc.to_params();
+        let temporal = sample.temporal.to_params();
+        for sampled in sample.layers {
+            let position = sampled.position;
+            apply_export_morph_layer(&mut layers[position], sampled);
+        }
+
+        let plan = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(16, 9, time),
+            MasterFrameInput {
+                effects: &master,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            layers
+                .iter()
+                .enumerate()
+                .map(|(slot, layer)| LayerFrameInput {
+                    source: SourceTap::new(export_selective_layer_id(slot), slot, 4, 3),
+                    effects: &layer.effects,
+                    transform: &layer.transform,
+                    opacity: layer.opacity,
+                    speed: layer.speed,
+                    fps: layer.fps,
+                    blend_mode: layer.blend_mode,
+                    visible: layer.visible,
+                    paused: layer.paused,
+                    bypass_master_fx: layer.bypass_master_fx,
+                }),
+        );
+        (plan, layers)
+    }
+
+    fn render_live_full_stack(
+        renderer: &mut crate::renderer::state::Renderer,
+        layers: &[crate::layers::Layer],
+        plan: &crate::evaluated_frame::EvaluatedFramePlan,
+        delta_seconds: f32,
+    ) -> Result<Vec<u8>, String> {
+        assert!(!plan.ntsc().enabled, "golden explicitly disables NTSC");
+        assert_eq!(plan.temporal().feedback, 0.0);
+        assert_eq!(plan.temporal().slitscan, 0.0);
+        assert_eq!(plan.temporal().key_mode, 0.0);
+        assert_eq!(layers.len(), plan.layers().len());
+
+        let mut encoder = renderer
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Spatial Full-Stack Live Encoder"),
+            });
+        let resources = crate::renderer::state::LiveFrameResources::capture(layers);
+        renderer.render_evaluated_frame(&mut encoder, &resources, plan)?;
+        renderer.render_temporal_with_dt(&mut encoder, plan.temporal(), delta_seconds, true);
+        renderer.render_opaque_output(&mut encoder);
+        renderer.queue.submit(std::iter::once(encoder.finish()));
+        renderer.commit_temporal_frame();
+
+        let bytes_per_row = (renderer.output_width * 4 + 255) & !255;
+        let staging = renderer.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Spatial Full-Stack Live Readback"),
+            size: u64::from(bytes_per_row) * u64::from(renderer.output_height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        readback_pixels(
+            &renderer.device,
+            &renderer.queue,
+            &renderer.composite_textures[2],
+            &staging,
+            renderer.output_width,
+            renderer.output_height,
+            bytes_per_row,
+            &AtomicBool::new(false),
+        )
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn matte_test_base(visible: bool) -> ExportFrameLayerBase {
+        ExportFrameLayerBase {
+            effects: EffectUniforms::default(),
+            transform: SpatialTransform::default(),
+            opacity: 1.0,
+            speed: 1.0,
+            fps: 30.0,
+            blend_mode: BlendMode::Normal,
+            visible,
+            paused: false,
+            bypass_master_fx: false,
+        }
+    }
+
+    fn simple_matte_plan(
+        width: u32,
+        height: u32,
+        sources: &[SourceTap],
+        visible: &[bool],
+        mattes: &[LayerMatte],
+        history_ready: bool,
+    ) -> Result<EvaluatedFramePlan, String> {
+        assert_eq!(sources.len(), visible.len());
+        assert_eq!(sources.len(), mattes.len());
+        let effects = vec![EffectUniforms::default(); sources.len()];
+        let transforms = vec![SpatialTransform::default(); sources.len()];
+        let master_effects = EffectUniforms::default();
+        let master_transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(sources.len());
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(width, height, 0.0),
+            MasterFrameInput {
+                effects: &master_effects,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| LayerFrameInput {
+                    source: *source,
+                    effects: &effects[index],
+                    transform: &transforms[index],
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: visible[index],
+                    paused: false,
+                    bypass_master_fx: false,
+                }),
+        )
+        .with_image_routing(mattes.iter().copied(), history_ready)
+    }
+
+    fn selected_luma_matte(layer_id: StableLayerId) -> LayerMatte {
+        LayerMatte {
+            enabled: true,
+            input: crate::image_routing::ImageInput::SelectedLayer {
+                layer_id,
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            },
+            channel: crate::image_routing::MatteChannel::Luma,
+            invert: false,
+            amount: 1.0,
+            threshold: 0.0,
+            softness: 1.0,
+        }
+    }
+
+    #[test]
+    fn export_saved_position_mapping_survives_resource_reorder_and_rejects_bad_routes_visibly() {
+        use crate::image_routing::{
+            ImageInput, ImageRouteCycle, ImageRouteDiagnostic, LayerImageStage, LayerMatteConfig,
+            SavedImageInput,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        let saved = LayerMatteConfig {
+            enabled: true,
+            input: SavedImageInput::SelectedLayer {
+                layer_position: SavedLayerPosition::new(1).unwrap(),
+                stage: LayerImageStage::PreLocalEffects,
+            },
+            ..LayerMatteConfig::default()
+        };
+        let runtime = export_runtime_matte(saved, 2);
+        let donor_id = StableLayerId::new(export_selective_layer_id(1)).unwrap();
+        assert_eq!(
+            runtime.input,
+            ImageInput::SelectedLayer {
+                layer_id: donor_id,
+                stage: LayerImageStage::PreLocalEffects,
+            }
+        );
+
+        // Current resource order is deliberately the reverse of patch order.
+        // The saved position still resolves to source-index 1, now at slot 0.
+        let sources = [
+            SourceTap::new(export_selective_layer_id(1), 0, 4, 3),
+            SourceTap::new(export_selective_layer_id(0), 1, 4, 3),
+        ];
+        let reordered = simple_matte_plan(
+            16,
+            9,
+            &sources,
+            &[false, true],
+            &[LayerMatte::default(), runtime],
+            false,
+        )
+        .unwrap();
+        assert_eq!(reordered.image_routing().taps().len(), 1);
+        assert_eq!(reordered.image_routing().taps()[0].donor_layer_index, 0);
+        assert_eq!(
+            reordered.image_routing().mattes()[1].diagnostic,
+            ImageRouteDiagnostic::Ready
+        );
+
+        let cycle = LayerMatte {
+            enabled: true,
+            input: ImageInput::CleanProgram,
+            ..LayerMatte::default()
+        };
+        let cyclic = simple_matte_plan(16, 9, &sources[..1], &[true], &[cycle], false).unwrap();
+        assert_eq!(
+            cyclic.image_routing().mattes()[0].diagnostic,
+            ImageRouteDiagnostic::Cycle(ImageRouteCycle::CleanProgramSameFrame)
+        );
+        assert_eq!(
+            cyclic.image_routing().mattes()[0].resolved_input,
+            ResolvedImageInput::Transparent
+        );
+
+        // The CPU planner rejects the full-frame history allocation before a
+        // GPU object exists and leaves the legacy-safe plan untouched.
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(1);
+        let mut oversized = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(16_384, 16_384, 0.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(1, 0, 4, 3),
+                effects: &effects,
+                transform: &transform,
+                opacity: 1.0,
+                speed: 1.0,
+                fps: 30.0,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                paused: false,
+                bypass_master_fx: false,
+            }],
+        );
+        assert!(oversized
+            .attach_image_routing(
+                [LayerMatte {
+                    enabled: true,
+                    input: ImageInput::OneBelow,
+                    ..LayerMatte::default()
+                }],
+                false,
+            )
+            .unwrap_err()
+            .contains("bounded limit"));
+        assert!(!oversized.image_routing().is_active());
+        assert!(oversized.image_routing().mattes().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; routed export textures stay offscreen"]
+    fn gpu_export_missing_donor_is_transparent_and_never_reuses_a_stale_tap() {
+        use crate::image_routing::{ImageInput, LayerImageStage, MatteChannel};
+
+        let harness = SpatialShaderHarness::new(16, 9).unwrap();
+        let primary = spatial_acceptance_card();
+        let donor = second_spatial_acceptance_card();
+        let mut layers = vec![
+            harness
+                .export_layer(0, &primary, matte_test_base(true))
+                .unwrap(),
+            harness
+                .export_layer(1, &donor, matte_test_base(false))
+                .unwrap(),
+        ];
+        let sources = [
+            SourceTap::new(export_selective_layer_id(0), 0, 4, 3),
+            SourceTap::new(export_selective_layer_id(1), 1, 4, 3),
+        ];
+        let valid = simple_matte_plan(
+            16,
+            9,
+            &sources,
+            &[true, false],
+            &[
+                selected_luma_matte(StableLayerId::new(export_selective_layer_id(1)).unwrap()),
+                LayerMatte::default(),
+            ],
+            false,
+        )
+        .unwrap();
+        let mut routing = None;
+        let valid_pixels = harness
+            .render_export_full_stack_with_routing(&mut layers, &valid, 1.0 / 30.0, &mut routing)
+            .unwrap();
+        assert!(valid_pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[..3] != [0, 0, 0]));
+        assert!(routing.as_ref().is_some_and(|state| state.history_valid));
+
+        // Keep the same resources and history alive while the next authored ID
+        // is absent. A stale array slice would visibly resurrect `primary`.
+        let missing = simple_matte_plan(
+            16,
+            9,
+            &sources,
+            &[true, false],
+            &[
+                LayerMatte {
+                    enabled: true,
+                    input: ImageInput::SelectedLayer {
+                        layer_id: StableLayerId::new(999).unwrap(),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    channel: MatteChannel::Luma,
+                    amount: 1.0,
+                    threshold: 0.0,
+                    softness: 1.0,
+                    ..LayerMatte::default()
+                },
+                LayerMatte::default(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            missing.image_routing().mattes()[0].resolved_input,
+            ResolvedImageInput::Transparent
+        );
+        assert!(missing.image_routing().taps().is_empty());
+        let missing_pixels = harness
+            .render_export_full_stack_with_routing(&mut layers, &missing, 1.0 / 30.0, &mut routing)
+            .unwrap();
+        assert!(missing_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 255]));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a Windows window surface and real GPU; matte parity stays offscreen/temp"]
+    fn gpu_selected_layer_matte_live_and_export_match_a_fixed_golden() {
+        use std::sync::Arc;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        let mut event_loop_builder = winit::event_loop::EventLoop::<()>::builder();
+        event_loop_builder.with_any_thread(true);
+        let event_loop = event_loop_builder.build().unwrap();
+        #[allow(deprecated)]
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    winit::window::Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(16, 9)),
+                )
+                .unwrap(),
+        );
+        let mut live_renderer = crate::renderer::state::Renderer::new(window, 16, 9).unwrap();
+        let export_harness = SpatialShaderHarness::new(16, 9).unwrap();
+        let primary_pixels = spatial_acceptance_card();
+        let donor_pixels = second_spatial_acceptance_card();
+        let primary_card =
+            TemporarySpatialCard::create_with_pixels("matte-primary", &primary_pixels);
+        let donor_card = TemporarySpatialCard::create_with_pixels("matte-donor", &donor_pixels);
+        let mut live_layers: Vec<crate::layers::Layer> = [
+            (&primary_card.path, matte_test_base(true)),
+            (&donor_card.path, matte_test_base(false)),
+        ]
+        .into_iter()
+        .map(|(path, base)| {
+            let mut layer =
+                crate::layers::Layer::new(path.to_str().unwrap(), &live_renderer.device).unwrap();
+            let frame = layer
+                .take_ready_media_frame()
+                .unwrap()
+                .expect("temporary matte card must publish its seed frame");
+            layer
+                .upload_frame(&live_renderer.device, &live_renderer.queue, &frame.rgba)
+                .unwrap();
+            configure_live_layer(&mut layer, base);
+            layer
+        })
+        .collect();
+        let live_sources = [
+            SourceTap::new(
+                live_layers[0].layer_id(),
+                0,
+                live_layers[0].width,
+                live_layers[0].height,
+            ),
+            SourceTap::new(
+                live_layers[1].layer_id(),
+                1,
+                live_layers[1].width,
+                live_layers[1].height,
+            ),
+        ];
+        let live_plan = simple_matte_plan(
+            16,
+            9,
+            &live_sources,
+            &[true, false],
+            &[
+                selected_luma_matte(StableLayerId::new(live_layers[1].layer_id()).unwrap()),
+                LayerMatte::default(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        let mut export_layers = vec![
+            export_harness
+                .export_layer(0, &primary_pixels, matte_test_base(true))
+                .unwrap(),
+            export_harness
+                .export_layer(1, &donor_pixels, matte_test_base(false))
+                .unwrap(),
+        ];
+        let export_sources = [
+            SourceTap::new(export_selective_layer_id(0), 0, 4, 3),
+            SourceTap::new(export_selective_layer_id(1), 1, 4, 3),
+        ];
+        let export_plan = simple_matte_plan(
+            16,
+            9,
+            &export_sources,
+            &[true, false],
+            &[
+                selected_luma_matte(StableLayerId::new(export_selective_layer_id(1)).unwrap()),
+                LayerMatte::default(),
+            ],
+            false,
+        )
+        .unwrap();
+
+        // Authored mutations after evaluation must not become an alternate
+        // runtime authority for either resource consumer.
+        live_layers[0].opacity = 0.0;
+        export_layers[0].opacity = 0.0;
+        let live_pixels =
+            render_live_full_stack(&mut live_renderer, &live_layers, &live_plan, 1.0 / 30.0)
+                .unwrap();
+        let export_pixels = export_harness
+            .render_export_full_stack(&mut export_layers, &export_plan, 1.0 / 30.0)
+            .unwrap();
+        assert_eq!(live_pixels, export_pixels);
+        assert!(live_pixels
+            .chunks_exact(4)
+            .any(|pixel| pixel[..3] != [0, 0, 0]));
+
+        // Filled after the first opt-in run; this literal makes subsequent
+        // live/export agreement insufficient to self-author the expected image.
+        const MATTE_GOLDEN_SHA256: &str =
+            "869654f91f66fc164963f00a7724dbd01ebd9e34b47786d2d9a773aab4791552";
+        assert_eq!(sha256_hex(&live_pixels), MATTE_GOLDEN_SHA256);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter; renders only to temporary offscreen textures"]
+    fn gpu_live_and_export_morph_modulation_parity_is_exact_at_24_30_and_60_fps() {
+        let harness = SpatialShaderHarness::new(16, 9).unwrap();
+        let card = TemporarySpatialCard::create();
+        let mut cross_fps_evidence: Option<Vec<u8>> = None;
+        for fps in [24_u32, 30, 60] {
+            let frame_index = u64::from(fps);
+            let live = live_style_parity_plan(&harness.device, &card.path, frame_index, fps);
+            let export = export_style_parity_plan(frame_index, fps);
+            assert_eq!(live.context().time_seconds.to_bits(), 1.0_f32.to_bits());
+            assert_eq!(live.context(), export.context());
+
+            let live_master = live.master_pass_uniforms();
+            let export_master = export.master_pass_uniforms();
+            let live_layer = live.layer_pass_uniforms(0).unwrap();
+            let export_layer = export.layer_pass_uniforms(0).unwrap();
+            assert_eq!(
+                bytemuck::bytes_of(&live_master),
+                bytemuck::bytes_of(&export_master),
+                "master pass diverged at {fps} fps"
+            );
+            assert_eq!(
+                bytemuck::bytes_of(&live_layer),
+                bytemuck::bytes_of(&export_layer),
+                "layer pass diverged at {fps} fps"
+            );
+            assert_eq!(
+                live.layers()[0].opacity.to_bits(),
+                export.layers()[0].opacity.to_bits(),
+                "opacity diverged at {fps} fps"
+            );
+            assert_ne!(
+                live.layers()[0].transform,
+                parity_layer_base().transform,
+                "fixture failed to exercise spatial Morph + modulation"
+            );
+
+            // Render each independently evaluated payload. Reusing one byte
+            // block for both consumers would make the proof tautological.
+            let live_layer_pixels = harness.render_pass_uniforms(live_layer).unwrap();
+            let export_layer_pixels = harness.render_pass_uniforms(export_layer).unwrap();
+            assert_eq!(
+                live_layer_pixels, export_layer_pixels,
+                "layer shader pixels diverged at {fps} fps"
+            );
+            let live_master_pixels = harness.render_pass_uniforms(live_master).unwrap();
+            let export_master_pixels = harness.render_pass_uniforms(export_master).unwrap();
+            assert_eq!(
+                live_master_pixels, export_master_pixels,
+                "master shader pixels diverged at {fps} fps"
+            );
+
+            let mut evidence = Vec::new();
+            evidence.extend_from_slice(bytemuck::bytes_of(&live_master));
+            evidence.extend_from_slice(bytemuck::bytes_of(&live_layer));
+            evidence.extend_from_slice(&live.layers()[0].opacity.to_ne_bytes());
+            evidence.extend_from_slice(&live_layer_pixels);
+            evidence.extend_from_slice(&live_master_pixels);
+            if let Some(expected) = &cross_fps_evidence {
+                assert_eq!(
+                    &evidence, expected,
+                    "equal one-second live/export sample changed at {fps} fps"
+                );
+            } else {
+                cross_fps_evidence = Some(evidence);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires a Windows window surface and real GPU; all images stay offscreen/temp"]
+    fn gpu_two_layer_live_and_export_full_stack_matches_fixed_golden_at_24_30_and_60_fps() {
+        use std::sync::Arc;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+
+        let mut event_loop_builder = winit::event_loop::EventLoop::<()>::builder();
+        event_loop_builder.with_any_thread(true);
+        let event_loop = event_loop_builder.build().unwrap();
+        #[allow(deprecated)]
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    winit::window::Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(16, 9)),
+                )
+                .unwrap(),
+        );
+        let mut live_renderer = crate::renderer::state::Renderer::new(window, 16, 9).unwrap();
+        let export_harness = SpatialShaderHarness::new(16, 9).unwrap();
+        let first_card = TemporarySpatialCard::create();
+        let first_pixels = spatial_acceptance_card();
+        let second_pixels = second_spatial_acceptance_card();
+        let second_card = TemporarySpatialCard::create_with_pixels("secondary", &second_pixels);
+
+        // Generated once from the complete production live renderer at the
+        // one-second fixture below, then cross-checked byte-for-byte against
+        // the independently reconstructed export stack. This is intentionally
+        // a stored digest, not a runtime self-reference.
+        const FINAL_FRAME_GOLDEN_SHA256: &str =
+            "3818c4e65a94102f3086049cb5dfdac2b74318cdaaaca0f940cdc0fe045ddefc";
+        let mut cross_fps_pixels: Option<Vec<u8>> = None;
+        for fps in [24_u32, 30, 60] {
+            let frame_index = u64::from(fps);
+            let (live_plan, mut live_layers) = live_full_stack_world(
+                &live_renderer.device,
+                &live_renderer.queue,
+                [&first_card.path, &second_card.path],
+                frame_index,
+                fps,
+            );
+            let (export_plan, export_bases) = export_full_stack_world(frame_index, fps);
+
+            assert_eq!(live_plan.context(), export_plan.context());
+            assert_eq!(
+                live_plan.context().time_seconds.to_bits(),
+                1.0_f32.to_bits()
+            );
+            assert!(!live_plan.ntsc().enabled);
+            assert!(!live_plan.temporal().is_active());
+            assert!((live_plan.temporal().fb_zoom - 1.0).abs() <= f32::EPSILON);
+            assert_eq!(live_plan.temporal().fb_rotate, 0.0);
+            assert_eq!(live_plan.layers().len(), 2);
+            assert_eq!(export_plan.layers().len(), 2);
+            assert_eq!(
+                bytemuck::bytes_of(live_plan.master_pass()),
+                bytemuck::bytes_of(export_plan.master_pass()),
+                "master payload diverged at {fps} fps"
+            );
+            for index in 0..2 {
+                assert_eq!(
+                    bytemuck::bytes_of(&live_plan.layer_passes()[index]),
+                    bytemuck::bytes_of(&export_plan.layer_passes()[index]),
+                    "layer {index} payload diverged at {fps} fps"
+                );
+                assert_eq!(
+                    live_plan.layers()[index].opacity.to_bits(),
+                    export_plan.layers()[index].opacity.to_bits(),
+                    "layer {index} opacity diverged at {fps} fps"
+                );
+                assert_eq!(
+                    live_plan.layers()[index].blend_mode,
+                    export_plan.layers()[index].blend_mode,
+                    "layer {index} blend diverged at {fps} fps"
+                );
+            }
+            assert_ne!(
+                live_plan.layers()[0].transform,
+                parity_layer_base().transform,
+                "fixture failed to exercise layer-one spatial Morph/modulation"
+            );
+            assert_ne!(
+                live_plan.layers()[1].transform,
+                parity_second_layer_base().transform,
+                "fixture failed to exercise layer-two spatial Morph/modulation"
+            );
+
+            // After evaluation, deliberately corrupt every authored field
+            // that a stale live consumer might reread. Source identity and the
+            // pinned texture stay intact; the final pixels must remain owned
+            // entirely by the immutable plan.
+            live_layers[0].effects = EffectUniforms::default();
+            live_layers[0].transform = SpatialTransform::default();
+            live_layers[0].opacity = 0.0;
+            live_layers[0].blend_mode = BlendMode::Multiply;
+            live_layers[0].visible = false;
+            live_layers[0].bypass_master_fx = true;
+
+            // These are two real consumers: live owns actual `Layer` textures
+            // and uses `Renderer::render_evaluated_frame`; export owns detached
+            // `ExportLayer`s and uses `render_layers_and_master_export`.
+            let live_pixels = render_live_full_stack(
+                &mut live_renderer,
+                &live_layers,
+                &live_plan,
+                1.0 / fps as f32,
+            )
+            .unwrap();
+            let mut export_layers = export_bases
+                .into_iter()
+                .enumerate()
+                .map(|(index, base)| {
+                    export_harness.export_layer(
+                        index,
+                        if index == 0 {
+                            &first_pixels
+                        } else {
+                            &second_pixels
+                        },
+                        base,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            for layer in &mut export_layers {
+                layer.effects = EffectUniforms::default();
+                layer.transform = SpatialTransform::default();
+                layer.opacity = 0.0;
+                layer.blend_mode = BlendMode::Multiply;
+                layer.visible = false;
+                layer.bypass_master_fx = true;
+            }
+            let export_pixels = export_harness
+                .render_export_full_stack(&mut export_layers, &export_plan, 1.0 / fps as f32)
+                .unwrap();
+            assert_eq!(
+                live_pixels, export_pixels,
+                "complete live/export program images diverged at {fps} fps"
+            );
+            assert!(live_pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+            let digest = sha256_hex(&live_pixels);
+            assert_eq!(
+                digest, FINAL_FRAME_GOLDEN_SHA256,
+                "fixed final-frame golden diverged at {fps} fps"
+            );
+            if let Some(expected) = &cross_fps_pixels {
+                assert_eq!(
+                    &live_pixels, expected,
+                    "the equal one-second final frame changed at {fps} fps"
+                );
+            } else {
+                cross_fps_pixels = Some(live_pixels);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "real-GPU 1080p eight-layer smoke/performance gate; intentionally opt-in"]
+    fn gpu_1080p60_eight_transformed_layers_complete_within_debug_smoke_ceiling() {
+        use crate::effects::params::TemporalParams;
+        use crate::evaluated_frame::{
+            EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+        };
+        use crate::modulation::ModMatrix;
+
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+        const FPS: u32 = 60;
+        // This is deliberately ~15x the 16.67 ms realtime target for
+        // unoptimized test binaries and includes queue synchronization plus an
+        // 8 MiB RGBA readback. It remains tight enough to catch a catastrophic
+        // per-layer/per-pixel regression while the realtime target is reported.
+        const DEBUG_SMOKE_CEILING: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let harness = SpatialShaderHarness::new(WIDTH, HEIGHT).unwrap();
+        let blends = [
+            BlendMode::Normal,
+            BlendMode::Screen,
+            BlendMode::Multiply,
+            BlendMode::Difference,
+        ];
+        let bases: Vec<ExportFrameLayerBase> = (0..8)
+            .map(|index| {
+                let offset = index as f32 - 3.5;
+                ExportFrameLayerBase {
+                    effects: EffectUniforms {
+                        hue_shift: offset * 7.0,
+                        brightness: offset * 0.006,
+                        random_seed: 0x5045_5246_u32.wrapping_add(index as u32),
+                        ..EffectUniforms::default()
+                    },
+                    transform: SpatialTransform {
+                        position: [offset * 0.015, -offset * 0.01],
+                        scale: [0.86 + index as f32 * 0.025, 1.08 - index as f32 * 0.018],
+                        anchor: [0.2 + index as f32 * 0.075, 0.75 - index as f32 * 0.06],
+                        rotation_deg: offset * 4.0,
+                        skew_deg: offset * 1.5,
+                        skew_axis_deg: -30.0 + index as f32 * 9.0,
+                        fit: if index % 2 == 0 {
+                            FitMode::Fit
+                        } else {
+                            FitMode::Fill
+                        },
+                        edge: if index % 3 == 0 {
+                            EdgeMode::Transparent
+                        } else {
+                            EdgeMode::Mirror
+                        },
+                        sampling: SamplingMode::Nearest,
+                        ..SpatialTransform::default()
+                    },
+                    opacity: 0.38 + index as f32 * 0.055,
+                    speed: 1.0,
+                    fps: FPS as f32,
+                    blend_mode: blends[index % blends.len()],
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }
+            })
+            .collect();
+        let master = EffectUniforms {
+            brightness: 0.02,
+            ..EffectUniforms::default()
+        };
+        let master_transform = SpatialTransform {
+            rotation_deg: 1.25,
+            skew_deg: 0.75,
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+            ..SpatialTransform::default()
+        };
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = TemporalParams::default();
+        let modulation = ModMatrix::new().frame(8);
+        let plan = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(WIDTH, HEIGHT, 1.0),
+            MasterFrameInput {
+                effects: &master,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            bases
+                .iter()
+                .enumerate()
+                .map(|(slot, layer)| LayerFrameInput {
+                    source: SourceTap::new(export_selective_layer_id(slot), slot, 4, 3),
+                    effects: &layer.effects,
+                    transform: &layer.transform,
+                    opacity: layer.opacity,
+                    speed: layer.speed,
+                    fps: layer.fps,
+                    blend_mode: layer.blend_mode,
+                    visible: layer.visible,
+                    paused: layer.paused,
+                    bypass_master_fx: layer.bypass_master_fx,
+                }),
+        );
+        assert_eq!(plan.layer_passes().len(), 8);
+        assert!(plan
+            .layers()
+            .iter()
+            .all(|layer| layer.transform != SpatialTransform::default()));
+
+        let primary = spatial_acceptance_card();
+        let secondary = second_spatial_acceptance_card();
+        let mut layers = bases
+            .into_iter()
+            .enumerate()
+            .map(|(index, base)| {
+                harness.export_layer(
+                    index,
+                    if index % 2 == 0 { &primary } else { &secondary },
+                    base,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let (pixels, elapsed) = harness
+            .render_export_full_stack_timed(&mut layers, &plan, 1.0 / FPS as f32)
+            .unwrap();
+        eprintln!(
+            "1080p60 / 8 transformed layers: {:.2} ms measured (16.67 ms realtime target; {:.0} ms debug smoke ceiling)",
+            elapsed.as_secs_f64() * 1_000.0,
+            DEBUG_SMOKE_CEILING.as_secs_f64() * 1_000.0,
+        );
+        assert_eq!(pixels.len(), WIDTH as usize * HEIGHT as usize * 4);
+        assert!(pixels.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(pixels.chunks_exact(4).any(|pixel| pixel[..3] != [0, 0, 0]));
+        assert!(
+            elapsed <= DEBUG_SMOKE_CEILING,
+            "1080p60 eight-layer frame took {:.2} ms, above the documented {:.0} ms debug smoke ceiling",
+            elapsed.as_secs_f64() * 1_000.0,
+            DEBUG_SMOKE_CEILING.as_secs_f64() * 1_000.0,
+        );
     }
 
     #[test]
@@ -3740,6 +11222,252 @@ mod tests {
             "a stale generation cannot reroll or rewind the consumer"
         );
         assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn offline_boundary_events_drive_reroll_without_decoder_eof_or_double_count() {
+        let config = ClipTransportConfig {
+            rate: 10.0,
+            ..ClipTransportConfig::default()
+        };
+        let mut transport = ExportClipTransport::new(
+            config,
+            crate::transport::NormalizedTime::clamped(0.9),
+            1.0,
+            30,
+        );
+        let _ = transport.seed_selection();
+        let selected = transport.select(
+            config,
+            ProgramTransportTick {
+                delta_seconds: 0.35,
+                source_duration_seconds: 99.0,
+                source_frame_count: 99,
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert_eq!(selected.boundary_events, 4);
+
+        let mut effects = EffectUniforms {
+            random_seed: 0x1020_3040,
+            ..EffectUniforms::default()
+        };
+        let mut consumed = 0;
+        let timeline_generation = consumed + u64::from(selected.boundary_events);
+        assert_eq!(
+            apply_export_loop_generation(&mut effects, true, &mut consumed, timeline_generation,),
+            4
+        );
+        assert_eq!(
+            effects.random_seed,
+            crate::randomization::advance_seed(0x1020_3040, 4)
+        );
+        assert_eq!(
+            apply_export_loop_generation(&mut effects, true, &mut consumed, timeline_generation,),
+            0,
+            "the same absolute selection cannot be consumed twice"
+        );
+    }
+
+    #[test]
+    fn canonical_rate_eight_survives_the_legacy_modulation_proxy() {
+        let modulation = crate::modulation::ModMatrix::new().frame(1);
+        let mut base = parity_layer_base();
+        base.speed = 8.0;
+        base.fps = 480.0;
+        let config = modulated_export_transport_config(
+            &modulation,
+            0,
+            ClipTransportConfig {
+                rate: 8.0,
+                sample_fps: Some(480.0),
+                ..ClipTransportConfig::default()
+            },
+            &base,
+            ExportMorphOverrides::default(),
+        );
+        assert_eq!(config.rate, 8.0);
+        assert_eq!(config.sample_fps, Some(480.0));
+    }
+
+    fn mix_transport_signature(signature: &mut u64, value: u64) {
+        // Stable FNV-1a over explicit scalar evidence; unlike DefaultHasher,
+        // this is a durable cross-toolchain golden contract.
+        for byte in value.to_le_bytes() {
+            *signature ^= u64::from(byte);
+            *signature = signature.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn deterministic_offline_transport_signature(fps: u32) -> u64 {
+        use crate::transport::{
+            BeatLoop, ClipBeatGrid, CueId, CuePoint, CuePoints, EndBehavior, NormalizedTime,
+            PlaybackDirection,
+        };
+
+        let mut cues = CuePoints::default();
+        let cue = CueId::new(9).unwrap();
+        assert!(cues.insert(CuePoint {
+            id: cue,
+            at: NormalizedTime::clamped(0.65),
+        }));
+        let config = ClipTransportConfig {
+            direction: PlaybackDirection::Reverse,
+            end_behavior: EndBehavior::PingPong,
+            in_point: NormalizedTime::clamped(0.1),
+            out_point: NormalizedTime::clamped(0.9),
+            rate: 1.375,
+            sample_fps: Some(23.976),
+            beat_grid: Some(ClipBeatGrid {
+                bpm: 128.0,
+                length_beats: Some(7.5),
+                sync_to_program: true,
+                beats_per_bar: 4,
+            }),
+            beat_loop: Some(BeatLoop {
+                start_beat: 0.5,
+                length_beats: 4.0,
+            }),
+            cues,
+            ..ClipTransportConfig::default()
+        };
+        let saved = NormalizedTime::clamped(0.73);
+        let mut offline = ExportClipTransport::new(config, saved, 3.75, 90);
+        let offline_seed = offline.seed_selection();
+
+        // The live side starts from the same persisted state and invokes the
+        // same pure contract. Keeping it explicit catches drift in the export
+        // adapter's tick/source-fact injection rather than comparing a helper
+        // to itself.
+        let mut live_state = ClipTransportState::at(saved, config.direction);
+        let (next_live, live_seed) = TransportTimeline::select(
+            &config,
+            live_state,
+            ProgramTransportTick {
+                program_running: false,
+                media_running: false,
+                source_duration_seconds: 3.75,
+                source_frame_count: 90,
+                ..ProgramTransportTick::default()
+            },
+        );
+        live_state = next_live;
+        assert_eq!(offline_seed, live_seed);
+        assert!((offline_seed.normalized_time.get() - 0.6).abs() < 1e-12);
+
+        let mut signature = 0xcbf2_9ce4_8422_2325;
+        for frame in 0..fps * 6 {
+            let seconds = f64::from(frame) / f64::from(fps);
+            let tick = ProgramTransportTick {
+                delta_seconds: if frame == 0 {
+                    0.0
+                } else {
+                    1.0 / f64::from(fps)
+                },
+                program_beat: seconds * 128.0 / 60.0,
+                program_running: !(fps * 5..fps * 5 + fps / 4).contains(&frame),
+                media_running: !(fps * 3..fps * 3 + fps / 2).contains(&frame),
+                source_duration_seconds: 3.75,
+                source_frame_count: 90,
+                cue_id: (frame == fps * 2).then_some(cue),
+                seek_to: (frame == fps * 4).then_some(NormalizedTime::clamped(0.2)),
+                ..ProgramTransportTick::default()
+            };
+            let offline_selected = offline.select(config, tick);
+            let (next_live, live_selected) = TransportTimeline::select(&config, live_state, tick);
+            live_state = next_live;
+            assert_eq!(
+                offline_selected, live_selected,
+                "parity frame {frame} at {fps} fps"
+            );
+
+            mix_transport_signature(
+                &mut signature,
+                offline_selected.normalized_time.get().to_bits(),
+            );
+            mix_transport_signature(
+                &mut signature,
+                offline_selected.logical_time.get().to_bits(),
+            );
+            mix_transport_signature(&mut signature, offline_selected.source_seconds.to_bits());
+            mix_transport_signature(
+                &mut signature,
+                offline_selected.frame_index.unwrap_or(u64::MAX),
+            );
+            mix_transport_signature(&mut signature, offline_selected.generation);
+            mix_transport_signature(&mut signature, u64::from(offline_selected.boundary_events));
+            let flags = u64::from(offline_selected.sample_due)
+                | (u64::from(offline_selected.held) << 1)
+                | (u64::from(offline_selected.transparent) << 2)
+                | (u64::from(offline_selected.discontinuity) << 3)
+                | (u64::from(offline_selected.completed) << 4);
+            mix_transport_signature(&mut signature, flags);
+        }
+        signature
+    }
+
+    #[test]
+    fn offline_transport_has_deterministic_24_30_60_fps_goldens_and_live_parity() {
+        let signatures = [24, 30, 60].map(deterministic_offline_transport_signature);
+        assert_eq!(
+            signatures,
+            [
+                0x55ca_058c_bbe6_db3a,
+                0x2fe1_deb3_4664_77b1,
+                0xfd17_ec73_0125_ffb2,
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_freeze_gates_and_one_shot_visibility_match_the_pure_law() {
+        use crate::transport::{EndBehavior, NormalizedTime};
+
+        let looped = ClipTransportConfig::default();
+        let mut transport =
+            ExportClipTransport::new(looped, NormalizedTime::clamped(0.4), 10.0, 100);
+        let saved_playhead = transport.seed_selection();
+        assert_eq!(saved_playhead.normalized_time, NormalizedTime::clamped(0.4));
+        assert_eq!(saved_playhead.source_seconds, 4.0);
+        let program_frozen = transport.select(
+            looped,
+            ProgramTransportTick {
+                delta_seconds: 1.0,
+                program_running: false,
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert_eq!(program_frozen.logical_time, NormalizedTime::clamped(0.4));
+        let media_frozen = transport.select(
+            looped,
+            ProgramTransportTick {
+                delta_seconds: 1.0,
+                media_running: false,
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert_eq!(media_frozen.logical_time, NormalizedTime::clamped(0.4));
+
+        let one_shot = ClipTransportConfig {
+            end_behavior: EndBehavior::OneShot,
+            ..ClipTransportConfig::default()
+        };
+        let mut transport =
+            ExportClipTransport::new(one_shot, NormalizedTime::clamped(0.95), 1.0, 30);
+        let _ = transport.seed_selection();
+        let terminal = transport.select(
+            one_shot,
+            ProgramTransportTick {
+                delta_seconds: 0.1,
+                ..ProgramTransportTick::default()
+            },
+        );
+        assert!(!terminal.transparent, "the terminal frame presents once");
+        let transparent = transport.select(one_shot, ProgramTransportTick::default());
+        assert!(transparent.transparent);
+        let authored_visible = true;
+        let evaluated_visible = authored_visible && !transparent.transparent;
+        assert!(!evaluated_visible);
     }
 
     #[test]
@@ -3798,7 +11526,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3, 1]
         );
-        assert_eq!(plan.layers[0].blend_mode, 0);
+        assert_eq!(plan.layers[0].blend_mode, BlendMode::Multiply.as_u32());
         assert_eq!(plan.layers[1].blend_mode, BlendMode::Difference.as_u32());
         assert_eq!(plan.layers[0].opacity, 0.8);
         assert_eq!(plan.layers[1].opacity, 0.4);
@@ -3819,6 +11547,61 @@ mod tests {
         assert_ne!(
             export_selective_topology_signature(&bypass_change),
             signature
+        );
+    }
+
+    #[test]
+    fn advanced_export_ntsc_policy_matches_shared_homogeneous_classification() {
+        assert_eq!(
+            advanced_export_skips_global_ntsc(AdvancedNtscPath::Disabled, 0, 0),
+            Ok(false)
+        );
+        assert_eq!(
+            advanced_export_skips_global_ntsc(AdvancedNtscPath::AllApplying, 2, 0),
+            Ok(false)
+        );
+        assert_eq!(
+            advanced_export_skips_global_ntsc(AdvancedNtscPath::AllBypass, 0, 2),
+            Ok(true)
+        );
+        let error = advanced_export_skips_global_ntsc(AdvancedNtscPath::Mixed, 2, 1).unwrap_err();
+        assert_eq!(
+            error,
+            "advanced composition cannot enter selective NTSC: 2 applying layer(s), 1 bypassing layer(s)"
+        );
+    }
+
+    #[test]
+    fn selective_export_fingerprint_tracks_layer_and_inherited_master_geometry() {
+        let effects = EffectUniforms::default();
+        let identity = SpatialTransform::default();
+        let mut moved = identity;
+        moved.position = [0.125, -0.25];
+
+        let base = export_selective_transform_fingerprint(&effects, &identity, None, None);
+        assert_eq!(
+            base,
+            export_selective_transform_fingerprint(&effects, &identity, None, None)
+        );
+        assert_ne!(
+            base,
+            export_selective_transform_fingerprint(&effects, &moved, None, None)
+        );
+
+        let inherited = export_selective_transform_fingerprint(
+            &effects,
+            &identity,
+            Some(&effects),
+            Some(&identity),
+        );
+        assert_ne!(
+            inherited,
+            export_selective_transform_fingerprint(
+                &effects,
+                &identity,
+                Some(&effects),
+                Some(&moved),
+            )
         );
     }
 
@@ -4155,11 +11938,11 @@ mod tests {
     }
 
     #[test]
-    fn every_saved_blend_mode_has_a_placeholder_equivalent() {
-        assert_eq!(configured_blend_mode("normal"), BlendMode::Normal);
-        assert_eq!(configured_blend_mode("screen"), BlendMode::Screen);
-        assert_eq!(configured_blend_mode("multiply"), BlendMode::Multiply);
-        assert_eq!(configured_blend_mode("difference"), BlendMode::Difference);
+    fn every_saved_blend_mode_has_an_exact_export_equivalent() {
+        for mode in BlendMode::ALL {
+            assert_eq!(configured_blend_mode(mode.key()), mode);
+        }
+        assert_eq!(configured_blend_mode("unknown"), BlendMode::Normal);
     }
 
     #[test]
@@ -4384,10 +12167,28 @@ mod tests {
                 paused: false,
                 visible: true,
                 effects: EffectsConfig::default(),
+                transform: SpatialTransform::default(),
+                rack: None,
+                motion: None,
+                clip_slots: crate::performance::ClipSlots::singleton(
+                    crate::performance::ClipSlotConfig::from_legacy(
+                        filename.to_string(),
+                        String::new(),
+                        1.0,
+                        30.0,
+                    ),
+                ),
+                active_clip_slot: Some(crate::performance::ClipSlotId::LEGACY),
+                matte: crate::image_routing::LayerMatteConfig::default(),
             })
             .collect();
         let patch = PatchState {
             master: EffectsConfig::default(),
+            master_transform: SpatialTransform::default(),
+            master_rack: None,
+            master_motion: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: false,
             media_frozen: false,
             layers,
@@ -4395,6 +12196,7 @@ mod tests {
             modulation: None,
             temporal: None,
             morph: None,
+            scenes: crate::performance::Scenes::default(),
         };
         let output = std::env::temp_dir().join(format!(
             "collideoscope-live-cancel-{}-{}.mp4",
@@ -4470,6 +12272,11 @@ mod effects_audit {
     fn base_patch() -> PatchState {
         PatchState {
             master: EffectsConfig::default(),
+            master_transform: SpatialTransform::default(),
+            master_rack: None,
+            master_motion: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: false,
             media_frozen: false,
             layers: vec![LayerConfig {
@@ -4484,11 +12291,25 @@ mod effects_audit {
                 paused: false,
                 visible: true,
                 effects: EffectsConfig::default(),
+                transform: SpatialTransform::default(),
+                rack: None,
+                motion: None,
+                clip_slots: crate::performance::ClipSlots::singleton(
+                    crate::performance::ClipSlotConfig::from_legacy(
+                        "audit.mp4".to_string(),
+                        String::new(),
+                        1.0,
+                        30.0,
+                    ),
+                ),
+                active_clip_slot: Some(crate::performance::ClipSlotId::LEGACY),
+                matte: crate::image_routing::LayerMatteConfig::default(),
             }],
             ntsc: Some(NtscConfig::default()),
             modulation: None,
             temporal: Some(TemporalConfig::default()),
             morph: None,
+            scenes: crate::performance::Scenes::default(),
         }
     }
 

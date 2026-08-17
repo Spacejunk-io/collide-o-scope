@@ -1,0 +1,5147 @@
+//! Shared live/export GPU boundary for evaluated creative compositions.
+//!
+//! The immutable [`EvaluatedCompositionPlan`] is the only authored contract
+//! accepted here. Exact legacy plans are explicitly delegated to the frozen
+//! renderer/export path; advanced plans are prepared transactionally and keep
+//! every GPU handle inside this executor so a warmed encode creates nothing.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use crate::composition::{BusAssignment, RuntimeRootItem};
+use crate::evaluated_frame::evaluated_composition::{
+    AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
+    EvaluatedScopeExecution, EvaluatedScopeStep, ImageTapConsumer, LegacyCanonicalApplication,
+    MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
+};
+use crate::image_routing::{LayerImageStage, StableLayerId};
+use crate::layers::BlendMode;
+use crate::motion::MotionFieldOrigin;
+use crate::program_recorder::CaptureTarget;
+use crate::renderer::composition_host::{
+    CompositionHost, CompositionHostError, HostCapacities, HostCompositeInputs,
+    HostCompositeUniforms, HostEffectSource, HostFrameTiming, HostMatteInputs, HostSurface,
+    HostTemporalInput, HostTextureInputs, HostUniformSlot,
+};
+use crate::renderer::compositor::{MatteChannelCode, MatteCompositeUniforms, ResolvedMatteParams};
+use crate::renderer::motion::{
+    MotionFrameInput, MotionGpuError, MotionGpuFieldSource, MotionGpuFieldSpec, MotionGpuResources,
+    MotionGpuScopeSpec, MotionRuntimeDiagnostic, MotionRuntimeMetrics,
+};
+use crate::renderer::rack::{
+    CollisionRackExecutor, RackGpuError, RackImageBindings, RackImageInput, RackSourceBinding,
+};
+use crate::renderer::readback::{
+    PreparedRgbaReadback, RecorderReadbackAdmission, RecorderReadbackAllocationSnapshot,
+    RecorderReadbackCaptureStatus, RecorderReadbackError, RecorderReadbackPoll,
+    RecorderReadbackReadiness, RecorderReadbackRequest, RecorderReadbackReservation,
+    RecorderReadbackTag,
+};
+use crate::temporal::{TemporalFrameInput, TemporalResetCause, TemporalStateMetrics};
+use crate::visual_rack::{EdgeTiming, GroupId, MatteChannel, NodeId, VisualScopeId};
+
+pub(crate) const COMPOSITION_WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(crate) const COMPOSITION_PRESENT_FORMAT: wgpu::TextureFormat =
+    wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Stable source view selected before command encoding. Preparing bind groups
+/// from this descriptor is permitted; retaining the descriptor itself is not
+/// required because wgpu bind groups retain their texture resources.
+pub(crate) struct CompositionSourceDescriptor<'a> {
+    pub stable_id: StableLayerId,
+    pub view: &'a wgpu::TextureView,
+    pub dimensions: [u32; 2],
+    /// Caller-owned resource identity. A source replacement with unchanged
+    /// stable ID and dimensions must advance this token so preparation can
+    /// replace only bindings which retain the old view.
+    pub resource_epoch: u64,
+}
+
+impl<'a> CompositionSourceDescriptor<'a> {
+    pub const fn new(
+        stable_id: StableLayerId,
+        view: &'a wgpu::TextureView,
+        dimensions: [u32; 2],
+    ) -> Self {
+        Self {
+            stable_id,
+            view,
+            dimensions,
+            resource_epoch: 0,
+        }
+    }
+
+    pub const fn with_resource_epoch(mut self, resource_epoch: u64) -> Self {
+        self.resource_epoch = resource_epoch;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CompositionFrameTiming {
+    temporal: TemporalFrameInput,
+}
+
+impl CompositionFrameTiming {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "legacy dt/pause adapter remains a supported composition API"
+        )
+    )]
+    pub fn new(delta_seconds: f32, advance_program: bool) -> Self {
+        let delta_seconds = if delta_seconds.is_finite() {
+            delta_seconds.max(0.0)
+        } else {
+            0.0
+        };
+        Self {
+            temporal: TemporalFrameInput::legacy(delta_seconds, advance_program),
+        }
+    }
+
+    /// Full T0 temporal-domain input. Main and export use this constructor to
+    /// feed the identical freeze/blackout/event batch into the shared staged
+    /// state; [`Self::new`] remains the legacy dt/pause compatibility seam.
+    pub const fn from_temporal_input(temporal: TemporalFrameInput) -> Self {
+        Self { temporal }
+    }
+
+    pub const fn temporal_input(self) -> TemporalFrameInput {
+        self.temporal
+    }
+}
+
+/// Frame-borrowed products/facts for the evaluated motion plan. The shared
+/// executor remains the sole authority for source decisions, exact attachment
+/// matching, and transactional publication.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CompositionMotionFrameInput<'a> {
+    pub attachments: &'a [MotionFieldAttachment<'a>],
+    pub held_scopes: &'a [VisualScopeId],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompositionPreparedKind {
+    /// Caller must invoke the pre-existing exact renderer. No advanced GPU
+    /// resource is allocated, cleared, or encoded for this plan.
+    LegacyExact,
+    /// Executor-held resources are ready for the reported immutable topology.
+    Advanced { topology_signature: u64 },
+}
+
+pub(crate) struct CompositionGpuOutput<'a> {
+    pub texture: &'a wgpu::Texture,
+    pub view: &'a wgpu::TextureView,
+    pub dimensions: [u32; 2],
+    pub format: wgpu::TextureFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompositionEncodeKind {
+    LegacyExact,
+    Advanced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompositionGpuError {
+    ZeroDimensions([u32; 2]),
+    DimensionsExceedDevice {
+        requested: [u32; 2],
+        limit: u32,
+    },
+    UnsupportedSelectiveNtsc {
+        applying: usize,
+        bypassing: usize,
+    },
+    DuplicateSource(StableLayerId),
+    MissingSource(StableLayerId),
+    UnknownSource(StableLayerId),
+    SourceDimensionMismatch {
+        layer_id: StableLayerId,
+        planned: [u32; 2],
+        supplied: [u32; 2],
+    },
+    TopologyNotPrepared {
+        prepared: Option<u64>,
+        requested: u64,
+    },
+    #[allow(
+        dead_code,
+        reason = "explicit delegate error remains part of the shared adapter contract"
+    )]
+    LegacyExactMustDelegate,
+    ResourceCreation(String),
+    Host(String),
+    Rack(String),
+    Motion(String),
+    Readback(String),
+    InvalidSchedule(String),
+    PresentFormatUnsupported(wgpu::TextureFormat),
+}
+
+impl fmt::Display for CompositionGpuError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroDimensions(dimensions) => write!(
+                formatter,
+                "advanced composition dimensions must be nonzero, got {}x{}",
+                dimensions[0], dimensions[1]
+            ),
+            Self::DimensionsExceedDevice { requested, limit } => write!(
+                formatter,
+                "advanced composition dimensions {}x{} exceed device limit {limit}",
+                requested[0], requested[1]
+            ),
+            Self::UnsupportedSelectiveNtsc {
+                applying,
+                bypassing,
+            } => write!(
+                formatter,
+                "advanced composition cannot enter selective NTSC: {applying} applying layer(s), {bypassing} bypassing layer(s)"
+            ),
+            Self::DuplicateSource(layer_id) => write!(
+                formatter,
+                "advanced composition received duplicate source for stable layer {}",
+                layer_id.get()
+            ),
+            Self::MissingSource(layer_id) => write!(
+                formatter,
+                "advanced composition is missing source for stable layer {}",
+                layer_id.get()
+            ),
+            Self::UnknownSource(layer_id) => write!(
+                formatter,
+                "advanced composition received unknown stable layer source {}",
+                layer_id.get()
+            ),
+            Self::SourceDimensionMismatch {
+                layer_id,
+                planned,
+                supplied,
+            } => write!(
+                formatter,
+                "advanced composition source {} is {}x{}, planned {}x{}",
+                layer_id.get(), supplied[0], supplied[1], planned[0], planned[1]
+            ),
+            Self::TopologyNotPrepared {
+                prepared,
+                requested,
+            } => write!(
+                formatter,
+                "advanced composition topology {requested} is not prepared (prepared {prepared:?})"
+            ),
+            Self::LegacyExactMustDelegate => formatter.write_str(
+                "exact legacy composition must be delegated to the frozen renderer path",
+            ),
+            Self::ResourceCreation(message) => {
+                write!(formatter, "advanced composition GPU resource creation failed: {message}")
+            }
+            Self::Host(message) => write!(formatter, "advanced composition host failed: {message}"),
+            Self::Rack(message) => write!(formatter, "advanced Collision Rack failed: {message}"),
+            Self::Motion(message) => write!(formatter, "advanced motion failed: {message}"),
+            Self::Readback(message) => {
+                write!(formatter, "advanced scope readback failed: {message}")
+            }
+            Self::InvalidSchedule(message) => {
+                write!(formatter, "advanced composition schedule is invalid: {message}")
+            }
+            Self::PresentFormatUnsupported(format) => write!(
+                formatter,
+                "advanced composition cannot present into {format:?}; expected {COMPOSITION_PRESENT_FORMAT:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CompositionGpuError {}
+
+impl From<CompositionHostError> for CompositionGpuError {
+    fn from(value: CompositionHostError) -> Self {
+        Self::Host(value.to_string())
+    }
+}
+
+impl From<RackGpuError> for CompositionGpuError {
+    fn from(value: RackGpuError) -> Self {
+        Self::Rack(value.to_string())
+    }
+}
+
+impl From<MotionGpuError> for CompositionGpuError {
+    fn from(value: MotionGpuError) -> Self {
+        Self::Motion(value.to_string())
+    }
+}
+
+impl From<RecorderReadbackError> for CompositionGpuError {
+    fn from(value: RecorderReadbackError) -> Self {
+        Self::Readback(value.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CompositionAllocationSnapshot {
+    pub host_objects: u64,
+    pub rack_objects: u64,
+    pub retained_textures: u64,
+    pub retained_views: u64,
+    pub executor_bindings: u64,
+    pub readback_objects: u64,
+    pub readback_bytes: u64,
+    pub readback_staging_bytes: u64,
+    pub readback_texture_bytes: u64,
+    /// Exact payload bytes from the admitted format/resource plans which
+    /// created the live objects represented above.
+    pub creative_bytes: u64,
+    pub motion_bytes: u64,
+}
+
+impl CompositionAllocationSnapshot {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "aggregate allocation accounting is exercised by GPU goldens"
+        )
+    )]
+    pub const fn total(self) -> u64 {
+        self.host_objects
+            + self.rack_objects
+            + self.retained_textures
+            + self.retained_views
+            + self.executor_bindings
+            + self.readback_objects
+    }
+}
+
+struct RetainedSurface {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+enum TapBacking {
+    Transparent,
+    ProgramHistory,
+    CurrentPreLocal {
+        layer_id: StableLayerId,
+    },
+    Current(RetainedSurface),
+    Previous {
+        surfaces: [RetainedSurface; 2],
+        initialized: bool,
+        staged: bool,
+    },
+}
+
+struct PreparedTap {
+    planned: PlannedImageTap,
+    backing: TapBacking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RootTask {
+    Layer(StableLayerId),
+    Group(GroupId),
+}
+
+impl RootTask {
+    const fn output_scope(self) -> VisualScopeId {
+        match self {
+            Self::Layer(id) => VisualScopeId::Layer(id),
+            Self::Group(id) => VisualScopeId::Group(id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduledSource {
+    Ping,
+    RetainedTap(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScheduledAdmission<T> {
+    item: T,
+    source: ScheduledSource,
+}
+
+struct RootScheduleEntry {
+    task: RootTask,
+    drains: Box<[ScheduledAdmission<RootTask>]>,
+}
+
+struct MemberScheduleEntry {
+    layer_id: StableLayerId,
+    drains: Box<[ScheduledAdmission<StableLayerId>]>,
+}
+
+struct PreparedRackSegment {
+    scope: VisualScopeId,
+    segment_index: u8,
+    uniform_base_slot: usize,
+    /// Bind groups retain their texture views, so both committed N-1 read
+    /// parities are prepared once and selected without allocating in encode.
+    bindings: [RackImageBindings; 2],
+    tap_indices: Box<[(NodeId, crate::visual_rack::ResolvedImageTap, usize)]>,
+}
+
+struct PreparedAdvanced {
+    topology_signature: u64,
+    source_keys: Box<[(StableLayerId, [u32; 2], u64)]>,
+    host: CompositionHost,
+    rack: CollisionRackExecutor,
+    motion: Option<MotionGpuResources>,
+    taps: Box<[PreparedTap]>,
+    /// Current-frame PreLocal donors are independently materialized and
+    /// deduplicated by stable layer ID. They cannot alias a single transient
+    /// Pong surface when more than one donor is used in an authored rack.
+    prelocal_surfaces: BTreeMap<StableLayerId, RetainedSurface>,
+    root_schedule: Box<[RootScheduleEntry]>,
+    member_schedules: BTreeMap<GroupId, Box<[MemberScheduleEntry]>>,
+    external_effects: BTreeMap<StableLayerId, HostEffectSource>,
+    ping_effect: HostEffectSource,
+    group_effect: HostEffectSource,
+    ping_rack_source: RackSourceBinding,
+    rack_segments: Vec<PreparedRackSegment>,
+    composite_a: HostCompositeInputs,
+    composite_b: HostCompositeInputs,
+    composite_program: HostCompositeInputs,
+    composite_group: HostCompositeInputs,
+    prefix_group_composite: HostCompositeInputs,
+    /// Like rack image bindings, matte bindings are immutable and prepared for
+    /// both possible committed N-1 read parities.
+    matte_bindings: BTreeMap<ImageTapConsumer, [HostMatteInputs; 2]>,
+    temporal: HostTemporalInput,
+    bus_inputs: HostTextureInputs,
+    present: HostTextureInputs,
+    effect_slots: BTreeMap<(VisualScopeId, usize), HostUniformSlot>,
+    exact_layer_slots: BTreeMap<StableLayerId, HostUniformSlot>,
+    prelocal_slots: BTreeMap<StableLayerId, HostUniformSlot>,
+    composite_slots: BTreeMap<VisualScopeId, HostUniformSlot>,
+    prefix_composite_slot: HostUniformSlot,
+    matte_slots: BTreeMap<ImageTapConsumer, HostUniformSlot>,
+    tap_history_read_index: usize,
+    history_staged: bool,
+    retained_textures: u64,
+    retained_views: u64,
+    executor_bindings: u64,
+    creative_bytes: u64,
+    motion_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArmedScopeReadback {
+    reservation: RecorderReadbackReservation,
+    captured: bool,
+}
+
+/// One reusable RGBA8 conversion surface plus the common fixed staging pool.
+/// It lives outside `PreparedAdvanced`, so a topology replacement cannot
+/// silently retarget a recorder or allocate during encode.
+struct PreparedScopeRecorderReadback {
+    target: CaptureTarget,
+    conversion_texture: wgpu::Texture,
+    conversion_view: wgpu::TextureView,
+    staging: PreparedRgbaReadback,
+    armed: Option<ArmedScopeReadback>,
+}
+
+#[allow(
+    dead_code,
+    reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+)]
+impl PreparedScopeRecorderReadback {
+    fn prepare(
+        device: &wgpu::Device,
+        dimensions: [u32; 2],
+        target: CaptureTarget,
+    ) -> Result<Self, RecorderReadbackError> {
+        if matches!(target, CaptureTarget::Program) {
+            return Err(RecorderReadbackError::UnsupportedTarget(target));
+        }
+        let staging = PreparedRgbaReadback::prepare(device, dimensions, 1)?;
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let conversion_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Prepared post-effects scope recorder conversion"),
+            size: wgpu::Extent3d {
+                width: dimensions[0],
+                height: dimensions[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COMPOSITION_PRESENT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let conversion_view =
+            conversion_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let scope_error = [
+            ("out of memory", pollster::block_on(out_of_memory.pop())),
+            ("internal/backend", pollster::block_on(internal.pop())),
+            ("validation", pollster::block_on(validation.pop())),
+        ]
+        .into_iter()
+        .find_map(|(kind, error)| error.map(|error| format!("{kind}: {error}")));
+        if let Some(message) = scope_error {
+            return Err(RecorderReadbackError::ResourceCreation(message));
+        }
+        Ok(Self {
+            target,
+            conversion_texture,
+            conversion_view,
+            staging,
+            armed: None,
+        })
+    }
+
+    fn allocation_snapshot(&self) -> RecorderReadbackAllocationSnapshot {
+        self.staging.allocation_snapshot(1)
+    }
+
+    fn begin(&mut self, tag: RecorderReadbackTag) -> RecorderReadbackAdmission {
+        if self.armed.is_some() {
+            return RecorderReadbackAdmission::Busy;
+        }
+        let admission = self
+            .staging
+            .reserve(RecorderReadbackRequest::new(self.target, tag));
+        if let RecorderReadbackAdmission::Scheduled(reservation) = admission {
+            self.armed = Some(ArmedScopeReadback {
+                reservation,
+                captured: false,
+            });
+        }
+        admission
+    }
+
+    fn capture(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        host: &CompositionHost,
+        present: &HostTextureInputs,
+        scope: VisualScopeId,
+    ) -> Result<(), CompositionGpuError> {
+        if capture_target_scope(self.target) != Some(scope) {
+            return Ok(());
+        }
+        let Some(armed) = self.armed else {
+            return Ok(());
+        };
+        if armed.captured {
+            return Ok(());
+        }
+        host.encode_present(
+            encoder,
+            present,
+            &self.conversion_view,
+            COMPOSITION_PRESENT_FORMAT,
+        )?;
+        self.staging
+            .encode_reserved(encoder, armed.reservation, &self.conversion_texture)?;
+        self.armed = Some(ArmedScopeReadback {
+            captured: true,
+            ..armed
+        });
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        reservation: RecorderReadbackReservation,
+    ) -> Result<RecorderReadbackCaptureStatus, RecorderReadbackError> {
+        let Some(armed) = self.armed else {
+            return Err(RecorderReadbackError::InvalidReservation);
+        };
+        if armed.reservation != reservation {
+            return Err(RecorderReadbackError::InvalidReservation);
+        }
+        self.armed = None;
+        if armed.captured {
+            Ok(RecorderReadbackCaptureStatus::Captured)
+        } else {
+            self.staging.discard_unsubmitted(reservation)?;
+            Ok(RecorderReadbackCaptureStatus::SourceUnavailable)
+        }
+    }
+
+    fn discard_armed_unsubmitted(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        let _ = self.staging.discard_unsubmitted(armed.reservation);
+    }
+}
+
+const fn capture_target_scope(target: CaptureTarget) -> Option<VisualScopeId> {
+    match target {
+        CaptureTarget::Program => None,
+        CaptureTarget::Layer(layer_id) => Some(VisualScopeId::Layer(layer_id)),
+        CaptureTarget::Group(group_id) => Some(VisualScopeId::Group(group_id)),
+    }
+}
+
+/// Executor-owned preparation. The public boundary intentionally returns only
+/// a value report; callers never own a half-built advanced resource graph.
+pub(crate) struct CompositionGpuExecutor {
+    dimensions: [u32; 2],
+    topology_signature: Option<u64>,
+    prepared: Option<PreparedAdvanced>,
+    scope_recorder_readback: Option<PreparedScopeRecorderReadback>,
+}
+
+impl CompositionGpuExecutor {
+    pub fn new(
+        device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        dimensions: [u32; 2],
+    ) -> Result<Self, CompositionGpuError> {
+        if dimensions.contains(&0) {
+            return Err(CompositionGpuError::ZeroDimensions(dimensions));
+        }
+        let limit = device.limits().max_texture_dimension_2d;
+        if dimensions[0] > limit || dimensions[1] > limit {
+            return Err(CompositionGpuError::DimensionsExceedDevice {
+                requested: dimensions,
+                limit,
+            });
+        }
+        Ok(Self {
+            dimensions,
+            topology_signature: None,
+            prepared: None,
+            scope_recorder_readback: None,
+        })
+    }
+
+    pub const fn dimensions(&self) -> [u32; 2] {
+        self.dimensions
+    }
+
+    pub fn program_history_initialized(&self) -> bool {
+        self.prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.host.program_history_initialized())
+    }
+
+    #[allow(dead_code, reason = "compatibility wrapper for embedders")]
+    pub fn reset_history(&mut self) {
+        self.reset_history_for(TemporalResetCause::PatchGeneration);
+    }
+
+    pub(crate) fn reset_history_for(&mut self, cause: TemporalResetCause) {
+        if let Some(prepared) = &mut self.prepared {
+            prepared.host.reset_program_history();
+            prepared.host.reset_temporal_for(cause);
+            prepared.tap_history_read_index = 0;
+            prepared.history_staged = false;
+            for tap in &mut prepared.taps {
+                if let TapBacking::Previous {
+                    initialized,
+                    staged,
+                    ..
+                } = &mut tap.backing
+                {
+                    *initialized = false;
+                    *staged = false;
+                }
+            }
+            if matches!(
+                cause,
+                TemporalResetCause::PatchGeneration
+                    | TemporalResetCause::ApplyLook
+                    | TemporalResetCause::SourceCut
+                    | TemporalResetCause::Seek
+                    | TemporalResetCause::Resize
+                    | TemporalResetCause::BroadRevert
+                    | TemporalResetCause::ManualClear
+            ) {
+                if let Some(motion) = &mut prepared.motion {
+                    motion.reset();
+                }
+            }
+        }
+    }
+
+    /// Operator-facing M4 memory clear. Authored parameters, Temporal,
+    /// Program/N-1 history, image taps, and the held audience image remain
+    /// untouched.
+    pub(crate) fn clear_motion_memory(&mut self) {
+        if let Some(motion) = self
+            .prepared
+            .as_mut()
+            .and_then(|prepared| prepared.motion.as_mut())
+        {
+            motion.reset();
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "Main telemetry consumes this frozen runtime seam")
+    )]
+    pub(crate) fn motion_metrics(&self, scope: VisualScopeId) -> Option<MotionRuntimeMetrics> {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.motion.as_ref())
+            .and_then(|motion| motion.metrics(scope))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Main/export telemetry consumes this frozen runtime seam"
+    )]
+    pub(crate) fn motion_diagnostics(&self) -> &[MotionRuntimeDiagnostic] {
+        self.prepared
+            .as_ref()
+            .and_then(|prepared| prepared.motion.as_ref())
+            .map_or(&[], MotionGpuResources::diagnostics)
+    }
+
+    /// Operator-facing M3 memory clear. This is intentionally narrower than
+    /// [`Self::reset_history`]: stable image taps and N-1 Program history stay
+    /// published, while the temporal ring/carrier/Score reset and a frozen
+    /// audience image remains available until Program Freeze is released.
+    pub fn clear_temporal_memory(&mut self) {
+        if let Some(prepared) = &mut self.prepared {
+            prepared.host.clear_temporal_memory();
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "native telemetry selects this adapter only while Advanced composition is active"
+    )]
+    pub(crate) fn temporal_state_metrics(&self) -> Option<TemporalStateMetrics> {
+        self.prepared
+            .as_ref()
+            .map(|prepared| prepared.host.temporal_state_metrics())
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "allocation snapshots are exposed for warmed-frame GPU goldens"
+        )
+    )]
+    pub fn allocation_snapshot(&self) -> CompositionAllocationSnapshot {
+        let Some(prepared) = &self.prepared else {
+            return self.scope_recorder_readback.as_ref().map_or_else(
+                CompositionAllocationSnapshot::default,
+                |readback| {
+                    let readback = readback.allocation_snapshot();
+                    CompositionAllocationSnapshot {
+                        readback_objects: readback.total_objects(),
+                        readback_bytes: readback.total_bytes(),
+                        ..CompositionAllocationSnapshot::default()
+                    }
+                },
+            );
+        };
+        let readback = self
+            .scope_recorder_readback
+            .as_ref()
+            .map(PreparedScopeRecorderReadback::allocation_snapshot)
+            .unwrap_or_default();
+        CompositionAllocationSnapshot {
+            host_objects: prepared.host.allocation_snapshot().total(),
+            rack_objects: prepared.rack.allocation_snapshot().total(),
+            retained_textures: prepared.retained_textures,
+            retained_views: prepared.retained_views,
+            executor_bindings: prepared.executor_bindings,
+            readback_objects: readback.total_objects(),
+            readback_bytes: readback.total_bytes(),
+            readback_staging_bytes: readback.buffer_bytes,
+            readback_texture_bytes: readback.conversion_texture_bytes,
+            creative_bytes: prepared.creative_bytes,
+            motion_bytes: prepared.motion_bytes,
+        }
+    }
+
+    /// Cold-prepare the one stable layer/group capture target. Re-selecting a
+    /// target reuses the same fixed RGBA8 surface and two staging buffers.
+    /// Program capture belongs to `Renderer` because only it observes the
+    /// post-NTSC/post-blackout audience slot.
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn prepare_scope_recorder_readback(
+        &mut self,
+        device: &wgpu::Device,
+        target: CaptureTarget,
+    ) -> Result<RecorderReadbackAllocationSnapshot, RecorderReadbackError> {
+        if matches!(target, CaptureTarget::Program) {
+            return Err(RecorderReadbackError::UnsupportedTarget(target));
+        }
+        if let Some(readback) = &mut self.scope_recorder_readback {
+            if readback.armed.is_some() {
+                return Err(RecorderReadbackError::InvalidReservation);
+            }
+            readback.target = target;
+            return Ok(readback.allocation_snapshot());
+        }
+        let readback = PreparedScopeRecorderReadback::prepare(device, self.dimensions, target)?;
+        let snapshot = readback.allocation_snapshot();
+        self.scope_recorder_readback = Some(readback);
+        Ok(snapshot)
+    }
+
+    /// Arm one exact post-effects boundary before `encode_with_motion`.
+    /// Missing/deleted scopes fail visibly and never retarget to Program.
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn begin_scope_recorder_readback(
+        &mut self,
+        tag: RecorderReadbackTag,
+    ) -> RecorderReadbackAdmission {
+        let Some(target) = self
+            .scope_recorder_readback
+            .as_ref()
+            .map(|readback| readback.target)
+        else {
+            return RecorderReadbackAdmission::Unprepared;
+        };
+        if !self
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.has_capture_target(target))
+        {
+            return RecorderReadbackAdmission::SourceUnavailable;
+        }
+        self.scope_recorder_readback
+            .as_mut()
+            .expect("checked prepared scope readback")
+            .begin(tag)
+    }
+
+    /// Confirm that the armed boundary was actually encountered. Invoke after
+    /// a successful encode and before submission; unavailable is a capture
+    /// drop, not a reason to reject the creative frame.
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn finish_scope_recorder_readback(
+        &mut self,
+        reservation: RecorderReadbackReservation,
+    ) -> Result<RecorderReadbackCaptureStatus, RecorderReadbackError> {
+        self.scope_recorder_readback
+            .as_mut()
+            .ok_or(RecorderReadbackError::InvalidReservation)?
+            .finish(reservation)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn map_scope_recorder_readback(
+        &self,
+        reservation: RecorderReadbackReservation,
+    ) -> Result<(), RecorderReadbackError> {
+        self.scope_recorder_readback
+            .as_ref()
+            .ok_or(RecorderReadbackError::InvalidReservation)?
+            .staging
+            .map(reservation)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn poll_scope_recorder_readback_into(
+        &mut self,
+        device: &wgpu::Device,
+        destination: &mut [u8],
+    ) -> Result<RecorderReadbackPoll, RecorderReadbackError> {
+        let _ = device.poll(wgpu::PollType::Poll);
+        match self.scope_recorder_readback.as_mut() {
+            Some(readback) => readback.staging.poll_into(destination),
+            None => Ok(RecorderReadbackPoll::Idle),
+        }
+    }
+
+    /// Non-consuming oldest-slot observation for lease-on-ready harvesting.
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn scope_recorder_readback_readiness(
+        &self,
+        device: &wgpu::Device,
+    ) -> RecorderReadbackReadiness {
+        let _ = device.poll(wgpu::PollType::Poll);
+        self.scope_recorder_readback
+            .as_ref()
+            .map_or(RecorderReadbackReadiness::Idle, |readback| {
+                readback.staging.oldest_readiness()
+            })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn discard_unsubmitted_scope_recorder_readback(
+        &mut self,
+        reservation: RecorderReadbackReservation,
+    ) -> Result<(), RecorderReadbackError> {
+        let readback = self
+            .scope_recorder_readback
+            .as_mut()
+            .ok_or(RecorderReadbackError::InvalidReservation)?;
+        if readback
+            .armed
+            .is_some_and(|armed| armed.reservation == reservation)
+        {
+            readback.armed = None;
+        }
+        readback.staging.discard_unsubmitted(reservation)
+    }
+
+    /// True only when the warmed executor exactly matches both the immutable
+    /// topology and every source view-generation key. Callers use this before
+    /// planning donor readiness so a topology/source replacement is diagnosed
+    /// cold on its first frame instead of borrowing the prior graph's history.
+    pub fn is_prepared_for(
+        &self,
+        plan: &EvaluatedCompositionPlan,
+        source_keys: &[(StableLayerId, [u32; 2], u64)],
+    ) -> bool {
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            return false;
+        };
+        self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.topology_signature == plan.topology_signature()
+                && prepared.source_keys.as_ref() == source_keys
+        })
+    }
+
+    pub fn validate_plan(plan: &EvaluatedCompositionPlan) -> Result<(), CompositionGpuError> {
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            return Ok(());
+        };
+        let applying = plan.master().selective_ntsc_layers.len();
+        let bypassing = plan.master().selective_ntsc_bypass_layers.len();
+        if plan.ntsc_path() == AdvancedNtscPath::Mixed {
+            return Err(CompositionGpuError::UnsupportedSelectiveNtsc {
+                applying,
+                bypassing,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate a complete stable source set and atomically select the plan's
+    /// topology. Concrete per-pass resources are installed here as the
+    /// implementation grows; encode never repairs or allocates missing state.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        plan: &EvaluatedCompositionPlan,
+        sources: &[CompositionSourceDescriptor<'_>],
+    ) -> Result<CompositionPreparedKind, CompositionGpuError> {
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            self.topology_signature = None;
+            self.prepared = None;
+            return Ok(CompositionPreparedKind::LegacyExact);
+        };
+        Self::validate_plan(&EvaluatedCompositionPlan::Advanced(plan.clone()))?;
+
+        let mut supplied = BTreeMap::new();
+        for source in sources {
+            if supplied.insert(source.stable_id, source).is_some() {
+                return Err(CompositionGpuError::DuplicateSource(source.stable_id));
+            }
+        }
+        for layer in plan.layers() {
+            let source = supplied
+                .remove(&layer.stable_id)
+                .ok_or(CompositionGpuError::MissingSource(layer.stable_id))?;
+            let planned = plan.base().layers()[layer.base_layer_index].source.size;
+            if source.dimensions != planned {
+                return Err(CompositionGpuError::SourceDimensionMismatch {
+                    layer_id: layer.stable_id,
+                    planned,
+                    supplied: source.dimensions,
+                });
+            }
+        }
+        if let Some(unknown) = supplied.keys().next().copied() {
+            return Err(CompositionGpuError::UnknownSource(unknown));
+        }
+        let source_keys = plan
+            .layers()
+            .iter()
+            .map(|layer| {
+                let source = sources
+                    .iter()
+                    .find(|source| source.stable_id == layer.stable_id)
+                    .expect("validated source exists");
+                (source.stable_id, source.dimensions, source.resource_epoch)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let signature = plan.topology_signature();
+        if self.prepared.as_ref().is_some_and(|prepared| {
+            prepared.topology_signature == signature && prepared.source_keys == source_keys
+        }) {
+            self.topology_signature = Some(signature);
+            return Ok(CompositionPreparedKind::Advanced {
+                topology_signature: signature,
+            });
+        }
+
+        let prepared =
+            PreparedAdvanced::new(device, queue, self.dimensions, plan, sources, source_keys)?;
+        self.prepared = Some(prepared);
+        self.topology_signature = Some(signature);
+        Ok(CompositionPreparedKind::Advanced {
+            topology_signature: signature,
+        })
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "compatibility wrapper for embedders without motion products"
+        )
+    )]
+    pub fn encode(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &EvaluatedCompositionPlan,
+        timing: CompositionFrameTiming,
+    ) -> Result<CompositionEncodeKind, CompositionGpuError> {
+        self.encode_with_motion(
+            queue,
+            encoder,
+            plan,
+            timing,
+            CompositionMotionFrameInput::default(),
+        )
+    }
+
+    /// Recycle a caller-verified stale scope completion without allocating a
+    /// full-frame scratch or acquiring a recorder lease.
+    #[allow(
+        dead_code,
+        reason = "native Main consumes scope capture; alternate targets retain the prepared adapter without a caller"
+    )]
+    pub(crate) fn recycle_ready_scope_recorder_readback_without_copy(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<RecorderReadbackPoll, RecorderReadbackError> {
+        let _ = device.poll(wgpu::PollType::Poll);
+        match self.scope_recorder_readback.as_mut() {
+            Some(readback) => readback.staging.recycle_oldest_ready_without_copy(),
+            None => Ok(RecorderReadbackPoll::Idle),
+        }
+    }
+
+    pub fn encode_with_motion(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &EvaluatedCompositionPlan,
+        timing: CompositionFrameTiming,
+        motion_input: CompositionMotionFrameInput<'_>,
+    ) -> Result<CompositionEncodeKind, CompositionGpuError> {
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            return Ok(CompositionEncodeKind::LegacyExact);
+        };
+        Self::validate_plan(&EvaluatedCompositionPlan::Advanced(plan.clone()))?;
+        if self.topology_signature != Some(plan.topology_signature()) {
+            return Err(CompositionGpuError::TopologyNotPrepared {
+                prepared: self.topology_signature,
+                requested: plan.topology_signature(),
+            });
+        }
+        let (prepared, scope_readback) = (&mut self.prepared, &mut self.scope_recorder_readback);
+        let prepared = prepared
+            .as_mut()
+            .ok_or(CompositionGpuError::TopologyNotPrepared {
+                prepared: None,
+                requested: plan.topology_signature(),
+            })?;
+        if let Err(error) =
+            prepared.encode(queue, encoder, plan, timing, motion_input, scope_readback)
+        {
+            prepared.discard_frame_history();
+            if let Some(readback) = scope_readback {
+                readback.discard_armed_unsubmitted();
+            }
+            return Err(error);
+        }
+        Ok(CompositionEncodeKind::Advanced)
+    }
+
+    pub fn output(&self) -> CompositionGpuOutput<'_> {
+        let prepared = self
+            .prepared
+            .as_ref()
+            .expect("advanced composition output requested before prepare");
+        let output = prepared.host.surface(HostSurface::Ping);
+        CompositionGpuOutput {
+            texture: output.texture,
+            view: output.view,
+            dimensions: self.dimensions,
+            format: COMPOSITION_WORKING_FORMAT,
+        }
+    }
+
+    /// Final RGBA16Float -> target conversion is intentionally a render/blit,
+    /// never a texture copy into the existing Rgba8UnormSrgb composites.
+    pub fn encode_present(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<(), CompositionGpuError> {
+        if target_format != COMPOSITION_PRESENT_FORMAT {
+            return Err(CompositionGpuError::PresentFormatUnsupported(target_format));
+        }
+        let prepared = self
+            .prepared
+            .as_ref()
+            .ok_or(CompositionGpuError::TopologyNotPrepared {
+                prepared: None,
+                requested: self.topology_signature.unwrap_or(0),
+            })?;
+        prepared
+            .host
+            .encode_present(encoder, &prepared.present, target, target_format)
+            .map_err(Into::into)
+    }
+
+    /// Publish every CPU-visible N-1 readiness/cadence bit only after the
+    /// caller has successfully submitted the command buffer containing this
+    /// frame. No GPU object or command encoder is created here.
+    pub fn commit_frame_history(&mut self) {
+        let Some(prepared) = &mut self.prepared else {
+            return;
+        };
+        prepared.commit_frame_history();
+    }
+
+    /// Roll back all staged CPU history/cadence state when encode, present, or
+    /// outer submission is abandoned.
+    pub fn discard_frame_history(&mut self) {
+        if let Some(prepared) = &mut self.prepared {
+            prepared.discard_frame_history();
+        }
+        if let Some(readback) = &mut self.scope_recorder_readback {
+            readback.discard_armed_unsubmitted();
+        }
+    }
+}
+
+impl PreparedAdvanced {
+    #[allow(
+        dead_code,
+        reason = "the prepared scope-capture adapter uses this exact target-presence check"
+    )]
+    fn has_capture_target(&self, target: CaptureTarget) -> bool {
+        match target {
+            CaptureTarget::Program => false,
+            CaptureTarget::Layer(layer_id) => self
+                .source_keys
+                .iter()
+                .any(|(candidate, _, _)| *candidate == layer_id),
+            CaptureTarget::Group(group_id) => {
+                self.member_schedules.contains_key(&group_id)
+                    || self.root_schedule.iter().any(
+                        |entry| matches!(entry.task, RootTask::Group(candidate) if candidate == group_id),
+                    )
+            }
+        }
+    }
+
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        dimensions: [u32; 2],
+        plan: &AdvancedCompositionPlan,
+        sources: &[CompositionSourceDescriptor<'_>],
+        source_keys: Box<[(StableLayerId, [u32; 2], u64)]>,
+    ) -> Result<Self, CompositionGpuError> {
+        let (
+            effect_slot_count,
+            effect_slots,
+            exact_layer_slots,
+            prelocal_slots,
+            composite_slots,
+            prefix_composite_slot,
+            matte_slots,
+        ) = assign_uniform_slots(plan)?;
+        let retain_program_history = plan
+            .image_taps()
+            .iter()
+            .any(|tap| matches!(tap.resolved, PlannedImageSource::ProgramHistory));
+
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let built = (|| {
+            let host = CompositionHost::new(
+                device,
+                dimensions,
+                HostCapacities {
+                    effect_slots: effect_slot_count.max(1),
+                    composite_slots: (composite_slots.len() + 1).max(1),
+                    matte_slots: matte_slots.len().max(1),
+                    retain_program_history,
+                    resources: plan.resources(),
+                },
+            )?;
+            let rack = CollisionRackExecutor::new_with_uniform_slots(
+                device,
+                queue,
+                dimensions,
+                rack_uniform_slot_count(plan)?,
+            )?;
+            let taps = prepare_tap_surfaces(device, dimensions, plan.image_taps())?;
+            let prelocal_surfaces = prepare_current_prelocal_surfaces(device, dimensions, &taps);
+            validate_actual_surface_ledger(
+                plan,
+                retain_program_history,
+                &taps,
+                prelocal_surfaces.len(),
+            )?;
+
+            let source_lookup: BTreeMap<_, _> = sources
+                .iter()
+                .map(|source| (source.stable_id, source))
+                .collect();
+            let external_effects = plan
+                .layers()
+                .iter()
+                .map(|layer| {
+                    let source = source_lookup[&layer.stable_id];
+                    (
+                        layer.stable_id,
+                        host.prepare_effect_source(device, source.view),
+                    )
+                })
+                .collect();
+
+            let ping = host.surface(HostSurface::Ping);
+            let pong = host.surface(HostSurface::Pong);
+            let group_scratch = host.surface(HostSurface::GroupScratch);
+            let ping_effect = host.prepare_effect_source(device, ping.view);
+            let group_effect = host.prepare_effect_source(device, group_scratch.view);
+            let ping_rack_source = rack.prepare_source(device, ping.view, dimensions)?;
+            let rack_zero = rack.surface(1).ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule("rack scratch 1 missing".into())
+            })?;
+
+            let motion = if let Some(motion_plan) = plan.motion().advanced() {
+                let field_specs = motion_plan
+                    .fields()
+                    .iter()
+                    .map(|field| MotionGpuFieldSpec {
+                        grid: field.grid,
+                        requires_luma: matches!(
+                            field.source.origin,
+                            MotionFieldOrigin::Lattice | MotionFieldOrigin::LatticeFallback
+                        ) || motion_plan.scope(field.scope).is_some_and(|scope| {
+                            scope.params.field_source == crate::motion::MotionFieldSource::Auto
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                let prepared_resources = MotionGpuResources::prepare(
+                    device,
+                    motion_plan.resources(),
+                    &field_specs,
+                    dimensions,
+                )?;
+                if let Some(mut resources) = prepared_resources {
+                    let field_sources = motion_plan
+                        .fields()
+                        .iter()
+                        .filter(|field| {
+                            matches!(
+                                field.source.origin,
+                                MotionFieldOrigin::Lattice | MotionFieldOrigin::LatticeFallback
+                            ) || motion_plan.scope(field.scope).is_some_and(|scope| {
+                                scope.params.field_source == crate::motion::MotionFieldSource::Auto
+                            })
+                        })
+                        .map(|field| {
+                            let view = match field.scope {
+                                VisualScopeId::Master => ping.view,
+                                VisualScopeId::Layer(layer_id) => source_lookup
+                                    .get(&layer_id)
+                                    .map(|source| source.view)
+                                    .ok_or(CompositionGpuError::MissingSource(layer_id))?,
+                                VisualScopeId::Group(_) | VisualScopeId::Program => {
+                                    return Err(CompositionGpuError::Motion(
+                                        "group motion fields are not admitted in algorithm v1"
+                                            .into(),
+                                    ));
+                                }
+                            };
+                            Ok(MotionGpuFieldSource {
+                                slot: field.slot,
+                                view,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, CompositionGpuError>>()?;
+                    let scope_specs = motion_plan
+                        .scopes()
+                        .iter()
+                        .filter_map(|scope| {
+                            if scope.params.is_exact_zero()
+                                || (!scope.transplant_admitted && scope.field_slot.is_none())
+                            {
+                                return None;
+                            }
+                            let render_field_slot = if scope.transplant_admitted {
+                                scope.donor_field_slot?
+                            } else {
+                                scope.field_slot?
+                            };
+                            Some(MotionGpuScopeSpec {
+                                scope: scope.scope,
+                                render_field_slot,
+                                uses_carrier: scope.transplant_admitted,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    resources.prepare_composition_bindings(
+                        device,
+                        queue,
+                        motion_plan,
+                        &field_sources,
+                        &scope_specs,
+                        ping.view,
+                        pong.view,
+                    )?;
+                    Some(resources)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let composite_a =
+                host.prepare_composite_inputs(device, host.surface(HostSurface::A).view, ping.view);
+            let composite_b =
+                host.prepare_composite_inputs(device, host.surface(HostSurface::B).view, ping.view);
+            let composite_program = host.prepare_composite_inputs(
+                device,
+                host.surface(HostSurface::Program).view,
+                ping.view,
+            );
+            let composite_group =
+                host.prepare_composite_inputs(device, group_scratch.view, ping.view);
+            let prefix_group_composite =
+                host.prepare_composite_inputs(device, ping.view, group_scratch.view);
+
+            let mut matte_bindings = BTreeMap::new();
+            for tap in plan.image_taps() {
+                if !matches!(
+                    tap.consumer,
+                    ImageTapConsumer::LayerMatte { .. } | ImageTapConsumer::GroupMatte { .. }
+                ) {
+                    continue;
+                }
+                let tap_index = plan
+                    .image_taps()
+                    .iter()
+                    .position(|candidate| candidate.consumer == tap.consumer)
+                    .expect("tap is in its source slice");
+                let base = match tap.consumer {
+                    ImageTapConsumer::LayerMatte { layer_id } => {
+                        let layer = layer_plan(plan, layer_id)?;
+                        if layer.group_id.is_some() {
+                            group_scratch.view
+                        } else {
+                            host.surface(bus_surface(layer.bus)).view
+                        }
+                    }
+                    ImageTapConsumer::GroupMatte { .. } => rack_zero.view,
+                    ImageTapConsumer::RackNode { .. } => unreachable!(),
+                };
+                matte_bindings.insert(
+                    tap.consumer,
+                    std::array::from_fn(|read_index| {
+                        let donor = prepared_tap_view(
+                            &host,
+                            &prelocal_surfaces,
+                            rack_zero.view,
+                            &taps[tap_index],
+                            read_index,
+                        );
+                        host.prepare_matte_inputs(device, base, ping.view, donor)
+                    }),
+                );
+            }
+            // Amount-zero group mattes deliberately have no active graph tap,
+            // yet their dry path remains an authored ordered step.
+            for group in plan.groups() {
+                if group.matte.is_some() {
+                    let consumer = ImageTapConsumer::GroupMatte { group_id: group.id };
+                    matte_bindings.entry(consumer).or_insert_with(|| {
+                        std::array::from_fn(|_| {
+                            host.prepare_matte_inputs(
+                                device,
+                                rack_zero.view,
+                                ping.view,
+                                rack_zero.view,
+                            )
+                        })
+                    });
+                }
+            }
+
+            let rack_segments =
+                prepare_rack_segments(device, plan, &host, &rack, &taps, &prelocal_surfaces)?;
+            let retained_scope_sources = retained_scope_sources(plan, &taps);
+            let (root_schedule, member_schedules) =
+                build_block_schedules(plan, &retained_scope_sources)?;
+            let temporal = host.prepare_temporal_input(device, ping.view, pong.view);
+            let bus_inputs = host.prepare_bus_inputs(
+                device,
+                host.surface(HostSurface::A).view,
+                host.surface(HostSurface::B).view,
+                host.surface(HostSurface::Program).view,
+            );
+            let present = host.prepare_copy_source(device, ping.view);
+
+            // Defined initialization is recorded once during preparation. It
+            // does not publish any history-valid bit.
+            let mut initialize = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Advanced composition retained-surface initialization"),
+            });
+            host.encode_clear(&mut initialize, rack_zero.view, wgpu::Color::TRANSPARENT);
+            for tap in &taps {
+                match &tap.backing {
+                    TapBacking::Current(surface) => {
+                        host.encode_clear(&mut initialize, &surface.view, wgpu::Color::TRANSPARENT);
+                    }
+                    TapBacking::Previous { surfaces, .. } => {
+                        for surface in surfaces {
+                            host.encode_clear(
+                                &mut initialize,
+                                &surface.view,
+                                wgpu::Color::TRANSPARENT,
+                            );
+                        }
+                    }
+                    TapBacking::Transparent
+                    | TapBacking::ProgramHistory
+                    | TapBacking::CurrentPreLocal { .. } => {}
+                }
+            }
+            for surface in prelocal_surfaces.values() {
+                host.encode_clear(&mut initialize, &surface.view, wgpu::Color::TRANSPARENT);
+            }
+            queue.submit(Some(initialize.finish()));
+
+            let retained_textures = taps
+                .iter()
+                .map(|tap| match tap.backing {
+                    TapBacking::Current(_) => 1,
+                    TapBacking::Previous { .. } => 2,
+                    _ => 0,
+                })
+                .sum::<u64>()
+                + prelocal_surfaces.len() as u64;
+            Ok(Self {
+                topology_signature: plan.topology_signature(),
+                source_keys,
+                host,
+                rack,
+                motion,
+                taps: taps.into_boxed_slice(),
+                prelocal_surfaces,
+                root_schedule,
+                member_schedules,
+                external_effects,
+                ping_effect,
+                group_effect,
+                ping_rack_source,
+                rack_segments,
+                composite_a,
+                composite_b,
+                composite_program,
+                composite_group,
+                prefix_group_composite,
+                matte_bindings,
+                temporal,
+                bus_inputs,
+                present,
+                effect_slots,
+                exact_layer_slots,
+                prelocal_slots,
+                composite_slots,
+                prefix_composite_slot,
+                matte_slots,
+                tap_history_read_index: 0,
+                history_staged: false,
+                retained_textures,
+                retained_views: retained_textures,
+                executor_bindings: 0,
+                creative_bytes: plan.resources().creative_bytes,
+                motion_bytes: plan
+                    .motion()
+                    .advanced()
+                    .map_or(0, |motion| motion.resources().total_bytes),
+            })
+        })();
+        let scope_error = [
+            ("out of memory", pollster::block_on(out_of_memory.pop())),
+            ("internal/backend", pollster::block_on(internal.pop())),
+            ("validation", pollster::block_on(validation.pop())),
+        ]
+        .into_iter()
+        .find_map(|(kind, error)| error.map(|error| format!("{kind}: {error}")));
+        match (built, scope_error) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Some(message)) => Err(CompositionGpuError::ResourceCreation(message)),
+            (Ok(prepared), None) => Ok(prepared),
+        }
+    }
+
+    fn encode(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        timing: CompositionFrameTiming,
+        motion_input: CompositionMotionFrameInput<'_>,
+        scope_readback: &mut Option<PreparedScopeRecorderReadback>,
+    ) -> Result<(), CompositionGpuError> {
+        if self.topology_signature != plan.topology_signature() {
+            return Err(CompositionGpuError::TopologyNotPrepared {
+                prepared: Some(self.topology_signature),
+                requested: plan.topology_signature(),
+            });
+        }
+        self.discard_frame_history();
+        let allocations_before = self.allocation_snapshot();
+        self.write_uniforms(queue, plan)?;
+        if let (Some(resources), Some(motion_plan)) = (&mut self.motion, plan.motion().advanced()) {
+            resources.begin_frame(
+                queue,
+                motion_plan,
+                timing.temporal_input(),
+                MotionFrameInput {
+                    attachments: motion_input.attachments,
+                    held_scopes: motion_input.held_scopes,
+                },
+            )?;
+            for field in motion_plan
+                .fields()
+                .iter()
+                .filter(|field| field.scope != VisualScopeId::Master)
+            {
+                resources.encode_field_scope(encoder, motion_plan, field.scope)?;
+            }
+        }
+
+        for surface in [
+            HostSurface::A,
+            HostSurface::B,
+            HostSurface::Program,
+            HostSurface::GroupScratch,
+        ] {
+            self.host.encode_clear(
+                encoder,
+                self.host.surface(surface).view,
+                wgpu::Color::TRANSPARENT,
+            );
+        }
+        let rack_zero = self
+            .rack
+            .surface(1)
+            .ok_or_else(|| CompositionGpuError::InvalidSchedule("rack scratch 1 missing".into()))?;
+        self.host
+            .encode_clear(encoder, rack_zero.view, wgpu::Color::TRANSPARENT);
+
+        self.stage_previous_prelocal(queue, encoder, plan)?;
+        self.capture_root_prefix(queue, encoder, plan, 0)?;
+
+        let mut completed_root_items = 0_usize;
+        for schedule_index in 0..self.root_schedule.len() {
+            let task = self.root_schedule[schedule_index].task;
+            match task {
+                RootTask::Layer(layer_id) => {
+                    self.execute_layer(queue, encoder, plan, layer_id)?;
+                    self.capture_scope_output(
+                        encoder,
+                        VisualScopeId::Layer(layer_id),
+                        HostSurface::Ping,
+                        scope_readback,
+                    )?;
+                }
+                RootTask::Group(group_id) => {
+                    self.execute_group(
+                        queue,
+                        encoder,
+                        plan,
+                        group_id,
+                        completed_root_items,
+                        scope_readback,
+                    )?;
+                }
+            }
+
+            for drain_index in 0..self.root_schedule[schedule_index].drains.len() {
+                let admission = self.root_schedule[schedule_index].drains[drain_index];
+                self.load_scheduled_source(encoder, admission.source)?;
+                match admission.item {
+                    RootTask::Layer(layer_id) => {
+                        self.admit_layer(queue, encoder, plan, layer_id, None)?;
+                    }
+                    RootTask::Group(group_id) => {
+                        self.admit_group(queue, encoder, plan, group_id)?;
+                    }
+                }
+                completed_root_items += 1;
+                self.capture_root_prefix(queue, encoder, plan, completed_root_items)?;
+            }
+        }
+
+        self.host.encode_bus(
+            queue,
+            encoder,
+            &self.bus_inputs,
+            self.host.surface(HostSurface::Ping).view,
+            plan.bus_crossfade(),
+        );
+        self.execute_master(queue, encoder, plan, timing)?;
+        if let (Some(resources), Some(motion_plan)) = (&self.motion, plan.motion().advanced()) {
+            resources.encode_field_scope(encoder, motion_plan, VisualScopeId::Master)?;
+        }
+        self.execute_motion_scope(encoder, plan, VisualScopeId::Master)?;
+        self.capture_scope_output(
+            encoder,
+            VisualScopeId::Master,
+            HostSurface::Ping,
+            scope_readback,
+        )?;
+
+        // Every non-Program Previous tap writes the inactive parity directly.
+        // Publishing is a CPU parity swap in `commit_frame_history`; an
+        // abandoned/submitted-but-rejected frame therefore cannot overwrite
+        // the committed image read by the next accepted frame.
+        if self
+            .taps
+            .iter()
+            .any(|tap| matches!(tap.backing, TapBacking::Previous { staged: false, .. }))
+        {
+            return Err(CompositionGpuError::InvalidSchedule(
+                "a previous-frame tap producer did not stage this frame".into(),
+            ));
+        }
+        self.host
+            .encode_stage_program_history(encoder, self.host.surface(HostSurface::Program).texture);
+        self.history_staged = true;
+
+        if allocations_before != self.allocation_snapshot() {
+            return Err(CompositionGpuError::InvalidSchedule(
+                "warmed encode changed the GPU allocation snapshot".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn allocation_snapshot(&self) -> CompositionAllocationSnapshot {
+        CompositionAllocationSnapshot {
+            host_objects: self.host.allocation_snapshot().total(),
+            rack_objects: self.rack.allocation_snapshot().total(),
+            retained_textures: self.retained_textures,
+            retained_views: self.retained_views,
+            executor_bindings: self.executor_bindings,
+            readback_objects: 0,
+            readback_bytes: 0,
+            readback_staging_bytes: 0,
+            readback_texture_bytes: 0,
+            creative_bytes: self.creative_bytes,
+            motion_bytes: self.motion_bytes,
+        }
+    }
+
+    fn commit_frame_history(&mut self) {
+        if !self.history_staged {
+            return;
+        }
+        self.host.commit_frame_history();
+        self.tap_history_read_index = 1 - self.tap_history_read_index;
+        if self.host.program_history_views().is_some() {
+            debug_assert_eq!(
+                self.host.program_history_read_index(),
+                self.tap_history_read_index
+            );
+        }
+        for tap in &mut self.taps {
+            if let TapBacking::Previous {
+                initialized,
+                staged,
+                ..
+            } = &mut tap.backing
+            {
+                if *staged {
+                    *initialized = true;
+                    *staged = false;
+                }
+            }
+        }
+        if let Some(motion) = &mut self.motion {
+            motion.commit_frame();
+        }
+        self.history_staged = false;
+    }
+
+    fn discard_frame_history(&mut self) {
+        self.host.discard_frame_history();
+        if let Some(motion) = &mut self.motion {
+            motion.discard_frame();
+        }
+        for tap in &mut self.taps {
+            if let TapBacking::Previous { staged, .. } = &mut tap.backing {
+                *staged = false;
+            }
+        }
+        self.history_staged = false;
+    }
+
+    fn write_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        plan: &AdvancedCompositionPlan,
+    ) -> Result<(), CompositionGpuError> {
+        for layer in plan.layers() {
+            let base_index = layer.base_layer_index;
+            self.host.write_effect_uniform(
+                queue,
+                self.prelocal_slots[&layer.stable_id],
+                &plan.base().layer_pre_passes()[base_index],
+            )?;
+            if let Some(slot) = self.exact_layer_slots.get(&layer.stable_id) {
+                self.host.write_effect_uniform(
+                    queue,
+                    *slot,
+                    &plan.base().layer_passes()[base_index],
+                )?;
+            }
+            self.write_execution_effect_uniforms(
+                queue,
+                VisualScopeId::Layer(layer.stable_id),
+                &layer.execution,
+            )?;
+            let evaluated = &plan.base().layers()[base_index];
+            self.host.write_composite_uniform(
+                queue,
+                self.composite_slots[&VisualScopeId::Layer(layer.stable_id)],
+                &HostCompositeUniforms::new(evaluated.opacity, evaluated.blend_mode),
+            )?;
+            if let Some(matte) = layer.legacy_matte {
+                let consumer = ImageTapConsumer::LayerMatte {
+                    layer_id: layer.stable_id,
+                };
+                let valid = self
+                    .tap_index(consumer)
+                    .is_some_and(|index| self.tap_ready(index));
+                let mut params = matte.params;
+                params.donor_valid = valid;
+                self.host.write_matte_uniform(
+                    queue,
+                    self.matte_slots[&consumer],
+                    &MatteCompositeUniforms::new(
+                        evaluated.opacity,
+                        evaluated.blend_mode.as_u32(),
+                        params,
+                    ),
+                )?;
+            }
+        }
+        for group in plan.groups() {
+            self.write_execution_effect_uniforms(
+                queue,
+                VisualScopeId::Group(group.id),
+                &group.execution,
+            )?;
+            self.host.write_composite_uniform(
+                queue,
+                self.composite_slots[&VisualScopeId::Group(group.id)],
+                &HostCompositeUniforms::new(group.opacity, BlendMode::Normal),
+            )?;
+            if let Some(matte) = group.matte {
+                let consumer = ImageTapConsumer::GroupMatte { group_id: group.id };
+                let valid = self
+                    .tap_index(consumer)
+                    .is_some_and(|index| self.tap_ready(index));
+                self.host.write_matte_uniform(
+                    queue,
+                    self.matte_slots[&consumer],
+                    &MatteCompositeUniforms::new(
+                        1.0,
+                        BlendMode::Normal.as_u32(),
+                        runtime_matte_params(matte, valid),
+                    ),
+                )?;
+            }
+        }
+        self.write_execution_effect_uniforms(
+            queue,
+            VisualScopeId::Master,
+            &plan.master().execution,
+        )?;
+        self.host.write_composite_uniform(
+            queue,
+            self.prefix_composite_slot,
+            &HostCompositeUniforms::new(1.0, BlendMode::Normal),
+        )?;
+        Ok(())
+    }
+
+    fn write_execution_effect_uniforms(
+        &self,
+        queue: &wgpu::Queue,
+        scope: VisualScopeId,
+        execution: &EvaluatedScopeExecution,
+    ) -> Result<(), CompositionGpuError> {
+        for (index, step) in execution.steps().iter().enumerate() {
+            let pass = match step {
+                EvaluatedScopeStep::MaterializeSpatial { pass, .. }
+                | EvaluatedScopeStep::LegacyCanonical { pass, .. } => pass,
+                EvaluatedScopeStep::CollisionRack { .. }
+                | EvaluatedScopeStep::LegacyTemporal { .. }
+                | EvaluatedScopeStep::GroupMatte { .. } => continue,
+            };
+            self.host
+                .write_effect_uniform(queue, self.effect_slots[&(scope, index)], pass)?;
+        }
+        Ok(())
+    }
+
+    fn tap_index(&self, consumer: ImageTapConsumer) -> Option<usize> {
+        self.taps
+            .iter()
+            .position(|tap| tap.planned.consumer == consumer)
+    }
+
+    fn tap_ready(&self, index: usize) -> bool {
+        match self.taps[index].backing {
+            TapBacking::Transparent => false,
+            TapBacking::ProgramHistory => self.host.program_history_initialized(),
+            TapBacking::CurrentPreLocal { .. } | TapBacking::Current(_) => true,
+            TapBacking::Previous { initialized, .. } => initialized,
+        }
+    }
+
+    fn stage_previous_prelocal(
+        &mut self,
+        _queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+    ) -> Result<(), CompositionGpuError> {
+        for index in 0..self.taps.len() {
+            let layer_id = match self.taps[index].planned.resolved {
+                PlannedImageSource::SelectedLayer {
+                    layer_id,
+                    stage: LayerImageStage::PreLocalEffects,
+                } if self.taps[index].planned.origin.timing() == EdgeTiming::PreviousFrame => {
+                    layer_id
+                }
+                _ => continue,
+            };
+            let write_index = 1 - self.tap_history_read_index;
+            let TapBacking::Previous {
+                surfaces, staged, ..
+            } = &mut self.taps[index].backing
+            else {
+                return Err(CompositionGpuError::InvalidSchedule(
+                    "previous PreLocal tap lacks history staging".into(),
+                ));
+            };
+            self.host.encode_effect(
+                encoder,
+                &self.external_effects[&layer_id],
+                &surfaces[write_index].view,
+                self.prelocal_slots[&layer_id],
+            )?;
+            *staged = true;
+            let _ = plan;
+        }
+        Ok(())
+    }
+
+    fn ensure_current_prelocal(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        tap_index: usize,
+    ) -> Result<(), CompositionGpuError> {
+        let PlannedImageSource::SelectedLayer {
+            layer_id,
+            stage: LayerImageStage::PreLocalEffects,
+        } = self.taps[tap_index].planned.resolved
+        else {
+            return Ok(());
+        };
+        if self.taps[tap_index].planned.origin.timing() != EdgeTiming::CurrentFrame {
+            return Ok(());
+        }
+        let surface = self.prelocal_surfaces.get(&layer_id).ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(format!(
+                "current PreLocal donor {} has no retained surface",
+                layer_id.get()
+            ))
+        })?;
+        self.host.encode_effect(
+            encoder,
+            &self.external_effects[&layer_id],
+            &surface.view,
+            self.prelocal_slots[&layer_id],
+        )?;
+        Ok(())
+    }
+
+    fn capture_scope_output(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        scope: VisualScopeId,
+        source: HostSurface,
+        scope_readback: &mut Option<PreparedScopeRecorderReadback>,
+    ) -> Result<(), CompositionGpuError> {
+        let source = self.host.surface(source);
+        let dimensions = self.host.dimensions();
+        let write_index = 1 - self.tap_history_read_index;
+        for tap in &mut self.taps {
+            if tap_boundary_scope(&tap.planned) == Some(scope) {
+                stage_tap_from_texture(encoder, source.texture, tap, dimensions, write_index);
+            }
+        }
+        if let Some(readback) = scope_readback {
+            readback.capture(encoder, &self.host, &self.present, scope)?;
+        }
+        Ok(())
+    }
+
+    fn capture_root_prefix(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        preceding_root_outputs: usize,
+    ) -> Result<(), CompositionGpuError> {
+        self.capture_prefix_with_crossfade(
+            queue,
+            encoder,
+            CompositePrefix::Root {
+                preceding_root_outputs,
+            },
+            plan.bus_crossfade(),
+        )
+    }
+
+    fn capture_prefix_with_crossfade(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        prefix: CompositePrefix,
+        crossfade: f32,
+    ) -> Result<(), CompositionGpuError> {
+        if !self.taps.iter().any(|tap| {
+            matches!(tap.planned.resolved, PlannedImageSource::AllBelow(candidate) if candidate == prefix)
+        }) {
+            return Ok(());
+        }
+        self.host.encode_bus(
+            queue,
+            encoder,
+            &self.bus_inputs,
+            self.host.surface(HostSurface::Ping).view,
+            crossfade,
+        );
+        let source_surface = match prefix {
+            CompositePrefix::Root { .. } => HostSurface::Ping,
+            CompositePrefix::GroupMember { .. } => {
+                self.host.encode_composite(
+                    encoder,
+                    &self.prefix_group_composite,
+                    self.host.surface(HostSurface::Pong).view,
+                    self.prefix_composite_slot,
+                )?;
+                HostSurface::Pong
+            }
+        };
+        let source = self.host.surface(source_surface);
+        let dimensions = self.host.dimensions();
+        let write_index = 1 - self.tap_history_read_index;
+        for tap in &mut self.taps {
+            if matches!(tap.planned.resolved, PlannedImageSource::AllBelow(candidate) if candidate == prefix)
+            {
+                stage_tap_from_texture(encoder, source.texture, tap, dimensions, write_index);
+            }
+        }
+        Ok(())
+    }
+
+    fn load_scheduled_source(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source: ScheduledSource,
+    ) -> Result<(), CompositionGpuError> {
+        let ScheduledSource::RetainedTap(index) = source else {
+            return Ok(());
+        };
+        let TapBacking::Current(surface) = &self.taps[index].backing else {
+            return Err(CompositionGpuError::InvalidSchedule(
+                "late structural admission did not reference a current retained tap".into(),
+            ));
+        };
+        copy_texture(
+            encoder,
+            &surface.texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        Ok(())
+    }
+
+    fn encode_effect_from_ping(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        slot: HostUniformSlot,
+    ) -> Result<(), CompositionGpuError> {
+        self.host.encode_effect(
+            encoder,
+            &self.ping_effect,
+            self.host.surface(HostSurface::Pong).view,
+            slot,
+        )?;
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Pong).texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        Ok(())
+    }
+
+    fn execute_motion_scope(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        scope: VisualScopeId,
+    ) -> Result<(), CompositionGpuError> {
+        let (Some(resources), Some(motion_plan)) = (&self.motion, plan.motion().advanced()) else {
+            return Ok(());
+        };
+        let scratch = self.rack.surface(0).ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule("rack scratch 0 missing for motion".into())
+        })?;
+        let ping = self.host.surface(HostSurface::Ping);
+        let pong = self.host.surface(HostSurface::Pong);
+        resources.encode_scope(
+            encoder,
+            motion_plan,
+            scope,
+            ping.texture,
+            pong.texture,
+            pong.view,
+            scratch.texture,
+            scratch.view,
+            self.host.dimensions(),
+        )?;
+        Ok(())
+    }
+
+    fn execute_layer(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        layer_id: StableLayerId,
+    ) -> Result<(), CompositionGpuError> {
+        let layer = layer_plan(plan, layer_id)?;
+        if layer.execution.is_exact_legacy() {
+            self.host.encode_effect(
+                encoder,
+                &self.external_effects[&layer_id],
+                self.host.surface(HostSurface::Ping).view,
+                self.exact_layer_slots[&layer_id],
+            )?;
+            self.execute_motion_scope(encoder, plan, VisualScopeId::Layer(layer_id))?;
+            return Ok(());
+        }
+        let scope = VisualScopeId::Layer(layer_id);
+        for (index, step) in layer.execution.steps().iter().enumerate() {
+            match step {
+                EvaluatedScopeStep::MaterializeSpatial { .. } => {
+                    if index == 0 {
+                        self.host.encode_effect(
+                            encoder,
+                            &self.external_effects[&layer_id],
+                            self.host.surface(HostSurface::Ping).view,
+                            self.effect_slots[&(scope, index)],
+                        )?;
+                    } else {
+                        self.encode_effect_from_ping(encoder, self.effect_slots[&(scope, index)])?;
+                    }
+                }
+                EvaluatedScopeStep::LegacyCanonical { .. } => {
+                    self.encode_effect_from_ping(encoder, self.effect_slots[&(scope, index)])?;
+                }
+                EvaluatedScopeStep::CollisionRack {
+                    segment_index,
+                    plan: rack_plan,
+                } => self.execute_rack_segment(
+                    queue,
+                    encoder,
+                    plan,
+                    scope,
+                    *segment_index,
+                    rack_plan,
+                )?,
+                EvaluatedScopeStep::LegacyTemporal { .. }
+                | EvaluatedScopeStep::GroupMatte { .. } => {
+                    return Err(CompositionGpuError::InvalidSchedule(format!(
+                        "layer {} contains a non-layer host boundary",
+                        layer_id.get()
+                    )));
+                }
+            }
+        }
+        self.execute_motion_scope(encoder, plan, scope)?;
+        Ok(())
+    }
+
+    fn execute_rack_segment(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        scope: VisualScopeId,
+        segment_index: u8,
+        rack_plan: &crate::renderer::rack::CollisionRackPlan,
+    ) -> Result<(), CompositionGpuError> {
+        let prepared_index = self
+            .rack_segments
+            .iter()
+            .position(|segment| segment.scope == scope && segment.segment_index == segment_index)
+            .ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "rack segment {segment_index} for {scope:?} was not prepared"
+                ))
+            })?;
+        let prelocal = self.rack_segments[prepared_index]
+            .tap_indices
+            .iter()
+            .find_map(|(_, _, tap_index)| {
+                matches!(
+                    self.taps[*tap_index].backing,
+                    TapBacking::CurrentPreLocal { .. }
+                )
+                .then_some(*tap_index)
+            });
+        if let Some(tap_index) = prelocal {
+            self.ensure_current_prelocal(encoder, tap_index)?;
+        }
+        for binding_index in 0..self.rack_segments[prepared_index].tap_indices.len() {
+            let (node_id, tap, tap_index) =
+                self.rack_segments[prepared_index].tap_indices[binding_index];
+            let valid = self.tap_ready(tap_index);
+            let updated = self.rack_segments[prepared_index].bindings[self.tap_history_read_index]
+                .set_valid(node_id, tap, valid);
+            debug_assert!(updated);
+        }
+        let report = self.rack.encode_at(
+            queue,
+            encoder,
+            rack_plan,
+            &self.ping_rack_source,
+            &self.rack_segments[prepared_index].bindings[self.tap_history_read_index],
+            self.rack_segments[prepared_index].uniform_base_slot,
+            plan.base().context().time_seconds,
+        )?;
+        let output = self.rack.output(report);
+        copy_texture(
+            encoder,
+            output.texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        Ok(())
+    }
+
+    fn execute_group(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        group_id: GroupId,
+        preceding_root_outputs: usize,
+        scope_readback: &mut Option<PreparedScopeRecorderReadback>,
+    ) -> Result<(), CompositionGpuError> {
+        let group = group_plan(plan, group_id)?;
+        self.host.encode_clear(
+            encoder,
+            self.host.surface(HostSurface::GroupScratch).view,
+            wgpu::Color::TRANSPARENT,
+        );
+        self.capture_prefix_with_crossfade(
+            queue,
+            encoder,
+            CompositePrefix::GroupMember {
+                group_id,
+                preceding_root_outputs,
+                preceding_members: 0,
+            },
+            plan.bus_crossfade(),
+        )?;
+
+        let schedule_len = self
+            .member_schedules
+            .get(&group_id)
+            .map_or(0, |schedule| schedule.len());
+        let mut completed_members = 0_usize;
+        for schedule_index in 0..schedule_len {
+            let layer_id = self.member_schedules[&group_id][schedule_index].layer_id;
+            self.execute_layer(queue, encoder, plan, layer_id)?;
+            self.capture_scope_output(
+                encoder,
+                VisualScopeId::Layer(layer_id),
+                HostSurface::Ping,
+                scope_readback,
+            )?;
+            let drain_len = self.member_schedules[&group_id][schedule_index]
+                .drains
+                .len();
+            for drain_index in 0..drain_len {
+                let admission =
+                    self.member_schedules[&group_id][schedule_index].drains[drain_index];
+                self.load_scheduled_source(encoder, admission.source)?;
+                self.admit_layer(queue, encoder, plan, admission.item, Some(group_id))?;
+                completed_members += 1;
+                self.capture_prefix_with_crossfade(
+                    queue,
+                    encoder,
+                    CompositePrefix::GroupMember {
+                        group_id,
+                        preceding_root_outputs,
+                        preceding_members: completed_members,
+                    },
+                    plan.bus_crossfade(),
+                )?;
+            }
+        }
+
+        // GroupScratch is the authoritative member composite. A group whose
+        // first authored operation is a rack node has no MaterializeSpatial
+        // host step to seed Ping, so establish that boundary explicitly.
+        // A leading spatial step may overwrite Ping from the same scratch
+        // source; the copy is intentionally harmless and allocation-free.
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::GroupScratch).texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        if !group.bypass {
+            let scope = VisualScopeId::Group(group_id);
+            for (index, step) in group.execution.steps().iter().enumerate() {
+                match step {
+                    EvaluatedScopeStep::MaterializeSpatial { .. } => {
+                        if index == 0 {
+                            self.host.encode_effect(
+                                encoder,
+                                &self.group_effect,
+                                self.host.surface(HostSurface::Ping).view,
+                                self.effect_slots[&(scope, index)],
+                            )?;
+                        } else {
+                            self.encode_effect_from_ping(
+                                encoder,
+                                self.effect_slots[&(scope, index)],
+                            )?;
+                        }
+                    }
+                    EvaluatedScopeStep::LegacyCanonical { .. } => {
+                        self.encode_effect_from_ping(encoder, self.effect_slots[&(scope, index)])?;
+                    }
+                    EvaluatedScopeStep::CollisionRack {
+                        segment_index,
+                        plan: rack_plan,
+                    } => self.execute_rack_segment(
+                        queue,
+                        encoder,
+                        plan,
+                        scope,
+                        *segment_index,
+                        rack_plan,
+                    )?,
+                    EvaluatedScopeStep::GroupMatte { .. } => {
+                        self.execute_group_matte(encoder, plan, group_id)?;
+                    }
+                    EvaluatedScopeStep::LegacyTemporal { .. } => {
+                        return Err(CompositionGpuError::InvalidSchedule(format!(
+                            "group {} contains LegacyTemporal",
+                            group_id.get()
+                        )));
+                    }
+                }
+            }
+        }
+        self.capture_scope_output(
+            encoder,
+            VisualScopeId::Group(group_id),
+            HostSurface::Ping,
+            scope_readback,
+        )?;
+        Ok(())
+    }
+
+    fn execute_group_matte(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        group_id: GroupId,
+    ) -> Result<(), CompositionGpuError> {
+        let consumer = ImageTapConsumer::GroupMatte { group_id };
+        if let Some(tap_index) = self.tap_index(consumer) {
+            self.ensure_current_prelocal(encoder, tap_index)?;
+        }
+        let zero = self
+            .rack
+            .surface(1)
+            .ok_or_else(|| CompositionGpuError::InvalidSchedule("rack scratch 1 missing".into()))?;
+        let target = self
+            .rack
+            .surface(0)
+            .ok_or_else(|| CompositionGpuError::InvalidSchedule("rack scratch 0 missing".into()))?;
+        self.host
+            .encode_clear(encoder, zero.view, wgpu::Color::TRANSPARENT);
+        self.host.encode_matte(
+            encoder,
+            &self.matte_bindings.get(&consumer).ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "group {} matte binding is absent",
+                    group_id.get()
+                ))
+            })?[self.tap_history_read_index],
+            target.view,
+            self.matte_slots[&consumer],
+        )?;
+        copy_texture(
+            encoder,
+            target.texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        let _ = plan;
+        Ok(())
+    }
+
+    fn admit_layer(
+        &mut self,
+        _queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        layer_id: StableLayerId,
+        group_id: Option<GroupId>,
+    ) -> Result<(), CompositionGpuError> {
+        let layer = layer_plan(plan, layer_id)?;
+        if layer.group_id != group_id {
+            return Err(CompositionGpuError::InvalidSchedule(format!(
+                "layer {} admission group changed after prepare",
+                layer_id.get()
+            )));
+        }
+        let evaluated = &plan.base().layers()[layer.base_layer_index];
+        let visible = evaluated.visible
+            && evaluated.opacity.is_finite()
+            && evaluated.opacity > 0.0
+            && (group_id.is_some() || layer.admitted_to_program);
+        if !visible {
+            return Ok(());
+        }
+        if layer.admitted_to_program {
+            self.apply_master_admission(encoder, plan, layer_id)?;
+        }
+        let destination = if group_id.is_some() {
+            HostSurface::GroupScratch
+        } else {
+            bus_surface(layer.bus)
+        };
+        if layer.legacy_matte.is_some() {
+            let consumer = ImageTapConsumer::LayerMatte { layer_id };
+            let tap_index = self.tap_index(consumer).ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "layer {} matte has no planned donor",
+                    layer_id.get()
+                ))
+            })?;
+            self.ensure_current_prelocal(encoder, tap_index)?;
+            if !self.tap_ready(tap_index) {
+                let zero = self.rack.surface(1).ok_or_else(|| {
+                    CompositionGpuError::InvalidSchedule("rack scratch 1 missing".into())
+                })?;
+                self.host
+                    .encode_clear(encoder, zero.view, wgpu::Color::TRANSPARENT);
+            }
+            let target = self.rack.surface(0).ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule("rack scratch 0 missing".into())
+            })?;
+            self.host.encode_matte(
+                encoder,
+                &self.matte_bindings[&consumer][self.tap_history_read_index],
+                target.view,
+                self.matte_slots[&consumer],
+            )?;
+            copy_texture(
+                encoder,
+                target.texture,
+                self.host.surface(destination).texture,
+                self.host.dimensions(),
+            );
+        } else {
+            let inputs = match destination {
+                HostSurface::A => &self.composite_a,
+                HostSurface::B => &self.composite_b,
+                HostSurface::Program => &self.composite_program,
+                HostSurface::GroupScratch => &self.composite_group,
+                HostSurface::Ping | HostSurface::Pong => {
+                    return Err(CompositionGpuError::InvalidSchedule(
+                        "layer admission selected a transient surface".into(),
+                    ));
+                }
+            };
+            self.host.encode_composite(
+                encoder,
+                inputs,
+                self.host.surface(HostSurface::Pong).view,
+                self.composite_slots[&VisualScopeId::Layer(layer_id)],
+            )?;
+            copy_texture(
+                encoder,
+                self.host.surface(HostSurface::Pong).texture,
+                self.host.surface(destination).texture,
+                self.host.dimensions(),
+            );
+        }
+        Ok(())
+    }
+
+    fn apply_master_admission(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        layer_id: StableLayerId,
+    ) -> Result<(), CompositionGpuError> {
+        if plan.master().canonical_bypass_layers.contains(&layer_id) {
+            return Ok(());
+        }
+        for (index, step) in plan.master().execution.steps().iter().enumerate() {
+            let application = match step {
+                EvaluatedScopeStep::MaterializeSpatial { application, .. }
+                | EvaluatedScopeStep::LegacyCanonical { application, .. } => application,
+                _ => continue,
+            };
+            if *application == LegacyCanonicalApplication::PreCompositeLayerAdmission {
+                self.encode_effect_from_ping(
+                    encoder,
+                    self.effect_slots[&(VisualScopeId::Master, index)],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn admit_group(
+        &self,
+        _queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        group_id: GroupId,
+    ) -> Result<(), CompositionGpuError> {
+        let group = group_plan(plan, group_id)?;
+        if !group.span.admitted_to_program || !group.opacity.is_finite() || group.opacity <= 0.0 {
+            return Ok(());
+        }
+        let destination = bus_surface(group.bus);
+        let inputs = match destination {
+            HostSurface::A => &self.composite_a,
+            HostSurface::B => &self.composite_b,
+            HostSurface::Program => &self.composite_program,
+            _ => unreachable!(),
+        };
+        self.host.encode_composite(
+            encoder,
+            inputs,
+            self.host.surface(HostSurface::Pong).view,
+            self.composite_slots[&VisualScopeId::Group(group_id)],
+        )?;
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Pong).texture,
+            self.host.surface(destination).texture,
+            self.host.dimensions(),
+        );
+        Ok(())
+    }
+
+    fn execute_master(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        timing: CompositionFrameTiming,
+    ) -> Result<(), CompositionGpuError> {
+        let mut captured_clean_program = false;
+        for (index, step) in plan.master().execution.steps().iter().enumerate() {
+            match step {
+                EvaluatedScopeStep::MaterializeSpatial { application, .. }
+                | EvaluatedScopeStep::LegacyCanonical { application, .. } => {
+                    if *application == LegacyCanonicalApplication::ScopeLocal {
+                        self.encode_effect_from_ping(
+                            encoder,
+                            self.effect_slots[&(VisualScopeId::Master, index)],
+                        )?;
+                    }
+                }
+                EvaluatedScopeStep::CollisionRack {
+                    segment_index,
+                    plan: rack_plan,
+                } => self.execute_rack_segment(
+                    queue,
+                    encoder,
+                    plan,
+                    VisualScopeId::Master,
+                    *segment_index,
+                    rack_plan,
+                )?,
+                EvaluatedScopeStep::LegacyTemporal { params } => {
+                    if !captured_clean_program {
+                        copy_texture(
+                            encoder,
+                            self.host.surface(HostSurface::Ping).texture,
+                            self.host.surface(HostSurface::Program).texture,
+                            self.host.dimensions(),
+                        );
+                        captured_clean_program = true;
+                    }
+                    let ping = self.host.surface(HostSurface::Ping);
+                    let pong = self.host.surface(HostSurface::Pong);
+                    self.host.encode_temporal(
+                        queue,
+                        encoder,
+                        &self.temporal,
+                        ping.texture,
+                        pong.texture,
+                        pong.view,
+                        params,
+                        HostFrameTiming::from_temporal_input(timing.temporal_input()),
+                    );
+                    copy_texture(encoder, pong.texture, ping.texture, self.host.dimensions());
+                }
+                EvaluatedScopeStep::GroupMatte { .. } => {
+                    return Err(CompositionGpuError::InvalidSchedule(
+                        "master execution contains a group matte".into(),
+                    ));
+                }
+            }
+        }
+        if !captured_clean_program {
+            copy_texture(
+                encoder,
+                self.host.surface(HostSurface::Ping).texture,
+                self.host.surface(HostSurface::Program).texture,
+                self.host.dimensions(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn create_retained_surface(
+    device: &wgpu::Device,
+    dimensions: [u32; 2],
+    label: &'static str,
+) -> RetainedSurface {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: dimensions[0],
+            height: dimensions[1],
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: COMPOSITION_WORKING_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    RetainedSurface { texture, view }
+}
+
+fn prepare_tap_surfaces(
+    device: &wgpu::Device,
+    dimensions: [u32; 2],
+    planned: &[PlannedImageTap],
+) -> Result<Vec<PreparedTap>, CompositionGpuError> {
+    Ok(planned
+        .iter()
+        .cloned()
+        .map(|planned| {
+            let backing = if matches!(planned.resolved, PlannedImageSource::Transparent) {
+                TapBacking::Transparent
+            } else if matches!(planned.resolved, PlannedImageSource::ProgramHistory) {
+                TapBacking::ProgramHistory
+            } else if planned.origin.timing() == EdgeTiming::PreviousFrame {
+                TapBacking::Previous {
+                    surfaces: std::array::from_fn(|_| {
+                        create_retained_surface(
+                            device,
+                            dimensions,
+                            "Advanced composition previous tap parity",
+                        )
+                    }),
+                    initialized: false,
+                    staged: false,
+                }
+            } else if matches!(
+                planned.resolved,
+                PlannedImageSource::SelectedLayer {
+                    stage: LayerImageStage::PreLocalEffects,
+                    ..
+                }
+            ) {
+                let PlannedImageSource::SelectedLayer { layer_id, .. } = planned.resolved else {
+                    unreachable!("matched selected PreLocal source")
+                };
+                TapBacking::CurrentPreLocal { layer_id }
+            } else {
+                TapBacking::Current(create_retained_surface(
+                    device,
+                    dimensions,
+                    "Advanced composition current tap",
+                ))
+            };
+            PreparedTap { planned, backing }
+        })
+        .collect())
+}
+
+fn prepare_current_prelocal_surfaces(
+    device: &wgpu::Device,
+    dimensions: [u32; 2],
+    taps: &[PreparedTap],
+) -> BTreeMap<StableLayerId, RetainedSurface> {
+    let mut surfaces = BTreeMap::new();
+    for tap in taps {
+        let TapBacking::CurrentPreLocal { layer_id } = tap.backing else {
+            continue;
+        };
+        surfaces.entry(layer_id).or_insert_with(|| {
+            create_retained_surface(
+                device,
+                dimensions,
+                "Advanced composition current PreLocal donor",
+            )
+        });
+    }
+    surfaces
+}
+
+fn validate_actual_surface_ledger(
+    plan: &AdvancedCompositionPlan,
+    retain_program_history: bool,
+    taps: &[PreparedTap],
+    current_prelocal_surfaces: usize,
+) -> Result<(), CompositionGpuError> {
+    let tap_surfaces: u32 = taps
+        .iter()
+        .map(|tap| match tap.backing {
+            TapBacking::Current(_) => 1,
+            TapBacking::Previous { .. } => 2,
+            _ => 0,
+        })
+        .sum();
+    let actual = 6_u32
+        .checked_add(2)
+        .and_then(|value| value.checked_add(2 * u32::from(retain_program_history)))
+        .and_then(|value| value.checked_add(tap_surfaces))
+        .and_then(|value| value.checked_add(current_prelocal_surfaces as u32))
+        .ok_or_else(|| CompositionGpuError::InvalidSchedule("surface ledger overflowed".into()))?;
+    if actual != plan.resources().rgba16_surface_layers {
+        return Err(CompositionGpuError::InvalidSchedule(format!(
+            "resource ledger declares {} RGBA16 layers but executor allocates exactly {actual}",
+            plan.resources().rgba16_surface_layers
+        )));
+    }
+    Ok(())
+}
+
+fn prepared_tap_view<'a>(
+    host: &'a CompositionHost,
+    prelocal_surfaces: &'a BTreeMap<StableLayerId, RetainedSurface>,
+    zero: &'a wgpu::TextureView,
+    tap: &'a PreparedTap,
+    read_index: usize,
+) -> &'a wgpu::TextureView {
+    match &tap.backing {
+        TapBacking::Transparent => zero,
+        TapBacking::ProgramHistory => host
+            .program_history_views()
+            .map_or(zero, |views| views[read_index]),
+        TapBacking::CurrentPreLocal { layer_id } => prelocal_surfaces
+            .get(layer_id)
+            .map_or(zero, |surface| &surface.view),
+        TapBacking::Current(surface) => &surface.view,
+        TapBacking::Previous { surfaces, .. } => &surfaces[read_index].view,
+    }
+}
+
+fn tap_boundary_scope(tap: &PlannedImageTap) -> Option<VisualScopeId> {
+    match tap.resolved {
+        PlannedImageSource::Scope(scope) | PlannedImageSource::OneBelow(scope) => Some(scope),
+        PlannedImageSource::SelectedLayer {
+            layer_id,
+            stage: LayerImageStage::PostLocalEffects,
+        } => Some(VisualScopeId::Layer(layer_id)),
+        PlannedImageSource::SelectedLayer {
+            stage: LayerImageStage::PreLocalEffects,
+            ..
+        }
+        | PlannedImageSource::AllBelow(_)
+        | PlannedImageSource::ProgramHistory
+        | PlannedImageSource::Transparent => None,
+    }
+}
+
+fn stage_tap_from_texture(
+    encoder: &mut wgpu::CommandEncoder,
+    source: &wgpu::Texture,
+    tap: &mut PreparedTap,
+    dimensions: [u32; 2],
+    write_index: usize,
+) {
+    match &mut tap.backing {
+        TapBacking::Current(surface) => {
+            copy_texture(encoder, source, &surface.texture, dimensions);
+        }
+        TapBacking::Previous {
+            surfaces, staged, ..
+        } => {
+            copy_texture(encoder, source, &surfaces[write_index].texture, dimensions);
+            *staged = true;
+        }
+        TapBacking::Transparent
+        | TapBacking::ProgramHistory
+        | TapBacking::CurrentPreLocal { .. } => {}
+    }
+}
+
+fn copy_texture(
+    encoder: &mut wgpu::CommandEncoder,
+    source: &wgpu::Texture,
+    target: &wgpu::Texture,
+    dimensions: [u32; 2],
+) {
+    encoder.copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: source,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyTextureInfo {
+            texture: target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::Extent3d {
+            width: dimensions[0],
+            height: dimensions[1],
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
+fn runtime_matte_params(
+    matte: crate::visual_rack::RuntimeImageMatte,
+    donor_valid: bool,
+) -> ResolvedMatteParams {
+    ResolvedMatteParams {
+        channel: match matte.channel {
+            MatteChannel::Alpha => MatteChannelCode::Alpha,
+            MatteChannel::Luma => MatteChannelCode::Luma,
+            MatteChannel::Red => MatteChannelCode::Red,
+            MatteChannel::Green => MatteChannelCode::Green,
+            MatteChannel::Blue => MatteChannelCode::Blue,
+        },
+        invert: matte.invert,
+        amount: matte.amount,
+        threshold: matte.threshold,
+        softness: matte.softness,
+        donor_valid,
+    }
+    .sanitized()
+}
+
+type UniformSlotMaps = (
+    usize,
+    BTreeMap<(VisualScopeId, usize), HostUniformSlot>,
+    BTreeMap<StableLayerId, HostUniformSlot>,
+    BTreeMap<StableLayerId, HostUniformSlot>,
+    BTreeMap<VisualScopeId, HostUniformSlot>,
+    HostUniformSlot,
+    BTreeMap<ImageTapConsumer, HostUniformSlot>,
+);
+
+fn assign_uniform_slots(
+    plan: &AdvancedCompositionPlan,
+) -> Result<UniformSlotMaps, CompositionGpuError> {
+    fn next_slot(next: &mut u32) -> Result<HostUniformSlot, CompositionGpuError> {
+        let slot = HostUniformSlot(*next);
+        *next = next.checked_add(1).ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule("uniform slot count overflowed".into())
+        })?;
+        Ok(slot)
+    }
+
+    let mut next_effect = 0_u32;
+    let mut effect_slots = BTreeMap::new();
+    let mut exact_layer_slots = BTreeMap::new();
+    let mut prelocal_slots = BTreeMap::new();
+    for layer in plan.layers() {
+        prelocal_slots.insert(layer.stable_id, next_slot(&mut next_effect)?);
+        if layer.execution.is_exact_legacy() {
+            exact_layer_slots.insert(layer.stable_id, next_slot(&mut next_effect)?);
+        }
+        for (index, step) in layer.execution.steps().iter().enumerate() {
+            if matches!(
+                step,
+                EvaluatedScopeStep::MaterializeSpatial { .. }
+                    | EvaluatedScopeStep::LegacyCanonical { .. }
+            ) {
+                effect_slots.insert(
+                    (VisualScopeId::Layer(layer.stable_id), index),
+                    next_slot(&mut next_effect)?,
+                );
+            }
+        }
+    }
+    for group in plan.groups() {
+        for (index, step) in group.execution.steps().iter().enumerate() {
+            if matches!(
+                step,
+                EvaluatedScopeStep::MaterializeSpatial { .. }
+                    | EvaluatedScopeStep::LegacyCanonical { .. }
+            ) {
+                effect_slots.insert(
+                    (VisualScopeId::Group(group.id), index),
+                    next_slot(&mut next_effect)?,
+                );
+            }
+        }
+    }
+    for (index, step) in plan.master().execution.steps().iter().enumerate() {
+        if matches!(
+            step,
+            EvaluatedScopeStep::MaterializeSpatial { .. }
+                | EvaluatedScopeStep::LegacyCanonical { .. }
+        ) {
+            effect_slots.insert((VisualScopeId::Master, index), next_slot(&mut next_effect)?);
+        }
+    }
+
+    let mut composite_slots = BTreeMap::new();
+    let mut next_composite = 0_u32;
+    for layer in plan.layers() {
+        composite_slots.insert(
+            VisualScopeId::Layer(layer.stable_id),
+            next_slot(&mut next_composite)?,
+        );
+    }
+    for group in plan.groups() {
+        composite_slots.insert(
+            VisualScopeId::Group(group.id),
+            next_slot(&mut next_composite)?,
+        );
+    }
+    let prefix_composite_slot = next_slot(&mut next_composite)?;
+
+    let mut matte_slots = BTreeMap::new();
+    let mut next_matte = 0_u32;
+    for layer in plan
+        .layers()
+        .iter()
+        .filter(|layer| layer.legacy_matte.is_some())
+    {
+        matte_slots.insert(
+            ImageTapConsumer::LayerMatte {
+                layer_id: layer.stable_id,
+            },
+            next_slot(&mut next_matte)?,
+        );
+    }
+    for group in plan.groups().iter().filter(|group| group.matte.is_some()) {
+        matte_slots.insert(
+            ImageTapConsumer::GroupMatte { group_id: group.id },
+            next_slot(&mut next_matte)?,
+        );
+    }
+    Ok((
+        next_effect as usize,
+        effect_slots,
+        exact_layer_slots,
+        prelocal_slots,
+        composite_slots,
+        prefix_composite_slot,
+        matte_slots,
+    ))
+}
+
+fn layer_plan(
+    plan: &AdvancedCompositionPlan,
+    layer_id: StableLayerId,
+) -> Result<
+    &crate::evaluated_frame::evaluated_composition::EvaluatedLayerScopePlan,
+    CompositionGpuError,
+> {
+    plan.layers()
+        .iter()
+        .find(|layer| layer.stable_id == layer_id)
+        .ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(format!(
+                "stable layer {} is absent from the evaluated plan",
+                layer_id.get()
+            ))
+        })
+}
+
+fn group_plan(
+    plan: &AdvancedCompositionPlan,
+    group_id: GroupId,
+) -> Result<
+    &crate::evaluated_frame::evaluated_composition::EvaluatedGroupScopePlan,
+    CompositionGpuError,
+> {
+    plan.groups()
+        .iter()
+        .find(|group| group.id == group_id)
+        .ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(format!(
+                "group {} is absent from the evaluated plan",
+                group_id.get()
+            ))
+        })
+}
+
+const fn bus_surface(bus: BusAssignment) -> HostSurface {
+    match bus {
+        BusAssignment::A => HostSurface::A,
+        BusAssignment::B => HostSurface::B,
+        BusAssignment::Program => HostSurface::Program,
+    }
+}
+
+fn tap_index_for_consumer(
+    plan: &AdvancedCompositionPlan,
+    consumer: ImageTapConsumer,
+) -> Option<usize> {
+    plan.image_taps()
+        .iter()
+        .position(|tap| tap.consumer == consumer)
+}
+
+fn prepare_rack_segments(
+    device: &wgpu::Device,
+    plan: &AdvancedCompositionPlan,
+    host: &CompositionHost,
+    rack: &CollisionRackExecutor,
+    taps: &[PreparedTap],
+    prelocal_surfaces: &BTreeMap<StableLayerId, RetainedSurface>,
+) -> Result<Vec<PreparedRackSegment>, CompositionGpuError> {
+    let zero = rack
+        .surface(1)
+        .ok_or_else(|| CompositionGpuError::InvalidSchedule("rack scratch 1 missing".into()))?;
+    let mut prepared = Vec::new();
+    let mut next_uniform_slot = 0_usize;
+    let mut visit = |scope: VisualScopeId,
+                     execution: &EvaluatedScopeExecution|
+     -> Result<(), CompositionGpuError> {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::CollisionRack {
+                segment_index,
+                plan: rack_plan,
+            } = step
+            else {
+                continue;
+            };
+            let mut indices = Vec::new();
+            for pass in rack_plan.passes() {
+                let Some(tap) = pass.kind.image_tap() else {
+                    continue;
+                };
+                let consumer = ImageTapConsumer::RackNode {
+                    scope,
+                    node_id: pass.node_id,
+                };
+                let Some(tap_index) = tap_index_for_consumer(plan, consumer) else {
+                    continue;
+                };
+                indices.push((pass.node_id, tap, tap_index));
+            }
+            let prelocal_donors = indices
+                .iter()
+                .filter_map(|(_, _, tap_index)| match taps[*tap_index].backing {
+                    TapBacking::CurrentPreLocal { layer_id } => Some(layer_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if prelocal_donors.len() > 1 {
+                return Err(CompositionGpuError::InvalidSchedule(
+                    "a rack segment contains more than one current PreLocal donor".into(),
+                ));
+            }
+            let bindings = std::array::from_fn(|read_index| {
+                let inputs = indices
+                    .iter()
+                    .map(|(node_id, tap, tap_index)| {
+                        let view = match taps[*tap_index].backing {
+                            TapBacking::Transparent => None,
+                            _ => Some(prepared_tap_view(
+                                host,
+                                prelocal_surfaces,
+                                zero.view,
+                                &taps[*tap_index],
+                                read_index,
+                            )),
+                        };
+                        RackImageInput {
+                            node_id: *node_id,
+                            tap: *tap,
+                            view,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                rack.prepare_image_bindings(device, &inputs)
+            });
+            let [first, second] = bindings;
+            let uniform_base_slot = next_uniform_slot;
+            next_uniform_slot = next_uniform_slot
+                .checked_add(rack_plan.passes().len().saturating_add(1))
+                .ok_or_else(|| {
+                    CompositionGpuError::InvalidSchedule(
+                        "rack uniform slot count overflowed during preparation".into(),
+                    )
+                })?;
+            prepared.push(PreparedRackSegment {
+                scope,
+                segment_index: *segment_index,
+                uniform_base_slot,
+                bindings: [first?, second?],
+                tap_indices: indices.into_boxed_slice(),
+            });
+        }
+        Ok(())
+    };
+    for layer in plan.layers() {
+        visit(VisualScopeId::Layer(layer.stable_id), &layer.execution)?;
+    }
+    for group in plan.groups() {
+        visit(VisualScopeId::Group(group.id), &group.execution)?;
+    }
+    visit(VisualScopeId::Master, &plan.master().execution)?;
+    Ok(prepared)
+}
+
+fn rack_uniform_slot_count(plan: &AdvancedCompositionPlan) -> Result<usize, CompositionGpuError> {
+    let mut count = 0_usize;
+    let executions = plan
+        .layers()
+        .iter()
+        .map(|layer| &layer.execution)
+        .chain(plan.groups().iter().map(|group| &group.execution))
+        .chain(std::iter::once(&plan.master().execution));
+    for execution in executions {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::CollisionRack {
+                plan: rack_plan, ..
+            } = step
+            else {
+                continue;
+            };
+            count = count
+                .checked_add(rack_plan.passes().len().saturating_add(1))
+                .ok_or_else(|| {
+                    CompositionGpuError::InvalidSchedule(
+                        "rack uniform slot count overflowed during planning".into(),
+                    )
+                })?;
+        }
+    }
+    Ok(count.max(1))
+}
+
+fn tap_scope_producer(tap: &PreparedTap) -> Option<VisualScopeId> {
+    if tap.planned.origin.timing() != EdgeTiming::CurrentFrame {
+        return None;
+    }
+    match tap.planned.resolved {
+        PlannedImageSource::Scope(scope) | PlannedImageSource::OneBelow(scope) => Some(scope),
+        PlannedImageSource::SelectedLayer {
+            layer_id,
+            stage: LayerImageStage::PostLocalEffects,
+        } => Some(VisualScopeId::Layer(layer_id)),
+        PlannedImageSource::SelectedLayer {
+            stage: LayerImageStage::PreLocalEffects,
+            ..
+        }
+        | PlannedImageSource::AllBelow(_)
+        | PlannedImageSource::ProgramHistory
+        | PlannedImageSource::Transparent => None,
+    }
+}
+
+fn retained_scope_sources(
+    _plan: &AdvancedCompositionPlan,
+    taps: &[PreparedTap],
+) -> BTreeMap<VisualScopeId, usize> {
+    let mut retained = BTreeMap::new();
+    for (index, tap) in taps.iter().enumerate() {
+        if matches!(tap.backing, TapBacking::Current(_)) {
+            if let Some(scope) = tap_scope_producer(tap) {
+                retained.entry(scope).or_insert(index);
+            }
+        }
+    }
+    retained
+}
+
+fn scheduled_source(
+    scope: VisualScopeId,
+    current: VisualScopeId,
+    first: bool,
+    retained: &BTreeMap<VisualScopeId, usize>,
+) -> Result<ScheduledSource, CompositionGpuError> {
+    if scope == current && first {
+        return Ok(ScheduledSource::Ping);
+    }
+    retained
+        .get(&scope)
+        .copied()
+        .map(ScheduledSource::RetainedTap)
+        .ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(format!(
+                "scope {scope:?} executed before structural admission without a current retained tap"
+            ))
+        })
+}
+
+type BlockSchedules = (
+    Box<[RootScheduleEntry]>,
+    BTreeMap<GroupId, Box<[MemberScheduleEntry]>>,
+);
+
+fn build_block_schedules(
+    plan: &AdvancedCompositionPlan,
+    retained: &BTreeMap<VisualScopeId, usize>,
+) -> Result<BlockSchedules, CompositionGpuError> {
+    let root_desired = plan
+        .root()
+        .iter()
+        .map(|item| match *item {
+            RuntimeRootItem::Layer { layer_id, .. } => RootTask::Layer(layer_id),
+            RuntimeRootItem::Group { group_id } => RootTask::Group(group_id),
+        })
+        .collect::<Vec<_>>();
+    let grouped_layers: BTreeMap<_, _> = plan
+        .groups()
+        .iter()
+        .flat_map(|group| group.members.iter().map(move |id| (*id, group.id)))
+        .collect();
+    let mut root_execution = Vec::new();
+    for scope in plan.execution_order() {
+        let task = match *scope {
+            VisualScopeId::Layer(id) if !grouped_layers.contains_key(&id) => {
+                Some(RootTask::Layer(id))
+            }
+            VisualScopeId::Group(id) => Some(RootTask::Group(id)),
+            _ => None,
+        };
+        if let Some(task) = task {
+            root_execution.push(task);
+        }
+    }
+    if root_execution.len() != root_desired.len()
+        || root_execution
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != root_desired.len()
+    {
+        return Err(CompositionGpuError::InvalidSchedule(
+            "planner execution order did not contain every root block exactly once".into(),
+        ));
+    }
+    let mut rendered = BTreeSet::new();
+    let mut cursor = 0_usize;
+    let mut root_schedule = Vec::with_capacity(root_execution.len());
+    for task in root_execution {
+        rendered.insert(task);
+        let mut drains = Vec::new();
+        while root_desired
+            .get(cursor)
+            .is_some_and(|candidate| rendered.contains(candidate))
+        {
+            let item = root_desired[cursor];
+            let source = scheduled_source(
+                item.output_scope(),
+                task.output_scope(),
+                drains.is_empty(),
+                retained,
+            )?;
+            drains.push(ScheduledAdmission { item, source });
+            cursor += 1;
+        }
+        root_schedule.push(RootScheduleEntry {
+            task,
+            drains: drains.into_boxed_slice(),
+        });
+    }
+    if cursor != root_desired.len() {
+        return Err(CompositionGpuError::InvalidSchedule(
+            "root block schedule did not drain the complete back-to-front stack".into(),
+        ));
+    }
+
+    let mut member_schedules = BTreeMap::new();
+    for group in plan.groups() {
+        let desired = group.members.as_ref();
+        let execution = plan
+            .execution_order()
+            .iter()
+            .filter_map(|scope| match *scope {
+                VisualScopeId::Layer(id) if desired.contains(&id) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if execution.len() != desired.len() {
+            return Err(CompositionGpuError::InvalidSchedule(format!(
+                "group {} execution block lost a member",
+                group.id.get()
+            )));
+        }
+        let mut rendered = BTreeSet::new();
+        let mut cursor = 0_usize;
+        let mut entries = Vec::with_capacity(execution.len());
+        for layer_id in execution {
+            rendered.insert(layer_id);
+            let mut drains = Vec::new();
+            while desired
+                .get(cursor)
+                .is_some_and(|candidate| rendered.contains(candidate))
+            {
+                let item = desired[cursor];
+                let source = scheduled_source(
+                    VisualScopeId::Layer(item),
+                    VisualScopeId::Layer(layer_id),
+                    drains.is_empty(),
+                    retained,
+                )?;
+                drains.push(ScheduledAdmission { item, source });
+                cursor += 1;
+            }
+            entries.push(MemberScheduleEntry {
+                layer_id,
+                drains: drains.into_boxed_slice(),
+            });
+        }
+        if cursor != desired.len() {
+            return Err(CompositionGpuError::InvalidSchedule(format!(
+                "group {} member schedule did not drain completely",
+                group.id.get()
+            )));
+        }
+        member_schedules.insert(group.id, entries.into_boxed_slice());
+    }
+    Ok((root_schedule.into_boxed_slice(), member_schedules))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composition::{
+        GroupName, RuntimeComposition, RuntimeGroup, RuntimeGroupMembers, RuntimeRootItem,
+    };
+    use crate::effects::params::{
+        CollisionAtlasParams, TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
+        TemporalParams, TemporalTopology,
+    };
+    use crate::effects::EffectUniforms;
+    use crate::evaluated_frame::evaluated_composition::{
+        LayerMotionPlanInput, MotionCodecFrameFacts,
+    };
+    use crate::evaluated_frame::{
+        EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
+    };
+    use crate::modulation::ModMatrix;
+    use crate::motion::{
+        CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier,
+        MotionDeviceLimits, MotionDonor, MotionField, MotionFieldOrigin, MotionFieldSource,
+        MotionGrid, MotionParams, MotionVectorSample,
+    };
+    use crate::ntsc::NtscParams;
+    use crate::performance::SavedLayerPosition;
+    use crate::spatial::SpatialTransform;
+    use crate::temporal::{TemporalFrameEvents, TemporalFreezeState};
+    use crate::visual_rack::{
+        DigitalColorParams, LegacyRackScope, ResolvedImageTap, RuntimeImageMatte,
+        RuntimeMaskParams, RuntimeVisualNodeKind, RuntimeVisualRack,
+    };
+
+    #[test]
+    fn selective_error_is_stable_and_operator_visible() {
+        assert_eq!(
+            CompositionGpuError::UnsupportedSelectiveNtsc {
+                applying: 2,
+                bypassing: 1,
+            }
+            .to_string(),
+            "advanced composition cannot enter selective NTSC: 2 applying layer(s), 1 bypassing layer(s)"
+        );
+    }
+
+    #[test]
+    fn composition_timing_preserves_the_full_temporal_event_batch() {
+        let input = TemporalFrameInput::new(
+            1.0 / 59.94,
+            TemporalFreezeState::MediaFrozen,
+            true,
+            TemporalFrameEvents {
+                boundary_events: 2,
+                downbeat_events: 3,
+                audio_onset_events: 4,
+                manual_events: 5,
+            },
+        );
+        assert_eq!(
+            CompositionFrameTiming::from_temporal_input(input).temporal_input(),
+            input
+        );
+        assert_eq!(
+            CompositionFrameTiming::new(1.0 / 30.0, false)
+                .temporal_input()
+                .freeze,
+            TemporalFreezeState::ProgramFrozen
+        );
+    }
+
+    fn stable_layer(value: u64) -> StableLayerId {
+        StableLayerId::new(value).unwrap()
+    }
+
+    fn recorder_metadata(capture_index: u64) -> crate::program_recorder::RecorderFrameMetadata {
+        crate::program_recorder::RecorderFrameMetadata {
+            capture_index,
+            capture_time_ns: capture_index * 1_000,
+            program_time_ns: capture_index * 2_000,
+            visual_epoch: 9,
+            program_frozen: false,
+            media_frozen: false,
+            blackout: false,
+            audio_clock: None,
+        }
+    }
+
+    fn evaluated_base(ids_front_to_back: &[u64], dimensions: [u32; 2]) -> EvaluatedFramePlan {
+        evaluated_base_with_temporal(ids_front_to_back, dimensions, &TemporalParams::default())
+    }
+
+    fn evaluated_base_with_temporal(
+        ids_front_to_back: &[u64],
+        dimensions: [u32; 2],
+        temporal: &TemporalParams,
+    ) -> EvaluatedFramePlan {
+        let effects = vec![EffectUniforms::default(); ids_front_to_back.len()];
+        let transforms = vec![SpatialTransform::new_layer_default(); ids_front_to_back.len()];
+        let master_effects = EffectUniforms::default();
+        let master_transform = SpatialTransform::default();
+        let ntsc = NtscParams::default();
+        let matrix = ModMatrix::new();
+        let modulation = matrix.frame(ids_front_to_back.len());
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(dimensions[0], dimensions[1], 2.0),
+            MasterFrameInput {
+                effects: &master_effects,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal,
+            },
+            ids_front_to_back
+                .iter()
+                .enumerate()
+                .map(|(slot, id)| LayerFrameInput {
+                    source: SourceTap::new(*id, slot, dimensions[0], dimensions[1]),
+                    effects: &effects[slot],
+                    transform: &transforms[slot],
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: false,
+                }),
+        )
+    }
+
+    struct GpuHarness {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    }
+
+    struct TestSource {
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+        dimensions: [u32; 2],
+    }
+
+    impl GpuHarness {
+        fn new() -> Self {
+            let instance = wgpu::Instance::default();
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+                .expect("GPU adapter for advanced composition test");
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("Advanced composition test device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                }))
+                .expect("GPU device for advanced composition test");
+            Self { device, queue }
+        }
+
+        fn source(&self, dimensions: [u32; 2], rgba: [u8; 4], label: &'static str) -> TestSource {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let source = TestSource {
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                texture,
+                dimensions,
+            };
+            self.write_source(&source, rgba);
+            source
+        }
+
+        fn write_source(&self, source: &TestSource, rgba: [u8; 4]) {
+            let bytes = rgba
+                .into_iter()
+                .cycle()
+                .take(source.dimensions[0] as usize * source.dimensions[1] as usize * 4)
+                .collect::<Vec<_>>();
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &source.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(source.dimensions[0] * 4),
+                    rows_per_image: Some(source.dimensions[1]),
+                },
+                wgpu::Extent3d {
+                    width: source.dimensions[0],
+                    height: source.dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        fn render(
+            &self,
+            executor: &mut CompositionGpuExecutor,
+            plan: &EvaluatedCompositionPlan,
+            delta_seconds: f32,
+            commit: bool,
+        ) -> Vec<[f32; 4]> {
+            self.render_with_motion(
+                executor,
+                plan,
+                delta_seconds,
+                commit,
+                CompositionMotionFrameInput::default(),
+            )
+        }
+
+        fn render_with_motion(
+            &self,
+            executor: &mut CompositionGpuExecutor,
+            plan: &EvaluatedCompositionPlan,
+            delta_seconds: f32,
+            commit: bool,
+            motion_input: CompositionMotionFrameInput<'_>,
+        ) -> Vec<[f32; 4]> {
+            let dimensions = executor.dimensions();
+            let unpadded_row = dimensions[0] * 8;
+            let padded_row = (unpadded_row + 255) & !255;
+            let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Advanced composition test readback"),
+                size: u64::from(padded_row) * u64::from(dimensions[1]),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Advanced composition test encoder"),
+                });
+            executor
+                .encode_with_motion(
+                    &self.queue,
+                    &mut encoder,
+                    plan,
+                    CompositionFrameTiming::new(delta_seconds, true),
+                    motion_input,
+                )
+                .unwrap();
+            let output = executor.output();
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: output.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row),
+                        rows_per_image: Some(dimensions[1]),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+            let slice = staging.slice(..);
+            let (send, receive) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = send.send(result);
+            });
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("advanced composition GPU wait");
+            receive.recv().expect("map callback").expect("map result");
+            if commit {
+                executor.commit_frame_history();
+            } else {
+                executor.discard_frame_history();
+            }
+            let mapped = slice.get_mapped_range();
+            let mut pixels = Vec::with_capacity(dimensions[0] as usize * dimensions[1] as usize);
+            for row in 0..dimensions[1] as usize {
+                let start = row * padded_row as usize;
+                for pixel in mapped[start..start + unpadded_row as usize].chunks_exact(8) {
+                    pixels.push(std::array::from_fn(|channel| {
+                        let offset = channel * 2;
+                        half_to_f32(u16::from_le_bytes([pixel[offset], pixel[offset + 1]]))
+                    }));
+                }
+            }
+            drop(mapped);
+            staging.unmap();
+            pixels
+        }
+
+        fn submit(
+            &self,
+            executor: &mut CompositionGpuExecutor,
+            plan: &EvaluatedCompositionPlan,
+            delta_seconds: f32,
+            commit: bool,
+        ) {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Advanced composition temporal sequence encoder"),
+                });
+            executor
+                .encode(
+                    &self.queue,
+                    &mut encoder,
+                    plan,
+                    CompositionFrameTiming::new(delta_seconds, true),
+                )
+                .unwrap();
+            self.queue.submit(std::iter::once(encoder.finish()));
+            if commit {
+                executor.commit_frame_history();
+            } else {
+                executor.discard_frame_history();
+            }
+        }
+    }
+
+    fn half_to_f32(value: u16) -> f32 {
+        let sign = u32::from(value & 0x8000) << 16;
+        let exponent = (value >> 10) & 0x1f;
+        let fraction = value & 0x03ff;
+        let bits = if exponent == 0 {
+            if fraction == 0 {
+                sign
+            } else {
+                let mut fraction = u32::from(fraction);
+                let mut exponent = -14_i32;
+                while fraction & 0x0400 == 0 {
+                    fraction <<= 1;
+                    exponent -= 1;
+                }
+                fraction &= 0x03ff;
+                sign | (((exponent + 127) as u32) << 23) | (fraction << 13)
+            }
+        } else if exponent == 0x1f {
+            sign | 0x7f80_0000 | (u32::from(fraction) << 13)
+        } else {
+            sign | (u32::from(exponent + 112) << 23) | (u32::from(fraction) << 13)
+        };
+        f32::from_bits(bits)
+    }
+
+    fn group_rack_matte_bus_fixture(
+        dimensions: [u32; 2],
+    ) -> (EvaluatedCompositionPlan, RuntimeComposition) {
+        let base = evaluated_base(&[2, 1], dimensions);
+        let mut group_rack = RuntimeVisualRack::empty();
+        group_rack
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        let group_id = GroupId::new(10).unwrap();
+        let group = RuntimeGroup {
+            id: group_id,
+            name: GroupName::new("Golden group").unwrap(),
+            members: RuntimeGroupMembers::try_from_vec(vec![stable_layer(2)]).unwrap(),
+            opacity: 0.5,
+            transform: SpatialTransform::default(),
+            rack: group_rack,
+            matte: Some(RuntimeImageMatte {
+                tap: ResolvedImageTap {
+                    source: crate::visual_rack::ResolvedImageSource::SelectedLayer {
+                        layer_id: stable_layer(1),
+                        saved_position: SavedLayerPosition::new(2).unwrap(),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                channel: MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 1.0,
+            }),
+            solo: false,
+            bypass: false,
+            bus: BusAssignment::B,
+        };
+        let composition = RuntimeComposition::try_from_parts(
+            vec![group],
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::A,
+                },
+                RuntimeRootItem::Group { group_id },
+            ],
+            None,
+            0.25,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![
+            (
+                stable_layer(2),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let plan = EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(plan, EvaluatedCompositionPlan::Advanced(_)));
+        (plan, composition)
+    }
+
+    fn motion_shutter_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![(
+            stable_layer(1),
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        let motion = [LayerMotionPlanInput {
+            stable_id: stable_layer(1),
+            params: MotionParams {
+                shutter: CurvedShutterParams {
+                    angle_degrees: 180.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            codec: MotionCodecFrameFacts::default(),
+        }];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn motion_transform_shutter_fixture(
+        dimensions: [u32; 2],
+        transform: SpatialTransform,
+    ) -> EvaluatedCompositionPlan {
+        let effects = EffectUniforms::default();
+        let master_effects = EffectUniforms::default();
+        let master_transform = SpatialTransform::default();
+        let ntsc = NtscParams::default();
+        let temporal = TemporalParams::default();
+        let modulation = ModMatrix::new().frame(1);
+        let base = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(dimensions[0], dimensions[1], 2.0),
+            MasterFrameInput {
+                effects: &master_effects,
+                transform: &master_transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            [LayerFrameInput {
+                source: SourceTap::new(1, 0, dimensions[0], dimensions[1]),
+                effects: &effects,
+                transform: &transform,
+                opacity: 1.0,
+                speed: 1.0,
+                fps: 30.0,
+                blend_mode: BlendMode::Normal,
+                visible: true,
+                paused: false,
+                bypass_master_fx: false,
+            }],
+        );
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![(
+            stable_layer(1),
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        let motion = [LayerMotionPlanInput {
+            stable_id: stable_layer(1),
+            params: MotionParams {
+                field_source: MotionFieldSource::CodecVectors,
+                shutter: CurvedShutterParams {
+                    angle_degrees: 360.0,
+                    quality: CurvedShutterQuality::Live,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            codec: MotionCodecFrameFacts {
+                available: true,
+                source_generation: 7,
+                frame_ordinal: 9,
+            },
+        }];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn motion_faraday_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[2, 1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![
+            (
+                stable_layer(2),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let motion = [
+            LayerMotionPlanInput {
+                stable_id: stable_layer(2),
+                params: MotionParams {
+                    transplant: FaradayParams {
+                        amount: 1.0,
+                        donor: MotionDonor::Selected {
+                            layer_id: stable_layer(1),
+                            saved_position: SavedLayerPosition::new(2).unwrap(),
+                        },
+                        carrier: MotionCarrier::FirstSourceFrame,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(1),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn motion_codec_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![(
+            stable_layer(1),
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        let motion = [LayerMotionPlanInput {
+            stable_id: stable_layer(1),
+            params: MotionParams {
+                field_source: MotionFieldSource::CodecVectors,
+                shutter: CurvedShutterParams {
+                    angle_degrees: 180.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            codec: MotionCodecFrameFacts {
+                available: true,
+                source_generation: 7,
+                frame_ordinal: 9,
+            },
+        }];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn motion_lattice_shutter_is_warm_transactional_and_static_safe() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let plan = motion_shutter_fixture(dimensions);
+        let source = gpu.source(dimensions, [255, 0, 0, 255], "Motion static red source");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        let advanced = match &plan {
+            EvaluatedCompositionPlan::Advanced(plan) => plan,
+            EvaluatedCompositionPlan::LegacyExact(_) => panic!("fixture must be Advanced"),
+        };
+        assert_eq!(warmed.creative_bytes, advanced.resources().creative_bytes);
+        assert_eq!(
+            warmed.motion_bytes,
+            advanced
+                .motion()
+                .advanced()
+                .expect("motion fixture must allocate motion")
+                .resources()
+                .total_bytes
+        );
+        assert!(warmed.motion_bytes > 0);
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        assert_eq!(executor.allocation_snapshot(), warmed);
+
+        // Frame one primes luma; frame two publishes a deterministic static
+        // field; frame three consumes it through the fixed Sharp shutter.
+        gpu.submit(&mut executor, &plan, 1.0 / 30.0, true);
+        gpu.submit(&mut executor, &plan, 1.0 / 30.0, true);
+        let pixels = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        let metrics = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .expect("motion metrics");
+        assert_eq!(metrics.memory_generation, 3);
+        assert_eq!(metrics.valid_fields, 1);
+        assert_eq!(metrics.valid_luma_fields, 1);
+        assert_eq!(metrics.shutter_samples, 1);
+        assert!(!metrics.frame_staged);
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        for pixel in pixels {
+            assert!((pixel[0] - 1.0).abs() <= 0.01, "{pixel:?}");
+            assert!(pixel[1].abs() <= 0.01, "{pixel:?}");
+            assert!(pixel[2].abs() <= 0.01, "{pixel:?}");
+            assert!((pixel[3] - 1.0).abs() <= 0.01, "{pixel:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn authored_transform_shutter_uses_the_shared_warm_transactional_plan() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let baseline = motion_transform_shutter_fixture(dimensions, SpatialTransform::default());
+        let moved = motion_transform_shutter_fixture(
+            dimensions,
+            SpatialTransform {
+                position: [0.25, 0.0],
+                rotation_deg: 12.0,
+                ..SpatialTransform::default()
+            },
+        );
+        assert_eq!(baseline.topology_signature(), moved.topology_signature());
+
+        let source = gpu.source(
+            dimensions,
+            [0, 0, 0, 0],
+            "Motion transform patterned source",
+        );
+        let mut bytes = vec![0_u8; dimensions[0] as usize * dimensions[1] as usize * 4];
+        for row in 0..dimensions[1] as usize {
+            for column in 0..dimensions[0] as usize / 2 {
+                let offset = (row * dimensions[0] as usize + column) * 4;
+                bytes[offset..offset + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+        gpu.queue.write_texture(
+            source.texture.as_image_copy(),
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dimensions[0] * 4),
+                rows_per_image: Some(dimensions[1]),
+            },
+            wgpu::Extent3d {
+                width: dimensions[0],
+                height: dimensions[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let grid = MotionGrid::for_source(dimensions, Default::default()).unwrap();
+        let zero_field = MotionField::zeroed(dimensions, grid, MotionFieldOrigin::CodecVectors)
+            .expect("canonical zero transform fixture field");
+        let attachment = MotionFieldAttachment {
+            scope: VisualScopeId::Layer(stable_layer(1)),
+            source_generation: 7,
+            frame_ordinal: 9,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            source_dimensions: dimensions,
+            grid,
+            field: &zero_field,
+        };
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &baseline, &sources)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        let _ = gpu.render_with_motion(
+            &mut executor,
+            &baseline,
+            1.0 / 30.0,
+            true,
+            CompositionMotionFrameInput {
+                attachments: &[attachment],
+                held_scopes: &[],
+            },
+        );
+        executor
+            .prepare(&gpu.device, &gpu.queue, &moved, &sources)
+            .unwrap();
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        let pixels = gpu.render_with_motion(
+            &mut executor,
+            &moved,
+            1.0 / 30.0,
+            true,
+            CompositionMotionFrameInput {
+                attachments: &[attachment],
+                held_scopes: &[],
+            },
+        );
+
+        // Live and export own independent executors but consume this same
+        // immutable frame-plan sequence and transaction boundary. Their
+        // physical-GPU output must therefore agree without re-resolving
+        // transforms or field-source policy in either caller.
+        let mut export_executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        export_executor
+            .prepare(&gpu.device, &gpu.queue, &baseline, &sources)
+            .unwrap();
+        let _ = gpu.render_with_motion(
+            &mut export_executor,
+            &baseline,
+            1.0 / 30.0,
+            true,
+            CompositionMotionFrameInput {
+                attachments: &[attachment],
+                held_scopes: &[],
+            },
+        );
+        export_executor
+            .prepare(&gpu.device, &gpu.queue, &moved, &sources)
+            .unwrap();
+        let export_pixels = gpu.render_with_motion(
+            &mut export_executor,
+            &moved,
+            1.0 / 30.0,
+            true,
+            CompositionMotionFrameInput {
+                attachments: &[attachment],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(pixels, export_pixels);
+
+        let middle_row = &pixels[8 * 16..9 * 16];
+        let partially_covered = middle_row
+            .iter()
+            .filter(|pixel| pixel[3] > 0.05 && pixel[3] < 0.95)
+            .count();
+        assert!(
+            partially_covered >= 2,
+            "subframe transform resolve did not span an exposure: {middle_row:?}"
+        );
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        let metrics = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .unwrap();
+        assert_eq!(metrics.memory_generation, 2);
+        assert_eq!(metrics.valid_fields, 1);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn faraday_uses_an_exact_zero_donor_field_and_one_transactional_carrier() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let plan = motion_faraday_fixture(dimensions);
+        let recipient = gpu.source(dimensions, [255, 0, 0, 255], "Faraday red recipient");
+        let donor = gpu.source(dimensions, [0, 255, 0, 255], "Faraday green exact donor");
+        let sources = [
+            CompositionSourceDescriptor::new(stable_layer(2), &recipient.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(1), &donor.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        gpu.submit(&mut executor, &plan, 1.0 / 30.0, true);
+        gpu.submit(&mut executor, &plan, 1.0 / 30.0, true);
+        let pixels = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        let recipient_metrics = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(2)))
+            .expect("recipient motion metrics");
+        let donor_metrics = executor
+            .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+            .expect("exact donor motion metrics");
+        assert_eq!(recipient_metrics.active_field_slots, 1);
+        assert_eq!(recipient_metrics.persistent_carriers, 1);
+        assert!(recipient_metrics.carrier_valid);
+        assert_eq!(donor_metrics.active_field_slots, 1);
+        assert_eq!(donor_metrics.persistent_carriers, 0);
+        assert_eq!(donor_metrics.valid_fields, 1);
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        for pixel in pixels {
+            assert!((pixel[0] - 1.0).abs() <= 0.01, "{pixel:?}");
+            assert!(pixel[1].abs() <= 0.01, "{pixel:?}");
+            assert!(pixel[2].abs() <= 0.01, "{pixel:?}");
+            assert!((pixel[3] - 1.0).abs() <= 0.01, "{pixel:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn codec_attachment_is_exactly_admitted_uploaded_and_rejects_stale_generation() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let plan = motion_codec_fixture(dimensions);
+        let source = gpu.source(dimensions, [255, 0, 0, 255], "Codec motion red source");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let grid = MotionGrid::for_source(dimensions, Default::default()).unwrap();
+        let field = MotionField::from_samples(
+            dimensions,
+            grid,
+            MotionFieldOrigin::CodecVectors,
+            std::iter::repeat_n(
+                MotionVectorSample {
+                    velocity_uv_per_second: [1.0, 0.0],
+                    confidence: 1.0,
+                    visibility: 1.0,
+                },
+                usize::try_from(grid.vector_count).unwrap(),
+            ),
+        )
+        .unwrap();
+        let valid = MotionFieldAttachment {
+            scope: VisualScopeId::Layer(stable_layer(1)),
+            source_generation: 7,
+            frame_ordinal: 9,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            source_dimensions: dimensions,
+            grid,
+            field: &field,
+        };
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let pixels = gpu.render_with_motion(
+            &mut executor,
+            &plan,
+            1.0 / 30.0,
+            true,
+            CompositionMotionFrameInput {
+                attachments: &[valid],
+                held_scopes: &[],
+            },
+        );
+        assert!(executor.motion_diagnostics().is_empty());
+        assert_eq!(
+            executor
+                .motion_metrics(VisualScopeId::Layer(stable_layer(1)))
+                .unwrap()
+                .valid_fields,
+            1
+        );
+        assert!(pixels.iter().all(|pixel| pixel[0] >= 0.99));
+
+        let stale = MotionFieldAttachment {
+            source_generation: 8,
+            ..valid
+        };
+        let _ = gpu.render_with_motion(
+            &mut executor,
+            &plan,
+            1.0 / 30.0,
+            true,
+            CompositionMotionFrameInput {
+                attachments: &[stale],
+                held_scopes: &[],
+            },
+        );
+        assert!(executor.motion_diagnostics().iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                MotionRuntimeDiagnostic::RejectedCodecAttachment {
+                    scope: VisualScopeId::Layer(id)
+                } if *id == stable_layer(1)
+            )
+        }));
+    }
+
+    fn temporal_originals_fixture(
+        dimensions: [u32; 2],
+        topology: TemporalTopology,
+        interpolation: TemporalInterpolation,
+        seed: u32,
+    ) -> EvaluatedCompositionPlan {
+        let temporal = TemporalParams {
+            originals: TemporalOriginalsParams {
+                loom: TemporalLoomParams {
+                    amount: 1.0,
+                    topology,
+                    interpolation,
+                    depth: 0.9,
+                    phase: 0.17,
+                    scale: 1.4,
+                    angle: 31.0,
+                    folds: 7,
+                    quantization: 0,
+                },
+                atlas: CollisionAtlasParams {
+                    amount: 0.72,
+                    seed,
+                    territories: 12,
+                    collision: 0.55,
+                },
+                ..TemporalOriginalsParams::default()
+            },
+            ..TemporalParams::default()
+        };
+        let base = evaluated_base_with_temporal(&[1], dimensions, &temporal);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::try_from_parts(
+            vec![
+                crate::visual_rack::RuntimeVisualNode::authored(
+                    crate::visual_rack::NodeId::new(3).unwrap(),
+                    RuntimeVisualNodeKind::Transform(SpatialTransform::default()),
+                ),
+                crate::visual_rack::RuntimeVisualNode::authored(
+                    crate::visual_rack::NodeId::LEGACY_TEMPORAL,
+                    RuntimeVisualNodeKind::LegacyTemporal,
+                ),
+                crate::visual_rack::RuntimeVisualNode::authored(
+                    crate::visual_rack::NodeId::new(4).unwrap(),
+                    RuntimeVisualNodeKind::DigitalColor(DigitalColorParams::default()),
+                ),
+            ],
+            Some(5),
+        )
+        .unwrap();
+        let racks = vec![(
+            stable_layer(1),
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        let plan = EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            ),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("authored temporal fixture must use Advanced")
+        };
+        assert!(matches!(
+            advanced.master().execution.steps(),
+            [
+                EvaluatedScopeStep::MaterializeSpatial { .. },
+                EvaluatedScopeStep::CollisionRack { .. },
+                EvaluatedScopeStep::LegacyTemporal { .. },
+                EvaluatedScopeStep::CollisionRack { .. },
+            ]
+        ));
+        plan
+    }
+
+    fn group_output_reference_fixture(
+        dimensions: [u32; 2],
+        missing_group: bool,
+    ) -> EvaluatedCompositionPlan {
+        let base = if missing_group {
+            evaluated_base(&[2], dimensions)
+        } else {
+            evaluated_base(&[2, 1, 3], dimensions)
+        };
+        let group_id = GroupId::new(12).unwrap();
+        let mut group_rack = RuntimeVisualRack::empty();
+        group_rack
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..Default::default()
+            }))
+            .unwrap();
+        let group = RuntimeGroup {
+            id: group_id,
+            name: GroupName::new("Referenced group").unwrap(),
+            members: RuntimeGroupMembers::try_from_vec(vec![stable_layer(1)]).unwrap(),
+            // The reference must be captured before this admission opacity.
+            // A red-channel hard threshold below distinguishes 1.0 from 0.25.
+            opacity: 0.25,
+            transform: SpatialTransform::default(),
+            rack: group_rack,
+            matte: Some(RuntimeImageMatte {
+                tap: ResolvedImageTap {
+                    source: crate::visual_rack::ResolvedImageSource::SelectedLayer {
+                        layer_id: stable_layer(3),
+                        saved_position: SavedLayerPosition::new(3).unwrap(),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                channel: MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 0.0,
+            }),
+            solo: false,
+            bypass: false,
+            // A is fully absent at crossfade 1.0, so only the later Program
+            // consumer can make the referenced group visible in the result.
+            bus: BusAssignment::A,
+        };
+        let composition = if missing_group {
+            RuntimeComposition::try_from_parts(
+                Vec::new(),
+                vec![RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                }],
+                None,
+                1.0,
+            )
+            .unwrap()
+        } else {
+            RuntimeComposition::try_from_parts(
+                vec![group],
+                vec![
+                    RuntimeRootItem::Layer {
+                        layer_id: stable_layer(3),
+                        bus: BusAssignment::A,
+                    },
+                    RuntimeRootItem::Group { group_id },
+                    RuntimeRootItem::Layer {
+                        layer_id: stable_layer(2),
+                        bus: BusAssignment::Program,
+                    },
+                ],
+                None,
+                1.0,
+            )
+            .unwrap()
+        };
+        let mut consumer = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        consumer
+            .push(RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(
+                RuntimeImageMatte {
+                    tap: ResolvedImageTap {
+                        source: if missing_group {
+                            crate::visual_rack::ResolvedImageSource::MissingGroupOutput(group_id)
+                        } else {
+                            crate::visual_rack::ResolvedImageSource::GroupOutput(group_id)
+                        },
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    channel: MatteChannel::Red,
+                    invert: false,
+                    amount: 1.0,
+                    threshold: 0.5,
+                    softness: 0.0,
+                },
+            )))
+            .unwrap();
+        let racks = if missing_group {
+            vec![(stable_layer(2), consumer)]
+        } else {
+            vec![
+                (stable_layer(2), consumer),
+                (
+                    stable_layer(1),
+                    RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+                ),
+                (
+                    stable_layer(3),
+                    RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+                ),
+            ]
+        };
+        let plan = EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master),
+                &racks,
+            ),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("group-output reference fixture must be advanced")
+        };
+        if !missing_group {
+            let producer = advanced
+                .execution_order()
+                .iter()
+                .position(|scope| *scope == VisualScopeId::Group(group_id))
+                .unwrap();
+            let consumer = advanced
+                .execution_order()
+                .iter()
+                .position(|scope| *scope == VisualScopeId::Layer(stable_layer(2)))
+                .unwrap();
+            assert!(
+                producer < consumer,
+                "group producer must precede its consumer"
+            );
+        }
+        let consumer_tap = advanced
+            .image_taps()
+            .iter()
+            .find(|tap| {
+                matches!(
+                    tap.consumer,
+                    ImageTapConsumer::RackNode {
+                        scope: VisualScopeId::Layer(layer_id),
+                        ..
+                    } if layer_id == stable_layer(2)
+                )
+            })
+            .expect("consumer image-mask tap");
+        if missing_group {
+            assert_eq!(consumer_tap.resolved, PlannedImageSource::Transparent);
+        } else {
+            assert_eq!(
+                advanced
+                    .groups()
+                    .iter()
+                    .find(|group| group.id == group_id)
+                    .unwrap()
+                    .output_stage,
+                crate::composition::GroupOutputStage::PostProcessingPreAdmission
+            );
+            assert_eq!(
+                consumer_tap.resolved,
+                PlannedImageSource::Scope(VisualScopeId::Group(group_id))
+            );
+        }
+        plan
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_group_rack_matte_bus_is_fixed_at_24_30_and_60_fps() {
+        let gpu = GpuHarness::new();
+        let dimensions = [4, 4];
+        let (plan, _composition) = group_rack_matte_bus_fixture(dimensions);
+        let front = gpu.source(dimensions, [0, 255, 0, 255], "Advanced green group member");
+        let back = gpu.source(dimensions, [255, 0, 0, 128], "Advanced red A donor");
+        let sources = [
+            CompositionSourceDescriptor::new(stable_layer(2), &front.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(1), &back.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        assert!(warmed.total() > 0);
+        let advanced = match &plan {
+            EvaluatedCompositionPlan::Advanced(plan) => plan,
+            EvaluatedCompositionPlan::LegacyExact(_) => panic!("fixture must be Advanced"),
+        };
+        let resources = advanced.resources();
+        assert_eq!(warmed.creative_bytes, resources.creative_bytes);
+        assert_eq!(
+            warmed.motion_bytes,
+            advanced
+                .motion()
+                .advanced()
+                .map_or(0, |motion| motion.resources().total_bytes)
+        );
+        let reconciled = crate::precision::RuntimeResourceLedger::reconcile(
+            crate::precision::RuntimeAllocationSnapshot {
+                output_size: dimensions,
+                path: crate::precision::SETTLED_ADVANCED_PRECISION_PATH,
+                working_layers: resources.rgba16_surface_layers,
+                history_layers: resources.compat8_surface_layers,
+                creative_bytes: warmed.creative_bytes,
+                motion_bytes: warmed.motion_bytes,
+                ntsc_bytes: 0,
+                staging_bytes: warmed.readback_staging_bytes,
+                readback_bytes: warmed.readback_texture_bytes,
+            },
+            crate::precision::PrecisionResourceLimits::default(),
+        )
+        .expect("physical allocation snapshot must reconcile with its admitted plan");
+        assert_eq!(reconciled.creative_bytes, resources.creative_bytes);
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        assert_eq!(executor.allocation_snapshot(), warmed);
+
+        let mut outputs = Vec::new();
+        for fps in [24.0_f32, 30.0, 60.0] {
+            executor.reset_history();
+            let pixels = gpu.render(&mut executor, &plan, 1.0 / fps, false);
+            assert_eq!(executor.allocation_snapshot(), warmed);
+            outputs.push(pixels);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[1], outputs[2]);
+
+        let donor_alpha = 128.0 / 255.0;
+        let shaped = donor_alpha * donor_alpha * (3.0 - 2.0 * donor_alpha);
+        let expected = crate::renderer::composition_host::host_bus_reference(
+            [1.0, 0.0, 0.0, donor_alpha],
+            [1.0, 0.0, 1.0, shaped * 0.5],
+            [0.0; 4],
+            0.25,
+        );
+        for pixel in &outputs[0] {
+            for channel in 0..4 {
+                assert!(
+                    (pixel[channel] - expected[channel]).abs() <= 0.015,
+                    "channel {channel}: actual {}, expected {}",
+                    pixel[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn recorder_scope_capture_is_post_effects_fifo_warm_and_never_falls_back() {
+        let gpu = GpuHarness::new();
+        let dimensions = [4, 4];
+        let (plan, _composition) = group_rack_matte_bus_fixture(dimensions);
+        let member = gpu.source(dimensions, [0, 255, 0, 255], "Scope capture green member");
+        let donor = gpu.source(dimensions, [255, 0, 0, 128], "Scope capture alpha donor");
+        let sources = [
+            CompositionSourceDescriptor::new(stable_layer(2), &member.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(1), &donor.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let prepared = executor
+            .prepare_scope_recorder_readback(&gpu.device, CaptureTarget::Layer(stable_layer(2)))
+            .unwrap();
+        assert_eq!(prepared.buffers, 2);
+        assert_eq!(prepared.conversion_textures, 1);
+        assert!(
+            prepared.total_bytes() <= crate::renderer::readback::RECORDER_GPU_READBACK_MAX_BYTES
+        );
+        let warmed = executor.allocation_snapshot();
+
+        // An outer rejected frame can revoke an armed reservation without
+        // submitting it, after which the same fixed slot is reusable.
+        let RecorderReadbackAdmission::Scheduled(abandoned) = executor
+            .begin_scope_recorder_readback(RecorderReadbackTag::new(17, recorder_metadata(0)))
+        else {
+            panic!("layer scope must arm")
+        };
+        executor
+            .discard_unsubmitted_scope_recorder_readback(abandoned)
+            .unwrap();
+        assert!(matches!(
+            executor.map_scope_recorder_readback(abandoned),
+            Err(RecorderReadbackError::InvalidReservation)
+        ));
+
+        let RecorderReadbackAdmission::Scheduled(abandoned_with_frame) = executor
+            .begin_scope_recorder_readback(RecorderReadbackTag::new(17, recorder_metadata(0)))
+        else {
+            panic!("layer scope must re-arm")
+        };
+        executor.discard_frame_history();
+        assert!(matches!(
+            executor.map_scope_recorder_readback(abandoned_with_frame),
+            Err(RecorderReadbackError::InvalidReservation)
+        ));
+
+        let capture = |executor: &mut CompositionGpuExecutor,
+                       capture_index: u64|
+         -> (Vec<u8>, RecorderReadbackRequest) {
+            let RecorderReadbackAdmission::Scheduled(reservation) = executor
+                .begin_scope_recorder_readback(RecorderReadbackTag::new(
+                    17,
+                    recorder_metadata(capture_index),
+                ))
+            else {
+                panic!("prepared scope must arm")
+            };
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Post-effects scope recorder test encoder"),
+                });
+            executor
+                .encode(
+                    &gpu.queue,
+                    &mut encoder,
+                    &plan,
+                    CompositionFrameTiming::new(1.0 / 30.0, true),
+                )
+                .unwrap();
+            assert_eq!(
+                executor
+                    .finish_scope_recorder_readback(reservation)
+                    .unwrap(),
+                RecorderReadbackCaptureStatus::Captured
+            );
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            executor.map_scope_recorder_readback(reservation).unwrap();
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("scope recorder GPU wait");
+            let mut pixels = vec![0_u8; dimensions[0] as usize * dimensions[1] as usize * 4];
+            let RecorderReadbackPoll::Ready(completed) = executor
+                .poll_scope_recorder_readback_into(&gpu.device, &mut pixels)
+                .unwrap()
+            else {
+                panic!("scope recorder capture must be ready")
+            };
+            executor.commit_frame_history();
+            (pixels, completed.request)
+        };
+
+        let (layer_pixels, layer_request) = capture(&mut executor, 1);
+        assert_eq!(layer_request.target, CaptureTarget::Layer(stable_layer(2)));
+        assert_eq!(layer_request.tag.metadata().capture_index, 1);
+        assert_eq!(layer_request.tag.capture_generation(), 17);
+        assert!(layer_pixels
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 255, 0, 255]));
+        assert_eq!(executor.allocation_snapshot(), warmed);
+
+        // Selecting the group reuses every object. Its rack inverts the green
+        // member before the group matte boundary, yielding magenta.
+        let group_id = GroupId::new(10).unwrap();
+        let group_prepared = executor
+            .prepare_scope_recorder_readback(&gpu.device, CaptureTarget::Group(group_id))
+            .unwrap();
+        assert_eq!(group_prepared, prepared);
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        let (group_pixels, group_request) = capture(&mut executor, 2);
+        assert_eq!(group_request.target, CaptureTarget::Group(group_id));
+        assert!(group_pixels
+            .chunks_exact(4)
+            .all(|pixel| { pixel[0] >= 250 && pixel[1] <= 5 && pixel[2] >= 250 && pixel[3] > 0 }));
+
+        // A topology replacement which deletes the stable group is explicit
+        // unavailable; it can never retarget the final Program image.
+        let no_group = motion_shutter_fixture(dimensions);
+        executor
+            .prepare(&gpu.device, &gpu.queue, &no_group, &sources[1..])
+            .unwrap();
+        assert_eq!(
+            executor
+                .begin_scope_recorder_readback(RecorderReadbackTag::new(17, recorder_metadata(3))),
+            RecorderReadbackAdmission::SourceUnavailable
+        );
+        assert_eq!(executor.allocation_snapshot().readback_objects, 3);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn advanced_temporal_originals_are_deterministic_and_allocation_free_at_authored_position() {
+        let gpu = GpuHarness::new();
+        let dimensions = [9, 7];
+        let source = gpu.source(
+            dimensions,
+            [255, 0, 0, 255],
+            "Advanced temporal-originals live source",
+        );
+        let descriptors = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        let first_plan = temporal_originals_fixture(
+            dimensions,
+            TemporalTopology::Linear,
+            TemporalInterpolation::Floor,
+            0,
+        );
+        executor
+            .prepare(&gpu.device, &gpu.queue, &first_plan, &descriptors)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        let palette = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 0, 255],
+            [255, 0, 255, 255],
+            [0, 255, 255, 255],
+            [255, 255, 255, 255],
+            [0, 0, 0, 255],
+        ];
+
+        for fps in [24.0_f32, 30.0, 60.0] {
+            for topology in [
+                TemporalTopology::Linear,
+                TemporalTopology::Radial,
+                TemporalTopology::Spiral,
+                TemporalTopology::Contour,
+                TemporalTopology::Folded,
+                TemporalTopology::Kaleidoscopic,
+            ] {
+                for interpolation in [TemporalInterpolation::Floor, TemporalInterpolation::Linear] {
+                    for seed in [0, 1, 0x6a09_e667, u32::MAX] {
+                        let plan =
+                            temporal_originals_fixture(dimensions, topology, interpolation, seed);
+                        executor
+                            .prepare(&gpu.device, &gpu.queue, &plan, &descriptors)
+                            .unwrap();
+                        assert_eq!(executor.allocation_snapshot(), warmed);
+
+                        let mut replay = || {
+                            executor.reset_history();
+                            for frame in 0..14_usize {
+                                let color = palette[(frame + seed as usize) % palette.len()];
+                                gpu.write_source(&source, color);
+                                gpu.submit(&mut executor, &plan, 1.0 / fps, true);
+                            }
+                            let color = palette[(14 + seed as usize) % palette.len()];
+                            gpu.write_source(&source, color);
+                            gpu.render(&mut executor, &plan, 1.0 / fps, true)
+                        };
+                        let first = replay();
+                        let second = replay();
+                        assert_eq!(
+                            first, second,
+                            "fps={fps}, topology={topology:?}, interpolation={interpolation:?}, seed={seed}"
+                        );
+                        assert_eq!(executor.allocation_snapshot(), warmed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_group_output_reference_is_pre_admission_and_missing_is_transparent() {
+        let gpu = GpuHarness::new();
+        let dimensions = [3, 3];
+        let valid = group_output_reference_fixture(dimensions, false);
+        let missing = group_output_reference_fixture(dimensions, true);
+        let consumer = gpu.source(dimensions, [255, 255, 255, 255], "Group-output consumer");
+        let member = gpu.source(dimensions, [0, 0, 0, 255], "Group-output processed member");
+        let matte_donor = gpu.source(dimensions, [255, 255, 255, 255], "Group-output matte donor");
+        let sources = [
+            CompositionSourceDescriptor::new(stable_layer(2), &consumer.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(1), &member.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(3), &matte_donor.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &valid, &sources)
+            .unwrap();
+        let referenced = gpu.render(&mut executor, &valid, 1.0 / 30.0, false);
+        assert!(
+            referenced.iter().all(|pixel| pixel[3] >= 0.99),
+            "the post-rack/post-matte, pre-opacity group reference was not captured: {:?}; order {:?}",
+            referenced[0],
+            match &valid {
+                EvaluatedCompositionPlan::Advanced(plan) => plan.execution_order(),
+                EvaluatedCompositionPlan::LegacyExact(_) => &[],
+            }
+        );
+
+        executor
+            .prepare(&gpu.device, &gpu.queue, &missing, &sources[..1])
+            .unwrap();
+        let tombstone = gpu.render(&mut executor, &missing, 1.0 / 30.0, false);
+        assert!(
+            tombstone.iter().all(|pixel| pixel[3] <= 0.001),
+            "a deleted/missing group reference must bind transparent: {:?}",
+            tombstone[0]
+        );
+    }
+
+    fn program_history_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        master
+            .push(RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(
+                RuntimeImageMatte {
+                    tap: ResolvedImageTap {
+                        source: crate::visual_rack::ResolvedImageSource::CleanProgram,
+                        timing: EdgeTiming::PreviousFrame,
+                    },
+                    channel: MatteChannel::Red,
+                    invert: false,
+                    amount: 1.0,
+                    threshold: 0.5,
+                    softness: 0.0,
+                },
+            )))
+            .unwrap();
+        let racks = vec![(
+            stable_layer(1),
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            ),
+        )
+        .unwrap()
+    }
+
+    fn selected_previous_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[2, 1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::A,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            1.0,
+        )
+        .unwrap();
+        let mut consumer = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        consumer
+            .push(RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(
+                RuntimeImageMatte {
+                    tap: ResolvedImageTap {
+                        source: crate::visual_rack::ResolvedImageSource::SelectedLayer {
+                            layer_id: stable_layer(1),
+                            saved_position: SavedLayerPosition::new(2).unwrap(),
+                            stage: LayerImageStage::PostLocalEffects,
+                        },
+                        timing: EdgeTiming::PreviousFrame,
+                    },
+                    channel: MatteChannel::Red,
+                    invert: false,
+                    amount: 1.0,
+                    threshold: 0.5,
+                    softness: 0.0,
+                },
+            )))
+            .unwrap();
+        let racks = vec![
+            (stable_layer(2), consumer),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master),
+                &racks,
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn nonprogram_previous_tap_discards_submitted_rejected_parity() {
+        let gpu = GpuHarness::new();
+        let dimensions = [2, 2];
+        let plan = selected_previous_fixture(dimensions);
+        let consumer = gpu.source(dimensions, [255, 255, 255, 255], "Previous consumer");
+        let donor = gpu.source(dimensions, [255, 255, 255, 255], "Previous donor A");
+        let descriptors = [
+            CompositionSourceDescriptor::new(stable_layer(2), &consumer.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(1), &donor.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &descriptors)
+            .unwrap();
+
+        let first = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        assert!(first.iter().all(|pixel| pixel[3] <= 0.001));
+        executor.clear_temporal_memory();
+        gpu.write_source(&donor, [0, 0, 0, 255]);
+        let rejected = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert!(rejected.iter().all(|pixel| pixel[3] >= 0.999));
+        gpu.write_source(&donor, [255, 255, 255, 255]);
+        let after_reject = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        assert!(
+            after_reject.iter().all(|pixel| pixel[3] >= 0.999),
+            "discard published rejected non-Program history: {:?}",
+            after_reject[0]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn program_history_is_first_frame_transparent_n_minus_one_and_commit_discard_safe() {
+        let gpu = GpuHarness::new();
+        let dimensions = [2, 2];
+        let plan = program_history_fixture(dimensions);
+        let source = gpu.source(dimensions, [255, 255, 255, 255], "Program history source");
+        let descriptors = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &descriptors)
+            .unwrap();
+        assert!(!executor.program_history_initialized());
+
+        let cold = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        assert!(cold.iter().all(|pixel| pixel[3] <= 0.001));
+        assert!(executor.program_history_initialized());
+        executor.clear_temporal_memory();
+        assert!(
+            executor.program_history_initialized(),
+            "manual temporal clear must not revoke N-1 Program history"
+        );
+
+        // The rejected frame writes transparent B only into the inactive
+        // parity. Discard must keep committed opaque A as the next N-1 donor.
+        gpu.write_source(&source, [0, 0, 0, 255]);
+        let rejected = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert!(
+            rejected.iter().all(|pixel| pixel[3] >= 0.999),
+            "rejected frame sampled committed A: {:?}",
+            rejected[0]
+        );
+        gpu.write_source(&source, [255, 255, 255, 255]);
+        let after_reject = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        assert!(
+            after_reject.iter().all(|pixel| pixel[3] >= 0.999),
+            "post-reject frame sampled committed A: {:?}",
+            after_reject[0]
+        );
+
+        executor.reset_history();
+        assert!(!executor.program_history_initialized());
+        let reset = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert!(reset.iter().all(|pixel| pixel[3] <= 0.001));
+
+        // Replacing a view under the same stable ID and dimensions is keyed
+        // by the caller's resource epoch. Preparation must bind the new black
+        // texture and start history cold; a stale white bind would make the
+        // second frame opaque.
+        let replacement = gpu.source(
+            dimensions,
+            [0, 0, 0, 255],
+            "Program history replacement source",
+        );
+        let replacement_descriptors =
+            [
+                CompositionSourceDescriptor::new(stable_layer(1), &replacement.view, dimensions)
+                    .with_resource_epoch(2),
+            ];
+        let replacement_keys = [(stable_layer(1), dimensions, 2)];
+        assert!(!executor.is_prepared_for(&plan, &replacement_keys));
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &replacement_descriptors)
+            .unwrap();
+        assert!(executor.is_prepared_for(&plan, &replacement_keys));
+        assert!(!executor.program_history_initialized());
+        let replacement_cold = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        let replacement_warm = gpu.render(&mut executor, &plan, 1.0 / 30.0, true);
+        assert!(replacement_cold.iter().all(|pixel| pixel[3] <= 0.001));
+        assert!(replacement_warm.iter().all(|pixel| pixel[3] <= 0.001));
+
+        // Advanced -> exact destroys prepared history. Re-entering the same
+        // topology/source identity is a clean rebuild, never a stale revival.
+        let exact_base = evaluated_base(&[1], dimensions);
+        let exact_composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let exact_master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let exact_racks = vec![(
+            stable_layer(1),
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+        )];
+        let exact = EvaluatedCompositionPlan::evaluate(
+            &exact_base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &exact_composition,
+                &exact_master,
+                &exact_racks,
+            ),
+        )
+        .unwrap();
+        assert!(matches!(exact, EvaluatedCompositionPlan::LegacyExact(_)));
+        executor
+            .prepare(&gpu.device, &gpu.queue, &exact, &[])
+            .unwrap();
+        assert!(!executor.program_history_initialized());
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &replacement_descriptors)
+            .unwrap();
+        assert!(!executor.program_history_initialized());
+        let after_exact = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert!(after_exact.iter().all(|pixel| pixel[3] <= 0.001));
+    }
+}

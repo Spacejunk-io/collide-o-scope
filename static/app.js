@@ -12,7 +12,36 @@ const mediaSafetyMode = document.getElementById('media-safety-mode');
 const mediaSafetySummary = document.getElementById('media-safety-summary');
 const mediaSafetyRationale = document.getElementById('media-safety-rationale');
 const mediaSafetyStatus = document.getElementById('media-safety-status');
+const newLayerFit = document.getElementById('new-layer-fit');
+const librarySlotTarget = document.getElementById('library-slot-target');
+const librarySlotTrigger = document.getElementById('library-slot-trigger');
+const slotLoadStatus = document.getElementById('slot-load-status');
+const sceneList = document.getElementById('scene-list');
+const sceneStatus = document.getElementById('scene-status');
+const sceneCaptureForm = document.getElementById('scene-capture-form');
+const sceneCaptureName = document.getElementById('scene-capture-name');
+const sceneCaptureMode = document.getElementById('scene-capture-mode');
 let authoritativeMediaSafetyMode = 'safe';
+let authoritativeNewLayerFit = 'fit';
+
+const LAYER_BLEND_MODES = Object.freeze([
+  { key: 'normal', label: 'Normal', description: 'Normal composites the layer over the content below.' },
+  { key: 'screen', label: 'Screen', description: 'Screen brightens by combining inverse color values.' },
+  { key: 'multiply', label: 'Multiply', description: 'Multiply darkens by multiplying color values.' },
+  { key: 'difference', label: 'Difference', description: 'Difference shows the absolute color distance between layer and below.' },
+  { key: 'add', label: 'Add', description: 'Add sums layer and below for luminous accumulation.' },
+  { key: 'subtract', label: 'Subtract', description: 'Subtract computes below minus layer.' },
+  { key: 'darken', label: 'Darken', description: 'Darken keeps the lower value in each color channel.' },
+  { key: 'lighten', label: 'Lighten', description: 'Lighten keeps the higher value in each color channel.' },
+  { key: 'overlay', label: 'Overlay', description: 'Overlay combines Multiply and Screen according to the content below.' },
+  { key: 'soft_light', label: 'Soft Light', description: 'Soft Light applies a restrained contrast and illumination response.' },
+  { key: 'hard_light', label: 'Hard Light', description: 'Hard Light combines Multiply and Screen according to the layer.' },
+  { key: 'exclusion', label: 'Exclusion', description: 'Exclusion creates a lower-contrast difference relation.' },
+  { key: 'dodge', label: 'Dodge', description: 'Dodge brightens the content below toward the layer color.' },
+  { key: 'burn', label: 'Burn', description: 'Burn darkens the content below toward the layer color.' },
+  { key: 'alpha_cut', label: 'Alpha Cut', description: 'Alpha Cut erases accumulated content; it is a no-op without content below.' },
+]);
+const LAYER_BLEND_ORDER_POLICY = 'Reordering changes the content below; the saved blend choice remains unchanged.';
 
 // The one-time query key bootstraps the HttpOnly Strict cookie. Remove only
 // that secret from browser history once the document has received its cookie;
@@ -43,6 +72,15 @@ spoutInForm?.addEventListener('submit', (event) => {
   }
 });
 
+newLayerFit?.addEventListener('change', () => {
+  const fit = ['stretch', 'fit', 'fill', 'native'].includes(newLayerFit.value)
+    ? newLayerFit.value
+    : authoritativeNewLayerFit;
+  if (!sendAction({ action: 'set_new_layer_fit', fit })) {
+    newLayerFit.value = authoritativeNewLayerFit;
+  }
+});
+
 // Declared before the socket connects so reconnect reconciliation is safe
 // even when the initial connection opens immediately.
 let padPointerId = null;
@@ -51,7 +89,11 @@ let padLastPosition = [0.5, 0.5];
 let padNeedsReconcile = false;
 let beatQuantizeEnabled = false;
 let layerStackRevision = 0;
+let compositionRevision = 0;
+let presetRevision = 0;
+let latestCreative = null;
 let latestLayerIdentities = [];
+let latestLayers = [];
 let transportAuthoritativePaused = false;
 let transportPendingPaused = null;
 let transportRequestSequence = 0;
@@ -63,7 +105,11 @@ let outputPendingOpen = null;
 let outputRequestSequence = 0;
 
 const QUANTIZABLE_ACTIONS = new Set([
-  'set_param', 'set_layer_param', 'set_layer_effect', 'set_ntsc_param', 'set_temporal',
+  'set_param', 'set_master_transform', 'set_layer_param', 'set_layer_effect',
+  'set_layer_transform', 'set_ntsc_param', 'set_temporal',
+  'set_clip_transport', 'set_clip_cue', 'set_layer_matte_param',
+  'set_visual_node_param', 'set_composition_group_param',
+  'set_composition_group_matte_param', 'set_composition_bus_crossfade',
   'set_morph', 'morph_capture', 'morph_clear', 'morph_glide',
 ]);
 
@@ -84,6 +130,7 @@ function connect() {
         padNeedsReconcile = false;
       }
     }
+    reconcileInterruptedHistoryGestures();
     reconcileGyroStreamConnection();
   };
 
@@ -104,9 +151,11 @@ function connect() {
       expertMediaToggle.checked = authoritativeMediaSafetyMode === 'expert';
       expertMediaToggle.toggleAttribute('aria-busy', false);
     }
+    if (newLayerFit) newLayerFit.value = authoritativeNewLayerFit;
     outputRequestSequence += 1;
     outputPendingOpen = null;
     renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
+    rememberInterruptedHistoryGestures();
     showGyroDisconnected();
     setTimeout(connect, 2000);
   };
@@ -118,23 +167,36 @@ function connect() {
       const msg = JSON.parse(e.data);
       if (msg.type === 'state') {
         syncEffects(msg.effects);
+        syncMasterTransform(msg.master_transform);
         syncNtsc(msg.ntsc);
         layerStackRevision = Number(msg.layer_stack_revision) || 0;
+        compositionRevision = Number(msg.composition_revision) || 0;
         syncLayers(msg.layers);
+        syncCreative(msg.creative);
+        syncPerformance(msg.performance);
         syncLibrary(msg.library);
         syncMediaSafety(msg.media_safety);
+        syncNewLayerFit(msg.new_layer_fit);
         syncTransport(msg.program_frozen ?? msg.paused, msg.media_frozen);
-        syncExport(msg.export_progress, msg.export_error, msg.export_status, msg.export_warnings);
+        syncExport(msg.export_progress, msg.export_error, msg.export_status, msg.export_warnings, msg.export_motion);
+        syncHistory(msg.history);
+        syncPresets(msg.presets);
+        syncRecovery(msg.recovery_available, msg.recovery_status);
         syncPatchSave(msg.patch_save_status || '');
         syncPatchLoad(msg.patch_load_status || '');
         syncModulation(msg.modulation);
         syncAudio(msg.audio);
         syncMidi(msg.midi);
+        syncControllerRuntime(msg.controller_runtime);
+        syncOscRuntime(msg.osc_runtime);
         syncTemporal(msg.temporal);
+        syncMasterMotion(msg.master_motion);
         syncSpout(msg.spout);
         syncRemote(msg.remote_url);
         syncMorph(msg.morph);
         syncOutputWindow(msg.output_window, msg.output_error);
+        syncRecorder(msg.recorder);
+        syncStageHealth(msg.stage_health);
         syncBlackout(msg.blackout);
         syncQuantize(msg.quantized_pending || 0);
         syncRangeEditors(document);
@@ -154,6 +216,63 @@ connect();
 
 const touchedControls = new Map(); // element -> Set(pointerId) | last-edit ms
 const rangeControlPeers = new WeakMap(); // slider <-> editable numeric display
+const activeHistoryGestures = new Map(); // pointer/key identity -> gesture record
+const interruptedHistoryGestures = [];
+let historyGestureSequence = 0;
+
+function nextHistoryGestureId() {
+  historyGestureSequence = historyGestureSequence >= Number.MAX_SAFE_INTEGER
+    ? 1
+    : historyGestureSequence + 1;
+  return historyGestureSequence;
+}
+
+function beginScalarHistoryGesture(key, control) {
+  if (!control || beatQuantizeEnabled) return false;
+  if (activeHistoryGestures.has(key)) return true;
+  // The protocol owns one scalar destination at a time. Prevent a second
+  // touch/key gesture from being silently folded into the first controller's
+  // transaction; the server enforces the same law across browser clients.
+  if (activeHistoryGestures.size) return false;
+  const gesture = { id: nextHistoryGestureId(), control, dirty: false };
+  if (sendAction({ action: 'begin_history_gesture', gesture_id: gesture.id })) {
+    activeHistoryGestures.set(key, gesture);
+    return true;
+  }
+  return false;
+}
+
+function closeScalarHistoryGesture(key) {
+  const gesture = activeHistoryGestures.get(key);
+  if (!gesture) return;
+  activeHistoryGestures.delete(key);
+  sendAction(historyBoundaryAction(gesture));
+}
+
+function historyBoundaryAction(gesture) {
+  if (gesture.dirty) {
+    return { action: 'end_history_gesture', gesture_id: gesture.id };
+  }
+  return { action: 'cancel_history_gesture', gesture_id: gesture.id };
+}
+
+function rememberInterruptedHistoryGestures() {
+  for (const gesture of activeHistoryGestures.values()) {
+    interruptedHistoryGestures.push({ id: gesture.id, dirty: gesture.dirty });
+  }
+  activeHistoryGestures.clear();
+}
+
+function reconcileInterruptedHistoryGestures() {
+  while (interruptedHistoryGestures.length) {
+    const gesture = interruptedHistoryGestures.shift();
+    if (!sendAction(historyBoundaryAction(gesture))) {
+      interruptedHistoryGestures.unshift(gesture);
+      break;
+    }
+  }
+}
+
 document.addEventListener('pointerdown', (e) => {
   const el = e.target.closest('input,select,[data-range-editor]');
   if (el) {
@@ -162,6 +281,11 @@ document.addEventListener('pointerdown', (e) => {
     held.add(e.pointerId);
     touchedControls.set(el, held);
   }
+  const slider = e.target.closest('input[type="range"]');
+  if (slider && !beginScalarHistoryGesture(`pointer:${e.pointerId}`, slider)) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
 }, true);
 const releaseControl = (e) => {
   for (const [el, t] of touchedControls) {
@@ -169,6 +293,7 @@ const releaseControl = (e) => {
     t.delete(e.pointerId);
     touchedControls.set(el, t.size ? t : performance.now());
   }
+  closeScalarHistoryGesture(`pointer:${e.pointerId}`);
 };
 document.addEventListener('pointerup', releaseControl, true);
 document.addEventListener('pointercancel', releaseControl, true);
@@ -177,6 +302,9 @@ const releaseAllControls = () => {
   for (const [el, state] of touchedControls) {
     if (!el.isConnected) touchedControls.delete(el);
     else if (state instanceof Set) touchedControls.set(el, now);
+  }
+  for (const key of Array.from(activeHistoryGestures.keys())) {
+    closeScalarHistoryGesture(key);
   }
 };
 window.addEventListener('blur', releaseAllControls);
@@ -187,6 +315,21 @@ document.addEventListener('input', (e) => {
   if (!(touchedControls.get(e.target) instanceof Set)) {
     touchedControls.set(e.target, performance.now());
   }
+  for (const gesture of activeHistoryGestures.values()) {
+    if (gesture.control === e.target) gesture.dirty = true;
+  }
+}, true);
+
+const HISTORY_RANGE_KEYS = new Set(['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End']);
+document.addEventListener('keydown', (event) => {
+  if (!HISTORY_RANGE_KEYS.has(event.key) || !event.target.matches?.('input[type="range"]')) return;
+  if (!beginScalarHistoryGesture('keyboard', event.target)) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+}, true);
+document.addEventListener('keyup', (event) => {
+  if (HISTORY_RANGE_KEYS.has(event.key)) closeScalarHistoryGesture('keyboard');
 }, true);
 
 function controlIsBusy(el) {
@@ -222,6 +365,699 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+function layerBlendModeInfo(key) {
+  return LAYER_BLEND_MODES.find((mode) => mode.key === key) || LAYER_BLEND_MODES[0];
+}
+
+function layerBlendTitle(key) {
+  return `${layerBlendModeInfo(key).description} ${LAYER_BLEND_ORDER_POLICY}`;
+}
+
+// --- Collision Rack + one-level composition ---------------------------
+
+const creativeRackScope = document.getElementById('creative-rack-scope');
+const creativeNodeKind = document.getElementById('creative-node-kind');
+const creativeNodeAdd = document.getElementById('creative-node-add');
+const creativeRackNodes = document.getElementById('creative-rack-nodes');
+const creativeGroups = document.getElementById('creative-groups');
+const creativeRoot = document.getElementById('creative-root');
+const creativeStatus = document.getElementById('creative-status');
+const creativeRevision = document.getElementById('creative-revision');
+const creativeBusCrossfade = document.getElementById('creative-bus-crossfade');
+const creativeBusCrossfadeValue = document.getElementById('creative-bus-crossfade-value');
+const creativeGroupCreate = document.getElementById('creative-group-create');
+const creativeGroupName = document.getElementById('creative-group-name');
+const creativeGroupMembers = document.getElementById('creative-group-members');
+let creativeStructureKey = '';
+
+const CREATIVE_NODE_INFO = Object.freeze({
+  legacy_canonical: { label: 'Legacy Canonical', marker: true },
+  legacy_temporal: { label: 'Legacy Temporal', marker: true },
+  transform: { label: 'Transform' },
+  digital_color: { label: 'Digital / Color' },
+  key: { label: 'Key' },
+  cellular: { label: 'Cellular' },
+  shift: { label: 'Shift' },
+  grain: { label: 'Grain' },
+  mask: { label: 'Mask' },
+});
+
+const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
+const floatDef = (key, label, min, max, step) => ({ key, label, type: 'float', min, max, step });
+const vecDef = (key, label, min, max, step, components = ['X', 'Y']) => ({ key, label, type: 'vec', min, max, step, components });
+const boolDef = (key, label) => ({ key, label, type: 'bool' });
+const uintDef = (key, label) => ({ key, label, type: 'uint' });
+
+const CREATIVE_NODE_PARAMS = Object.freeze({
+  transform: [
+    vecDef('position', 'Position', -4, 4, 0.01),
+    vecDef('scale', 'Scale', -16, 16, 0.01),
+    vecDef('anchor', 'Anchor', -2, 3, 0.01),
+    floatDef('rotation_deg', 'Rotation', -180, 180, 0.1),
+    floatDef('skew_deg', 'Skew', -89, 89, 0.1),
+    floatDef('skew_axis_deg', 'Skew axis', -180, 180, 0.1),
+    enumDef('fit_mode', 'Fit', [['stretch', 'Stretch'], ['fit', 'Fit'], ['fill', 'Fill'], ['native', 'Native']]),
+    floatDef('crop_left', 'Crop left', 0, 1, 0.001),
+    floatDef('crop_top', 'Crop top', 0, 1, 0.001),
+    floatDef('crop_right', 'Crop right', 0, 1, 0.001),
+    floatDef('crop_bottom', 'Crop bottom', 0, 1, 0.001),
+    enumDef('edge_mode', 'Edge', [['transparent', 'Transparent'], ['clamp', 'Clamp'], ['repeat', 'Repeat'], ['mirror', 'Mirror']]),
+    enumDef('sampling', 'Sampling', [['linear', 'Linear'], ['nearest', 'Nearest']]),
+  ],
+  digital_color: [
+    floatDef('pixelate_size', 'Pixelate', 1, 32, 0.1),
+    floatDef('rgb_split', 'RGB split', 0, 30, 0.1),
+    floatDef('downsample', 'Downsample', 0.05, 1, 0.01),
+    floatDef('hue_shift', 'Hue', -180, 180, 0.1),
+    floatDef('saturation', 'Saturation', -1, 1, 0.01),
+    floatDef('brightness', 'Brightness', -1, 1, 0.01),
+    floatDef('contrast', 'Contrast', -1, 1, 0.01),
+    floatDef('posterize', 'Posterize', 0, 16, 0.1),
+    floatDef('invert', 'Invert', 0, 1, 0.01),
+    floatDef('vignette', 'Vignette', 0, 1.5, 0.01),
+    floatDef('color_drift', 'Color drift', 0, 0.02, 0.0001),
+  ],
+  key: [
+    enumDef('mode', 'Mode', [['keep_bright', 'Keep bright'], ['keep_dark', 'Keep dark'], ['remove_color', 'Remove color'], ['keep_color', 'Keep color']]),
+    floatDef('threshold', 'Threshold', 0, 1, 0.001),
+    floatDef('softness', 'Softness', 0, 0.5, 0.001),
+    vecDef('color', 'Color', 0, 1, 0.001, ['R', 'G', 'B']),
+    floatDef('tolerance', 'Tolerance', 0, 1, 0.001),
+    boolDef('invert', 'Invert'),
+  ],
+  cellular: [
+    floatDef('amount', 'Amount', 0, 1, 0.001),
+    floatDef('scale', 'Scale', 2, 32, 0.1),
+    floatDef('warp', 'Warp', 0, 1, 0.001),
+    floatDef('speed', 'Speed', 0, 2, 0.001),
+    floatDef('gap_amount', 'Gap key', 0, 1, 0.001),
+    floatDef('gap_threshold', 'Gap threshold', 0, 1, 0.001),
+    floatDef('gap_softness', 'Gap softness', 0, 0.5, 0.001),
+    uintDef('seed', 'Seed'),
+  ],
+  shift: [
+    floatDef('amount', 'Amount', 0, 1, 0.001),
+    floatDef('block_size', 'Block size', 2, 256, 1),
+    floatDef('density', 'Density', 0, 1, 0.001),
+    floatDef('speed', 'Speed', 0, 20, 0.01),
+    uintDef('seed', 'Seed'),
+  ],
+  grain: [
+    floatDef('intensity', 'Intensity', 0, 0.3, 0.001),
+    floatDef('size', 'Size', 1, 4, 0.01),
+    enumDef('algorithm', 'Algorithm', [['gaussian', 'Gaussian'], ['perlin', 'Perlin'], ['salt_pepper', 'Salt + pepper'], ['blue', 'Blue noise']]),
+    boolDef('color', 'Color'),
+    uintDef('seed', 'Seed'),
+  ],
+  mask: [
+    vecDef('rectangle_center', 'Rectangle center', -2, 3, 0.001),
+    vecDef('rectangle_size', 'Rectangle size', 0, 4, 0.001),
+    floatDef('rectangle_rotation_deg', 'Rectangle rotation', -180, 180, 0.1),
+    floatDef('rectangle_feather', 'Rectangle feather', 0, 1, 0.001),
+    boolDef('rectangle_invert', 'Rectangle invert'),
+    vecDef('ellipse_center', 'Ellipse center', -2, 3, 0.001),
+    vecDef('ellipse_radii', 'Ellipse radii', 0, 2, 0.001),
+    floatDef('ellipse_rotation_deg', 'Ellipse rotation', -180, 180, 0.1),
+    floatDef('ellipse_feather', 'Ellipse feather', 0, 1, 0.001),
+    boolDef('ellipse_invert', 'Ellipse invert'),
+    floatDef('image_amount', 'Image amount', 0, 1, 0.001),
+    floatDef('image_threshold', 'Image threshold', 0, 1, 0.001),
+    floatDef('image_softness', 'Image softness', 0, 0.5, 0.001),
+  ],
+});
+
+const GROUP_TRANSFORM_FIELDS = Object.freeze([
+  floatDef('position_x', 'Position X', -4, 4, 0.01),
+  floatDef('position_y', 'Position Y', -4, 4, 0.01),
+  floatDef('scale_x', 'Scale X', -16, 16, 0.01),
+  floatDef('scale_y', 'Scale Y', -16, 16, 0.01),
+  floatDef('anchor_x', 'Anchor X', -2, 3, 0.01),
+  floatDef('anchor_y', 'Anchor Y', -2, 3, 0.01),
+  floatDef('rotation_deg', 'Rotation', -180, 180, 0.1),
+  floatDef('skew_deg', 'Skew', -89, 89, 0.1),
+  floatDef('skew_axis_deg', 'Skew axis', -180, 180, 0.1),
+  floatDef('crop_left', 'Crop left', 0, 1, 0.001),
+  floatDef('crop_top', 'Crop top', 0, 1, 0.001),
+  floatDef('crop_right', 'Crop right', 0, 1, 0.001),
+  floatDef('crop_bottom', 'Crop bottom', 0, 1, 0.001),
+  enumDef('fit', 'Fit', [['stretch', 'Stretch'], ['fit', 'Fit'], ['fill', 'Fill'], ['native', 'Native']]),
+  enumDef('edge', 'Edge', [['transparent', 'Transparent'], ['clamp', 'Clamp'], ['repeat', 'Repeat'], ['mirror', 'Mirror']]),
+  enumDef('sampling', 'Sampling', [['linear', 'Linear'], ['nearest', 'Nearest']]),
+]);
+
+function creativeScopeWire(value = creativeRackScope?.value || 'master') {
+  if (value.startsWith('layer:')) return { scope: 'layer', layer_id: value.slice(6) };
+  if (value.startsWith('group:')) return { scope: 'group', group_id: value.slice(6) };
+  return { scope: 'master' };
+}
+
+function creativeScopeRack(value = creativeRackScope?.value || 'master') {
+  if (!latestCreative) return null;
+  if (value === 'master') return latestCreative.master_rack || null;
+  if (value.startsWith('layer:')) {
+    const id = value.slice(6);
+    return (latestCreative.layer_racks || []).find(([layerId]) => String(layerId) === id)?.[1] || null;
+  }
+  if (value.startsWith('group:')) {
+    const id = value.slice(6);
+    return (latestCreative.groups || []).find((group) => String(group.group_id) === id)?.rack || null;
+  }
+  return null;
+}
+
+function creativeLayerLabel(layerId) {
+  const index = latestLayers.findIndex((layer) => String(layer.layer_id) === String(layerId));
+  const layer = index >= 0 ? latestLayers[index] : null;
+  return layer ? `Layer ${index + 1} · ${layer.filename || layer.source_kind || layerId}` : `Layer ${layerId}`;
+}
+
+function creativeSetStatus(message, isError = false) {
+  if (!creativeStatus) return;
+  creativeStatus.textContent = message;
+  creativeStatus.classList.toggle('error', isError);
+}
+
+function creativeSend(action, pending) {
+  const sent = sendAction(action);
+  creativeSetStatus(sent ? pending : 'Control connection is offline.', !sent);
+  return sent;
+}
+
+function creativeOptionHtml(options, selected) {
+  return options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${String(value) === String(selected) ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('');
+}
+
+function creativeControlHtml(def, value, extraClass = '') {
+  const klass = `creative-control ${extraClass}`.trim();
+  if (def.type === 'bool') {
+    return `<label class="${klass}" data-creative-param="${escapeHtml(def.key)}"><span>${escapeHtml(def.label)}</span><input type="checkbox" ${value ? 'checked' : ''}><output>${value ? 'on' : 'off'}</output></label>`;
+  }
+  if (def.type === 'enum') {
+    return `<label class="${klass}" data-creative-param="${escapeHtml(def.key)}"><span>${escapeHtml(def.label)}</span><select>${creativeOptionHtml(def.options, value)}</select><output></output></label>`;
+  }
+  if (def.type === 'uint') {
+    return `<label class="${klass}" data-creative-param="${escapeHtml(def.key)}"><span>${escapeHtml(def.label)}</span><input type="number" min="0" max="4294967295" step="1" value="${Number(value) || 0}"><output></output></label>`;
+  }
+  if (def.type === 'vec') {
+    const values = Array.isArray(value) ? value : def.components.map(() => 0);
+    const controls = def.components.map((component, index) => `<label class="creative-control" data-creative-param="${escapeHtml(def.key)}" data-component="${index}"><span>${escapeHtml(def.label)} ${component}</span><input type="range" min="${def.min}" max="${def.max}" step="${def.step}" value="${Number(values[index]) || 0}"><output>${Number(values[index] || 0).toFixed(3)}</output></label>`).join('');
+    return `<div class="creative-control-wide creative-vector" data-vector-param="${escapeHtml(def.key)}">${controls}</div>`;
+  }
+  return `<label class="${klass}" data-creative-param="${escapeHtml(def.key)}"><span>${escapeHtml(def.label)}</span><input type="range" min="${def.min}" max="${def.max}" step="${def.step}" value="${Number(value) || 0}"><output>${Number(value || 0).toFixed(3)}</output></label>`;
+}
+
+function creativeRouteToken(route) {
+  const input = route?.input || { source: 'one_below' };
+  switch (input.source) {
+    case 'selected_layer': return `layer:${input.layer_id}:${input.stage || 'post_local_effects'}`;
+    case 'missing_selected_layer': return `missing-layer:${input.saved_position || '?'}`;
+    case 'group_output': return `group:${input.group_id}`;
+    case 'missing_group_output': return `missing-group:${input.group_id}`;
+    case 'all_below': return 'all_below';
+    case 'clean_program': return 'clean_program';
+    default: return 'one_below';
+  }
+}
+
+function creativeRouteOptions(route) {
+  const options = [
+    ['one_below', 'One below'],
+    ['all_below', 'All below'],
+    ['clean_program', 'Clean program (N−1)'],
+  ];
+  for (const layer of latestLayers) {
+    const id = String(layer.layer_id);
+    options.push([`layer:${id}:pre_local_effects`, `${creativeLayerLabel(id)} · pre`]);
+    options.push([`layer:${id}:post_local_effects`, `${creativeLayerLabel(id)} · post`]);
+  }
+  for (const group of latestCreative?.groups || []) {
+    options.push([`group:${group.group_id}`, `Group · ${group.name || group.group_id}`]);
+  }
+  const token = creativeRouteToken(route);
+  if (!options.some(([value]) => value === token)) options.push([token, `${token} · missing`]);
+  return options;
+}
+
+function creativeRouteFromToken(token, timing) {
+  const normalizedTiming = token === 'clean_program' ? 'previous_frame' : timing;
+  let input;
+  if (token.startsWith('layer:')) {
+    const [, layerId, stage] = token.split(':');
+    input = { source: 'selected_layer', layer_id: layerId, stage };
+  } else if (token.startsWith('group:')) {
+    input = { source: 'group_output', group_id: token.slice(6) };
+  } else if (token === 'all_below') {
+    input = { source: 'all_below' };
+  } else if (token === 'clean_program') {
+    input = { source: 'clean_program' };
+  } else {
+    input = { source: 'one_below' };
+  }
+  return { input, timing: normalizedTiming };
+}
+
+function creativeRouteEditorHtml(route, channel = 'alpha', invert = false) {
+  const token = creativeRouteToken(route);
+  const timing = route?.timing || 'current_frame';
+  return `<div class="creative-route-editor">
+    <div class="creative-route-row">
+      <label>Donor <select class="creative-route-source">${creativeOptionHtml(creativeRouteOptions(route), token)}</select></label>
+      <label>Timing <select class="creative-route-timing">
+        <option value="current_frame" ${timing === 'current_frame' ? 'selected' : ''}>Current frame</option>
+        <option value="previous_frame" ${timing === 'previous_frame' ? 'selected' : ''}>Previous frame N−1</option>
+      </select></label>
+      <label>Channel <select class="creative-route-channel">${creativeOptionHtml([['alpha', 'Alpha'], ['luma', 'Luma'], ['red', 'Red'], ['green', 'Green'], ['blue', 'Blue']], channel)}</select></label>
+      <label><input class="creative-route-invert" type="checkbox" ${invert ? 'checked' : ''}> Invert</label>
+    </div>
+    <div class="creative-node-diagnostic">Current-frame routes participate in cycle rejection. Clean Program is deliberately previous-frame only.</div>
+  </div>`;
+}
+
+function wireCreativeRouteEditor(editor, onChange, selfGroupId = '') {
+  const source = editor.querySelector('.creative-route-source');
+  const timing = editor.querySelector('.creative-route-timing');
+  const channel = editor.querySelector('.creative-route-channel');
+  const invert = editor.querySelector('.creative-route-invert');
+  const submit = () => {
+    if (source.value === 'clean_program') timing.value = 'previous_frame';
+    if (selfGroupId && source.value === `group:${selfGroupId}` && timing.value === 'current_frame') {
+      timing.value = 'previous_frame';
+    }
+    onChange(creativeRouteFromToken(source.value, timing.value), channel.value, invert.checked);
+  };
+  source.addEventListener('change', submit);
+  timing.addEventListener('change', submit);
+  channel.addEventListener('change', submit);
+  invert.addEventListener('change', submit);
+}
+
+function creativeNodeVisibleDefs(node) {
+  const defs = CREATIVE_NODE_PARAMS[node.kind] || [];
+  if (node.kind !== 'mask') return defs;
+  const variant = node.params?.variant || 'rectangle';
+  return defs.filter((def) => def.key.startsWith(`${variant}_`));
+}
+
+function creativeNodeValue(node, key) {
+  if (key === 'enabled') return node.enabled;
+  if (key === 'wet') return node.wet;
+  if (key === 'blend') return node.blend;
+  return node.params?.[key];
+}
+
+function creativeReadControlValue(row, def, container) {
+  if (def.type === 'vec') {
+    const vector = container.querySelector(`[data-vector-param="${def.key}"]`);
+    return [...vector.querySelectorAll('input')].map((input) => Number(input.value));
+  }
+  const input = row.querySelector('input,select');
+  if (def.type === 'bool') return input.checked;
+  if (def.type === 'uint') return Math.max(0, Math.min(0xffffffff, Math.trunc(Number(input.value) || 0)));
+  if (def.type === 'enum') return input.value;
+  return Number(input.value);
+}
+
+function wireCreativeNodeControl(card, node, def) {
+  const rows = def.type === 'vec'
+    ? [...card.querySelectorAll(`[data-creative-param="${def.key}"]`)]
+    : [card.querySelector(`[data-creative-param="${def.key}"]`)];
+  for (const row of rows) {
+    if (!row) continue;
+    const input = row.querySelector('input,select');
+    const eventName = def.type === 'bool' || def.type === 'enum' || def.type === 'uint' ? 'change' : 'input';
+    input.addEventListener(eventName, () => {
+      const value = creativeReadControlValue(row, def, card);
+      creativeSend({
+        action: 'set_visual_node_param',
+        scope: creativeScopeWire(),
+        node_id: String(node.node_id),
+        node_kind: node.kind,
+        param: def.key,
+        value,
+        composition_revision: compositionRevision,
+      }, `Applying ${CREATIVE_NODE_INFO[node.kind]?.label || node.kind} ${def.label.toLowerCase()}…`);
+      const output = row.querySelector('output');
+      if (output) output.textContent = def.type === 'bool' ? (value ? 'on' : 'off') : (typeof value === 'number' ? value.toFixed(3) : '');
+    });
+  }
+}
+
+function renderCreativeRack() {
+  if (!creativeRackNodes) return;
+  const rack = creativeScopeRack();
+  const nodes = rack?.nodes || [];
+  creativeNodeAdd.disabled = !rack || nodes.length >= 8 || !compositionRevision;
+  creativeRackNodes.innerHTML = nodes.length ? '' : '<div class="creative-help">Empty rack · scope passes its input unchanged.</div>';
+  nodes.forEach((node, index) => {
+    const info = CREATIVE_NODE_INFO[node.kind] || { label: node.kind };
+    const marker = !!info.marker;
+    const card = document.createElement('article');
+    card.className = `creative-node${marker ? ' creative-node-marker' : ''}`;
+    card.dataset.nodeId = String(node.node_id);
+    card.setAttribute('role', 'listitem');
+    const common = marker ? '' : [
+      boolDef('enabled', 'Enabled'),
+      floatDef('wet', 'Wet', 0, 1, 0.001),
+      enumDef('blend', 'Node blend', LAYER_BLEND_MODES.map((mode) => [mode.key, mode.label])),
+    ].map((def) => creativeControlHtml(def, creativeNodeValue(node, def.key))).join('');
+    const params = marker ? '' : creativeNodeVisibleDefs(node).map((def) => creativeControlHtml(def, creativeNodeValue(node, def.key))).join('');
+    const maskVariant = node.kind === 'mask' ? `<label class="creative-control creative-control-wide"><span>Mask kind</span><select class="creative-mask-variant">${creativeOptionHtml([['rectangle', 'Rectangle'], ['ellipse', 'Ellipse'], ['image', 'Image donor']], node.params?.variant || 'rectangle')}</select><output></output></label>` : '';
+    const imageRoute = node.kind === 'mask' && node.params?.variant === 'image'
+      ? creativeRouteEditorHtml(node.params.image_tap, node.params.image_channel, node.params.image_invert)
+      : '';
+    card.innerHTML = `<div class="creative-node-head">
+      <span class="creative-node-title">${escapeHtml(info.label)}</span>
+      <span class="creative-node-id">#${escapeHtml(node.node_id)}</span>
+      <button class="creative-node-up" type="button" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeHtml(info.label)} earlier">↑</button>
+      <button class="creative-node-down" type="button" ${index + 1 === nodes.length ? 'disabled' : ''} aria-label="Move ${escapeHtml(info.label)} later">↓</button>
+      <button class="creative-node-remove" type="button" ${marker ? 'disabled title="Legacy execution markers are immutable"' : ''} aria-label="Remove ${escapeHtml(info.label)}">×</button>
+    </div><div class="creative-node-controls">${common}${maskVariant}${params}${imageRoute}</div>${marker ? '<div class="creative-node-diagnostic">Frozen compatibility marker · values are supplied by the established engine path.</div>' : ''}`;
+    creativeRackNodes.appendChild(card);
+    card.querySelector('.creative-node-up')?.addEventListener('click', () => creativeSend({ action: 'move_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), to: index - 1, composition_revision: compositionRevision }, 'Moving rack node…'));
+    card.querySelector('.creative-node-down')?.addEventListener('click', () => creativeSend({ action: 'move_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), to: index + 1, composition_revision: compositionRevision }, 'Moving rack node…'));
+    if (!marker) card.querySelector('.creative-node-remove')?.addEventListener('click', () => creativeSend({ action: 'remove_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), composition_revision: compositionRevision }, 'Removing rack node…'));
+    if (!marker) {
+      [boolDef('enabled', 'Enabled'), floatDef('wet', 'Wet', 0, 1, 0.001), enumDef('blend', 'Node blend', [])].forEach((def) => wireCreativeNodeControl(card, node, def));
+      creativeNodeVisibleDefs(node).forEach((def) => wireCreativeNodeControl(card, node, def));
+    }
+    card.querySelector('.creative-mask-variant')?.addEventListener('change', (event) => creativeSend({
+      action: 'set_visual_node_mask_variant', scope: creativeScopeWire(), node_id: String(node.node_id), variant: event.currentTarget.value, composition_revision: compositionRevision,
+    }, 'Changing mask kind…'));
+    const routeEditor = card.querySelector('.creative-route-editor');
+    if (routeEditor) wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
+      action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
+    }, 'Preflighting image route…'), creativeScopeWire().scope === 'group' ? creativeScopeWire().group_id : '');
+  });
+}
+
+function groupTransformValue(transform, param) {
+  const value = transform || {};
+  const components = {
+    position_x: value.position?.[0], position_y: value.position?.[1],
+    scale_x: value.scale?.[0], scale_y: value.scale?.[1],
+    anchor_x: value.anchor?.[0], anchor_y: value.anchor?.[1],
+    crop_left: value.crop?.[0], crop_top: value.crop?.[1],
+    crop_right: value.crop?.[2], crop_bottom: value.crop?.[3],
+  };
+  return Object.hasOwn(components, param) ? components[param] : value[param];
+}
+
+function wireGroupControl(card, group, param, eventName = 'input') {
+  const row = card.querySelector(`[data-group-param="${param}"]`);
+  const input = row?.querySelector('input,select');
+  if (!input) return;
+  input.addEventListener(eventName, () => {
+    let value = input.type === 'checkbox' ? input.checked : (input.type === 'range' ? Number(input.value) : input.value);
+    if (param === 'name') {
+      value = String(value).replace(/[\u0000-\u001f\u007f]/g, '').trim();
+      if (new TextEncoder().encode(value).length > 64) {
+        creativeSetStatus('Group names may contain at most 64 UTF-8 bytes.', true);
+        return;
+      }
+    }
+    creativeSend({
+      action: 'set_composition_group_param', group_id: String(group.group_id), param, value, composition_revision: compositionRevision,
+    }, `Applying group ${param.replaceAll('_', ' ')}…`);
+    const output = row.querySelector('output');
+    if (output && typeof value === 'number') output.textContent = value.toFixed(3);
+  });
+}
+
+function renderCreativeGroups() {
+  if (!creativeGroups) return;
+  const groups = latestCreative?.groups || [];
+  creativeGroups.innerHTML = groups.length ? '' : '<div class="creative-help">No groups. Direct layers remain on the exact legacy stack.</div>';
+  for (const group of groups) {
+    const card = document.createElement('article');
+    card.className = 'creative-group-card';
+    card.dataset.groupId = String(group.group_id);
+    card.setAttribute('role', 'listitem');
+    const memberOptions = latestLayers.map((layer) => {
+      const id = String(layer.layer_id);
+      return `<option value="${escapeHtml(id)}" ${(group.member_layer_ids || []).map(String).includes(id) ? 'selected' : ''}>${escapeHtml(creativeLayerLabel(id))}</option>`;
+    }).join('');
+    const transformControls = GROUP_TRANSFORM_FIELDS.map((def) => `<div data-group-param="${def.key}">${creativeControlHtml(def, groupTransformValue(group.transform, def.key))}</div>`).join('');
+    const matte = group.matte;
+    const matteBody = matte ? `${creativeRouteEditorHtml(matte.route, matte.channel, matte.invert)}
+      ${creativeControlHtml(floatDef('amount', 'Matte amount', 0, 1, 0.001), matte.amount)}
+      ${creativeControlHtml(floatDef('threshold', 'Matte threshold', 0, 1, 0.001), matte.threshold)}
+      ${creativeControlHtml(floatDef('softness', 'Matte softness', 0, 0.5, 0.001), matte.softness)}
+      ${matte.diagnostic ? `<div class="creative-node-diagnostic creative-control-wide">${escapeHtml(matte.diagnostic)}</div>` : ''}` : '<div class="creative-help creative-control-wide">Disabled · no donor is sampled.</div>';
+    card.innerHTML = `<div class="creative-group-head">
+      <span class="creative-group-title">${escapeHtml(group.name || `Group ${group.group_id}`)}</span>
+      <span class="creative-node-id">#${escapeHtml(group.group_id)}</span>
+      <button class="creative-group-rack" type="button" aria-label="Open ${escapeHtml(group.name || 'group')} Collision Rack">Rack</button>
+      <button class="creative-group-remove" type="button" aria-label="Remove ${escapeHtml(group.name || 'group')}">Ungroup</button>
+    </div>
+    <div class="creative-group-controls">
+      <label class="creative-control creative-control-wide" data-group-param="name"><span>Name</span><input maxlength="64" value="${escapeHtml(group.name || '')}"><output></output></label>
+      <label class="creative-control" data-group-param="opacity"><span>Opacity</span><input type="range" min="0" max="1" step="0.001" value="${Number(group.opacity)}"><output>${Number(group.opacity).toFixed(3)}</output></label>
+      <label class="creative-control" data-group-param="bus"><span>Bus</span><select>${creativeOptionHtml([['program', 'Program'], ['a', 'A'], ['b', 'B']], group.bus)}</select><output></output></label>
+      <label class="creative-control" data-group-param="solo"><span>Solo</span><input type="checkbox" ${group.solo ? 'checked' : ''}><output>${group.solo ? 'on' : 'off'}</output></label>
+      <label class="creative-control" data-group-param="bypass"><span>Processing bypass</span><input type="checkbox" ${group.bypass ? 'checked' : ''}><output>${group.bypass ? 'on' : 'off'}</output></label>
+      <label class="creative-control creative-control-wide creative-group-members"><span>Members</span><select multiple size="3">${memberOptions}</select><output></output></label>
+    </div>
+    <details><summary class="creative-subtitle">GROUP TRANSFORM</summary><div class="creative-group-controls">${transformControls}</div></details>
+    <details><summary class="creative-subtitle">GROUP MATTE</summary><label class="creative-control"><span>Enabled</span><input class="creative-group-matte-enabled" type="checkbox" ${matte ? 'checked' : ''}><output>${matte ? 'on' : 'off'}</output></label><div class="creative-matte-controls">${matteBody}</div></details>`;
+    creativeGroups.appendChild(card);
+    card.querySelector('.creative-group-rack').addEventListener('click', () => {
+      creativeRackScope.value = `group:${group.group_id}`;
+      creativeStructureKey = '';
+      syncCreative(latestCreative);
+      document.getElementById('creative-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    card.querySelector('.creative-group-remove').addEventListener('click', () => creativeSend({ action: 'remove_composition_group', group_id: String(group.group_id), composition_revision: compositionRevision }, 'Ungrouping without deleting member layers…'));
+    wireGroupControl(card, group, 'name', 'change');
+    wireGroupControl(card, group, 'opacity');
+    wireGroupControl(card, group, 'bus', 'change');
+    wireGroupControl(card, group, 'solo', 'change');
+    wireGroupControl(card, group, 'bypass', 'change');
+    for (const def of GROUP_TRANSFORM_FIELDS) wireGroupControl(card, group, def.key, def.type === 'enum' ? 'change' : 'input');
+    const memberSelect = card.querySelector('.creative-group-members select');
+    memberSelect.addEventListener('change', () => creativeSend({
+      action: 'set_composition_group_members', group_id: String(group.group_id), member_layer_ids: [...memberSelect.selectedOptions].map((option) => option.value), composition_revision: compositionRevision,
+    }, 'Validating contiguous group membership…'));
+    const enabled = card.querySelector('.creative-group-matte-enabled');
+    enabled.addEventListener('change', () => creativeSend({
+      action: 'set_composition_group_matte_route', group_id: String(group.group_id), route: enabled.checked ? creativeRouteFromToken('one_below', 'current_frame') : null, channel: matte?.channel || 'alpha', invert: matte?.invert || false, composition_revision: compositionRevision,
+    }, enabled.checked ? 'Enabling group matte…' : 'Disabling group matte…'));
+    const routeEditor = card.querySelector('.creative-route-editor');
+    if (routeEditor) wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
+      action: 'set_composition_group_matte_route', group_id: String(group.group_id), route, channel, invert, composition_revision: compositionRevision,
+    }, 'Preflighting group matte route…'), String(group.group_id));
+    for (const param of ['amount', 'threshold', 'softness']) {
+      const row = card.querySelector(`.creative-matte-controls [data-creative-param="${param}"]`);
+      const input = row?.querySelector('input');
+      input?.addEventListener('input', () => {
+        const value = Number(input.value);
+        row.querySelector('output').textContent = value.toFixed(3);
+        creativeSend({ action: 'set_composition_group_matte_param', group_id: String(group.group_id), param, value, composition_revision: compositionRevision }, `Applying group matte ${param}…`);
+      });
+    }
+  }
+}
+
+function renderCreativeRoot() {
+  if (!creativeRoot) return;
+  const root = latestCreative?.root || [];
+  creativeRoot.innerHTML = root.length ? '' : '<div class="creative-help">Empty composition root.</div>';
+  root.forEach((item, index) => {
+    const row = document.createElement('div');
+    row.className = 'creative-root-item';
+    row.setAttribute('role', 'listitem');
+    const isLayer = item.kind === 'layer';
+    const id = isLayer ? String(item.layer_id) : String(item.group_id);
+    const group = !isLayer ? (latestCreative.groups || []).find((candidate) => String(candidate.group_id) === id) : null;
+    row.dataset.rootKind = item.kind;
+    row.dataset.rootId = id;
+    row.innerHTML = `<span class="creative-node-id">${index + 1}</span><span class="creative-root-label">${escapeHtml(isLayer ? creativeLayerLabel(id) : `Group · ${group?.name || id}`)}</span>
+      ${isLayer ? `<label>Bus <select class="creative-root-bus">${creativeOptionHtml([['program', 'Program'], ['a', 'A'], ['b', 'B']], item.bus)}</select></label>` : ''}
+      <button class="creative-root-up" type="button" ${index === 0 ? 'disabled' : ''} aria-label="Move root item backward">↑</button>
+      <button class="creative-root-down" type="button" ${index + 1 === root.length ? 'disabled' : ''} aria-label="Move root item forward">↓</button>`;
+    creativeRoot.appendChild(row);
+    const move = (to) => creativeSend({ action: 'move_composition_root_item', item, to, composition_revision: compositionRevision }, 'Moving composition root item…');
+    row.querySelector('.creative-root-up').addEventListener('click', () => move(index - 1));
+    row.querySelector('.creative-root-down').addEventListener('click', () => move(index + 1));
+    row.querySelector('.creative-root-bus')?.addEventListener('change', (event) => creativeSend({ action: 'set_composition_layer_bus', layer_id: id, bus: event.currentTarget.value, composition_revision: compositionRevision }, 'Assigning layer bus…'));
+  });
+}
+
+function creativeSyncRow(row, value) {
+  if (!row) return;
+  const input = row.querySelector('input,select');
+  if (!input || !canSync(input)) return;
+  const component = row.dataset.component;
+  const scalar = component === undefined ? value : value?.[Number(component)];
+  if (input.type === 'checkbox') input.checked = !!scalar;
+  else input.value = scalar ?? '';
+  const output = row.querySelector('output');
+  if (output) {
+    if (input.type === 'checkbox') output.textContent = input.checked ? 'on' : 'off';
+    else if (typeof scalar === 'number') output.textContent = scalar.toFixed(3);
+  }
+}
+
+function syncCreativeRenderedValues() {
+  if (!latestCreative) return;
+  if (creativeBusCrossfade && canSync(creativeBusCrossfade)) creativeBusCrossfade.value = latestCreative.bus_crossfade ?? 0.5;
+  if (creativeBusCrossfadeValue) creativeBusCrossfadeValue.textContent = Number(latestCreative.bus_crossfade ?? 0.5).toFixed(2);
+  const rack = creativeScopeRack();
+  for (const node of rack?.nodes || []) {
+    const card = creativeRackNodes?.querySelector(`[data-node-id="${node.node_id}"]`);
+    if (!card) continue;
+    for (const param of ['enabled', 'wet', 'blend']) creativeSyncRow(card.querySelector(`[data-creative-param="${param}"]`), creativeNodeValue(node, param));
+    for (const def of creativeNodeVisibleDefs(node)) {
+      card.querySelectorAll(`[data-creative-param="${def.key}"]`).forEach((row) => creativeSyncRow(row, creativeNodeValue(node, def.key)));
+    }
+  }
+  for (const group of latestCreative.groups || []) {
+    const card = creativeGroups?.querySelector(`[data-group-id="${group.group_id}"]`);
+    if (!card) continue;
+    for (const [param, value] of [['name', group.name], ['opacity', group.opacity], ['bus', group.bus], ['solo', group.solo], ['bypass', group.bypass]]) {
+      creativeSyncRow(card.querySelector(`[data-group-param="${param}"]`), value);
+    }
+    for (const def of GROUP_TRANSFORM_FIELDS) creativeSyncRow(card.querySelector(`[data-group-param="${def.key}"]`), groupTransformValue(group.transform, def.key));
+    if (group.matte) {
+      for (const param of ['amount', 'threshold', 'softness']) creativeSyncRow(card.querySelector(`.creative-matte-controls [data-creative-param="${param}"]`), group.matte[param]);
+    }
+  }
+  (latestCreative.root || []).forEach((item) => {
+    if (item.kind !== 'layer') return;
+    const select = creativeRoot?.querySelector(`[data-root-kind="layer"][data-root-id="${item.layer_id}"] .creative-root-bus`);
+    if (select && canSync(select)) select.value = item.bus;
+  });
+}
+
+function creativeRackStructure(rack) {
+  return (rack?.nodes || []).map((node) => ({
+    id: String(node.node_id), kind: node.kind, variant: node.params?.variant || '',
+    route: node.params?.variant === 'image' ? node.params.image_tap : null,
+    channel: node.params?.image_channel || '', invert: !!node.params?.image_invert,
+  }));
+}
+
+function creativeSnapshotStructure(creative, selectedScope) {
+  return JSON.stringify({
+    selectedScope,
+    master: creativeRackStructure(creative.master_rack),
+    layers: (creative.layer_racks || []).map(([id, rack]) => [String(id), creativeRackStructure(rack)]),
+    groups: (creative.groups || []).map((group) => ({
+      id: String(group.group_id), name: group.name || '', members: (group.member_layer_ids || []).map(String), rack: creativeRackStructure(group.rack),
+      matte: group.matte ? { route: group.matte.route, channel: group.matte.channel, invert: group.matte.invert } : null,
+    })),
+    root: creative.root || [],
+    layerLabels: latestLayers.map((layer) => [String(layer.layer_id), layer.filename || layer.source_kind || '']),
+  });
+}
+
+function syncCreative(creative) {
+  latestCreative = creative || { master_rack: { nodes: [] }, layer_racks: [], groups: [], root: [], bus_crossfade: 0.5 };
+  if (creativeRevision) creativeRevision.textContent = `composition ${compositionRevision}`;
+  const currentScope = creativeRackScope?.value || 'master';
+  const scopeOptions = [['master', 'Master']];
+  for (const [layerId] of latestCreative.layer_racks || []) scopeOptions.push([`layer:${layerId}`, creativeLayerLabel(layerId)]);
+  for (const group of latestCreative.groups || []) scopeOptions.push([`group:${group.group_id}`, `Group · ${group.name || group.group_id}`]);
+  const nextScope = scopeOptions.some(([value]) => value === currentScope) ? currentScope : 'master';
+  if (creativeRackScope && (creativeRackScope.options.length !== scopeOptions.length || [...creativeRackScope.options].some((option, index) => option.value !== scopeOptions[index]?.[0] || option.textContent !== scopeOptions[index]?.[1]))) {
+    creativeRackScope.innerHTML = creativeOptionHtml(scopeOptions, nextScope);
+  }
+  const availableLayers = latestLayers.map((layer) => [String(layer.layer_id), creativeLayerLabel(layer.layer_id)]);
+  const availableLayerKey = JSON.stringify(availableLayers);
+  if (creativeGroupMembers && !controlIsBusy(creativeGroupMembers) && creativeGroupMembers.dataset.optionsKey !== availableLayerKey) {
+    creativeGroupMembers.innerHTML = creativeOptionHtml(availableLayers, '');
+    creativeGroupMembers.dataset.optionsKey = availableLayerKey;
+  }
+  if (rerollGroup && !controlIsBusy(rerollGroup)) {
+    const selected = rerollGroup.value;
+    const options = (latestCreative.groups || []).map((group) => [String(group.group_id), group.name || `Group ${group.group_id}`]);
+    const optionsKey = JSON.stringify(options);
+    if (rerollGroup.dataset.optionsKey !== optionsKey) {
+      rerollGroup.innerHTML = creativeOptionHtml(options, options.some(([value]) => value === selected) ? selected : options[0]?.[0] || '');
+      rerollGroup.dataset.optionsKey = optionsKey;
+    }
+  }
+  const structure = creativeSnapshotStructure(latestCreative, nextScope);
+  if (structure !== creativeStructureKey) {
+    creativeStructureKey = structure;
+    renderCreativeRack();
+    renderCreativeGroups();
+    renderCreativeRoot();
+    if (!latestCreative.groups?.length && (latestCreative.master_rack?.nodes || []).every((node, index) => ['legacy_canonical', 'legacy_temporal'][index] === node.kind)) {
+      creativeSetStatus('Legacy rack · exact compatibility path');
+    }
+  }
+  if (latestCreative.status) creativeSetStatus(latestCreative.status, /reject|error|invalid|cycle|budget|missing|stale/i.test(latestCreative.status));
+  syncCreativeRenderedValues();
+}
+
+creativeRackScope?.addEventListener('change', () => {
+  creativeStructureKey = '';
+  syncCreative(latestCreative);
+});
+
+creativeNodeAdd?.addEventListener('click', () => {
+  const rack = creativeScopeRack();
+  if (!rack || !creativeNodeKind?.value) return;
+  creativeSend({ action: 'insert_visual_node', scope: creativeScopeWire(), index: rack.nodes?.length || 0, node_kind: creativeNodeKind.value, composition_revision: compositionRevision }, `Inserting ${CREATIVE_NODE_INFO[creativeNodeKind.value]?.label || creativeNodeKind.value}…`);
+});
+
+creativeBusCrossfade?.addEventListener('input', () => {
+  const value = Number(creativeBusCrossfade.value);
+  creativeBusCrossfadeValue.textContent = value.toFixed(2);
+  creativeSend({ action: 'set_composition_bus_crossfade', value }, 'Crossfading A / B…');
+});
+
+creativeGroupCreate?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const name = (creativeGroupName?.value || '').replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (new TextEncoder().encode(name).length > 64) {
+    creativeSetStatus('Group names may contain at most 64 UTF-8 bytes.', true);
+    return;
+  }
+  const memberLayerIds = [...(creativeGroupMembers?.selectedOptions || [])].map((option) => option.value);
+  if (creativeSend({ action: 'create_composition_group', name, member_layer_ids: memberLayerIds, root_index: latestCreative?.root?.length || 0, composition_revision: compositionRevision }, 'Creating composition group…')) {
+    creativeGroupName.value = '';
+  }
+});
+
+function layerBlendOptionsHtml(selected) {
+  const selectedKey = layerBlendModeInfo(selected).key;
+  return LAYER_BLEND_MODES.map((mode) =>
+    `<option value="${mode.key}" title="${escapeHtml(mode.description)}" ${mode.key === selectedKey ? 'selected' : ''}>${escapeHtml(mode.label)}</option>`
+  ).join('');
+}
+
+function syncLayerBlendDescription(row, key) {
+  const mode = layerBlendModeInfo(key);
+  const select = row?.querySelector('select');
+  const description = row?.querySelector('.blend-mode-description');
+  if (select) select.title = layerBlendTitle(mode.key);
+  if (description) description.textContent = mode.description;
+}
+
+function validSceneName(name) {
+  return typeof name === 'string'
+    && name === name.trim()
+    && !/[\u0000-\u001f\u007f]/.test(name)
+    && new TextEncoder().encode(name).length <= 128;
+}
+
+function sceneNameFrom(control) {
+  const name = String(control?.value || '').trim();
+  if (!validSceneName(name)) {
+    sceneStatus.textContent = 'Scene names must be at most 128 UTF-8 bytes with no control characters.';
+    sceneStatus.classList.add('error');
+    control?.focus();
+    return null;
+  }
+  return name;
+}
+
+function sceneTriggerModeFrom(control) {
+  const mode = String(control?.value || '');
+  return ['immediate', 'next_beat', 'next_bar'].includes(mode) ? mode : null;
+}
+
 function layerSelector(layer, index) {
   return { index, layer_id: layer?.layer_id || null };
 }
@@ -238,6 +1074,15 @@ function currentLayerContext(card, fallbackLayer, fallbackIndex) {
 function currentLayerSelector(card, fallbackLayer, fallbackIndex) {
   const current = currentLayerContext(card, fallbackLayer, fallbackIndex);
   return layerSelector(current.layer, current.index);
+}
+
+function stableLayerId(layer) {
+  const id = String(layer?.layer_id || '');
+  return /^(?:[1-9][0-9]*)$/.test(id) ? id : null;
+}
+
+function currentStableLayerId(card, fallbackLayer, fallbackIndex) {
+  return stableLayerId(currentLayerContext(card, fallbackLayer, fallbackIndex).layer);
 }
 
 // Attach missing programmatic names without requiring every compact visual
@@ -564,6 +1409,281 @@ function resetRangeOnDoubleActivation(el, fallback) {
   });
 }
 
+// --- Canonical spatial transform controls ------------------------------
+
+const LEGACY_SPATIAL_TRANSFORM = Object.freeze({
+  position: Object.freeze([0, 0]),
+  scale: Object.freeze([1, 1]),
+  anchor: Object.freeze([0.5, 0.5]),
+  rotation_deg: 0,
+  skew_deg: 0,
+  skew_axis_deg: 0,
+  fit: 'stretch',
+  crop: Object.freeze([0, 0, 0, 0]),
+  edge: 'transparent',
+  sampling: 'linear',
+});
+
+const TRANSFORM_RANGE_SPECS = [
+  ['position_x', 'Position X', -4, 4, 0.01, 0],
+  ['position_y', 'Position Y', -4, 4, 0.01, 0],
+  ['scale_x', 'Scale X', -16, 16, 0.01, 1],
+  ['scale_y', 'Scale Y', -16, 16, 0.01, 1],
+  ['anchor_x', 'Anchor X', -2, 3, 0.01, 0.5],
+  ['anchor_y', 'Anchor Y', -2, 3, 0.01, 0.5],
+  ['rotation_deg', 'Rotation °', -180, 180, 0.1, 0],
+  ['skew_deg', 'Skew °', -89, 89, 0.1, 0],
+  ['skew_axis_deg', 'Skew Axis °', -180, 180, 0.1, 0],
+  ['crop_left', 'Crop Left', 0, 0.999, 0.001, 0],
+  ['crop_top', 'Crop Top', 0, 0.999, 0.001, 0],
+  ['crop_right', 'Crop Right', 0, 0.999, 0.001, 0],
+  ['crop_bottom', 'Crop Bottom', 0, 0.999, 0.001, 0],
+];
+
+const TRANSFORM_RANGE_DEFAULTS = Object.fromEntries(
+  TRANSFORM_RANGE_SPECS.map(([param, , , , , fallback]) => [param, fallback])
+);
+const layerTransformUiState = new Map();
+let latestMasterTransform = cloneSpatialTransform(LEGACY_SPATIAL_TRANSFORM);
+let spatialTransformClipboard = null;
+
+function finiteTransformNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function normalizeSpatialTransform(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  const vector = (value, fallback) => Array.isArray(value) && value.length >= fallback.length
+    ? fallback.map((item, index) => finiteTransformNumber(value[index], item))
+    : [...fallback];
+  const oneOf = (value, choices, fallback) => choices.includes(value) ? value : fallback;
+  return {
+    position: vector(source.position, LEGACY_SPATIAL_TRANSFORM.position),
+    scale: vector(source.scale, LEGACY_SPATIAL_TRANSFORM.scale),
+    anchor: vector(source.anchor, LEGACY_SPATIAL_TRANSFORM.anchor),
+    rotation_deg: finiteTransformNumber(source.rotation_deg, 0),
+    skew_deg: finiteTransformNumber(source.skew_deg, 0),
+    skew_axis_deg: finiteTransformNumber(source.skew_axis_deg, 0),
+    fit: oneOf(source.fit, ['stretch', 'fit', 'fill', 'native'], 'stretch'),
+    crop: vector(source.crop, LEGACY_SPATIAL_TRANSFORM.crop),
+    edge: oneOf(source.edge, ['transparent', 'clamp', 'repeat', 'mirror'], 'transparent'),
+    sampling: oneOf(source.sampling, ['linear', 'nearest'], 'linear'),
+  };
+}
+
+function cloneSpatialTransform(transform) {
+  const normalized = normalizeSpatialTransform(transform);
+  return {
+    ...normalized,
+    position: [...normalized.position],
+    scale: [...normalized.scale],
+    anchor: [...normalized.anchor],
+    crop: [...normalized.crop],
+  };
+}
+
+function transformFieldValue(transform, param) {
+  const t = normalizeSpatialTransform(transform);
+  const fields = {
+    position_x: t.position[0], position_y: t.position[1],
+    scale_x: t.scale[0], scale_y: t.scale[1],
+    anchor_x: t.anchor[0], anchor_y: t.anchor[1],
+    rotation_deg: t.rotation_deg, skew_deg: t.skew_deg, skew_axis_deg: t.skew_axis_deg,
+    crop_left: t.crop[0], crop_top: t.crop[1], crop_right: t.crop[2], crop_bottom: t.crop[3],
+    fit: t.fit, edge: t.edge, sampling: t.sampling,
+  };
+  return fields[param];
+}
+
+function spatialTransformPreset(name) {
+  const preset = cloneSpatialTransform(LEGACY_SPATIAL_TRANSFORM);
+  if (name === 'center_fit') {
+    preset.fit = 'fit';
+    preset.edge = 'transparent';
+  } else if (name === 'center_fill') {
+    preset.fit = 'fill';
+    preset.edge = 'transparent';
+  } else if (name === 'native') {
+    preset.fit = 'native';
+    preset.edge = 'transparent';
+  } else if (name === 'mirror_x') {
+    preset.scale[0] = -1;
+  } else if (name === 'mirror_y') {
+    preset.scale[1] = -1;
+  } else if (name !== 'identity') {
+    return null;
+  }
+  return preset;
+}
+
+function transformRowParam(row) {
+  return row?.dataset.masterTransform || row?.dataset.layerTransform || '';
+}
+
+function transformRow(panel, param) {
+  return panel?.querySelector(
+    `[data-master-transform="${param}"], [data-layer-transform="${param}"]`
+  );
+}
+
+function updateTransformRangeDisplay(slider) {
+  const binding = rangeBindings.get(slider);
+  if (binding) {
+    writeRangeEditor(binding, slider.value);
+    return;
+  }
+  const value = Number(slider.value);
+  const display = slider.nextElementSibling;
+  if (display?.classList.contains('value')) {
+    display.textContent = formatValue(
+      value,
+      Number(slider.min),
+      Number(slider.max),
+      Number(slider.step)
+    );
+  }
+}
+
+function syncTransformPanel(panel, transform) {
+  if (!panel) return;
+  const normalized = normalizeSpatialTransform(transform);
+  panel.querySelectorAll('[data-master-transform], [data-layer-transform]').forEach((row) => {
+    const param = transformRowParam(row);
+    const value = transformFieldValue(normalized, param);
+    const control = row.querySelector('input[type="range"],select');
+    if (!control || !canSync(control)) return;
+    control.value = String(value);
+    if (control.matches('input[type="range"]')) updateTransformRangeDisplay(control);
+  });
+}
+
+function updateTransformPasteButtons() {
+  document.querySelectorAll('.transform-paste').forEach((button) => {
+    button.disabled = spatialTransformClipboard === null;
+    button.setAttribute('aria-disabled', String(button.disabled));
+  });
+}
+
+function setTransformPanelStatus(panel, message) {
+  const status = panel?.querySelector('.transform-status');
+  if (status) status.textContent = message;
+}
+
+function wireTransformPanel(panel, api) {
+  if (!panel || panel.dataset.transformWired === 'true') return;
+  panel.dataset.transformWired = 'true';
+  const link = panel.querySelector('.transform-scale-link');
+  if (api.stateKey) {
+    const remembered = layerTransformUiState.get(api.stateKey);
+    link.checked = remembered?.scaleLinked
+      ?? Math.abs(transformFieldValue(api.getTransform(), 'scale_x') - transformFieldValue(api.getTransform(), 'scale_y')) < 1e-6;
+    link.addEventListener('change', () => {
+      layerTransformUiState.set(api.stateKey, { scaleLinked: link.checked });
+    });
+  }
+
+  panel.querySelectorAll('[data-master-transform], [data-layer-transform]').forEach((row) => {
+    const param = transformRowParam(row);
+    const control = row.querySelector('input[type="range"],select');
+    if (!control) return;
+    const eventName = control.matches('input[type="range"]') ? 'input' : 'change';
+    control.addEventListener(eventName, () => {
+      const value = control.matches('select') ? control.value : Number(control.value);
+      if (!api.set(param, value)) {
+        setTransformPanelStatus(panel, 'Control connection is offline; transform was not sent.');
+        return;
+      }
+      setTransformPanelStatus(panel, '');
+      if (link?.checked && (param === 'scale_x' || param === 'scale_y')) {
+        const pairedParam = param === 'scale_x' ? 'scale_y' : 'scale_x';
+        const paired = transformRow(panel, pairedParam)?.querySelector('input[type="range"]');
+        if (paired) {
+          paired.value = String(value);
+          updateTransformRangeDisplay(paired);
+          api.set(pairedParam, value);
+        }
+      }
+    });
+    if (control.matches('input[type="range"]')) {
+      resetRangeOnDoubleActivation(control, TRANSFORM_RANGE_DEFAULTS[param]);
+    }
+  });
+
+  panel.querySelector('.transform-reset')?.addEventListener('click', () => {
+    setTransformPanelStatus(
+      panel,
+      api.reset() ? 'Transform reset requested.' : 'Control connection is offline; reset was not sent.'
+    );
+  });
+  panel.querySelector('.transform-copy')?.addEventListener('click', () => {
+    spatialTransformClipboard = cloneSpatialTransform(api.getTransform());
+    updateTransformPasteButtons();
+    setTransformPanelStatus(panel, 'Transform copied for this control session.');
+  });
+  panel.querySelector('.transform-paste')?.addEventListener('click', () => {
+    if (!spatialTransformClipboard) return;
+    setTransformPanelStatus(
+      panel,
+      api.apply(cloneSpatialTransform(spatialTransformClipboard))
+        ? 'Transform paste requested.'
+        : 'Control connection is offline; paste was not sent.'
+    );
+  });
+  panel.querySelector('.transform-preset')?.addEventListener('change', (event) => {
+    const transform = spatialTransformPreset(event.currentTarget.value);
+    event.currentTarget.value = '';
+    if (!transform) return;
+    setTransformPanelStatus(
+      panel,
+      api.apply(transform)
+        ? 'Transform preset requested.'
+        : 'Control connection is offline; preset was not sent.'
+    );
+  });
+  bindRangeEditors(panel);
+  syncTransformPanel(panel, api.getTransform());
+  updateTransformPasteButtons();
+}
+
+function layerTransformControlsHtml(index) {
+  const ranges = TRANSFORM_RANGE_SPECS.map(([param, label, min, max, step, fallback]) => `
+    <div class="param-row" data-layer-transform="${param}">
+      <label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${fallback}" aria-label="Layer ${index + 1} ${label}"><span class="value">${formatValue(fallback, min, max, step)}</span>
+    </div>`).join('');
+  return `
+    <div class="transform-toolbar" role="group" aria-label="Layer ${index + 1} transform commands">
+      <button type="button" class="transform-reset" title="Reset to the legacy full-frame identity">Reset</button>
+      <button type="button" class="transform-copy">Copy</button>
+      <button type="button" class="transform-paste">Paste</button>
+      <label class="transform-preset-label">Preset
+        <select class="transform-preset" aria-label="Layer ${index + 1} transform preset">
+          <option value="">Choose…</option><option value="identity">Identity</option><option value="center_fit">Center Fit</option><option value="center_fill">Center Fill</option><option value="native">Native 1:1</option><option value="mirror_x">Mirror X</option><option value="mirror_y">Mirror Y</option>
+        </select>
+      </label>
+    </div>
+    ${ranges}
+    <div class="param-row toggle-row transform-scale-link-row"><label>Link scale</label><label class="toggle"><input type="checkbox" class="transform-scale-link" aria-label="Link layer ${index + 1} scale axes"><span class="toggle-slider"></span></label></div>
+    <div class="param-row select-row" data-layer-transform="fit"><label>Fit</label><select aria-label="Layer ${index + 1} media fit"><option value="stretch">Stretch</option><option value="fit">Fit</option><option value="fill">Fill</option><option value="native">Native</option></select></div>
+    <div class="param-row select-row" data-layer-transform="edge"><label>Edge</label><select aria-label="Layer ${index + 1} edge mode"><option value="transparent">Transparent</option><option value="clamp">Clamp</option><option value="repeat">Repeat</option><option value="mirror">Mirror</option></select></div>
+    <div class="param-row select-row" data-layer-transform="sampling"><label>Sampling</label><select aria-label="Layer ${index + 1} sampling mode"><option value="linear">Linear</option><option value="nearest">Nearest</option></select></div>
+    <div class="audio-status">Position uses composition dimensions; anchor and crop use source fractions. Zero scale fails closed to transparent.</div>
+    <div class="transform-status" role="status" aria-live="polite"></div>`;
+}
+
+const masterTransformPanel = document.getElementById('master-transform-body');
+wireTransformPanel(masterTransformPanel, {
+  getTransform: () => latestMasterTransform,
+  set: (param, value) => sendAction({ action: 'set_master_transform', param, value }),
+  reset: () => sendAction({ action: 'reset_master_transform' }),
+  apply: (transform) => sendAction({ action: 'apply_master_transform', transform }),
+});
+
+function syncMasterTransform(transform) {
+  latestMasterTransform = normalizeSpatialTransform(transform);
+  syncTransformPanel(masterTransformPanel, latestMasterTransform);
+}
+
 // --- Initialize sliders from DOM attributes ---
 
 document.querySelectorAll('.param-row[data-param]').forEach((row) => {
@@ -671,6 +1791,8 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
   const step = parseFloat(row.dataset.step);
 
   const slider = row.querySelector('input[type="range"]');
+  const checkbox = row.querySelector('input[type="checkbox"]');
+  const number = row.querySelector('input[type="number"]');
   const valueEl = row.querySelector('.value');
   const select = row.querySelector('select');
 
@@ -683,6 +1805,14 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
       key_threshold: 0.1,
       key_softness: 0.03,
       key_history: 1,
+      loom_depth: 1,
+      loom_scale: 1,
+      loom_folds: 1,
+      atlas_territories: 8,
+      garden_threshold: 0.1,
+      garden_softness: 0.03,
+      garden_decay: 1,
+      score_state_count: 4,
     };
     slider.value = defaults[param] ?? min;
 
@@ -694,19 +1824,108 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
     resetRangeOnDoubleActivation(slider, defaults[param] ?? 0);
   }
 
+  if (checkbox) {
+    checkbox.addEventListener('change', () => {
+      sendAction({ action: 'set_temporal', param, value: checkbox.checked });
+    });
+  }
+
+  if (number) {
+    number.addEventListener('change', () => {
+      const parsed = Number(number.value);
+      const minimum = Number(number.min);
+      const maximum = Number(number.max);
+      if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+        number.value = row.dataset.default || '0';
+        return;
+      }
+      sendAction({ action: 'set_temporal', param, value: parsed });
+    });
+  }
+
   if (select) {
     select.addEventListener('change', () => {
-      sendAction({ action: 'set_temporal', param, value: parseInt(select.value) });
+      const value = param === 'key_mode' ? parseInt(select.value, 10) : select.value;
+      sendAction({ action: 'set_temporal', param, value });
     });
   }
 });
 
+function syncTemporalLoopDriver(driver) {
+  const select = document.getElementById('temporal-score-loop-driver');
+  if (!select || !canSync(select)) return;
+  const desired = driver?.kind === 'selected_layer'
+    ? String(driver.layer_id || '')
+    : driver?.kind === 'missing_selected_layer'
+      ? `missing:${Number(driver.saved_position) || 0}`
+      : 'none';
+
+  select.replaceChildren(new Option('None', 'none'));
+  latestLayers.forEach((layer, index) => {
+    const id = String(layer.layer_id || '');
+    if (!id) return;
+    select.add(new Option(`Layer ${index + 1}: ${layer.filename || layer.source_kind || id}`, id));
+  });
+  if (desired.startsWith('missing:')) {
+    const position = Number(desired.slice(8)) + 1;
+    const missing = new Option(`Missing saved layer ${position}`, desired, true, true);
+    missing.disabled = true;
+    select.add(missing);
+  }
+  select.value = [...select.options].some(option => option.value === desired) ? desired : 'none';
+}
+
 function syncTemporal(t) {
   if (!t) return;
-  for (const [param, value] of Object.entries(t)) {
+  const originals = t.originals || {};
+  const loom = originals.loom || {};
+  const atlas = originals.atlas || {};
+  const garden = originals.garden || {};
+  const score = originals.score || {};
+  const reset = originals.reset || {};
+  const values = {
+    feedback: t.feedback,
+    fb_zoom: t.fb_zoom,
+    fb_rotate: t.fb_rotate,
+    slitscan: t.slitscan,
+    slit_angle: t.slit_angle,
+    key_mode: t.key_mode,
+    key_threshold: t.key_threshold,
+    key_softness: t.key_softness,
+    key_history: t.key_history,
+    loom_amount: loom.amount,
+    loom_topology: loom.topology,
+    loom_interpolation: loom.interpolation,
+    loom_depth: loom.depth,
+    loom_phase: loom.phase,
+    loom_scale: loom.scale,
+    loom_angle: loom.angle,
+    loom_folds: loom.folds,
+    loom_quantization: loom.quantization,
+    atlas_amount: atlas.amount,
+    atlas_seed: atlas.seed,
+    atlas_territories: atlas.territories,
+    atlas_collision: atlas.collision,
+    garden_amount: garden.amount,
+    garden_gate: garden.gate,
+    garden_threshold: garden.threshold,
+    garden_softness: garden.softness,
+    garden_decay: garden.decay,
+    garden_max_hold_ticks: garden.max_hold_ticks,
+    score_enabled: score.enabled,
+    score_seed: score.seed,
+    score_state_count: score.state_count,
+    score_trigger: score.trigger,
+    reset_loop_boundary: reset.loop_boundary,
+    reset_downbeat: reset.downbeat,
+  };
+  for (const [param, value] of Object.entries(values)) {
+    if (value === undefined || value === null) continue;
     const row = document.querySelector(`.param-row[data-temporal="${param}"]`);
     if (!row) continue;
     const slider = row.querySelector('input[type="range"]');
+    const checkbox = row.querySelector('input[type="checkbox"]');
+    const number = row.querySelector('input[type="number"]');
     const valueEl = row.querySelector('.value');
     const select = row.querySelector('select');
     if (slider && valueEl && canSync(slider)) {
@@ -719,10 +1938,134 @@ function syncTemporal(t) {
       );
     }
     if (select && canSync(select)) {
-      select.value = Math.round(value);
+      select.value = String(value);
     }
+    if (checkbox && canSync(checkbox)) checkbox.checked = Boolean(value);
+    if (number && canSync(number)) number.value = String(value);
+  }
+  syncTemporalLoopDriver(score.loop_driver);
+
+  const telemetry = t.telemetry || {};
+  const telemetryEl = document.getElementById('temporal-telemetry');
+  if (telemetryEl) {
+    const valid = Number(telemetry.history_valid) || 0;
+    const capacity = Number(telemetry.history_capacity) || 24;
+    const carrier = telemetry.carrier_valid ? 'carrier ready' : 'carrier empty';
+    const hold = telemetry.freeze_hold_valid ? 'hold ready' : 'hold empty';
+    const ticks = Number(telemetry.total_reference_ticks) || 0;
+    const scoreState = Number(telemetry.score_state) || 0;
+    const ordinal = Number(telemetry.score_event_ordinal) || 0;
+    const staged = telemetry.frame_staged ? ' · staged' : '';
+    const resetText = telemetry.last_reset ? ` · reset ${telemetry.last_reset}` : '';
+    telemetryEl.textContent = `History ${valid}/${capacity} · ${carrier} · ${hold} · tick ${ticks} · Score ${scoreState} · event ${ordinal}${staged}${resetText}`;
   }
 }
+
+document.getElementById('temporal-clear-memory')?.addEventListener('click', () => {
+  sendAction({ action: 'clear_temporal_memory' });
+});
+
+document.getElementById('temporal-score-trigger')?.addEventListener('click', () => {
+  sendAction({ action: 'trigger_collision_score' });
+});
+
+// --- M4 Motion Fields / Faraday Transplant / Curved Shutter ---
+
+const MOTION_PARAM_DEFAULTS = Object.freeze({
+  field_source: 'auto', lattice_quality: 'live', transplant_amount: 0,
+  carrier: 'transparent', confidence_threshold: 0.1, confidence_softness: 0.05,
+  refresh: 1, decay: 1, occlusion: 0, shutter_angle: 0, shutter_phase: 0,
+  shutter_curvature: 0, shutter_chromatic_lag: 0, shutter_quality: 'sharp',
+});
+
+function motionParamValue(motion = {}, param) {
+  const transplant = motion.transplant || {};
+  const shutter = motion.shutter || {};
+  const values = {
+    field_source: motion.field_source,
+    lattice_quality: motion.lattice_quality,
+    transplant_amount: transplant.amount,
+    carrier: transplant.carrier,
+    confidence_threshold: transplant.confidence_threshold,
+    confidence_softness: transplant.confidence_softness,
+    refresh: transplant.refresh,
+    decay: transplant.decay,
+    occlusion: transplant.occlusion,
+    shutter_angle: shutter.angle_degrees,
+    shutter_phase: shutter.phase,
+    shutter_curvature: shutter.curvature,
+    shutter_chromatic_lag: shutter.chromatic_lag,
+    shutter_quality: shutter.quality,
+  };
+  return values[param] ?? MOTION_PARAM_DEFAULTS[param];
+}
+
+function motionTelemetryText(motion = {}) {
+  const telemetry = motion.telemetry || {};
+  const dimensions = telemetry.field_dimensions || [0, 0];
+  const source = telemetry.effective_source || 'idle';
+  const fallback = telemetry.fallback_active ? ' · lattice fallback' : '';
+  const missing = telemetry.donor_missing ? ' · donor missing' : '';
+  const admitted = telemetry.transplant_admitted ? ' · transplant admitted' : '';
+  const carrier = telemetry.carrier_valid ? 'carrier ready' : 'carrier empty';
+  const field = dimensions[0] && dimensions[1] ? ` · ${dimensions[0]}×${dimensions[1]}` : '';
+  const diagnostic = telemetry.diagnostic ? ` · ${telemetry.diagnostic}` : '';
+  return `v${Number(motion.algorithm_version || 1)} · ${source}${fallback}${field} · ${Number(telemetry.vector_count || 0)} vectors · ${carrier}${admitted}${missing}${diagnostic}`;
+}
+
+function wireMotionPanel(panel, scopeProvider) {
+  if (!panel || panel.dataset.motionWired === 'true') return;
+  panel.dataset.motionWired = 'true';
+  panel.querySelectorAll('[data-motion-param]').forEach((row) => {
+    const param = row.dataset.motionParam;
+    const control = row.querySelector('input,select');
+    if (!control) return;
+    const eventName = control.type === 'range' ? 'input' : 'change';
+    control.addEventListener(eventName, () => {
+      const scope = scopeProvider();
+      if (!scope) return;
+      const value = control.type === 'range' ? Number(control.value) : control.value;
+      if (control.type === 'range') {
+        const valueEl = row.querySelector('.value');
+        if (valueEl) valueEl.textContent = formatValue(value, Number(control.min), Number(control.max), Number(control.step));
+      }
+      sendAction({ action: 'set_motion', scope, param, value });
+    });
+    if (control.type === 'range') resetRangeOnDoubleActivation(control, Number(MOTION_PARAM_DEFAULTS[param]));
+  });
+}
+
+function syncMotionPanel(panel, motion = {}) {
+  if (!panel) return;
+  panel.querySelectorAll('[data-motion-param]').forEach((row) => {
+    const param = row.dataset.motionParam;
+    const control = row.querySelector('input,select');
+    if (!control || !canSync(control)) return;
+    const value = motionParamValue(motion, param);
+    control.value = String(value);
+    if (control.type === 'range') {
+      const valueEl = row.querySelector('.value');
+      if (valueEl) valueEl.textContent = formatValue(Number(value), Number(control.min), Number(control.max), Number(control.step));
+    }
+  });
+  const telemetry = panel.querySelector('.motion-telemetry');
+  if (telemetry) {
+    telemetry.textContent = motionTelemetryText(motion);
+    const diagnostic = String(motion.telemetry?.diagnostic || '').toLowerCase();
+    telemetry.classList.toggle('error', !!diagnostic || !!motion.telemetry?.donor_missing);
+  }
+}
+
+const masterMotionPanel = document.getElementById('master-motion-panel');
+wireMotionPanel(masterMotionPanel, () => ({ scope: 'master' }));
+
+function syncMasterMotion(motion) {
+  syncMotionPanel(masterMotionPanel, motion || {});
+}
+
+document.getElementById('motion-clear-memory')?.addEventListener('click', () => {
+  sendAction({ action: 'clear_motion_memory' });
+});
 
 // --- Collapsible FX groups (state remembered across reloads) ---
 
@@ -897,14 +2240,29 @@ const rerollSeed = document.getElementById('reroll-seed');
 const rerollAmount = document.getElementById('reroll-amount');
 const rerollAmountValue = document.getElementById('reroll-amount-value');
 const rerollGrainControls = document.getElementById('reroll-grain-controls');
+const rerollTransformControls = document.getElementById('reroll-transform-controls');
+const rerollRackControls = document.getElementById('reroll-rack-controls');
+const rerollGroupControls = document.getElementById('reroll-group-controls');
+const rerollGroup = document.getElementById('reroll-group');
 const rerollButton = document.getElementById('reroll-button');
 
 function syncRerollModeControls() {
   const variation = rerollMode?.value === 'variation';
+  const groupScope = rerollScope?.value === 'group';
+  const compositionScope = groupScope || rerollScope?.value === 'all';
   document.getElementById('reroll-amount-row')?.classList.toggle('control-disabled', !variation);
   document.getElementById('reroll-grain-row')?.classList.toggle('control-disabled', !variation);
+  document.getElementById('reroll-transform-row')?.classList.toggle('control-disabled', !variation);
+  document.getElementById('reroll-rack-row')?.classList.toggle('control-disabled', !variation);
+  document.getElementById('reroll-group-controls-row')?.classList.toggle('control-disabled', !variation || !compositionScope);
+  const groupRow = document.getElementById('reroll-group-row');
+  if (groupRow) groupRow.hidden = !groupScope;
   if (rerollAmount) rerollAmount.disabled = !variation;
   if (rerollGrainControls) rerollGrainControls.disabled = !variation;
+  if (rerollTransformControls) rerollTransformControls.disabled = !variation;
+  if (rerollRackControls) rerollRackControls.disabled = !variation;
+  if (rerollGroupControls) rerollGroupControls.disabled = !variation || !compositionScope;
+  if (rerollGroup) rerollGroup.disabled = !groupScope;
 }
 
 function readExactRerollSeed() {
@@ -921,6 +2279,7 @@ function readExactRerollSeed() {
 }
 
 rerollMode?.addEventListener('change', syncRerollModeControls);
+rerollScope?.addEventListener('change', syncRerollModeControls);
 rerollAmount?.addEventListener('input', () => {
   rerollAmountValue.textContent = Number(rerollAmount.value).toFixed(2);
 });
@@ -928,16 +2287,24 @@ rerollSeed?.addEventListener('input', () => readExactRerollSeed());
 rerollButton?.addEventListener('click', () => {
   const seed = readExactRerollSeed();
   if (!seed.valid) return;
-  const scope = rerollScope.value === 'all' ? 'all' : 'master';
+  const scope = ['all', 'group'].includes(rerollScope.value) ? rerollScope.value : 'master';
   const action = {
     action: 'reroll',
     scope,
     mode: rerollMode.value === 'variation' ? 'variation' : 'pattern',
     amount: Math.min(2, Math.max(0, Number(rerollAmount.value) || 0)),
     include_grain_controls: !!rerollGrainControls.checked,
+    include_transform: !!rerollTransformControls.checked,
+    include_rack_controls: !!rerollRackControls?.checked,
+    include_group_controls: scope === 'group' && !!rerollGroupControls?.checked
+      || scope === 'all' && !!rerollGroupControls?.checked,
   };
   if (seed.value !== null) action.seed = seed.value;
   if (scope === 'all') action.stack_revision = layerStackRevision;
+  if (scope === 'group') {
+    if (!rerollGroup?.value) return;
+    action.group_id = rerollGroup.value;
+  }
   if (sendAction(action)) {
     document.getElementById('reroll-status').textContent = seed.value === null
       ? 'Advancing deterministic seed…'
@@ -1046,6 +2413,13 @@ function syncMediaSafety(safety) {
   );
 }
 
+function syncNewLayerFit(value) {
+  if (!newLayerFit) return;
+  const fit = ['stretch', 'fit', 'fill', 'native'].includes(value) ? value : 'fit';
+  authoritativeNewLayerFit = fit;
+  if (canSync(newLayerFit)) newLayerFit.value = fit;
+}
+
 expertMediaToggle?.addEventListener('change', () => {
   const mode = expertMediaToggle.checked ? 'expert' : 'safe';
   if (mode === 'expert') {
@@ -1074,15 +2448,25 @@ expertMediaToggle?.addEventListener('change', () => {
 
 function syncLayers(layers) {
   if (!layers) return;
+  latestLayers = layers;
   latestLayerIdentities = layers.map((layer) => String(layer.layer_id || ''));
   const liveDisclosureKeys = new Set(layers.map(layerDisclosureKey));
   for (const key of layerDisclosureState.keys()) {
     if (!liveDisclosureKeys.has(key)) layerDisclosureState.delete(key);
   }
+  for (const key of layerTransformUiState.keys()) {
+    if (!liveDisclosureKeys.has(key)) layerTransformUiState.delete(key);
+  }
   syncExportAudioLayers(layers);
+  syncLibrarySlotTargets(layers);
   layersEmpty.style.display = layers.length === 0 ? 'block' : 'none';
 
-  const layerKey = JSON.stringify(layers.map((layer) => [layer.layer_id, layer.filename, layer.source_kind]));
+  const layerKey = JSON.stringify(layers.map((layer) => [
+    layer.layer_id,
+    layer.filename,
+    layer.source_kind,
+    (layer.performance?.slots || []).map((slot) => [slot.id, slot.filename]),
+  ]));
   // Rebuild when identity/order changes, including same-count replacement.
   if (layersList.children.length !== layers.length || layersList.dataset.layerKey !== layerKey) {
     layersList.innerHTML = '';
@@ -1096,6 +2480,173 @@ function syncLayers(layers) {
     });
   }
 }
+
+function syncLibrarySlotTargets(layers) {
+  if (!librarySlotTarget) return;
+  const key = JSON.stringify(layers.map((layer) => [
+    layer.layer_id,
+    layer.filename,
+    (layer.performance?.slots || []).map((slot) => [slot.id, slot.name, slot.filename]),
+  ]));
+  if (librarySlotTarget.dataset.layersKey === key) return;
+  const previous = librarySlotTarget.value;
+  librarySlotTarget.dataset.layersKey = key;
+  librarySlotTarget.replaceChildren(new Option('Choose a stable layer…', ''));
+  layers.forEach((layer, index) => {
+    const layerId = stableLayerId(layer);
+    if (!layerId) return;
+    const group = document.createElement('optgroup');
+    group.label = `Layer ${index + 1} [${layerId}] · ${layer.filename || 'Untitled'}`;
+    group.appendChild(new Option('New slot', `${layerId}:new`));
+    for (const slot of layer.performance?.slots || []) {
+      group.appendChild(new Option(
+        `Replace slot ${slot.id} · ${slot.name || slot.filename || 'Untitled'}`,
+        `${layerId}:${slot.id}`,
+      ));
+    }
+    librarySlotTarget.appendChild(group);
+  });
+  librarySlotTarget.value = Array.from(librarySlotTarget.options).some((option) => option.value === previous)
+    ? previous
+    : '';
+}
+
+function syncPerformance(performanceState = {}) {
+  if (!sceneList || !sceneStatus) return;
+  const scenes = Array.isArray(performanceState?.scenes) ? performanceState.scenes : [];
+  const key = JSON.stringify({
+    layers: latestLayers.map((layer) => [layer.layer_id, layer.filename]),
+    scenes: scenes.map((scene) => [
+      scene.id,
+      scene.name,
+      scene.trigger_mode,
+      scene.prepared,
+      scene.pending,
+      scene.status,
+      scene.bindings,
+    ]),
+  });
+  if (sceneList.dataset.sceneKey !== key) {
+    sceneList.dataset.sceneKey = key;
+    sceneList.replaceChildren();
+    const layerNames = new Map(latestLayers.map((layer, index) => [
+      stableLayerId(layer),
+      `L${index + 1} [${stableLayerId(layer) || 'missing'}]`,
+    ]));
+    for (const scene of scenes) {
+      const sceneId = Number(scene.id);
+      if (!Number.isInteger(sceneId) || sceneId <= 0 || sceneId > 65535) continue;
+      const row = document.createElement('article');
+      row.className = `scene-row${scene.prepared ? ' prepared' : ''}${scene.pending ? ' pending' : ''}`;
+      row.setAttribute('role', 'listitem');
+      const bindings = (scene.bindings || []).map((binding) => {
+        const donor = layerNames.get(String(binding.layer_id)) || `missing ${binding.layer_id}`;
+        const cue = binding.cue_id === null || binding.cue_id === undefined ? '' : ` @ cue ${binding.cue_id}`;
+        return `${donor} → slot ${binding.slot_id}${cue}`;
+      }).join(' · ');
+      const displayName = scene.name || `Scene ${sceneId}`;
+      const authoredMode = ['immediate', 'next_beat', 'next_bar'].includes(scene.trigger_mode)
+        ? scene.trigger_mode
+        : 'immediate';
+      row.innerHTML = `
+        <div class="scene-copy">
+          <label class="visually-hidden" for="scene-name-${sceneId}">Scene ${sceneId} name</label>
+          <input id="scene-name-${sceneId}" class="scene-name" type="text" maxlength="128" autocomplete="off" spellcheck="false" value="${escapeHtml(scene.name || '')}" placeholder="Scene ${sceneId}" aria-label="Scene ${sceneId} name">
+          <span>${escapeHtml(bindings || 'No bindings')}</span>
+          ${scene.status ? `<span class="scene-diagnostic">${escapeHtml(scene.status)}</span>` : ''}
+        </div>
+        <div class="scene-timing">
+          <label for="scene-mode-${sceneId}">Timing</label>
+          <select id="scene-mode-${sceneId}" class="scene-mode" aria-label="${escapeHtml(displayName)} trigger timing">
+            <option value="immediate"${authoredMode === 'immediate' ? ' selected' : ''}>Immediate</option>
+            <option value="next_beat"${authoredMode === 'next_beat' ? ' selected' : ''}>Next beat</option>
+            <option value="next_bar"${authoredMode === 'next_bar' ? ' selected' : ''}>Next bar</option>
+          </select>
+        </div>
+        <div class="scene-actions" role="group" aria-label="${escapeHtml(displayName)} commands">
+          <button type="button" class="scene-prepare" aria-label="Prepare ${escapeHtml(displayName)}">Prepare</button>
+          <button type="button" class="scene-trigger" aria-label="Trigger ${escapeHtml(displayName)}">Trigger</button>
+          <button type="button" class="scene-recapture" aria-label="Recapture ${escapeHtml(displayName)} from current active slots">Recapture</button>
+          <button type="button" class="scene-remove" aria-label="Remove ${escapeHtml(displayName)}">Remove</button>
+        </div>`;
+      row.querySelector('.scene-prepare').addEventListener('click', () => {
+        if (sendAction({ action: 'prepare_scene', scene_id: sceneId })) {
+          sceneStatus.textContent = `Preparing ${displayName}…`;
+          sceneStatus.classList.remove('error');
+        }
+      });
+      row.querySelector('.scene-trigger').addEventListener('click', () => {
+        const triggerMode = sceneTriggerModeFrom(row.querySelector('.scene-mode'));
+        if (!triggerMode) return;
+        if (sendAction({
+          action: 'trigger_scene',
+          scene_id: sceneId,
+          trigger_mode: triggerMode,
+        })) {
+          sceneStatus.textContent = `Triggering ${displayName} (${triggerMode.replace('_', ' ')})…`;
+          sceneStatus.classList.remove('error');
+        }
+      });
+      row.querySelector('.scene-recapture').addEventListener('click', () => {
+        const name = sceneNameFrom(row.querySelector('.scene-name'));
+        const triggerMode = sceneTriggerModeFrom(row.querySelector('.scene-mode'));
+        if (name === null || !triggerMode) return;
+        if (sendAction({
+          action: 'capture_scene',
+          scene_id: sceneId,
+          name,
+          trigger_mode: triggerMode,
+        })) {
+          sceneStatus.textContent = `Recapturing ${name || `Scene ${sceneId}`} from the current active slots…`;
+          sceneStatus.classList.remove('error');
+        } else {
+          sceneStatus.textContent = 'Control connection is offline; the scene was not recaptured.';
+          sceneStatus.classList.add('error');
+        }
+      });
+      row.querySelector('.scene-remove').addEventListener('click', () => {
+        if (sendAction({ action: 'remove_scene', scene_id: sceneId })) {
+          sceneStatus.textContent = `Removing ${displayName}…`;
+          sceneStatus.classList.remove('error');
+        } else {
+          sceneStatus.textContent = 'Control connection is offline; the scene was not removed.';
+          sceneStatus.classList.add('error');
+        }
+      });
+      sceneList.appendChild(row);
+    }
+  }
+  sceneList.hidden = scenes.length === 0;
+  const diagnostics = [
+    performanceState?.status,
+    performanceState?.scene_staging_status,
+    performanceState?.source_staging_status,
+    performanceState?.image_routing_status,
+  ].filter(Boolean);
+  sceneStatus.textContent = diagnostics.join(' · ')
+    || (scenes.length ? `${scenes.length} authored scene${scenes.length === 1 ? '' : 's'}` : 'No authored scenes');
+  sceneStatus.classList.toggle('error', !!performanceState?.image_routing_status);
+}
+
+sceneCaptureForm?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const name = sceneNameFrom(sceneCaptureName);
+  const triggerMode = sceneTriggerModeFrom(sceneCaptureMode);
+  if (name === null || !triggerMode) return;
+  if (latestLayers.length === 0) {
+    sceneStatus.textContent = 'Add at least one live layer before capturing a scene.';
+    sceneStatus.classList.add('error');
+    return;
+  }
+  if (sendAction({ action: 'capture_scene', name, trigger_mode: triggerMode })) {
+    sceneStatus.textContent = `Capturing ${name || 'a new scene'} from the current active slots…`;
+    sceneStatus.classList.remove('error');
+    sceneCaptureName.value = '';
+  } else {
+    sceneStatus.textContent = 'Control connection is offline; the scene was not captured.';
+    sceneStatus.classList.add('error');
+  }
+});
 
 function syncExportAudioLayers(layers) {
   const select = document.getElementById('export-audio');
@@ -1192,6 +2743,137 @@ function layerEffectsHtml(effects, index) {
     </div>`;
 }
 
+function activeClipSlot(layer) {
+  const slots = layer?.performance?.slots || [];
+  const requested = Number(layer?.performance?.active_slot_id);
+  return slots.find((slot) => Number(slot.id) === requested)
+    || slots.find((slot) => slot.active)
+    || slots[0]
+    || null;
+}
+
+function clipSlotOptionsHtml(layer) {
+  const active = activeClipSlot(layer);
+  const slots = layer?.performance?.slots || [];
+  if (!slots.length) return '<option value="">No prepared slots</option>';
+  return slots.map((slot) => `<option value="${Number(slot.id)}" ${Number(slot.id) === Number(active?.id) ? 'selected' : ''}>Slot ${Number(slot.id)} · ${escapeHtml(slot.name || slot.filename || 'Untitled')}${slot.prepared ? '' : ' · staging'}</option>`).join('');
+}
+
+function matteInputValue(input = {}) {
+  if (input.source === 'selected_layer') {
+    return `selected:${input.layer_id}:${input.stage || 'post_local_effects'}`;
+  }
+  if (input.source === 'missing_selected_layer') {
+    return `missing:${Number(input.saved_position)}:${input.stage || 'post_local_effects'}`;
+  }
+  if (input.source === 'group_output') return `group:${String(input.group_id)}`;
+  if (input.source === 'missing_group_output') return `missing-group:${String(input.group_id)}`;
+  return input.source || 'one_below';
+}
+
+function matteInputOptionsHtml(layer) {
+  const current = matteInputValue(layer?.performance?.matte?.input);
+  const ordinary = [
+    ['one_below', 'One below'],
+    ['all_below', 'All below'],
+    ['program_history', 'Program history (N−1)'],
+    ['clean_program', 'Clean program (same-frame cycle diagnostic)'],
+  ].map(([value, label]) => `<option value="${value}" ${current === value ? 'selected' : ''}>${label}</option>`);
+  const selected = [];
+  latestLayers.forEach((candidate, index) => {
+    const candidateId = stableLayerId(candidate);
+    if (!candidateId) return;
+    for (const [stage, label] of [['pre_local_effects', 'pre local FX'], ['post_local_effects', 'post local FX']]) {
+      const value = `selected:${candidateId}:${stage}`;
+      selected.push(`<option value="${value}" ${current === value ? 'selected' : ''}>Layer ${index + 1} [${candidateId}] · ${escapeHtml(candidate.filename || 'Untitled')} · ${label}</option>`);
+    }
+  });
+  const groupOutputs = (latestCreative?.groups || []).map((group) => {
+    const value = `group:${String(group.group_id)}`;
+    return `<option value="${escapeHtml(value)}" ${current === value ? 'selected' : ''}>Group · ${escapeHtml(group.name || String(group.group_id))}</option>`;
+  });
+  if (String(current).startsWith('missing:')) {
+    const [, position, stage] = String(current).split(':');
+    ordinary.unshift(`<option value="${escapeHtml(current)}" selected disabled>Missing saved layer ${escapeHtml(position)} · ${escapeHtml(stage)}</option>`);
+  } else if (String(current).startsWith('missing-group:')) {
+    ordinary.unshift(`<option value="${escapeHtml(current)}" selected disabled>Missing group ${escapeHtml(String(current).slice(14))}</option>`);
+  }
+  return ordinary.concat(selected, groupOutputs).join('');
+}
+
+function layerPerformanceHtml(layer, index) {
+  const slot = activeClipSlot(layer);
+  const transport = slot?.transport || {};
+  const grid = transport.beat_grid || {};
+  const beatLoop = transport.beat_loop || {};
+  const cues = Array.isArray(transport.cues) ? transport.cues : [];
+  const matte = layer?.performance?.matte || {};
+  const cueOptions = cues.length
+    ? cues.map((cue) => `<option value="${Number(cue.id)}">Cue ${Number(cue.id)} · ${Number(cue.at).toFixed(3)}</option>`).join('')
+    : '<option value="">No cues</option>';
+  return `
+    <div class="layer-performance-heading">
+      <button class="layer-performance-toggle" type="button" aria-expanded="false" aria-controls="layer-performance-body-${index}">
+        <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Slots / Transport</span>
+      </button>
+    </div>
+    <div class="layer-performance-body" id="layer-performance-body-${index}" role="region" aria-label="Layer ${index + 1} clip slots and transport" hidden>
+      <div class="slot-command-row">
+        <label for="clip-slot-${index}">Prepared source</label>
+        <select id="clip-slot-${index}" class="clip-slot-select">${clipSlotOptionsHtml(layer)}</select>
+        <select class="clip-trigger-mode" aria-label="Layer ${index + 1} slot activation timing">
+          <option value="immediate">Immediate</option><option value="next_beat">Next beat</option><option value="next_bar">Next bar</option>
+        </select>
+        <button type="button" class="clip-activate">Activate</button>
+        <button type="button" class="clip-remove" aria-label="Remove selected prepared slot">Remove</button>
+      </div>
+      <div class="performance-status clip-slot-status" role="status" aria-live="polite">${escapeHtml(slot?.status || (slot?.prepared ? 'Prepared' : slot ? 'Staging…' : 'No prepared source'))}</div>
+      <div class="transport-grid" ${slot ? '' : 'hidden'}>
+        <label>Playhead <input class="clip-seek" type="range" min="0" max="1" step="0.001" value="${Number(slot?.playhead || 0)}" aria-label="Layer ${index + 1} clip playhead"></label>
+        <label>Direction <select data-clip-transport="direction"><option value="forward">Forward</option><option value="reverse">Reverse</option></select></label>
+        <label>End <select data-clip-transport="end_behavior"><option value="loop">Loop</option><option value="ping_pong">Ping pong</option><option value="one_shot">One shot</option><option value="hold">Hold</option></select></label>
+        <label>In <input data-clip-transport="in_point" type="number" min="0" max="1" step="0.001" value="${Number(transport.in_point ?? 0)}"></label>
+        <label>Out <input data-clip-transport="out_point" type="number" min="0" max="1" step="0.001" value="${Number(transport.out_point ?? 1)}"></label>
+        <label>Rate <input data-clip-transport="rate" type="number" min="0" max="16" step="0.01" value="${Number(transport.rate ?? 1)}"></label>
+        <label>Sample FPS <input data-clip-transport="sample_fps" type="number" min="0.25" max="480" step="0.01" value="${transport.sample_fps ?? ''}" placeholder="source"></label>
+        <label><input data-clip-transport="beat_grid_enabled" type="checkbox" ${transport.beat_grid ? 'checked' : ''}> Beat grid</label>
+        <label>Clip BPM <input data-clip-transport="clip_bpm" type="number" min="1" max="999" step="0.01" value="${Number(grid.bpm ?? 120)}"></label>
+        <label>Length beats <input data-clip-transport="length_beats" type="number" min="0.015625" max="65536" step="0.015625" value="${grid.length_beats ?? ''}" placeholder="derive"></label>
+        <label><input data-clip-transport="sync_to_program" type="checkbox" ${grid.sync_to_program ? 'checked' : ''}> Sync BPM</label>
+        <label>Beats/bar <input data-clip-transport="beats_per_bar" type="number" min="1" max="32" step="1" value="${Number(grid.beats_per_bar ?? 4)}"></label>
+        <label><input data-clip-transport="beat_loop_enabled" type="checkbox" ${transport.beat_loop ? 'checked' : ''}> Beat loop</label>
+        <label>Loop start <input data-clip-transport="beat_loop_start" type="number" min="0" max="65536" step="0.015625" value="${Number(beatLoop.start_beat ?? 0)}"></label>
+        <label>Loop length <input data-clip-transport="beat_loop_length" type="number" min="0.015625" max="64" step="0.015625" value="${Number(beatLoop.length_beats ?? 1)}"></label>
+      </div>
+      <fieldset class="cue-controls" ${slot ? '' : 'disabled'}>
+        <legend>Cues</legend>
+        <select class="clip-cue-select" aria-label="Layer ${index + 1} cues">${cueOptions}</select>
+        <button type="button" class="clip-cue-trigger">Trigger</button>
+        <button type="button" class="clip-cue-remove">Remove</button>
+        <label>ID <input class="clip-cue-id" type="number" min="0" max="4095" step="1" value="0"></label>
+        <label>At <input class="clip-cue-at" type="number" min="0" max="1" step="0.001" value="0"></label>
+        <button type="button" class="clip-cue-set">Add / update</button>
+      </fieldset>
+    </div>
+    <div class="layer-matte-heading">
+      <button class="layer-matte-toggle" type="button" aria-expanded="false" aria-controls="layer-matte-body-${index}">
+        <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Matte / Image Input</span>
+      </button>
+    </div>
+    <div class="layer-matte-body" id="layer-matte-body-${index}" role="region" aria-label="Layer ${index + 1} matte and image input" hidden>
+      <div class="matte-grid">
+        <label><input data-layer-matte="enabled" type="checkbox" ${matte.enabled ? 'checked' : ''}> Enabled</label>
+        <label>Input <select class="matte-input">${matteInputOptionsHtml(layer)}</select></label>
+        <label>Channel <select data-layer-matte="channel"><option value="alpha">Alpha</option><option value="luma">Luma</option><option value="red">Red</option><option value="green">Green</option><option value="blue">Blue</option></select></label>
+        <label><input data-layer-matte="invert" type="checkbox" ${matte.invert ? 'checked' : ''}> Invert</label>
+        <label>Amount <input data-layer-matte="amount" type="range" min="0" max="1" step="0.01" value="${Number(matte.amount ?? 1)}"></label>
+        <label>Threshold <input data-layer-matte="threshold" type="range" min="0" max="1" step="0.01" value="${Number(matte.threshold ?? 0.5)}"></label>
+        <label>Softness <input data-layer-matte="softness" type="range" min="0" max="1" step="0.01" value="${Number(matte.softness ?? 0.1)}"></label>
+      </div>
+      <div class="performance-status matte-status" role="status" aria-live="polite">${escapeHtml(matte.diagnostic || (matte.enabled ? 'Ready' : 'Disabled'))}</div>
+    </div>`;
+}
+
 const layerDisclosureState = new Map();
 
 function layerDisclosureKey(layer, index) {
@@ -1205,13 +2887,35 @@ function setLayerDisclosure(button, body, expanded) {
 
 function wireLayerDisclosures(card, layer, index) {
   const key = layerDisclosureKey(layer, index);
-  const remembered = layerDisclosureState.get(key) || { effects: false, cellular: false };
+  const remembered = layerDisclosureState.get(key) || { transform: false, motion: false, performance: false, matte: false, effects: false, cellular: false };
+  const transformButton = card.querySelector('.layer-transform-toggle');
+  const transformBody = card.querySelector('.layer-transform-body');
+  const motionButton = card.querySelector('.layer-motion-toggle');
+  const motionBody = card.querySelector('.layer-motion-body');
   const effectsButton = card.querySelector('.layer-fx-toggle');
   const effectsBody = card.querySelector('.layer-fx-body');
   const cellularButton = card.querySelector('.layer-cellular-toggle');
   const cellularBody = card.querySelector('.layer-cellular-body');
+  const performanceButton = card.querySelector('.layer-performance-toggle');
+  const performanceBody = card.querySelector('.layer-performance-body');
+  const matteButton = card.querySelector('.layer-matte-toggle');
+  const matteBody = card.querySelector('.layer-matte-body');
+  setLayerDisclosure(transformButton, transformBody, !!remembered.transform);
+  setLayerDisclosure(motionButton, motionBody, !!remembered.motion);
   setLayerDisclosure(effectsButton, effectsBody, remembered.effects);
   setLayerDisclosure(cellularButton, cellularBody, remembered.cellular);
+  setLayerDisclosure(performanceButton, performanceBody, remembered.performance);
+  setLayerDisclosure(matteButton, matteBody, remembered.matte);
+  transformButton.addEventListener('click', () => {
+    remembered.transform = transformButton.getAttribute('aria-expanded') !== 'true';
+    layerDisclosureState.set(key, remembered);
+    setLayerDisclosure(transformButton, transformBody, remembered.transform);
+  });
+  motionButton.addEventListener('click', () => {
+    remembered.motion = motionButton.getAttribute('aria-expanded') !== 'true';
+    layerDisclosureState.set(key, remembered);
+    setLayerDisclosure(motionButton, motionBody, remembered.motion);
+  });
   effectsButton.addEventListener('click', () => {
     remembered.effects = effectsButton.getAttribute('aria-expanded') !== 'true';
     layerDisclosureState.set(key, remembered);
@@ -1221,6 +2925,92 @@ function wireLayerDisclosures(card, layer, index) {
     remembered.cellular = cellularButton.getAttribute('aria-expanded') !== 'true';
     layerDisclosureState.set(key, remembered);
     setLayerDisclosure(cellularButton, cellularBody, remembered.cellular);
+  });
+  performanceButton.addEventListener('click', () => {
+    remembered.performance = performanceButton.getAttribute('aria-expanded') !== 'true';
+    layerDisclosureState.set(key, remembered);
+    setLayerDisclosure(performanceButton, performanceBody, remembered.performance);
+  });
+  matteButton.addEventListener('click', () => {
+    remembered.matte = matteButton.getAttribute('aria-expanded') !== 'true';
+    layerDisclosureState.set(key, remembered);
+    setLayerDisclosure(matteButton, matteBody, remembered.matte);
+  });
+}
+
+function motionRangeHtml(param, label, min, max, step, value) {
+  return `<div class="param-row" data-motion-param="${param}"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-label="${label}"><span class="value">${value}</span></div>`;
+}
+
+function motionSelectHtml(param, label, options) {
+  return `<div class="param-row select-row" data-motion-param="${param}"><label>${label}</label><select aria-label="${label}">${options.map(([value, text]) => `<option value="${value}">${text}</option>`).join('')}</select></div>`;
+}
+
+function layerMotionControlsHtml(layer, index) {
+  const motion = layer.motion || {};
+  return `
+    ${motionSelectHtml('field_source', 'Field source', [['auto', 'Auto'], ['codec_vectors', 'Codec vectors'], ['lattice', 'Motion lattice']])}
+    ${motionSelectHtml('lattice_quality', 'Lattice', [['draft', 'Draft · 16px'], ['live', 'Live · 8px'], ['high', 'High · 4px']])}
+    <div class="param-row select-row motion-donor-row"><label for="layer-motion-donor-${index}">Faraday donor</label><select id="layer-motion-donor-${index}" class="motion-donor-select" aria-label="Layer ${index + 1} Faraday motion donor"><option value="none">None</option></select></div>
+    ${motionRangeHtml('transplant_amount', 'Transplant', 0, 1, 0.01, Number(motion.transplant?.amount ?? 0))}
+    ${motionSelectHtml('carrier', 'Carrier', [['transparent', 'Transparent'], ['black', 'Black'], ['first_source_frame', 'First source frame']])}
+    ${motionRangeHtml('confidence_threshold', 'Confidence', 0, 1, 0.01, Number(motion.transplant?.confidence_threshold ?? 0.1))}
+    ${motionRangeHtml('confidence_softness', 'Conf. soft', 0, 0.5, 0.01, Number(motion.transplant?.confidence_softness ?? 0.05))}
+    ${motionRangeHtml('refresh', 'Refresh', 0, 1, 0.01, Number(motion.transplant?.refresh ?? 1))}
+    ${motionRangeHtml('decay', 'Decay', 0, 1, 0.01, Number(motion.transplant?.decay ?? 1))}
+    ${motionRangeHtml('occlusion', 'Occlusion', 0, 1, 0.01, Number(motion.transplant?.occlusion ?? 0))}
+    ${motionRangeHtml('shutter_angle', 'Shutter angle', 0, 360, 1, Number(motion.shutter?.angle_degrees ?? 0))}
+    ${motionRangeHtml('shutter_phase', 'Phase', -1, 1, 0.01, Number(motion.shutter?.phase ?? 0))}
+    ${motionRangeHtml('shutter_curvature', 'Curvature', -2, 2, 0.01, Number(motion.shutter?.curvature ?? 0))}
+    ${motionRangeHtml('shutter_chromatic_lag', 'Chroma lag', 0, 1, 0.01, Number(motion.shutter?.chromatic_lag ?? 0))}
+    ${motionSelectHtml('shutter_quality', 'Shutter quality', [['sharp', 'Sharp · 1'], ['draft', 'Draft · 4'], ['live', 'Live · 8'], ['high', 'High · 16']])}
+    <div class="audio-status motion-telemetry" role="status" aria-live="polite">${escapeHtml(motionTelemetryText(motion))}</div>
+    <div class="audio-status">One active transplant is admitted composition-wide. A missing donor stays inert and never retargets.</div>`;
+}
+
+function syncLayerMotion(card, layer) {
+  const panel = card.querySelector('.layer-motion-body');
+  if (!panel) return;
+  syncMotionPanel(panel, layer.motion || {});
+  const donorSelect = panel.querySelector('.motion-donor-select');
+  if (!donorSelect || !canSync(donorSelect)) return;
+  const donor = layer.motion?.transplant?.donor || { kind: 'none' };
+  const currentValue = donor.kind === 'selected'
+    ? String(donor.layer_id || '')
+    : donor.kind === 'missing' ? `missing:${Number(donor.saved_position || 0)}` : 'none';
+  const optionKey = JSON.stringify([String(layer.layer_id || ''), currentValue, latestLayers.map((candidate) => [candidate.layer_id, candidate.filename])]);
+  if (donorSelect.dataset.optionKey !== optionKey) {
+    donorSelect.dataset.optionKey = optionKey;
+    const options = [new Option('None', 'none')];
+    latestLayers.forEach((candidate, candidateIndex) => {
+      if (String(candidate.layer_id) === String(layer.layer_id)) return;
+      options.push(new Option(`Layer ${candidateIndex + 1} · ${candidate.filename || 'Untitled'}`, String(candidate.layer_id)));
+    });
+    if (donor.kind === 'missing') {
+      const missing = new Option(`Missing saved layer ${Number(donor.saved_position || 0) + 1}`, currentValue);
+      missing.disabled = true;
+      options.push(missing);
+    }
+    donorSelect.replaceChildren(...options);
+  }
+  donorSelect.value = currentValue;
+}
+
+function wireLayerMotion(card, layer, index) {
+  const panel = card.querySelector('.layer-motion-body');
+  wireMotionPanel(panel, () => {
+    const current = currentLayerContext(card, layer, index).layer;
+    const layerId = String(current?.layer_id || '');
+    return /^(?:[1-9][0-9]*)$/.test(layerId) ? { scope: 'layer', layer_id: layerId } : null;
+  });
+  panel.querySelector('.motion-donor-select')?.addEventListener('change', (event) => {
+    const current = currentLayerContext(card, layer, index).layer;
+    const layerId = String(current?.layer_id || '');
+    const selected = event.currentTarget.value;
+    if (!/^(?:[1-9][0-9]*)$/.test(layerId) || selected.startsWith('missing:')) return;
+    const donorLayerId = selected === 'none' ? null : selected;
+    if (donorLayerId !== null && !/^(?:[1-9][0-9]*)$/.test(donorLayerId)) return;
+    sendAction({ action: 'set_motion_donor', layer_id: layerId, donor_layer_id: donorLayerId, layer_stack_revision: layerStackRevision });
   });
 }
 
@@ -1242,10 +3032,246 @@ function wireLayerEffects(card, layer, index) {
   });
 }
 
+function selectedSlotId(card, layer) {
+  const selected = Number(card.querySelector('.clip-slot-select')?.value);
+  if (Number.isInteger(selected) && selected > 0 && selected <= 65535) return selected;
+  const active = Number(activeClipSlot(layer)?.id);
+  return Number.isInteger(active) && active > 0 && active <= 65535 ? active : null;
+}
+
+function displayedClipSlot(card, layer) {
+  const slots = layer?.performance?.slots || [];
+  const active = activeClipSlot(layer);
+  const requested = Number(card?.dataset.selectedSlotId);
+  const selected = slots.find((slot) => Number(slot.id) === requested);
+  if (card?._slotSelectionTouched && selected && Number(active?.id) !== requested) return selected;
+  if (card && card._slotSelectionTouched && Number(active?.id) === requested) {
+    card._slotSelectionTouched = false;
+  }
+  if (card && active) card.dataset.selectedSlotId = String(active.id);
+  return active || selected || null;
+}
+
+function wireLayerPerformance(card, layer, index) {
+  const target = () => {
+    const current = currentLayerContext(card, layer, index).layer;
+    const layerId = stableLayerId(current);
+    const slotId = selectedSlotId(card, current);
+    return layerId && slotId ? { layer: current, layerId, slotId } : null;
+  };
+
+  card.querySelector('.clip-slot-select').addEventListener('change', (event) => {
+    const selected = Number(event.currentTarget.value);
+    if (!Number.isInteger(selected) || selected <= 0 || selected > 65535) return;
+    card.dataset.selectedSlotId = String(selected);
+    card._slotSelectionTouched = true;
+    syncLayerPerformance(card, currentLayerContext(card, layer, index).layer);
+  });
+  const status = (message, error = false) => {
+    const element = card.querySelector('.clip-slot-status');
+    if (!element) return;
+    element.textContent = message;
+    element.classList.toggle('error', error);
+  };
+
+  card.querySelector('.clip-activate').addEventListener('click', () => {
+    const selected = target();
+    if (!selected) return status('A prepared stable slot is required.', true);
+    const triggerMode = card.querySelector('.clip-trigger-mode').value;
+    if (sendAction({ action: 'activate_clip_slot', layer_id: selected.layerId, slot_id: selected.slotId, trigger_mode: triggerMode })) {
+      status(`Activation staged (${triggerMode.replace('_', ' ')}).`);
+    } else status('Control connection is offline.', true);
+  });
+  card.querySelector('.clip-remove').addEventListener('click', () => {
+    const selected = target();
+    if (!selected) return status('A prepared stable slot is required.', true);
+    if (!window.confirm(`Remove prepared slot ${selected.slotId}?`)) return;
+    sendAction({ action: 'remove_clip_slot', layer_id: selected.layerId, slot_id: selected.slotId });
+  });
+  const clipSeek = card.querySelector('.clip-seek');
+  const sendSeek = (event) => {
+    const selected = target();
+    const position = Number(event.currentTarget.value);
+    if (selected && Number.isFinite(position) && position >= 0 && position <= 1) {
+      sendAction({ action: 'seek_clip_slot', layer_id: selected.layerId, slot_id: selected.slotId, position });
+    }
+  };
+  // Dragging is source-time scratching, not merely a release-time seek. The
+  // bounded server queue and decoder mailbox retain only the newest adjacent
+  // request for this stable layer/slot; change supplies the exact final value.
+  clipSeek.addEventListener('input', sendSeek);
+  clipSeek.addEventListener('change', sendSeek);
+  card.querySelectorAll('[data-clip-transport]').forEach((control) => {
+    const param = control.dataset.clipTransport;
+    control.addEventListener(control.type === 'range' ? 'input' : 'change', () => {
+      const selected = target();
+      if (!selected || !control.checkValidity()) return;
+      let value;
+      if (control.type === 'checkbox') value = control.checked;
+      else if (control.tagName === 'SELECT') value = control.value;
+      else if (control.value === '' && ['sample_fps', 'length_beats'].includes(param)) value = null;
+      else value = Number(control.value);
+      if (value !== null && typeof value === 'number' && !Number.isFinite(value)) return;
+      sendAction({ action: 'set_clip_transport', layer_id: selected.layerId, slot_id: selected.slotId, param, value });
+    });
+  });
+
+  const cueSelection = () => {
+    const cueId = Number(card.querySelector('.clip-cue-select').value);
+    return Number.isInteger(cueId) && cueId >= 0 && cueId <= 4095 ? cueId : null;
+  };
+  card.querySelector('.clip-cue-select').addEventListener('change', (event) => {
+    const selected = target();
+    const cueId = cueSelection();
+    const cue = selected?.layer?.performance?.slots
+      ?.find((slot) => Number(slot.id) === selected.slotId)?.transport?.cues
+      ?.find((candidate) => Number(candidate.id) === cueId);
+    if (!cue) return;
+    card.querySelector('.clip-cue-id').value = String(cue.id);
+    card.querySelector('.clip-cue-at').value = String(cue.at);
+    event.currentTarget.setCustomValidity('');
+  });
+  card.querySelector('.clip-cue-trigger').addEventListener('click', () => {
+    const selected = target();
+    const cueId = cueSelection();
+    if (selected && cueId !== null) sendAction({ action: 'trigger_clip_cue', layer_id: selected.layerId, slot_id: selected.slotId, cue_id: cueId });
+  });
+  card.querySelector('.clip-cue-remove').addEventListener('click', () => {
+    const selected = target();
+    const cueId = cueSelection();
+    if (selected && cueId !== null) sendAction({ action: 'remove_clip_cue', layer_id: selected.layerId, slot_id: selected.slotId, cue_id: cueId });
+  });
+  card.querySelector('.clip-cue-set').addEventListener('click', () => {
+    const selected = target();
+    const idControl = card.querySelector('.clip-cue-id');
+    const atControl = card.querySelector('.clip-cue-at');
+    const cueId = Number(idControl.value);
+    const at = Number(atControl.value);
+    if (!selected || !idControl.checkValidity() || !atControl.checkValidity()
+        || !Number.isInteger(cueId) || cueId < 0 || cueId > 4095
+        || !Number.isFinite(at) || at < 0 || at > 1) return;
+    sendAction({ action: 'set_clip_cue', layer_id: selected.layerId, slot_id: selected.slotId, cue_id: cueId, at });
+  });
+
+  card.querySelectorAll('[data-layer-matte]').forEach((control) => {
+    const param = control.dataset.layerMatte;
+    const eventName = control.type === 'range' ? 'input' : 'change';
+    control.addEventListener(eventName, () => {
+      const layerId = currentStableLayerId(card, layer, index);
+      if (!layerId || !control.checkValidity()) return;
+      const value = control.type === 'checkbox'
+        ? control.checked
+        : control.tagName === 'SELECT'
+          ? control.value
+          : Number(control.value);
+      if (typeof value === 'number' && !Number.isFinite(value)) return;
+      sendAction({ action: 'set_layer_matte_param', layer_id: layerId, param, value, composition_revision: compositionRevision });
+    });
+  });
+  card.querySelector('.matte-input').addEventListener('change', (event) => {
+    const layerId = currentStableLayerId(card, layer, index);
+    if (!layerId) return;
+    const value = event.currentTarget.value;
+    let input;
+    if (value.startsWith('selected:')) {
+      const [, donorId, stage] = value.split(':');
+      if (!/^(?:[1-9][0-9]*)$/.test(donorId)
+          || !['pre_local_effects', 'post_local_effects'].includes(stage)) return;
+      input = { source: 'selected_layer', layer_id: donorId, stage };
+    } else if (value.startsWith('group:')) {
+      const groupId = value.slice(6);
+      if (!/^(?:[1-9][0-9]*)$/.test(groupId)) return;
+      input = { source: 'group_output', group_id: groupId };
+    } else if (['one_below', 'all_below', 'clean_program', 'program_history'].includes(value)) {
+      input = { source: value };
+    } else return;
+    sendAction({ action: 'set_layer_matte_input', layer_id: layerId, input, composition_revision: compositionRevision });
+  });
+}
+
+function syncLayerPerformance(card, layer) {
+  const slot = displayedClipSlot(card, layer);
+  const transport = slot?.transport || {};
+  const grid = transport.beat_grid || {};
+  const beatLoop = transport.beat_loop || {};
+  const slotSelect = card.querySelector('.clip-slot-select');
+  if (slotSelect && canSync(slotSelect) && slot) slotSelect.value = String(slot.id);
+  const seek = card.querySelector('.clip-seek');
+  if (seek && canSync(seek)) seek.value = String(slot?.playhead ?? 0);
+  const values = {
+    direction: transport.direction ?? 'forward',
+    end_behavior: transport.end_behavior ?? 'loop',
+    in_point: transport.in_point ?? 0,
+    out_point: transport.out_point ?? 1,
+    rate: transport.rate ?? 1,
+    sample_fps: transport.sample_fps ?? '',
+    beat_grid_enabled: !!transport.beat_grid,
+    clip_bpm: grid.bpm ?? 120,
+    length_beats: grid.length_beats ?? '',
+    sync_to_program: !!grid.sync_to_program,
+    beats_per_bar: grid.beats_per_bar ?? 4,
+    beat_loop_enabled: !!transport.beat_loop,
+    beat_loop_start: beatLoop.start_beat ?? 0,
+    beat_loop_length: beatLoop.length_beats ?? 1,
+  };
+  for (const [param, value] of Object.entries(values)) {
+    const control = card.querySelector(`[data-clip-transport="${param}"]`);
+    if (!control || !canSync(control)) continue;
+    if (control.type === 'checkbox') control.checked = !!value;
+    else control.value = String(value);
+  }
+  const status = card.querySelector('.clip-slot-status');
+  if (status && !controlIsBusy(status)) {
+    status.textContent = slot?.status || (slot?.prepared ? 'Prepared' : slot ? 'Staging…' : 'No prepared source');
+    status.classList.toggle('error', !!slot?.status && !slot?.prepared);
+  }
+  const cues = Array.isArray(transport.cues) ? transport.cues : [];
+  const cueSelect = card.querySelector('.clip-cue-select');
+  const cueKey = JSON.stringify(cues);
+  if (cueSelect && cueSelect.dataset.cueKey !== cueKey && !controlIsBusy(cueSelect)) {
+    const previous = cueSelect.value;
+    cueSelect.dataset.cueKey = cueKey;
+    cueSelect.replaceChildren(...(cues.length
+      ? cues.map((cue) => new Option(`Cue ${cue.id} · ${Number(cue.at).toFixed(3)}`, String(cue.id)))
+      : [new Option('No cues', '')]));
+    if (Array.from(cueSelect.options).some((option) => option.value === previous)) cueSelect.value = previous;
+  }
+
+  const matte = layer?.performance?.matte || {};
+  for (const [param, fallback] of [['enabled', false], ['channel', 'alpha'], ['invert', false], ['amount', 1], ['threshold', 0.5], ['softness', 0.1]]) {
+    const control = card.querySelector(`[data-layer-matte="${param}"]`);
+    if (!control || !canSync(control)) continue;
+    const value = matte[param] ?? fallback;
+    if (control.type === 'checkbox') control.checked = !!value;
+    else control.value = String(value);
+  }
+  const matteInput = card.querySelector('.matte-input');
+  if (matteInput && canSync(matteInput)) {
+    const optionKey = JSON.stringify([
+      matte.input,
+      latestLayers.map((candidate) => [candidate.layer_id, candidate.filename]),
+      (latestCreative?.groups || []).map((group) => [group.group_id, group.name]),
+    ]);
+    if (matteInput.dataset.optionKey !== optionKey) {
+      matteInput.dataset.optionKey = optionKey;
+      matteInput.innerHTML = matteInputOptionsHtml(layer);
+    }
+    matteInput.value = matteInputValue(matte.input);
+  }
+  const matteStatus = card.querySelector('.matte-status');
+  if (matteStatus) {
+    matteStatus.textContent = matte.diagnostic || (matte.enabled ? 'Ready' : 'Disabled');
+    matteStatus.classList.toggle('error', ['missing', 'cycle'].some((word) => String(matte.diagnostic).toLowerCase().includes(word)));
+  }
+}
+
 function createLayerCard(layer, index) {
   const card = document.createElement('div');
   card.className = 'layer-card expanded';
   card.dataset.index = index;
+  const blendMode = layerBlendModeInfo(layer.blend_mode);
+  const blendSelectId = `layer-blend-${index}`;
+  const blendDescriptionId = `layer-blend-description-${index}`;
 
   card.innerHTML = `
     <div class="layer-header">
@@ -1256,6 +3282,7 @@ function createLayerCard(layer, index) {
       <span class="layer-num">${index + 1}</span>
       <button class="layer-play-btn" title="Play/Pause" aria-label="${layer.paused ? 'Play' : 'Pause'} layer ${index + 1}">${layer.paused ? '\u25B6' : '\u25A0'}</button>
       <span class="layer-title">${escapeHtml(layer.filename || 'Untitled')}</span>
+      <button class="layer-rack-btn" type="button" title="Open this layer's Collision Rack" aria-label="Open layer ${index + 1} Collision Rack">RACK</button>
       <button class="layer-vis-btn ${layer.visible ? 'visible' : ''}" title="Visibility" aria-label="${layer.visible ? 'Hide' : 'Show'} layer ${index + 1}">${layer.visible ? '\u25C9' : '\u25CB'}</button>
       <button class="layer-remove-btn" title="Remove" aria-label="Remove layer ${index + 1}">\u00D7</button>
     </div>
@@ -1278,14 +3305,25 @@ function createLayerCard(layer, index) {
         <span class="value">${Number(layer.fps || 30).toFixed(0)}</span>
       </div>
       <div class="param-row select-row" data-layer="${index}" data-param="blend_mode">
-        <label>Blend</label>
-        <select>
-          <option value="normal" ${layer.blend_mode === 'normal' ? 'selected' : ''}>Normal</option>
-          <option value="screen" ${layer.blend_mode === 'screen' ? 'selected' : ''}>Screen</option>
-          <option value="multiply" ${layer.blend_mode === 'multiply' ? 'selected' : ''}>Multiply</option>
-          <option value="difference" ${layer.blend_mode === 'difference' ? 'selected' : ''}>Difference</option>
+        <label for="${blendSelectId}">Blend</label>
+        <select id="${blendSelectId}" aria-describedby="layer-blend-policy ${blendDescriptionId}" title="${escapeHtml(layerBlendTitle(blendMode.key))}">
+          ${layerBlendOptionsHtml(blendMode.key)}
         </select>
+        <span id="${blendDescriptionId}" class="visually-hidden blend-mode-description">${escapeHtml(blendMode.description)}</span>
       </div>
+      ${layerPerformanceHtml(layer, index)}
+      <div class="layer-transform-heading">
+        <button class="layer-transform-toggle" type="button" aria-expanded="false" aria-controls="layer-transform-body-${index}">
+          <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Transform</span>
+        </button>
+      </div>
+      <div class="layer-transform-body" id="layer-transform-body-${index}" role="region" aria-label="Layer ${index + 1} transform" hidden>${layerTransformControlsHtml(index)}</div>
+      <div class="layer-motion-heading">
+        <button class="layer-motion-toggle" type="button" aria-expanded="false" aria-controls="layer-motion-body-${index}">
+          <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Motion field</span>
+        </button>
+      </div>
+      <div class="layer-motion-body motion-authoring" id="layer-motion-body-${index}" role="region" aria-label="Layer ${index + 1} motion field, Faraday transplant, and curved shutter" hidden>${layerMotionControlsHtml(layer, index)}</div>
       <div class="param-row select-row" data-layer="${index}" data-param="key_mode">
         <label>Key</label>
         <select>
@@ -1416,6 +3454,19 @@ function createLayerCard(layer, index) {
     sendAction({ action: 'set_layer_visibility', ...layerSelector(current.layer, current.index), visible: !current.layer.visible });
   });
 
+  card.querySelector('.layer-rack-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const current = currentLayerContext(card, layer, index);
+    const layerId = String(current.layer?.layer_id || '');
+    if (!layerId || !creativeRackScope) return;
+    const panel = document.getElementById('creative-panel');
+    if (panel) panel.open = true;
+    creativeRackScope.value = `layer:${layerId}`;
+    creativeStructureKey = '';
+    syncCreative(latestCreative);
+    panel?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+
   // Remove
   card.querySelector('.layer-remove-btn').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1445,6 +3496,7 @@ function createLayerCard(layer, index) {
     if (select) {
       select.addEventListener('change', () => {
         const v = param === 'key_mode' ? parseInt(select.value) : select.value;
+        if (param === 'blend_mode') syncLayerBlendDescription(row, v);
         sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param, value: v });
       });
     }
@@ -1463,6 +3515,7 @@ function createLayerCard(layer, index) {
       mode: 'pattern',
       amount: 0.7,
       include_grain_controls: false,
+      include_transform: !!rerollTransformControls?.checked,
     });
   });
   card.querySelector('.layer-random-seed').addEventListener('change', (event) => {
@@ -1479,7 +3532,17 @@ function createLayerCard(layer, index) {
     sendAction({ action: 'set_layer_reroll_on_loop', ...currentLayerSelector(card, layer, index), enabled: event.currentTarget.checked });
   });
   wireLayerDisclosures(card, layer, index);
+  const transformStateKey = layerDisclosureKey(layer, index);
+  wireTransformPanel(card.querySelector('.layer-transform-body'), {
+    stateKey: transformStateKey,
+    getTransform: () => currentLayerContext(card, layer, index).layer?.transform,
+    set: (param, value) => sendAction({ action: 'set_layer_transform', ...currentLayerSelector(card, layer, index), param, value }),
+    reset: () => sendAction({ action: 'reset_layer_transform', ...currentLayerSelector(card, layer, index) }),
+    apply: (transform) => sendAction({ action: 'apply_layer_transform', ...currentLayerSelector(card, layer, index), transform }),
+  });
   wireLayerEffects(card, layer, index);
+  wireLayerMotion(card, layer, index);
+  wireLayerPerformance(card, layer, index);
   bindRangeEditors(card);
 
   updateLayerCard(card, layer, index);
@@ -1561,7 +3624,8 @@ function updateLayerCard(card, layer, index) {
   if (blendRow) {
     const select = blendRow.querySelector('select');
     if (select && canSync(select)) {
-      select.value = layer.blend_mode;
+      select.value = layerBlendModeInfo(layer.blend_mode).key;
+      syncLayerBlendDescription(blendRow, select.value);
     }
   }
 
@@ -1609,11 +3673,38 @@ function updateLayerCard(card, layer, index) {
     else control.value = String(value);
     if (kind === 'range') row.querySelector('.value').textContent = formatValue(Number(value), min, max, step);
   }
+  syncTransformPanel(card.querySelector('.layer-transform-body'), layer.transform);
+  syncLayerMotion(card, layer);
+  syncLayerPerformance(card, layer);
 }
 
 // --- Sync library ---
 
 const activePreviewIntervals = new Set();
+
+function loadLibraryFileIntoSelectedSlot(filename) {
+  const match = /^([1-9][0-9]*):(new|[1-9][0-9]*)$/.exec(librarySlotTarget?.value || '');
+  if (!match) {
+    if (slotLoadStatus) slotLoadStatus.textContent = 'Choose a stable layer and destination slot first.';
+    librarySlotTarget?.focus();
+    return;
+  }
+  const [, layerId, slotText] = match;
+  const triggerMode = ['immediate', 'next_beat', 'next_bar'].includes(librarySlotTrigger?.value)
+    ? librarySlotTrigger.value
+    : 'immediate';
+  const action = {
+    action: 'load_clip_into_slot',
+    layer_id: layerId,
+    filename,
+    activate: true,
+    trigger_mode: triggerMode,
+    ...(slotText === 'new' ? {} : { slot_id: Number(slotText) }),
+  };
+  if (sendAction(action)) {
+    if (slotLoadStatus) slotLoadStatus.textContent = `Staging ${filename}; the current source stays live until ready.`;
+  } else if (slotLoadStatus) slotLoadStatus.textContent = 'Control connection is offline.';
+}
 
 function syncLibrary(files) {
   if (!files) return;
@@ -1636,9 +3727,8 @@ function syncLibrary(files) {
     const item = document.createElement('div');
     item.className = 'library-item';
     item.title = filename;
-    item.tabIndex = 0;
-    item.setAttribute('role', 'button');
-    item.setAttribute('aria-label', `Add ${filename} as a layer`);
+    item.setAttribute('role', 'group');
+    item.setAttribute('aria-label', `${filename} library actions`);
 
     // Thumbnail image from server (retries if not yet generated)
     const img = document.createElement('img');
@@ -1711,6 +3801,31 @@ function syncLibrary(files) {
     label.textContent = filename.replace(/\.[^.]+$/, '');
     item.appendChild(label);
 
+    const actions = document.createElement('div');
+    actions.className = 'library-actions';
+    const addLayer = document.createElement('button');
+    addLayer.type = 'button';
+    addLayer.className = 'lib-action lib-add-layer';
+    addLayer.textContent = 'Layer';
+    addLayer.title = `Add ${filename} as a new layer`;
+    addLayer.setAttribute('aria-label', `Add ${filename} as a new layer`);
+    addLayer.addEventListener('click', (event) => {
+      event.stopPropagation();
+      sendAction({ action: 'add_layer', filename });
+    });
+    const loadSlot = document.createElement('button');
+    loadSlot.type = 'button';
+    loadSlot.className = 'lib-action lib-load-slot';
+    loadSlot.textContent = 'Slot';
+    loadSlot.title = `Load ${filename} into the selected prepared slot`;
+    loadSlot.setAttribute('aria-label', `Load ${filename} into the selected prepared slot`);
+    loadSlot.addEventListener('click', (event) => {
+      event.stopPropagation();
+      loadLibraryFileIntoSelectedSlot(filename);
+    });
+    actions.append(addLayer, loadSlot);
+    item.appendChild(actions);
+
     // Remove from library (to the Recycle Bin — recoverable)
     const del = document.createElement('button');
     del.className = 'lib-delete-btn';
@@ -1732,13 +3847,9 @@ function syncLibrary(files) {
     item.appendChild(del);
 
     let lastTouchAdd = 0;
-    item.addEventListener('dblclick', () => {
+    item.addEventListener('dblclick', (event) => {
+      if (event.target.closest('button')) return;
       if (performance.now() - lastTouchAdd < 500) return;
-      sendAction({ action: 'add_layer', filename });
-    });
-    item.addEventListener('keydown', (e) => {
-      if (e.target !== item || (e.key !== 'Enter' && e.key !== ' ')) return;
-      e.preventDefault();
       sendAction({ action: 'add_layer', filename });
     });
     let libraryTap = 0;
@@ -1878,6 +3989,205 @@ function syncTransport(paused, mediaFrozen = false) {
 
 // --- Export / Render ---
 
+const historyUndoButton = document.getElementById('history-undo');
+const historyRedoButton = document.getElementById('history-redo');
+const historyStatus = document.getElementById('history-status');
+const presetNameInput = document.getElementById('preset-name');
+const presetKindSelect = document.getElementById('preset-kind');
+const presetTargetSelect = document.getElementById('preset-target');
+const presetCaptureButton = document.getElementById('preset-capture');
+const presetList = document.getElementById('preset-list');
+const presetStatus = document.getElementById('preset-status');
+let latestPresetSnapshotKey = '';
+
+historyUndoButton?.addEventListener('click', () => sendAction({ action: 'undo_manual' }));
+historyRedoButton?.addEventListener('click', () => sendAction({ action: 'redo_manual' }));
+
+document.addEventListener('keydown', (event) => {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'z') return;
+  const active = document.activeElement;
+  if (active?.matches?.('input[type="text"],input[type="number"],textarea,[contenteditable="true"]')) return;
+  const action = event.shiftKey ? 'redo_manual' : 'undo_manual';
+  const button = event.shiftKey ? historyRedoButton : historyUndoButton;
+  if (button?.disabled) return;
+  event.preventDefault();
+  sendAction({ action });
+});
+
+function syncHistory(history = {}) {
+  if (!historyUndoButton || !historyRedoButton || !historyStatus) return;
+  historyUndoButton.disabled = !history.can_undo;
+  historyRedoButton.disabled = !history.can_redo;
+  const undoLabel = String(history.undo_label || '');
+  const redoLabel = String(history.redo_label || '');
+  historyUndoButton.textContent = undoLabel ? `Undo ${undoLabel}` : 'Undo';
+  historyRedoButton.textContent = redoLabel ? `Redo ${redoLabel}` : 'Redo';
+  historyUndoButton.title = undoLabel || 'No manual edit to undo';
+  historyRedoButton.title = redoLabel || 'No manual edit to redo';
+  const status = String(history.status || '');
+  historyStatus.textContent = status || `${Number(history.undo_depth || 0)} undo · ${Number(history.redo_depth || 0)} redo · ${Number(history.bytes || 0).toLocaleString()} bytes`;
+  historyStatus.className = /reject|error|stale|failed/i.test(status)
+    ? 'export-status error'
+    : 'export-status';
+}
+
+function presetTargetSnapshot(value) {
+  if (value === 'master') return { scope: 'master' };
+  if (value === 'controller_profile') return { scope: 'controller_profile' };
+  if (value === 'stage_map') return { scope: 'stage_map' };
+  const [scope, id] = String(value).split(':');
+  if (!/^[1-9][0-9]*$/.test(id || '')) return null;
+  if (scope === 'layer') return { scope: 'layer', layer_id: id };
+  if (scope === 'group') return { scope: 'group', group_id: id };
+  return null;
+}
+
+function presetTargets(kind) {
+  if (kind === 'controller_profile') {
+    return [{ value: 'controller_profile', label: 'Controller Profile document' }];
+  }
+  if (kind === 'stage_map') {
+    return [{ value: 'stage_map', label: 'Stage Map document' }];
+  }
+  const targets = [];
+  if (kind === 'transform' || kind === 'rack') {
+    targets.push({ value: 'master', label: 'Master' });
+  }
+  if (kind !== 'group') {
+    latestLayers.forEach((layer, index) => {
+      const id = stableLayerId(layer);
+      if (id) targets.push({ value: `layer:${id}`, label: `Layer ${index + 1}` });
+    });
+  }
+  if (kind === 'transform' || kind === 'rack' || kind === 'matte' || kind === 'group') {
+    (latestCreative?.groups || []).forEach((group, index) => {
+      const id = String(group?.group_id || '');
+      if (/^[1-9][0-9]*$/.test(id)) {
+        targets.push({ value: `group:${id}`, label: group.name || `Group ${index + 1}` });
+      }
+    });
+  }
+  return targets;
+}
+
+function refreshPresetTargets(kind = presetKindSelect?.value || 'transform') {
+  if (!presetTargetSelect) return;
+  const previous = presetTargetSelect.value;
+  const targets = presetTargets(kind);
+  presetTargetSelect.replaceChildren(...targets.map(target => {
+    const option = document.createElement('option');
+    option.value = target.value;
+    option.textContent = target.label;
+    return option;
+  }));
+  if (targets.some(target => target.value === previous)) presetTargetSelect.value = previous;
+  presetTargetSelect.disabled = targets.length === 0;
+  if (presetCaptureButton) presetCaptureButton.disabled = presetRevision === 0 || targets.length === 0;
+}
+
+presetKindSelect?.addEventListener('change', () => refreshPresetTargets(presetKindSelect.value));
+
+presetCaptureButton?.addEventListener('click', () => {
+  const name = String(presetNameInput?.value || '').trim();
+  const kind = String(presetKindSelect?.value || '');
+  const target = presetTargetSnapshot(presetTargetSelect?.value);
+  if (!name || name.length > 80 || !target || presetRevision === 0 || !layerStackRevision || !compositionRevision) {
+    presetStatus.textContent = 'Choose a valid name and current scope.';
+    presetStatus.className = 'export-status error';
+    return;
+  }
+  sendAction({
+    action: 'capture_scoped_preset',
+    name,
+    kind,
+    target,
+    preset_revision: presetRevision,
+    layer_stack_revision: layerStackRevision,
+    composition_revision: compositionRevision,
+  });
+});
+
+function applyPreset(preset) {
+  refreshPresetTargets(preset.kind);
+  const target = presetTargetSnapshot(presetTargetSelect?.value);
+  if (!target || !layerStackRevision || !compositionRevision || !presetRevision) return;
+  sendAction({
+    action: 'apply_scoped_preset',
+    preset_id: String(preset.id),
+    target,
+    preset_revision: presetRevision,
+    layer_stack_revision: layerStackRevision,
+    composition_revision: compositionRevision,
+  });
+}
+
+function syncPresets(snapshot = {}) {
+  presetRevision = Number(snapshot.revision) || 0;
+  const presets = Array.isArray(snapshot.presets) ? snapshot.presets.slice(0, 128) : [];
+  const key = JSON.stringify([presetRevision, presets, snapshot.status || '']);
+  if (key !== latestPresetSnapshotKey && presetList) {
+    latestPresetSnapshotKey = key;
+    presetList.replaceChildren(...presets.map(preset => {
+      const row = document.createElement('div');
+      row.className = 'preset-entry';
+      const label = document.createElement('span');
+      label.className = 'preset-entry-label';
+      const kind = String(preset.kind || 'preset');
+      label.textContent = String(preset.name || 'Untitled');
+      label.title = `${label.textContent} · ${kind}`;
+      const kindTag = document.createElement('span');
+      kindTag.className = 'preset-entry-kind';
+      kindTag.textContent = kind;
+      const apply = document.createElement('button');
+      apply.className = 'btn-export';
+      apply.type = 'button';
+      apply.textContent = 'Apply';
+      apply.addEventListener('click', () => applyPreset(preset));
+      const remove = document.createElement('button');
+      remove.className = 'btn-export btn-cancel';
+      remove.type = 'button';
+      remove.textContent = 'Delete';
+      remove.setAttribute('aria-label', `Delete ${label.textContent}`);
+      remove.addEventListener('click', () => sendAction({
+        action: 'delete_scoped_preset',
+        preset_id: String(preset.id),
+        preset_revision: presetRevision,
+      }));
+      row.append(label, kindTag, apply, remove);
+      return row;
+    }));
+  }
+  refreshPresetTargets(presetKindSelect?.value || 'transform');
+  if (presetStatus) {
+    const status = String(snapshot.status || '');
+    presetStatus.textContent = status || (presets.length ? `${presets.length} value preset${presets.length === 1 ? '' : 's'}` : 'No presets');
+    presetStatus.className = /reject|error|invalid|stale|mismatch|failed/i.test(status)
+      ? 'export-status error'
+      : 'export-status';
+  }
+}
+
+document.getElementById('recovery-restore')?.addEventListener('click', () => {
+  sendAction({ action: 'restore_recovery_journal' });
+});
+document.getElementById('recovery-discard')?.addEventListener('click', () => {
+  sendAction({ action: 'discard_recovery_journal' });
+});
+
+function syncRecovery(available = false, status = '') {
+  const panel = document.getElementById('recovery-panel');
+  const statusElement = document.getElementById('recovery-status');
+  const restore = document.getElementById('recovery-restore');
+  if (!panel || !statusElement || !restore) return;
+  const message = String(status || '');
+  panel.hidden = !available && !message;
+  restore.disabled = !available;
+  statusElement.textContent = message || (available ? 'A valid checkpoint is available. It will never be applied automatically.' : '');
+  statusElement.className = /corrupt|truncat|error|failed|reject/i.test(message)
+    ? 'export-status error'
+    : 'export-status';
+}
+
 const patchCaptureButton = document.getElementById('patch-capture');
 const patchSaveStatus = document.getElementById('patch-save-status');
 const patchLoadSnapshotButton = document.getElementById('patch-load-snapshot');
@@ -2003,7 +4313,22 @@ function syncExportWarnings(warnings = []) {
   }));
 }
 
-function syncExport(progress, error, status = '', warnings = []) {
+function syncExportMotion(motion = {}) {
+  const element = document.getElementById('export-motion-status');
+  if (!element) return;
+  const scopes = Array.isArray(motion.scopes) ? motion.scopes : [];
+  const accepted = motion.accepted_frame;
+  if (accepted === null || accepted === undefined) {
+    element.textContent = '';
+    return;
+  }
+  const fallbackCount = scopes.filter(scope => scope.source_origin === 'lattice_fallback').length;
+  const admittedCount = scopes.filter(scope => scope.transplant_admitted).length;
+  const suffix = motion.scopes_truncated ? ' · scope list truncated' : '';
+  element.textContent = `Motion metadata v${Number(motion.schema_version || 1)} · frame ${Number(accepted)} · ${scopes.length} scope${scopes.length === 1 ? '' : 's'} · ${fallbackCount} fallback · ${admittedCount} transplant · cross-GPU pixel identity not claimed${suffix}`;
+}
+
+function syncExport(progress, error, status = '', warnings = [], motion = {}) {
   const startBtn = document.getElementById('export-start');
   const cancelBtn = document.getElementById('export-cancel');
   const progressEl = document.getElementById('export-progress');
@@ -2012,6 +4337,7 @@ function syncExport(progress, error, status = '', warnings = []) {
   const statusEl = document.getElementById('export-status');
   const warningCount = Array.isArray(warnings) ? warnings.length : 0;
   syncExportWarnings(warnings);
+  syncExportMotion(motion || {});
   progress = Math.min(1, Math.max(0, Number(progress) || 0));
   progressEl.setAttribute('aria-valuenow', String(Math.round(progress * 100)));
 
@@ -2102,6 +4428,19 @@ const MOD_TARGETS = [
   ['shift_block_size', 'Shift Block Size'],
   ['shift_density', 'Shift Density'],
   ['shift_speed', 'Shift Speed'],
+  ['position_x', 'Position X'],
+  ['position_y', 'Position Y'],
+  ['scale_x', 'Scale X'],
+  ['scale_y', 'Scale Y'],
+  ['anchor_x', 'Anchor X'],
+  ['anchor_y', 'Anchor Y'],
+  ['rotation_deg', 'Rotation'],
+  ['skew_deg', 'Skew'],
+  ['skew_axis_deg', 'Skew Axis'],
+  ['crop_left', 'Crop Left'],
+  ['crop_top', 'Crop Top'],
+  ['crop_right', 'Crop Right'],
+  ['crop_bottom', 'Crop Bottom'],
   ['key_threshold', 'Key Threshold'],
   ['key_softness', 'Key Softness'],
   ['key_color_r', 'Key Color Red'],
@@ -2128,6 +4467,10 @@ const MOD_TARGETS = [
   ['temporal_key_threshold', 'Temporal Key Threshold'],
   ['temporal_key_softness', 'Temporal Key Softness'],
   ['temporal_key_history', 'Temporal Key History'],
+  ['motion_shutter_angle', 'Motion Shutter Angle'],
+  ['motion_shutter_phase', 'Motion Shutter Phase'],
+  ['motion_shutter_curvature', 'Motion Shutter Curvature'],
+  ['motion_shutter_chromatic_lag', 'Motion Shutter Chroma Lag'],
   ['morph', 'Morph'],
 ];
 const MASTER_MOD_TARGETS = MOD_TARGETS.slice();
@@ -2152,6 +4495,22 @@ const LAYER_FX_TARGETS = [
   ['key_softness', 'Key Soft'], ['downsample', 'Downsample'],
   ['shift_amount', 'Shift Amount'], ['shift_block_size', 'Shift Block Size'],
   ['shift_density', 'Shift Density'], ['shift_speed', 'Shift Speed'],
+  ['position_x', 'Position X'], ['position_y', 'Position Y'],
+  ['scale_x', 'Scale X'], ['scale_y', 'Scale Y'],
+  ['anchor_x', 'Anchor X'], ['anchor_y', 'Anchor Y'],
+  ['rotation_deg', 'Rotation'], ['skew_deg', 'Skew'],
+  ['skew_axis_deg', 'Skew Axis'],
+  ['crop_left', 'Crop Left'], ['crop_top', 'Crop Top'],
+  ['crop_right', 'Crop Right'], ['crop_bottom', 'Crop Bottom'],
+  ['motion_transplant_amount', 'Motion Transplant'],
+  ['motion_confidence_threshold', 'Motion Confidence'],
+  ['motion_confidence_softness', 'Motion Confidence Softness'],
+  ['motion_refresh', 'Motion Refresh'], ['motion_decay', 'Motion Decay'],
+  ['motion_occlusion', 'Motion Occlusion'],
+  ['motion_shutter_angle', 'Motion Shutter Angle'],
+  ['motion_shutter_phase', 'Motion Shutter Phase'],
+  ['motion_shutter_curvature', 'Motion Shutter Curvature'],
+  ['motion_shutter_chromatic_lag', 'Motion Shutter Chroma Lag'],
 ];
 
 const ROUTING_CURVES = [
@@ -2307,6 +4666,57 @@ function currentModTargets(selected = '') {
     }
     groups.push([`Layer ${layer}`, targets]);
   }
+  if (latestCreative) {
+    groups[0][1].push(['composition/bus_crossfade', 'Composition · A / B Crossfade']);
+    const nodeTargets = (scopeKey, scopeLabel, rack) => {
+      const values = [];
+      for (const node of rack?.nodes || []) {
+        if (CREATIVE_NODE_INFO[node.kind]?.marker) continue;
+        const prefix = `${scopeLabel} · ${CREATIVE_NODE_INFO[node.kind]?.label || node.kind} #${node.node_id}`;
+        values.push([`node/${scopeKey}/${node.node_id}/wet`, `${prefix} · Wet`]);
+        for (const def of creativeNodeVisibleDefs(node)) {
+          if (def.type === 'float') values.push([`node/${scopeKey}/${node.node_id}/${def.key}`, `${prefix} · ${def.label}`]);
+          if (def.type === 'vec') {
+            const suffixes = def.components.length === 3 ? ['r', 'g', 'b'] : ['x', 'y'];
+            suffixes.forEach((suffix, index) => values.push([`node/${scopeKey}/${node.node_id}/${def.key}.${suffix}`, `${prefix} · ${def.label} ${def.components[index]}`]));
+          }
+        }
+      }
+      return values;
+    };
+    const masterNodes = nodeTargets('master', 'Master rack', latestCreative.master_rack);
+    if (masterNodes.length) groups.push(['Master Collision Rack', masterNodes]);
+    for (const [layerId, rack] of latestCreative.layer_racks || []) {
+      const values = nodeTargets(`layer/${layerId}`, creativeLayerLabel(layerId), rack);
+      if (values.length) groups.push([`${creativeLayerLabel(layerId)} Rack`, values]);
+    }
+    for (const group of latestCreative.groups || []) {
+      const groupLabel = group.name || `Group ${group.group_id}`;
+      const values = [
+        [`group/${group.group_id}/opacity`, `${groupLabel} · Opacity`],
+        [`group/${group.group_id}/position.x`, `${groupLabel} · Position X`],
+        [`group/${group.group_id}/position.y`, `${groupLabel} · Position Y`],
+        [`group/${group.group_id}/scale.x`, `${groupLabel} · Scale X`],
+        [`group/${group.group_id}/scale.y`, `${groupLabel} · Scale Y`],
+        [`group/${group.group_id}/anchor.x`, `${groupLabel} · Anchor X`],
+        [`group/${group.group_id}/anchor.y`, `${groupLabel} · Anchor Y`],
+        [`group/${group.group_id}/rotation_deg`, `${groupLabel} · Rotation`],
+        [`group/${group.group_id}/skew_deg`, `${groupLabel} · Skew`],
+        [`group/${group.group_id}/skew_axis_deg`, `${groupLabel} · Skew axis`],
+        [`group/${group.group_id}/crop_left`, `${groupLabel} · Crop left`],
+        [`group/${group.group_id}/crop_top`, `${groupLabel} · Crop top`],
+        [`group/${group.group_id}/crop_right`, `${groupLabel} · Crop right`],
+        [`group/${group.group_id}/crop_bottom`, `${groupLabel} · Crop bottom`],
+        ...(group.matte ? [
+          [`group/${group.group_id}/matte.amount`, `${groupLabel} · Matte amount`],
+          [`group/${group.group_id}/matte.threshold`, `${groupLabel} · Matte threshold`],
+          [`group/${group.group_id}/matte.softness`, `${groupLabel} · Matte softness`],
+        ] : []),
+        ...nodeTargets(`group/${group.group_id}`, groupLabel, group.rack),
+      ];
+      groups.push([`${groupLabel} Values + Rack`, values]);
+    }
+  }
   // Preserve visibility for a legacy/out-of-range selection until the engine
   // publishes its authoritative replacement instead of showing a blank menu.
   if (selected && !groups.some(([, values]) => values.some(([value]) => value === selected))) {
@@ -2437,6 +4847,7 @@ function syncModulation(m) {
   const routings = m.routings || [];
   const routingKey = JSON.stringify({
     layers: latestLayerIdentities,
+    creative: creativeStructureKey,
     routes: routings.map((routing, index) => [
       routing.route_id || `legacy-index:${index}`,
       routing.target || '',
@@ -2756,6 +5167,10 @@ function syncAudio(a) {
 const midiEnabled = document.getElementById('midi-enabled');
 const midiSlots = document.getElementById('midi-slots');
 const midiStatus = document.getElementById('midi-status');
+const controllerProfileImport = document.getElementById('controller-profile-import');
+const controllerProfileExport = document.getElementById('controller-profile-export');
+const controllerProfileFile = document.getElementById('controller-profile-file');
+const CONTROLLER_PROFILE_MAX_BYTES = 256 * 1024;
 
 midiEnabled.addEventListener('change', () => {
   sendAction({ action: 'set_midi', param: 'enabled', value: midiEnabled.checked });
@@ -2764,6 +5179,65 @@ midiEnabled.addEventListener('change', () => {
 const midiClockSync = document.getElementById('midi-clock-sync');
 midiClockSync.addEventListener('change', () => {
   sendAction({ action: 'set_midi', param: 'clock_sync', value: midiClockSync.checked });
+});
+
+function setControllerProfileTransferStatus(message, error = false) {
+  const status = document.getElementById('controller-runtime-status');
+  if (!status) return;
+  status.textContent = String(message || '').slice(0, 1024);
+  status.className = error ? 'audio-status error' : 'audio-status';
+}
+
+async function postControllerProfileAction(action) {
+  const body = JSON.stringify(action);
+  if (new TextEncoder().encode(body).byteLength > CONTROLLER_PROFILE_MAX_BYTES + 1024) {
+    throw new Error('controller profile request exceeds the 257 KiB action cap');
+  }
+  const response = await fetch('/controller-profile', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+  });
+  if (!response.ok) {
+    const detail = (await response.text()).slice(0, 1024);
+    throw new Error(detail || `controller profile request failed (${response.status})`);
+  }
+  return response;
+}
+
+controllerProfileImport?.addEventListener('click', () => controllerProfileFile?.click());
+controllerProfileFile?.addEventListener('change', async () => {
+  const file = controllerProfileFile.files?.[0];
+  controllerProfileFile.value = '';
+  if (!file) return;
+  if (file.size > CONTROLLER_PROFILE_MAX_BYTES) {
+    setControllerProfileTransferStatus('Controller profile exceeds the 256 KiB document cap.', true);
+    return;
+  }
+  try {
+    const documentValue = JSON.parse(await file.text());
+    await postControllerProfileAction({ action: 'import', document: documentValue });
+    setControllerProfileTransferStatus('Controller profile import queued for atomic validation.');
+  } catch (error) {
+    setControllerProfileTransferStatus(`Controller profile import rejected: ${error.message || error}`, true);
+  }
+});
+
+controllerProfileExport?.addEventListener('click', async () => {
+  try {
+    const response = await postControllerProfileAction({ action: 'export' });
+    const blob = await response.blob();
+    const href = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = href;
+    anchor.download = 'controller_profile.json';
+    anchor.click();
+    URL.revokeObjectURL(href);
+    setControllerProfileTransferStatus('Controller profile exported without browser path authority.');
+  } catch (error) {
+    setControllerProfileTransferStatus(`Controller profile export failed: ${error.message || error}`, true);
+  }
 });
 
 // Build the 4 static MIDI slot rows once.
@@ -2845,6 +5319,87 @@ function syncMidi(m) {
     midiStatus.textContent = status.join(' | ');
     midiStatus.className = 'audio-status';
   }
+}
+
+function runtimeCount(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.trunc(numeric) : 0;
+}
+
+function runtimePhaseLabel(value, fallback = 'Unavailable') {
+  const phase = String(value || '').trim();
+  if (!phase) return fallback;
+  return phase.replaceAll('_', ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function syncControllerRuntime(snapshot = {}) {
+  const runtime = snapshot?.midi || {};
+  const counters = runtime.counters || {};
+  const profile = document.getElementById('controller-runtime-profile');
+  const input = document.getElementById('midi-runtime-input');
+  const output = document.getElementById('midi-runtime-output');
+  const status = document.getElementById('controller-runtime-status');
+  const counterLine = document.getElementById('midi-runtime-counters');
+  if (!profile || !input || !output || !status || !counterLine) return;
+
+  const revision = runtimeCount(snapshot.profile_revision);
+  profile.textContent = `${String(snapshot.name || 'Unspecified profile')} · revision ${revision || 'legacy'}`;
+  input.textContent = runtime.input_port
+    ? `${runtime.input_port} · ${runtimeCount(runtime.available_inputs?.length)} available`
+    : `None · ${runtimeCount(runtime.available_inputs?.length)} available`;
+  output.textContent = runtime.output_port
+    ? `${runtime.output_port} · ${runtimeCount(runtime.available_outputs?.length)} available`
+    : `None · ${runtimeCount(runtime.available_outputs?.length)} available`;
+  const messages = [
+    runtimePhaseLabel(runtime.phase, 'Legacy runtime'),
+    String(snapshot.status || ''),
+    String(runtime.error || ''),
+  ].filter(Boolean);
+  status.textContent = messages.join(' · ');
+  status.className = /error|reject|unavailable|failed/i.test(status.textContent)
+    ? 'audio-status error'
+    : 'audio-status';
+  counterLine.textContent = [
+    `raw ${runtimeCount(counters.raw_received)}`,
+    `decoded ${runtimeCount(counters.decoded_events)}`,
+    `malformed ${runtimeCount(counters.malformed)}`,
+    `unmapped ${runtimeCount(counters.channel_or_unmapped)}`,
+    `input drops ${runtimeCount(counters.input_queue_dropped)}`,
+    `event drops ${runtimeCount(counters.event_queue_dropped)}`,
+    `loop suppressions ${runtimeCount(counters.loop_suppressed)}`,
+    `feedback queued/coalesced/sent ${runtimeCount(counters.feedback_queued)}/${runtimeCount(counters.feedback_coalesced)}/${runtimeCount(counters.feedback_sent)}`,
+    `feedback drops/rate limits ${runtimeCount(counters.feedback_dropped)}/${runtimeCount(counters.feedback_rate_limited)}`,
+    `scans/reconnects/disconnects ${runtimeCount(counters.scans)}/${runtimeCount(counters.reconnects)}/${runtimeCount(counters.disconnects)}`,
+  ].join(' · ');
+}
+
+function syncOscRuntime(runtime = {}) {
+  const counters = runtime?.counters || {};
+  const bind = document.getElementById('osc-runtime-bind');
+  const bound = document.getElementById('osc-runtime-bound');
+  const phase = document.getElementById('osc-runtime-phase');
+  const warning = document.getElementById('osc-runtime-lan-warning');
+  const error = document.getElementById('osc-runtime-error');
+  const counterLine = document.getElementById('osc-runtime-counters');
+  if (!bind || !bound || !phase || !warning || !error || !counterLine) return;
+
+  bind.textContent = String(runtime.bind_address || 'Not configured');
+  bound.textContent = String(runtime.bound_address || 'Not listening');
+  phase.textContent = `${runtimePhaseLabel(runtime.phase, 'Disabled')}${runtime.running ? ' · running' : ''}`;
+  warning.textContent = runtime.lan_warning
+    ? 'LAN exposure is enabled: this typed OSC listener is reachable beyond loopback. Verify the interface and firewall before performance.'
+    : 'Loopback-only unless a validated LAN configuration explicitly says otherwise.';
+  warning.classList.toggle('active', !!runtime.lan_warning);
+  error.textContent = String(runtime.error || '');
+  error.className = error.textContent ? 'audio-status error' : 'audio-status';
+  counterLine.textContent = [
+    `datagrams/messages ${runtimeCount(counters.datagrams_received)}/${runtimeCount(counters.messages_received)}`,
+    `malformed ${runtimeCount(counters.malformed)}`,
+    `rate/queue drops ${runtimeCount(counters.rate_dropped)}/${runtimeCount(counters.queue_dropped)}`,
+    `loop suppressions ${runtimeCount(counters.loop_suppressed)}`,
+    `feedback queued/coalesced/sent ${runtimeCount(counters.feedback_queued)}/${runtimeCount(counters.feedback_coalesced)}/${runtimeCount(counters.feedback_sent)}`,
+    `feedback drops/rate limits/send errors ${runtimeCount(counters.feedback_dropped)}/${runtimeCount(counters.feedback_rate_limited)}/${runtimeCount(counters.feedback_send_errors)}`,
+  ].join(' · ');
 }
 
 // --- XY performance pad ---
@@ -3193,12 +5748,12 @@ const morphLaw = document.getElementById('morph-law');
 const morphDuration = document.getElementById('morph-duration');
 
 document.getElementById('morph-set-a').addEventListener('click', () => {
-  if (!sendAction({ action: 'morph_capture', slot: 'a', stack_revision: layerStackRevision })) {
+  if (!sendAction({ action: 'morph_capture', slot: 'a', stack_revision: layerStackRevision, composition_revision: compositionRevision })) {
     morphStatus.textContent = 'Control connection is offline; A was not captured.';
   }
 });
 document.getElementById('morph-set-b').addEventListener('click', () => {
-  if (!sendAction({ action: 'morph_capture', slot: 'b', stack_revision: layerStackRevision })) {
+  if (!sendAction({ action: 'morph_capture', slot: 'b', stack_revision: layerStackRevision, composition_revision: compositionRevision })) {
     morphStatus.textContent = 'Control connection is offline; B was not captured.';
   }
 });
@@ -3290,6 +5845,268 @@ function syncOutputWindow(open, error = '') {
     outputPendingOpen !== null,
     error,
   );
+}
+
+// --- Bounded program recorder / committed resampling ---
+
+const recorderStart = document.getElementById('recorder-start');
+const recorderFinish = document.getElementById('recorder-finish');
+const recorderCancel = document.getElementById('recorder-cancel');
+const recorderStatus = document.getElementById('recorder-status');
+const recorderCounters = document.getElementById('recorder-counters');
+const stillTarget = document.getElementById('still-target');
+const resampleTarget = document.getElementById('resample-target');
+const resampleDestination = document.getElementById('resample-destination');
+let captureOptionKey = '';
+
+function captureTargetPayload(value) {
+  if (value === 'program') return { target: 'program' };
+  const separator = value.indexOf(':');
+  if (separator <= 0) return null;
+  const kind = value.slice(0, separator);
+  const id = value.slice(separator + 1);
+  if (!/^[1-9][0-9]*$/.test(id)) return null;
+  if (kind === 'layer') return { target: 'layer', layer_id: id };
+  if (kind === 'group') return { target: 'group', group_id: id };
+  return null;
+}
+
+function syncCaptureOptions() {
+  const layerFacts = Array.isArray(latestLayers) ? latestLayers : [];
+  const groups = Array.isArray(latestCreative?.groups) ? latestCreative.groups : [];
+  const key = JSON.stringify([
+    layerFacts.map(layer => [String(layer.layer_id || ''), String(layer.filename || '')]),
+    groups.map(group => [String(group.group_id || ''), String(group.name || '')]),
+  ]);
+  if (key === captureOptionKey) return;
+  captureOptionKey = key;
+  const targetOptions = [new Option('Program', 'program')];
+  for (const [index, layer] of layerFacts.entries()) {
+    const id = String(layer.layer_id || '');
+    if (!/^[1-9][0-9]*$/.test(id)) continue;
+    targetOptions.push(new Option(`Layer ${index + 1} · ${layer.filename || id}`, `layer:${id}`));
+  }
+  for (const group of groups) {
+    const id = String(group.group_id || '');
+    if (!/^[1-9][0-9]*$/.test(id)) continue;
+    targetOptions.push(new Option(`Group · ${group.name || id}`, `group:${id}`));
+  }
+  for (const select of [stillTarget, resampleTarget]) {
+    const previous = select.value;
+    select.replaceChildren(...targetOptions.map(option => option.cloneNode(true)));
+    if ([...select.options].some(option => option.value === previous)) select.value = previous;
+  }
+  const previousDestination = resampleDestination.value;
+  const destinations = [new Option('Choose layer…', '')];
+  for (const [index, layer] of layerFacts.entries()) {
+    const id = String(layer.layer_id || '');
+    if (!/^[1-9][0-9]*$/.test(id)) continue;
+    destinations.push(new Option(`Layer ${index + 1} · ${layer.filename || id}`, id));
+  }
+  resampleDestination.replaceChildren(...destinations);
+  if ([...resampleDestination.options].some(option => option.value === previousDestination)) {
+    resampleDestination.value = previousDestination;
+  }
+}
+
+recorderStart.addEventListener('click', () => {
+  recorderStart.disabled = true;
+  if (!sendAction({
+    action: 'start_program_recording',
+    auto_import: document.getElementById('recorder-auto-import').checked,
+  })) {
+    recorderStart.disabled = false;
+    recorderStatus.textContent = 'Control connection is offline.';
+    recorderStatus.className = 'export-status error';
+  }
+});
+
+recorderFinish.addEventListener('click', () => {
+  if (sendAction({ action: 'finish_program_recording' })) recorderFinish.disabled = true;
+});
+
+recorderCancel.addEventListener('click', () => {
+  if (sendAction({ action: 'cancel_program_recording' })) recorderCancel.disabled = true;
+});
+
+document.getElementById('still-capture').addEventListener('click', () => {
+  const target = captureTargetPayload(stillTarget.value);
+  if (!target) return;
+  sendAction({
+    action: 'capture_still',
+    ...target,
+    auto_import: document.getElementById('still-auto-import').checked,
+  });
+});
+
+document.getElementById('resample-start').addEventListener('click', () => {
+  const target = captureTargetPayload(resampleTarget.value);
+  const destination = resampleDestination.value;
+  if (!target || !/^[1-9][0-9]*$/.test(destination)) {
+    recorderStatus.textContent = 'Choose a current destination layer.';
+    recorderStatus.className = 'export-status error';
+    return;
+  }
+  sendAction({
+    action: 'start_resample',
+    ...target,
+    destination_layer_id: destination,
+    activate: document.getElementById('resample-activate').checked,
+  });
+});
+
+function syncRecorder(recorder = {}) {
+  syncCaptureOptions();
+  const status = String(recorder?.status || 'idle');
+  const active = ['starting', 'recording', 'finishing'].includes(status);
+  recorderStart.hidden = active;
+  recorderStart.disabled = false;
+  recorderFinish.hidden = !['starting', 'recording'].includes(status);
+  recorderFinish.disabled = status !== 'recording';
+  recorderCancel.hidden = !active;
+  recorderCancel.disabled = false;
+  document.getElementById('still-capture').disabled = active;
+  document.getElementById('resample-start').disabled = active;
+  const error = String(recorder?.error || '');
+  const artifact = String(recorder?.artifact_name || '');
+  if (error) {
+    recorderStatus.textContent = error;
+    recorderStatus.className = 'export-status error';
+  } else if (status === 'starting') {
+    recorderStatus.textContent = 'Preparing fixed frame pool and encoder…';
+    recorderStatus.className = 'export-status';
+  } else if (status === 'recording') {
+    recorderStatus.textContent = 'Recording program';
+    recorderStatus.className = 'export-status recording-live';
+  } else if (status === 'finishing') {
+    recorderStatus.textContent = 'Finishing and publishing…';
+    recorderStatus.className = 'export-status';
+  } else if (status === 'succeeded') {
+    recorderStatus.textContent = artifact ? `Committed ${artifact}` : 'Recording committed';
+    recorderStatus.className = 'export-status success';
+  } else if (status === 'cancelled') {
+    recorderStatus.textContent = 'Recording cancelled; temporary files removed';
+    recorderStatus.className = 'export-status';
+  } else {
+    recorderStatus.textContent = '';
+    recorderStatus.className = 'export-status';
+  }
+  const drops = ['dropped_not_ready', 'dropped_source_unavailable', 'dropped_pool_empty', 'dropped_queue_full']
+    .reduce((sum, key) => sum + Math.max(0, Number(recorder?.[key]) || 0), 0);
+  recorderCounters.textContent = `attempted ${Number(recorder?.attempted) || 0} · accepted ${Number(recorder?.accepted) || 0} · encoded ${Number(recorder?.encoded) || 0} · duplicated ${Number(recorder?.duplicated) || 0} · dropped ${drops}`;
+}
+
+// --- Preview health / exact physical-endpoint calibration ---
+
+const stageHealthHud = document.getElementById('stage-health-hud');
+const stageEndpoint = document.getElementById('stage-output-endpoint');
+const stageTestCard = document.getElementById('stage-test-card');
+const stageIdentification = document.getElementById('stage-output-identification');
+
+stageHealthHud.addEventListener('change', () => {
+  sendAction({ action: 'set_stage_health_hud', enabled: stageHealthHud.checked });
+});
+
+stageTestCard.addEventListener('change', () => {
+  const mode = ['off', 'smpte_bars', 'grid'].includes(stageTestCard.value)
+    ? stageTestCard.value : 'off';
+  sendAction({
+    action: 'set_stage_test_card',
+    mode,
+    output_endpoint_id: mode === 'off' ? null : stageEndpoint.value,
+  });
+});
+
+stageIdentification.addEventListener('change', () => {
+  sendAction({
+    action: 'set_output_identification',
+    enabled: stageIdentification.checked,
+    output_endpoint_id: stageIdentification.checked ? stageEndpoint.value : null,
+  });
+});
+
+stageEndpoint.addEventListener('change', () => {
+  // Moving the selector while a calibration tool is active retargets that
+  // exact tool explicitly. No generic audience/program route is implied.
+  if (stageTestCard.value !== 'off') {
+    sendAction({
+      action: 'set_stage_test_card',
+      mode: stageTestCard.value,
+      output_endpoint_id: stageEndpoint.value,
+    });
+  }
+  if (stageIdentification.checked) {
+    sendAction({
+      action: 'set_output_identification',
+      enabled: true,
+      output_endpoint_id: stageEndpoint.value,
+    });
+  }
+});
+
+function boundedMetric(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function budgetText(label, budget = {}) {
+  const used = Number(budget?.used);
+  const limit = Number(budget?.limit);
+  const unit = String(budget?.unit || '').slice(0, 256);
+  const detail = String(budget?.detail || 'unknown').slice(0, 256);
+  if (Number.isFinite(used) && Number.isFinite(limit)) {
+    return `${label} ${used}/${limit} ${unit}`.trim();
+  }
+  return `${label} ${detail}`;
+}
+
+function ensureStageEndpoint(endpointId, label = endpointId) {
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(String(endpointId || ''))) return;
+  if ([...stageEndpoint.options].some(option => option.value === endpointId)) return;
+  // StageMap admits at most sixteen endpoints. Keep the legacy adapter plus a
+  // bounded rolling set even if a hostile/stale snapshot invents identities.
+  while (stageEndpoint.options.length >= 16) stageEndpoint.remove(1);
+  stageEndpoint.add(new Option(String(label || endpointId).slice(0, 256), endpointId));
+}
+
+function syncStageHealth(health = {}) {
+  const tools = health?.tools || {};
+  if (canSync(stageHealthHud)) stageHealthHud.checked = !!tools.health_hud_enabled;
+  if (canSync(stageTestCard)) stageTestCard.value = ['off', 'smpte_bars', 'grid'].includes(tools.test_card)
+    ? tools.test_card : 'off';
+  if (canSync(stageIdentification)) {
+    stageIdentification.checked = !!tools.output_identification_enabled;
+  }
+  const output = health?.output || {};
+  const endpointId = /^[A-Za-z0-9._-]{1,128}$/.test(String(output.endpoint_id || ''))
+    ? String(output.endpoint_id) : 'legacy-output-1';
+  const endpointLabel = String(output.identity || endpointId).slice(0, 256);
+  ensureStageEndpoint(endpointId, endpointLabel);
+  ensureStageEndpoint(tools.test_card_endpoint_id);
+  ensureStageEndpoint(tools.output_identification_endpoint_id);
+  const selected = tools.test_card_endpoint_id || tools.output_identification_endpoint_id || endpointId;
+  if (canSync(stageEndpoint) && [...stageEndpoint.options].some(option => option.value === selected)) {
+    stageEndpoint.value = selected;
+  }
+  const fps = boundedMetric(health?.fps);
+  const p50 = boundedMetric(health?.frame_time_p50_us) / 1000;
+  const p95 = boundedMetric(health?.frame_time_p95_us) / 1000;
+  const p99 = boundedMetric(health?.frame_time_p99_us) / 1000;
+  document.getElementById('stage-health-summary').textContent =
+    `${fps.toFixed(1)} fps · frame ${p50.toFixed(2)}/${p95.toFixed(2)}/${p99.toFixed(2)} ms p50/p95/p99 · missed ${boundedMetric(health?.missed_deadlines)} · ${boundedMetric(output.width)}×${boundedMetric(output.height)} @ ${(boundedMetric(output.refresh_millihz) / 1000).toFixed(3)} Hz`;
+  const budgets = health?.budgets || {};
+  document.getElementById('stage-health-budgets').textContent = [
+    budgetText('GPU', budgets.gpu), budgetText('media', budgets.media),
+    budgetText('NTSC', budgets.ntsc), budgetText('motion', budgets.motion),
+  ].join(' · ');
+  const rows = (Array.isArray(health?.layers) ? health.layers : []).slice(0, 256).map(layer => {
+    const row = document.createElement('div');
+    row.className = 'stage-health-layer';
+    const age = layer.decoded_age_ms == null ? 'n/a' : `${boundedMetric(layer.decoded_age_ms)} ms`;
+    row.textContent = `${String(layer.name || layer.layer_id || 'layer').slice(0, 256)} · decoded ${age} · pending ${boundedMetric(layer.pending_frames)} · drops ${boundedMetric(layer.dropped_frames)} · ${String(layer.status || '').slice(0, 256)}`;
+    return row;
+  });
+  document.getElementById('stage-health-layers').replaceChildren(...rows);
 }
 
 // --- Remote / QR ---

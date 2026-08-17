@@ -3,6 +3,16 @@
 /// reference so a render at 24, 30, or 60 fps describes the same motion.
 pub const TEMPORAL_REFERENCE_FPS: f32 = 30.0;
 
+#[allow(
+    unused_imports,
+    reason = "T0 exposes the frozen authoring vocabulary before T1 consumers land"
+)]
+pub use crate::temporal::{
+    CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, RefreshGardenGate,
+    RefreshGardenParams, TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
+    TemporalTopology,
+};
+
 /// Temporal (frame-history) effect parameters: feedback trails and
 /// slit-scan, driven by the renderer's ring buffer of past output frames.
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +35,9 @@ pub struct TemporalParams {
     pub key_softness: f32,
     /// Age of the reference image in 30 Hz history frames (1..23).
     pub key_history: f32,
+    /// Inert/zero by default. T0 freezes the authoring contract while the
+    /// legacy 64-byte GPU path remains the only materialized implementation.
+    pub originals: TemporalOriginalsParams,
 }
 
 /// Return an aspect-correct, normalized scan direction for shader use.
@@ -59,6 +72,7 @@ impl Default for TemporalParams {
             key_threshold: 0.1,
             key_softness: 0.03,
             key_history: 1.0,
+            originals: TemporalOriginalsParams::default(),
         }
     }
 }
@@ -115,6 +129,7 @@ impl TemporalParams {
             key_threshold: finite_or(self.key_threshold, 0.1).clamp(0.0, 1.0),
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
             key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
+            originals: self.originals.sanitized(),
         }
     }
 }
@@ -148,6 +163,7 @@ mod temporal_tests {
             key_threshold: 0.2,
             key_softness: 0.04,
             key_history: 7.0,
+            originals: TemporalOriginalsParams::default(),
         };
         let half = params.for_frame_delta(1.0 / 60.0);
 
@@ -174,6 +190,7 @@ mod temporal_tests {
             key_threshold: f32::NAN,
             key_softness: f32::NEG_INFINITY,
             key_history: 999.0,
+            originals: TemporalOriginalsParams::default(),
         };
         let normalized = params.for_frame_delta(f32::NAN);
 

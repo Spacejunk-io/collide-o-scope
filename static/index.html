@@ -31,6 +31,30 @@
           <div class="media-safety-rationale" id="media-safety-rationale">The default cap bounds decoder, mailbox, and texture allocations. Expert mode affects future source opens only and remains limited by this host.</div>
           <div class="lib-upload-status media-safety-status" id="media-safety-status" role="status" aria-live="polite"></div>
         </section>
+        <section class="new-layer-preference" aria-labelledby="new-layer-fit-label">
+          <label id="new-layer-fit-label" for="new-layer-fit">NEW LAYER FRAMING</label>
+          <select id="new-layer-fit" aria-describedby="new-layer-fit-help">
+            <option value="stretch">Stretch</option>
+            <option value="fit" selected>Fit</option>
+            <option value="fill">Fill</option>
+            <option value="native">Native</option>
+          </select>
+          <div id="new-layer-fit-help" class="media-safety-rationale">Host-session preference for future file, still, and Spout layers. Existing and recalled layers are unchanged.</div>
+        </section>
+        <section class="slot-load-target" aria-labelledby="slot-load-title">
+          <label id="slot-load-title" for="library-slot-target">LOAD INTO SLOT</label>
+          <select id="library-slot-target" aria-describedby="slot-load-help">
+            <option value="">Choose a stable layer…</option>
+          </select>
+          <label class="visually-hidden" for="library-slot-trigger">Slot activation timing</label>
+          <select id="library-slot-trigger" aria-label="Slot activation timing">
+            <option value="immediate">Immediate</option>
+            <option value="next_beat">Next beat</option>
+            <option value="next_bar">Next bar</option>
+          </select>
+          <div id="slot-load-help" class="media-safety-rationale">Each library tile has explicit Add layer and Load slot commands. A replacement is decoded and uploaded before its active source changes.</div>
+          <div id="slot-load-status" class="lib-upload-status" role="status" aria-live="polite"></div>
+        </section>
         <form class="spout-in-form" id="spout-in-form">
           <label for="spout-in-name">Spout input</label>
           <div class="spout-in-row">
@@ -46,7 +70,80 @@
 
       <!-- CENTER: Layers -->
       <section class="col-center">
+        <details class="creative-panel" id="creative-panel" open>
+          <summary>
+            <span>COLLISION RACK + GROUPS</span>
+            <span class="dim" id="creative-revision">composition 0</span>
+          </summary>
+          <div class="creative-panel-body">
+            <div class="creative-bus-row">
+              <label for="creative-bus-crossfade">A / B</label>
+              <span class="creative-bus-label" aria-hidden="true">A</span>
+              <input id="creative-bus-crossfade" type="range" min="0" max="1" step="0.01" value="0.5" aria-label="Composition A B crossfade">
+              <span class="creative-bus-label" aria-hidden="true">B</span>
+              <output id="creative-bus-crossfade-value" for="creative-bus-crossfade">0.50</output>
+            </div>
+
+            <div class="creative-rack-toolbar">
+              <label for="creative-rack-scope">Rack</label>
+              <select id="creative-rack-scope" aria-label="Collision Rack scope">
+                <option value="master">Master</option>
+              </select>
+              <label class="visually-hidden" for="creative-node-kind">New node kind</label>
+              <select id="creative-node-kind" aria-label="New visual node kind">
+                <option value="transform">Transform</option>
+                <option value="digital_color">Digital / Color</option>
+                <option value="key">Key</option>
+                <option value="cellular">Cellular</option>
+                <option value="shift">Shift</option>
+                <option value="grain">Grain</option>
+                <option value="mask">Mask</option>
+              </select>
+              <button id="creative-node-add" type="button" title="Insert a node after the current rack">Add node</button>
+            </div>
+            <div class="creative-help">Stable IDs preserve routes while racks and groups move. Current-frame cycles are rejected before the live composition changes; Previous Frame is exactly N−1.</div>
+            <div class="creative-rack-nodes" id="creative-rack-nodes" role="list"></div>
+
+            <details class="creative-groups-panel">
+              <summary>GROUPS + ROOT ORDER</summary>
+              <form id="creative-group-create" class="creative-group-create" aria-label="Create a composition group">
+                <label for="creative-group-name">Name</label>
+                <input id="creative-group-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="Group">
+                <label for="creative-group-members">Members</label>
+                <select id="creative-group-members" multiple size="3" aria-describedby="creative-group-help"></select>
+                <button type="submit">Create group</button>
+                <div id="creative-group-help" class="creative-help">Members must form one contiguous root run. A group remains addressable when empty.</div>
+              </form>
+              <div id="creative-groups" class="creative-groups" role="list"></div>
+              <h4 class="creative-subtitle">ROOT · BACK TO FRONT</h4>
+              <div id="creative-root" class="creative-root" role="list"></div>
+            </details>
+            <div id="creative-status" class="creative-status" role="status" aria-live="polite">Legacy rack · exact path</div>
+          </div>
+        </details>
+
+        <section class="scenes-panel" aria-labelledby="scenes-title">
+          <div class="scenes-heading">
+            <h3 class="panel-title" id="scenes-title">Scenes</h3>
+            <span class="dim">atomic source studies</span>
+          </div>
+          <form class="scene-capture-form" id="scene-capture-form" aria-label="Capture the current active slots as a scene">
+            <label for="scene-capture-name">Name <span class="dim">optional</span></label>
+            <input id="scene-capture-name" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="Untitled scene">
+            <label for="scene-capture-mode">Timing</label>
+            <select id="scene-capture-mode">
+              <option value="immediate">Immediate</option>
+              <option value="next_beat">Next beat</option>
+              <option value="next_bar">Next bar</option>
+            </select>
+            <button id="scene-capture-submit" type="submit">Capture Current</button>
+            <div class="scene-capture-help">Captures one active slot per live layer. Scene changes remain atomic.</div>
+          </form>
+          <div class="scene-list" id="scene-list" role="list"></div>
+          <div class="scene-status" id="scene-status" role="status" aria-live="polite">No authored scenes</div>
+        </section>
         <div class="layers-section">
+          <p id="layer-blend-policy" class="visually-hidden">Reordering changes the content below; the saved blend choice remains unchanged. Subtract computes below minus layer. Alpha Cut erases accumulated content; it is a no-op without content below.</p>
           <div class="layers-list" id="layers-list">
             <!-- Layer cards rendered by JS -->
           </div>
@@ -71,6 +168,85 @@
         <div class="fx-scroll" id="master-fx">
           <div class="fx-columns">
           <div class="fx-col" data-fx-column="video"><!-- video effects -->
+          <div class="fx-group" data-group="transform" id="master-transform-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">TRANSFORM</span>
+            </div>
+            <div class="fx-group-body spatial-transform-body" id="master-transform-body">
+              <div class="transform-toolbar" role="group" aria-label="Master transform commands">
+                <button type="button" class="transform-reset" title="Reset to the legacy full-frame identity">Reset</button>
+                <button type="button" class="transform-copy">Copy</button>
+                <button type="button" class="transform-paste">Paste</button>
+                <label class="transform-preset-label">Preset
+                  <select class="transform-preset" aria-label="Master transform preset">
+                    <option value="">Choose…</option>
+                    <option value="identity">Identity</option>
+                    <option value="center_fit">Center Fit</option>
+                    <option value="center_fill">Center Fill</option>
+                    <option value="native">Native 1:1</option>
+                    <option value="mirror_x">Mirror X</option>
+                    <option value="mirror_y">Mirror Y</option>
+                  </select>
+                </label>
+              </div>
+              <div class="param-row" data-master-transform="position_x">
+                <label>Position X</label><input type="range" min="-4" max="4" step="0.01" value="0"><span class="value">0.00</span>
+              </div>
+              <div class="param-row" data-master-transform="position_y">
+                <label>Position Y</label><input type="range" min="-4" max="4" step="0.01" value="0"><span class="value">0.00</span>
+              </div>
+              <div class="param-row" data-master-transform="scale_x">
+                <label>Scale X</label><input type="range" min="-16" max="16" step="0.01" value="1"><span class="value">1.00</span>
+              </div>
+              <div class="param-row" data-master-transform="scale_y">
+                <label>Scale Y</label><input type="range" min="-16" max="16" step="0.01" value="1"><span class="value">1.00</span>
+              </div>
+              <div class="param-row toggle-row transform-scale-link-row">
+                <label>Link scale</label>
+                <label class="toggle"><input type="checkbox" class="transform-scale-link" checked aria-label="Link master scale axes"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row" data-master-transform="anchor_x">
+                <label>Anchor X</label><input type="range" min="-2" max="3" step="0.01" value="0.5"><span class="value">0.50</span>
+              </div>
+              <div class="param-row" data-master-transform="anchor_y">
+                <label>Anchor Y</label><input type="range" min="-2" max="3" step="0.01" value="0.5"><span class="value">0.50</span>
+              </div>
+              <div class="param-row" data-master-transform="rotation_deg">
+                <label>Rotation °</label><input type="range" min="-180" max="180" step="0.1" value="0"><span class="value">0.0</span>
+              </div>
+              <div class="param-row" data-master-transform="skew_deg">
+                <label>Skew °</label><input type="range" min="-89" max="89" step="0.1" value="0"><span class="value">0.0</span>
+              </div>
+              <div class="param-row" data-master-transform="skew_axis_deg">
+                <label>Skew Axis °</label><input type="range" min="-180" max="180" step="0.1" value="0"><span class="value">0.0</span>
+              </div>
+              <div class="param-row select-row" data-master-transform="fit">
+                <label>Fit</label><select aria-label="Master media fit"><option value="stretch">Stretch</option><option value="fit">Fit</option><option value="fill">Fill</option><option value="native">Native</option></select>
+              </div>
+              <div class="param-row" data-master-transform="crop_left">
+                <label>Crop Left</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+              </div>
+              <div class="param-row" data-master-transform="crop_top">
+                <label>Crop Top</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+              </div>
+              <div class="param-row" data-master-transform="crop_right">
+                <label>Crop Right</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+              </div>
+              <div class="param-row" data-master-transform="crop_bottom">
+                <label>Crop Bottom</label><input type="range" min="0" max="0.999" step="0.001" value="0"><span class="value">0.000</span>
+              </div>
+              <div class="param-row select-row" data-master-transform="edge">
+                <label>Edge</label><select aria-label="Master edge mode"><option value="transparent" selected>Transparent</option><option value="clamp">Clamp</option><option value="repeat">Repeat</option><option value="mirror">Mirror</option></select>
+              </div>
+              <div class="param-row select-row" data-master-transform="sampling">
+                <label>Sampling</label><select aria-label="Master sampling mode"><option value="linear" selected>Linear</option><option value="nearest">Nearest</option></select>
+              </div>
+              <div class="audio-status">Position uses composition dimensions; anchor and crop use source fractions. Zero scale fails closed to transparent.</div>
+              <div class="transform-status" role="status" aria-live="polite"></div>
+            </div>
+          </div>
+
           <div class="fx-group" data-group="digital">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -369,6 +545,42 @@
             </div>
           </div>
 
+          <div class="fx-group" id="motion-fields-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">MOTION FIELDS</span>
+            </div>
+            <div class="fx-group-body motion-authoring" id="master-motion-panel" role="region" aria-label="Master motion field and curved shutter">
+              <div class="param-row select-row" data-motion-param="field_source">
+                <label>Field source</label>
+                <select aria-label="Master motion field source"><option value="auto">Auto</option><option value="codec_vectors">Codec vectors</option><option value="lattice">Motion lattice</option></select>
+              </div>
+              <div class="param-row select-row" data-motion-param="lattice_quality">
+                <label>Lattice</label>
+                <select aria-label="Master motion lattice quality"><option value="draft">Draft · 16px</option><option value="live" selected>Live · 8px</option><option value="high">High · 4px</option></select>
+              </div>
+              <div class="param-row" data-motion-param="shutter_angle" data-min="0" data-max="360" data-step="1">
+                <label>Shutter angle</label><input type="range" min="0" max="360" step="1" value="0" aria-label="Master shutter angle"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-motion-param="shutter_phase" data-min="-1" data-max="1" data-step="0.01">
+                <label>Phase</label><input type="range" min="-1" max="1" step="0.01" value="0" aria-label="Master shutter phase"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-motion-param="shutter_curvature" data-min="-2" data-max="2" data-step="0.01">
+                <label>Curvature</label><input type="range" min="-2" max="2" step="0.01" value="0" aria-label="Master shutter curvature"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-motion-param="shutter_chromatic_lag" data-min="0" data-max="1" data-step="0.01">
+                <label>Chroma lag</label><input type="range" min="0" max="1" step="0.01" value="0" aria-label="Master shutter chromatic lag"><span class="value">0</span>
+              </div>
+              <div class="param-row select-row" data-motion-param="shutter_quality">
+                <label>Shutter quality</label>
+                <select aria-label="Master curved shutter quality"><option value="sharp" selected>Sharp · 1</option><option value="draft">Draft · 4</option><option value="live">Live · 8</option><option value="high">High · 16</option></select>
+              </div>
+              <div class="temporal-command-row"><button type="button" id="motion-clear-memory">Clear motion memory</button></div>
+              <div class="audio-status motion-telemetry" id="master-motion-telemetry" role="status" aria-live="polite">v1 · field idle · 0 vectors · carrier empty</div>
+              <div class="audio-status">Auto uses codec vectors when valid on layers and visibly falls back to the deterministic lattice. Master Auto is lattice. Codec-only never falls back.</div>
+            </div>
+          </div>
+
           <div class="fx-group" data-group="temporal" id="temporal-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -411,6 +623,151 @@
                 <label>History</label><input type="range"><span class="value">1</span>
               </div>
               <div class="audio-status">History key compares the current frame with the selected prior frame, then gates the final temporal output.</div>
+
+              <div class="temporal-originals" role="region" aria-label="Temporal originals">
+                <details class="temporal-study">
+                  <summary>TOPOLOGY LOOM</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="loom_amount" data-min="0" data-max="1" data-step="0.01">
+                      <label>Loom</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row select-row" data-temporal="loom_topology">
+                      <label>Topology</label>
+                      <select aria-label="Loom topology">
+                        <option value="linear">Linear</option><option value="radial">Radial</option>
+                        <option value="spiral">Spiral</option><option value="contour">Contour</option>
+                        <option value="folded">Folded</option><option value="kaleidoscopic">Kaleidoscopic</option>
+                      </select>
+                    </div>
+                    <div class="param-row select-row" data-temporal="loom_interpolation">
+                      <label>Sampling</label>
+                      <select aria-label="Loom history interpolation">
+                        <option value="floor">Floor</option><option value="linear">Linear</option>
+                      </select>
+                    </div>
+                    <div class="param-row" data-temporal="loom_depth" data-min="0" data-max="1" data-step="0.01">
+                      <label>Depth</label><input type="range"><span class="value">1</span>
+                    </div>
+                    <div class="param-row" data-temporal="loom_phase" data-min="-1000" data-max="1000" data-step="0.1">
+                      <label>Phase</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="loom_scale" data-min="0.01" data-max="100" data-step="0.01">
+                      <label>Scale</label><input type="range"><span class="value">1</span>
+                    </div>
+                    <div class="param-row" data-temporal="loom_angle" data-min="-180" data-max="180" data-step="1">
+                      <label>Angle</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="loom_folds" data-min="1" data-max="16" data-step="1">
+                      <label>Folds</label><input type="range"><span class="value">1</span>
+                    </div>
+                    <div class="param-row" data-temporal="loom_quantization" data-min="0" data-max="24" data-step="1">
+                      <label>Quantize</label><input type="range"><span class="value">0</span>
+                    </div>
+                  </div>
+                </details>
+
+                <details class="temporal-study">
+                  <summary>COLLISION ATLAS</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="atlas_amount" data-min="0" data-max="1" data-step="0.01">
+                      <label>Atlas</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row temporal-number-row" data-temporal="atlas_seed" data-default="0">
+                      <label for="temporal-atlas-seed">Seed</label><input id="temporal-atlas-seed" type="number" min="0" max="4294967295" step="1" value="0">
+                    </div>
+                    <div class="param-row" data-temporal="atlas_territories" data-min="1" data-max="64" data-step="1">
+                      <label>Territories</label><input type="range"><span class="value">8</span>
+                    </div>
+                    <div class="param-row" data-temporal="atlas_collision" data-min="0" data-max="1" data-step="0.01">
+                      <label>Collision</label><input type="range"><span class="value">0</span>
+                    </div>
+                  </div>
+                </details>
+
+                <details class="temporal-study">
+                  <summary>REFRESH GARDEN</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="garden_amount" data-min="0" data-max="1" data-step="0.01">
+                      <label>Garden</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row select-row" data-temporal="garden_gate">
+                      <label>Gate</label>
+                      <select aria-label="Refresh Garden admission gate">
+                        <option value="temporal_delta">Temporal Δ</option><option value="luma">Luma</option>
+                        <option value="chroma">Chroma</option><option value="cellular_ridge">Cellular ridge</option>
+                        <option value="audio_energy">Audio energy</option><option value="audio_onset">Audio onset</option>
+                        <option value="matte">Matte</option>
+                      </select>
+                    </div>
+                    <div class="param-row" data-temporal="garden_threshold" data-min="0" data-max="1" data-step="0.01">
+                      <label>Threshold</label><input type="range"><span class="value">0.1</span>
+                    </div>
+                    <div class="param-row" data-temporal="garden_softness" data-min="0" data-max="0.5" data-step="0.01">
+                      <label>Softness</label><input type="range"><span class="value">0.03</span>
+                    </div>
+                    <div class="param-row" data-temporal="garden_decay" data-min="0" data-max="1" data-step="0.01">
+                      <label>Decay</label><input type="range"><span class="value">1</span>
+                    </div>
+                    <div class="param-row temporal-number-row" data-temporal="garden_max_hold_ticks" data-default="0">
+                      <label for="temporal-garden-hold">Max hold</label><input id="temporal-garden-hold" type="number" min="0" max="4294967295" step="1" value="0">
+                    </div>
+                  </div>
+                </details>
+
+                <details class="temporal-study">
+                  <summary>COLLISION SCORE</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row toggle-row" data-temporal="score_enabled">
+                      <label>Enable</label><label class="toggle"><input type="checkbox"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="param-row temporal-number-row" data-temporal="score_seed" data-default="0">
+                      <label for="temporal-score-seed">Seed</label><input id="temporal-score-seed" type="number" min="0" max="4294967295" step="1" value="0">
+                    </div>
+                    <div class="param-row" data-temporal="score_state_count" data-min="2" data-max="16" data-step="1">
+                      <label>States</label><input type="range"><span class="value">4</span>
+                    </div>
+                    <div class="param-row select-row" data-temporal="score_trigger">
+                      <label>Trigger</label>
+                      <select aria-label="Collision Score event trigger">
+                        <option value="boundary">Loop boundary</option><option value="downbeat">Downbeat</option>
+                        <option value="audio_onset">Audio onset</option><option value="manual">Manual</option>
+                      </select>
+                    </div>
+                    <div class="param-row select-row" data-temporal="score_loop_driver">
+                      <label>Loop driver</label>
+                      <select id="temporal-score-loop-driver" aria-label="Collision Score loop driver"><option value="none">None</option></select>
+                    </div>
+                    <div class="temporal-command-row">
+                      <button type="button" id="temporal-score-trigger">Trigger score</button>
+                    </div>
+                  </div>
+                </details>
+
+                <details class="temporal-study">
+                  <summary>MEMORY LAW</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row select-row" data-temporal="reset_loop_boundary">
+                      <label>On loop</label>
+                      <select aria-label="Temporal reset on loop boundary">
+                        <option value="none">None</option><option value="score">Score</option>
+                        <option value="memory">Memory</option><option value="all">All</option>
+                      </select>
+                    </div>
+                    <div class="param-row select-row" data-temporal="reset_downbeat">
+                      <label>Downbeat</label>
+                      <select aria-label="Temporal reset on downbeat">
+                        <option value="none">None</option><option value="score">Score</option>
+                        <option value="memory">Memory</option><option value="all">All</option>
+                      </select>
+                    </div>
+                    <div class="temporal-command-row">
+                      <button type="button" id="temporal-clear-memory">Clear temporal memory</button>
+                    </div>
+                    <div class="audio-status temporal-telemetry" id="temporal-telemetry" role="status" aria-live="polite">History 0/24 · carrier empty · hold empty · tick 0 · Score 0 · event 0</div>
+                    <div class="audio-status">Clear is an ordered memory barrier. It preserves authored controls and a paused audience hold.</div>
+                  </div>
+                </details>
+              </div>
             </div>
           </div>
 
@@ -494,7 +851,12 @@
                 <select id="reroll-scope">
                   <option value="master">Master</option>
                   <option value="all">Everything</option>
+                  <option value="group">Group</option>
                 </select>
+              </div>
+              <div class="param-row select-row" id="reroll-group-row" hidden>
+                <label for="reroll-group">Group</label>
+                <select id="reroll-group" aria-label="Group to reroll"></select>
               </div>
               <div class="param-row select-row">
                 <label for="reroll-mode">Mode</label>
@@ -516,6 +878,19 @@
                 <label for="reroll-grain-controls">Grain mode</label>
                 <label class="toggle"><input type="checkbox" id="reroll-grain-controls" aria-label="Include discrete grain algorithm and color grain"><span class="toggle-slider"></span></label>
               </div>
+              <div class="param-row toggle-row" id="reroll-transform-row">
+                <label for="reroll-transform-controls">Transform variation</label>
+                <label class="toggle"><input type="checkbox" id="reroll-transform-controls" aria-label="Include bounded spatial transform variation; off by default"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" id="reroll-rack-row">
+                <label for="reroll-rack-controls">Rack values</label>
+                <label class="toggle"><input type="checkbox" id="reroll-rack-controls" aria-label="Include bounded Collision Rack value variation; topology and routes never change"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" id="reroll-group-controls-row">
+                <label for="reroll-group-controls">Composition values</label>
+                <label class="toggle"><input type="checkbox" id="reroll-group-controls" aria-label="Include bounded group opacity, transform and matte variation; All scope also varies the A B crossfade"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="audio-status">Variation also moves bounded Loom, Atlas, and Garden numeric values for Master / Everything, and bounded Motion numeric values for Master / Layer / Everything. Transform, rack, group, matte, and A/B value variation are explicit opt-ins. Dice never changes Motion algorithm/version, field or quality tiers, donor, carrier, temporal topology, seeds, Score configuration, reset law, loop driver, routes, channel/invert, node order, membership, solo, bypass, or bus assignment.</div>
               <button id="reroll-button" class="btn-export" type="button" title="Choose a deterministic new pattern; supplied seeds are exactly replayable">&#x2684; Reroll</button>
               <div class="audio-status" id="reroll-status" role="status" aria-live="polite">Master seed 0 · legacy pattern</div>
             </div>
@@ -611,16 +986,53 @@
                 <label class="toggle"><input type="checkbox" id="midi-clock-sync" aria-label="Follow incoming MIDI Timing Clock"><span class="toggle-slider"></span></label>
                 <span class="clock-indicator" id="midi-clock-indicator" role="status" aria-live="polite">off</span>
               </div>
-              <div class="midi-help">Learn CC listens only for Control Change; keys and notes are ignored. Clk Sync follows incoming 24-PPQN MIDI Timing Clock. It is not an audible click, and collide-o-scope sends no MIDI.</div>
+              <div class="midi-help">Legacy Learn listens only for Control Change; keys and notes are ignored. Clk Sync follows incoming 24-PPQN MIDI Timing Clock. A validated Controller Profile may send bounded feedback to its configured output; MIDI input is never echoed back to the same origin.</div>
               <div id="midi-slots">
                 <!-- 4 slot rows rendered by JS -->
               </div>
               <div class="audio-status" id="midi-status" role="status" aria-live="polite"></div>
+              <section class="protocol-runtime-panel" id="controller-runtime-panel" aria-labelledby="controller-runtime-heading">
+                <h3 id="controller-runtime-heading">Controller runtime</h3>
+                <dl class="protocol-runtime-facts">
+                  <dt>Profile</dt><dd id="controller-runtime-profile">Legacy / unavailable</dd>
+                  <dt>Input</dt><dd id="midi-runtime-input">None</dd>
+                  <dt>Output</dt><dd id="midi-runtime-output">None</dd>
+                </dl>
+                <div class="audio-status" id="controller-runtime-status" role="status" aria-live="polite"></div>
+                <div class="protocol-runtime-counters" id="midi-runtime-counters" aria-label="MIDI runtime counters">No MIDI runtime samples</div>
+                <div class="protocol-profile-actions">
+                  <button id="controller-profile-import" type="button">Import JSON</button>
+                  <button id="controller-profile-export" type="button">Export JSON</button>
+                  <input id="controller-profile-file" type="file" accept="application/json,.json" hidden>
+                </div>
+                <div class="audio-status">Browser transfer is a bounded typed document with no path or URL authority. Native shortcuts: Ctrl+Shift+I / Ctrl+Shift+X.</div>
+              </section>
             </div>
           </div>
 
           </div>
           <div class="fx-col" data-fx-column="io"><!-- output, remote access, and phone steering -->
+          <div class="fx-group" id="osc-runtime-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">OSC RUNTIME</span>
+            </div>
+            <div class="fx-group-body">
+              <section class="protocol-runtime-panel" id="osc-runtime-panel" aria-labelledby="osc-runtime-heading">
+                <h3 id="osc-runtime-heading">Typed OSC listener</h3>
+                <dl class="protocol-runtime-facts">
+                  <dt>Requested bind</dt><dd id="osc-runtime-bind">Not configured</dd>
+                  <dt>Bound address</dt><dd id="osc-runtime-bound">Not listening</dd>
+                  <dt>State</dt><dd id="osc-runtime-phase">Disabled</dd>
+                </dl>
+                <div class="protocol-runtime-warning" id="osc-runtime-lan-warning" role="status" aria-live="polite">Loopback-only unless a validated LAN configuration explicitly says otherwise.</div>
+                <div class="audio-status" id="osc-runtime-error" role="status" aria-live="polite"></div>
+                <div class="protocol-runtime-counters" id="osc-runtime-counters" aria-label="OSC runtime counters">No OSC runtime samples</div>
+                <div class="audio-status">Read-only telemetry. Browser messages cannot invent OSC addresses or dispatch arbitrary JSON controls.</div>
+              </section>
+            </div>
+          </div>
+
           <div class="fx-group" id="output-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
@@ -639,6 +1051,73 @@
               </div>
               <div class="audio-status error" id="output-status" role="status" aria-live="polite"></div>
               <div class="audio-status" id="spout-status"></div>
+            </div>
+          </div>
+
+          <div class="fx-group" id="recorder-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">RECORDER</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label for="recorder-auto-import">Auto-import</label>
+                <label class="toggle"><input type="checkbox" id="recorder-auto-import"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="recorder-command-row">
+                <button id="recorder-start" class="btn-export" type="button">Record program…</button>
+                <button id="recorder-finish" class="btn-export" type="button" hidden>Finish</button>
+                <button id="recorder-cancel" class="btn-export btn-cancel" type="button" hidden>Cancel</button>
+              </div>
+              <details class="capture-tool">
+                <summary>STILL SNAPSHOT</summary>
+                <div class="capture-tool-body">
+                  <label for="still-target">Source</label><select id="still-target"><option value="program">Program</option></select>
+                  <label class="toggle-row-inline" for="still-auto-import"><span>Auto-import</span><input type="checkbox" id="still-auto-import"></label>
+                  <button id="still-capture" class="btn-export" type="button">Capture PNG…</button>
+                </div>
+              </details>
+              <details class="capture-tool">
+                <summary>RESAMPLE TO CLIP</summary>
+                <div class="capture-tool-body">
+                  <label for="resample-target">Source</label><select id="resample-target"><option value="program">Program</option></select>
+                  <label for="resample-destination">Destination</label><select id="resample-destination"><option value="">Choose layer…</option></select>
+                  <label class="toggle-row-inline" for="resample-activate"><span>Activate after prepare</span><input type="checkbox" id="resample-activate"></label>
+                  <button id="resample-start" class="btn-export" type="button">Start resample…</button>
+                </div>
+              </details>
+              <div class="export-status" id="recorder-status" role="status" aria-live="polite"></div>
+              <div class="audio-status" id="recorder-counters"></div>
+              <div class="audio-status">Video uses the exact program cadence. Drop gaps repeat the prior frame; audio clock correlation is reported, but audio is not yet muxed.</div>
+            </div>
+          </div>
+
+          <div class="fx-group" id="stage-health-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">STAGE HEALTH</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label for="stage-health-hud">Preview HUD</label>
+                <label class="toggle"><input type="checkbox" id="stage-health-hud"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row select-row">
+                <label for="stage-output-endpoint">Endpoint</label>
+                <select id="stage-output-endpoint"><option value="legacy-output-1">Legacy output</option></select>
+              </div>
+              <div class="param-row select-row">
+                <label for="stage-test-card">Test card</label>
+                <select id="stage-test-card"><option value="off">Off</option><option value="smpte_bars">SMPTE bars</option><option value="grid">Grid</option></select>
+              </div>
+              <div class="param-row toggle-row">
+                <label for="stage-output-identification">Identify endpoint</label>
+                <label class="toggle"><input type="checkbox" id="stage-output-identification"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="stage-health-summary" id="stage-health-summary" role="status" aria-live="polite">Waiting for stage telemetry…</div>
+              <div class="stage-health-budgets" id="stage-health-budgets"></div>
+              <div class="stage-health-layers" id="stage-health-layers"></div>
+              <div class="audio-status">HUD appears only in the editor preview. Calibration affects only the selected physical endpoint—not Composite, Spout, recording, export, or another output.</div>
             </div>
           </div>
 
@@ -690,6 +1169,35 @@
               </div>
               <div class="export-status" id="patch-save-status" role="status" aria-live="polite"></div>
               <div class="export-status" id="patch-load-status" role="status" aria-live="polite"></div>
+              <section class="history-panel" aria-labelledby="history-heading">
+                <h3 id="history-heading">Manual history</h3>
+                <div class="history-controls" role="group" aria-label="Manual undo and redo">
+                  <button id="history-undo" class="btn-export" type="button" disabled>Undo</button>
+                  <button id="history-redo" class="btn-export" type="button" disabled>Redo</button>
+                </div>
+                <div class="export-status" id="history-status" role="status" aria-live="polite">No manual edits</div>
+              </section>
+              <section class="recovery-panel" id="recovery-panel" aria-labelledby="recovery-heading" hidden>
+                <h3 id="recovery-heading">Recovery checkpoint</h3>
+                <div class="recovery-controls" role="group" aria-label="Recovery checkpoint choice">
+                  <button id="recovery-restore" class="btn-export" type="button">Restore checkpoint</button>
+                  <button id="recovery-discard" class="btn-export btn-cancel" type="button">Discard</button>
+                </div>
+                <div class="export-status" id="recovery-status" role="status" aria-live="polite"></div>
+                <div class="audio-status">A recovery checkpoint will never be applied automatically.</div>
+              </section>
+              <details class="preset-panel">
+                <summary>SCOPED PRESETS</summary>
+                <div class="preset-tool-body">
+                  <label for="preset-name">Name</label><input id="preset-name" type="text" maxlength="80" autocomplete="off" value="New preset">
+                  <label for="preset-kind">Values / document</label><select id="preset-kind"><option value="transform">Transform</option><option value="rack">Rack</option><option value="matte">Matte</option><option value="group">Group</option><option value="controller_profile">Controller Profile</option><option value="stage_map">Stage Map</option></select>
+                  <label for="preset-target">Scope</label><select id="preset-target"><option value="master">Master</option></select>
+                  <button id="preset-capture" class="btn-export" type="button">Capture preset</button>
+                </div>
+                <div class="preset-list" id="preset-list" aria-label="Saved scoped presets"></div>
+                <div class="export-status" id="preset-status" role="status" aria-live="polite">No presets</div>
+                <div class="audio-status">Creative presets require matching node/value topology and preserve IDs, routes, donors, membership, and root order. Controller Profile and Stage Map presets are complete, separately bounded typed documents.</div>
+              </details>
               <div class="export-controls">
                 <button id="export-start" class="btn-export">Render</button>
                 <button id="export-cancel" class="btn-export btn-cancel" style="display:none">Cancel</button>
@@ -699,6 +1207,7 @@
                 <span class="progress-text" id="export-text">0%</span>
               </div>
               <div class="export-status" id="export-status" role="status" aria-live="polite"></div>
+              <div class="audio-status export-motion-status" id="export-motion-status" role="status" aria-live="polite"></div>
               <div class="export-warnings" id="export-warnings" role="status" aria-live="polite" hidden>
                 <div class="export-warnings-summary" id="export-warnings-summary"></div>
                 <ul id="export-warnings-list"></ul>

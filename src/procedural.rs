@@ -16,18 +16,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::layers::BlendMode;
 use crate::media_source::{
     ContentIdentity, FingerprintLimits, FingerprintSession, ResolveContext, ResolvedVisualSource,
     DEFAULT_MAX_FINGERPRINT_BYTES, DEFAULT_MAX_SEARCH_ENTRIES,
 };
-use crate::patch::{EffectsConfig, PatchState};
+use crate::patch::{EffectsConfig, MotionConfig, PatchState, TemporalOriginalsConfig};
 use crate::randomization::{
     mutate_circular, mutate_discrete, mutate_linear, mutate_log, SplitMix64,
 };
 #[cfg(test)]
 use crate::randomization::{reflect, wrap};
+use crate::spatial::{
+    SpatialTransform, ANCHOR_MAX, ANCHOR_MIN, CROP_MAX, POSITION_MAX, POSITION_MIN, SCALE_MAX,
+    SCALE_MIN, SKEW_LIMIT_DEGREES,
+};
+use crate::visual_rack::{GroupId, MaskParams, NodeId, VisualNodeKind, VisualRack};
 
-pub const GENERATOR_VERSION: &str = "2";
+/// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
+/// new isolated domains. Manifest readers remain data-driven and accept every
+/// earlier version string.
+pub const GENERATOR_VERSION: &str = "7";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -151,6 +160,28 @@ fn finite_temperature(value: f32) -> Result<f32, String> {
         return Err("temperature must be finite and between 0 and 2".to_string());
     }
     Ok(value)
+}
+
+fn canonical_blend_mode(key: &str) -> BlendMode {
+    BlendMode::from_key(key).unwrap_or(BlendMode::Normal)
+}
+
+/// Keep blend mutation in the established layer RNG stream: parsing the
+/// expanded typed set consumes no entropy and `mutate_discrete` performs the
+/// same mean-reversion/chance/selection draws it used for the original four.
+fn mutate_blend_mode(
+    anchor: &str,
+    value: &str,
+    change_probability: f32,
+    rng: &mut SplitMix64,
+) -> BlendMode {
+    mutate_discrete(
+        canonical_blend_mode(anchor),
+        canonical_blend_mode(value),
+        &BlendMode::ALL,
+        change_probability,
+        rng,
+    )
 }
 
 fn mutate_bool(anchor: bool, value: bool, change_probability: f32, rng: &mut SplitMix64) -> bool {
@@ -313,8 +344,1103 @@ fn mutate_effects(
     );
 }
 
+// Appended M3 streams. Every numeric value is isolated so introducing a new
+// control cannot shift an established procedural sequence. Discrete laws,
+// public seeds, loop-driver identity, and reset policy never mutate here.
+const PROCEDURAL_TEMPORAL_LOOM_AMOUNT: u64 = 0x5033_4c4f_4f4d_414d;
+const PROCEDURAL_TEMPORAL_LOOM_DEPTH: u64 = 0x5033_4c4f_4f4d_4450;
+const PROCEDURAL_TEMPORAL_LOOM_PHASE: u64 = 0x5033_4c4f_4f4d_5048;
+const PROCEDURAL_TEMPORAL_LOOM_SCALE: u64 = 0x5033_4c4f_4f4d_5343;
+const PROCEDURAL_TEMPORAL_LOOM_ANGLE: u64 = 0x5033_4c4f_4f4d_414e;
+const PROCEDURAL_TEMPORAL_LOOM_FOLDS: u64 = 0x5033_4c4f_4f4d_464f;
+const PROCEDURAL_TEMPORAL_LOOM_QUANT: u64 = 0x5033_4c4f_4f4d_5155;
+const PROCEDURAL_TEMPORAL_ATLAS_AMOUNT: u64 = 0x5033_4154_4c53_414d;
+const PROCEDURAL_TEMPORAL_ATLAS_TERRITORIES: u64 = 0x5033_4154_4c53_5445;
+const PROCEDURAL_TEMPORAL_ATLAS_COLLISION: u64 = 0x5033_4154_4c53_434f;
+const PROCEDURAL_TEMPORAL_GARDEN_AMOUNT: u64 = 0x5033_4741_5244_414d;
+const PROCEDURAL_TEMPORAL_GARDEN_THRESHOLD: u64 = 0x5033_4741_5244_5448;
+const PROCEDURAL_TEMPORAL_GARDEN_SOFTNESS: u64 = 0x5033_4741_5244_534f;
+const PROCEDURAL_TEMPORAL_GARDEN_DECAY: u64 = 0x5033_4741_5244_4443;
+const PROCEDURAL_TEMPORAL_GARDEN_HOLD: u64 = 0x5033_4741_5244_484f;
+
+fn mutate_temporal_originals(
+    anchor: &TemporalOriginalsConfig,
+    value: &mut TemporalOriginalsConfig,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    macro_rules! linear {
+        ($field:expr, $anchor:expr, $min:expr, $max:expr, $scale:expr, $domain:expr) => {{
+            let mut rng = SplitMix64::new(domain_seed(seed, index, $domain));
+            $field = mutate_linear($anchor, $field, $min, $max, temperature * $scale, &mut rng);
+        }};
+    }
+
+    linear!(
+        value.loom.amount,
+        anchor.loom.amount,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_TEMPORAL_LOOM_AMOUNT
+    );
+    linear!(
+        value.loom.depth,
+        anchor.loom.depth,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_TEMPORAL_LOOM_DEPTH
+    );
+    linear!(
+        value.loom.phase,
+        anchor.loom.phase,
+        -1_000.0,
+        1_000.0,
+        0.25,
+        PROCEDURAL_TEMPORAL_LOOM_PHASE
+    );
+    {
+        let mut rng = SplitMix64::new(domain_seed(seed, index, PROCEDURAL_TEMPORAL_LOOM_SCALE));
+        value.loom.scale = mutate_log(
+            anchor.loom.scale,
+            value.loom.scale,
+            0.01,
+            100.0,
+            temperature * 0.25,
+            &mut rng,
+        );
+    }
+    {
+        let mut rng = SplitMix64::new(domain_seed(seed, index, PROCEDURAL_TEMPORAL_LOOM_ANGLE));
+        value.loom.angle = mutate_circular(
+            anchor.loom.angle,
+            value.loom.angle,
+            -180.0,
+            180.0,
+            temperature * 30.0,
+            &mut rng,
+        );
+    }
+    {
+        let mut rng = SplitMix64::new(domain_seed(seed, index, PROCEDURAL_TEMPORAL_LOOM_FOLDS));
+        value.loom.folds = mutate_linear(
+            f32::from(anchor.loom.folds),
+            f32::from(value.loom.folds),
+            1.0,
+            16.0,
+            temperature * 2.0,
+            &mut rng,
+        )
+        .round() as u8;
+    }
+    {
+        let mut rng = SplitMix64::new(domain_seed(seed, index, PROCEDURAL_TEMPORAL_LOOM_QUANT));
+        value.loom.quantization = mutate_linear(
+            f32::from(anchor.loom.quantization),
+            f32::from(value.loom.quantization),
+            0.0,
+            24.0,
+            temperature * 3.0,
+            &mut rng,
+        )
+        .round() as u8;
+    }
+    linear!(
+        value.atlas.amount,
+        anchor.atlas.amount,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_TEMPORAL_ATLAS_AMOUNT
+    );
+    {
+        let mut rng = SplitMix64::new(domain_seed(
+            seed,
+            index,
+            PROCEDURAL_TEMPORAL_ATLAS_TERRITORIES,
+        ));
+        value.atlas.territories = mutate_linear(
+            f32::from(anchor.atlas.territories),
+            f32::from(value.atlas.territories),
+            1.0,
+            64.0,
+            temperature * 6.0,
+            &mut rng,
+        )
+        .round() as u8;
+    }
+    linear!(
+        value.atlas.collision,
+        anchor.atlas.collision,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_TEMPORAL_ATLAS_COLLISION
+    );
+    linear!(
+        value.garden.amount,
+        anchor.garden.amount,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_TEMPORAL_GARDEN_AMOUNT
+    );
+    linear!(
+        value.garden.threshold,
+        anchor.garden.threshold,
+        0.0,
+        1.0,
+        0.15,
+        PROCEDURAL_TEMPORAL_GARDEN_THRESHOLD
+    );
+    linear!(
+        value.garden.softness,
+        anchor.garden.softness,
+        0.0,
+        0.5,
+        0.08,
+        PROCEDURAL_TEMPORAL_GARDEN_SOFTNESS
+    );
+    linear!(
+        value.garden.decay,
+        anchor.garden.decay,
+        0.0,
+        1.0,
+        0.15,
+        PROCEDURAL_TEMPORAL_GARDEN_DECAY
+    );
+    {
+        let mut rng = SplitMix64::new(domain_seed(seed, index, PROCEDURAL_TEMPORAL_GARDEN_HOLD));
+        let anchor = f64::from(anchor.garden.max_hold_ticks);
+        let current = f64::from(value.garden.max_hold_ticks);
+        let candidate = anchor
+            + 0.85 * (current - anchor)
+            + f64::from(rng.signed()) * f64::from(temperature) * 30.0;
+        value.garden.max_hold_ticks = candidate.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+    }
+}
+
+// M4 numeric values live in field-isolated streams. Master and each persisted
+// saved-layer position also own separate domains, so Motion cannot perturb
+// any v1-v6 generator sequence or a sibling scope. Every topology/provenance
+// field remains exactly authored.
+const PROCEDURAL_MOTION_DOMAIN: u64 = 0x5034_4d4f_5449_4f4e;
+const PROCEDURAL_MOTION_AMOUNT: u64 = 0x414d_4f55_4e54_0001;
+const PROCEDURAL_MOTION_THRESHOLD: u64 = 0x5448_5245_5348_0001;
+const PROCEDURAL_MOTION_SOFTNESS: u64 = 0x534f_4654_4e45_5353;
+const PROCEDURAL_MOTION_REFRESH: u64 = 0x5245_4652_4553_4801;
+const PROCEDURAL_MOTION_DECAY: u64 = 0x4445_4341_5900_0001;
+const PROCEDURAL_MOTION_OCCLUSION: u64 = 0x4f43_434c_5553_494f;
+const PROCEDURAL_MOTION_SHUTTER_ANGLE: u64 = 0x5348_5554_414e_474c;
+const PROCEDURAL_MOTION_SHUTTER_PHASE: u64 = 0x5348_5554_5048_4153;
+const PROCEDURAL_MOTION_SHUTTER_CURVE: u64 = 0x5348_5554_4355_5256;
+const PROCEDURAL_MOTION_CHROMATIC_LAG: u64 = 0x4348_524f_4d4c_4147;
+
+fn mutate_motion_config(
+    anchor: &MotionConfig,
+    value: &mut MotionConfig,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+    owner_domain: u64,
+    include_faraday: bool,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    macro_rules! linear {
+        ($field:expr, $anchor:expr, $min:expr, $max:expr, $scale:expr, $domain:expr) => {{
+            let mut rng = SplitMix64::new(domain_seed(
+                seed,
+                index,
+                PROCEDURAL_MOTION_DOMAIN ^ owner_domain ^ $domain,
+            ));
+            $field = mutate_linear($anchor, $field, $min, $max, temperature * $scale, &mut rng);
+        }};
+    }
+
+    if include_faraday {
+        linear!(
+            value.transplant.amount,
+            anchor.transplant.amount,
+            0.0,
+            1.0,
+            0.2,
+            PROCEDURAL_MOTION_AMOUNT
+        );
+        linear!(
+            value.transplant.confidence_threshold,
+            anchor.transplant.confidence_threshold,
+            0.0,
+            1.0,
+            0.15,
+            PROCEDURAL_MOTION_THRESHOLD
+        );
+        linear!(
+            value.transplant.confidence_softness,
+            anchor.transplant.confidence_softness,
+            0.0,
+            0.5,
+            0.08,
+            PROCEDURAL_MOTION_SOFTNESS
+        );
+        linear!(
+            value.transplant.refresh,
+            anchor.transplant.refresh,
+            0.0,
+            1.0,
+            0.15,
+            PROCEDURAL_MOTION_REFRESH
+        );
+        linear!(
+            value.transplant.decay,
+            anchor.transplant.decay,
+            0.0,
+            1.0,
+            0.15,
+            PROCEDURAL_MOTION_DECAY
+        );
+        linear!(
+            value.transplant.occlusion,
+            anchor.transplant.occlusion,
+            0.0,
+            1.0,
+            0.15,
+            PROCEDURAL_MOTION_OCCLUSION
+        );
+    }
+    linear!(
+        value.shutter.angle_degrees,
+        anchor.shutter.angle_degrees,
+        0.0,
+        360.0,
+        60.0,
+        PROCEDURAL_MOTION_SHUTTER_ANGLE
+    );
+    linear!(
+        value.shutter.phase,
+        anchor.shutter.phase,
+        -1.0,
+        1.0,
+        0.25,
+        PROCEDURAL_MOTION_SHUTTER_PHASE
+    );
+    linear!(
+        value.shutter.curvature,
+        anchor.shutter.curvature,
+        -2.0,
+        2.0,
+        0.5,
+        PROCEDURAL_MOTION_SHUTTER_CURVE
+    );
+    linear!(
+        value.shutter.chromatic_lag,
+        anchor.shutter.chromatic_lag,
+        0.0,
+        1.0,
+        0.15,
+        PROCEDURAL_MOTION_CHROMATIC_LAG
+    );
+    *value = value.sanitized();
+}
+
+fn mutate_transform(
+    anchor: &SpatialTransform,
+    transform: &mut SpatialTransform,
+    temperature: f32,
+    rng: &mut SplitMix64,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    let anchor = anchor.sanitized();
+    let mut value = transform.sanitized();
+    for axis in 0..2 {
+        value.position[axis] = mutate_linear(
+            anchor.position[axis],
+            value.position[axis],
+            POSITION_MIN,
+            POSITION_MAX,
+            temperature * 0.25,
+            rng,
+        );
+        value.scale[axis] = mutate_linear(
+            anchor.scale[axis],
+            value.scale[axis],
+            SCALE_MIN,
+            SCALE_MAX,
+            temperature * 0.35,
+            rng,
+        );
+        value.anchor[axis] = mutate_linear(
+            anchor.anchor[axis],
+            value.anchor[axis],
+            ANCHOR_MIN,
+            ANCHOR_MAX,
+            temperature * 0.10,
+            rng,
+        );
+    }
+    value.rotation_deg = mutate_circular(
+        anchor.rotation_deg,
+        value.rotation_deg,
+        -180.0,
+        180.0,
+        temperature * 30.0,
+        rng,
+    );
+    value.skew_deg = mutate_linear(
+        anchor.skew_deg,
+        value.skew_deg,
+        -SKEW_LIMIT_DEGREES,
+        SKEW_LIMIT_DEGREES,
+        temperature * 12.0,
+        rng,
+    );
+    value.skew_axis_deg = mutate_circular(
+        anchor.skew_axis_deg,
+        value.skew_axis_deg,
+        -180.0,
+        180.0,
+        temperature * 25.0,
+        rng,
+    );
+    for side in 0..4 {
+        value.crop[side] = mutate_linear(
+            anchor.crop[side],
+            value.crop[side],
+            0.0,
+            CROP_MAX,
+            temperature * 0.04,
+            rng,
+        );
+    }
+    // Fit/edge/sampling are intentionally not randomized. Sanitize once after
+    // all four crop sides so their paired extents remain valid.
+    *transform = value.sanitized();
+}
+
+/// Saved procedural pieces do not own runtime layer IDs, so rack owners use
+/// the stable identity available in the persisted graph: the singleton master
+/// domain, saved layer position, or GroupId. NodeId then isolates every node's
+/// stream from rack insertion and reordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProceduralRackOwner {
+    Master,
+    Layer(usize),
+    Group(GroupId),
+}
+
+const PROCEDURAL_CREATIVE_DOMAIN: u64 = 0x4352_4541_5449_5645;
+const PROCEDURAL_GROUP_VALUES_DOMAIN: u64 = 0x4752_4f55_505f_5641;
+const PROCEDURAL_GROUP_MATTE_DOMAIN: u64 = 0x4752_4f55_505f_4d41;
+
+const fn procedural_owner_domain(owner: ProceduralRackOwner) -> u64 {
+    match owner {
+        ProceduralRackOwner::Master => 0x4d41_5354_4552_0005,
+        ProceduralRackOwner::Layer(position) => {
+            0x4c41_5945_5200_0005 ^ (position as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        }
+        ProceduralRackOwner::Group(group_id) => {
+            0x4752_4f55_5000_0005 ^ group_id.get().wrapping_mul(0xd6e8_feb8_6659_fd93)
+        }
+    }
+}
+
+fn procedural_node_rng(
+    seed: u64,
+    index: usize,
+    owner: ProceduralRackOwner,
+    node_id: NodeId,
+) -> SplitMix64 {
+    SplitMix64::new(domain_seed(
+        seed,
+        index,
+        PROCEDURAL_CREATIVE_DOMAIN
+            ^ procedural_owner_domain(owner)
+            ^ node_id.get().wrapping_mul(0xa076_1d64_78bd_642f),
+    ))
+}
+
+/// Only values that can wake a saved image edge need transactional fallback.
+/// Every other procedural rack/group mutation is graph-topology neutral.
+#[derive(Debug, Clone, Copy)]
+enum CreativeEdgeFallback {
+    NodeWet {
+        owner: ProceduralRackOwner,
+        node_id: NodeId,
+        prior: f32,
+    },
+    ImageMaskAmount {
+        owner: ProceduralRackOwner,
+        node_id: NodeId,
+        prior: f32,
+    },
+    GroupMatteAmount {
+        group_id: GroupId,
+        prior: f32,
+    },
+}
+
+fn saved_rack_mut(patch: &mut PatchState, owner: ProceduralRackOwner) -> Option<&mut VisualRack> {
+    match owner {
+        ProceduralRackOwner::Master => patch.master_rack.as_mut(),
+        ProceduralRackOwner::Layer(position) => patch.layers.get_mut(position)?.rack.as_mut(),
+        ProceduralRackOwner::Group(group_id) => {
+            Some(&mut patch.composition.as_mut()?.group_mut(group_id)?.rack)
+        }
+    }
+}
+
+impl CreativeEdgeFallback {
+    fn restore(self, patch: &mut PatchState) {
+        match self {
+            Self::NodeWet {
+                owner,
+                node_id,
+                prior,
+            } => {
+                if let Some(node) =
+                    saved_rack_mut(patch, owner).and_then(|rack| rack.get_mut(node_id))
+                {
+                    node.wet = prior;
+                }
+            }
+            Self::ImageMaskAmount {
+                owner,
+                node_id,
+                prior,
+            } => {
+                let Some(node) =
+                    saved_rack_mut(patch, owner).and_then(|rack| rack.get_mut(node_id))
+                else {
+                    return;
+                };
+                if let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind {
+                    matte.amount = prior;
+                }
+            }
+            Self::GroupMatteAmount { group_id, prior } => {
+                let Some(matte) = patch
+                    .composition
+                    .as_mut()
+                    .and_then(|composition| composition.group_mut(group_id))
+                    .and_then(|group| group.matte.as_mut())
+                else {
+                    return;
+                };
+                matte.amount = prior;
+            }
+        }
+    }
+}
+
+fn mutate_saved_rack_values(
+    anchor: &VisualRack,
+    rack: &mut VisualRack,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+    owner: ProceduralRackOwner,
+    edge_fallbacks: &mut Vec<CreativeEdgeFallback>,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    let node_ids: Vec<_> = rack.iter().map(|node| node.stable_id).collect();
+    for node_id in node_ids {
+        let Some(anchor_node) = anchor.get(node_id).copied() else {
+            continue;
+        };
+        let Some(node) = rack.get_mut(node_id) else {
+            continue;
+        };
+        if matches!(
+            node.kind,
+            VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal
+        ) {
+            continue;
+        }
+
+        let prior_wet = node.wet;
+        let prior_image_amount = match node.kind {
+            VisualNodeKind::Mask(MaskParams::Image(matte)) => Some(matte.amount),
+            _ => None,
+        };
+        let mut rng = procedural_node_rng(seed, index, owner, node_id);
+        node.wet = mutate_linear(
+            anchor_node.wet,
+            node.wet,
+            0.0,
+            1.0,
+            temperature * 0.25,
+            &mut rng,
+        );
+
+        match (anchor_node.kind, &mut node.kind) {
+            (VisualNodeKind::Transform(anchor), VisualNodeKind::Transform(value)) => {
+                mutate_transform(&anchor, value, temperature, &mut rng);
+            }
+            (VisualNodeKind::DigitalColor(anchor), VisualNodeKind::DigitalColor(value)) => {
+                value.pixelate_size = mutate_log(
+                    anchor.pixelate_size,
+                    value.pixelate_size,
+                    1.0,
+                    32.0,
+                    temperature * 0.45,
+                    &mut rng,
+                )
+                .round();
+                value.rgb_split = mutate_linear(
+                    anchor.rgb_split,
+                    value.rgb_split,
+                    0.0,
+                    30.0,
+                    temperature * 4.0,
+                    &mut rng,
+                );
+                value.downsample = mutate_log(
+                    anchor.downsample,
+                    value.downsample,
+                    0.05,
+                    1.0,
+                    temperature * 0.22,
+                    &mut rng,
+                );
+                value.hue_shift = mutate_circular(
+                    anchor.hue_shift,
+                    value.hue_shift,
+                    -180.0,
+                    180.0,
+                    temperature * 50.0,
+                    &mut rng,
+                );
+                value.saturation = mutate_linear(
+                    anchor.saturation,
+                    value.saturation,
+                    -1.0,
+                    1.0,
+                    temperature * 0.3,
+                    &mut rng,
+                );
+                value.brightness = mutate_linear(
+                    anchor.brightness,
+                    value.brightness,
+                    -1.0,
+                    1.0,
+                    temperature * 0.25,
+                    &mut rng,
+                );
+                value.contrast = mutate_linear(
+                    anchor.contrast,
+                    value.contrast,
+                    -1.0,
+                    1.0,
+                    temperature * 0.3,
+                    &mut rng,
+                );
+                value.posterize = mutate_linear(
+                    anchor.posterize,
+                    value.posterize,
+                    0.0,
+                    16.0,
+                    temperature * 2.0,
+                    &mut rng,
+                )
+                .round();
+                value.invert = mutate_linear(
+                    anchor.invert,
+                    value.invert,
+                    0.0,
+                    1.0,
+                    temperature * 0.25,
+                    &mut rng,
+                );
+                value.vignette = mutate_linear(
+                    anchor.vignette,
+                    value.vignette,
+                    0.0,
+                    1.5,
+                    temperature * 0.22,
+                    &mut rng,
+                );
+                value.color_drift = mutate_linear(
+                    anchor.color_drift,
+                    value.color_drift,
+                    0.0,
+                    0.02,
+                    temperature * 0.004,
+                    &mut rng,
+                );
+            }
+            (VisualNodeKind::Key(anchor), VisualNodeKind::Key(value)) => {
+                value.threshold = mutate_linear(
+                    anchor.threshold,
+                    value.threshold,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.softness = mutate_linear(
+                    anchor.softness,
+                    value.softness,
+                    0.0,
+                    0.5,
+                    temperature * 0.1,
+                    &mut rng,
+                );
+                for component in 0..3 {
+                    value.color[component] = mutate_linear(
+                        anchor.color[component],
+                        value.color[component],
+                        0.0,
+                        1.0,
+                        temperature * 0.15,
+                        &mut rng,
+                    );
+                }
+                value.tolerance = mutate_linear(
+                    anchor.tolerance,
+                    value.tolerance,
+                    0.0,
+                    1.0,
+                    temperature * 0.15,
+                    &mut rng,
+                );
+            }
+            (VisualNodeKind::Cellular(anchor), VisualNodeKind::Cellular(value)) => {
+                value.amount = mutate_linear(
+                    anchor.amount,
+                    value.amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.scale = mutate_log(
+                    anchor.scale,
+                    value.scale,
+                    2.0,
+                    32.0,
+                    temperature * 0.28,
+                    &mut rng,
+                );
+                value.warp = mutate_linear(
+                    anchor.warp,
+                    value.warp,
+                    0.0,
+                    1.0,
+                    temperature * 0.18,
+                    &mut rng,
+                );
+                value.speed = mutate_linear(
+                    anchor.speed,
+                    value.speed,
+                    0.0,
+                    2.0,
+                    temperature * 0.35,
+                    &mut rng,
+                );
+                value.gap_amount = mutate_linear(
+                    anchor.gap_amount,
+                    value.gap_amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.15,
+                    &mut rng,
+                );
+                value.gap_threshold = mutate_linear(
+                    anchor.gap_threshold,
+                    value.gap_threshold,
+                    0.0,
+                    1.0,
+                    temperature * 0.15,
+                    &mut rng,
+                );
+                value.gap_softness = mutate_linear(
+                    anchor.gap_softness,
+                    value.gap_softness,
+                    0.0,
+                    0.5,
+                    temperature * 0.08,
+                    &mut rng,
+                );
+                if rng.chance((temperature * 0.5).clamp(0.0, 1.0)) {
+                    value.seed = rng.next_u64() as u32;
+                }
+            }
+            (VisualNodeKind::Shift(anchor), VisualNodeKind::Shift(value)) => {
+                value.amount = mutate_linear(
+                    anchor.amount,
+                    value.amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.25,
+                    &mut rng,
+                );
+                value.block_size = mutate_log(
+                    anchor.block_size,
+                    value.block_size,
+                    2.0,
+                    256.0,
+                    temperature * 0.35,
+                    &mut rng,
+                )
+                .round();
+                value.density = mutate_linear(
+                    anchor.density,
+                    value.density,
+                    0.0,
+                    1.0,
+                    temperature * 0.15,
+                    &mut rng,
+                );
+                value.speed = mutate_linear(
+                    anchor.speed,
+                    value.speed,
+                    0.0,
+                    20.0,
+                    temperature * 2.5,
+                    &mut rng,
+                );
+                if rng.chance((temperature * 0.5).clamp(0.0, 1.0)) {
+                    value.seed = rng.next_u64() as u32;
+                }
+            }
+            (VisualNodeKind::Grain(anchor), VisualNodeKind::Grain(value)) => {
+                value.intensity = mutate_linear(
+                    anchor.intensity,
+                    value.intensity,
+                    0.0,
+                    0.3,
+                    temperature * 0.06,
+                    &mut rng,
+                );
+                value.size = mutate_linear(
+                    anchor.size,
+                    value.size,
+                    1.0,
+                    4.0,
+                    temperature * 0.5,
+                    &mut rng,
+                );
+                if rng.chance((temperature * 0.5).clamp(0.0, 1.0)) {
+                    value.seed = rng.next_u64() as u32;
+                }
+            }
+            (VisualNodeKind::Mask(anchor), VisualNodeKind::Mask(value)) => match (anchor, value) {
+                (MaskParams::Rectangle(anchor), MaskParams::Rectangle(value)) => {
+                    for axis in 0..2 {
+                        value.center[axis] = mutate_linear(
+                            anchor.center[axis],
+                            value.center[axis],
+                            -2.0,
+                            3.0,
+                            temperature * 0.15,
+                            &mut rng,
+                        );
+                        value.size[axis] = mutate_linear(
+                            anchor.size[axis],
+                            value.size[axis],
+                            0.0,
+                            4.0,
+                            temperature * 0.3,
+                            &mut rng,
+                        );
+                    }
+                    value.rotation_deg = mutate_circular(
+                        anchor.rotation_deg,
+                        value.rotation_deg,
+                        -180.0,
+                        180.0,
+                        temperature * 30.0,
+                        &mut rng,
+                    );
+                    value.feather = mutate_linear(
+                        anchor.feather,
+                        value.feather,
+                        0.0,
+                        1.0,
+                        temperature * 0.15,
+                        &mut rng,
+                    );
+                }
+                (MaskParams::Ellipse(anchor), MaskParams::Ellipse(value)) => {
+                    for axis in 0..2 {
+                        value.center[axis] = mutate_linear(
+                            anchor.center[axis],
+                            value.center[axis],
+                            -2.0,
+                            3.0,
+                            temperature * 0.15,
+                            &mut rng,
+                        );
+                        value.radii[axis] = mutate_linear(
+                            anchor.radii[axis],
+                            value.radii[axis],
+                            0.0,
+                            2.0,
+                            temperature * 0.2,
+                            &mut rng,
+                        );
+                    }
+                    value.rotation_deg = mutate_circular(
+                        anchor.rotation_deg,
+                        value.rotation_deg,
+                        -180.0,
+                        180.0,
+                        temperature * 30.0,
+                        &mut rng,
+                    );
+                    value.feather = mutate_linear(
+                        anchor.feather,
+                        value.feather,
+                        0.0,
+                        1.0,
+                        temperature * 0.15,
+                        &mut rng,
+                    );
+                }
+                (MaskParams::Image(anchor), MaskParams::Image(value)) => {
+                    value.amount = mutate_linear(
+                        anchor.amount,
+                        value.amount,
+                        0.0,
+                        1.0,
+                        temperature * 0.2,
+                        &mut rng,
+                    );
+                    value.threshold = mutate_linear(
+                        anchor.threshold,
+                        value.threshold,
+                        0.0,
+                        1.0,
+                        temperature * 0.2,
+                        &mut rng,
+                    );
+                    value.softness = mutate_linear(
+                        anchor.softness,
+                        value.softness,
+                        0.0,
+                        0.5,
+                        temperature * 0.1,
+                        &mut rng,
+                    );
+                }
+                _ => {}
+            },
+            (VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal, _)
+            | (_, VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal) => {}
+            // A generated patch never changes rack topology. Be defensive if
+            // a future schema-normalization step supplies unlike kinds.
+            _ => {}
+        }
+
+        if !node.enabled {
+            continue;
+        }
+        let current_image_amount = match node.kind {
+            VisualNodeKind::Mask(MaskParams::Image(matte)) => Some(matte.amount),
+            _ => None,
+        };
+        if prior_wet <= 0.0 && node.wet > 0.0 && current_image_amount.is_some_and(|v| v > 0.0) {
+            edge_fallbacks.push(CreativeEdgeFallback::NodeWet {
+                owner,
+                node_id,
+                prior: prior_wet,
+            });
+        }
+        if node.wet > 0.0
+            && prior_image_amount.is_some_and(|value| value <= 0.0)
+            && current_image_amount.is_some_and(|value| value > 0.0)
+        {
+            edge_fallbacks.push(CreativeEdgeFallback::ImageMaskAmount {
+                owner,
+                node_id,
+                prior: prior_image_amount.unwrap_or(0.0),
+            });
+        }
+    }
+}
+
+fn mutate_saved_composition_values(
+    anchor: &crate::composition::CompositionTree,
+    composition: &mut crate::composition::CompositionTree,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+    edge_fallbacks: &mut Vec<CreativeEdgeFallback>,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    let group_ids: Vec<_> = composition.groups().map(|group| group.id).collect();
+    for group_id in group_ids {
+        let Some(anchor_group) = anchor.group(group_id) else {
+            continue;
+        };
+        let Some(group) = composition.group_mut(group_id) else {
+            continue;
+        };
+        let group_domain = procedural_owner_domain(ProceduralRackOwner::Group(group_id));
+        let mut group_rng = SplitMix64::new(domain_seed(
+            seed,
+            index,
+            PROCEDURAL_GROUP_VALUES_DOMAIN ^ group_domain,
+        ));
+        group.opacity = mutate_linear(
+            anchor_group.opacity,
+            group.opacity,
+            0.0,
+            1.0,
+            temperature * 0.25,
+            &mut group_rng,
+        );
+        mutate_transform(
+            &anchor_group.transform,
+            &mut group.transform,
+            temperature,
+            &mut group_rng,
+        );
+
+        if let (Some(anchor_matte), Some(matte)) = (anchor_group.matte, group.matte.as_mut()) {
+            let prior_amount = matte.amount;
+            let mut matte_rng = SplitMix64::new(domain_seed(
+                seed,
+                index,
+                PROCEDURAL_GROUP_MATTE_DOMAIN ^ group_domain,
+            ));
+            matte.amount = mutate_linear(
+                anchor_matte.amount,
+                matte.amount,
+                0.0,
+                1.0,
+                temperature * 0.2,
+                &mut matte_rng,
+            );
+            matte.threshold = mutate_linear(
+                anchor_matte.threshold,
+                matte.threshold,
+                0.0,
+                1.0,
+                temperature * 0.2,
+                &mut matte_rng,
+            );
+            matte.softness = mutate_linear(
+                anchor_matte.softness,
+                matte.softness,
+                0.0,
+                0.5,
+                temperature * 0.1,
+                &mut matte_rng,
+            );
+            if !group.bypass && prior_amount <= 0.0 && matte.amount > 0.0 {
+                edge_fallbacks.push(CreativeEdgeFallback::GroupMatteAmount {
+                    group_id,
+                    prior: prior_amount,
+                });
+            }
+        }
+
+        mutate_saved_rack_values(
+            &anchor_group.rack,
+            &mut group.rack,
+            temperature,
+            seed,
+            index,
+            ProceduralRackOwner::Group(group_id),
+            edge_fallbacks,
+        );
+    }
+}
+
+fn mutate_saved_creative_values(
+    anchor: &PatchState,
+    patch: &mut PatchState,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+    edge_fallbacks: &mut Vec<CreativeEdgeFallback>,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    if let (Some(anchor_rack), Some(rack)) = (&anchor.master_rack, &mut patch.master_rack) {
+        mutate_saved_rack_values(
+            anchor_rack,
+            rack,
+            temperature,
+            seed,
+            index,
+            ProceduralRackOwner::Master,
+            edge_fallbacks,
+        );
+    }
+    for (position, (anchor_layer, layer)) in anchor.layers.iter().zip(&mut patch.layers).enumerate()
+    {
+        if let (Some(anchor_rack), Some(rack)) = (&anchor_layer.rack, &mut layer.rack) {
+            mutate_saved_rack_values(
+                anchor_rack,
+                rack,
+                temperature,
+                seed,
+                index,
+                ProceduralRackOwner::Layer(position),
+                edge_fallbacks,
+            );
+        }
+    }
+    if let (Some(anchor_composition), Some(composition)) =
+        (&anchor.composition, &mut patch.composition)
+    {
+        mutate_saved_composition_values(
+            anchor_composition,
+            composition,
+            temperature,
+            seed,
+            index,
+            edge_fallbacks,
+        );
+    }
+}
+
+fn validate_generated_patch(patch: &PatchState) -> Result<(), String> {
+    let yaml = serde_yaml::to_string(patch)
+        .map_err(|error| format!("serialize generated creative graph: {error}"))?;
+    serde_yaml::from_str::<PatchState>(&yaml)
+        .map(|_| ())
+        .map_err(|error| format!("validate generated creative graph: {error}"))
+}
+
+fn retain_valid_creative_edge_values(
+    patch: &mut PatchState,
+    edge_fallbacks: Vec<CreativeEdgeFallback>,
+) -> Result<(), String> {
+    if validate_generated_patch(patch).is_ok() {
+        return Ok(());
+    }
+    for fallback in edge_fallbacks {
+        fallback.restore(patch);
+        if validate_generated_patch(patch).is_ok() {
+            return Ok(());
+        }
+    }
+    validate_generated_patch(patch)
+}
+
 fn normalized_anchor(anchor: &PatchState) -> Result<PatchState, String> {
-    let yaml = serde_yaml::to_string(anchor).map_err(|e| format!("serialize anchor: {e}"))?;
+    let mut compatible_anchor = anchor.clone();
+    for layer in &mut compatible_anchor.layers {
+        layer.sync_active_slot_from_legacy_mirrors();
+    }
+    let yaml =
+        serde_yaml::to_string(&compatible_anchor).map_err(|e| format!("serialize anchor: {e}"))?;
     let mut normalized: PatchState =
         serde_yaml::from_str(&yaml).map_err(|e| format!("normalize anchor: {e}"))?;
 
@@ -324,6 +1450,8 @@ fn normalized_anchor(anchor: &PatchState) -> Result<PatchState, String> {
         EffectsConfig::from_uniforms(&uniforms)
     };
     normalized.master = sanitize_effects(&normalized.master);
+    normalized.master_transform = normalized.master_transform.sanitized();
+    normalized.master_motion = normalized.master_motion.map(MotionConfig::sanitized);
     for layer in &mut normalized.layers {
         layer.opacity = if layer.opacity.is_finite() {
             layer.opacity.clamp(0.0, 1.0)
@@ -340,24 +1468,74 @@ fn normalized_anchor(anchor: &PatchState) -> Result<PatchState, String> {
         } else {
             30.0
         };
-        layer.blend_mode = match layer.blend_mode.as_str() {
-            "screen" | "multiply" | "difference" => layer.blend_mode.clone(),
-            _ => "normal".to_string(),
-        };
+        layer.blend_mode = canonical_blend_mode(layer.blend_mode.as_str())
+            .key()
+            .to_string();
         layer.effects = sanitize_effects(&layer.effects);
+        layer.transform = layer.transform.sanitized();
+        layer.motion = layer.motion.map(MotionConfig::sanitized);
+        layer.collapse_to_generated_single_slot();
     }
+    // Generated studies deliberately avoid copying performance topology. One
+    // selected source per layer remains inspectable; mattes are disabled by
+    // the collapse above and atomic scenes are never randomized or emitted.
+    normalized.scenes = crate::performance::Scenes::default();
     normalized.ntsc = normalized
         .ntsc
         .as_ref()
         .map(|config| crate::patch::NtscConfig::from_params(&config.to_params()));
-    normalized.temporal = normalized
-        .temporal
-        .as_ref()
-        .map(|config| crate::patch::TemporalConfig::from_params(&config.to_params()));
+    normalized.temporal = normalized.temporal.as_ref().map(|config| {
+        let mut sanitized = crate::patch::TemporalConfig::from_params(&config.to_params());
+        // Runtime conversion has no live layer IDs and therefore represents
+        // both saved conductor states as Missing. Restore the persisted
+        // Selected-vs-tombstone distinction, and preserve explicit presence
+        // so an authored all-default block remains eligible for generation.
+        sanitized.originals = config.originals.map(TemporalOriginalsConfig::sanitized);
+        sanitized
+    });
     normalized.modulation = normalized.modulation.as_ref().map(|config| {
         let mut matrix = crate::modulation::ModMatrix::new();
         config.apply_to_matrix(&mut matrix);
-        crate::patch::ModConfig::from_matrix(&matrix)
+        let mut clean = crate::patch::ModConfig::from_matrix(&matrix);
+        if config
+            .routings
+            .iter()
+            .any(|routing| routing.stable_target.is_some())
+        {
+            // Stable targets are saved-position topology. The compatibility
+            // matrix intentionally cannot resolve them without live IDs, so a
+            // v5 procedural normalization retains their ordered typed intent.
+            clean.routings = config
+                .routings
+                .iter()
+                .take(crate::modulation::MAX_ROUTINGS)
+                .cloned()
+                .map(|mut routing| {
+                    routing.depth = if routing.depth.is_finite() {
+                        routing.depth.clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    routing.curve_amount = if routing.curve_amount.is_finite() {
+                        routing.curve_amount.clamp(-2.0, 2.0)
+                    } else {
+                        0.0
+                    };
+                    routing.attack = if routing.attack.is_finite() {
+                        routing.attack.clamp(0.0, 10.0)
+                    } else {
+                        0.0
+                    };
+                    routing.release = if routing.release.is_finite() {
+                        routing.release.clamp(0.0, 10.0)
+                    } else {
+                        0.0
+                    };
+                    routing
+                })
+                .collect();
+        }
+        clean
     });
     normalized.morph = normalized
         .morph
@@ -746,6 +1924,7 @@ fn apply_inventory_references(patch: &mut PatchState, inventory: &SourceInventor
         let Some(source) = source_for_layer(inventory, index) else {
             layer.filename = logical_filename(&layer.filename);
             layer.source_path.clear();
+            layer.collapse_to_generated_single_slot();
             continue;
         };
         layer.filename = source.logical_name.clone();
@@ -770,6 +1949,7 @@ fn apply_inventory_references(patch: &mut PatchState, inventory: &SourceInventor
             }
             _ => layer.source_path.clear(),
         }
+        layer.collapse_to_generated_single_slot();
     }
     if let Some(modulation) = patch.modulation.as_mut() {
         if modulation.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
@@ -893,6 +2073,28 @@ pub fn generate_with_inventory(
             temperature,
             &mut master_rng,
         );
+        let mut master_spatial_rng =
+            SplitMix64::new(domain_seed(config.seed, index, 0x4d53_5041_544c));
+        mutate_transform(
+            &normalized.master_transform,
+            &mut patch.master_transform,
+            temperature,
+            &mut master_spatial_rng,
+        );
+        if let (Some(anchor_motion), Some(motion)) = (
+            normalized.master_motion.as_ref(),
+            patch.master_motion.as_mut(),
+        ) {
+            mutate_motion_config(
+                anchor_motion,
+                motion,
+                temperature,
+                config.seed,
+                index,
+                0x4d41_5354_4552_4d34,
+                false,
+            );
+        }
         for (layer_index, (anchor_layer, layer)) in normalized
             .layers
             .iter()
@@ -910,6 +2112,31 @@ pub fn generate_with_inventory(
                 temperature,
                 &mut rng,
             );
+            let mut spatial_rng = SplitMix64::new(domain_seed(
+                config.seed,
+                index,
+                0x4c53_5041_5400 ^ layer_index as u64,
+            ));
+            mutate_transform(
+                &anchor_layer.transform,
+                &mut layer.transform,
+                temperature,
+                &mut spatial_rng,
+            );
+            if let (Some(anchor_motion), Some(motion)) =
+                (anchor_layer.motion.as_ref(), layer.motion.as_mut())
+            {
+                mutate_motion_config(
+                    anchor_motion,
+                    motion,
+                    temperature,
+                    config.seed,
+                    index,
+                    0x4c41_5945_525f_4d34
+                        ^ (layer_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    true,
+                );
+            }
             layer.opacity = mutate_linear(
                 anchor_layer.opacity,
                 layer.opacity,
@@ -935,15 +2162,14 @@ pub fn generate_with_inventory(
                 &mut rng,
             )
             .round();
-            const BLENDS: &[&str] = &["normal", "screen", "multiply", "difference"];
-            let blend = mutate_discrete(
+            let blend = mutate_blend_mode(
                 anchor_layer.blend_mode.as_str(),
                 layer.blend_mode.as_str(),
-                BLENDS,
                 temperature * 0.04,
                 &mut rng,
             );
-            layer.blend_mode = blend.to_string();
+            layer.blend_mode = blend.key().to_string();
+            layer.collapse_to_generated_single_slot();
         }
         if let (Some(anchor_temporal), Some(temporal)) =
             (normalized.temporal.as_ref(), patch.temporal.as_mut())
@@ -1018,6 +2244,18 @@ pub fn generate_with_inventory(
                 &mut rng,
             )
             .round();
+        }
+        if let (Some(anchor_originals), Some(originals)) = (
+            normalized
+                .temporal
+                .as_ref()
+                .and_then(|temporal| temporal.originals.as_ref()),
+            patch
+                .temporal
+                .as_mut()
+                .and_then(|temporal| temporal.originals.as_mut()),
+        ) {
+            mutate_temporal_originals(anchor_originals, originals, temperature, config.seed, index);
         }
         if let (Some(anchor_modulation), Some(modulation)) =
             (normalized.modulation.as_ref(), patch.modulation.as_mut())
@@ -1107,6 +2345,21 @@ pub fn generate_with_inventory(
                 ntsc.tracking_noise_enabled = false;
             }
         }
+
+        // M2 creative values evolve in owner/NodeId-isolated domains. This
+        // deliberately consumes none of the v4 streams above, and every
+        // topology- or route-owning field remains frozen. A dormant image
+        // edge may only wake if the complete saved graph still validates.
+        let mut creative_edge_fallbacks = Vec::new();
+        mutate_saved_creative_values(
+            &normalized,
+            &mut patch,
+            temperature,
+            config.seed,
+            index,
+            &mut creative_edge_fallbacks,
+        );
+        retain_valid_creative_edge_values(&mut patch, creative_edge_fallbacks)?;
 
         let title_seed = domain_seed(config.seed, index, 0x5449_544c_4500);
         let title = title_for(&patch, title_seed);
@@ -1610,8 +2863,18 @@ mod tests {
     use crate::patch::{EffectsConfig, LayerConfig};
 
     fn anchor() -> PatchState {
+        let clip_slots = crate::performance::ClipSlots::singleton(
+            crate::performance::ClipSlotConfig::from_legacy(
+                "clip.mp4".to_string(),
+                String::new(),
+                1.0,
+                30.0,
+            ),
+        );
         PatchState {
             master: EffectsConfig::default(),
+            master_transform: SpatialTransform::default(),
+            master_motion: None,
             layers: vec![LayerConfig {
                 filename: "clip.mp4".to_string(),
                 source_path: String::new(),
@@ -1624,13 +2887,375 @@ mod tests {
                 bypass_master_fx: false,
                 reroll_on_loop: false,
                 effects: EffectsConfig::default(),
+                transform: SpatialTransform::default(),
+                motion: None,
+                rack: None,
+                clip_slots,
+                active_clip_slot: Some(crate::performance::ClipSlotId::LEGACY),
+                matte: crate::image_routing::LayerMatteConfig::default(),
             }],
+            master_rack: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: false,
             media_frozen: false,
             ntsc: None,
             modulation: None,
             temporal: None,
             morph: None,
+            scenes: crate::performance::Scenes::default(),
+        }
+    }
+
+    fn advanced_anchor() -> PatchState {
+        use crate::composition::{
+            BusAssignment, CompositionTree, Group, GroupMembers, GroupName, RootItem,
+        };
+        use crate::performance::SavedLayerPosition;
+        use crate::visual_rack::{
+            EdgeTiming, GrainParams, GroupId, ImageMatte, MaskParams, MatteChannel, NodeId,
+            SavedImageSource, SavedImageTap, ShiftParams, VisualNode, VisualNodeKind, VisualRack,
+        };
+
+        let mut patch = anchor();
+        patch.master_rack = Some(
+            VisualRack::try_from_parts(
+                vec![VisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    VisualNodeKind::Shift(ShiftParams {
+                        amount: 0.4,
+                        seed: 91,
+                        ..ShiftParams::default()
+                    }),
+                )],
+                Some(4),
+            )
+            .unwrap(),
+        );
+        patch.layers[0].rack = Some(
+            VisualRack::try_from_parts(
+                vec![VisualNode::authored(
+                    NodeId::new(11).unwrap(),
+                    VisualNodeKind::Grain(GrainParams {
+                        intensity: 0.08,
+                        size: 1.7,
+                        seed: 37,
+                        ..GrainParams::default()
+                    }),
+                )],
+                Some(12),
+            )
+            .unwrap(),
+        );
+
+        let position = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(7).unwrap();
+        let group_rack = VisualRack::try_from_parts(
+            vec![VisualNode::authored(
+                NodeId::new(3).unwrap(),
+                VisualNodeKind::Mask(MaskParams::Image(ImageMatte {
+                    tap: SavedImageTap {
+                        source: SavedImageSource::SelectedLayer {
+                            layer_position: position,
+                            stage: crate::image_routing::LayerImageStage::PreLocalEffects,
+                        },
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    channel: MatteChannel::Red,
+                    invert: true,
+                    amount: 0.6,
+                    threshold: 0.45,
+                    softness: 0.12,
+                })),
+            )],
+            Some(4),
+        )
+        .unwrap();
+        let group = Group {
+            id: group_id,
+            name: GroupName::new("source study").unwrap(),
+            members: GroupMembers::try_from_vec(vec![position]).unwrap(),
+            opacity: 0.72,
+            transform: SpatialTransform {
+                rotation_deg: 17.0,
+                ..SpatialTransform::default()
+            },
+            rack: group_rack,
+            matte: Some(ImageMatte {
+                tap: SavedImageTap {
+                    source: SavedImageSource::CleanProgram,
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                channel: MatteChannel::Luma,
+                invert: false,
+                amount: 0.8,
+                threshold: 0.3,
+                softness: 0.2,
+            }),
+            solo: false,
+            bypass: true,
+            bus: BusAssignment::B,
+        };
+        patch.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![group],
+                vec![RootItem::Group { group_id }],
+                Some(8),
+                0.27,
+            )
+            .unwrap(),
+        );
+        patch.visual_schema_version = 1;
+        patch
+    }
+
+    #[test]
+    fn temporal_originals_generation_is_domain_isolated_and_preserves_authored_laws() {
+        let mut authored = TemporalOriginalsConfig::default();
+        authored.loom.topology = crate::patch::TemporalTopologyConfig::Folded;
+        authored.loom.interpolation = crate::patch::TemporalInterpolationConfig::Linear;
+        authored.atlas.seed = 0xdead_beef;
+        authored.garden.gate = crate::patch::RefreshGardenGateConfig::Matte;
+        authored.score.enabled = true;
+        authored.score.seed = 0x1234_5678;
+        authored.score.trigger = crate::patch::CollisionScoreTriggerConfig::Manual;
+        authored.score.loop_driver = crate::patch::CollisionScoreLoopDriverConfig::SelectedLayer {
+            saved_position: crate::performance::SavedLayerPosition::new(0).unwrap(),
+        };
+        authored.reset.loop_boundary = crate::patch::TemporalEventResetModeConfig::Memory;
+
+        let mut left = authored;
+        let mut right = authored;
+        mutate_temporal_originals(&authored, &mut left, 2.0, 77, 3);
+        mutate_temporal_originals(&authored, &mut right, 2.0, 77, 3);
+        assert_eq!(left, right);
+        assert!((0.0..=1.0).contains(&left.loom.amount));
+        assert!((0.0..=1.0).contains(&left.loom.depth));
+        assert!((-1_000.0..=1_000.0).contains(&left.loom.phase));
+        assert!((0.01..=100.0).contains(&left.loom.scale));
+        assert!((-180.0..=180.0).contains(&left.loom.angle));
+        assert!((1..=16).contains(&left.loom.folds));
+        assert!(left.loom.quantization <= 24);
+        assert!((0.0..=1.0).contains(&left.atlas.amount));
+        assert!((1..=64).contains(&left.atlas.territories));
+        assert!((0.0..=1.0).contains(&left.atlas.collision));
+        assert!((0.0..=1.0).contains(&left.garden.amount));
+        assert!((0.0..=1.0).contains(&left.garden.threshold));
+        assert!((0.0..=0.5).contains(&left.garden.softness));
+        assert!((0.0..=1.0).contains(&left.garden.decay));
+        assert_eq!(left.loom.topology, authored.loom.topology);
+        assert_eq!(left.loom.interpolation, authored.loom.interpolation);
+        assert_eq!(left.atlas.seed, authored.atlas.seed);
+        assert_eq!(left.garden.gate, authored.garden.gate);
+        assert_eq!(left.score, authored.score);
+        assert_eq!(left.reset, authored.reset);
+
+        let mut patch_anchor = anchor();
+        patch_anchor.temporal = Some(crate::patch::TemporalConfig {
+            originals: Some(authored),
+            ..crate::patch::TemporalConfig::default()
+        });
+        let normalized = normalized_anchor(&patch_anchor).unwrap();
+        assert!(matches!(
+            normalized
+                .temporal
+                .unwrap()
+                .originals
+                .unwrap()
+                .score
+                .loop_driver,
+            crate::patch::CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 0
+        ));
+    }
+
+    #[test]
+    fn motion_generation_is_isolated_bounded_and_preserves_authored_laws() {
+        use crate::patch::{
+            CurvedShutterConfig, CurvedShutterQualityConfig, FaradayConfig, MotionCarrierConfig,
+            MotionDonorConfig, MotionFieldSourceConfig, MotionLatticeQualityConfig,
+        };
+
+        let authored = MotionConfig {
+            field_source: MotionFieldSourceConfig::CodecVectors,
+            lattice_quality: MotionLatticeQualityConfig::High,
+            transplant: FaradayConfig {
+                donor: MotionDonorConfig::Selected {
+                    saved_position: crate::performance::SavedLayerPosition::new(0).unwrap(),
+                },
+                carrier: MotionCarrierConfig::FirstSourceFrame,
+                ..FaradayConfig::default()
+            },
+            shutter: CurvedShutterConfig {
+                quality: CurvedShutterQualityConfig::High,
+                ..CurvedShutterConfig::default()
+            },
+            ..MotionConfig::default()
+        };
+
+        let mut left = authored;
+        let mut right = authored;
+        mutate_motion_config(
+            &authored,
+            &mut left,
+            2.0,
+            77,
+            3,
+            0x4c41_5945_525f_4d34,
+            true,
+        );
+        mutate_motion_config(
+            &authored,
+            &mut right,
+            2.0,
+            77,
+            3,
+            0x4c41_5945_525f_4d34,
+            true,
+        );
+        assert_eq!(left, right);
+        assert_ne!(left, authored);
+        assert_eq!(left.algorithm_version, authored.algorithm_version);
+        assert_eq!(left.field_source, authored.field_source);
+        assert_eq!(left.lattice_quality, authored.lattice_quality);
+        assert_eq!(left.transplant.donor, authored.transplant.donor);
+        assert_eq!(left.transplant.carrier, authored.transplant.carrier);
+        assert_eq!(left.shutter.quality, authored.shutter.quality);
+        assert_eq!(left, left.sanitized());
+
+        let mut master = authored;
+        mutate_motion_config(
+            &authored,
+            &mut master,
+            2.0,
+            77,
+            3,
+            0x4d41_5354_4552_4d34,
+            false,
+        );
+        assert_eq!(master.transplant, authored.transplant);
+        assert_ne!(master.shutter, authored.shutter);
+
+        // v6 is the M3-compatible projection: introducing authored M4 blocks
+        // cannot consume or reorder any pre-M4 generator stream.
+        let mut m3_anchor = anchor();
+        m3_anchor.temporal = Some(crate::patch::TemporalConfig {
+            originals: Some(TemporalOriginalsConfig::default()),
+            ..crate::patch::TemporalConfig::default()
+        });
+        let mut m4_anchor = m3_anchor.clone();
+        m4_anchor.master_motion = Some(authored);
+        m4_anchor.layers[0].motion = Some(authored);
+        let config = GenerationConfig {
+            seed: 0x4d34_4953_4f4c_4154,
+            count: 1,
+            temperature: 1.5,
+            allow_black_sources: false,
+        };
+        let m3 = generate(&m3_anchor, &config).unwrap().remove(0).patch;
+        let mut m4 = generate(&m4_anchor, &config).unwrap().remove(0).patch;
+        assert_ne!(m4.master_motion, m4_anchor.master_motion);
+        assert_ne!(m4.layers[0].motion, m4_anchor.layers[0].motion);
+        m4.master_motion = None;
+        m4.layers[0].motion = None;
+        assert_eq!(
+            serde_yaml::to_string(&m4).unwrap(),
+            serde_yaml::to_string(&m3).unwrap(),
+            "M4 domains must preserve the projected v6/M3 stream"
+        );
+    }
+
+    fn assert_rack_topology_and_switches_eq(expected: &VisualRack, actual: &VisualRack) {
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(actual.next_node_id_raw(), expected.next_node_id_raw());
+        for (expected, actual) in expected.iter().zip(actual.iter()) {
+            assert_eq!(actual.stable_id, expected.stable_id);
+            assert_eq!(actual.enabled, expected.enabled);
+            assert_eq!(actual.blend, expected.blend);
+            assert_eq!(actual.kind.tag(), expected.kind.tag());
+            match (expected.kind, actual.kind) {
+                (VisualNodeKind::Transform(expected), VisualNodeKind::Transform(actual)) => {
+                    assert_eq!(actual.fit, expected.fit);
+                    assert_eq!(actual.edge, expected.edge);
+                    assert_eq!(actual.sampling, expected.sampling);
+                }
+                (VisualNodeKind::Key(expected), VisualNodeKind::Key(actual)) => {
+                    assert_eq!(actual.mode, expected.mode);
+                    assert_eq!(actual.invert, expected.invert);
+                }
+                (VisualNodeKind::Grain(expected), VisualNodeKind::Grain(actual)) => {
+                    assert_eq!(actual.algorithm, expected.algorithm);
+                    assert_eq!(actual.color, expected.color);
+                }
+                (
+                    VisualNodeKind::Mask(MaskParams::Rectangle(expected)),
+                    VisualNodeKind::Mask(MaskParams::Rectangle(actual)),
+                ) => assert_eq!(actual.invert, expected.invert),
+                (
+                    VisualNodeKind::Mask(MaskParams::Ellipse(expected)),
+                    VisualNodeKind::Mask(MaskParams::Ellipse(actual)),
+                ) => assert_eq!(actual.invert, expected.invert),
+                (
+                    VisualNodeKind::Mask(MaskParams::Image(expected)),
+                    VisualNodeKind::Mask(MaskParams::Image(actual)),
+                ) => {
+                    assert_eq!(actual.tap, expected.tap);
+                    assert_eq!(actual.channel, expected.channel);
+                    assert_eq!(actual.invert, expected.invert);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn assert_creative_topology_and_switches_eq(expected: &PatchState, actual: &PatchState) {
+        assert_eq!(actual.visual_schema_version, expected.visual_schema_version);
+        match (&expected.master_rack, &actual.master_rack) {
+            (Some(expected), Some(actual)) => {
+                assert_rack_topology_and_switches_eq(expected, actual)
+            }
+            (None, None) => {}
+            _ => panic!("master-rack presence changed"),
+        }
+        assert_eq!(actual.layers.len(), expected.layers.len());
+        for (expected, actual) in expected.layers.iter().zip(&actual.layers) {
+            match (&expected.rack, &actual.rack) {
+                (Some(expected), Some(actual)) => {
+                    assert_rack_topology_and_switches_eq(expected, actual)
+                }
+                (None, None) => {}
+                _ => panic!("layer-rack presence changed"),
+            }
+        }
+
+        match (&expected.composition, &actual.composition) {
+            (Some(expected), Some(actual)) => {
+                assert_eq!(actual.root(), expected.root());
+                assert_eq!(actual.next_group_id_raw(), expected.next_group_id_raw());
+                assert_eq!(actual.bus_crossfade(), expected.bus_crossfade());
+                assert_eq!(actual.groups().len(), expected.groups().len());
+                for expected_group in expected.groups() {
+                    let actual_group = actual.group(expected_group.id).unwrap();
+                    assert_eq!(actual_group.id, expected_group.id);
+                    assert_eq!(actual_group.name, expected_group.name);
+                    assert_eq!(actual_group.members, expected_group.members);
+                    assert_eq!(actual_group.solo, expected_group.solo);
+                    assert_eq!(actual_group.bypass, expected_group.bypass);
+                    assert_eq!(actual_group.bus, expected_group.bus);
+                    assert_rack_topology_and_switches_eq(&expected_group.rack, &actual_group.rack);
+                    match (expected_group.matte, actual_group.matte) {
+                        (Some(expected), Some(actual)) => {
+                            assert_eq!(actual.tap, expected.tap);
+                            assert_eq!(actual.channel, expected.channel);
+                            assert_eq!(actual.invert, expected.invert);
+                        }
+                        (None, None) => {}
+                        _ => panic!("group-matte presence changed"),
+                    }
+                }
+            }
+            (None, None) => {}
+            _ => panic!("composition presence changed"),
         }
     }
 
@@ -1677,8 +3302,350 @@ mod tests {
         assert_eq!(first[0].patch.master.shift_block_size, 8.0);
         assert_eq!(first[0].patch.master.shift_density, 0.5);
         assert_eq!(first[0].patch.master.shift_speed, 3.0);
+        assert_eq!(first[0].patch.master_transform, SpatialTransform::default());
         assert_eq!(first[0].patch.layers[0].filename, "clip.mp4");
+        assert_eq!(
+            first[0].patch.layers[0].transform,
+            SpatialTransform::default()
+        );
+        assert_eq!(first[0].manifest.generator_version, GENERATOR_VERSION);
         assert!(first[0].manifest.title.contains(' '));
+    }
+
+    #[test]
+    fn generator_v4_collapses_performance_topology_without_randomizing_routes() {
+        let prepared: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: stale.mov
+    effects: {}
+    clip_slots:
+      - { id: 9, name: A, filename: a.mov, transport: { rate: 0.5 } }
+      - { id: 27, name: B, filename: b.mov, transport: { rate: 1.25, sample_fps: 25 } }
+    active_clip_slot: 27
+    matte:
+      enabled: true
+      input: { source: selected_layer, layer_position: 0, stage: pre_local_effects }
+      channel: luma
+      amount: 0.75
+scenes:
+  - id: 3
+    bindings:
+      - { layer_position: 0, slot_id: 27 }
+"#,
+        )
+        .unwrap();
+        let piece = generate(
+            &prepared,
+            &GenerationConfig {
+                seed: 11,
+                count: 1,
+                temperature: 1.0,
+                allow_black_sources: false,
+            },
+        )
+        .unwrap()
+        .remove(0);
+        let layer = &piece.patch.layers[0];
+        assert_eq!(piece.manifest.generator_version, "7");
+        assert_eq!(layer.clip_slots.len(), 1);
+        assert_eq!(
+            layer.active_clip_slot,
+            Some(crate::performance::ClipSlotId::LEGACY)
+        );
+        assert_eq!(layer.filename, "b.mov", "the selected source is retained");
+        assert_eq!(
+            layer
+                .clip_slots
+                .get(crate::performance::ClipSlotId::LEGACY)
+                .unwrap()
+                .filename,
+            "b.mov"
+        );
+        assert!(layer.matte.is_legacy_disabled());
+        assert!(piece.patch.scenes.is_empty());
+    }
+
+    #[test]
+    fn generator_v5_mutates_creative_values_without_perturbing_topology_or_v4_streams() {
+        let legacy = anchor();
+        let advanced = advanced_anchor();
+        let config = GenerationConfig {
+            seed: 0x5635_4352_4541_5449,
+            count: 1,
+            temperature: 1.25,
+            allow_black_sources: false,
+        };
+        let legacy_piece = generate(&legacy, &config).unwrap().remove(0);
+        let advanced_piece = generate(&advanced, &config).unwrap().remove(0);
+
+        assert_eq!(advanced_piece.manifest.generator_version, "7");
+        assert_creative_topology_and_switches_eq(&advanced, &advanced_piece.patch);
+        assert_ne!(advanced_piece.patch.master_rack, advanced.master_rack);
+        assert_ne!(advanced_piece.patch.layers[0].rack, advanced.layers[0].rack);
+        let original_group = advanced
+            .composition
+            .as_ref()
+            .unwrap()
+            .group(GroupId::new(7).unwrap())
+            .unwrap();
+        let generated_group = advanced_piece
+            .patch
+            .composition
+            .as_ref()
+            .unwrap()
+            .group(GroupId::new(7).unwrap())
+            .unwrap();
+        assert!(
+            generated_group.opacity != original_group.opacity
+                || generated_group.transform != original_group.transform
+                || generated_group.rack != original_group.rack
+                || generated_group.matte != original_group.matte,
+            "nonzero temperature must evolve safe group values"
+        );
+
+        let mut projected = advanced_piece.patch.clone();
+        projected.master_rack = None;
+        projected.composition = None;
+        projected.visual_schema_version = 0;
+        for layer in &mut projected.layers {
+            layer.rack = None;
+        }
+        assert_eq!(
+            serde_yaml::to_string(&projected).unwrap(),
+            serde_yaml::to_string(&legacy_piece.patch).unwrap(),
+            "M2 creative topology must not consume or reorder any v4 mutation stream"
+        );
+    }
+
+    #[test]
+    fn generator_v5_temperature_zero_is_exact_creative_identity() {
+        let advanced = advanced_anchor();
+        let generated = generate(
+            &advanced,
+            &GenerationConfig {
+                seed: 0x5445_4d50_5f5a_4552,
+                count: 1,
+                temperature: 0.0,
+                allow_black_sources: false,
+            },
+        )
+        .unwrap()
+        .remove(0)
+        .patch;
+
+        assert_eq!(generated.master_rack, advanced.master_rack);
+        assert_eq!(generated.layers[0].rack, advanced.layers[0].rack);
+        assert_eq!(generated.composition, advanced.composition);
+    }
+
+    #[test]
+    fn generator_v5_creative_domains_ignore_unrelated_node_and_group_insertions() {
+        use crate::composition::GroupName;
+        use crate::visual_rack::{GrainParams, ShiftParams};
+
+        let base = advanced_anchor();
+        let mut expanded = advanced_anchor();
+        expanded
+            .master_rack
+            .as_mut()
+            .unwrap()
+            .insert(
+                0,
+                VisualNodeKind::Grain(GrainParams {
+                    intensity: 0.03,
+                    ..GrainParams::default()
+                }),
+            )
+            .unwrap();
+        expanded.layers[0]
+            .rack
+            .as_mut()
+            .unwrap()
+            .insert(
+                0,
+                VisualNodeKind::Shift(ShiftParams {
+                    amount: 0.2,
+                    ..ShiftParams::default()
+                }),
+            )
+            .unwrap();
+        expanded
+            .composition
+            .as_mut()
+            .unwrap()
+            .insert_empty_group(GroupName::new("unrelated").unwrap(), 0)
+            .unwrap();
+
+        let config = GenerationConfig {
+            seed: 0x5354_4142_4c45_5f49,
+            count: 1,
+            temperature: 1.6,
+            allow_black_sources: false,
+        };
+        let generated_base = generate(&base, &config).unwrap().remove(0).patch;
+        let generated_expanded = generate(&expanded, &config).unwrap().remove(0).patch;
+
+        assert_eq!(
+            generated_base
+                .master_rack
+                .as_ref()
+                .unwrap()
+                .get(NodeId::new(3).unwrap()),
+            generated_expanded
+                .master_rack
+                .as_ref()
+                .unwrap()
+                .get(NodeId::new(3).unwrap())
+        );
+        assert_eq!(
+            generated_base.layers[0]
+                .rack
+                .as_ref()
+                .unwrap()
+                .get(NodeId::new(11).unwrap()),
+            generated_expanded.layers[0]
+                .rack
+                .as_ref()
+                .unwrap()
+                .get(NodeId::new(11).unwrap())
+        );
+        let group_id = GroupId::new(7).unwrap();
+        let base_group = generated_base
+            .composition
+            .as_ref()
+            .unwrap()
+            .group(group_id)
+            .unwrap();
+        let expanded_group = generated_expanded
+            .composition
+            .as_ref()
+            .unwrap()
+            .group(group_id)
+            .unwrap();
+        assert_eq!(base_group.opacity, expanded_group.opacity);
+        assert_eq!(base_group.transform, expanded_group.transform);
+        assert_eq!(base_group.matte, expanded_group.matte);
+        assert_eq!(
+            base_group.rack.get(NodeId::new(3).unwrap()),
+            expanded_group.rack.get(NodeId::new(3).unwrap())
+        );
+    }
+
+    #[test]
+    fn generator_v5_reverts_only_edge_values_needed_to_keep_dormant_cycles_safe() {
+        use crate::visual_rack::{
+            EdgeTiming, ImageMatte, MatteChannel, SavedImageSource, SavedImageTap,
+        };
+
+        let mut source = advanced_anchor();
+        let group_id = GroupId::new(7).unwrap();
+        let group = source
+            .composition
+            .as_mut()
+            .unwrap()
+            .group_mut(group_id)
+            .unwrap();
+        group.bypass = false;
+        group.matte = Some(ImageMatte {
+            tap: SavedImageTap {
+                source: SavedImageSource::GroupOutput { group_id },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            channel: MatteChannel::Luma,
+            invert: false,
+            amount: 0.0,
+            threshold: 0.27,
+            softness: 0.08,
+        });
+        let first = group.rack.get_mut(NodeId::new(3).unwrap()).unwrap();
+        first.kind = VisualNodeKind::Mask(MaskParams::Image(ImageMatte {
+            tap: SavedImageTap {
+                source: SavedImageSource::GroupOutput { group_id },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            channel: MatteChannel::Red,
+            invert: true,
+            amount: 0.0,
+            threshold: 0.31,
+            softness: 0.07,
+        }));
+        let second_id = group
+            .rack
+            .push(VisualNodeKind::Mask(MaskParams::Image(ImageMatte {
+                tap: SavedImageTap {
+                    source: SavedImageSource::GroupOutput { group_id },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                channel: MatteChannel::Blue,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.63,
+                softness: 0.11,
+            })))
+            .unwrap();
+        group.rack.get_mut(second_id).unwrap().wet = 0.0;
+
+        let generated = generate(
+            &source,
+            &GenerationConfig {
+                seed: 0x4359_434c_455f_5341,
+                count: 1,
+                temperature: 2.0,
+                allow_black_sources: false,
+            },
+        )
+        .unwrap()
+        .remove(0)
+        .patch;
+        validate_generated_patch(&generated).unwrap();
+        let generated_group = generated
+            .composition
+            .as_ref()
+            .unwrap()
+            .group(group_id)
+            .unwrap();
+        assert_eq!(generated_group.matte.unwrap().amount, 0.0);
+        let VisualNodeKind::Mask(MaskParams::Image(first)) = generated_group
+            .rack
+            .get(NodeId::new(3).unwrap())
+            .unwrap()
+            .kind
+        else {
+            panic!("first route changed kind");
+        };
+        assert_eq!(first.amount, 0.0);
+        assert_eq!(generated_group.rack.get(second_id).unwrap().wet, 0.0);
+        assert!(
+            first.threshold != 0.31 || first.softness != 0.07,
+            "safe image-matte values should still evolve"
+        );
+    }
+
+    #[test]
+    fn generator_v5_creative_values_are_deterministic_finite_and_sanitized() {
+        let source = advanced_anchor();
+        let config = GenerationConfig {
+            seed: 0x424f_554e_4445_445f,
+            count: 8,
+            temperature: 2.0,
+            allow_black_sources: false,
+        };
+        let first = generate(&source, &config).unwrap();
+        let second = generate(&source, &config).unwrap();
+        assert_eq!(first.len(), second.len());
+        for (first, second) in first.iter().zip(&second) {
+            let first_yaml = serde_yaml::to_string(&first.patch).unwrap();
+            assert_eq!(first_yaml, serde_yaml::to_string(&second.patch).unwrap());
+            let restored: PatchState = serde_yaml::from_str(&first_yaml).unwrap();
+            assert_eq!(
+                first_yaml,
+                serde_yaml::to_string(&restored).unwrap(),
+                "generated values must already be finite and within persisted bounds"
+            );
+            assert_creative_topology_and_switches_eq(&source, &first.patch);
+        }
     }
 
     #[test]
@@ -1690,6 +3657,8 @@ mod tests {
         patch.layers[0].speed = 99.0;
         patch.layers[0].fps = f32::NAN;
         patch.layers[0].blend_mode = "unknown".to_string();
+        patch.master_transform.rotation_deg = f32::INFINITY;
+        patch.layers[0].transform.crop = [9.0, 9.0, 9.0, 9.0];
         let piece = generate(
             &patch,
             &GenerationConfig {
@@ -1707,6 +3676,82 @@ mod tests {
         assert_eq!(piece.patch.layers[0].speed, 4.0);
         assert_eq!(piece.patch.layers[0].fps, 30.0);
         assert_eq!(piece.patch.layers[0].blend_mode, "normal");
+        assert_eq!(piece.patch.master_transform.rotation_deg, 0.0);
+        assert_eq!(
+            piece.patch.layers[0].transform,
+            piece.patch.layers[0].transform.sanitized()
+        );
+    }
+
+    #[test]
+    fn procedural_generation_preserves_and_round_trips_every_curated_blend_key() {
+        for blend_mode in BlendMode::ALL {
+            let mut patch = anchor();
+            patch.layers[0].blend_mode = blend_mode.key().to_string();
+            let piece = generate(
+                &patch,
+                &GenerationConfig {
+                    seed: 0x424c_454e_4400 + u64::from(blend_mode.as_u32()),
+                    count: 1,
+                    temperature: 0.0,
+                    allow_black_sources: false,
+                },
+            )
+            .unwrap()
+            .remove(0);
+            assert_eq!(
+                piece.patch.layers[0].blend_mode,
+                blend_mode.key(),
+                "procedural normalization collapsed {blend_mode:?}"
+            );
+
+            let yaml = serde_yaml::to_string(&piece.patch).unwrap();
+            let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(restored.layers[0].blend_mode, blend_mode.key());
+        }
+    }
+
+    #[test]
+    fn expanded_blend_mutation_reaches_all_modes_without_advancing_the_legacy_rng_stream() {
+        const LEGACY: &[BlendMode] = &[
+            BlendMode::Normal,
+            BlendMode::Screen,
+            BlendMode::Multiply,
+            BlendMode::Difference,
+        ];
+        assert_eq!(&BlendMode::ALL[..LEGACY.len()], LEGACY);
+
+        for seed in [0, 1, 7, 0xaced, u64::MAX] {
+            for probability in [0.0, 0.37, 1.0] {
+                let mut expanded = SplitMix64::new(seed);
+                let _ = mutate_blend_mode("normal", "normal", probability, &mut expanded);
+
+                let mut legacy = SplitMix64::new(seed);
+                let _ = mutate_discrete(
+                    BlendMode::Normal,
+                    BlendMode::Normal,
+                    LEGACY,
+                    probability,
+                    &mut legacy,
+                );
+                assert_eq!(
+                    expanded.next_u64(),
+                    legacy.next_u64(),
+                    "the expanded choice set must not add or reorder RNG draws"
+                );
+            }
+        }
+
+        let mut seen = [false; BlendMode::ALL.len()];
+        for seed in 0..4096 {
+            let mut rng = SplitMix64::new(seed);
+            let blend = mutate_blend_mode("normal", "normal", 1.0, &mut rng);
+            seen[blend.as_u32() as usize] = true;
+        }
+        assert!(
+            seen.into_iter().all(|was_seen| was_seen),
+            "the typed mutation choices must expose every curated mode"
+        );
     }
 
     #[test]
@@ -1857,10 +3902,10 @@ mod tests {
     }
 
     #[test]
-    fn version_one_manifest_deserializes_with_safe_identity_defaults() {
+    fn version_one_through_six_manifests_deserialize_with_safe_identity_defaults() {
         let legacy = r#"{
             "schema_version": 1,
-            "generator_version": "1",
+            "generator_version": "VERSION",
             "seed": 9,
             "index": 0,
             "temperature": 0.5,
@@ -1871,12 +3916,16 @@ mod tests {
             "logical_sources": ["clip.mp4"],
             "warnings": []
         }"#;
-        let manifest: Manifest = serde_json::from_str(legacy).unwrap();
-        assert_eq!(manifest.schema_version, 1);
-        assert!(manifest.anchor_sha256.is_empty());
-        assert!(manifest.piece_sha256.is_empty());
-        assert!(!manifest.identity_complete);
-        assert!(manifest.sources.is_empty());
+        for version in ["1", "2", "3", "4", "5", "6"] {
+            let manifest: Manifest =
+                serde_json::from_str(&legacy.replace("VERSION", version)).unwrap();
+            assert_eq!(manifest.schema_version, 1);
+            assert_eq!(manifest.generator_version, version);
+            assert!(manifest.anchor_sha256.is_empty());
+            assert!(manifest.piece_sha256.is_empty());
+            assert!(!manifest.identity_complete);
+            assert!(manifest.sources.is_empty());
+        }
     }
 
     #[test]
@@ -1889,6 +3938,13 @@ mod tests {
         };
         let mut source = anchor();
         source.layers[0].bypass_master_fx = true;
+        source.master_transform.fit = crate::spatial::FitMode::Fill;
+        source.master_transform.edge = crate::spatial::EdgeMode::Repeat;
+        source.master_transform.sampling = crate::spatial::SamplingMode::Nearest;
+        source.layers[0].transform.fit = crate::spatial::FitMode::Native;
+        source.layers[0].transform.edge = crate::spatial::EdgeMode::Mirror;
+        source.layers[0].transform.sampling = crate::spatial::SamplingMode::Nearest;
+        let mut saw_spatial_change = false;
         for piece in generate(&source, &config).unwrap() {
             assert_eq!(piece.patch.layers.len(), 1);
             let layer = &piece.patch.layers[0];
@@ -1906,7 +3962,36 @@ mod tests {
             assert!((2.0..=256.0).contains(&piece.patch.master.shift_block_size));
             assert!((0.0..=1.0).contains(&piece.patch.master.shift_density));
             assert!((0.0..=20.0).contains(&piece.patch.master.shift_speed));
+            assert_eq!(
+                piece.patch.master_transform,
+                piece.patch.master_transform.sanitized()
+            );
+            assert_eq!(layer.transform, layer.transform.sanitized());
+            assert_eq!(
+                piece.patch.master_transform.fit,
+                crate::spatial::FitMode::Fill
+            );
+            assert_eq!(
+                piece.patch.master_transform.edge,
+                crate::spatial::EdgeMode::Repeat
+            );
+            assert_eq!(
+                piece.patch.master_transform.sampling,
+                crate::spatial::SamplingMode::Nearest
+            );
+            assert_eq!(layer.transform.fit, crate::spatial::FitMode::Native);
+            assert_eq!(layer.transform.edge, crate::spatial::EdgeMode::Mirror);
+            assert_eq!(
+                layer.transform.sampling,
+                crate::spatial::SamplingMode::Nearest
+            );
+            saw_spatial_change |= piece.patch.master_transform.position != [0.0, 0.0]
+                || layer.transform.position != [0.0, 0.0];
         }
+        assert!(
+            saw_spatial_change,
+            "temperature must participate in spatial generation"
+        );
     }
 
     #[test]

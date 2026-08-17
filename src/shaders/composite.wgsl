@@ -1,9 +1,9 @@
-// Composites an overlay layer onto a base layer using blend modes.
-// Each composite pass blends one layer onto the accumulated result.
+// Two-input compositor bindings and entry point. renderer::blend prepends the
+// canonical blend.wgsl kernel before compiling this body.
 
 struct CompositeUniforms {
     opacity: f32,
-    blend_mode: u32,  // 0=normal, 1=screen, 2=multiply, 3=difference
+    blend_mode: u32,
     _pad: vec2f,
 };
 
@@ -16,41 +16,10 @@ struct CompositeUniforms {
 fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     let base = textureSample(base_tex, samp, uv);
     let overlay = textureSample(overlay_tex, samp, uv);
-
-    var blended: vec3f;
-
-    switch uniforms.blend_mode {
-        case 1u: {
-            // Screen: 1 - (1-base)*(1-overlay)
-            blended = vec3f(1.0) - (vec3f(1.0) - base.rgb) * (vec3f(1.0) - overlay.rgb);
-        }
-        case 2u: {
-            // Multiply
-            blended = base.rgb * overlay.rgb;
-        }
-        case 3u: {
-            // Difference
-            blended = abs(base.rgb - overlay.rgb);
-        }
-        default: {
-            // Normal (source-over)
-            blended = overlay.rgb;
-        }
-    }
-
-    // Both inputs carry straight (un-premultiplied) RGB. Composite the blend
-    // result in premultiplied space, then return straight RGB so keyed holes
-    // remain transparent through every layer without acquiring dark fringes.
-    let source_alpha = clamp(uniforms.opacity, 0.0, 1.0) * overlay.a;
-    let output_alpha = source_alpha + base.a * (1.0 - source_alpha);
-    let output_premultiplied =
-        base.rgb * base.a * (1.0 - source_alpha)
-        + overlay.rgb * source_alpha * (1.0 - base.a)
-        + blended * base.a * source_alpha;
-    let output_rgb = select(
-        vec3f(0.0),
-        output_premultiplied / max(output_alpha, 0.000001),
-        output_alpha > 0.000001,
+    return composite_straight_alpha(
+        uniforms.blend_mode,
+        base,
+        overlay,
+        uniforms.opacity,
     );
-    return vec4f(output_rgb, output_alpha);
 }

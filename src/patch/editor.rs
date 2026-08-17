@@ -1,8 +1,25 @@
+use crate::composition::RuntimeComposition;
 use crate::effects::EffectUniforms;
 use crate::layers::Layer;
+use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
+use crate::visual_rack::RuntimeVisualRack;
 
-use super::{param_meta, EffectsConfig, LayerConfig, PatchState};
+use super::{param_meta, EffectsConfig, LayerConfig, PatchMasterVisual, PatchState};
+
+const MAX_EDITOR_HISTORY_BOUNDARIES: usize = 32;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorHistoryBoundary {
+    Begin {
+        gesture_id: u64,
+        label: String,
+        category: String,
+    },
+    End {
+        gesture_id: u64,
+    },
+}
 
 pub struct EditorState {
     pub active: bool,
@@ -10,6 +27,9 @@ pub struct EditorState {
     pub active_field: Option<String>, // which param key is being edited
     pub field_buffer: String,         // text in the active pill input
     pub request_focus: bool,          // request focus on next frame
+    history_boundaries: Vec<EditorHistoryBoundary>,
+    active_history_gesture: Option<u64>,
+    next_history_gesture: u64,
 }
 
 impl Default for EditorState {
@@ -20,7 +40,60 @@ impl Default for EditorState {
             active_field: None,
             field_buffer: String::new(),
             request_focus: false,
+            history_boundaries: Vec::new(),
+            active_history_gesture: None,
+            next_history_gesture: 1,
         }
+    }
+}
+
+impl EditorState {
+    fn push_history_boundary(&mut self, boundary: EditorHistoryBoundary) -> bool {
+        if self.history_boundaries.len() == MAX_EDITOR_HISTORY_BOUNDARIES {
+            // Main drains these every UI frame. Fail closed if an integration
+            // bug stops draining: forget the entirely unobserved batch and do
+            // not publish an unmatched Begin that could strand Main open.
+            self.history_boundaries.clear();
+            self.active_history_gesture = None;
+            return false;
+        }
+        self.history_boundaries.push(boundary);
+        true
+    }
+
+    fn begin_history_gesture(&mut self, label: String) -> bool {
+        self.end_history_gesture();
+        let gesture_id = self.next_history_gesture.max(1);
+        self.next_history_gesture = gesture_id.checked_add(1).unwrap_or(1);
+        let accepted = self.push_history_boundary(EditorHistoryBoundary::Begin {
+            gesture_id,
+            label,
+            category: "native_editor".to_string(),
+        });
+        if accepted {
+            self.active_history_gesture = Some(gesture_id);
+        }
+        accepted
+    }
+
+    fn end_history_gesture(&mut self) {
+        let Some(gesture_id) = self.active_history_gesture.take() else {
+            return;
+        };
+        let _ = self.push_history_boundary(EditorHistoryBoundary::End { gesture_id });
+    }
+
+    /// Drain ordered native edit boundaries after the current egui frame.
+    /// Main captures the exact authored world on Begin and commits it on End.
+    pub fn take_history_boundaries(&mut self) -> Vec<EditorHistoryBoundary> {
+        std::mem::take(&mut self.history_boundaries)
+    }
+
+    /// Close a focused text gesture before hiding the editor or replacing its
+    /// state through another transaction.
+    pub fn finish_active_edit(&mut self) {
+        self.active_field = None;
+        self.end_history_gesture();
     }
 }
 
@@ -129,11 +202,16 @@ fn param_row(
             if enter || response.lost_focus() {
                 new_value = Some(editor.field_buffer.clone());
                 editor.active_field = None;
+                editor.end_history_gesture();
             }
 
             // Escape cancels
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 editor.active_field = None;
+                // Values apply live on every valid text change. Escape closes
+                // that one transaction; fingerprint equality removes a truly
+                // unchanged edit from history.
+                editor.end_history_gesture();
             }
 
             response
@@ -165,7 +243,7 @@ fn param_row(
             );
 
             let response = inner.inner;
-            if response.clicked() {
+            if response.clicked() && editor.begin_history_gesture(format!("Edit {key}")) {
                 editor.active_field = Some(key.to_string());
                 editor.field_buffer = value.to_string();
                 editor.request_focus = true;
@@ -203,6 +281,7 @@ pub fn build_yaml_editor_content(
     // Tab bar: Master + per-layer tabs
     ui.horizontal(|ui| {
         if ui.selectable_label(editor.tab == 0, "Master").clicked() && editor.tab != 0 {
+            editor.end_history_gesture();
             editor.tab = 0;
             editor.active_field = None;
         }
@@ -211,6 +290,7 @@ pub fn build_yaml_editor_content(
             let tab_id = i + 1;
             let label = format!("Layer {}", i + 1);
             if ui.selectable_label(editor.tab == tab_id, &label).clicked() && editor.tab != tab_id {
+                editor.end_history_gesture();
                 editor.tab = tab_id;
                 editor.active_field = None;
             }
@@ -341,16 +421,27 @@ pub fn build_yaml_editor_content(
 }
 
 /// Save full patch state to a YAML file via native dialog.
+// This UI boundary deliberately mirrors the complete PatchState capture
+// inputs so call sites cannot accidentally omit performance state.
+#[allow(
+    dead_code,
+    reason = "native dialog save entrypoint remains a compatibility UI API"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the compatibility UI boundary mirrors complete patch capture inputs"
+)]
 pub fn save_patch(
-    master: &EffectUniforms,
+    master: PatchMasterVisual<'_>,
     layers: &[Layer],
     ntsc_params: &NtscParams,
     mod_matrix: &crate::modulation::ModMatrix,
     temporal: &crate::effects::params::TemporalParams,
     transport: super::PatchTransportState,
     morph: &crate::morph::Morph,
+    scenes: &crate::performance::Scenes,
 ) {
-    let patch = PatchState::capture(
+    let mut patch = PatchState::capture(
         master,
         layers,
         ntsc_params,
@@ -359,6 +450,7 @@ pub fn save_patch(
         transport,
         morph,
     );
+    patch.scenes = scenes.clone();
     let yaml = serde_yaml::to_string(&patch).unwrap_or_default();
 
     if let Some(path) = rfd::FileDialog::new()
@@ -370,6 +462,88 @@ pub fn save_patch(
             eprintln!("Failed to save patch: {e}");
         }
     }
+}
+
+/// Save the complete M2 creative graph. Capture resolves all live stable IDs
+/// to saved positional identities before the file dialog is shown, so a
+/// failed mapping cannot leave a partially authored patch on disk.
+#[allow(
+    dead_code,
+    reason = "pre-M4 compatibility wrapper preserves the historical native API"
+)]
+#[allow(clippy::too_many_arguments)]
+pub fn save_patch_with_composition(
+    master: PatchMasterVisual<'_>,
+    layers: &[Layer],
+    master_rack: &RuntimeVisualRack,
+    layer_racks: &[RuntimeVisualRack],
+    composition: &RuntimeComposition,
+    ntsc_params: &NtscParams,
+    mod_matrix: &crate::modulation::ModMatrix,
+    temporal: &crate::effects::params::TemporalParams,
+    transport: super::PatchTransportState,
+    morph: &crate::morph::Morph,
+    scenes: &crate::performance::Scenes,
+) -> Result<(), String> {
+    save_patch_with_composition_and_motion(
+        master,
+        &MotionParams::default(),
+        layers,
+        master_rack,
+        layer_racks,
+        composition,
+        ntsc_params,
+        mod_matrix,
+        temporal,
+        transport,
+        morph,
+        scenes,
+    )
+}
+
+/// Save the complete creative graph plus authored M4 master/layer Motion.
+/// Runtime vector fields, carrier pixels, codec products, and telemetry are
+/// absent from `PatchState`, so this remains an authored-only transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn save_patch_with_composition_and_motion(
+    master: PatchMasterVisual<'_>,
+    master_motion: &MotionParams,
+    layers: &[Layer],
+    master_rack: &RuntimeVisualRack,
+    layer_racks: &[RuntimeVisualRack],
+    composition: &RuntimeComposition,
+    ntsc_params: &NtscParams,
+    mod_matrix: &crate::modulation::ModMatrix,
+    temporal: &crate::effects::params::TemporalParams,
+    transport: super::PatchTransportState,
+    morph: &crate::morph::Morph,
+    scenes: &crate::performance::Scenes,
+) -> Result<(), String> {
+    let mut patch = PatchState::capture_with_composition_and_motion(
+        master,
+        master_motion,
+        layers,
+        master_rack,
+        layer_racks,
+        composition,
+        ntsc_params,
+        mod_matrix,
+        temporal,
+        transport,
+        morph,
+    )?;
+    patch.scenes = scenes.clone();
+    let yaml =
+        serde_yaml::to_string(&patch).map_err(|error| format!("serialize patch: {error}"))?;
+
+    let Some(path) = rfd::FileDialog::new()
+        .set_file_name("patch.yaml")
+        .add_filter("YAML", &["yaml", "yml"])
+        .save_file()
+    else {
+        return Ok(());
+    };
+    std::fs::write(&path, yaml).map_err(|error| format!("write patch {}: {error}", path.display()))
 }
 
 /// Pick and parse a patch via the native dialog. Cancellation is distinct from
@@ -447,5 +621,56 @@ mod tests {
         let current = load_patch_path(&path.0).unwrap();
         assert!(!current.master_paused);
         assert!(current.media_frozen);
+    }
+
+    #[test]
+    fn native_editor_boundaries_are_ordered_and_one_focus_session_is_one_gesture() {
+        let mut editor = EditorState::default();
+        editor.begin_history_gesture("Edit brightness".to_string());
+        // Live character/step changes do not manufacture more checkpoints.
+        assert_eq!(editor.take_history_boundaries().len(), 1);
+        editor.end_history_gesture();
+        editor.end_history_gesture();
+        let boundaries = editor.take_history_boundaries();
+        assert_eq!(boundaries.len(), 1);
+        let EditorHistoryBoundary::End { gesture_id } = boundaries[0] else {
+            panic!("expected end boundary")
+        };
+        assert_eq!(gesture_id, 1);
+
+        editor.begin_history_gesture("Edit contrast".to_string());
+        editor.begin_history_gesture("Edit saturation".to_string());
+        assert_eq!(
+            editor.take_history_boundaries(),
+            vec![
+                EditorHistoryBoundary::Begin {
+                    gesture_id: 2,
+                    label: "Edit contrast".to_string(),
+                    category: "native_editor".to_string(),
+                },
+                EditorHistoryBoundary::End { gesture_id: 2 },
+                EditorHistoryBoundary::Begin {
+                    gesture_id: 3,
+                    label: "Edit saturation".to_string(),
+                    category: "native_editor".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn undrained_native_boundary_overflow_never_emits_an_unmatched_begin() {
+        let mut editor = EditorState::default();
+        for index in 0..(MAX_EDITOR_HISTORY_BOUNDARIES / 2) {
+            assert!(editor.begin_history_gesture(format!("Edit {index}")));
+            editor.end_history_gesture();
+        }
+        assert_eq!(
+            editor.history_boundaries.len(),
+            MAX_EDITOR_HISTORY_BOUNDARIES
+        );
+        assert!(!editor.begin_history_gesture("Overflow".to_string()));
+        assert!(editor.take_history_boundaries().is_empty());
+        assert!(editor.active_history_gesture.is_none());
     }
 }

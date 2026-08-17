@@ -9,12 +9,32 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::composition::{CompositionTree, RuntimeComposition};
 use crate::effects::params::TemporalParams;
 use crate::effects::EffectUniforms;
 use crate::layers::{BlendMode, Layer};
+use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
+use crate::patch::{
+    CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
+    MotionConfig, MotionDonorConfig, RefreshGardenConfig, TemporalLoomConfig,
+    TemporalOriginalsConfig, TemporalResetPolicyConfig,
+};
+use crate::spatial::SpatialTransform;
+use crate::temporal::CollisionScoreLoopDriver;
+use crate::visual_rack::{
+    CellularParams, DigitalColorParams, EllipseMask, GrainParams, ImageMatte, KeyParams,
+    MaskParams, RectangleMask, RuntimeImageMatte, RuntimeMaskParams, RuntimeVisualNodeKind,
+    RuntimeVisualRack, SavedImageSource, ShiftParams, VisualNodeKind, VisualRack,
+};
+
+// Morph's positional layer world follows the existing saved stack bound, not
+// the smaller advanced-composition planner limit. This preserves flat legacy
+// and dynamic stacks beyond 256 while still bounding hostile raw sequences.
+const MAX_MORPH_LAYER_RACKS: usize = crate::performance::MAX_SAVED_LAYER_POSITION as usize + 1;
 
 /// Parameter interpolation law for the A/B crossfader.
 ///
@@ -551,6 +571,10 @@ pub struct MorphTemporalSnapshot {
     pub key_threshold: f32,
     pub key_softness: f32,
     pub key_history: f32,
+    /// M3 originals capture authored configuration only. Renderer history,
+    /// Garden carrier pixels, and the Collision Score ordinal are runtime
+    /// memory and deliberately never enter a morph slot.
+    pub originals: TemporalOriginalsConfig,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -572,6 +596,7 @@ impl MorphTemporalSnapshot {
             key_threshold: value.key_threshold,
             key_softness: value.key_softness,
             key_history: value.key_history,
+            originals: TemporalOriginalsConfig::from_params(value.originals),
         }
         .sanitized()
     }
@@ -588,6 +613,7 @@ impl MorphTemporalSnapshot {
             key_threshold: finite_clamp(self.key_threshold, 0.1, 0.0, 1.0),
             key_softness: finite_clamp(self.key_softness, 0.03, 0.0, 0.5),
             key_history: finite_clamp(self.key_history, 1.0, 1.0, 23.0).round(),
+            originals: self.originals.sanitized(),
         }
     }
 
@@ -604,6 +630,7 @@ impl MorphTemporalSnapshot {
             key_threshold: clean.key_threshold,
             key_softness: clean.key_softness,
             key_history: clean.key_history,
+            originals: clean.originals.to_params(),
         }
     }
 
@@ -621,9 +648,135 @@ impl MorphTemporalSnapshot {
             key_threshold: blend_finite(a.key_threshold, b.key_threshold, weights),
             key_softness: blend_finite(a.key_softness, b.key_softness, weights),
             key_history: blend_finite(a.key_history, b.key_history, weights),
+            originals: interpolate_temporal_originals(a.originals, b.originals, weights, choose_b),
         }
         .sanitized()
     }
+}
+
+fn blend_u8(a: u8, b: u8, weights: [f32; 2], min: u8, max: u8) -> u8 {
+    blend_finite(f32::from(a), f32::from(b), weights)
+        .round()
+        .clamp(f32::from(min), f32::from(max)) as u8
+}
+
+fn blend_u32(a: u32, b: u32, weights: [f32; 2]) -> u32 {
+    let value = f64::from(a) * f64::from(weights[0]) + f64::from(b) * f64::from(weights[1]);
+    if value.is_finite() {
+        value.round().clamp(0.0, f64::from(u32::MAX)) as u32
+    } else {
+        0
+    }
+}
+
+fn interpolate_temporal_originals(
+    a: TemporalOriginalsConfig,
+    b: TemporalOriginalsConfig,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> TemporalOriginalsConfig {
+    TemporalOriginalsConfig {
+        loom: TemporalLoomConfig {
+            amount: blend_finite(a.loom.amount, b.loom.amount, weights),
+            topology: pick(a.loom.topology, b.loom.topology, choose_b),
+            interpolation: pick(a.loom.interpolation, b.loom.interpolation, choose_b),
+            depth: blend_finite(a.loom.depth, b.loom.depth, weights),
+            phase: blend_finite(a.loom.phase, b.loom.phase, weights),
+            scale: blend_finite(a.loom.scale, b.loom.scale, weights),
+            angle: blend_wrapped_degrees(a.loom.angle, b.loom.angle, weights),
+            folds: blend_u8(a.loom.folds, b.loom.folds, weights, 1, 16),
+            quantization: blend_u8(a.loom.quantization, b.loom.quantization, weights, 0, 24),
+        },
+        atlas: CollisionAtlasConfig {
+            amount: blend_finite(a.atlas.amount, b.atlas.amount, weights),
+            // Seed identity is an endpoint recall, never an interpolated RNG.
+            seed: pick(a.atlas.seed, b.atlas.seed, choose_b),
+            territories: blend_u8(a.atlas.territories, b.atlas.territories, weights, 1, 64),
+            collision: blend_finite(a.atlas.collision, b.atlas.collision, weights),
+        },
+        garden: RefreshGardenConfig {
+            amount: blend_finite(a.garden.amount, b.garden.amount, weights),
+            gate: pick(a.garden.gate, b.garden.gate, choose_b),
+            threshold: blend_finite(a.garden.threshold, b.garden.threshold, weights),
+            softness: blend_finite(a.garden.softness, b.garden.softness, weights),
+            decay: blend_finite(a.garden.decay, b.garden.decay, weights),
+            max_hold_ticks: blend_u32(a.garden.max_hold_ticks, b.garden.max_hold_ticks, weights),
+        },
+        // Score configuration is entirely discrete: an A/B move may recall
+        // either conductor, but may not synthesize a third sequence.
+        score: pick(a.score, b.score, choose_b),
+        reset: TemporalResetPolicyConfig {
+            loop_boundary: pick(a.reset.loop_boundary, b.reset.loop_boundary, choose_b),
+            downbeat: pick(a.reset.downbeat, b.reset.downbeat, choose_b),
+        },
+    }
+}
+
+fn resolve_score_loop_driver(
+    driver: CollisionScoreLoopDriverConfig,
+    resolve_position: impl FnOnce(
+        crate::performance::SavedLayerPosition,
+    ) -> Option<crate::image_routing::StableLayerId>,
+) -> CollisionScoreLoopDriver {
+    match driver {
+        CollisionScoreLoopDriverConfig::None => CollisionScoreLoopDriver::None,
+        CollisionScoreLoopDriverConfig::SelectedLayer { saved_position } => {
+            resolve_position(saved_position).map_or(
+                CollisionScoreLoopDriver::MissingSelectedLayer { saved_position },
+                |layer_id| CollisionScoreLoopDriver::SelectedLayer {
+                    layer_id,
+                    saved_position,
+                },
+            )
+        }
+        CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position } => {
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position }
+        }
+    }
+}
+
+fn interpolate_motion_config(
+    a: MotionConfig,
+    b: MotionConfig,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> MotionConfig {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    MotionConfig {
+        // Provenance, algorithms, source laws, identities, and fixed quality
+        // tiers are endpoint recalls. Morph never invents a third algorithm,
+        // RNG identity, route, or sample count.
+        algorithm_version: pick(a.algorithm_version, b.algorithm_version, choose_b),
+        field_source: pick(a.field_source, b.field_source, choose_b),
+        lattice_quality: pick(a.lattice_quality, b.lattice_quality, choose_b),
+        transplant: FaradayConfig {
+            amount: blend_finite(a.transplant.amount, b.transplant.amount, weights),
+            donor: pick(a.transplant.donor, b.transplant.donor, choose_b),
+            carrier: pick(a.transplant.carrier, b.transplant.carrier, choose_b),
+            confidence_threshold: blend_finite(
+                a.transplant.confidence_threshold,
+                b.transplant.confidence_threshold,
+                weights,
+            ),
+            confidence_softness: blend_finite(
+                a.transplant.confidence_softness,
+                b.transplant.confidence_softness,
+                weights,
+            ),
+            refresh: blend_finite(a.transplant.refresh, b.transplant.refresh, weights),
+            decay: blend_finite(a.transplant.decay, b.transplant.decay, weights),
+            occlusion: blend_finite(a.transplant.occlusion, b.transplant.occlusion, weights),
+        },
+        shutter: CurvedShutterConfig {
+            angle_degrees: blend_finite(a.shutter.angle_degrees, b.shutter.angle_degrees, weights),
+            phase: blend_finite(a.shutter.phase, b.shutter.phase, weights),
+            curvature: blend_finite(a.shutter.curvature, b.shutter.curvature, weights),
+            chromatic_lag: blend_finite(a.shutter.chromatic_lag, b.shutter.chromatic_lag, weights),
+            quality: pick(a.shutter.quality, b.shutter.quality, choose_b),
+        },
+    }
+    .sanitized()
 }
 
 /// Stable serialized representation of the renderer's layer blend modes.
@@ -635,6 +788,17 @@ pub enum MorphLayerBlendMode {
     Screen,
     Multiply,
     Difference,
+    Add,
+    Subtract,
+    Darken,
+    Lighten,
+    Overlay,
+    SoftLight,
+    HardLight,
+    Exclusion,
+    Dodge,
+    Burn,
+    AlphaCut,
 }
 
 impl MorphLayerBlendMode {
@@ -644,6 +808,17 @@ impl MorphLayerBlendMode {
             BlendMode::Screen => Self::Screen,
             BlendMode::Multiply => Self::Multiply,
             BlendMode::Difference => Self::Difference,
+            BlendMode::Add => Self::Add,
+            BlendMode::Subtract => Self::Subtract,
+            BlendMode::Darken => Self::Darken,
+            BlendMode::Lighten => Self::Lighten,
+            BlendMode::Overlay => Self::Overlay,
+            BlendMode::SoftLight => Self::SoftLight,
+            BlendMode::HardLight => Self::HardLight,
+            BlendMode::Exclusion => Self::Exclusion,
+            BlendMode::Dodge => Self::Dodge,
+            BlendMode::Burn => Self::Burn,
+            BlendMode::AlphaCut => Self::AlphaCut,
         }
     }
 
@@ -653,6 +828,17 @@ impl MorphLayerBlendMode {
             Self::Screen => BlendMode::Screen,
             Self::Multiply => BlendMode::Multiply,
             Self::Difference => BlendMode::Difference,
+            Self::Add => BlendMode::Add,
+            Self::Subtract => BlendMode::Subtract,
+            Self::Darken => BlendMode::Darken,
+            Self::Lighten => BlendMode::Lighten,
+            Self::Overlay => BlendMode::Overlay,
+            Self::SoftLight => BlendMode::SoftLight,
+            Self::HardLight => BlendMode::HardLight,
+            Self::Exclusion => BlendMode::Exclusion,
+            Self::Dodge => BlendMode::Dodge,
+            Self::Burn => BlendMode::Burn,
+            Self::AlphaCut => BlendMode::AlphaCut,
         }
     }
 }
@@ -684,6 +870,14 @@ pub struct LayerMorphSnapshot {
     /// captured by older builds leave the live value untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bypass_master_fx: Option<bool>,
+    /// Optional for schema evolution: a slot written before spatial controls
+    /// existed must not claim or reset a live layer's transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<SpatialTransform>,
+    /// Optional for schema evolution. Runtime field pixels and stable IDs are
+    /// absent; Selected donor intent stores only its saved layer position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<MotionConfig>,
     /// Compatibility field for pre-full-state snapshots. Newly captured
     /// snapshots store this value inside `effects` and omit this duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -705,6 +899,8 @@ pub(crate) enum LayerMorphControl {
     Visible,
     Paused,
     BypassMasterFx,
+    Transform,
+    Motion,
 }
 
 impl Default for LayerMorphSnapshot {
@@ -719,13 +915,19 @@ impl Default for LayerMorphSnapshot {
             visible: None,
             paused: None,
             bypass_master_fx: None,
+            transform: None,
+            motion: None,
             key_threshold: None,
         }
     }
 }
 
 impl LayerMorphSnapshot {
-    fn capture(position: usize, layer: &Layer) -> Self {
+    fn capture(
+        position: usize,
+        layer: &Layer,
+        layer_ids: &[crate::image_routing::StableLayerId],
+    ) -> Self {
         Self {
             position,
             opacity: layer.opacity,
@@ -736,6 +938,11 @@ impl LayerMorphSnapshot {
             visible: Some(layer.visible),
             paused: Some(layer.paused),
             bypass_master_fx: Some(layer.bypass_master_fx),
+            transform: Some(layer.transform.sanitized()),
+            motion: Some(MotionConfig::from_params_for_capture(
+                layer.motion,
+                layer_ids,
+            )),
             key_threshold: None,
         }
         .sanitized()
@@ -760,6 +967,8 @@ impl LayerMorphSnapshot {
             visible: self.visible,
             paused: self.paused,
             bypass_master_fx: self.bypass_master_fx,
+            transform: self.transform.map(SpatialTransform::sanitized),
+            motion: self.motion.map(MotionConfig::sanitized),
             key_threshold: if has_effects { None } else { legacy_key },
         }
     }
@@ -813,6 +1022,14 @@ impl LayerMorphSnapshot {
                 (Some(a), Some(b)) => Some(pick(a, b, choose_b)),
                 _ => None,
             },
+            transform: match (a.transform, b.transform) {
+                (Some(a), Some(b)) => Some(SpatialTransform::interpolate(a, b, weights, choose_b)),
+                _ => None,
+            },
+            motion: match (a.motion, b.motion) {
+                (Some(a), Some(b)) => Some(interpolate_motion_config(a, b, weights, choose_b)),
+                _ => None,
+            },
             key_threshold,
         }
     }
@@ -842,6 +1059,12 @@ impl LayerMorphSnapshot {
         if let Some(bypass_master_fx) = clean.bypass_master_fx {
             layer.bypass_master_fx = bypass_master_fx;
         }
+        if let Some(transform) = clean.transform {
+            layer.transform = transform;
+        }
+        if let Some(motion) = clean.motion {
+            layer.motion = motion.to_params().sanitized();
+        }
     }
 }
 
@@ -851,29 +1074,322 @@ impl LayerMorphSnapshot {
 #[serde(default)]
 pub struct MorphSlot {
     pub master: MorphMasterSnapshot,
+    /// Optional so legacy A/B slots leave the newly introduced master
+    /// transform directly editable instead of silently claiming identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_transform: Option<SpatialTransform>,
+    /// Optional so legacy slots leave M4 controls directly editable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_motion: Option<MotionConfig>,
     pub ntsc: MorphNtscSnapshot,
     pub temporal: MorphTemporalSnapshot,
     pub layers: Vec<LayerMorphSnapshot>,
+    /// Authored master Collision Rack. Absence means this slot predates racks
+    /// and therefore cannot claim any rack value while the crossfader moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_rack: Option<VisualRack>,
+    /// One rack per saved layer position. The outer option distinguishes a
+    /// legacy omitted section from an explicitly captured vector containing
+    /// empty racks. Raw deserialization is bounded before allocation grows.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_layer_racks"
+    )]
+    pub layer_racks: Option<Vec<VisualRack>>,
+    /// One-level group values and group racks. Its strict deserializer rejects
+    /// duplicate/zero IDs, invalid cursors, and malformed one-level topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<CompositionTree>,
+}
+
+fn remapped_saved_position_after_move(
+    position: crate::performance::SavedLayerPosition,
+    from: usize,
+    to: usize,
+) -> crate::performance::SavedLayerPosition {
+    let position_index = position.get() as usize;
+    let remapped = if position_index == from {
+        to
+    } else if from < to && position_index > from && position_index <= to {
+        position_index - 1
+    } else if to < from && position_index >= to && position_index < from {
+        position_index + 1
+    } else {
+        position_index
+    };
+    u32::try_from(remapped)
+        .ok()
+        .and_then(crate::performance::SavedLayerPosition::new)
+        .unwrap_or(position)
+}
+
+fn remap_saved_rack_routes_after_move(rack: &mut VisualRack, from: usize, to: usize) {
+    let node_ids = rack.iter().map(|node| node.stable_id).collect::<Vec<_>>();
+    for node_id in node_ids {
+        let Some(node) = rack.get_mut(node_id) else {
+            continue;
+        };
+        let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
+            continue;
+        };
+        let SavedImageSource::SelectedLayer {
+            layer_position,
+            stage,
+        } = matte.tap.source
+        else {
+            continue;
+        };
+        matte.tap.source = SavedImageSource::SelectedLayer {
+            layer_position: remapped_saved_position_after_move(layer_position, from, to),
+            stage,
+        };
+    }
+}
+
+fn remap_saved_rack_routes_after_remove(rack: &mut VisualRack, removed: usize) {
+    let node_ids = rack.iter().map(|node| node.stable_id).collect::<Vec<_>>();
+    for node_id in node_ids {
+        let Some(node) = rack.get_mut(node_id) else {
+            continue;
+        };
+        let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
+            continue;
+        };
+        let SavedImageSource::SelectedLayer {
+            layer_position,
+            stage,
+        } = matte.tap.source
+        else {
+            continue;
+        };
+        let position_index = layer_position.get() as usize;
+        matte.tap.source = if position_index == removed {
+            SavedImageSource::MissingSelectedLayer {
+                saved_position: layer_position,
+                stage,
+            }
+        } else if position_index > removed {
+            SavedImageSource::SelectedLayer {
+                layer_position: crate::performance::SavedLayerPosition::new(
+                    layer_position
+                        .get()
+                        .checked_sub(1)
+                        .expect("a position greater than the removed index is nonzero"),
+                )
+                .expect("decrementing a valid saved position remains valid"),
+                stage,
+            }
+        } else {
+            matte.tap.source
+        };
+    }
+}
+
+fn remap_score_driver_after_move(
+    driver: &mut CollisionScoreLoopDriverConfig,
+    from: usize,
+    to: usize,
+) {
+    let CollisionScoreLoopDriverConfig::SelectedLayer { saved_position } = driver else {
+        return;
+    };
+    *saved_position = remapped_saved_position_after_move(*saved_position, from, to);
+}
+
+fn remap_score_driver_after_remove(driver: &mut CollisionScoreLoopDriverConfig, removed: usize) {
+    let CollisionScoreLoopDriverConfig::SelectedLayer { saved_position } = *driver else {
+        return;
+    };
+    let position = saved_position.get() as usize;
+    *driver = if position == removed {
+        CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position }
+    } else if position > removed {
+        CollisionScoreLoopDriverConfig::SelectedLayer {
+            saved_position: crate::performance::SavedLayerPosition::new(
+                saved_position
+                    .get()
+                    .checked_sub(1)
+                    .expect("a position greater than the removed index is nonzero"),
+            )
+            .expect("decrementing a valid saved position remains valid"),
+        }
+    } else {
+        *driver
+    };
+}
+
+fn remap_motion_donor_after_move(donor: &mut MotionDonorConfig, from: usize, to: usize) {
+    let MotionDonorConfig::Selected { saved_position } = donor else {
+        return;
+    };
+    *saved_position = remapped_saved_position_after_move(*saved_position, from, to);
+}
+
+fn remap_motion_donor_after_remove(donor: &mut MotionDonorConfig, removed: usize) {
+    let MotionDonorConfig::Selected { saved_position } = *donor else {
+        return;
+    };
+    let position = saved_position.get() as usize;
+    *donor = if position == removed {
+        MotionDonorConfig::Missing { saved_position }
+    } else if position > removed {
+        MotionDonorConfig::Selected {
+            saved_position: crate::performance::SavedLayerPosition::new(
+                saved_position
+                    .get()
+                    .checked_sub(1)
+                    .expect("a position greater than the removed index is nonzero"),
+            )
+            .expect("decrementing a valid saved position remains valid"),
+        }
+    } else {
+        *donor
+    };
 }
 
 impl MorphSlot {
     pub fn capture(
         master: &EffectUniforms,
+        master_transform: &SpatialTransform,
         ntsc: &NtscParams,
         temporal: &TemporalParams,
         layers: &[Layer],
     ) -> Self {
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        let mut temporal_snapshot = MorphTemporalSnapshot::capture(temporal);
+        temporal_snapshot.originals.score.loop_driver =
+            CollisionScoreLoopDriverConfig::from_runtime_for_capture(
+                temporal.originals.score.loop_driver,
+                &layer_ids,
+            );
         Self {
             master: MorphMasterSnapshot::capture(master),
+            master_transform: Some(master_transform.sanitized()),
+            master_motion: None,
             ntsc: MorphNtscSnapshot::capture(ntsc),
-            temporal: MorphTemporalSnapshot::capture(temporal),
+            temporal: temporal_snapshot,
             layers: layers
                 .iter()
                 .enumerate()
-                .map(|(position, layer)| LayerMorphSnapshot::capture(position, layer))
+                .map(|(position, layer)| LayerMorphSnapshot::capture(position, layer, &layer_ids))
                 .collect(),
+            master_rack: None,
+            layer_racks: None,
+            composition: None,
         }
         .sanitized()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn capture_with_motion(
+        master: &EffectUniforms,
+        master_transform: &SpatialTransform,
+        master_motion: &MotionParams,
+        ntsc: &NtscParams,
+        temporal: &TemporalParams,
+        layers: &[Layer],
+    ) -> Self {
+        let mut slot = Self::capture(master, master_transform, ntsc, temporal, layers);
+        slot.master_motion = Some(MotionConfig::from_params(*master_motion).sanitized());
+        slot
+    }
+
+    /// Capture the same legacy parameter world plus the complete authored
+    /// creative-value world. Topology is retained only as an ownership
+    /// signature: sampling and application never insert, remove, or reorder a
+    /// node, layer, group, or image edge.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_with_composition(
+        master: &EffectUniforms,
+        master_transform: &SpatialTransform,
+        ntsc: &NtscParams,
+        temporal: &TemporalParams,
+        layers: &[Layer],
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[RuntimeVisualRack],
+        composition: &RuntimeComposition,
+    ) -> Result<Self, String> {
+        if layer_racks.len() != layers.len() {
+            return Err(format!(
+                "morph capture has {} layer racks for {} layers",
+                layer_racks.len(),
+                layers.len()
+            ));
+        }
+        if layer_racks.len() > MAX_MORPH_LAYER_RACKS {
+            return Err(format!(
+                "morph capture has {} layer racks; limit is {MAX_MORPH_LAYER_RACKS}",
+                layer_racks.len()
+            ));
+        }
+        master_rack
+            .validate_for_scope(crate::visual_rack::LegacyRackScope::Master)
+            .map_err(|error| format!("invalid master rack: {error}"))?;
+        for (position, rack) in layer_racks.iter().enumerate() {
+            rack.validate_for_scope(crate::visual_rack::LegacyRackScope::Layer)
+                .map_err(|error| format!("invalid layer rack {position}: {error}"))?;
+        }
+        let position_of_layer = |wanted| {
+            layers
+                .iter()
+                .position(|layer| layer.stable_layer_id() == wanted)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(crate::performance::SavedLayerPosition::new)
+        };
+        let saved_master_rack = master_rack
+            .capture_routes(position_of_layer)
+            .map_err(|error| format!("capture morph master rack: {error}"))?;
+        let saved_layer_racks = layer_racks
+            .iter()
+            .enumerate()
+            .map(|(position, rack)| {
+                rack.capture_routes(position_of_layer)
+                    .map_err(|error| format!("capture morph layer rack {position}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let saved_composition = composition
+            .capture(|wanted| {
+                layers
+                    .iter()
+                    .position(|layer| layer.stable_layer_id() == wanted)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .and_then(crate::performance::SavedLayerPosition::new)
+            })
+            .map_err(|error| format!("capture morph composition: {error}"))?;
+
+        let mut slot = Self::capture(master, master_transform, ntsc, temporal, layers);
+        slot.master_rack = Some(saved_master_rack);
+        slot.layer_racks = Some(saved_layer_racks);
+        slot.composition = Some(saved_composition);
+        Ok(slot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_with_composition_and_motion(
+        master: &EffectUniforms,
+        master_transform: &SpatialTransform,
+        master_motion: &MotionParams,
+        ntsc: &NtscParams,
+        temporal: &TemporalParams,
+        layers: &[Layer],
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[RuntimeVisualRack],
+        composition: &RuntimeComposition,
+    ) -> Result<Self, String> {
+        let mut slot = Self::capture_with_composition(
+            master,
+            master_transform,
+            ntsc,
+            temporal,
+            layers,
+            master_rack,
+            layer_racks,
+            composition,
+        )?;
+        slot.master_motion = Some(MotionConfig::from_params(*master_motion).sanitized());
+        Ok(slot)
     }
 
     pub fn sanitized(&self) -> Self {
@@ -887,15 +1403,37 @@ impl MorphSlot {
         }
         Self {
             master: self.master.sanitized(),
+            master_transform: self.master_transform.map(SpatialTransform::sanitized),
+            master_motion: self.master_motion.map(MotionConfig::sanitized),
             ntsc: self.ntsc.sanitized(),
             temporal: self.temporal.sanitized(),
             layers,
+            master_rack: self.master_rack.clone(),
+            layer_racks: self.layer_racks.clone(),
+            composition: self.composition.clone(),
         }
     }
 
     /// Keep positional snapshots aligned after removing one live layer while
     /// preserving the independent master/NTSC/temporal worlds.
     fn remap_layers_after_remove(&mut self, removed: usize) {
+        remap_score_driver_after_remove(&mut self.temporal.originals.score.loop_driver, removed);
+        if let Some(motion) = &mut self.master_motion {
+            remap_motion_donor_after_remove(&mut motion.transplant.donor, removed);
+        }
+        for layer in &mut self.layers {
+            if let Some(motion) = &mut layer.motion {
+                remap_motion_donor_after_remove(&mut motion.transplant.donor, removed);
+            }
+        }
+        if let Some(master_rack) = &mut self.master_rack {
+            remap_saved_rack_routes_after_remove(master_rack, removed);
+        }
+        if let Some(racks) = &mut self.layer_racks {
+            for rack in racks.iter_mut() {
+                remap_saved_rack_routes_after_remove(rack, removed);
+            }
+        }
         self.layers.retain_mut(|layer| {
             if layer.position == removed {
                 return false;
@@ -905,12 +1443,40 @@ impl MorphSlot {
             }
             true
         });
+        if let Some(racks) = &mut self.layer_racks {
+            if removed < racks.len() {
+                racks.remove(removed);
+            } else {
+                self.layer_racks = None;
+            }
+        }
+        // CompositionTree intentionally exposes only validated structural
+        // transactions. A legacy positional layer edit cannot partially
+        // rewrite a captured group graph, so group-value ownership is dropped.
+        self.composition = None;
     }
 
     /// Apply the same stable stack permutation as the live layer move.
     fn remap_layers_after_move(&mut self, from: usize, to: usize) {
         if from == to {
             return;
+        }
+        remap_score_driver_after_move(&mut self.temporal.originals.score.loop_driver, from, to);
+        if let Some(motion) = &mut self.master_motion {
+            remap_motion_donor_after_move(&mut motion.transplant.donor, from, to);
+        }
+        for layer in &mut self.layers {
+            if let Some(motion) = &mut layer.motion {
+                remap_motion_donor_after_move(&mut motion.transplant.donor, from, to);
+            }
+        }
+        if let Some(master_rack) = &mut self.master_rack {
+            remap_saved_rack_routes_after_move(master_rack, from, to);
+        }
+        if let Some(racks) = &mut self.layer_racks {
+            for rack in racks.iter_mut() {
+                remap_saved_rack_routes_after_move(rack, from, to);
+            }
         }
         for layer in &mut self.layers {
             layer.position = if layer.position == from {
@@ -923,16 +1489,84 @@ impl MorphSlot {
                 layer.position
             };
         }
+        if let Some(racks) = &mut self.layer_racks {
+            if from < racks.len() && to < racks.len() {
+                let rack = racks.remove(from);
+                racks.insert(to, rack);
+            } else {
+                self.layer_racks = None;
+            }
+        }
+        self.composition = None;
     }
+}
+
+struct BoundedMorphLayerRacks(Vec<VisualRack>);
+
+impl<'de> Deserialize<'de> for BoundedMorphLayerRacks {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RacksVisitor;
+
+        impl<'de> Visitor<'de> for RacksVisitor {
+            type Value = BoundedMorphLayerRacks;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "at most {MAX_MORPH_LAYER_RACKS} layer racks")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut racks = Vec::with_capacity(
+                    sequence.size_hint().unwrap_or(0).min(MAX_MORPH_LAYER_RACKS),
+                );
+                while let Some(rack) = sequence.next_element::<VisualRack>()? {
+                    if racks.len() == MAX_MORPH_LAYER_RACKS {
+                        return Err(de::Error::custom(format_args!(
+                            "morph slot may contain at most {MAX_MORPH_LAYER_RACKS} layer racks"
+                        )));
+                    }
+                    racks.push(rack);
+                }
+                Ok(BoundedMorphLayerRacks(racks))
+            }
+        }
+
+        deserializer.deserialize_seq(RacksVisitor)
+    }
+}
+
+fn deserialize_optional_layer_racks<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<VisualRack>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<BoundedMorphLayerRacks>::deserialize(deserializer)
+        .map(|value| value.map(|value| value.0))
 }
 
 /// A pure, detached morph result suitable for either live or offline use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MorphSample {
     pub master: MorphMasterSnapshot,
+    pub master_transform: Option<SpatialTransform>,
+    pub master_motion: Option<MotionConfig>,
     pub ntsc: MorphNtscSnapshot,
     pub temporal: MorphTemporalSnapshot,
     pub layers: Vec<LayerMorphSnapshot>,
+    /// Present only when both slots contain the same ordered master topology.
+    pub master_rack: Option<VisualRack>,
+    /// Present only when both slots own every positional rack and each ordered
+    /// node identity/kind signature matches.
+    pub layer_racks: Option<Vec<VisualRack>>,
+    /// Present only when group membership/root topology and every group rack
+    /// signature match. The sampled tree contains values, never new topology.
+    pub composition: Option<CompositionTree>,
 }
 
 impl MorphSample {
@@ -941,18 +1575,124 @@ impl MorphSample {
     pub fn apply_to(
         &self,
         master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
         ntsc: &mut NtscParams,
         temporal: &mut TemporalParams,
         layers: &mut [Layer],
     ) {
         self.master.apply_to(master);
+        if let Some(transform) = self.master_transform {
+            *master_transform = transform.sanitized();
+        }
         *ntsc = self.ntsc.to_params();
-        *temporal = self.temporal.to_params();
+        let mut sampled_temporal = self.temporal.to_params();
+        sampled_temporal.originals.score.loop_driver = resolve_score_loop_driver(
+            self.temporal.originals.score.loop_driver,
+            |saved_position| saved_position.resolve(layers).map(Layer::stable_layer_id),
+        );
+        *temporal = sampled_temporal;
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         for sampled in &self.layers {
             let Some(layer) = layers.get_mut(sampled.position) else {
                 continue;
             };
             sampled.apply_to(layer);
+            if let Some(motion) = sampled.motion {
+                layer.motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn apply_to_with_motion(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        ntsc: &mut NtscParams,
+        temporal: &mut TemporalParams,
+        layers: &mut [Layer],
+    ) {
+        self.apply_to(master, master_transform, ntsc, temporal, layers);
+        if let Some(motion) = self.master_motion {
+            *master_motion = motion.to_params().sanitized();
+            let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+            master_motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+        }
+    }
+
+    /// Apply advanced creative values without granting a morph snapshot
+    /// authority over topology or ID cursors. Any live mismatch is inert.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_to_with_composition(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        ntsc: &mut NtscParams,
+        temporal: &mut TemporalParams,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+    ) {
+        self.apply_to(master, master_transform, ntsc, temporal, layers);
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        let group_exists = |group_id| composition.contains_group(group_id);
+        if let Some(sampled) = &self.master_rack {
+            let sampled = sampled.resolve_routes(
+                |position| position.resolve(&layer_ids).copied(),
+                group_exists,
+            );
+            let _ = apply_runtime_rack_values_strict(&sampled, master_rack);
+        }
+        if let Some(sampled) = &self.layer_racks {
+            if sampled.len() == layer_racks.len() {
+                for (sampled, live) in sampled.iter().zip(layer_racks) {
+                    let sampled = sampled.resolve_routes(
+                        |position| position.resolve(&layer_ids).copied(),
+                        group_exists,
+                    );
+                    let _ = apply_runtime_rack_values_strict(&sampled, live);
+                }
+            }
+        }
+        if let Some(sampled) = &self.composition {
+            if let Ok(sampled) = sampled.resolve(|saved_position| {
+                saved_position.resolve(layers).map(Layer::stable_layer_id)
+            }) {
+                let _ = apply_runtime_composition_values_strict(&sampled, composition);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_to_with_composition_and_motion(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        ntsc: &mut NtscParams,
+        temporal: &mut TemporalParams,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+    ) {
+        self.apply_to_with_composition(
+            master,
+            master_transform,
+            ntsc,
+            temporal,
+            layers,
+            master_rack,
+            layer_racks,
+            composition,
+        );
+        if let Some(motion) = self.master_motion {
+            *master_motion = motion.to_params().sanitized();
+            let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+            master_motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
         }
     }
 }
@@ -1077,7 +1817,24 @@ impl Morph {
             LayerMorphControl::BypassMasterFx => {
                 a.bypass_master_fx.is_some() && b.bypass_master_fx.is_some()
             }
+            LayerMorphControl::Transform => a.transform.is_some() && b.transform.is_some(),
+            LayerMorphControl::Motion => a.motion.is_some() && b.motion.is_some(),
         }
+    }
+
+    /// Legacy slots did not contain this field and therefore cannot own it.
+    pub(crate) fn controls_master_transform(&self) -> bool {
+        matches!(
+            (&self.a, &self.b),
+            (Some(a), Some(b)) if a.master_transform.is_some() && b.master_transform.is_some()
+        )
+    }
+
+    pub(crate) fn controls_master_motion(&self) -> bool {
+        matches!(
+            (&self.a, &self.b),
+            (Some(a), Some(b)) if a.master_motion.is_some() && b.master_motion.is_some()
+        )
     }
 
     pub fn clear(&mut self) {
@@ -1169,8 +1926,33 @@ impl Morph {
             })
             .collect();
 
+        let master_rack = match (&a.master_rack, &b.master_rack) {
+            (Some(a), Some(b)) => interpolate_rack(a, b, weights, choose_b),
+            _ => None,
+        };
+        let layer_racks = match (&a.layer_racks, &b.layer_racks) {
+            (Some(a), Some(b)) if a.len() == b.len() => a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| interpolate_rack(a, b, weights, choose_b))
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        };
+        let composition = match (&a.composition, &b.composition) {
+            (Some(a), Some(b)) => interpolate_composition(a, b, weights, choose_b),
+            _ => None,
+        };
+
         Some(MorphSample {
             master: MorphMasterSnapshot::interpolate(&a.master, &b.master, weights, choose_b),
+            master_transform: match (a.master_transform, b.master_transform) {
+                (Some(a), Some(b)) => Some(SpatialTransform::interpolate(a, b, weights, choose_b)),
+                _ => None,
+            },
+            master_motion: match (a.master_motion, b.master_motion) {
+                (Some(a), Some(b)) => Some(interpolate_motion_config(a, b, weights, choose_b)),
+                _ => None,
+            },
             ntsc: MorphNtscSnapshot::interpolate(&a.ntsc, &b.ntsc, weights, choose_b),
             temporal: MorphTemporalSnapshot::interpolate(
                 &a.temporal,
@@ -1179,22 +1961,117 @@ impl Morph {
                 choose_b,
             ),
             layers,
+            master_rack,
+            layer_racks,
+            composition,
         })
     }
 
     /// Write a sampled state into live base parameters. This preserves the
     /// pre-existing API while sharing the exact interpolation path with the
     /// exporter-facing pure sampler.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "legacy flat apply API is retained for compatibility and parity tests"
+        )
+    )]
     pub fn apply(
         &self,
         t: f32,
         master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
         ntsc: &mut NtscParams,
         temporal: &mut TemporalParams,
         layers: &mut [Layer],
     ) {
         if let Some(sample) = self.sample(t) {
-            sample.apply_to(master, ntsc, temporal, layers);
+            sample.apply_to(master, master_transform, ntsc, temporal, layers);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn apply_with_motion(
+        &self,
+        t: f32,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        ntsc: &mut NtscParams,
+        temporal: &mut TemporalParams,
+        layers: &mut [Layer],
+    ) {
+        if let Some(sample) = self.sample(t) {
+            sample.apply_to_with_motion(
+                master,
+                master_transform,
+                master_motion,
+                ntsc,
+                temporal,
+                layers,
+            );
+        }
+    }
+
+    /// Advanced sibling of [`Self::apply`]. The sampled value world is
+    /// written only into live racks/groups with an identical topology
+    /// signature; mismatches remain directly editable and untouched.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn apply_with_composition(
+        &self,
+        t: f32,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        ntsc: &mut NtscParams,
+        temporal: &mut TemporalParams,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+    ) {
+        if let Some(sample) = self.sample(t) {
+            sample.apply_to_with_composition(
+                master,
+                master_transform,
+                ntsc,
+                temporal,
+                layers,
+                master_rack,
+                layer_racks,
+                composition,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_composition_and_motion(
+        &self,
+        t: f32,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        ntsc: &mut NtscParams,
+        temporal: &mut TemporalParams,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+    ) {
+        if let Some(sample) = self.sample(t) {
+            sample.apply_to_with_composition_and_motion(
+                master,
+                master_transform,
+                master_motion,
+                ntsc,
+                temporal,
+                layers,
+                master_rack,
+                layer_racks,
+                composition,
+            );
         }
     }
 
@@ -1215,12 +2092,756 @@ impl Morph {
     }
 }
 
+fn racks_share_topology(a: &VisualRack, b: &VisualRack) -> bool {
+    a.topology_signature() == b.topology_signature()
+        && a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(a, b)| a.stable_id == b.stable_id && saved_node_topology_matches(a.kind, b.kind))
+}
+
+fn saved_node_topology_matches(a: VisualNodeKind, b: VisualNodeKind) -> bool {
+    if a.tag() != b.tag() {
+        return false;
+    }
+    match (a, b) {
+        (
+            VisualNodeKind::Mask(MaskParams::Rectangle(_)),
+            VisualNodeKind::Mask(MaskParams::Rectangle(_)),
+        )
+        | (
+            VisualNodeKind::Mask(MaskParams::Ellipse(_)),
+            VisualNodeKind::Mask(MaskParams::Ellipse(_)),
+        ) => true,
+        (
+            VisualNodeKind::Mask(MaskParams::Image(a)),
+            VisualNodeKind::Mask(MaskParams::Image(b)),
+        ) => image_matte_route_matches(a, b),
+        (VisualNodeKind::Mask(_), VisualNodeKind::Mask(_)) => false,
+        _ => true,
+    }
+}
+
+fn image_matte_route_matches(a: ImageMatte, b: ImageMatte) -> bool {
+    a.tap == b.tap && a.channel == b.channel && a.invert == b.invert
+}
+
+fn interpolate_rack(
+    a: &VisualRack,
+    b: &VisualRack,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<VisualRack> {
+    if !racks_share_topology(a, b) {
+        return None;
+    }
+    let mut sampled = a.clone();
+    for (node_a, node_b) in a.iter().zip(b.iter()) {
+        let node = sampled
+            .get_mut(node_a.stable_id)
+            .expect("topology-compatible rack contains every sampled node");
+        node.enabled = pick(node_a.enabled, node_b.enabled, choose_b);
+        node.wet = finite_clamp(blend_finite(node_a.wet, node_b.wet, weights), 1.0, 0.0, 1.0);
+        node.blend = pick(node_a.blend, node_b.blend, choose_b);
+        node.kind = interpolate_node_kind(node_a.kind, node_b.kind, weights, choose_b)?;
+    }
+    Some(sampled)
+}
+
+fn interpolate_node_kind(
+    a: VisualNodeKind,
+    b: VisualNodeKind,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<VisualNodeKind> {
+    Some(match (a, b) {
+        (VisualNodeKind::LegacyCanonical, VisualNodeKind::LegacyCanonical) => {
+            VisualNodeKind::LegacyCanonical
+        }
+        (VisualNodeKind::LegacyTemporal, VisualNodeKind::LegacyTemporal) => {
+            VisualNodeKind::LegacyTemporal
+        }
+        (VisualNodeKind::Transform(a), VisualNodeKind::Transform(b)) => {
+            VisualNodeKind::Transform(SpatialTransform::interpolate(a, b, weights, choose_b))
+        }
+        (VisualNodeKind::DigitalColor(a), VisualNodeKind::DigitalColor(b)) => {
+            VisualNodeKind::DigitalColor(interpolate_digital(a, b, weights))
+        }
+        (VisualNodeKind::Key(a), VisualNodeKind::Key(b)) => {
+            VisualNodeKind::Key(interpolate_key(a, b, weights, choose_b))
+        }
+        (VisualNodeKind::Cellular(a), VisualNodeKind::Cellular(b)) => {
+            VisualNodeKind::Cellular(interpolate_cellular(a, b, weights, choose_b))
+        }
+        (VisualNodeKind::Shift(a), VisualNodeKind::Shift(b)) => {
+            VisualNodeKind::Shift(interpolate_shift(a, b, weights, choose_b))
+        }
+        (VisualNodeKind::Grain(a), VisualNodeKind::Grain(b)) => {
+            VisualNodeKind::Grain(interpolate_grain(a, b, weights, choose_b))
+        }
+        (VisualNodeKind::Mask(a), VisualNodeKind::Mask(b)) => {
+            VisualNodeKind::Mask(interpolate_mask(a, b, weights, choose_b)?)
+        }
+        _ => return None,
+    })
+}
+
+fn interpolate_digital(
+    a: DigitalColorParams,
+    b: DigitalColorParams,
+    weights: [f32; 2],
+) -> DigitalColorParams {
+    DigitalColorParams {
+        pixelate_size: blend_finite(a.pixelate_size, b.pixelate_size, weights),
+        rgb_split: blend_finite(a.rgb_split, b.rgb_split, weights),
+        downsample: blend_finite(a.downsample, b.downsample, weights),
+        hue_shift: blend_wrapped_degrees(a.hue_shift, b.hue_shift, weights),
+        saturation: blend_finite(a.saturation, b.saturation, weights),
+        brightness: blend_finite(a.brightness, b.brightness, weights),
+        contrast: blend_finite(a.contrast, b.contrast, weights),
+        posterize: blend_finite(a.posterize, b.posterize, weights),
+        invert: blend_finite(a.invert, b.invert, weights),
+        vignette: blend_finite(a.vignette, b.vignette, weights),
+        color_drift: blend_finite(a.color_drift, b.color_drift, weights),
+    }
+}
+
+fn interpolate_key(a: KeyParams, b: KeyParams, weights: [f32; 2], choose_b: bool) -> KeyParams {
+    KeyParams {
+        mode: pick(a.mode, b.mode, choose_b),
+        threshold: blend_finite(a.threshold, b.threshold, weights),
+        softness: blend_finite(a.softness, b.softness, weights),
+        color: std::array::from_fn(|index| blend_finite(a.color[index], b.color[index], weights)),
+        tolerance: blend_finite(a.tolerance, b.tolerance, weights),
+        invert: pick(a.invert, b.invert, choose_b),
+    }
+}
+
+fn interpolate_cellular(
+    a: CellularParams,
+    b: CellularParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> CellularParams {
+    CellularParams {
+        amount: blend_finite(a.amount, b.amount, weights),
+        scale: blend_finite(a.scale, b.scale, weights),
+        warp: blend_finite(a.warp, b.warp, weights),
+        speed: blend_finite(a.speed, b.speed, weights),
+        gap_amount: blend_finite(a.gap_amount, b.gap_amount, weights),
+        gap_threshold: blend_finite(a.gap_threshold, b.gap_threshold, weights),
+        gap_softness: blend_finite(a.gap_softness, b.gap_softness, weights),
+        seed: pick(a.seed, b.seed, choose_b),
+    }
+}
+
+fn interpolate_shift(
+    a: ShiftParams,
+    b: ShiftParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> ShiftParams {
+    ShiftParams {
+        amount: blend_finite(a.amount, b.amount, weights),
+        block_size: blend_finite(a.block_size, b.block_size, weights),
+        density: blend_finite(a.density, b.density, weights),
+        speed: blend_finite(a.speed, b.speed, weights),
+        seed: pick(a.seed, b.seed, choose_b),
+    }
+}
+
+fn interpolate_grain(
+    a: GrainParams,
+    b: GrainParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> GrainParams {
+    GrainParams {
+        intensity: blend_finite(a.intensity, b.intensity, weights),
+        size: blend_finite(a.size, b.size, weights),
+        algorithm: pick(a.algorithm, b.algorithm, choose_b),
+        color: pick(a.color, b.color, choose_b),
+        seed: pick(a.seed, b.seed, choose_b),
+    }
+}
+
+fn interpolate_rectangle(
+    a: RectangleMask,
+    b: RectangleMask,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> RectangleMask {
+    RectangleMask {
+        center: std::array::from_fn(|index| {
+            blend_finite(a.center[index], b.center[index], weights)
+        }),
+        size: std::array::from_fn(|index| blend_finite(a.size[index], b.size[index], weights)),
+        rotation_deg: blend_wrapped_degrees(a.rotation_deg, b.rotation_deg, weights),
+        feather: blend_finite(a.feather, b.feather, weights),
+        invert: pick(a.invert, b.invert, choose_b),
+    }
+}
+
+fn interpolate_ellipse(
+    a: EllipseMask,
+    b: EllipseMask,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> EllipseMask {
+    EllipseMask {
+        center: std::array::from_fn(|index| {
+            blend_finite(a.center[index], b.center[index], weights)
+        }),
+        radii: std::array::from_fn(|index| blend_finite(a.radii[index], b.radii[index], weights)),
+        rotation_deg: blend_wrapped_degrees(a.rotation_deg, b.rotation_deg, weights),
+        feather: blend_finite(a.feather, b.feather, weights),
+        invert: pick(a.invert, b.invert, choose_b),
+    }
+}
+
+fn interpolate_image_matte(a: ImageMatte, b: ImageMatte, weights: [f32; 2]) -> ImageMatte {
+    ImageMatte {
+        // Donor, timing, channel and inversion are routing topology. A/B
+        // compatibility already proved equality, so the snapshot carries the
+        // route only as a signature and never morphs it.
+        tap: a.tap,
+        channel: a.channel,
+        invert: a.invert,
+        amount: blend_finite(a.amount, b.amount, weights),
+        threshold: blend_finite(a.threshold, b.threshold, weights),
+        softness: blend_finite(a.softness, b.softness, weights),
+    }
+}
+
+fn interpolate_mask(
+    a: MaskParams,
+    b: MaskParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<MaskParams> {
+    match (a, b) {
+        (MaskParams::Rectangle(a), MaskParams::Rectangle(b)) => Some(MaskParams::Rectangle(
+            interpolate_rectangle(a, b, weights, choose_b),
+        )),
+        (MaskParams::Ellipse(a), MaskParams::Ellipse(b)) => Some(MaskParams::Ellipse(
+            interpolate_ellipse(a, b, weights, choose_b),
+        )),
+        (MaskParams::Image(a), MaskParams::Image(b)) => {
+            Some(MaskParams::Image(interpolate_image_matte(a, b, weights)))
+        }
+        _ => None,
+    }
+}
+
+fn composition_topology_matches(a: &CompositionTree, b: &CompositionTree) -> bool {
+    a.root() == b.root()
+        && a.groups().len() == b.groups().len()
+        && a.groups().zip(b.groups()).all(|(a, b)| {
+            a.id == b.id
+                && a.members == b.members
+                && match (a.matte, b.matte) {
+                    (Some(a), Some(b)) => image_matte_route_matches(a, b),
+                    (None, None) => true,
+                    _ => false,
+                }
+                && racks_share_topology(&a.rack, &b.rack)
+        })
+}
+
+fn interpolate_composition(
+    a: &CompositionTree,
+    b: &CompositionTree,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<CompositionTree> {
+    if !composition_topology_matches(a, b) {
+        return None;
+    }
+    let mut sampled = a.clone();
+    sampled.set_bus_crossfade(finite_clamp(
+        blend_finite(a.bus_crossfade(), b.bus_crossfade(), weights),
+        0.5,
+        0.0,
+        1.0,
+    ));
+    for group_a in a.groups() {
+        let group_b = b.group(group_a.id)?;
+        let sampled_group = sampled.group_mut(group_a.id)?;
+        sampled_group.opacity = finite_clamp(
+            blend_finite(group_a.opacity, group_b.opacity, weights),
+            1.0,
+            0.0,
+            1.0,
+        );
+        sampled_group.transform =
+            SpatialTransform::interpolate(group_a.transform, group_b.transform, weights, choose_b);
+        sampled_group.rack = interpolate_rack(&group_a.rack, &group_b.rack, weights, choose_b)?;
+        sampled_group.matte = match (group_a.matte, group_b.matte) {
+            (Some(a), Some(b)) => Some(interpolate_image_matte(a, b, weights)),
+            (None, None) => None,
+            _ => return None,
+        };
+        sampled_group.solo = pick(group_a.solo, group_b.solo, choose_b);
+        sampled_group.bypass = pick(group_a.bypass, group_b.bypass, choose_b);
+        sampled_group.bus = pick(group_a.bus, group_b.bus, choose_b);
+    }
+    Some(sampled)
+}
+
+/// Copy values between topology-compatible racks while retaining the live
+/// rack's monotonic node cursor and ordered storage.
+#[allow(
+    dead_code,
+    reason = "saved-rack value application supports compatibility/parity paths"
+)]
+pub(crate) fn apply_rack_values(sampled: &VisualRack, live: &mut VisualRack) -> bool {
+    if !racks_share_topology(sampled, live) {
+        return false;
+    }
+    for sampled_node in sampled.iter() {
+        let live_node = live
+            .get_mut(sampled_node.stable_id)
+            .expect("topology-compatible live rack contains every node");
+        live_node.enabled = sampled_node.enabled;
+        live_node.wet = sampled_node.wet;
+        live_node.blend = sampled_node.blend;
+        if !apply_saved_node_kind_values(sampled_node.kind, &mut live_node.kind) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(
+    dead_code,
+    reason = "implementation detail of the retained saved-rack apply API"
+)]
+fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKind) -> bool {
+    match (sampled, live) {
+        (VisualNodeKind::LegacyCanonical, VisualNodeKind::LegacyCanonical)
+        | (VisualNodeKind::LegacyTemporal, VisualNodeKind::LegacyTemporal) => true,
+        (VisualNodeKind::Transform(value), VisualNodeKind::Transform(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::DigitalColor(value), VisualNodeKind::DigitalColor(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Key(value), VisualNodeKind::Key(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Cellular(value), VisualNodeKind::Cellular(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Shift(value), VisualNodeKind::Shift(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Grain(value), VisualNodeKind::Grain(live)) => {
+            *live = value;
+            true
+        }
+        (
+            VisualNodeKind::Mask(MaskParams::Rectangle(value)),
+            VisualNodeKind::Mask(MaskParams::Rectangle(live)),
+        ) => {
+            *live = value;
+            true
+        }
+        (
+            VisualNodeKind::Mask(MaskParams::Ellipse(value)),
+            VisualNodeKind::Mask(MaskParams::Ellipse(live)),
+        ) => {
+            *live = value;
+            true
+        }
+        (
+            VisualNodeKind::Mask(MaskParams::Image(value)),
+            VisualNodeKind::Mask(MaskParams::Image(live)),
+        ) => {
+            apply_saved_image_matte_values(value, live);
+            true
+        }
+        _ => false,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "implementation detail of retained saved value application"
+)]
+fn apply_saved_image_matte_values(sampled: ImageMatte, live: &mut ImageMatte) {
+    live.amount = sampled.amount;
+    live.threshold = sampled.threshold;
+    live.softness = sampled.softness;
+}
+
+/// Copy only group/rack values. Membership, root order, names, identities,
+/// and monotonic cursors remain owned by the live composition.
+#[allow(
+    dead_code,
+    reason = "saved-composition apply supports compatibility/parity paths"
+)]
+pub(crate) fn apply_composition_values(
+    sampled: &CompositionTree,
+    live: &mut CompositionTree,
+) -> bool {
+    if !composition_topology_matches(sampled, live) {
+        return false;
+    }
+    live.set_bus_crossfade(sampled.bus_crossfade());
+    for sampled_group in sampled.groups() {
+        let live_group = live
+            .group_mut(sampled_group.id)
+            .expect("topology-compatible composition contains every group");
+        live_group.opacity = sampled_group.opacity;
+        live_group.transform = sampled_group.transform;
+        let _ = apply_rack_values(&sampled_group.rack, &mut live_group.rack);
+        if let (Some(sampled), Some(live)) = (sampled_group.matte, &mut live_group.matte) {
+            apply_saved_image_matte_values(sampled, live);
+        }
+        live_group.solo = sampled_group.solo;
+        live_group.bypass = sampled_group.bypass;
+        live_group.bus = sampled_group.bus;
+    }
+    true
+}
+
+fn runtime_racks_share_value_topology(a: &RuntimeVisualRack, b: &RuntimeVisualRack) -> bool {
+    a.topology_signature() == b.topology_signature()
+        && a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(a, b)| {
+            a.stable_id == b.stable_id && runtime_node_value_topology_matches(a.kind, b.kind)
+        })
+}
+
+fn runtime_node_value_topology_matches(a: RuntimeVisualNodeKind, b: RuntimeVisualNodeKind) -> bool {
+    if a.tag() != b.tag() {
+        return false;
+    }
+    match (a, b) {
+        (
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(_)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(_)),
+        )
+        | (
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(_)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(_)),
+        )
+        | (
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_)),
+        ) => true,
+        (RuntimeVisualNodeKind::Mask(_), RuntimeVisualNodeKind::Mask(_)) => false,
+        _ => true,
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "topology guard for retained saved-to-runtime apply API"
+)]
+fn saved_and_runtime_racks_share_value_topology(
+    saved: &VisualRack,
+    live: &RuntimeVisualRack,
+) -> bool {
+    saved.topology_signature() == live.topology_signature()
+        && saved.len() == live.len()
+        && saved.iter().zip(live.iter()).all(|(saved, live)| {
+            saved.stable_id == live.stable_id
+                && match (saved.kind, live.kind) {
+                    (
+                        VisualNodeKind::Mask(MaskParams::Rectangle(_)),
+                        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(_)),
+                    )
+                    | (
+                        VisualNodeKind::Mask(MaskParams::Ellipse(_)),
+                        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(_)),
+                    )
+                    | (
+                        VisualNodeKind::Mask(MaskParams::Image(_)),
+                        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_)),
+                    ) => true,
+                    (VisualNodeKind::Mask(_), RuntimeVisualNodeKind::Mask(_)) => false,
+                    (saved, live) => saved.tag() == live.tag(),
+                }
+        })
+}
+
+#[allow(
+    dead_code,
+    reason = "saved-to-runtime apply supports compatibility/parity paths"
+)]
+pub(crate) fn apply_saved_rack_values_to_runtime(
+    sampled: &VisualRack,
+    live: &mut RuntimeVisualRack,
+) -> bool {
+    if !saved_and_runtime_racks_share_value_topology(sampled, live) {
+        return false;
+    }
+    for sampled_node in sampled.iter() {
+        let live_node = live
+            .get_mut(sampled_node.stable_id)
+            .expect("topology-compatible runtime rack contains every node");
+        live_node.enabled = sampled_node.enabled;
+        live_node.wet = sampled_node.wet;
+        live_node.blend = sampled_node.blend;
+        if !apply_saved_node_kind_values_to_runtime(sampled_node.kind, &mut live_node.kind) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(
+    dead_code,
+    reason = "implementation detail of retained saved-to-runtime apply API"
+)]
+fn apply_saved_node_kind_values_to_runtime(
+    sampled: VisualNodeKind,
+    live: &mut RuntimeVisualNodeKind,
+) -> bool {
+    match (sampled, live) {
+        (VisualNodeKind::LegacyCanonical, RuntimeVisualNodeKind::LegacyCanonical)
+        | (VisualNodeKind::LegacyTemporal, RuntimeVisualNodeKind::LegacyTemporal) => true,
+        (VisualNodeKind::Transform(value), RuntimeVisualNodeKind::Transform(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::DigitalColor(value), RuntimeVisualNodeKind::DigitalColor(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Key(value), RuntimeVisualNodeKind::Key(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Cellular(value), RuntimeVisualNodeKind::Cellular(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Shift(value), RuntimeVisualNodeKind::Shift(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Grain(value), RuntimeVisualNodeKind::Grain(live)) => {
+            *live = value;
+            true
+        }
+        (
+            VisualNodeKind::Mask(MaskParams::Rectangle(value)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(live)),
+        ) => {
+            *live = value;
+            true
+        }
+        (
+            VisualNodeKind::Mask(MaskParams::Ellipse(value)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(live)),
+        ) => {
+            *live = value;
+            true
+        }
+        (
+            VisualNodeKind::Mask(MaskParams::Image(value)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(live)),
+        ) => {
+            live.amount = value.amount;
+            live.threshold = value.threshold;
+            live.softness = value.softness;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_runtime_rack_values(sampled: &RuntimeVisualRack, live: &mut RuntimeVisualRack) -> bool {
+    if !runtime_racks_share_value_topology(sampled, live) {
+        return false;
+    }
+    for sampled_node in sampled.iter() {
+        let live_node = live
+            .get_mut(sampled_node.stable_id)
+            .expect("topology-compatible runtime rack contains every node");
+        live_node.enabled = sampled_node.enabled;
+        live_node.wet = sampled_node.wet;
+        live_node.blend = sampled_node.blend;
+        if !apply_runtime_node_kind_values(sampled_node.kind, &mut live_node.kind) {
+            return false;
+        }
+    }
+    true
+}
+
+fn runtime_racks_share_strict_topology(a: &RuntimeVisualRack, b: &RuntimeVisualRack) -> bool {
+    runtime_racks_share_value_topology(a, b)
+        && a.iter().zip(b.iter()).all(|(a, b)| match (a.kind, b.kind) {
+            (
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(a)),
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(b)),
+            ) => a.tap == b.tap && a.channel == b.channel && a.invert == b.invert,
+            _ => true,
+        })
+}
+
+pub(crate) fn apply_runtime_rack_values_strict(
+    sampled: &RuntimeVisualRack,
+    live: &mut RuntimeVisualRack,
+) -> bool {
+    runtime_racks_share_strict_topology(sampled, live) && apply_runtime_rack_values(sampled, live)
+}
+
+fn apply_runtime_node_kind_values(
+    sampled: RuntimeVisualNodeKind,
+    live: &mut RuntimeVisualNodeKind,
+) -> bool {
+    match (sampled, live) {
+        (RuntimeVisualNodeKind::LegacyCanonical, RuntimeVisualNodeKind::LegacyCanonical)
+        | (RuntimeVisualNodeKind::LegacyTemporal, RuntimeVisualNodeKind::LegacyTemporal) => true,
+        (RuntimeVisualNodeKind::Transform(value), RuntimeVisualNodeKind::Transform(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::DigitalColor(value), RuntimeVisualNodeKind::DigitalColor(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::Key(value), RuntimeVisualNodeKind::Key(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::Cellular(value), RuntimeVisualNodeKind::Cellular(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::Shift(value), RuntimeVisualNodeKind::Shift(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::Grain(value), RuntimeVisualNodeKind::Grain(live)) => {
+            *live = value;
+            true
+        }
+        (
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(value)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(live)),
+        ) => {
+            *live = value;
+            true
+        }
+        (
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(value)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(live)),
+        ) => {
+            *live = value;
+            true
+        }
+        (
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(value)),
+            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(live)),
+        ) => {
+            apply_runtime_image_matte_values(value, live);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_runtime_image_matte_values(sampled: RuntimeImageMatte, live: &mut RuntimeImageMatte) {
+    live.amount = sampled.amount;
+    live.threshold = sampled.threshold;
+    live.softness = sampled.softness;
+}
+
+fn runtime_composition_topology_matches(a: &RuntimeComposition, b: &RuntimeComposition) -> bool {
+    a.root() == b.root()
+        && a.groups().len() == b.groups().len()
+        && a.groups().zip(b.groups()).all(|(a, b)| {
+            a.id == b.id
+                && a.members == b.members
+                && a.matte.is_some() == b.matte.is_some()
+                && runtime_racks_share_value_topology(&a.rack, &b.rack)
+        })
+}
+
+fn runtime_composition_strict_topology_matches(
+    a: &RuntimeComposition,
+    b: &RuntimeComposition,
+) -> bool {
+    runtime_composition_topology_matches(a, b)
+        && a.groups().zip(b.groups()).all(|(a, b)| {
+            (match (a.matte, b.matte) {
+                (Some(a), Some(b)) => {
+                    a.tap == b.tap && a.channel == b.channel && a.invert == b.invert
+                }
+                (None, None) => true,
+                _ => false,
+            }) && runtime_racks_share_strict_topology(&a.rack, &b.rack)
+        })
+}
+
+fn apply_runtime_composition_values(
+    sampled: &RuntimeComposition,
+    live: &mut RuntimeComposition,
+) -> bool {
+    if !runtime_composition_topology_matches(sampled, live) {
+        return false;
+    }
+    live.set_bus_crossfade(sampled.bus_crossfade());
+    for sampled_group in sampled.groups() {
+        let live_group = live
+            .group_mut(sampled_group.id)
+            .expect("topology-compatible runtime composition contains every group");
+        live_group.opacity = sampled_group.opacity;
+        live_group.transform = sampled_group.transform;
+        let _ = apply_runtime_rack_values(&sampled_group.rack, &mut live_group.rack);
+        if let (Some(sampled), Some(live)) = (sampled_group.matte, &mut live_group.matte) {
+            apply_runtime_image_matte_values(sampled, live);
+        }
+        live_group.solo = sampled_group.solo;
+        live_group.bypass = sampled_group.bypass;
+        live_group.bus = sampled_group.bus;
+    }
+    true
+}
+
+pub(crate) fn apply_runtime_composition_values_strict(
+    sampled: &RuntimeComposition,
+    live: &mut RuntimeComposition,
+) -> bool {
+    runtime_composition_strict_topology_matches(sampled, live)
+        && apply_runtime_composition_values(sampled, live)
+}
+
 fn normalized_position(value: f32) -> f32 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
     } else {
         0.0
     }
+}
+
+/// Deterministic detached-preflight order shared by live and offline Morph
+/// materialization: requested sample, nearest captured endpoint (tie B), then
+/// the other endpoint. The vector is hard-bounded to three unique entries.
+pub(crate) fn preflight_sample_positions(value: f32) -> Vec<f32> {
+    let requested = normalized_position(value);
+    let nearest = if requested < 0.5 { 0.0 } else { 1.0 };
+    let other = 1.0 - nearest;
+    let mut attempts = Vec::with_capacity(3);
+    attempts.push(requested);
+    for endpoint in [nearest, other] {
+        if !attempts
+            .iter()
+            .any(|candidate| (candidate - endpoint).abs() <= f32::EPSILON)
+        {
+            attempts.push(endpoint);
+        }
+    }
+    attempts
 }
 
 fn finite_f64_or(value: f64, fallback: f64) -> f64 {
@@ -1364,6 +2985,17 @@ mod tests {
     }
 
     #[test]
+    fn all_layer_blend_modes_round_trip_exactly_through_morph_storage() {
+        for mode in BlendMode::ALL {
+            let stored = MorphLayerBlendMode::capture(mode);
+            assert_eq!(stored.to_blend_mode(), mode);
+            let yaml = serde_yaml::to_string(&stored).unwrap();
+            let restored: MorphLayerBlendMode = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(restored, stored);
+        }
+    }
+
+    #[test]
     fn layer_ownership_requires_the_position_in_both_engaged_slots() {
         let a = slot(1.0, 0.0, 0.25);
         let mut b = slot(2.0, 1.0, 0.75);
@@ -1447,6 +3079,13 @@ mod tests {
             visible: Some(high),
             paused: Some(high),
             bypass_master_fx: Some(high),
+            transform: Some(SpatialTransform {
+                position: if high { [0.75, -0.5] } else { [-0.25, 0.5] },
+                scale: if high { [4.0, 4.0] } else { [1.0, 1.0] },
+                rotation_deg: if high { -170.0 } else { 170.0 },
+                ..SpatialTransform::default()
+            }),
+            motion: None,
             key_threshold: None,
         }
     }
@@ -1476,6 +3115,324 @@ mod tests {
         close(quarter.master.pixelate_size, 8.5);
         assert_eq!(quarter.master.invert, 0.0);
         assert!(!quarter.ntsc.enabled);
+    }
+
+    #[test]
+    fn motion_morph_is_continuous_for_numbers_and_endpoint_exact_for_laws() {
+        use crate::patch::{
+            CurvedShutterConfig, CurvedShutterQualityConfig, FaradayConfig, MotionCarrierConfig,
+            MotionDonorConfig, MotionFieldSourceConfig, MotionLatticeQualityConfig,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        let low = MotionConfig {
+            field_source: MotionFieldSourceConfig::CodecVectors,
+            lattice_quality: MotionLatticeQualityConfig::Draft,
+            transplant: FaradayConfig {
+                donor: MotionDonorConfig::Selected {
+                    saved_position: SavedLayerPosition::new(0).unwrap(),
+                },
+                carrier: MotionCarrierConfig::Transparent,
+                ..FaradayConfig::default()
+            },
+            shutter: CurvedShutterConfig {
+                quality: CurvedShutterQualityConfig::Sharp,
+                ..CurvedShutterConfig::default()
+            },
+            ..MotionConfig::default()
+        };
+
+        let high = MotionConfig {
+            field_source: MotionFieldSourceConfig::Lattice,
+            lattice_quality: MotionLatticeQualityConfig::High,
+            transplant: FaradayConfig {
+                amount: 1.0,
+                donor: MotionDonorConfig::Missing {
+                    saved_position: SavedLayerPosition::new(1).unwrap(),
+                },
+                carrier: MotionCarrierConfig::FirstSourceFrame,
+                confidence_softness: 0.5,
+                ..FaradayConfig::default()
+            },
+            shutter: CurvedShutterConfig {
+                angle_degrees: 360.0,
+                phase: 1.0,
+                curvature: 2.0,
+                chromatic_lag: 1.0,
+                quality: CurvedShutterQualityConfig::High,
+            },
+            ..MotionConfig::default()
+        };
+
+        let mut a = MorphSlot {
+            master_motion: Some(low),
+            ..MorphSlot::default()
+        };
+        a.layers.push(LayerMorphSnapshot {
+            position: 0,
+            motion: Some(low),
+            ..LayerMorphSnapshot::default()
+        });
+        let mut b = MorphSlot {
+            master_motion: Some(high),
+            ..MorphSlot::default()
+        };
+        b.layers.push(LayerMorphSnapshot {
+            position: 0,
+            motion: Some(high),
+            ..LayerMorphSnapshot::default()
+        });
+        let morph = Morph {
+            a: Some(a),
+            b: Some(b),
+            ..Morph::default()
+        };
+
+        let quarter = morph.sample(0.25).unwrap();
+        let motion = quarter.master_motion.unwrap();
+        close(motion.transplant.amount, 0.25);
+        close(motion.shutter.angle_degrees, 90.0);
+        assert_eq!(motion.field_source, MotionFieldSourceConfig::CodecVectors);
+        assert_eq!(motion.lattice_quality, MotionLatticeQualityConfig::Draft);
+        assert_eq!(motion.transplant.donor, low.transplant.donor);
+        assert_eq!(motion.transplant.carrier, MotionCarrierConfig::Transparent);
+        assert_eq!(motion.shutter.quality, CurvedShutterQualityConfig::Sharp);
+
+        let midpoint = morph.sample(0.5).unwrap();
+        let motion = midpoint.master_motion.unwrap();
+        close(motion.transplant.amount, 0.5);
+        close(motion.transplant.confidence_softness, 0.275);
+        close(motion.shutter.angle_degrees, 180.0);
+        assert_eq!(
+            motion.algorithm_version,
+            crate::motion::MOTION_ALGORITHM_VERSION
+        );
+        assert_eq!(motion.field_source, MotionFieldSourceConfig::Lattice);
+        assert_eq!(motion.lattice_quality, MotionLatticeQualityConfig::High);
+        assert_eq!(motion.transplant.donor, high.transplant.donor);
+        assert_eq!(
+            motion.transplant.carrier,
+            MotionCarrierConfig::FirstSourceFrame
+        );
+        assert_eq!(motion.shutter.quality, CurvedShutterQualityConfig::High);
+        assert_eq!(midpoint.layers[0].motion, Some(motion));
+
+        let legacy: MorphSlot = serde_yaml::from_str("master: {}\n").unwrap();
+        assert_eq!(legacy.master_motion, None);
+        assert!(legacy.layers.is_empty());
+    }
+
+    #[test]
+    fn motion_donors_follow_stack_permutations_and_missing_never_rebinds() {
+        use crate::patch::{MotionConfig, MotionDonorConfig};
+        use crate::performance::SavedLayerPosition;
+
+        let selected = |position| {
+            let mut config = MotionConfig::default();
+            config.transplant.donor = MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(position).unwrap(),
+            };
+            config
+        };
+        let mut missing = MotionConfig::default();
+        missing.transplant.donor = MotionDonorConfig::Missing {
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+        };
+        let mut slot = MorphSlot {
+            master_motion: Some(selected(0)),
+            layers: vec![
+                LayerMorphSnapshot {
+                    position: 0,
+                    motion: Some(selected(2)),
+                    ..LayerMorphSnapshot::default()
+                },
+                LayerMorphSnapshot {
+                    position: 1,
+                    motion: Some(missing),
+                    ..LayerMorphSnapshot::default()
+                },
+                LayerMorphSnapshot {
+                    position: 2,
+                    motion: None,
+                    ..LayerMorphSnapshot::default()
+                },
+            ],
+            ..MorphSlot::default()
+        };
+
+        slot.remap_layers_after_move(0, 2);
+        assert!(matches!(
+            slot.master_motion.unwrap().transplant.donor,
+            MotionDonorConfig::Selected { saved_position } if saved_position.get() == 2
+        ));
+        let moved_selected = slot
+            .layers
+            .iter()
+            .find(|layer| {
+                layer.motion.is_some_and(|motion| {
+                    matches!(motion.transplant.donor, MotionDonorConfig::Selected { .. })
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            moved_selected.motion.unwrap().transplant.donor,
+            MotionDonorConfig::Selected { saved_position } if saved_position.get() == 1
+        ));
+        let authored_missing = slot
+            .layers
+            .iter()
+            .find_map(|layer| {
+                layer.motion.filter(|motion| {
+                    matches!(motion.transplant.donor, MotionDonorConfig::Missing { .. })
+                })
+            })
+            .unwrap();
+        assert!(matches!(
+            authored_missing.transplant.donor,
+            MotionDonorConfig::Missing { saved_position } if saved_position.get() == 0
+        ));
+
+        slot.remap_layers_after_remove(1);
+        assert!(matches!(
+            slot.master_motion.unwrap().transplant.donor,
+            MotionDonorConfig::Selected { saved_position } if saved_position.get() == 1
+        ));
+        assert!(slot.layers.iter().all(|layer| {
+            !matches!(
+                layer.motion.map(|motion| motion.transplant.donor),
+                Some(MotionDonorConfig::Selected { saved_position }) if saved_position.get() == 1
+            )
+        }));
+    }
+
+    #[test]
+    fn temporal_originals_morph_numeric_values_and_recall_discrete_laws() {
+        use crate::patch::{
+            CollisionScoreConfig, CollisionScoreTriggerConfig, RefreshGardenGateConfig,
+            TemporalEventResetModeConfig, TemporalInterpolationConfig, TemporalTopologyConfig,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        let mut a = MorphSlot::default();
+        a.temporal.originals.loom.amount = 0.0;
+        a.temporal.originals.loom.depth = 0.0;
+        a.temporal.originals.loom.phase = -100.0;
+        a.temporal.originals.loom.scale = 1.0;
+        a.temporal.originals.loom.angle = 170.0;
+        a.temporal.originals.loom.folds = 1;
+        a.temporal.originals.loom.quantization = 0;
+        a.temporal.originals.loom.topology = TemporalTopologyConfig::Linear;
+        a.temporal.originals.loom.interpolation = TemporalInterpolationConfig::Floor;
+        a.temporal.originals.atlas.amount = 0.0;
+        a.temporal.originals.atlas.seed = 11;
+        a.temporal.originals.atlas.territories = 2;
+        a.temporal.originals.atlas.collision = 0.2;
+        a.temporal.originals.garden.amount = 0.0;
+        a.temporal.originals.garden.gate = RefreshGardenGateConfig::Luma;
+        a.temporal.originals.garden.threshold = 0.2;
+        a.temporal.originals.garden.softness = 0.1;
+        a.temporal.originals.garden.decay = 1.0;
+        a.temporal.originals.garden.max_hold_ticks = 10;
+        a.temporal.originals.score = CollisionScoreConfig {
+            enabled: false,
+            seed: 31,
+            state_count: 4,
+            trigger: CollisionScoreTriggerConfig::Boundary,
+            loop_driver: CollisionScoreLoopDriverConfig::SelectedLayer {
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            },
+        };
+        a.temporal.originals.reset.loop_boundary = TemporalEventResetModeConfig::Memory;
+
+        let mut b = MorphSlot::default();
+        b.temporal.originals.loom.amount = 1.0;
+        b.temporal.originals.loom.depth = 1.0;
+        b.temporal.originals.loom.phase = 100.0;
+        b.temporal.originals.loom.scale = 3.0;
+        b.temporal.originals.loom.angle = -170.0;
+        b.temporal.originals.loom.folds = 16;
+        b.temporal.originals.loom.quantization = 24;
+        b.temporal.originals.loom.topology = TemporalTopologyConfig::Kaleidoscopic;
+        b.temporal.originals.loom.interpolation = TemporalInterpolationConfig::Linear;
+        b.temporal.originals.atlas.amount = 1.0;
+        b.temporal.originals.atlas.seed = 22;
+        b.temporal.originals.atlas.territories = 10;
+        b.temporal.originals.atlas.collision = 0.8;
+        b.temporal.originals.garden.amount = 1.0;
+        b.temporal.originals.garden.gate = RefreshGardenGateConfig::Matte;
+        b.temporal.originals.garden.threshold = 0.8;
+        b.temporal.originals.garden.softness = 0.3;
+        b.temporal.originals.garden.decay = 0.0;
+        b.temporal.originals.garden.max_hold_ticks = 20;
+        b.temporal.originals.score = CollisionScoreConfig {
+            enabled: true,
+            seed: 47,
+            state_count: 9,
+            trigger: CollisionScoreTriggerConfig::Manual,
+            loop_driver: CollisionScoreLoopDriverConfig::SelectedLayer {
+                saved_position: SavedLayerPosition::new(3).unwrap(),
+            },
+        };
+        b.temporal.originals.reset.loop_boundary = TemporalEventResetModeConfig::All;
+
+        let morph = Morph {
+            a: Some(a.clone()),
+            b: Some(b.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            morph.sample(0.0).unwrap().temporal.originals,
+            a.temporal.originals
+        );
+        assert_eq!(
+            morph.sample(1.0).unwrap().temporal.originals,
+            b.temporal.originals
+        );
+
+        let midpoint = morph.sample(0.5).unwrap().temporal.originals;
+        close(midpoint.loom.amount, 0.5);
+        close(midpoint.loom.depth, 0.5);
+        close(midpoint.loom.phase, 0.0);
+        close(midpoint.loom.scale, 2.0);
+        close(midpoint.loom.angle.abs(), 180.0);
+        assert_eq!(midpoint.loom.folds, 9);
+        assert_eq!(midpoint.loom.quantization, 12);
+        assert_eq!(
+            midpoint.loom.topology,
+            TemporalTopologyConfig::Kaleidoscopic
+        );
+        assert_eq!(
+            midpoint.loom.interpolation,
+            TemporalInterpolationConfig::Linear
+        );
+        close(midpoint.atlas.amount, 0.5);
+        assert_eq!(midpoint.atlas.seed, 22);
+        assert_eq!(midpoint.atlas.territories, 6);
+        close(midpoint.atlas.collision, 0.5);
+        close(midpoint.garden.amount, 0.5);
+        close(midpoint.garden.threshold, 0.5);
+        close(midpoint.garden.softness, 0.2);
+        close(midpoint.garden.decay, 0.5);
+        assert_eq!(midpoint.garden.max_hold_ticks, 15);
+        assert_eq!(midpoint.garden.gate, RefreshGardenGateConfig::Matte);
+        assert_eq!(midpoint.score, b.temporal.originals.score);
+        assert_eq!(
+            midpoint.reset.loop_boundary,
+            TemporalEventResetModeConfig::All
+        );
+
+        let before_endpoint = morph.sample(0.499).unwrap().temporal.originals;
+        assert_eq!(
+            before_endpoint.loom.topology,
+            TemporalTopologyConfig::Linear
+        );
+        assert_eq!(before_endpoint.atlas.seed, 11);
+        assert_eq!(before_endpoint.score, a.temporal.originals.score);
+        assert!(matches!(
+            before_endpoint.score.loop_driver,
+            CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 1
+        ));
     }
 
     #[test]
@@ -1625,6 +3582,7 @@ key_threshold: 0.2
         assert_eq!(legacy.visible, None);
         assert_eq!(legacy.paused, None);
         assert_eq!(legacy.bypass_master_fx, None);
+        assert_eq!(legacy.transform, None);
         assert_eq!(legacy.key_threshold, Some(0.2));
 
         let mut other = legacy;
@@ -1646,6 +3604,96 @@ key_threshold: 0.2
         close(sampled.key_threshold.unwrap(), 0.5);
         assert!(sampled.effects.is_none());
         assert!(sampled.blend_mode.is_none());
+    }
+
+    #[test]
+    fn spatial_morph_is_exact_at_endpoints_and_legacy_slots_do_not_claim_it() {
+        let layer_a = SpatialTransform {
+            position: [-0.25, 0.5],
+            scale: [1.0, -1.0],
+            rotation_deg: 170.0,
+            fit: crate::spatial::FitMode::Fit,
+            ..SpatialTransform::default()
+        };
+        let layer_b = SpatialTransform {
+            position: [0.75, -0.5],
+            scale: [4.0, 1.0],
+            rotation_deg: -170.0,
+            fit: crate::spatial::FitMode::Fill,
+            ..SpatialTransform::default()
+        };
+        let master_a = SpatialTransform {
+            skew_axis_deg: 170.0,
+            ..SpatialTransform::default()
+        };
+        let master_b = SpatialTransform {
+            skew_axis_deg: -170.0,
+            ..SpatialTransform::default()
+        };
+        let morph = Morph {
+            a: Some(MorphSlot {
+                master_transform: Some(master_a),
+                layers: vec![LayerMorphSnapshot {
+                    position: 0,
+                    transform: Some(layer_a),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            b: Some(MorphSlot {
+                master_transform: Some(master_b),
+                layers: vec![LayerMorphSnapshot {
+                    position: 0,
+                    transform: Some(layer_b),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(morph.controls_master_transform());
+        assert!(morph.controls_layer_field(0, LayerMorphControl::Transform));
+        assert_eq!(morph.sample(0.0).unwrap().master_transform, Some(master_a));
+        assert_eq!(morph.sample(1.0).unwrap().master_transform, Some(master_b));
+        assert_eq!(
+            morph.sample(0.0).unwrap().layers[0].transform,
+            Some(layer_a)
+        );
+        assert_eq!(
+            morph.sample(1.0).unwrap().layers[0].transform,
+            Some(layer_b)
+        );
+        let middle = morph.sample(0.5).unwrap();
+        let layer = middle.layers[0].transform.unwrap();
+        close(layer.scale[0], 2.0);
+        close(layer.scale[1], 0.0);
+        close(layer.rotation_deg.abs(), 180.0);
+        assert_eq!(layer.fit, crate::spatial::FitMode::Fill);
+        close(middle.master_transform.unwrap().skew_axis_deg.abs(), 180.0);
+
+        let legacy = Morph {
+            a: Some(MorphSlot {
+                layers: vec![LayerMorphSnapshot {
+                    position: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            b: Some(MorphSlot {
+                layers: vec![LayerMorphSnapshot {
+                    position: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!legacy.controls_master_transform());
+        assert!(!legacy.controls_layer_field(0, LayerMorphControl::Transform));
+        let sample = legacy.sample(0.5).unwrap();
+        assert_eq!(sample.master_transform, None);
+        assert_eq!(sample.layers[0].transform, None);
     }
 
     #[test]
@@ -1781,6 +3829,162 @@ key_threshold: 0.2
             0.75,
         );
         close(sampled.master.brightness, 0.5);
+    }
+
+    #[test]
+    fn layer_stack_remaps_preserve_every_saved_rack_donor_identity() {
+        use crate::image_routing::LayerImageStage;
+        use crate::performance::SavedLayerPosition;
+        use crate::visual_rack::{EdgeTiming, GroupId, NodeId, SavedImageTap, VisualNode};
+
+        let selected_rack = |position: u32| {
+            VisualRack::try_from_parts(
+                vec![VisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    VisualNodeKind::Mask(MaskParams::Image(ImageMatte {
+                        tap: SavedImageTap {
+                            source: SavedImageSource::SelectedLayer {
+                                layer_position: SavedLayerPosition::new(position).unwrap(),
+                                stage: LayerImageStage::PostLocalEffects,
+                            },
+                            timing: EdgeTiming::CurrentFrame,
+                        },
+                        ..ImageMatte::default()
+                    })),
+                )],
+                Some(4),
+            )
+            .unwrap()
+        };
+        let route = |rack: &VisualRack| {
+            let node = rack.get(NodeId::new(3).unwrap()).unwrap();
+            let VisualNodeKind::Mask(MaskParams::Image(matte)) = node.kind else {
+                panic!("fixture node must remain an image mask");
+            };
+            matte.tap.source
+        };
+
+        let mut master_rack = selected_rack(0);
+        let group_node = master_rack
+            .push(VisualNodeKind::Mask(MaskParams::Image(ImageMatte {
+                tap: SavedImageTap {
+                    source: SavedImageSource::GroupOutput {
+                        group_id: GroupId::new(91).unwrap(),
+                    },
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                ..ImageMatte::default()
+            })))
+            .unwrap();
+        let mut slot = MorphSlot {
+            master_rack: Some(master_rack),
+            layer_racks: Some(vec![selected_rack(2), selected_rack(1), selected_rack(0)]),
+            ..MorphSlot::default()
+        };
+        slot.temporal.originals.score.loop_driver = CollisionScoreLoopDriverConfig::SelectedLayer {
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+        };
+
+        slot.remap_layers_after_move(0, 2);
+        assert!(matches!(
+            slot.temporal.originals.score.loop_driver,
+            CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 2
+        ));
+        let master = slot.master_rack.as_ref().unwrap();
+        assert!(matches!(
+            route(master),
+            SavedImageSource::SelectedLayer { layer_position, .. }
+                if layer_position == SavedLayerPosition::new(2).unwrap()
+        ));
+        let VisualNodeKind::Mask(MaskParams::Image(group_matte)) =
+            master.get(group_node).unwrap().kind
+        else {
+            panic!("group fixture node must remain an image mask");
+        };
+        assert_eq!(
+            group_matte.tap.source,
+            SavedImageSource::GroupOutput {
+                group_id: GroupId::new(91).unwrap()
+            },
+            "layer permutations must never rewrite stable group identities"
+        );
+        let racks = slot.layer_racks.as_ref().unwrap();
+        assert!(
+            matches!(route(&racks[0]), SavedImageSource::SelectedLayer { layer_position, .. } if layer_position.get() == 0)
+        );
+        assert!(
+            matches!(route(&racks[1]), SavedImageSource::SelectedLayer { layer_position, .. } if layer_position.get() == 2)
+        );
+        assert!(
+            matches!(route(&racks[2]), SavedImageSource::SelectedLayer { layer_position, .. } if layer_position.get() == 1)
+        );
+
+        slot.remap_layers_after_remove(1);
+        assert!(matches!(
+            slot.temporal.originals.score.loop_driver,
+            CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
+                if saved_position.get() == 1
+        ));
+        assert!(matches!(
+            route(slot.master_rack.as_ref().unwrap()),
+            SavedImageSource::SelectedLayer { layer_position, .. } if layer_position.get() == 1
+        ));
+        let racks = slot.layer_racks.as_ref().unwrap();
+        assert_eq!(racks.len(), 2);
+        assert!(
+            matches!(route(&racks[0]), SavedImageSource::SelectedLayer { layer_position, .. } if layer_position.get() == 0)
+        );
+        assert!(matches!(
+            route(&racks[1]),
+            SavedImageSource::MissingSelectedLayer { saved_position, stage }
+                if saved_position.get() == 1
+                    && stage == LayerImageStage::PostLocalEffects
+        ));
+
+        slot.temporal.originals.score.loop_driver = CollisionScoreLoopDriverConfig::SelectedLayer {
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+        };
+        slot.remap_layers_after_remove(1);
+        assert!(matches!(
+            slot.temporal.originals.score.loop_driver,
+            CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position }
+                if saved_position.get() == 1
+        ));
+    }
+
+    #[test]
+    fn sampled_score_driver_resolves_only_selected_configuration() {
+        use crate::image_routing::StableLayerId;
+        use crate::performance::SavedLayerPosition;
+
+        let saved_position = SavedLayerPosition::new(3).unwrap();
+        let layer_id = StableLayerId::new(91).unwrap();
+        assert_eq!(
+            resolve_score_loop_driver(
+                CollisionScoreLoopDriverConfig::SelectedLayer { saved_position },
+                |position| (position == saved_position).then_some(layer_id),
+            ),
+            CollisionScoreLoopDriver::SelectedLayer {
+                layer_id,
+                saved_position,
+            }
+        );
+        assert_eq!(
+            resolve_score_loop_driver(
+                CollisionScoreLoopDriverConfig::SelectedLayer { saved_position },
+                |_| None,
+            ),
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position }
+        );
+        assert_eq!(
+            resolve_score_loop_driver(
+                CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position },
+                |_| Some(layer_id),
+            ),
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position },
+            "an authored tombstone must never bind to a new occupant"
+        );
     }
 
     #[test]
@@ -2226,5 +4430,90 @@ glide:
         close(sample.master.invert, 0.0);
         close(sample.layers[0].opacity, 1.0);
         assert!(sample.temporal.feedback.is_finite());
+    }
+
+    #[test]
+    fn image_route_topology_is_never_morph_owned_or_reverted() {
+        use crate::image_routing::{LayerImageStage, StableLayerId};
+        use crate::performance::SavedLayerPosition;
+        use crate::visual_rack::{
+            EdgeTiming, MatteChannel, NodeId, ResolvedImageSource, RuntimeVisualNodeKind,
+            SavedImageSource, SavedImageTap, VisualNode,
+        };
+
+        let saved_rack = |position: u32, amount: f32| {
+            let matte = ImageMatte {
+                tap: SavedImageTap {
+                    source: SavedImageSource::SelectedLayer {
+                        layer_position: SavedLayerPosition::new(position).unwrap(),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                channel: MatteChannel::Luma,
+                invert: true,
+                amount,
+                threshold: amount,
+                softness: amount * 0.25,
+            };
+            VisualRack::try_from_parts(
+                vec![VisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    VisualNodeKind::Mask(MaskParams::Image(matte)),
+                )],
+                Some(4),
+            )
+            .unwrap()
+        };
+        let a = saved_rack(0, 0.2);
+        let b = saved_rack(0, 0.8);
+        let mismatched_b = saved_rack(1, 0.8);
+        assert!(interpolate_rack(&a, &mismatched_b, [0.5, 0.5], true).is_none());
+
+        let sampled_saved = interpolate_rack(&a, &b, [0.5, 0.5], true).unwrap();
+        let donor_x = StableLayerId::new(10).unwrap();
+        let donor_y = StableLayerId::new(20).unwrap();
+        let sampled = sampled_saved.resolve_routes(
+            |position| (position.get() == 0).then_some(donor_x),
+            |_| false,
+        );
+        let mut live = sampled.clone();
+        let node = live.get_mut(NodeId::new(3).unwrap()).unwrap();
+        let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(live_matte)) = &mut node.kind
+        else {
+            panic!("expected image mask");
+        };
+        live_matte.tap.source = ResolvedImageSource::SelectedLayer {
+            layer_id: donor_y,
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        live_matte.channel = MatteChannel::Blue;
+        live_matte.invert = false;
+        live_matte.amount = 0.11;
+        let before = live.clone();
+
+        assert!(!apply_runtime_rack_values_strict(&sampled, &mut live));
+        assert_eq!(
+            live, before,
+            "live reroute and values must remain untouched"
+        );
+    }
+
+    #[test]
+    fn morph_layer_racks_round_trip_the_257th_saved_position() {
+        let mut slot = MorphSlot::default();
+        let mut racks = vec![VisualRack::empty(); 257];
+        racks[256] = VisualRack::synthetic_legacy(crate::visual_rack::LegacyRackScope::Layer);
+        slot.layer_racks = Some(racks);
+
+        let yaml = serde_yaml::to_string(&slot).unwrap();
+        let restored: MorphSlot = serde_yaml::from_str(&yaml).unwrap();
+        let restored = restored.layer_racks.unwrap();
+        assert_eq!(restored.len(), 257);
+        assert_eq!(
+            restored[256].topology_signature(),
+            crate::visual_rack::LEGACY_LAYER_RACK_SIGNATURE
+        );
     }
 }

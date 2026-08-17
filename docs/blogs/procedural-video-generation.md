@@ -26,8 +26,9 @@ and what still needs evidence.
 | clip luminance/color/motion statistics | deferred | motion statistics require bounded multi-frame decoding and a persistent cache; they are not “almost free” |
 | second-order markov names from two-word phrases | replaced | two-word examples cannot train a genuine second-order model; a weighted finite grammar is honest and deterministic |
 | visual-parameter-driven audio DSP | research gate | the current exporter promises explicit 1x media-audio muxing; pitch shift, convolution, dynamics, smoothing, and loudness need a real DSP contract |
-| content-aware source identity and preflight | implemented in generator v2 | bounded SHA-256 fingerprinting removes host paths from canonical identity and produces a reviewable receipt before commit |
-| automatic batch video rendering | still deferred | v2 prepares reviewable patches, manifests, and receipts but does not yet own a cancellable budgeted GPU render session |
+| content-aware source identity and preflight | implemented in generator v7 / manifest schema v2 | bounded SHA-256 fingerprinting removes host paths from canonical identity and produces a reviewable receipt before commit |
+| bounded spatial mutation | implemented in generator v7 | independent deterministic domains vary continuous position/scale/anchor/rotation/skew/crop while preserving discrete framing and sampling choices |
+| automatic batch video rendering | still deferred | v7 prepares reviewable patches, manifests, and receipts but does not yet own a cancellable budgeted GPU render session |
 
 ---
 
@@ -99,7 +100,9 @@ change a patch.
 
 ### command-line generation and source preflight
 
-generator v2 is deliberately patch-only:
+generator v7 is deliberately patch-only. Versions 4–7 add isolated domains for
+the Collision Rack/composition graph, Temporal Originals, and Motion while
+preserving the projected random streams of older manifests:
 
 ```powershell
 target\release\collide-o-scope.exe generate `
@@ -140,7 +143,7 @@ invocation—so an exceptional later storage failure can leave already committed
 piece directories; the returned error names them. rerunning the same command
 into a clean directory yields byte-identical YAML, manifest, and preflight files.
 
-the v2 manifest retains the v1 FNV field for deserialization compatibility, but
+the schema-v2 manifest retains the v1 FNV field for deserialization compatibility, but
 the authoritative identity is SHA-256 over normalized patch JSON with a
 versioned domain prefix. before hashing, file paths are replaced by content
 references of the form `cos-sha256://<sha256>/<byte-length>` and filenames are
@@ -308,8 +311,9 @@ pad when short, trim when long, and remain independent of visual speed/pause.
 ### next build order
 
 1. **implemented:** bounded atomic patch capture.
-2. **implemented:** deterministic typed generator, weighted titles, v2 manifests,
-   and content-aware preflight receipts.
+2. **implemented:** deterministic typed generator v7, weighted titles,
+   schema-v2 manifests, bounded spatial mutation, and content-aware preflight
+   receipts.
 3. **implemented:** bounded cellular/Worley effect across live and offline paths.
 4. **implemented:** shared digest-enforcing source resolution and path-independent
    canonical patch hashes.

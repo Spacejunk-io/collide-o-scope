@@ -15,6 +15,9 @@ use ntsc_rs::settings::standard::*;
 use ntsc_rs::yiq_fielding::Rgbx;
 use ntsc_rs::{Context, NtscEffect};
 
+use crate::layers::BlendMode;
+use crate::renderer::blend::composite_straight;
+
 /// User-facing VHS parameters (mirrored in the web UI).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NtscParams {
@@ -120,9 +123,9 @@ pub struct SelectiveNtscLayerPlan {
     pub opacity: f32,
     pub blend_mode: u32,
     /// Caller-owned semantic fingerprint. Pixel processing does not interpret
-    /// it. Live uses a stable source-identity projection (never frame-varying
-    /// time or modulation); synchronous export may retain an exact transform
-    /// digest.
+    /// it. It records the exact geometry which produced this coherent pixel
+    /// batch; asynchronous compatibility treats it as a sampled value which
+    /// may trail, just like opacity, blend, and other modulation.
     pub transform_fingerprint: u64,
 }
 
@@ -314,7 +317,7 @@ pub fn selective_generation_compatible(
 
 /// Accept a delayed live plan only within the same structural generation.
 /// Continuously sampled values (program time; sliders/morph; LFO, audio, MIDI,
-/// gyro; frame-local opacity/effect/NTSC/blend values) remain attached to their
+/// gyro; frame-local transform/opacity/effect/NTSC/blend values) remain attached to their
 /// coherent pixel batch and may trail. Requiring those values to equal the
 /// next render frame would starve an asynchronous pipeline. This comparison
 /// instead verifies the immutable ordered layer/routing projection.
@@ -324,11 +327,11 @@ pub fn selective_plan_compatible(
 ) -> bool {
     selective_generation_compatible(completed.generation, current.generation)
         && completed.layers.len() == current.layers.len()
-        && completed.layers.iter().zip(&current.layers).all(|(a, b)| {
-            a.layer_id == b.layer_id
-                && a.bypass_master_fx == b.bypass_master_fx
-                && a.transform_fingerprint == b.transform_fingerprint
-        })
+        && completed
+            .layers
+            .iter()
+            .zip(&current.layers)
+            .all(|(a, b)| a.layer_id == b.layer_id && a.bypass_master_fx == b.bypass_master_fx)
 }
 
 /// True only when a visible bypass layer can contribute pixels. This is the
@@ -347,9 +350,9 @@ where
 ///
 /// Invisible and finite non-positive-opacity layers cannot affect the current
 /// straight-alpha compositor and are omitted, keeping readback memory bounded.
-/// The bottom contributing layer uses Normal just like the GPU path; its blend
-/// mode is immaterial over transparent black, but making the law explicit
-/// prevents live/export drift.
+/// Blend codes remain in their stable append-only protocol domain. Validation
+/// happens in the compositor so an unknown code becomes an operator-visible
+/// worker error rather than silently changing the authored law.
 pub fn plan_selective_ntsc<I>(
     generation: SelectiveNtscGeneration,
     metadata: NtscFrameMetadata,
@@ -366,7 +369,7 @@ where
         return None;
     }
 
-    let mut planned: Vec<_> = descriptors
+    let planned: Vec<_> = descriptors
         .into_iter()
         .filter(|layer| layer.visible && layer.opacity.is_finite() && layer.opacity > 0.0)
         .rev()
@@ -374,13 +377,10 @@ where
             layer_id: layer.layer_id,
             bypass_master_fx: layer.bypass_master_fx,
             opacity: layer.opacity.clamp(0.0, 1.0),
-            blend_mode: layer.blend_mode.min(3),
+            blend_mode: layer.blend_mode,
             transform_fingerprint: layer.transform_fingerprint,
         })
         .collect();
-    if let Some(bottom) = planned.first_mut() {
-        bottom.blend_mode = 0;
-    }
     Some(SelectiveNtscPlan {
         generation,
         metadata,
@@ -791,10 +791,24 @@ pub(crate) fn composite_selective_ntsc_layers(
         ));
     }
 
+    let blend_modes = plan
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| {
+            BlendMode::from_u32(layer.blend_mode).ok_or_else(|| {
+                format!(
+                    "selective NTSC layer {index} has unknown blend mode code {}; expected 0..=14",
+                    layer.blend_mode
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     if plan.layers.len() == 1
         && plan.layers[0].bypass_master_fx
         && plan.layers[0].opacity >= 1.0
-        && plan.layers[0].blend_mode == 0
+        && blend_modes[0] == BlendMode::Normal
     {
         // One fully opaque bypass layer over transparent black is an exact
         // identity operation in the GPU compositor, including RGB stored
@@ -803,53 +817,36 @@ pub(crate) fn composite_selective_ntsc_layers(
     }
 
     let mut base = vec![0u8; expected];
-    for (layer, overlay) in plan.layers.iter().zip(slices) {
+    for ((layer, blend_mode), overlay) in plan.layers.iter().zip(blend_modes).zip(slices) {
         let opacity = layer.opacity.clamp(0.0, 1.0);
         for (base_pixel, overlay_pixel) in base.chunks_exact_mut(4).zip(overlay.chunks_exact(4)) {
             let source_alpha = opacity * (overlay_pixel[3] as f32 / 255.0);
-            if base_pixel[3] == 0 && source_alpha >= 1.0 {
-                // Exact GPU Normal-over-transparent result, including the
-                // otherwise unobservable RGB carried by alpha-zero texels.
-                // Preserving these bytes is important for a fully bypassed
-                // slice and avoids a needless transfer-function round trip.
+            if blend_mode != BlendMode::AlphaCut && base_pixel[3] == 0 && source_alpha >= 1.0 {
+                // Every curated color blend reduces to the source over a
+                // transparent destination. Preserve the exact source bytes;
+                // Alpha Cut instead preserves the transparent destination.
                 base_pixel.copy_from_slice(overlay_pixel);
                 continue;
             }
-            let base_rgb = [
+
+            let base_linear = [
                 srgb_byte_to_linear(base_pixel[0]),
                 srgb_byte_to_linear(base_pixel[1]),
                 srgb_byte_to_linear(base_pixel[2]),
+                base_pixel[3] as f32 / 255.0,
             ];
-            let overlay_rgb = [
+            let overlay_linear = [
                 srgb_byte_to_linear(overlay_pixel[0]),
                 srgb_byte_to_linear(overlay_pixel[1]),
                 srgb_byte_to_linear(overlay_pixel[2]),
+                overlay_pixel[3] as f32 / 255.0,
             ];
-            let base_alpha = base_pixel[3] as f32 / 255.0;
-            let output_alpha = source_alpha + base_alpha * (1.0 - source_alpha);
+            let output = composite_straight(blend_mode, base_linear, overlay_linear, opacity);
 
-            let mut output_rgb = [0.0f32; 3];
-            for channel in 0..3 {
-                let blended = match layer.blend_mode {
-                    1 => 1.0 - (1.0 - base_rgb[channel]) * (1.0 - overlay_rgb[channel]),
-                    2 => base_rgb[channel] * overlay_rgb[channel],
-                    3 => (base_rgb[channel] - overlay_rgb[channel]).abs(),
-                    _ => overlay_rgb[channel],
-                };
-                let premultiplied = base_rgb[channel] * base_alpha * (1.0 - source_alpha)
-                    + overlay_rgb[channel] * source_alpha * (1.0 - base_alpha)
-                    + blended * base_alpha * source_alpha;
-                output_rgb[channel] = if output_alpha > 0.000_001 {
-                    premultiplied / output_alpha.max(0.000_001)
-                } else {
-                    0.0
-                };
-            }
-
-            base_pixel[0] = linear_to_srgb_byte(output_rgb[0]);
-            base_pixel[1] = linear_to_srgb_byte(output_rgb[1]);
-            base_pixel[2] = linear_to_srgb_byte(output_rgb[2]);
-            base_pixel[3] = linear_byte(output_alpha);
+            base_pixel[0] = linear_to_srgb_byte(output[0]);
+            base_pixel[1] = linear_to_srgb_byte(output[1]);
+            base_pixel[2] = linear_to_srgb_byte(output[2]);
+            base_pixel[3] = linear_byte(output[3]);
         }
     }
     Ok(base)
@@ -1373,6 +1370,9 @@ mod tests {
         NtscState, NtscSubmitOutcome, NtscWorker, SelectiveNtscBatch, SelectiveNtscGeneration,
         SelectiveNtscLayerDescriptor, SelectiveNtscWorker, MAX_SELECTIVE_NTSC_LIVE_BYTES,
     };
+    use super::{linear_byte, linear_to_srgb_byte};
+    use crate::layers::BlendMode;
+    use crate::renderer::blend::composite_straight;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn selective_plan_is_bottom_to_top_and_forces_only_bottom_normal() {
+    fn selective_plan_is_bottom_to_top_and_preserves_authored_blends() {
         let plan = plan_selective_ntsc(
             generation(2, 1),
             enabled_metadata(),
@@ -1694,10 +1694,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             [30, 10]
         );
-        assert_eq!(plan.layers[0].blend_mode, 0);
+        assert_eq!(plan.layers[0].blend_mode, 2);
         assert_eq!(plan.layers[1].blend_mode, 3);
         assert!(!plan.layers[0].bypass_master_fx);
         assert!(plan.layers[1].bypass_master_fx);
+    }
+
+    #[test]
+    fn selective_plan_preserves_every_curated_code_without_legacy_clamping() {
+        let plan = plan_selective_ntsc(
+            generation(1, 1),
+            enabled_metadata(),
+            (0..=14).map(|code| descriptor(u64::from(code) + 1, true, true, 1.0, code)),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.layers
+                .iter()
+                .map(|layer| layer.blend_mode)
+                .collect::<Vec<_>>(),
+            (0..=14).rev().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1741,14 +1758,12 @@ mod tests {
         current.metadata.params.snow_intensity = 0.7;
         current.layers[0].opacity = 0.9;
         current.layers[0].blend_mode = 1;
+        current.layers[0].transform_fingerprint ^= 1;
         assert!(
             selective_plan_compatible(&completed, &current),
-            "frame-local modulation remains a coherent delayed sample"
+            "frame-local modulation and geometry remain a coherent delayed sample"
         );
 
-        current.layers[0].transform_fingerprint ^= 1;
-        assert!(!selective_plan_compatible(&completed, &current));
-        current.layers[0].transform_fingerprint ^= 1;
         current.generation.topology_generation += 1;
         assert!(!selective_plan_compatible(&completed, &current));
     }
@@ -1868,6 +1883,144 @@ mod tests {
             composite_selective_ntsc_layers(&normal_plan, &[overlay.to_vec(), base.to_vec()])
                 .unwrap();
         assert_ne!(reversed, overlay, "layer order must be observable");
+    }
+
+    fn reference_composite_pass(
+        mode: BlendMode,
+        base: [u8; 4],
+        overlay: [u8; 4],
+        opacity: f32,
+    ) -> [u8; 4] {
+        let base = [
+            srgb_byte_to_linear(base[0]),
+            srgb_byte_to_linear(base[1]),
+            srgb_byte_to_linear(base[2]),
+            base[3] as f32 / 255.0,
+        ];
+        let overlay = [
+            srgb_byte_to_linear(overlay[0]),
+            srgb_byte_to_linear(overlay[1]),
+            srgb_byte_to_linear(overlay[2]),
+            overlay[3] as f32 / 255.0,
+        ];
+        let output = composite_straight(mode, base, overlay, opacity);
+        [
+            linear_to_srgb_byte(output[0]),
+            linear_to_srgb_byte(output[1]),
+            linear_to_srgb_byte(output[2]),
+            linear_byte(output[3]),
+        ]
+    }
+
+    #[test]
+    fn selective_compositor_uses_shared_reference_for_all_half_alpha_modes() {
+        let base = [128, 64, 32, 128];
+        let overlay = [32, 192, 224, 128];
+        for mode in BlendMode::ALL {
+            let plan = plan_selective_ntsc(
+                generation(1, 1),
+                enabled_metadata(),
+                [
+                    descriptor(1, true, true, 0.75, mode.as_u32()),
+                    descriptor(2, true, true, 1.0, BlendMode::Normal.as_u32()),
+                ],
+            )
+            .unwrap();
+            let result =
+                composite_selective_ntsc_layers(&plan, &[base.to_vec(), overlay.to_vec()]).unwrap();
+            let quantized_base = reference_composite_pass(BlendMode::Normal, [0; 4], base, 1.0);
+            let expected = reference_composite_pass(mode, quantized_base, overlay, 0.75);
+            assert_eq!(result, expected, "mode {} ({})", mode.as_u32(), mode.key());
+        }
+    }
+
+    #[test]
+    fn transparent_bottom_law_is_source_for_color_blends_and_noop_for_alpha_cut() {
+        let source = [17, 93, 241, 128];
+        for mode in BlendMode::ALL {
+            let plan = plan_selective_ntsc(
+                generation(1, 1),
+                enabled_metadata(),
+                [descriptor(1, true, true, 0.5, mode.as_u32())],
+            )
+            .unwrap();
+            let result = composite_selective_ntsc_layers(&plan, &[source.to_vec()]).unwrap();
+            let expected = reference_composite_pass(mode, [0; 4], source, 0.5);
+            assert_eq!(result, expected, "mode {} ({})", mode.as_u32(), mode.key());
+            if mode == BlendMode::AlphaCut {
+                assert_eq!(result, [0, 0, 0, 0]);
+            } else {
+                assert_eq!(&result[..3], &source[..3]);
+                assert_eq!(result[3], 64);
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_cut_bottom_is_noop_and_opaque_cut_is_canonical_transparency() {
+        let bottom_cut = plan_selective_ntsc(
+            generation(1, 1),
+            enabled_metadata(),
+            [descriptor(1, true, true, 1.0, BlendMode::AlphaCut.as_u32())],
+        )
+        .unwrap();
+        assert_eq!(
+            composite_selective_ntsc_layers(&bottom_cut, &[vec![91, 37, 203, 255]]).unwrap(),
+            [0, 0, 0, 0]
+        );
+
+        let opaque_cut = plan_selective_ntsc(
+            generation(1, 1),
+            enabled_metadata(),
+            [
+                descriptor(1, true, true, 1.0, BlendMode::AlphaCut.as_u32()),
+                descriptor(2, true, true, 1.0, BlendMode::Normal.as_u32()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            composite_selective_ntsc_layers(
+                &opaque_cut,
+                &[vec![203, 71, 19, 255], vec![255, 255, 255, 255]],
+            )
+            .unwrap(),
+            [0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn selective_compositor_rejects_unknown_blend_codes_without_fallback() {
+        let plan = plan_selective_ntsc(
+            generation(1, 1),
+            enabled_metadata(),
+            [descriptor(1, true, true, 1.0, 15)],
+        )
+        .unwrap();
+        let error = composite_selective_ntsc_layers(&plan, &[vec![1, 2, 3, 255]]).unwrap_err();
+        assert!(error.contains("unknown blend mode code 15"));
+        assert!(error.contains("expected 0..=14"));
+    }
+
+    #[test]
+    fn blend_code_above_three_no_longer_collapses_to_normal() {
+        let render = |mode: BlendMode| {
+            let plan = plan_selective_ntsc(
+                generation(1, 1),
+                enabled_metadata(),
+                [
+                    descriptor(1, true, true, 1.0, mode.as_u32()),
+                    descriptor(2, true, true, 1.0, BlendMode::Normal.as_u32()),
+                ],
+            )
+            .unwrap();
+            composite_selective_ntsc_layers(
+                &plan,
+                &[vec![96, 48, 24, 255], vec![80, 120, 160, 255]],
+            )
+            .unwrap()
+        };
+        assert_ne!(render(BlendMode::Add), render(BlendMode::Normal));
+        assert_ne!(render(BlendMode::AlphaCut), render(BlendMode::Difference));
     }
 
     #[test]

@@ -48,11 +48,107 @@ struct Uniforms {
     shift_block_size: f32,
     shift_density: f32,
     shift_speed: f32,
+    // Canonical authored spatial transform. These four vec4 slots are packed
+    // immediately after the ten legacy effect slots by EffectPassUniforms.
+    spatial_inverse_row_0: vec4f,
+    spatial_inverse_row_1: vec4f,
+    // Crop origin X/Y followed by crop extent X/Y in source UV space.
+    spatial_crop: vec4f,
+    // Edge mode, sampling mode, valid flag, spatial-active flag.
+    spatial_modes: vec4u,
 };
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var nearest_samp: sampler;
 @group(1) @binding(0) var<uniform> uniforms: Uniforms;
+
+fn straight_from_premultiplied_filter(value: vec4f) -> vec4f {
+    let alpha = clamp(value.a, 0.0, 1.0);
+    if alpha <= 0.000001 {
+        return vec4f(0.0);
+    }
+    return vec4f(value.rgb / alpha, alpha);
+}
+
+// Advanced authored transforms retain straight-alpha storage, but hardware
+// filtering straight RGB would interpolate hidden color before coverage.
+// Load four texels, premultiply each independently, then bilinearly resolve
+// and return to the storage contract. The legacy inactive branch below stays
+// on its frozen textureSample expression byte-for-byte.
+fn sample_source_premultiplied_linear(uv: vec2f) -> vec4f {
+    let dimensions = vec2i(textureDimensions(tex));
+    let coordinate = uv * vec2f(dimensions) - vec2f(0.5);
+    let base = vec2i(floor(coordinate));
+    let fraction = fract(coordinate);
+    let maximum = dimensions - vec2i(1);
+    let p00 = clamp(base, vec2i(0), maximum);
+    let p10 = clamp(base + vec2i(1, 0), vec2i(0), maximum);
+    let p01 = clamp(base + vec2i(0, 1), vec2i(0), maximum);
+    let p11 = clamp(base + vec2i(1, 1), vec2i(0), maximum);
+    let s00 = textureLoad(tex, p00, 0);
+    let s10 = textureLoad(tex, p10, 0);
+    let s01 = textureLoad(tex, p01, 0);
+    let s11 = textureLoad(tex, p11, 0);
+    let c00 = vec4f(s00.rgb * clamp(s00.a, 0.0, 1.0), clamp(s00.a, 0.0, 1.0));
+    let c10 = vec4f(s10.rgb * clamp(s10.a, 0.0, 1.0), clamp(s10.a, 0.0, 1.0));
+    let c01 = vec4f(s01.rgb * clamp(s01.a, 0.0, 1.0), clamp(s01.a, 0.0, 1.0));
+    let c11 = vec4f(s11.rgb * clamp(s11.a, 0.0, 1.0), clamp(s11.a, 0.0, 1.0));
+    let covered = mix(mix(c00, c10, fraction.x), mix(c01, c11, fraction.x), fraction.y);
+    return straight_from_premultiplied_filter(covered);
+}
+
+// Map a composition-space UV through the canonical inverse transform and the
+// cropped source rectangle. The inactive branch deliberately contains the
+// exact historical sample expression: legacy patches must not gain a clamp,
+// coordinate operation, or filtering change merely because the uniform block
+// grew. Transparent edges still execute a texture sample so textureSample is
+// never placed behind fragment-varying control flow (which would invalidate
+// implicit derivatives on strict WGSL backends).
+fn sample_source(output_uv: vec2f) -> vec4f {
+    if uniforms.spatial_modes.w == 0u {
+        return textureSample(tex, samp, output_uv);
+    }
+    if uniforms.spatial_modes.z == 0u {
+        return vec4f(0.0);
+    }
+
+    var local_uv = vec2f(
+        dot(uniforms.spatial_inverse_row_0.xy, output_uv)
+            + uniforms.spatial_inverse_row_0.z,
+        dot(uniforms.spatial_inverse_row_1.xy, output_uv)
+            + uniforms.spatial_inverse_row_1.z,
+    );
+    var coverage = 1.0;
+    let edge_mode = uniforms.spatial_modes.x;
+    if edge_mode == 0u {
+        let inside = all(local_uv >= vec2f(0.0)) && all(local_uv <= vec2f(1.0));
+        coverage = select(0.0, 1.0, inside);
+        // Keep the speculative sample bounded even when coverage is zero.
+        local_uv = clamp(local_uv, vec2f(0.0), vec2f(1.0));
+    } else if edge_mode == 1u {
+        local_uv = clamp(local_uv, vec2f(0.0), vec2f(1.0));
+    } else if edge_mode == 2u {
+        local_uv = fract(local_uv);
+    } else {
+        // Triangle-wave mirror repeat: 0,1,0 over every two unit intervals.
+        local_uv = vec2f(1.0) - abs(fract(local_uv * 0.5) * 2.0 - vec2f(1.0));
+    }
+
+    let source_uv = uniforms.spatial_crop.xy + local_uv * uniforms.spatial_crop.zw;
+    var sampled: vec4f;
+    if uniforms.spatial_modes.y == 1u {
+        sampled = textureSample(tex, nearest_samp, source_uv);
+    } else if uniforms.spatial_modes.w == 1u {
+        // Frozen LegacyExact active-spatial law. Advanced upgrades the mode to
+        // 2 at its private uniform-upload boundary; legacy live/export keeps
+        // the historical hardware straight-alpha sample byte-for-byte.
+        sampled = textureSample(tex, samp, source_uv);
+    } else {
+        sampled = sample_source_premultiplied_linear(source_uv);
+    }
+    return sampled * coverage;
+}
 
 // --- Hash / noise functions (ported from legacy GLSL) ---
 
@@ -372,7 +468,15 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
             warp_cells = (field.zw / field.x) * min(field.x, 0.5) * (0.28 * warp);
         }
         let warp_uv = warp_cells / vec2f(scale * aspect, scale);
-        sample_uv = clamp(sample_uv + warp_uv * amount, vec2f(0.0), vec2f(1.0));
+        let warped_uv = sample_uv + warp_uv * amount;
+        // Preserve the historical clamp only for the exact legacy bypass.
+        // Active transforms delegate every exposed coordinate to their
+        // explicit Transparent/Clamp/Repeat/Mirror edge law.
+        if uniforms.spatial_modes.w == 0u {
+            sample_uv = clamp(warped_uv, vec2f(0.0), vec2f(1.0));
+        } else {
+            sample_uv = warped_uv;
+        }
     }
 
     // --- Shift (seeded horizontal block displacement) ---
@@ -390,7 +494,11 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         if gate < density {
             let direction = hash(vec2f(band * 1.6180339 + seed, epoch + 73.0)) * 2.0 - 1.0;
             let offset = direction * amount * 0.25;
-            sample_uv.x = fract(sample_uv.x + offset + 1.0);
+            if uniforms.spatial_modes.w == 0u {
+                sample_uv.x = fract(sample_uv.x + offset + 1.0);
+            } else {
+                sample_uv.x += offset;
+            }
         }
     }
 
@@ -413,21 +521,23 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         let seed = floor(uniforms.time * 30.0) + pattern_seed_offset();
         let r_shift = (hash(vec2f(seed, 10.0)) - 0.5) * uniforms.color_drift;
         let b_shift = (hash(vec2f(seed, 11.0)) - 0.5) * uniforms.color_drift;
-        let r = textureSample(tex, samp, vec2f(sample_uv.x + r_shift, sample_uv.y)).r;
-        let g = textureSample(tex, samp, sample_uv).g;
-        let b = textureSample(tex, samp, vec2f(sample_uv.x + b_shift, sample_uv.y)).b;
-        let a = textureSample(tex, samp, sample_uv).a;
+        let center = sample_source(sample_uv);
+        let r = sample_source(vec2f(sample_uv.x + r_shift, sample_uv.y)).r;
+        let g = center.g;
+        let b = sample_source(vec2f(sample_uv.x + b_shift, sample_uv.y)).b;
+        let a = center.a;
         color = vec4f(r, g, b, a);
     } else if uniforms.rgb_split > 0.0 {
         // --- Static RGB Split ---
         let offset = uniforms.rgb_split / uniforms.resolution.x;
-        let r = textureSample(tex, samp, vec2f(sample_uv.x + offset, sample_uv.y)).r;
-        let g = textureSample(tex, samp, sample_uv).g;
-        let b = textureSample(tex, samp, vec2f(sample_uv.x - offset, sample_uv.y)).b;
-        let a = textureSample(tex, samp, sample_uv).a;
+        let center = sample_source(sample_uv);
+        let r = sample_source(vec2f(sample_uv.x + offset, sample_uv.y)).r;
+        let g = center.g;
+        let b = sample_source(vec2f(sample_uv.x - offset, sample_uv.y)).b;
+        let a = center.a;
         color = vec4f(r, g, b, a);
     } else {
-        color = textureSample(tex, samp, sample_uv);
+        color = sample_source(sample_uv);
     }
 
     var rgb = color.rgb;

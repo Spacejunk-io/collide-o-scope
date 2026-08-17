@@ -8,23 +8,31 @@ control panel.
 > This is a fork of [collide-o-scope by Luis Queral](https://github.com/luismqueral/collide-o-scope)
 > ([queral.studio](https://queral.studio)). The original engine, compositing
 > architecture, and effect suite are his work. This fork adds the modulation
-> matrix, remote control, audio/MIDI reactivity, temporal effects, Spout I/O,
-> offline export, and Windows support. See [LICENSE](LICENSE) for the precise
-> licensing and attribution boundary.
+> matrix, remote control, prepared performance, Collision Rack, temporal and
+> motion studies, professional control/stage tools, Spout I/O, offline export,
+> and Windows support. See [LICENSE](LICENSE) for the precise licensing and
+> attribution boundary.
 
 <img width="1919" height="1040" alt="collide-o-scope" src="https://github.com/user-attachments/assets/3690c19f-8ab4-4a9d-9672-45476da4dede" />
 
 ## What it does
 
 - Composites a dynamically sized stack of video, PNG/JPEG/BMP/WebP still, or
-  live Spout layers with normal, screen, multiply, and difference blending.
-  There is no fixed layer-count policy; usable depth is governed by source,
-  GPU, output-resolution, and selective-VHS memory resources.
+  live Spout layers with a curated 15-mode blend set, typed image routing,
+  one-level groups, and A/B buses.
+  The composition contract caps a stack at 256 layers; practical usable depth
+  can be lower under source, GPU, output-resolution, motion, and selective-VHS
+  resource plans.
 - Applies per-layer and master pixelation, RGB split, hue, saturation,
   brightness, contrast, posterize, invert, film grain, vignette, color drift,
   breathing motion, seeded horizontal block Shift, luminance/chroma keying,
   and bounded animated cellular/Worley warping with a separately feathered
   cell-gap key.
+- Applies one resolution-independent spatial transform at every layer and at
+  master scope: Fit/Fill/Stretch/Native framing, crop, position, independent
+  X/Y scale, source-space anchor, rotation, axis-directed skew, explicit edge
+  behavior, and linear or nearest sampling. Live preview, selective VHS, and
+  offline export use the same packed transform/effect pass.
 - Runs [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) VHS simulation without
   blocking the render thread. Existing all-inherited stacks keep the global
   post-composite path; a contributing **Bypass Master FX** layer selects an
@@ -32,6 +40,10 @@ control panel.
 - Provides feedback trails and arbitrary-angle slit-scan from a 24-sample
   temporal history. History advances at a fixed 30 Hz, so its approximately
   0.8-second span does not change with display or export frame rate.
+- Adds prepared clip slots, bounded cue/loop transport, and atomic Scenes;
+  bounded Collision Racks at master, layer, and group scope; Temporal Topology
+  Loom, Collision Atlas, Refresh Garden, and Collision Score; and deterministic
+  motion fields, Faraday Motion Transplant, and Curved Shutter Sculpture.
 - Saves complete YAML performance patches. **Load snapshot** reconstructs the
   saved performance, while **Apply look** transfers its visual treatment onto
   the sources already on stage.
@@ -50,9 +62,117 @@ control panel.
   **Expert** mode for future large video, still, and Spout opens. Expert remains
   bounded by fixed area/edge ceilings, device limits, and a conservative host-
   memory plan; it is not an unbounded allocation switch.
-- Renders MP4 files through a deterministic frame-indexed offline path; real
-  MIDI, phone, Spout, audio-device, and multi-GPU output still require the
-  corresponding hardware for end-to-end validation.
+- Renders MP4 files through a deterministic frame-indexed offline path and can
+  publish a bounded motion-provenance sidecar. A separate nonblocking live
+  recorder captures Program or an exact layer/group scope, takes PNG stills,
+  and resamples durable results into a prepared clip slot.
+- Provides bounded manual undo/redo, scoped presets, a recovery journal with
+  explicit restore/discard, controller profiles, typed OSC, a preview-only
+  health HUD, and a separately
+  persisted StageMap. Real MIDI, phone, Spout, audio-device, encoder, and venue
+  display behavior still require end-to-end validation on the intended hardware.
+
+## Creative composition and prepared performance
+
+The **Collision Rack + Groups** panel replaces a fixed effect order with a
+small, preflighted graph while preserving the exact historical path for old
+patches. A master, layer, or group rack contains at most eight stable-ID nodes:
+Transform, Digital/Color, Key, Cellular, Shift, Grain, or geometric/image Mask.
+Every node has enable, wet mix, and one of 15 curated blends. Legacy Canonical
+and Legacy Temporal markers retain the established order during migration.
+Unsafe sample counts, image dependencies, current-frame cycles, or GPU resource
+plans are rejected before the live graph changes.
+
+The composition root can contain layers and up to 16 one-level groups. Groups
+own contiguous members, opacity, transform, rack, matte, solo/bypass, and a
+Program/A/B bus assignment. Root order and stable `GroupId`/`NodeId` references
+survive edits; deletion leaves a visible missing-reference tombstone instead of
+silently retargeting another image. The A/B fader linearly crossfades the two
+premultiplied-linear bus accumulators while Program-bus items remain direct.
+
+Layer mattes and image-mask nodes can read a selected layer before or after its
+local effects, one layer below, all content below, the clean program, the
+previous program-history frame, or a stable group output. Channel, invert,
+amount, threshold, and softness are authored values. Same-frame dependencies
+must be acyclic; explicit Previous Frame is exactly N−1.
+
+Each layer's **Performance Set** owns up to 32 stable clip slots. Loading a file
+into a slot probes, decodes, and uploads a replacement before it can become
+active. Transport supports forward/reverse playback; Loop, Ping-Pong, One Shot,
+or Hold endings; in/out points; rate and fixed sample-FPS policies; beat grids
+and beat loops; and up to 64 numeric cues. Activation can be immediate, next
+beat, or next bar. Up to 128 named Scenes bind prepared slots (and optional
+cues) across as many as 256 layer positions; prepare/trigger is one atomic
+transaction, so one bad or stale binding prevents a partial scene change.
+
+## Temporal originals and motion
+
+The fixed 30 Hz, 24-sample program history also powers four original studies:
+
+- **Temporal Topology Loom** draws age as linear, radial, spiral, contour,
+  folded, or kaleidoscopic surfaces with floor or linear history sampling.
+- **Collision Atlas** assigns seeded temporal territories and controls their
+  collisions.
+- **Refresh Garden** admits and holds memory through temporal-delta, luma,
+  chroma, cellular-ridge, audio-energy, audio-onset, or matte gates.
+- **Collision Score** advances a deterministic seeded state on a selected loop
+  boundary, downbeat, audio onset, or explicit manual event. Separate reset law
+  chooses whether loop/downbeat events clear Score, memory, both, or neither.
+
+Temporal zero modes preserve the earlier renderer. Freeze, reset, event, patch,
+Morph, modulation, Dice, and offline-frame laws are explicit and covered by
+deterministic fixtures; this is software evidence, not a claim about every GPU.
+
+At master and layer scope, **Motion Fields** selects valid codec vectors,
+deterministic Motion Lattice block matching, or Auto (visible lattice fallback
+on layers; lattice on master). Draft/Live/High field tiers are fixed rather
+than silently degraded under load. A layer can donate stable-ID motion to the
+single admitted **Faraday Motion Transplant** carrier, and **Curved Shutter**
+uses fixed Sharp/Draft/Live/High sample counts. Field, carrier, and transplant
+resources are hard-bounded and a zero amount/angle is an exact bypass.
+
+Offline export writes `<video>.motion.json` only after the video succeeds. The
+bounded schema-v1 report records source fingerprints when available, authored
+scope/algorithm/quality/carrier choices, observed field origin and diagnostics,
+dynamic-state changes, the last accepted frame, and warnings. It explicitly
+sets cross-GPU pixel identity to false; it is provenance, not a promise that
+different drivers render identical pixels.
+
+## Spatial transforms
+
+The master and every layer expose the same authored transform. Position is in
+normalized composition coordinates; `[0, 0]` is centered. Scale is independent
+on X and Y, negative values mirror, and the anchor is expressed in original
+source UV coordinates. Changing only the anchor is visually inert: it chooses
+the pivot used by scale, skew, and rotation rather than translating the image.
+Positive rotation is clockwise in screen space. Skew has its own axis angle.
+
+The forward order is crop and framing, authored scale, skew about its axis,
+rotation, then position about the selected anchor. Fit shows the complete
+cropped source, Fill covers the composition, Stretch reproduces the historical
+full-frame mapping, and Native maps source pixels one-for-one to output pixels.
+Transparent, Clamp, Repeat, and Mirror define out-of-bounds sampling; Linear
+and Nearest select filtering. Collapsed or invalid transforms produce
+transparent output rather than invalid GPU coordinates.
+
+Old patches have no transform section and therefore retain the exact historical
+inactive full-frame sample, including the original shader expression. Their
+authored edge default is Transparent, so moving or shrinking that identity does
+not smear a border into newly exposed canvas; Clamp remains an explicit choice.
+The host-session **New layer framing** preference defaults to Fit; every future
+interactive file, still, or Spout layer combines that choice with Transparent
+edges, while existing and patch-recalled layers remain untouched. It is not
+artistic patch state. The browser supplies
+linked-scale editing, reset, copy/paste, and framing presets. Absolute
+per-layer actions use immutable layer IDs, so reorder cannot redirect a late
+transform edit.
+
+Transforms are complete patch and Apply-look state, optional Morph A/B state,
+continuous modulation destinations, and an opt-in part of Bounded-variation
+Dice. Procedural generator v7 mutates continuous spatial values through
+independent deterministic streams while preserving the saved discrete fit,
+edge, and sampling choices. The same evaluated state reaches live and offline
+rendering.
 
 ## The modulation matrix
 
@@ -65,7 +185,7 @@ unchanged.
 |---|---|
 | 4 LFOs | Sine, triangle, saw, square, or deterministic sample-and-hold; musical divisions; tap-tempo or MIDI clock |
 | Audio | Live input, Windows system-playback loopback, or deterministic looping WAV/MP3/FLAC/Ogg/Opus/M4A/AAC analysis; level; 3–8 configurable bands; onset, brightness, noisiness; and a 32-bin display spectrum |
-| MIDI | Four MIDI-learn CC slots plus 24-PPQN clock/start handling |
+| MIDI | Legacy four-CC learn surface plus a separately persisted typed profile: selected input/output, channel filters, note and absolute/relative CC sources, button modes, Start/Continue/Stop/24-PPQN Clock, and bounded feedback |
 | Phone | Calibrated yaw/pitch/roll and a multitouch XY pad |
 
 Each routing supports signed depth, Linear/Exp/Log/SCurve/Steps response, curve
@@ -83,14 +203,18 @@ curve, and slew work is not repeated for each consumer. Offline rendering uses
 the same frame-indexed ordering.
 
 The matrix exposes every continuous master and NTSC value, Shift amount/block
-size/density/speed, temporal feedback, slit-scan and history-key values, morph
-position, and each layer's opacity, speed, target FPS, key controls, and
-continuous effects. This includes RGB
+size/density/speed, spatial position/scale/anchor/rotation/skew/skew-axis/crop,
+temporal feedback/slit-scan/history-key plus bounded Loom/Atlas/Garden values,
+master/layer Curved Shutter and layer Faraday values, Morph position, and each
+layer's opacity, speed, target FPS, key controls, spatial values, and continuous
+effects. Stable-ID targets also cover compatible rack-node wet/numeric values,
+group opacity/transform/matte values, and the composition A/B crossfade. This includes RGB
 chroma targets/tolerance, key thresholds and softness, temporal key history,
 and VHS edge-wave speed, tracking wave, composite/chroma noise, luma smear,
-and sharpening. Selector choices such as static/temporal key mode, blend mode,
-and grain algorithm remain deliberate discrete controls and are not modulation
-targets. The legacy patch target `layerN_key` is read as the canonical
+and sharpening. Selector/topology choices—image routes, static/temporal key
+mode, rack order/blend, Temporal topology/gate/Score/reset law, Motion field/
+quality/donor/carrier, and grain algorithm—remain deliberate discrete controls,
+not modulation targets. The legacy patch target `layerN_key` is read as the canonical
 `layerN_key_threshold`; if both spellings occur, the canonical route wins.
 Every current layer is routable, including stacks beyond the original panel's
 former 16-layer ceiling; the independent limit remains 64 simultaneous routes.
@@ -166,15 +290,25 @@ Freeze Program.
 
 **RANDOM / DICE** is deterministic. **Pattern only** changes stochastic shader
 seeds without moving effect controls. **Bounded variation** first chooses the
-seeds, then makes range-safe changes to continuous Digital, Analog, Motion,
-Shift, and core Cellular amount/scale/warp/speed controls; **Amount** sets their scale
-and **Grain mode** additionally allows the grain algorithm and color-grain
-switch to change. Sources, stack, opacity, visibility, blend, keying, Bypass
-Master FX, transport, routings, VHS, and Temporal are not randomized.
+seeds, then makes range-safe changes to continuous Digital/Color, analog-motion,
+Shift, core Cellular, Temporal Loom/Atlas/Garden, and M4 Motion values for the
+applicable scope. **Amount** sets their scale and **Grain mode** additionally
+allows the grain algorithm and color-grain switch to change. **Transform** opts
+bounded position, scale, anchor, rotation, skew/axis, and crop in; **Rack
+values** opts compatible node wet/numeric values in; and **Composition values**
+opts group opacity/transform/matte values (plus A/B crossfade for Everything)
+in. These three are off by default. Pattern-only and automatic per-loop rerolls
+never move those controls. Sources, topology, image routes, node IDs/order/
+enabled/blend, group membership/solo/bypass/bus, layer opacity/visibility/blend/key,
+master-FX bypass, transport, modulation routes, VHS, temporal topology/seeds/
+Score/reset/loop-driver law, and Motion algorithm/source/quality/donor/carrier
+law are never randomized.
 
 **Master** targets the master pattern plus all four LFO seeds; **Everything**
-also targets every current layer. A layer card has its own seed and
-pattern-only reroll. Leave **Exact seed** blank to advance deterministically
+also targets every current layer and can include compatible composition values.
+**Group** changes only explicitly opted compatible rack/composition values for
+the selected stable group. A layer card has its own seed and pattern-only
+reroll. Leave **Exact seed** blank to advance deterministically
 from stored master/layer seeds, or enter an unsigned 32-bit base value to
 replay it. Master keeps that base exactly; Everything derives reproducible
 per-position layer streams. Master and Everything derive all four LFO seeds
@@ -302,6 +436,113 @@ stale ID or reorder revision is rejected rather than being applied to the clip
 that now occupies the old index. See
 [docs/remote-control.md](docs/remote-control.md) for setup and troubleshooting.
 
+## Professional console and stage
+
+Manual browser and native-editor work uses one bounded, gesture-coalesced
+undo/redo history. A checkpoint includes the complete authored world—patch,
+stable layer identities and selection, patch base directory, StageMap, preset
+library, and controller profile—but never GPU/decoder/history pixels. MIDI,
+OSC, LFO, audio, clip triggers, and Collision Score do not flood that history.
+Undo/redo validates and durably publishes a candidate before changing the live
+world or history cursor.
+
+The separately persisted preset library stores values-only Transform, Rack,
+Matte, and Group presets that preserve identity/topology, plus exact bounded
+Controller Profile and StageMap documents. The append-only recovery journal is
+patch-only, checksum-framed, capped, and tolerant of a truncated/corrupt tail.
+Startup can offer its newest valid checkpoint, but never applies it without an
+explicit **Restore checkpoint** action.
+
+A typed controller profile is separate from the artistic patch. It can select
+MIDI input and output devices, filter channels, map notes or absolute/relative
+CC encodings and button modes to the closed control vocabulary, follow
+Start/Continue/Stop/Clock, and send bounded feedback. Saved layer positions are
+resolved once to stable live identities and never retarget after reorder. Typed
+OSC uses the same address vocabulary and bounded queues/rates. It defaults to
+loopback port 9000; LAN binding requires explicit configuration and always
+shows a warning. OSC packets cannot choose files, change peers/bind authority,
+invent controls, or dispatch arbitrary browser JSON.
+
+MIDI ingress admits only exact supported wire shapes and rejects high-bit data
+or wrong/extra lengths before Learn, clock, queues, decoder state, or events can
+change. Controller-profile JSON import/export is bounded and portable: native
+paths belong only to desktop pickers, while the browser contract can carry a
+typed document or request an export but has no path authority. A candidate is
+validated and resolved into one matching persisted/runtime pair before swap.
+See [Controller profile JSON](docs/controller-profile.md) for the exact schema,
+bounds, native shortcuts, and authenticated pathless browser endpoint.
+
+The live recorder uses fixed readback/pool capacity and never waits for FFmpeg
+on the render thread. Program recording taps the final audience after NTSC and
+absolute blackout; still/resample targeting can instead name one exact stable
+post-effects layer or group. Missing targets drop visibly rather than falling
+back to Program. Native pickers choose destinations, publication is
+create-new/sync/atomic-no-replace, and auto-import or a new prepared
+`ClipSlotId` occurs only after durable success. Recording is currently
+video-only; timing/drop truth and audio-clock correlation go in a bounded
+`.recording.json` sidecar, but audio is not claimed to be muxed.
+
+The stage-health HUD reports bounded frame percentiles/deadlines, per-layer
+decode age/queue/drop health, output identity/mode, and known resource budgets.
+Video decoder telemetry measures publish/consume age, the zero-or-one command
+and completed-frame depths, published/consumed totals, overwrite/drop counts,
+fixed-64 rolling decode/upload/publish-to-consume p95, and successful CPU upload wall timing without
+allocating in the decode hot path; absent decoder telemetry remains absent.
+It has an editor-preview-only permit and cannot enter audience, Spout,
+recording, or export pixels. `StageMap` is a different persisted venue document,
+not part of `PatchState`: up to 16 endpoints and 256 total slices can apply
+source rectangles, four-corner perspective or bounded convex polygon masks,
+edge feather, linear calibration, test cards, and endpoint identification.
+Monitor-bound endpoints use independent windows/surfaces and failure states;
+an unassigned endpoint remains offscreen and cannot be presented.
+
+The exact persistence, failure, recorder, health, and StageMap contracts are in
+[Professional console and stage](docs/professional-console-and-stage.md).
+
+## Precision and scale boundary
+
+Milestone 6 froze measurement and trust contracts rather than pretending that
+every evaluated integration shipped. `LegacyCompat8` remains the byte-exact
+compatibility path. The minimum Advanced executor uses eight straight-linear
+RGBA16Float working surfaces plus 25 Compat8 temporal surfaces: the 24-frame
+clean ring and one recursive-feedback image. Advanced filters and accumulates
+covered color premultiplied at spatial/temporal boundaries, while final
+presentation alone receives deterministic 8×8 ordered dithering; intermediate
+Compat8 history/feedback conversion is not dithered. Full-16 temporal storage is
+only a resource-accounted candidate.
+
+The local 192×108 Windows/Vulkan physical-GPU receipt measures production still
+and active-feedback shaders against an independent reference. Advanced improves
+RGBA16F working RMSE for both workloads and improves final 8×8 spatial-mean
+error, while final temporal pointwise RMSE/gradient direction regresses under
+the intentional dither pattern; both facts are reported. Its one-shot wall
+times are smoke observations, not comparative throughput evidence. See the
+[receipt](docs/evidence/m6-precision-gpu-receipt.json) and
+[precision boundary](docs/precision-and-scale.md). The bounded still/temporal
+working and spatial-presentation gains satisfy this evaluation's measured
+artist-relevant evidence gate without making a blanket subjective claim. A
+local receipt alone does not close the cross-platform boundary: the exact
+published SHA must pass hosted Linux, macOS, and Windows jobs with durable URLs.
+
+Content-addressed proxy keys/plans and bounded playback observations are pure
+assessment today—there is no integrated proxy encoder or cache worker. Study
+schema 1 / ABI 1.0 is a closed, at-most-1-MiB data-only SSA format with fixed
+read-only creative inputs and no native code, shader injection, filesystem,
+network, process, device, or host-mutation authority. It is not a general plugin
+ABI and its data license cannot license the host application.
+
+Live proxy observations assess every measured video source, including ordinary
+paths, and can recommend a proxy from decode, upload, age, drop, and queue
+pressure. Only a content-addressed cache key/preflight requires an
+already-verified retained `cos-sha256://` identity; ordinary paths do not cause
+background or warm-path fingerprinting merely to obtain one.
+
+Hardware decode, zero-copy decode, Syphon, NDI, external capture-input backends, full-16
+history, and bounded mesh warping remain explicitly evidence-gated/deferred;
+no menu, schema, platform assumption, or CI configuration is reported as a
+working backend. See [Precision and scale](docs/precision-and-scale.md) for the
+exact ledger, proxy law, Study validation, and capability evidence table.
+
 ## Sources and output
 
 - **Video and still layers:** add files from the active library or drag/drop.
@@ -323,6 +564,10 @@ that now occupies the old index. See
   existing main preview to a clean fullscreen audience surface. Window/surface
   creation failures are returned to the panel instead of leaving its switch in
   a false-open state.
+- **StageMap endpoints:** separately persisted monitor bindings can open
+  independent calibrated endpoint surfaces. They do not replace the legacy
+  fullscreen Output control, and one endpoint failure does not authorize a
+  fallback onto another monitor.
 - **Startup recovery:** the initial visual is metadata-probed under Safe policy
   before it can choose preview dimensions. A rejected probe uses 1280×720, and
   a source-sized renderer initialization failure receives one 1280×720 retry;
@@ -359,6 +604,12 @@ modulation, and looping. It is padded with silence or trimmed to the requested
 program duration, then muxed as AAC. This explicit policy avoids implying that
 arbitrarily modulated visual transport can be represented by one audio tempo.
 
+After a successful export, the exporter atomically publishes the bounded
+`<video>.motion.json` provenance report described above. Cancel/failure removes
+partial video and sidecar work. Missing source fingerprints and unavailable
+codec-vector provenance become explicit warnings; the report never upgrades
+those omissions into a reproducibility claim.
+
 ## Patches
 
 `Ctrl+S` saves a YAML patch through a native dialog. The browser's **Capture
@@ -366,24 +617,30 @@ snapshot** writes a uniquely named YAML file under `patches/` without blocking
 the render loop or overwriting an earlier capture. Recall has two deliberately
 different paths:
 
-- **Load snapshot…** (`Ctrl+O`) reconstructs the saved sources and layer order,
-  then restores visual state, layer and program transport, both freeze states,
-  modulation and input configuration, LFO state, and morph automation. The
+- **Load snapshot…** (`Ctrl+O`) reconstructs the saved sources, layer order,
+  prepared clip slots, and Scenes, then restores Collision Racks/composition,
+  mattes and image routes, temporal/motion authoring, layer and program
+  transport, both freeze states, modulation/input/LFO state, and Morph
+  automation. The
   replacement is atomic across the visual stack and saved imported analysis
   audio: every file is resolved and the audio is fully decoded before commit,
   so a missing, invalid, or corrupt source leaves the current performance in
   place. A legacy patch with no modulation section preserves current audio state.
 - **Apply look…** (`Ctrl+Shift+O`) keeps the current sources, layer identities,
-  order, layer count, speed/FPS/pause, per-video loop-reroll choices, both
-  freeze states, BPM, modulation, and input state. It applies master effects
-  and maps each saved layer by position onto the corresponding current layer:
-  direct effects/keying/pattern seed, opacity, blend, visibility, and Bypass
-  Master FX. Saved NTSC and Temporal sections apply when present; a legacy
-  patch that omits either leaves that current section unchanged. Extra current
-  layers remain visually unchanged and extra saved layers are reported unused.
-  A stack change while the picker is open rejects the transfer. An engaged
-  current A/B morph is materialized and cleared before the look is applied;
-  the patch's saved morph is not imported.
+  order, layer count, prepared slots/Scenes, speed/FPS/pause, per-video
+  loop-reroll choices, both freeze states, BPM, modulation, and input state. It
+  applies master values and maps saved layer values positionally: direct
+  effects/keying/pattern seed, transform, motion values, matte values, opacity,
+  blend, visibility, and Bypass Master FX. Racks require identical node
+  topology; groups require the same stable ID, membership, rack signature,
+  matte presence/route, and root identity. Apply Look copies compatible values
+  while preserving live node/group/layer IDs, image routes, motion donors,
+  Score loop driver, membership, ordering, solo/bypass, and bus assignment.
+  Saved NTSC and Temporal sections apply when present; a legacy omission leaves
+  that current section unchanged. Extra current layers remain visually
+  unchanged and extra saved layers are reported unused. A stack change while
+  the picker is open rejects the transfer. An engaged current A/B Morph is
+  materialized and cleared first; the patch's Morph is not imported.
 
 After a successful Apply Look, actions that could overwrite its applied master,
 mapped-layer, reroll, topology, and present NTSC/Temporal scope are discarded,
@@ -396,18 +653,29 @@ barrier.
 ordinary YAML and can also be edited in a text editor. Current snapshots
 include:
 
-- master, per-layer, NTSC, and temporal values, including visual pattern seeds;
-- layer order, visibility, pause, speed, blend, keying, master-FX bypass,
-  per-video loop reroll, and stable source paths;
+- master, per-layer, NTSC, Temporal Originals, and Motion values, including
+  spatial transforms, pattern seeds, reset/quality laws, and stable donors;
+- typed Collision Racks, image taps/mattes, the one-level group/root graph,
+  Program/A/B assignments, and crossfade;
+- layer order, visibility, pause, blend/keying/master-FX bypass, and the complete
+  prepared Performance Set: stable clip slots, source identities, transport,
+  cues, active slots, and atomic Scenes;
 - Freeze Program, Freeze Media, and complete modulation state, including LFO
   sample-and-hold seeds;
 - routing curves/slew, audio band count/crossovers/ceiling, gyro calibration/configuration, and XY
   configuration/current position;
-- morph A/B slots, crossfader law/position, and remaining beat glide.
+- Morph A/B slots, crossfader law/position, and remaining beat glide.
 
-Old patches remain accepted through serde defaults and legacy filename/slit
-axis fallbacks. New seeds default to `0` (the legacy pattern family), while
-per-video loop reroll and Freeze Media default to off.
+`PatchState` is an additive typed YAML document, not the generator manifest.
+Omitted fields keep explicit compatibility defaults and legacy filename/slit
+axis fallbacks. `visual_schema_version: 1` declares explicit M2 rack/composition
+topology; `0` or omission is the exact pre-rack layout synthesized with legacy
+markers, and unknown future visual-topology versions are rejected. New seeds
+default to `0` (the legacy pattern family), while prepared performance,
+Temporal Originals, Motion, per-video loop reroll, Scenes, and Freeze Media
+default to their exact inactive/legacy laws. StageMap, controller/OSC documents,
+preset library, recovery journal, recorder state, runtime pixels, and GPU
+resources are intentionally outside `PatchState`.
 
 Exact patch load and offline export share one visual/imported-analysis-audio
 resolver. Ordinary snapshots keep compatible path-first and nearby/library
@@ -442,7 +710,7 @@ target\release\collide-o-scope.exe generate `
   --max-fingerprint-bytes 68719476736
 ```
 
-Generator v2 resolves and SHA-256 fingerprints visual and imported
+Generator v7 resolves and SHA-256 fingerprints visual and imported
 analysis-audio files before it commits output. It replaces private local paths
 with `cos-sha256://<digest>/<bytes>` references, so canonical anchor/piece hashes
 and lineage are independent of the host root and change when source bytes do.
@@ -454,8 +722,11 @@ Each new piece directory contains `patch.yaml`, schema-v2 `manifest.json`, and
 deterministic `preflight.json`. The receipt records source digests, byte/search
 limits, warnings, and a narrow configuration/source-byte claim; it explicitly
 does not claim rendered-pixel identity. Generation uses typed, reflected,
-mean-reverting mutations, including Shift; preserves source/layer/routing
-topology; rejects active two-slot morphs and in-flight glides; and requires
+mean-reverting mutations in isolated deterministic domains, including Shift,
+bounded spatial values, compatible rack/group/matte/A-B values, Temporal
+Originals numeric values, and Motion numeric values. It preserves
+source/layer/routing/rack/composition/image-route/motion-donor topology and
+discrete temporal/motion laws; rejects active two-slot Morphs and in-flight glides; and requires
 explicit `--allow-black-sources` before accepting live Spout layers. The three
 files are committed atomically per piece and never overwritten.
 
@@ -519,14 +790,18 @@ cancelled chooser leaves the current library and program state unchanged.
 | 0 | Reset effects |
 | Ctrl+E | Toggle patch parameter editor |
 | Ctrl+S / Ctrl+O / Ctrl+Shift+O | Save / Load snapshot / Apply look |
+| Ctrl+Shift+I / Ctrl+Shift+X | Import / export the portable controller profile JSON |
 | Esc | Quit or close output window as appropriate |
 
 ## Validation boundary
 
-Software checks do not replace physical validation. MIDI controllers and MIDI
-clock, real phone sensors, venue audio hardware, external Spout applications,
-and multi-monitor stage output require tests on the corresponding equipment.
-Do not treat a successful build as hardware proof.
+Software, browser, and physical-GPU fixtures plus configured CI establish only
+their tested contracts and requested build targets. They do not prove a
+particular machine's MIDI/OSC devices and timing, phone sensors, venue audio,
+FFmpeg installation, external Spout applications, monitor/fullscreen behavior,
+or signal chain. A CI configuration is not itself a passed matrix. Validate the
+complete performance on the exact show computer and stage hardware; do not
+treat a successful build or shader fixture as hardware proof.
 
 ## Publication and license boundary
 

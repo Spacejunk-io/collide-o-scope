@@ -9,6 +9,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::effects::EffectUniforms;
+use crate::image_routing::{LayerImageStage, MatteChannel};
+use crate::performance::{ClipSlotId, SavedLayerPosition, SceneId};
+use crate::spatial::{FitMode, SpatialTransform};
+use crate::transport::{ClipTransportConfig, CueId, NormalizedTime, TriggerMode};
+use crate::visual_rack::EdgeTiming;
+
+/// Maximum UTF-8 payload for a browser-authored optional Scene name.
+/// Empty is valid and renders as the stable numeric Scene identity.
+pub const MAX_SCENE_NAME_BYTES: usize = 128;
 
 /// Lifecycle of the authenticated loopback control listener. This is kept
 /// separate from browser connection count: zero connected browsers can be a
@@ -46,6 +55,14 @@ pub struct WebState {
     pub tx: broadcast::Sender<String>,
     /// Actions queue: browser pushes commands, render loop drains them
     pub actions: Mutex<Vec<WebAction>>,
+    /// Latest validated, path-free controller-profile JSON for the dedicated
+    /// authenticated import/export endpoint. Keeping it outside AppSnapshot
+    /// avoids rebroadcasting up to 256 KiB on every render frame.
+    controller_profile_export: std::sync::RwLock<Vec<u8>>,
+    /// At most one remote controller may own one scalar destination. The
+    /// server retains whether an authored value crossed the Begin barrier so
+    /// a hostile dirty Cancel cannot strand Main's matching transaction.
+    browser_history_gesture: Mutex<Option<BrowserHistoryGesture>>,
     /// Thumbnail cache: filename → JPEG bytes (generated on library scan)
     pub thumbnails: std::sync::RwLock<HashMap<String, Vec<u8>>>,
     /// Preview frames: filename → vec of JPEG frames (for hover animation)
@@ -74,6 +91,14 @@ pub struct WebState {
     /// Server-owned phone-stream membership and monotonic sample freshness.
     gyro_streams: std::sync::Mutex<GyroStreamRegistry>,
     next_client_id: AtomicU64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BrowserHistoryGesture {
+    client_id: u64,
+    gesture_id: u64,
+    coalesce_key: Option<String>,
+    dirty: bool,
 }
 
 /// A phone normally publishes at roughly 30 Hz. This allows substantial
@@ -152,22 +177,803 @@ pub enum EnqueueOutcome {
     Dropped,
 }
 
+fn default_new_layer_fit() -> FitMode {
+    FitMode::Fit
+}
+
+/// Decimal-ID scope used by rack snapshots and mutations. Numeric runtime IDs
+/// never cross the JSON boundary, avoiding JavaScript precision loss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum CreativeScopeSnapshot {
+    Master,
+    Layer { layer_id: String },
+    Group { group_id: String },
+}
+
+/// Typed preset destination. The first three variants intentionally retain
+/// the established `{ "scope": ... }` wire shapes; controller and StageMap
+/// documents use distinct non-creative scopes and can never be mistaken for a
+/// layer/group values transfer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum PresetTargetSnapshot {
+    Master,
+    Layer { layer_id: String },
+    Group { group_id: String },
+    ControllerProfile,
+    StageMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum CreativeImageSourceSnapshot {
+    SelectedLayer {
+        layer_id: String,
+        #[serde(default)]
+        stage: LayerImageStage,
+    },
+    /// Output-only diagnostic retained when a saved donor cannot be resolved.
+    /// Ingress never accepts this as a newly authored route.
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+        #[serde(default)]
+        stage: LayerImageStage,
+    },
+    OneBelow,
+    AllBelow,
+    GroupOutput {
+        group_id: String,
+    },
+    /// Output-only diagnostic retained after deletion of a referenced group.
+    MissingGroupOutput {
+        group_id: String,
+    },
+    CleanProgram,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreativeImageTapSnapshot {
+    pub input: CreativeImageSourceSnapshot,
+    pub timing: EdgeTiming,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreativeMatteSnapshot {
+    pub route: CreativeImageTapSnapshot,
+    pub channel: String,
+    pub invert: bool,
+    pub amount: f32,
+    pub threshold: f32,
+    pub softness: f32,
+    /// Non-empty for a retained missing donor or another inert route.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnostic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct VisualNodeSnapshot {
+    pub node_id: String,
+    pub enabled: bool,
+    pub wet: f32,
+    pub blend: String,
+    pub kind: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct VisualRackSnapshot {
+    #[serde(default)]
+    pub nodes: Vec<VisualNodeSnapshot>,
+    pub next_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompositionRootSnapshot {
+    Layer { layer_id: String, bus: String },
+    Group { group_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CompositionGroupSnapshot {
+    pub group_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub member_layer_ids: Vec<String>,
+    pub opacity: f32,
+    pub transform: SpatialTransform,
+    pub rack: VisualRackSnapshot,
+    /// A group matte is independent from Mask nodes in the group's rack.
+    #[serde(default)]
+    pub matte: Option<CreativeMatteSnapshot>,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub bypass: bool,
+    pub bus: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CreativeCompositionSnapshot {
+    /// Latest transactional authoring/preflight result. Empty means there is
+    /// no outstanding diagnostic; Main overwrites this live-session field
+    /// immediately before publication.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub master_rack: VisualRackSnapshot,
+    #[serde(default)]
+    pub layer_racks: Vec<(String, VisualRackSnapshot)>,
+    #[serde(default)]
+    pub groups: Vec<CompositionGroupSnapshot>,
+    #[serde(default)]
+    pub root: Vec<CompositionRootSnapshot>,
+    #[serde(default = "default_matte_threshold")]
+    pub bus_crossfade: f32,
+    pub next_group_id: String,
+}
+
+fn creative_channel_key(channel: crate::visual_rack::MatteChannel) -> &'static str {
+    match channel {
+        crate::visual_rack::MatteChannel::Alpha => "alpha",
+        crate::visual_rack::MatteChannel::Luma => "luma",
+        crate::visual_rack::MatteChannel::Red => "red",
+        crate::visual_rack::MatteChannel::Green => "green",
+        crate::visual_rack::MatteChannel::Blue => "blue",
+    }
+}
+
+pub fn parse_creative_channel(value: &str) -> Option<crate::visual_rack::MatteChannel> {
+    Some(match value {
+        "alpha" => crate::visual_rack::MatteChannel::Alpha,
+        "luma" => crate::visual_rack::MatteChannel::Luma,
+        "red" => crate::visual_rack::MatteChannel::Red,
+        "green" => crate::visual_rack::MatteChannel::Green,
+        "blue" => crate::visual_rack::MatteChannel::Blue,
+        _ => return None,
+    })
+}
+
+impl CreativeImageTapSnapshot {
+    pub fn from_runtime(tap: crate::visual_rack::ResolvedImageTap) -> Self {
+        use crate::visual_rack::ResolvedImageSource;
+        let input = match tap.source {
+            ResolvedImageSource::SelectedLayer {
+                layer_id, stage, ..
+            } => CreativeImageSourceSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                stage,
+            },
+            ResolvedImageSource::MissingSelectedLayer {
+                saved_position,
+                stage,
+            } => CreativeImageSourceSnapshot::MissingSelectedLayer {
+                saved_position,
+                stage,
+            },
+            ResolvedImageSource::OneBelow => CreativeImageSourceSnapshot::OneBelow,
+            ResolvedImageSource::AllBelow => CreativeImageSourceSnapshot::AllBelow,
+            ResolvedImageSource::GroupOutput(group_id) => {
+                CreativeImageSourceSnapshot::GroupOutput {
+                    group_id: group_id.get().to_string(),
+                }
+            }
+            ResolvedImageSource::MissingGroupOutput(group_id) => {
+                CreativeImageSourceSnapshot::MissingGroupOutput {
+                    group_id: group_id.get().to_string(),
+                }
+            }
+            ResolvedImageSource::CleanProgram => CreativeImageSourceSnapshot::CleanProgram,
+        };
+        Self {
+            input,
+            timing: tap.timing,
+        }
+    }
+
+    /// Resolve an ingress route without permitting diagnostic missing forms or
+    /// inventing saved-position provenance for a live layer.
+    pub fn to_runtime(
+        &self,
+        mut saved_position_of: impl FnMut(
+            crate::image_routing::StableLayerId,
+        ) -> Option<SavedLayerPosition>,
+        group_exists: impl Fn(crate::visual_rack::GroupId) -> bool,
+    ) -> Result<crate::visual_rack::ResolvedImageTap, String> {
+        use crate::visual_rack::{GroupId, ResolvedImageSource};
+        let decimal_id = |value: &str, kind: &str| {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("{kind} must be a non-zero decimal ID"));
+            }
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| format!("{kind} must be a non-zero decimal ID"))
+        };
+        let source = match &self.input {
+            CreativeImageSourceSnapshot::SelectedLayer { layer_id, stage } => {
+                let layer_id =
+                    crate::image_routing::StableLayerId::new(decimal_id(layer_id, "layer ID")?)
+                        .ok_or_else(|| "layer ID must be non-zero".to_string())?;
+                let saved_position = saved_position_of(layer_id).ok_or_else(|| {
+                    format!(
+                        "live layer {} has no saved-position provenance",
+                        layer_id.get()
+                    )
+                })?;
+                ResolvedImageSource::SelectedLayer {
+                    layer_id,
+                    saved_position,
+                    stage: *stage,
+                }
+            }
+            CreativeImageSourceSnapshot::OneBelow => ResolvedImageSource::OneBelow,
+            CreativeImageSourceSnapshot::AllBelow => ResolvedImageSource::AllBelow,
+            CreativeImageSourceSnapshot::GroupOutput { group_id } => {
+                let group_id = GroupId::new(decimal_id(group_id, "group ID")?)
+                    .ok_or_else(|| "group ID must be non-zero".to_string())?;
+                if !group_exists(group_id) {
+                    return Err(format!("group {} does not exist", group_id.get()));
+                }
+                ResolvedImageSource::GroupOutput(group_id)
+            }
+            CreativeImageSourceSnapshot::CleanProgram => {
+                if self.timing != EdgeTiming::PreviousFrame {
+                    return Err("CleanProgram is only valid at previous_frame timing".into());
+                }
+                ResolvedImageSource::CleanProgram
+            }
+            CreativeImageSourceSnapshot::MissingSelectedLayer { .. }
+            | CreativeImageSourceSnapshot::MissingGroupOutput { .. } => {
+                return Err("missing creative image sources are output-only diagnostics".into());
+            }
+        };
+        Ok(crate::visual_rack::ResolvedImageTap {
+            source,
+            timing: self.timing,
+        })
+    }
+}
+
+impl CreativeMatteSnapshot {
+    pub fn from_runtime(matte: crate::visual_rack::RuntimeImageMatte) -> Self {
+        let diagnostic = match matte.tap.source {
+            crate::visual_rack::ResolvedImageSource::MissingSelectedLayer {
+                saved_position,
+                ..
+            } => format!("missing saved layer {}", saved_position.get()),
+            crate::visual_rack::ResolvedImageSource::MissingGroupOutput(group_id) => {
+                format!("missing group output {}", group_id.get())
+            }
+            _ => String::new(),
+        };
+        Self {
+            route: CreativeImageTapSnapshot::from_runtime(matte.tap),
+            channel: creative_channel_key(matte.channel).into(),
+            invert: matte.invert,
+            amount: matte.amount,
+            threshold: matte.threshold,
+            softness: matte.softness,
+            diagnostic,
+        }
+    }
+}
+
+fn creative_kind_key(kind: crate::visual_rack::NodeKindTag) -> &'static str {
+    crate::visual_rack::NODE_KIND_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.tag == kind)
+        .map_or("unknown", |descriptor| descriptor.key)
+}
+
+fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serde_json::Value {
+    use crate::visual_rack::{RuntimeMaskParams, RuntimeVisualNodeKind};
+    match kind {
+        RuntimeVisualNodeKind::LegacyCanonical | RuntimeVisualNodeKind::LegacyTemporal => {
+            serde_json::json!({})
+        }
+        RuntimeVisualNodeKind::Transform(value) => serde_json::json!({
+            "position": value.position,
+            "scale": value.scale,
+            "anchor": value.anchor,
+            "rotation_deg": value.rotation_deg,
+            "skew_deg": value.skew_deg,
+            "skew_axis_deg": value.skew_axis_deg,
+            "fit_mode": value.fit,
+            "crop_left": value.crop[0],
+            "crop_top": value.crop[1],
+            "crop_right": value.crop[2],
+            "crop_bottom": value.crop[3],
+            "edge_mode": value.edge,
+            "sampling": value.sampling,
+        }),
+        RuntimeVisualNodeKind::DigitalColor(value) => {
+            serde_json::to_value(value).unwrap_or_default()
+        }
+        RuntimeVisualNodeKind::Key(value) => serde_json::to_value(value).unwrap_or_default(),
+        RuntimeVisualNodeKind::Cellular(value) => serde_json::to_value(value).unwrap_or_default(),
+        RuntimeVisualNodeKind::Shift(value) => serde_json::to_value(value).unwrap_or_default(),
+        RuntimeVisualNodeKind::Grain(value) => serde_json::to_value(value).unwrap_or_default(),
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Rectangle(value)) => serde_json::json!({
+            "variant": "rectangle",
+            "rectangle_center": value.center,
+            "rectangle_size": value.size,
+            "rectangle_rotation_deg": value.rotation_deg,
+            "rectangle_feather": value.feather,
+            "rectangle_invert": value.invert,
+        }),
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Ellipse(value)) => serde_json::json!({
+            "variant": "ellipse",
+            "ellipse_center": value.center,
+            "ellipse_radii": value.radii,
+            "ellipse_rotation_deg": value.rotation_deg,
+            "ellipse_feather": value.feather,
+            "ellipse_invert": value.invert,
+        }),
+        RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(value)) => serde_json::json!({
+            "variant": "image",
+            "image_tap": CreativeImageTapSnapshot::from_runtime(value.tap),
+            "image_channel": creative_channel_key(value.channel),
+            "image_invert": value.invert,
+            "image_amount": value.amount,
+            "image_threshold": value.threshold,
+            "image_softness": value.softness,
+        }),
+    }
+}
+
+impl VisualRackSnapshot {
+    pub fn from_runtime(rack: &crate::visual_rack::RuntimeVisualRack) -> Self {
+        let nodes = rack
+            .iter()
+            .map(|node| VisualNodeSnapshot {
+                node_id: node.stable_id.get().to_string(),
+                enabled: node.enabled,
+                wet: node.wet,
+                blend: serde_json::to_value(node.blend)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "normal".into()),
+                kind: creative_kind_key(node.kind.tag()).into(),
+                params: creative_node_params(node.kind),
+            })
+            .collect();
+        Self {
+            nodes,
+            next_node_id: rack.next_node_id_raw().to_string(),
+        }
+    }
+}
+
+impl CreativeCompositionSnapshot {
+    pub fn from_runtime(
+        master_rack: &crate::visual_rack::RuntimeVisualRack,
+        layer_racks: &[(
+            crate::image_routing::StableLayerId,
+            crate::visual_rack::RuntimeVisualRack,
+        )],
+        composition: &crate::composition::RuntimeComposition,
+    ) -> Self {
+        use crate::composition::{BusAssignment, RuntimeRootItem};
+        let bus_key = |bus| match bus {
+            BusAssignment::Program => "program",
+            BusAssignment::A => "a",
+            BusAssignment::B => "b",
+        };
+        let groups = composition
+            .groups()
+            .map(|group| CompositionGroupSnapshot {
+                group_id: group.id.get().to_string(),
+                name: group.name.as_str().to_owned(),
+                member_layer_ids: group
+                    .members
+                    .iter()
+                    .map(|layer_id| layer_id.get().to_string())
+                    .collect(),
+                opacity: group.opacity,
+                transform: group.transform,
+                rack: VisualRackSnapshot::from_runtime(&group.rack),
+                matte: group.matte.map(CreativeMatteSnapshot::from_runtime),
+                solo: group.solo,
+                bypass: group.bypass,
+                bus: bus_key(group.bus).into(),
+            })
+            .collect();
+        let root = composition
+            .root()
+            .iter()
+            .map(|item| match *item {
+                RuntimeRootItem::Layer { layer_id, bus } => CompositionRootSnapshot::Layer {
+                    layer_id: layer_id.get().to_string(),
+                    bus: bus_key(bus).into(),
+                },
+                RuntimeRootItem::Group { group_id } => CompositionRootSnapshot::Group {
+                    group_id: group_id.get().to_string(),
+                },
+            })
+            .collect();
+        Self {
+            status: String::new(),
+            master_rack: VisualRackSnapshot::from_runtime(master_rack),
+            layer_racks: layer_racks
+                .iter()
+                .map(|(layer_id, rack)| {
+                    (
+                        layer_id.get().to_string(),
+                        VisualRackSnapshot::from_runtime(rack),
+                    )
+                })
+                .collect(),
+            groups,
+            root,
+            bus_crossfade: composition.bus_crossfade(),
+            next_group_id: composition.next_group_id_raw().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistorySnapshot {
+    #[serde(default)]
+    pub can_undo: bool,
+    #[serde(default)]
+    pub can_redo: bool,
+    #[serde(default)]
+    pub undo_depth: usize,
+    #[serde(default)]
+    pub redo_depth: usize,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub max_entries: usize,
+    #[serde(default)]
+    pub max_bytes: u64,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub undo_label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redo_label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+impl HistorySnapshot {
+    pub fn from_history<T>(
+        history: &crate::history::ManualHistory<T>,
+        status: impl Into<String>,
+    ) -> Self {
+        let metrics = history.metrics();
+        Self {
+            can_undo: metrics.can_undo,
+            can_redo: metrics.can_redo,
+            undo_depth: metrics.undo_depth,
+            redo_depth: metrics.redo_depth,
+            bytes: metrics.bytes,
+            max_entries: metrics.max_entries,
+            max_bytes: metrics.max_bytes,
+            generation: metrics.generation,
+            undo_label: history.undo_label().unwrap_or_default().to_string(),
+            redo_label: history.redo_label().unwrap_or_default().to_string(),
+            status: status.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetSummarySnapshot {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub created_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetLibrarySnapshot {
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub presets: Vec<PresetSummarySnapshot>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+impl PresetLibrarySnapshot {
+    pub fn from_library(
+        revision: u64,
+        library: &crate::preset::PresetLibrary,
+        status: impl Into<String>,
+    ) -> Self {
+        Self {
+            revision,
+            presets: library
+                .iter()
+                .map(|preset| PresetSummarySnapshot {
+                    id: preset.id.get().to_string(),
+                    name: preset.name.clone(),
+                    kind: preset.payload.kind().key().to_string(),
+                    created_ordinal: preset.created_ordinal,
+                })
+                .collect(),
+            status: status.into(),
+        }
+    }
+}
+
+/// Convert a read-only journal scan into the two additive AppSnapshot fields.
+/// A bad tail remains visible even when a valid prefix offers recovery.
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "App tests isolate startup from the operator's default recovery journal"
+    )
+)]
+pub fn recovery_snapshot_fields(scan: &crate::recovery_journal::RecoveryScan) -> (bool, String) {
+    let status = scan.warning.clone().unwrap_or_else(|| {
+        scan.latest.as_ref().map_or_else(String::new, |checkpoint| {
+            format!(
+                "Recovery checkpoint {} is available ({} valid entr{}).",
+                checkpoint.sequence,
+                scan.valid_entries,
+                if scan.valid_entries == 1 { "y" } else { "ies" }
+            )
+        })
+    });
+    (scan.recovery_available(), status)
+}
+
+pub const EXPORT_MOTION_SNAPSHOT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExportMotionScopeSnapshot {
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stable_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_tap_id: String,
+    #[serde(default)]
+    pub algorithm_version: u16,
+    #[serde(default)]
+    pub requested_source: String,
+    #[serde(default)]
+    pub lattice_quality: String,
+    #[serde(default)]
+    pub source_origin: String,
+    #[serde(default)]
+    pub source_diagnostic: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub codec_provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_ordinal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub donor_saved_position: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub donor_stable_id: String,
+    #[serde(default)]
+    pub carrier: String,
+    #[serde(default)]
+    pub transplant_admitted: bool,
+    #[serde(default)]
+    pub shutter_active: bool,
+    #[serde(default)]
+    pub shutter_angle_degrees: f32,
+    #[serde(default)]
+    pub shutter_quality: String,
+    #[serde(default)]
+    pub shutter_sample_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportMotionSnapshot {
+    pub schema_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_frame: Option<u64>,
+    #[serde(default)]
+    pub algorithm_version: u16,
+    #[serde(default)]
+    pub scopes: Vec<ExportMotionScopeSnapshot>,
+    #[serde(default)]
+    pub scopes_truncated: bool,
+    /// Motion vectors and codec provenance are deterministic inputs, but the
+    /// project deliberately makes no cross-adapter floating-point pixel claim.
+    #[serde(default)]
+    pub cross_gpu_pixel_identity_guaranteed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+impl Default for ExportMotionSnapshot {
+    fn default() -> Self {
+        Self {
+            schema_version: EXPORT_MOTION_SNAPSHOT_SCHEMA_VERSION,
+            accepted_frame: None,
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: Vec::new(),
+            scopes_truncated: false,
+            cross_gpu_pixel_identity_guaranteed: false,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl ExportMotionSnapshot {
+    pub fn from_export(
+        metadata: &crate::render_export::ExportMotionMetadata,
+        warnings: &[String],
+    ) -> Self {
+        const MAX_SNAPSHOT_WARNINGS: usize = 128;
+        let scopes = metadata
+            .scopes
+            .iter()
+            .map(|scope| {
+                let (scope_key, saved_position, stable_id, source_tap_id) = match scope.scope {
+                    crate::render_export::ExportMotionScopeIdentity::Master => {
+                        ("master", None, String::new(), String::new())
+                    }
+                    crate::render_export::ExportMotionScopeIdentity::Layer {
+                        saved_position,
+                        stable_id,
+                        source_tap_id,
+                    } => (
+                        "layer",
+                        Some(saved_position),
+                        stable_id.to_string(),
+                        source_tap_id.to_string(),
+                    ),
+                };
+                ExportMotionScopeSnapshot {
+                    scope: scope_key.into(),
+                    saved_position,
+                    stable_id,
+                    source_tap_id,
+                    algorithm_version: scope.algorithm_version,
+                    requested_source: motion_source_key(scope.requested_source).into(),
+                    lattice_quality: lattice_quality_key(scope.lattice_quality).into(),
+                    source_origin: motion_origin_key(scope.source_origin).into(),
+                    source_diagnostic: motion_diagnostic_key(scope.source_diagnostic).into(),
+                    codec_provenance: scope
+                        .codec_provenance
+                        .map(codec_provenance_key)
+                        .unwrap_or_default()
+                        .into(),
+                    source_generation: scope.source_generation,
+                    frame_ordinal: scope.frame_ordinal,
+                    donor_saved_position: scope.donor_saved_position,
+                    donor_stable_id: scope
+                        .donor_stable_id
+                        .map_or_else(String::new, |id| id.to_string()),
+                    carrier: motion_carrier_key(scope.carrier).into(),
+                    transplant_admitted: scope.transplant_admitted,
+                    shutter_active: scope.shutter_active,
+                    shutter_angle_degrees: scope.shutter_angle_degrees,
+                    shutter_quality: shutter_quality_key(scope.shutter_quality).into(),
+                    shutter_sample_count: scope.shutter_sample_count,
+                }
+            })
+            .collect();
+        Self {
+            schema_version: EXPORT_MOTION_SNAPSHOT_SCHEMA_VERSION,
+            accepted_frame: metadata.accepted_frame,
+            algorithm_version: metadata.algorithm_version,
+            scopes,
+            scopes_truncated: metadata.scopes_truncated,
+            cross_gpu_pixel_identity_guaranteed: false,
+            warnings: warnings
+                .iter()
+                .take(MAX_SNAPSHOT_WARNINGS)
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+const fn motion_source_key(value: crate::motion::MotionFieldSource) -> &'static str {
+    match value {
+        crate::motion::MotionFieldSource::Auto => "auto",
+        crate::motion::MotionFieldSource::CodecVectors => "codec_vectors",
+        crate::motion::MotionFieldSource::Lattice => "lattice",
+    }
+}
+
+const fn lattice_quality_key(value: crate::motion::MotionLatticeQuality) -> &'static str {
+    match value {
+        crate::motion::MotionLatticeQuality::Draft => "draft",
+        crate::motion::MotionLatticeQuality::Live => "live",
+        crate::motion::MotionLatticeQuality::High => "high",
+    }
+}
+
+const fn motion_origin_key(value: crate::motion::MotionFieldOrigin) -> &'static str {
+    match value {
+        crate::motion::MotionFieldOrigin::None => "none",
+        crate::motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
+        crate::motion::MotionFieldOrigin::Lattice => "lattice",
+        crate::motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+    }
+}
+
+const fn motion_diagnostic_key(value: crate::motion::MotionSourceDiagnostic) -> &'static str {
+    match value {
+        crate::motion::MotionSourceDiagnostic::None => "none",
+        crate::motion::MotionSourceDiagnostic::CodecUnavailable => "codec_unavailable",
+        crate::motion::MotionSourceDiagnostic::CodecUnavailableFallback => {
+            "codec_unavailable_fallback"
+        }
+    }
+}
+
+const fn codec_provenance_key(value: crate::video::CodecMotionProvenance) -> &'static str {
+    match value {
+        crate::video::CodecMotionProvenance::FfmpegExportMvs => "ffmpeg_export_mvs",
+    }
+}
+
+const fn motion_carrier_key(value: crate::motion::MotionCarrier) -> &'static str {
+    match value {
+        crate::motion::MotionCarrier::Transparent => "transparent",
+        crate::motion::MotionCarrier::Black => "black",
+        crate::motion::MotionCarrier::FirstSourceFrame => "first_source_frame",
+    }
+}
+
+const fn shutter_quality_key(value: crate::motion::CurvedShutterQuality) -> &'static str {
+    match value {
+        crate::motion::CurvedShutterQuality::Sharp => "sharp",
+        crate::motion::CurvedShutterQuality::Draft => "draft",
+        crate::motion::CurvedShutterQuality::Live => "live",
+        crate::motion::CurvedShutterQuality::High => "high",
+    }
+}
+
 /// Full app state snapshot sent to the browser each frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
     #[serde(rename = "type")]
     pub msg_type: String,
     pub effects: EffectsSnapshot,
+    /// Authored transform applied after the layer stack. Missing data from an
+    /// older server/client is the exact legacy full-frame identity.
+    #[serde(default)]
+    pub master_transform: SpatialTransform,
     pub ntsc: NtscSnapshot,
     /// Host-local admission limits for future media source allocations. This is
     /// deliberately independent from patches and output/export dimensions.
     #[serde(default)]
     pub media_safety: MediaSafetySnapshot,
+    /// Host-session preference for framing future interactive layers. It is
+    /// intentionally absent from artistic PatchState and never rewrites an
+    /// existing layer.
+    #[serde(default = "default_new_layer_fit")]
+    pub new_layer_fit: FitMode,
     pub layers: Vec<LayerSnapshot>,
+    /// Prepared cross-layer scene bank and its current staging state. This is
+    /// additive so an older engine/panel pair continues to deserialize an
+    /// otherwise complete snapshot as an empty performance set.
+    #[serde(default)]
+    pub performance: PerformanceSnapshot,
     /// Monotonic topology generation used to reject stale multi-controller
     /// reorder requests. Zero means an older server/client with no revision.
     #[serde(default)]
     pub layer_stack_revision: u64,
+    /// Independent optimistic-concurrency token for rack/group topology.
+    /// It is live session state and is deliberately absent from PatchState.
+    #[serde(default)]
+    pub composition_revision: u64,
+    #[serde(default)]
+    pub creative: CreativeCompositionSnapshot,
     pub library: Vec<String>,
     /// Legacy mirror of `program_frozen` for older bundled clients.
     pub paused: bool,
@@ -184,12 +990,30 @@ pub struct AppSnapshot {
     /// MIDI input state
     #[serde(default)]
     pub midi: MidiSnapshot,
+    /// Typed controller-profile identity plus live MIDI supervisor truth.
+    #[serde(default)]
+    pub controller_runtime: ControllerRuntimeSnapshot,
+    /// Read-only OSC listener, exposure, and bounded counter truth.
+    #[serde(default)]
+    pub osc_runtime: OscRuntimeSnapshot,
     /// Temporal (feedback/slit-scan) effect state
     #[serde(default)]
     pub temporal: TemporalSnapshot,
+    /// Program-wide Curved Shutter authoring and read-only execution truth.
+    /// Faraday controls remain disabled for this master scope.
+    #[serde(default)]
+    pub master_motion: MotionSnapshot,
     /// Spout output state
     #[serde(default)]
     pub spout: SpoutSnapshot,
+    /// Bounded live recorder lifecycle and drop counters. Host paths never
+    /// cross this boundary; only the committed artifact's file name is shown.
+    #[serde(default)]
+    pub recorder: ProgramRecorderSnapshot,
+    /// Preview/editor telemetry plus endpoint-scoped calibration controls.
+    /// The snapshot is informational and has no audience/composite pixels.
+    #[serde(default)]
+    pub stage_health: crate::stage_health::StageHealthSnapshot,
     /// Remote control URL (LAN address with access token) for the QR code
     #[serde(default)]
     pub remote_url: String,
@@ -220,6 +1044,21 @@ pub struct AppSnapshot {
     /// idle | running | cancelling | succeeded | failed | cancelled.
     #[serde(default)]
     pub export_status: String,
+    /// Bounded accepted-frame Motion provenance for the current/last export.
+    #[serde(default)]
+    pub export_motion: ExportMotionSnapshot,
+    /// Transactional manual undo/redo truth. Automation never contributes.
+    #[serde(default)]
+    pub history: HistorySnapshot,
+    /// Values-only, identity-safe creative preset library.
+    #[serde(default)]
+    pub presets: PresetLibrarySnapshot,
+    /// A valid durable checkpoint is offered, never auto-applied.
+    #[serde(default)]
+    pub recovery_available: bool,
+    /// Recovery scan/restore/discard outcome, including corrupt-tail warnings.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recovery_status: String,
     /// Result of the most recent frictionless patch capture. The engine owns
     /// this text so clients never manufacture a successful-save indication.
     #[serde(default)]
@@ -237,10 +1076,15 @@ impl Default for AppSnapshot {
         Self {
             msg_type: "state".to_string(),
             effects: EffectsSnapshot::default(),
+            master_transform: SpatialTransform::default(),
             ntsc: NtscSnapshot::default(),
             media_safety: MediaSafetySnapshot::default(),
+            new_layer_fit: default_new_layer_fit(),
             layers: Vec::new(),
+            performance: PerformanceSnapshot::default(),
             layer_stack_revision: 0,
+            composition_revision: 0,
+            creative: CreativeCompositionSnapshot::default(),
             library: Vec::new(),
             paused: false,
             program_frozen: false,
@@ -248,8 +1092,13 @@ impl Default for AppSnapshot {
             modulation: ModSnapshot::default(),
             audio: AudioSnapshot::default(),
             midi: MidiSnapshot::default(),
+            controller_runtime: ControllerRuntimeSnapshot::default(),
+            osc_runtime: OscRuntimeSnapshot::default(),
             temporal: TemporalSnapshot::default(),
+            master_motion: MotionSnapshot::default(),
             spout: SpoutSnapshot::default(),
+            recorder: ProgramRecorderSnapshot::default(),
+            stage_health: crate::stage_health::StageHealthSnapshot::default(),
             remote_url: String::new(),
             output_window: false,
             output_error: String::new(),
@@ -259,6 +1108,11 @@ impl Default for AppSnapshot {
             export_error: String::new(),
             export_warnings: Vec::new(),
             export_status: "idle".to_string(),
+            export_motion: ExportMotionSnapshot::default(),
+            history: HistorySnapshot::default(),
+            presets: PresetLibrarySnapshot::default(),
+            recovery_available: false,
+            recovery_status: String::new(),
             patch_save_status: String::new(),
             patch_load_status: String::new(),
             quantized_pending: 0,
@@ -990,6 +1844,173 @@ pub struct TemporalSnapshot {
     pub key_softness: f32,
     #[serde(default = "default_temporal_key_history")]
     pub key_history: f32,
+    /// Additive M3 authoring state. Every default is an exact no-op.
+    #[serde(default)]
+    pub originals: TemporalOriginalsSnapshot,
+    /// Read-only renderer truth. Main fills this DTO when the active executor
+    /// exposes metrics; older/exact paths safely report the zero placeholder.
+    #[serde(default)]
+    pub telemetry: TemporalTelemetrySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TemporalLoomSnapshot {
+    pub amount: f32,
+    pub topology: String,
+    pub interpolation: String,
+    pub depth: f32,
+    pub phase: f32,
+    pub scale: f32,
+    pub angle: f32,
+    pub folds: u8,
+    pub quantization: u8,
+}
+
+impl Default for TemporalLoomSnapshot {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            topology: "linear".into(),
+            interpolation: "floor".into(),
+            depth: 1.0,
+            phase: 0.0,
+            scale: 1.0,
+            angle: 0.0,
+            folds: 1,
+            quantization: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollisionAtlasSnapshot {
+    pub amount: f32,
+    pub seed: u32,
+    pub territories: u8,
+    pub collision: f32,
+}
+
+impl Default for CollisionAtlasSnapshot {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            seed: 0,
+            territories: 8,
+            collision: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RefreshGardenSnapshot {
+    pub amount: f32,
+    pub gate: String,
+    pub threshold: f32,
+    pub softness: f32,
+    pub decay: f32,
+    pub max_hold_ticks: u32,
+}
+
+impl Default for RefreshGardenSnapshot {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            gate: "temporal_delta".into(),
+            threshold: 0.1,
+            softness: 0.03,
+            decay: 1.0,
+            max_hold_ticks: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CollisionScoreLoopDriverSnapshot {
+    #[default]
+    None,
+    SelectedLayer {
+        layer_id: String,
+        saved_position: u32,
+    },
+    MissingSelectedLayer {
+        saved_position: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollisionScoreSnapshot {
+    pub enabled: bool,
+    pub seed: u32,
+    pub state_count: u8,
+    pub trigger: String,
+    pub loop_driver: CollisionScoreLoopDriverSnapshot,
+}
+
+impl Default for CollisionScoreSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            seed: 0,
+            state_count: 4,
+            trigger: "boundary".into(),
+            loop_driver: CollisionScoreLoopDriverSnapshot::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemporalResetPolicySnapshot {
+    pub loop_boundary: String,
+    pub downbeat: String,
+}
+
+impl Default for TemporalResetPolicySnapshot {
+    fn default() -> Self {
+        Self {
+            loop_boundary: "none".into(),
+            downbeat: "none".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TemporalOriginalsSnapshot {
+    pub loom: TemporalLoomSnapshot,
+    pub atlas: CollisionAtlasSnapshot,
+    pub garden: RefreshGardenSnapshot,
+    pub score: CollisionScoreSnapshot,
+    pub reset: TemporalResetPolicySnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemporalTelemetrySnapshot {
+    pub history_valid: u32,
+    pub history_capacity: u32,
+    pub carrier_valid: bool,
+    pub freeze_hold_valid: bool,
+    pub total_reference_ticks: u64,
+    pub score_state: u8,
+    pub score_event_ordinal: u64,
+    pub frame_staged: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_reset: String,
+}
+
+impl Default for TemporalTelemetrySnapshot {
+    fn default() -> Self {
+        Self {
+            history_valid: 0,
+            history_capacity: 24,
+            carrier_valid: false,
+            freeze_hold_valid: false,
+            total_reference_ticks: 0,
+            score_state: 0,
+            score_event_ordinal: 0,
+            frame_staged: false,
+            last_reset: String::new(),
+        }
+    }
 }
 
 fn default_temporal_key_threshold() -> f32 {
@@ -1017,12 +2038,67 @@ impl Default for TemporalSnapshot {
             key_threshold: default_temporal_key_threshold(),
             key_softness: default_temporal_key_softness(),
             key_history: default_temporal_key_history(),
+            originals: TemporalOriginalsSnapshot::default(),
+            telemetry: TemporalTelemetrySnapshot::default(),
         }
     }
 }
 
 impl TemporalSnapshot {
     pub fn from_params(p: &crate::effects::params::TemporalParams) -> Self {
+        use crate::effects::params::{
+            CollisionScoreTrigger, RefreshGardenGate, TemporalInterpolation, TemporalTopology,
+        };
+        use crate::temporal::{CollisionScoreLoopDriver, TemporalEventResetMode};
+
+        let topology = match p.originals.loom.topology {
+            TemporalTopology::Linear => "linear",
+            TemporalTopology::Radial => "radial",
+            TemporalTopology::Spiral => "spiral",
+            TemporalTopology::Contour => "contour",
+            TemporalTopology::Folded => "folded",
+            TemporalTopology::Kaleidoscopic => "kaleidoscopic",
+        };
+        let interpolation = match p.originals.loom.interpolation {
+            TemporalInterpolation::Floor => "floor",
+            TemporalInterpolation::Linear => "linear",
+        };
+        let gate = match p.originals.garden.gate {
+            RefreshGardenGate::TemporalDelta => "temporal_delta",
+            RefreshGardenGate::Luma => "luma",
+            RefreshGardenGate::Chroma => "chroma",
+            RefreshGardenGate::CellularRidge => "cellular_ridge",
+            RefreshGardenGate::AudioEnergy => "audio_energy",
+            RefreshGardenGate::AudioOnset => "audio_onset",
+            RefreshGardenGate::Matte => "matte",
+        };
+        let trigger = match p.originals.score.trigger {
+            CollisionScoreTrigger::Boundary => "boundary",
+            CollisionScoreTrigger::Downbeat => "downbeat",
+            CollisionScoreTrigger::AudioOnset => "audio_onset",
+            CollisionScoreTrigger::Manual => "manual",
+        };
+        let reset_key = |mode| match mode {
+            TemporalEventResetMode::None => "none",
+            TemporalEventResetMode::Score => "score",
+            TemporalEventResetMode::Memory => "memory",
+            TemporalEventResetMode::All => "all",
+        };
+        let loop_driver = match p.originals.score.loop_driver {
+            CollisionScoreLoopDriver::None => CollisionScoreLoopDriverSnapshot::None,
+            CollisionScoreLoopDriver::SelectedLayer {
+                layer_id,
+                saved_position,
+            } => CollisionScoreLoopDriverSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                saved_position: saved_position.get(),
+            },
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position } => {
+                CollisionScoreLoopDriverSnapshot::MissingSelectedLayer {
+                    saved_position: saved_position.get(),
+                }
+            }
+        };
         Self {
             feedback: p.feedback,
             fb_zoom: p.fb_zoom,
@@ -1034,6 +2110,231 @@ impl TemporalSnapshot {
             key_threshold: p.key_threshold,
             key_softness: p.key_softness,
             key_history: p.key_history,
+            originals: TemporalOriginalsSnapshot {
+                loom: TemporalLoomSnapshot {
+                    amount: p.originals.loom.amount,
+                    topology: topology.into(),
+                    interpolation: interpolation.into(),
+                    depth: p.originals.loom.depth,
+                    phase: p.originals.loom.phase,
+                    scale: p.originals.loom.scale,
+                    angle: p.originals.loom.angle,
+                    folds: p.originals.loom.folds,
+                    quantization: p.originals.loom.quantization,
+                },
+                atlas: CollisionAtlasSnapshot {
+                    amount: p.originals.atlas.amount,
+                    seed: p.originals.atlas.seed,
+                    territories: p.originals.atlas.territories,
+                    collision: p.originals.atlas.collision,
+                },
+                garden: RefreshGardenSnapshot {
+                    amount: p.originals.garden.amount,
+                    gate: gate.into(),
+                    threshold: p.originals.garden.threshold,
+                    softness: p.originals.garden.softness,
+                    decay: p.originals.garden.decay,
+                    max_hold_ticks: p.originals.garden.max_hold_ticks,
+                },
+                score: CollisionScoreSnapshot {
+                    enabled: p.originals.score.enabled,
+                    seed: p.originals.score.seed,
+                    state_count: p.originals.score.state_count,
+                    trigger: trigger.into(),
+                    loop_driver,
+                },
+                reset: TemporalResetPolicySnapshot {
+                    loop_boundary: reset_key(p.originals.reset.loop_boundary).into(),
+                    downbeat: reset_key(p.originals.reset.downbeat).into(),
+                },
+            },
+            telemetry: TemporalTelemetrySnapshot::default(),
+        }
+    }
+}
+
+/// Stable browser address for Motion authoring. Numeric runtime IDs are sent
+/// as decimal strings so JavaScript never rounds them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum MotionScopeSnapshot {
+    Master,
+    Layer { layer_id: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MotionDonorSnapshot {
+    #[default]
+    None,
+    Selected {
+        layer_id: String,
+        saved_position: u32,
+    },
+    /// Output-only tombstone. Ingress can select a current stable layer or
+    /// clear the donor; it can never manufacture or retarget this variant.
+    Missing { saved_position: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FaradayMotionSnapshot {
+    pub amount: f32,
+    pub donor: MotionDonorSnapshot,
+    pub carrier: String,
+    pub confidence_threshold: f32,
+    pub confidence_softness: f32,
+    pub refresh: f32,
+    pub decay: f32,
+    pub occlusion: f32,
+}
+
+impl Default for FaradayMotionSnapshot {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            donor: MotionDonorSnapshot::None,
+            carrier: "transparent".into(),
+            confidence_threshold: 0.1,
+            confidence_softness: 0.05,
+            refresh: 1.0,
+            decay: 1.0,
+            occlusion: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurvedShutterSnapshot {
+    pub angle_degrees: f32,
+    pub phase: f32,
+    pub curvature: f32,
+    pub chromatic_lag: f32,
+    pub quality: String,
+    pub sample_count: u8,
+}
+
+impl Default for CurvedShutterSnapshot {
+    fn default() -> Self {
+        Self {
+            angle_degrees: 0.0,
+            phase: 0.0,
+            curvature: 0.0,
+            chromatic_lag: 0.0,
+            quality: "sharp".into(),
+            sample_count: 1,
+        }
+    }
+}
+
+/// Read-only renderer truth. Zero placeholders are truthful before a planner
+/// has admitted resources and never imply hidden field/carrier history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MotionTelemetrySnapshot {
+    #[serde(default)]
+    pub effective_source: String,
+    #[serde(default)]
+    pub codec_vectors_available: bool,
+    #[serde(default)]
+    pub fallback_active: bool,
+    #[serde(default)]
+    pub field_dimensions: [u32; 2],
+    #[serde(default)]
+    pub vector_count: u64,
+    #[serde(default)]
+    pub required_as_donor: bool,
+    #[serde(default)]
+    pub transplant_admitted: bool,
+    #[serde(default)]
+    pub donor_missing: bool,
+    #[serde(default)]
+    pub carrier_valid: bool,
+    #[serde(default)]
+    pub memory_generation: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnostic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MotionSnapshot {
+    pub algorithm_version: u16,
+    pub field_source: String,
+    pub lattice_quality: String,
+    pub transplant: FaradayMotionSnapshot,
+    pub shutter: CurvedShutterSnapshot,
+    #[serde(default)]
+    pub telemetry: MotionTelemetrySnapshot,
+}
+
+impl Default for MotionSnapshot {
+    fn default() -> Self {
+        Self::from_params(crate::motion::MotionParams::default())
+    }
+}
+
+impl MotionSnapshot {
+    pub fn from_params(params: crate::motion::MotionParams) -> Self {
+        use crate::motion::{
+            CurvedShutterQuality, MotionCarrier, MotionDonor, MotionFieldSource,
+            MotionLatticeQuality,
+        };
+        let params = params.sanitized();
+        let field_source = match params.field_source {
+            MotionFieldSource::Auto => "auto",
+            MotionFieldSource::CodecVectors => "codec_vectors",
+            MotionFieldSource::Lattice => "lattice",
+        };
+        let lattice_quality = match params.lattice_quality {
+            MotionLatticeQuality::Draft => "draft",
+            MotionLatticeQuality::Live => "live",
+            MotionLatticeQuality::High => "high",
+        };
+        let donor = match params.transplant.donor {
+            MotionDonor::None => MotionDonorSnapshot::None,
+            MotionDonor::Selected {
+                layer_id,
+                saved_position,
+            } => MotionDonorSnapshot::Selected {
+                layer_id: layer_id.get().to_string(),
+                saved_position: saved_position.get(),
+            },
+            MotionDonor::Missing { saved_position } => MotionDonorSnapshot::Missing {
+                saved_position: saved_position.get(),
+            },
+        };
+        let carrier = match params.transplant.carrier {
+            MotionCarrier::Transparent => "transparent",
+            MotionCarrier::Black => "black",
+            MotionCarrier::FirstSourceFrame => "first_source_frame",
+        };
+        let quality = match params.shutter.quality {
+            CurvedShutterQuality::Sharp => "sharp",
+            CurvedShutterQuality::Draft => "draft",
+            CurvedShutterQuality::Live => "live",
+            CurvedShutterQuality::High => "high",
+        };
+        Self {
+            algorithm_version: params.algorithm_version,
+            field_source: field_source.into(),
+            lattice_quality: lattice_quality.into(),
+            transplant: FaradayMotionSnapshot {
+                amount: params.transplant.amount,
+                donor,
+                carrier: carrier.into(),
+                confidence_threshold: params.transplant.confidence_threshold,
+                confidence_softness: params.transplant.confidence_softness,
+                refresh: params.transplant.refresh,
+                decay: params.transplant.decay,
+                occlusion: params.transplant.occlusion,
+            },
+            shutter: CurvedShutterSnapshot {
+                angle_degrees: params.shutter.angle_degrees,
+                phase: params.shutter.phase,
+                curvature: params.shutter.curvature,
+                chromatic_lag: params.shutter.chromatic_lag,
+                quality: quality.into(),
+                sample_count: params.shutter.quality.sample_count(),
+            },
+            telemetry: MotionTelemetrySnapshot::default(),
         }
     }
 }
@@ -1045,6 +2346,65 @@ pub struct SpoutSnapshot {
     pub active: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+}
+
+/// Browser-safe program recorder status. Counter fields are monotonic for one
+/// worker run and reset only when Main accepts a new recorder configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProgramRecorderSnapshot {
+    /// idle | starting | recording | finishing | succeeded | failed | cancelled
+    #[serde(default)]
+    pub status: String,
+    pub attempted: u64,
+    pub accepted: u64,
+    pub encoded: u64,
+    pub duplicated: u64,
+    pub dropped_not_ready: u64,
+    pub dropped_source_unavailable: u64,
+    pub dropped_pool_empty: u64,
+    pub dropped_queue_full: u64,
+    pub rejected_metadata: u64,
+    pub encoder_failures: u64,
+    /// This foundation publishes exact audio-clock correlation but truthfully
+    /// does not mux audio until Main has a bounded program PCM source.
+    #[serde(default = "bool_true")]
+    pub audio_not_muxed: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub artifact_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+impl Default for ProgramRecorderSnapshot {
+    fn default() -> Self {
+        Self {
+            status: "idle".into(),
+            attempted: 0,
+            accepted: 0,
+            encoded: 0,
+            duplicated: 0,
+            dropped_not_ready: 0,
+            dropped_source_unavailable: 0,
+            dropped_pool_empty: 0,
+            dropped_queue_full: 0,
+            rejected_metadata: 0,
+            encoder_failures: 0,
+            audio_not_muxed: true,
+            artifact_name: String::new(),
+            error: String::new(),
+        }
+    }
+}
+
+/// Stable capture source selected by the operator. Display positions are not
+/// accepted, so reorder/delete races become explicit Main-side failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum CaptureTargetSnapshot {
+    Program,
+    Layer { layer_id: String },
+    Group { group_id: String },
 }
 
 /// Patch morph crossfader state sent to the browser.
@@ -1095,6 +2455,234 @@ pub struct MidiSlotSnapshot {
     pub value: f32,
 }
 
+/// Browser-safe truth from the typed controller profile and MIDI supervisor.
+/// This complements the legacy four-slot `MidiSnapshot`; it does not add a
+/// generic remote-dispatch surface or expose host paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerRuntimeSnapshot {
+    #[serde(default)]
+    pub profile_revision: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default)]
+    pub midi: MidiRuntimeSnapshot,
+}
+
+impl ControllerRuntimeSnapshot {
+    pub fn from_runtime(
+        profile_revision: u64,
+        profile: &crate::controller_profile::ControllerProfileDocument,
+        status: &str,
+        runtime: &crate::midi::MidiRuntimeSnapshot,
+    ) -> Self {
+        Self {
+            profile_revision,
+            name: bounded_runtime_text(&profile.name),
+            status: bounded_runtime_text(status),
+            midi: MidiRuntimeSnapshot::from_runtime(runtime),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiRuntimeSnapshot {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_port: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_port: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default)]
+    pub counters: MidiCountersSnapshot,
+}
+
+impl MidiRuntimeSnapshot {
+    pub fn from_runtime(runtime: &crate::midi::MidiRuntimeSnapshot) -> Self {
+        Self {
+            phase: midi_runtime_phase_key(runtime.phase).into(),
+            input_port: runtime
+                .input_port
+                .as_deref()
+                .map_or_else(String::new, bounded_runtime_text),
+            output_port: runtime
+                .output_port
+                .as_deref()
+                .map_or_else(String::new, bounded_runtime_text),
+            available_inputs: runtime
+                .available_inputs
+                .iter()
+                .take(128)
+                .map(|name| bounded_runtime_text(name))
+                .collect(),
+            available_outputs: runtime
+                .available_outputs
+                .iter()
+                .take(128)
+                .map(|name| bounded_runtime_text(name))
+                .collect(),
+            error: runtime
+                .error
+                .as_deref()
+                .map_or_else(String::new, bounded_runtime_text),
+            counters: runtime.counters.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiCountersSnapshot {
+    pub raw_received: u64,
+    pub malformed: u64,
+    pub input_queue_dropped: u64,
+    pub decoded_events: u64,
+    pub event_queue_dropped: u64,
+    pub channel_or_unmapped: u64,
+    pub loop_suppressed: u64,
+    pub feedback_queued: u64,
+    pub feedback_coalesced: u64,
+    pub feedback_dropped: u64,
+    pub feedback_sent: u64,
+    pub feedback_rate_limited: u64,
+    pub scans: u64,
+    pub reconnects: u64,
+    pub disconnects: u64,
+}
+
+impl From<crate::midi::MidiCounters> for MidiCountersSnapshot {
+    fn from(counters: crate::midi::MidiCounters) -> Self {
+        Self {
+            raw_received: counters.raw_received,
+            malformed: counters.malformed,
+            input_queue_dropped: counters.input_queue_dropped,
+            decoded_events: counters.decoded_events,
+            event_queue_dropped: counters.event_queue_dropped,
+            channel_or_unmapped: counters.channel_or_unmapped,
+            loop_suppressed: counters.loop_suppressed,
+            feedback_queued: counters.feedback_queued,
+            feedback_coalesced: counters.feedback_coalesced,
+            feedback_dropped: counters.feedback_dropped,
+            feedback_sent: counters.feedback_sent,
+            feedback_rate_limited: counters.feedback_rate_limited,
+            scans: counters.scans,
+            reconnects: counters.reconnects,
+            disconnects: counters.disconnects,
+        }
+    }
+}
+
+/// Read-only OSC listener/runtime truth. `lan_warning` is deliberately always
+/// serialized: operators must never infer exposure from an absent field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OscRuntimeSnapshot {
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub bind_address: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bound_address: String,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(default)]
+    pub counters: OscCountersSnapshot,
+    #[serde(default)]
+    pub lan_warning: bool,
+}
+
+impl OscRuntimeSnapshot {
+    pub fn from_runtime(
+        config: &crate::osc::OscConfigDocument,
+        status: &str,
+        runtime: &crate::osc::OscRuntimeSnapshot,
+    ) -> Self {
+        let runtime_error = runtime.error.as_deref().unwrap_or_default();
+        let error = match (status.is_empty(), runtime_error.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => bounded_runtime_text(status),
+            (true, false) => bounded_runtime_text(runtime_error),
+            (false, false) => bounded_runtime_text(&format!("{status}; {runtime_error}")),
+        };
+        Self {
+            phase: osc_runtime_phase_key(runtime.phase).into(),
+            bind_address: config.bind.address().to_string(),
+            bound_address: runtime
+                .bound_address
+                .map_or_else(String::new, |address| address.to_string()),
+            running: matches!(runtime.phase, crate::osc::OscRuntimePhase::Listening),
+            error,
+            counters: runtime.counters.into(),
+            lan_warning: config.bind.lan_warning() || runtime.lan_warning,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OscCountersSnapshot {
+    pub datagrams_received: u64,
+    pub messages_received: u64,
+    pub malformed: u64,
+    pub rate_dropped: u64,
+    pub queue_dropped: u64,
+    pub loop_suppressed: u64,
+    pub feedback_queued: u64,
+    pub feedback_coalesced: u64,
+    pub feedback_dropped: u64,
+    pub feedback_rate_limited: u64,
+    pub feedback_sent: u64,
+    pub feedback_send_errors: u64,
+}
+
+impl From<crate::osc::OscCounters> for OscCountersSnapshot {
+    fn from(counters: crate::osc::OscCounters) -> Self {
+        Self {
+            datagrams_received: counters.datagrams_received,
+            messages_received: counters.messages_received,
+            malformed: counters.malformed,
+            rate_dropped: counters.rate_dropped,
+            queue_dropped: counters.queue_dropped,
+            loop_suppressed: counters.loop_suppressed,
+            feedback_queued: counters.feedback_queued,
+            feedback_coalesced: counters.feedback_coalesced,
+            feedback_dropped: counters.feedback_dropped,
+            feedback_rate_limited: counters.feedback_rate_limited,
+            feedback_sent: counters.feedback_sent,
+            feedback_send_errors: counters.feedback_send_errors,
+        }
+    }
+}
+
+fn bounded_runtime_text(value: &str) -> String {
+    crate::controller_profile::bounded_status(value.to_string())
+}
+
+const fn midi_runtime_phase_key(phase: crate::midi::MidiConnectionPhase) -> &'static str {
+    match phase {
+        crate::midi::MidiConnectionPhase::Disabled => "disabled",
+        crate::midi::MidiConnectionPhase::Scanning => "scanning",
+        crate::midi::MidiConnectionPhase::WaitingForDevice => "waiting_for_device",
+        crate::midi::MidiConnectionPhase::Connected => "connected",
+        crate::midi::MidiConnectionPhase::Error => "error",
+    }
+}
+
+const fn osc_runtime_phase_key(phase: crate::osc::OscRuntimePhase) -> &'static str {
+    match phase {
+        crate::osc::OscRuntimePhase::Disabled => "disabled",
+        crate::osc::OscRuntimePhase::Binding => "binding",
+        crate::osc::OscRuntimePhase::Listening => "listening",
+        crate::osc::OscRuntimePhase::Error => "error",
+    }
+}
+
 /// Per-layer info sent to the browser.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerSnapshot {
@@ -1130,6 +2718,15 @@ pub struct LayerSnapshot {
     pub key_tolerance: f32,
     #[serde(default)]
     pub effects: EffectsSnapshot,
+    /// Authored field/transplant/shutter law plus renderer telemetry. Defaults
+    /// are an exact no-op for legacy clients.
+    #[serde(default)]
+    pub motion: MotionSnapshot,
+    /// Resolution-independent authored transform. The serde default preserves
+    /// the exact inactive pre-transform sampling path for old snapshots while
+    /// exposed canvas becomes transparent after an authored transform.
+    #[serde(default)]
+    pub transform: SpatialTransform,
     /// `video` for ordinary decoded clips or `spout` for a live receiver.
     #[serde(default)]
     pub source_kind: String,
@@ -1149,10 +2746,178 @@ pub struct LayerSnapshot {
     /// Explicitly tells the performer how non-file sources behave in export.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub offline_export_policy: String,
+    /// Prepared sources, true per-clip transport, and matte routing owned by
+    /// this persistent visual layer identity.
+    #[serde(default)]
+    pub performance: LayerPerformanceSnapshot,
 }
 
 fn default_layer_fps() -> f32 {
     30.0
+}
+
+/// Browser-safe view of one prepared source. Host paths never cross the web
+/// boundary: `filename` is a logical library identity, while the engine owns
+/// canonical/content-addressed resolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClipSlotSnapshot {
+    pub id: ClipSlotId,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub filename: String,
+    #[serde(default)]
+    pub transport: ClipTransportConfig,
+    #[serde(default)]
+    pub playhead: NormalizedTime,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub prepared: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+/// Live image-input identity. Selected donors are always addressed by the
+/// same non-zero decimal stable layer ID used by every current layer action;
+/// display positions are deliberately absent from mutable routing messages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum ImageInputSnapshot {
+    SelectedLayer {
+        layer_id: String,
+        #[serde(default)]
+        stage: LayerImageStage,
+    },
+    /// Exact patch restore may expose an authored donor that no longer maps.
+    /// Browsers can display this diagnostic but server validation rejects it
+    /// as a newly authored route.
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+        #[serde(default)]
+        stage: LayerImageStage,
+    },
+    #[default]
+    OneBelow,
+    AllBelow,
+    CleanProgram,
+    ProgramHistory,
+    /// Non-zero decimal group identity; strings avoid JavaScript precision
+    /// loss for the shared u64 creative-ID domain.
+    GroupOutput {
+        group_id: String,
+    },
+    /// Retained output-only tombstone for a deleted group. It is exposed so
+    /// clients can diagnose the inert authored route, but ingress must never
+    /// accept it as a newly selected input.
+    MissingGroupOutput {
+        group_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatteSnapshot {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub input: ImageInputSnapshot,
+    #[serde(default)]
+    pub channel: MatteChannel,
+    #[serde(default)]
+    pub invert: bool,
+    #[serde(default = "default_matte_amount")]
+    pub amount: f32,
+    #[serde(default = "default_matte_threshold")]
+    pub threshold: f32,
+    #[serde(default = "default_matte_softness")]
+    pub softness: f32,
+    /// disabled | ready | missing | cycle
+    #[serde(default)]
+    pub diagnostic: String,
+}
+
+const fn default_matte_amount() -> f32 {
+    1.0
+}
+
+const fn default_matte_threshold() -> f32 {
+    0.5
+}
+
+const fn default_matte_softness() -> f32 {
+    0.1
+}
+
+impl Default for MatteSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            input: ImageInputSnapshot::default(),
+            channel: MatteChannel::Alpha,
+            invert: false,
+            amount: default_matte_amount(),
+            threshold: default_matte_threshold(),
+            softness: default_matte_softness(),
+            diagnostic: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LayerPerformanceSnapshot {
+    #[serde(default)]
+    pub active_slot_id: Option<ClipSlotId>,
+    #[serde(default)]
+    pub slots: Vec<ClipSlotSnapshot>,
+    #[serde(default)]
+    pub matte: MatteSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneBindingSnapshot {
+    /// Live stable identity, not a saved position or current display index.
+    pub layer_id: String,
+    pub slot_id: ClipSlotId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cue_id: Option<CueId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SceneSnapshot {
+    pub id: SceneId,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default)]
+    pub trigger_mode: TriggerMode,
+    #[serde(default)]
+    pub bindings: Vec<SceneBindingSnapshot>,
+    #[serde(default)]
+    pub prepared: bool,
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerformanceSnapshot {
+    #[serde(default)]
+    pub scenes: Vec<SceneSnapshot>,
+    #[serde(default)]
+    pub prepared_scene_id: Option<SceneId>,
+    #[serde(default)]
+    pub pending_scene_id: Option<SceneId>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Atomic Scene prepare/quantize/commit/rejection status.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scene_staging_status: String,
+    /// Prepared-source open/decode/upload/cache admission status.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_staging_status: String,
+    /// Frame-plan route diagnostics, including missing donors and rejected
+    /// same-frame cycles. Kept separate from source/scene transaction status.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_routing_status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1160,6 +2925,7 @@ fn default_layer_fps() -> f32 {
 pub enum RerollScope {
     Master,
     Layer,
+    Group,
     All,
 }
 
@@ -1188,9 +2954,230 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// Set one absolute authored master-transform field.
+    #[serde(rename = "set_master_transform")]
+    SetMasterTransform {
+        param: String,
+        value: serde_json::Value,
+    },
+    /// Coalescible value edit. `node_kind` selects the authoritative parameter
+    /// descriptor; the engine verifies it again against the addressed node.
+    #[serde(rename = "set_visual_node_param")]
+    SetVisualNodeParam {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        node_kind: String,
+        param: String,
+        value: serde_json::Value,
+        composition_revision: u64,
+    },
+    /// Topology mutations are ordered barriers and require an exact current
+    /// composition revision. Node/group IDs are always engine allocated.
+    #[serde(rename = "insert_visual_node")]
+    InsertVisualNode {
+        scope: CreativeScopeSnapshot,
+        index: usize,
+        node_kind: String,
+        composition_revision: u64,
+    },
+    #[serde(rename = "remove_visual_node")]
+    RemoveVisualNode {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        composition_revision: u64,
+    },
+    #[serde(rename = "move_visual_node")]
+    MoveVisualNode {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        to: usize,
+        composition_revision: u64,
+    },
+    /// Replace only a Mask node's structural variant. Selecting image installs
+    /// the deterministic OneBelow/current-frame/alpha/non-inverted default;
+    /// the route action may refine it in a later ordered transaction.
+    #[serde(rename = "set_visual_node_mask_variant")]
+    SetVisualNodeMaskVariant {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        variant: String,
+        composition_revision: u64,
+    },
+    #[serde(rename = "set_visual_node_route")]
+    SetVisualNodeRoute {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        route: CreativeImageTapSnapshot,
+        channel: String,
+        invert: bool,
+        composition_revision: u64,
+    },
+    /// Enable/disable or reroute the separate group matte. `None` disables it;
+    /// numeric matte values remain untouched and use the coalescible action.
+    #[serde(rename = "set_composition_group_matte_route")]
+    SetCompositionGroupMatteRoute {
+        group_id: String,
+        route: Option<CreativeImageTapSnapshot>,
+        channel: String,
+        invert: bool,
+        composition_revision: u64,
+    },
+    #[serde(rename = "set_composition_group_matte_param")]
+    SetCompositionGroupMatteParam {
+        group_id: String,
+        param: String,
+        value: serde_json::Value,
+        composition_revision: u64,
+    },
+    #[serde(rename = "set_composition_group_param")]
+    SetCompositionGroupParam {
+        group_id: String,
+        param: String,
+        value: serde_json::Value,
+        composition_revision: u64,
+    },
+    #[serde(rename = "create_composition_group")]
+    CreateCompositionGroup {
+        name: String,
+        #[serde(default)]
+        member_layer_ids: Vec<String>,
+        root_index: usize,
+        composition_revision: u64,
+    },
+    #[serde(rename = "remove_composition_group")]
+    RemoveCompositionGroup {
+        group_id: String,
+        composition_revision: u64,
+    },
+    #[serde(rename = "set_composition_group_members")]
+    SetCompositionGroupMembers {
+        group_id: String,
+        member_layer_ids: Vec<String>,
+        composition_revision: u64,
+    },
+    #[serde(rename = "move_composition_root_item")]
+    MoveCompositionRootItem {
+        item: CompositionRootSnapshot,
+        to: usize,
+        composition_revision: u64,
+    },
+    /// Continuous A/B performance control; it does not mutate topology or
+    /// advance the optimistic composition revision.
+    #[serde(rename = "set_composition_bus_crossfade")]
+    SetCompositionBusCrossfade { value: f32 },
+    /// Stable direct-layer bus assignment is an ordered topology edit.
+    #[serde(rename = "set_composition_layer_bus")]
+    SetCompositionLayerBus {
+        layer_id: String,
+        bus: String,
+        composition_revision: u64,
+    },
+    /// Restore the exact legacy full-frame master-transform identity.
+    #[serde(rename = "reset_master_transform")]
+    ResetMasterTransform,
+    /// Atomically replace the complete master transform (paste/preset).
+    #[serde(rename = "apply_master_transform")]
+    ApplyMasterTransform { transform: SpatialTransform },
     /// Add a layer from the library by filename
     #[serde(rename = "add_layer")]
     AddLayer { filename: String },
+    /// Stage a library source into a persistent layer. `None` appends a new
+    /// engine-assigned slot; `Some` replaces that exact stable slot. Source
+    /// open and first-frame decode complete before any optional activation.
+    #[serde(rename = "load_clip_into_slot")]
+    LoadClipIntoSlot {
+        layer_id: String,
+        #[serde(default)]
+        slot_id: Option<ClipSlotId>,
+        filename: String,
+        #[serde(default)]
+        activate: bool,
+        #[serde(default)]
+        trigger_mode: TriggerMode,
+    },
+    /// Remove one exact prepared source. The active/last slot protections are
+    /// enforced again by the engine against its authoritative live set.
+    #[serde(rename = "remove_clip_slot")]
+    RemoveClipSlot {
+        layer_id: String,
+        slot_id: ClipSlotId,
+    },
+    /// Atomically swap the prepared source while retaining the visual layer's
+    /// stable identity, effects, transform, modulation, and image routes.
+    #[serde(rename = "activate_clip_slot")]
+    ActivateClipSlot {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        #[serde(default)]
+        trigger_mode: TriggerMode,
+    },
+    /// Edit one scalar field of a slot's authored source-time law. Ingress
+    /// accepts only a closed field/value vocabulary and coalesces by target.
+    #[serde(rename = "set_clip_transport")]
+    SetClipTransport {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        param: String,
+        value: serde_json::Value,
+    },
+    /// Add or move one bounded cue. Cue position is a scalar edit and may
+    /// coalesce; cue removal/triggering remain ordered barriers.
+    #[serde(rename = "set_clip_cue")]
+    SetClipCue {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        cue_id: CueId,
+        at: NormalizedTime,
+    },
+    #[serde(rename = "remove_clip_cue")]
+    RemoveClipCue {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        cue_id: CueId,
+    },
+    #[serde(rename = "trigger_clip_cue")]
+    TriggerClipCue {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        cue_id: CueId,
+    },
+    /// Direct discontinuous playhead movement. Consecutive requests for the
+    /// same stable layer/slot coalesce newest-only; no intervening command is
+    /// crossed, because every accepted seek advances decoder generation.
+    #[serde(rename = "seek_clip_slot")]
+    SeekClipSlot {
+        layer_id: String,
+        slot_id: ClipSlotId,
+        position: NormalizedTime,
+    },
+    /// Decode/upload every source required by a scene without changing output.
+    #[serde(rename = "prepare_scene")]
+    PrepareScene { scene_id: SceneId },
+    /// Capture the active slot on every current live layer as one bounded,
+    /// positional patch Scene. `None` requests a new engine-assigned stable
+    /// Scene ID; `Some` recaptures that exact existing Scene. Live layer IDs
+    /// deliberately never cross this authoring boundary into persistence.
+    #[serde(rename = "capture_scene")]
+    CaptureScene {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scene_id: Option<SceneId>,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        trigger_mode: TriggerMode,
+    },
+    /// Remove one exact authored Scene. This is an ordered topology barrier so
+    /// a pending prepare/trigger can never be silently retargeted by ID reuse.
+    #[serde(rename = "remove_scene")]
+    RemoveScene { scene_id: SceneId },
+    /// Commit all prepared scene bindings at one program-clock boundary or do
+    /// nothing. `None` uses the scene's authored trigger mode.
+    #[serde(rename = "trigger_scene")]
+    TriggerScene {
+        scene_id: SceneId,
+        #[serde(default)]
+        trigger_mode: Option<TriggerMode>,
+    },
     /// Add a live Spout receiver layer by sender name.
     #[serde(rename = "add_spout_layer")]
     AddSpoutLayer { sender: String },
@@ -1250,6 +3237,32 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// Set one absolute authored transform field on a layer. The wire shape
+    /// keeps the optional ID for serde compatibility, but server ingress
+    /// requires a present nonzero stable ID; index is diagnostic context only.
+    #[serde(rename = "set_layer_transform")]
+    SetLayerTransform {
+        index: usize,
+        #[serde(default)]
+        layer_id: Option<String>,
+        param: String,
+        value: serde_json::Value,
+    },
+    /// Restore one layer's exact legacy full-frame transform identity.
+    #[serde(rename = "reset_layer_transform")]
+    ResetLayerTransform {
+        index: usize,
+        #[serde(default)]
+        layer_id: Option<String>,
+    },
+    /// Atomically replace one complete layer transform (paste/preset).
+    #[serde(rename = "apply_layer_transform")]
+    ApplyLayerTransform {
+        index: usize,
+        #[serde(default)]
+        layer_id: Option<String>,
+        transform: SpatialTransform,
+    },
     /// Reset all direct effects on one layer.
     #[serde(rename = "reset_layer_fx")]
     ResetLayerFx {
@@ -1273,6 +3286,30 @@ pub enum WebAction {
         layer_id: Option<String>,
         paused: bool,
     },
+    /// Edit one matte field. Amount/threshold/softness are coalesced scalar
+    /// controls; enabled/channel/invert remain ordered atomic mode changes.
+    /// Image donor changes use the separate barrier action below.
+    #[serde(rename = "set_layer_matte_param")]
+    SetLayerMatteParam {
+        layer_id: String,
+        param: String,
+        value: serde_json::Value,
+        /// Required by current clients when `enabled` can admit/remove a DAG
+        /// edge; optional for backward-compatible scalar/channel edits.
+        #[serde(default)]
+        composition_revision: Option<u64>,
+    },
+    /// Replace the complete typed image input. Selected donors require a
+    /// non-zero decimal stable ID and never accept a display-position fallback.
+    #[serde(rename = "set_layer_matte_input")]
+    SetLayerMatteInput {
+        layer_id: String,
+        input: ImageInputSnapshot,
+        /// Current clients bind route replacement to creative topology. Old
+        /// clients may omit this but still pass transactional live preflight.
+        #[serde(default)]
+        composition_revision: Option<u64>,
+    },
     #[serde(rename = "set_master_paused")]
     SetMasterPaused { paused: bool },
     /// Canonical spelling for the complete program freeze. The legacy master
@@ -1288,6 +3325,10 @@ pub enum WebAction {
     SetMediaSafetyMode {
         mode: crate::media_safety::MediaSafetyMode,
     },
+    /// Change only the host-session framing preference for future interactive
+    /// file, still, and Spout layers. Patches never own this value.
+    #[serde(rename = "set_new_layer_fit")]
+    SetNewLayerFit { fit: FitMode },
     /// Deterministically choose a new stochastic pattern and optionally make
     /// bounded visual-control variations. Every press is an ordered barrier.
     #[serde(rename = "reroll")]
@@ -1298,6 +3339,8 @@ pub enum WebAction {
         #[serde(default)]
         layer_id: Option<String>,
         #[serde(default)]
+        group_id: Option<String>,
+        #[serde(default)]
         stack_revision: Option<u64>,
         #[serde(default)]
         seed: Option<u32>,
@@ -1307,6 +3350,18 @@ pub enum WebAction {
         amount: f32,
         #[serde(default)]
         include_grain_controls: bool,
+        /// Explicit performer opt-in for bounded spatial variation. Pattern
+        /// rerolls and automatic per-loop rerolls leave transforms untouched.
+        #[serde(default)]
+        include_transform: bool,
+        /// Opt in to numeric/wet mutation for addressed M2 rack nodes. Routes,
+        /// IDs, order, enabled state, and blends are never randomized.
+        #[serde(default)]
+        include_rack_controls: bool,
+        /// Opt in to group opacity/transform values. Membership, solo/bypass,
+        /// bus assignment, routes, and root order remain authored topology.
+        #[serde(default)]
+        include_group_controls: bool,
     },
     #[serde(rename = "set_layer_reroll_on_loop")]
     SetLayerRerollOnLoop {
@@ -1378,6 +3433,13 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// Bounded, path-free typed controller-profile document transfer. Large
+    /// documents use the dedicated authenticated HTTP endpoint; the same shape
+    /// remains valid over WebSocket when it fits the general message cap.
+    #[serde(rename = "controller_profile")]
+    ControllerProfile {
+        request: crate::controller_profile::ControllerProfileAction,
+    },
     /// Phone orientation sample (degrees, DeviceOrientation convention)
     #[serde(rename = "gyro")]
     Gyro { alpha: f32, beta: f32, gamma: f32 },
@@ -1428,6 +3490,11 @@ pub enum WebAction {
         /// queued against an older topology is rejected at execution time.
         #[serde(default)]
         stack_revision: Option<u64>,
+        /// Independent creative-topology generation. Legacy clients omit it;
+        /// current clients supply both barriers so capture cannot combine a
+        /// new stack with stale rack/group ownership.
+        #[serde(default)]
+        composition_revision: Option<u64>,
     },
     /// Clear both morph slots (crossfader disengages)
     #[serde(rename = "morph_clear")]
@@ -1453,9 +3520,133 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// Clear clean-history/Garden carrier/Score memory at one ordered engine
+    /// boundary. Authored temporal parameters and a paused audience hold stay.
+    #[serde(rename = "clear_temporal_memory")]
+    ClearTemporalMemory,
+    /// Emit one explicit manual Collision Score event. It is an ordered event,
+    /// never a coalesced scalar edit.
+    #[serde(rename = "trigger_collision_score")]
+    TriggerCollisionScore,
+    /// Coalescible bounded Motion value/tier edit. Donor identity uses the
+    /// separate ordered action below and algorithm provenance is read-only.
+    #[serde(rename = "set_motion")]
+    SetMotion {
+        scope: MotionScopeSnapshot,
+        param: String,
+        value: serde_json::Value,
+    },
+    /// Select or clear one layer recipient's stable donor. This is a topology
+    /// barrier protected by the current layer-stack revision.
+    #[serde(rename = "set_motion_donor")]
+    SetMotionDonor {
+        layer_id: String,
+        #[serde(default)]
+        donor_layer_id: Option<String>,
+        layer_stack_revision: u64,
+    },
+    /// Clear all lattice/transplant carrier history at one ordered engine
+    /// boundary while leaving authored Motion values untouched.
+    #[serde(rename = "clear_motion_memory")]
+    ClearMotionMemory,
     /// Enable/disable the Spout output sender
     #[serde(rename = "set_spout")]
     SetSpout { enabled: bool },
+    /// Begin a real-time program recording. Main owns the native destination
+    /// picker; browser payloads can never nominate a host filesystem path.
+    #[serde(rename = "start_program_recording")]
+    StartProgramRecording {
+        #[serde(default)]
+        auto_import: bool,
+    },
+    /// Drain the bounded recorder queue and close at an explicit CFR clock.
+    #[serde(rename = "finish_program_recording")]
+    FinishProgramRecording,
+    /// Abort capture and remove every temporary artifact.
+    #[serde(rename = "cancel_program_recording")]
+    CancelProgramRecording,
+    /// Publish one complete PNG through the same no-replace artifact law.
+    #[serde(rename = "capture_still")]
+    CaptureStill {
+        #[serde(flatten)]
+        target: CaptureTargetSnapshot,
+        #[serde(default)]
+        auto_import: bool,
+    },
+    /// Begin recording one stable scope. A successful commit emits an intent
+    /// for a newly allocated ClipSlot; it never mutates the live source itself.
+    #[serde(rename = "start_resample")]
+    StartResample {
+        #[serde(flatten)]
+        target: CaptureTargetSnapshot,
+        destination_layer_id: String,
+        #[serde(default)]
+        activate: bool,
+    },
+    /// Show/hide operator health telemetry in the editor preview only.
+    #[serde(rename = "set_stage_health_hud")]
+    SetStageHealthHud { enabled: bool },
+    /// Substitute a test card only on one exact physical output endpoint.
+    #[serde(rename = "set_stage_test_card")]
+    SetStageTestCard {
+        mode: crate::stage_map::TestCardMode,
+        #[serde(default)]
+        output_endpoint_id: Option<String>,
+    },
+    /// Overlay endpoint identity only on one exact physical output endpoint.
+    #[serde(rename = "set_output_identification")]
+    SetOutputIdentification {
+        enabled: bool,
+        #[serde(default)]
+        output_endpoint_id: Option<String>,
+    },
+    /// Open one coalesced manual scalar gesture. IDs are non-zero JS-safe
+    /// integers and boundaries remain ordered queue barriers.
+    #[serde(rename = "begin_history_gesture")]
+    BeginHistoryGesture { gesture_id: u64 },
+    /// Commit the one before-checkpoint after the final scalar edit.
+    #[serde(rename = "end_history_gesture")]
+    EndHistoryGesture { gesture_id: u64 },
+    /// Discard an unchanged/interrupted gesture boundary. A client that has
+    /// already emitted a value must end rather than cancel it.
+    #[serde(rename = "cancel_history_gesture")]
+    CancelHistoryGesture { gesture_id: u64 },
+    #[serde(rename = "undo_manual")]
+    UndoManual,
+    #[serde(rename = "redo_manual")]
+    RedoManual,
+    /// Capture values from one exact stable scope into the preset library.
+    #[serde(rename = "capture_scoped_preset")]
+    CaptureScopedPreset {
+        name: String,
+        kind: crate::preset::PresetKind,
+        target: PresetTargetSnapshot,
+        preset_revision: u64,
+        layer_stack_revision: u64,
+        composition_revision: u64,
+    },
+    /// Apply a values-only preset. Main resolves the ID, checks the target
+    /// kind/topology, performs unified preflight, then records one history
+    /// transaction; no route or stable identity may be replaced.
+    #[serde(rename = "apply_scoped_preset")]
+    ApplyScopedPreset {
+        preset_id: String,
+        target: PresetTargetSnapshot,
+        preset_revision: u64,
+        layer_stack_revision: u64,
+        composition_revision: u64,
+    },
+    #[serde(rename = "delete_scoped_preset")]
+    DeleteScopedPreset {
+        preset_id: String,
+        preset_revision: u64,
+    },
+    /// Recovery is always an explicit operator choice; startup never recalls
+    /// a journal automatically.
+    #[serde(rename = "restore_recovery_journal")]
+    RestoreRecoveryJournal,
+    #[serde(rename = "discard_recovery_journal")]
+    DiscardRecoveryJournal,
     /// Open a host-native picker and replace the complete performance state.
     #[serde(rename = "open_patch_snapshot")]
     OpenPatchSnapshot,
@@ -1493,6 +3684,14 @@ fn bool_true() -> bool {
 }
 
 impl WebAction {
+    fn creative_scope_key(scope: &CreativeScopeSnapshot) -> String {
+        match scope {
+            CreativeScopeSnapshot::Master => "master".to_string(),
+            CreativeScopeSnapshot::Layer { layer_id } => format!("layer:{layer_id}"),
+            CreativeScopeSnapshot::Group { group_id } => format!("group:{group_id}"),
+        }
+    }
+
     fn layer_key(index: usize, layer_id: &Option<String>) -> String {
         layer_id
             .as_deref()
@@ -1514,6 +3713,25 @@ impl WebAction {
         match self {
             Self::Quantized { inner } => inner.coalesce_key().map(|key| format!("quantized:{key}")),
             Self::SetParam { param, .. } => Some(format!("master:{param}")),
+            Self::SetMasterTransform { param, .. } => Some(format!("master:transform:{param}")),
+            Self::SetVisualNodeParam {
+                scope,
+                node_id,
+                param,
+                ..
+            } => Some(format!(
+                "creative:{}:node:{node_id}:{param}",
+                Self::creative_scope_key(scope)
+            )),
+            Self::SetCompositionGroupParam {
+                group_id, param, ..
+            } => Some(format!("creative:group:{group_id}:{param}")),
+            Self::SetCompositionGroupMatteParam {
+                group_id, param, ..
+            } => Some(format!("creative:group:{group_id}:matte:{param}")),
+            Self::SetCompositionBusCrossfade { .. } => {
+                Some("creative:composition:bus-crossfade".into())
+            }
             Self::SetLayerParam {
                 index,
                 layer_id,
@@ -1532,6 +3750,15 @@ impl WebAction {
                 "layer:{}:effect:{param}",
                 Self::layer_key(*index, layer_id)
             )),
+            Self::SetLayerTransform {
+                index,
+                layer_id,
+                param,
+                ..
+            } => Some(format!(
+                "layer:{}:transform:{param}",
+                Self::layer_key(*index, layer_id)
+            )),
             Self::SetLayerVisibility {
                 index, layer_id, ..
             } => Some(format!(
@@ -1544,10 +3771,35 @@ impl WebAction {
                 "layer:{}:paused",
                 Self::layer_key(*index, layer_id)
             )),
+            Self::SetClipTransport {
+                layer_id,
+                slot_id,
+                param,
+                ..
+            } => Some(format!(
+                "layer:id:{layer_id}:slot:{}:transport:{param}",
+                slot_id.get()
+            )),
+            Self::SetClipCue {
+                layer_id,
+                slot_id,
+                cue_id,
+                ..
+            } => Some(format!(
+                "layer:id:{layer_id}:slot:{}:cue:{}",
+                slot_id.get(),
+                cue_id.get()
+            )),
+            Self::SetLayerMatteParam {
+                layer_id, param, ..
+            } if matches!(param.as_str(), "amount" | "threshold" | "softness") => {
+                Some(format!("layer:id:{layer_id}:matte:{param}"))
+            }
             Self::SetMasterPaused { .. } => Some("master:paused".into()),
             Self::SetProgramFrozen { .. } => Some("master:paused".into()),
             Self::SetMediaFrozen { .. } => Some("media:frozen".into()),
             Self::SetMediaSafetyMode { .. } => Some("media:safety-mode".into()),
+            Self::SetNewLayerFit { .. } => Some("host:new-layer-fit".into()),
             Self::SetLayerRerollOnLoop {
                 index, layer_id, ..
             } => Some(format!(
@@ -1577,19 +3829,83 @@ impl WebAction {
             Self::SetMorph { .. } => Some("morph:position".into()),
             Self::SetMorphLaw { .. } => Some("morph:law".into()),
             Self::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
+            Self::SetMotion { scope, param, .. } => Some(match scope {
+                MotionScopeSnapshot::Master => format!("motion:master:{param}"),
+                MotionScopeSnapshot::Layer { layer_id } => {
+                    format!("motion:layer:{layer_id}:{param}")
+                }
+            }),
             Self::SetSpout { .. } => Some("spout:enabled".into()),
-            Self::OpenPatchSnapshot => Some("patch:open-snapshot".into()),
-            Self::OpenPatchLook { .. } => Some("patch:open-look".into()),
-            Self::QuickSavePatch => Some("patch:quick-save".into()),
-            Self::CancelExport => Some("export:cancel".into()),
-            Self::RescanLibrary => Some("library:rescan".into()),
+            Self::SetStageHealthHud { .. } => Some("stage:health-hud".into()),
+            Self::SetStageTestCard { .. } => Some("stage:test-card".into()),
+            Self::SetOutputIdentification { .. } => Some("stage:output-identification".into()),
             _ => None,
         }
+    }
+
+    /// These live/performance commands deliberately bypass manual history in
+    /// Main. The WebSocket owner gate uses the same frozen classification so
+    /// telemetry, triggers, and output operations cannot be mistaken for a
+    /// second controller's authored scalar edit.
+    fn is_performance_only_for_history(&self) -> bool {
+        matches!(
+            self,
+            Self::Quantized { .. }
+                | Self::ActivateClipSlot { .. }
+                | Self::TriggerClipCue { .. }
+                | Self::SeekClipSlot { .. }
+                | Self::PrepareScene { .. }
+                | Self::TriggerScene { .. }
+                | Self::TapTempo
+                | Self::Gyro { .. }
+                | Self::GyroStream { .. }
+                | Self::GyroCalibrate
+                | Self::Pad { .. }
+                | Self::TriggerCollisionScore
+                | Self::ClearTemporalMemory
+                | Self::ClearMotionMemory
+                | Self::SetOutputWindow { .. }
+                | Self::ToggleOutputWindow
+                | Self::SetSpout { .. }
+                | Self::StartProgramRecording { .. }
+                | Self::FinishProgramRecording
+                | Self::CancelProgramRecording
+                | Self::CaptureStill { .. }
+                | Self::StartResample { .. }
+                | Self::SetStageHealthHud { .. }
+                | Self::SetStageTestCard { .. }
+                | Self::SetOutputIdentification { .. }
+                | Self::RescanLibrary
+                | Self::QuickSavePatch
+                | Self::StartExport { .. }
+                | Self::CancelExport
+                | Self::ControllerProfile {
+                    request: crate::controller_profile::ControllerProfileAction::Export {},
+                }
+        )
     }
 
     fn is_priority(&self) -> bool {
         match self {
             Self::CancelExport
+            | Self::StartProgramRecording { .. }
+            | Self::FinishProgramRecording
+            | Self::CancelProgramRecording
+            | Self::CaptureStill { .. }
+            | Self::StartResample { .. }
+            | Self::SetStageTestCard { .. }
+            | Self::SetOutputIdentification { .. }
+            | Self::BeginHistoryGesture { .. }
+            | Self::EndHistoryGesture { .. }
+            | Self::CancelHistoryGesture { .. }
+            | Self::UndoManual
+            | Self::RedoManual
+            | Self::CaptureScopedPreset { .. }
+            | Self::ApplyScopedPreset { .. }
+            | Self::DeleteScopedPreset { .. }
+            | Self::RestoreRecoveryJournal
+            | Self::DiscardRecoveryJournal
+            | Self::ControllerProfile { .. }
             | Self::ToggleBlackout
             | Self::SetBlackout { .. }
             | Self::SetOutputWindow { .. }
@@ -1601,12 +3917,43 @@ impl WebAction {
             | Self::SetLayerRerollOnLoop { .. }
             | Self::ResetFx
             | Self::ResetVisualProgram
+            | Self::ClearTemporalMemory
+            | Self::TriggerCollisionScore
+            | Self::SetMotionDonor { .. }
+            | Self::ClearMotionMemory
             | Self::SetLayerPaused { .. }
             | Self::SetLayerVisibility { .. }
+            | Self::LoadClipIntoSlot { .. }
+            | Self::RemoveClipSlot { .. }
+            | Self::ActivateClipSlot { .. }
+            | Self::RemoveClipCue { .. }
+            | Self::TriggerClipCue { .. }
+            | Self::SeekClipSlot { .. }
+            | Self::PrepareScene { .. }
+            | Self::CaptureScene { .. }
+            | Self::RemoveScene { .. }
+            | Self::TriggerScene { .. }
+            | Self::SetLayerMatteInput { .. }
+            | Self::InsertVisualNode { .. }
+            | Self::RemoveVisualNode { .. }
+            | Self::MoveVisualNode { .. }
+            | Self::SetVisualNodeMaskVariant { .. }
+            | Self::SetVisualNodeRoute { .. }
+            | Self::SetCompositionGroupMatteRoute { .. }
+            | Self::CreateCompositionGroup { .. }
+            | Self::RemoveCompositionGroup { .. }
+            | Self::SetCompositionGroupMembers { .. }
+            | Self::MoveCompositionRootItem { .. }
+            | Self::SetCompositionLayerBus { .. }
             | Self::OpenPatchSnapshot
             | Self::OpenPatchLook { .. }
             | Self::QuickSavePatch
             | Self::RescanLibrary => true,
+            Self::SetLayerMatteParam { param, .. }
+                if !matches!(param.as_str(), "amount" | "threshold" | "softness") =>
+            {
+                true
+            }
             Self::SetMediaSafetyMode {
                 mode: crate::media_safety::MediaSafetyMode::Safe,
             } => true,
@@ -1626,6 +3973,23 @@ fn enqueue_bounded(queue: &mut Vec<WebAction>, action: WebAction) -> EnqueueOutc
             .any(|candidate| matches!(candidate, WebAction::RescanLibrary))
     {
         return EnqueueOutcome::Coalesced;
+    }
+    if let WebAction::SeekClipSlot {
+        layer_id, slot_id, ..
+    } = &action
+    {
+        let replaces_last = matches!(
+            queue.last(),
+            Some(WebAction::SeekClipSlot {
+                layer_id: pending_layer,
+                slot_id: pending_slot,
+                ..
+            }) if pending_layer == layer_id && pending_slot == slot_id
+        );
+        if replaces_last {
+            *queue.last_mut().expect("the matching final seek exists") = action;
+            return EnqueueOutcome::Coalesced;
+        }
     }
     if let Some(key) = action.coalesce_key() {
         // Captures, resets, saves, topology changes, and other uncoalesced
@@ -1942,6 +4306,13 @@ impl WebState {
             app: RwLock::new(AppSnapshot::default()),
             tx,
             actions: Mutex::new(Vec::new()),
+            controller_profile_export: std::sync::RwLock::new(
+                crate::controller_profile::export_controller_profile_json(
+                    &crate::controller_profile::ControllerProfileDocument::default(),
+                )
+                .map_err(|error| format!("default controller profile is invalid: {error}"))?,
+            ),
+            browser_history_gesture: Mutex::new(None),
             thumbnails: std::sync::RwLock::new(HashMap::new()),
             preview_frames: std::sync::RwLock::new(HashMap::new()),
             library_media_cache_bytes: std::sync::Mutex::new(0),
@@ -1962,6 +4333,129 @@ impl WebState {
     pub async fn enqueue_action(&self, action: WebAction) -> EnqueueOutcome {
         let mut queue = self.actions.lock().await;
         enqueue_bounded(&mut queue, action)
+    }
+
+    pub fn publish_controller_profile_export(
+        &self,
+        document: &crate::controller_profile::ControllerProfileDocument,
+    ) -> Result<(), crate::controller_profile::ControllerProfileError> {
+        let bytes = crate::controller_profile::export_controller_profile_json(document)?;
+        match self.controller_profile_export.write() {
+            Ok(mut slot) => *slot = bytes,
+            Err(poisoned) => *poisoned.into_inner() = bytes,
+        }
+        Ok(())
+    }
+
+    pub fn controller_profile_export(&self) -> Vec<u8> {
+        match self.controller_profile_export.read() {
+            Ok(bytes) => bytes.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub async fn begin_browser_history_gesture(&self, client_id: u64, gesture_id: u64) -> bool {
+        let mut active = self.browser_history_gesture.lock().await;
+        if active.is_some() {
+            return false;
+        }
+        *active = Some(BrowserHistoryGesture {
+            client_id,
+            gesture_id,
+            coalesce_key: None,
+            dirty: false,
+        });
+        true
+    }
+
+    /// Admit an action while preserving one-controller/one-destination
+    /// gesture ownership. Performance-only events remain live but never mark
+    /// the transaction dirty. An authored action from another client, a
+    /// topology command, or a second scalar destination is rejected before it
+    /// reaches Main and therefore cannot be folded into the owner's entry.
+    pub async fn admit_browser_action_during_gesture(
+        &self,
+        client_id: u64,
+        action: &WebAction,
+    ) -> bool {
+        if action.is_performance_only_for_history() {
+            return true;
+        }
+        let mut active = self.browser_history_gesture.lock().await;
+        let Some(active) = active.as_mut() else {
+            return true;
+        };
+        if active.client_id != client_id {
+            return false;
+        }
+        let Some(key) = action.coalesce_key() else {
+            return false;
+        };
+        if active
+            .coalesce_key
+            .as_ref()
+            .is_some_and(|owned| owned != &key)
+        {
+            return false;
+        }
+        active.coalesce_key.get_or_insert(key);
+        active.dirty = true;
+        true
+    }
+
+    /// A Cancel is valid only before any authored scalar crossed the Begin
+    /// barrier. Dirty clients must End, matching Main's fingerprint guard.
+    pub async fn may_finish_browser_history_gesture(
+        &self,
+        client_id: u64,
+        gesture_id: u64,
+        cancel: bool,
+    ) -> bool {
+        self.browser_history_gesture
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|active| {
+                active.client_id == client_id
+                    && active.gesture_id == gesture_id
+                    && (!cancel || !active.dirty)
+            })
+    }
+
+    pub async fn finish_browser_history_gesture(&self, client_id: u64, gesture_id: u64) {
+        let mut active = self.browser_history_gesture.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|active| active.client_id == client_id && active.gesture_id == gesture_id)
+        {
+            *active = None;
+        }
+    }
+
+    /// Close a vanished client's gesture without exposing a new owner until
+    /// the matching End barrier is already ordered in Main's action queue.
+    /// Clearing ownership first would let another client enqueue Begin(new)
+    /// ahead of End(old), leaving the server and Main with different owners.
+    pub async fn disconnect_browser_history_gesture(&self, client_id: u64) -> Option<u64> {
+        let mut active = self.browser_history_gesture.lock().await;
+        let gesture_id = match active.as_ref() {
+            Some(active) if active.client_id == client_id => Some(active.gesture_id),
+            _ => None,
+        };
+        if let Some(gesture_id) = gesture_id {
+            // Keep the ownership lock through queue admission. Every other
+            // Begin must therefore observe the old owner until End(old) is
+            // present. End is a priority action and is never dropped by the
+            // bounded queue; the outcome is retained as a debug assertion so
+            // a future queue-policy change cannot silently reopen this race.
+            let outcome = {
+                let mut queue = self.actions.lock().await;
+                enqueue_bounded(&mut queue, WebAction::EndHistoryGesture { gesture_id })
+            };
+            debug_assert_ne!(outcome, EnqueueOutcome::Dropped);
+            *active = None;
+        }
+        gesture_id
     }
 
     pub fn allocate_client_id(&self) -> u64 {
@@ -2321,6 +4815,7 @@ mod protocol_tests {
                 WebAction::MorphCapture {
                     slot: "a".into(),
                     stack_revision: Some(7),
+                    composition_revision: Some(11),
                 },
             ),
             EnqueueOutcome::Added
@@ -2335,10 +4830,227 @@ mod protocol_tests {
             queue[1],
             WebAction::MorphCapture {
                 stack_revision: Some(7),
+                composition_revision: Some(11),
                 ..
             }
         ));
         assert!(matches!(queue[2], WebAction::SetMorph { value } if value == 0.8));
+
+        let legacy: WebAction =
+            serde_json::from_str(r#"{"action":"morph_capture","slot":"b"}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            WebAction::MorphCapture {
+                stack_revision: None,
+                composition_revision: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn temporal_originals_snapshot_is_additive_exact_and_reports_runtime_identity() {
+        let mut legacy = serde_json::to_value(TemporalSnapshot::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("originals");
+        object.remove("telemetry");
+        let restored: TemporalSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.originals, TemporalOriginalsSnapshot::default());
+        assert_eq!(restored.telemetry, TemporalTelemetrySnapshot::default());
+
+        let mut params = crate::effects::params::TemporalParams::default();
+        params.originals.loom.amount = 0.7;
+        params.originals.loom.topology = crate::effects::params::TemporalTopology::Kaleidoscopic;
+        params.originals.loom.interpolation = crate::effects::params::TemporalInterpolation::Linear;
+        params.originals.atlas.seed = 0xdead_beef;
+        params.originals.garden.gate = crate::effects::params::RefreshGardenGate::AudioOnset;
+        params.originals.score.enabled = true;
+        params.originals.score.trigger = crate::effects::params::CollisionScoreTrigger::Manual;
+        let layer_id = crate::image_routing::StableLayerId::new(91).unwrap();
+        let saved_position = SavedLayerPosition::new(3).unwrap();
+        params.originals.score.loop_driver =
+            crate::temporal::CollisionScoreLoopDriver::SelectedLayer {
+                layer_id,
+                saved_position,
+            };
+        params.originals.reset.loop_boundary = crate::temporal::TemporalEventResetMode::Memory;
+
+        let snapshot = TemporalSnapshot::from_params(&params);
+        assert_eq!(snapshot.originals.loom.amount, 0.7);
+        assert_eq!(snapshot.originals.loom.topology, "kaleidoscopic");
+        assert_eq!(snapshot.originals.loom.interpolation, "linear");
+        assert_eq!(snapshot.originals.atlas.seed, 0xdead_beef);
+        assert_eq!(snapshot.originals.garden.gate, "audio_onset");
+        assert_eq!(snapshot.originals.score.trigger, "manual");
+        assert_eq!(snapshot.originals.reset.loop_boundary, "memory");
+        assert_eq!(
+            snapshot.originals.score.loop_driver,
+            CollisionScoreLoopDriverSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                saved_position: saved_position.get(),
+            }
+        );
+        assert_eq!(snapshot.telemetry, TemporalTelemetrySnapshot::default());
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(
+            value["originals"]["score"]["loop_driver"]["kind"],
+            "selected_layer"
+        );
+        assert_eq!(value["originals"]["score"]["loop_driver"]["layer_id"], "91");
+    }
+
+    #[test]
+    fn motion_snapshot_is_additive_exact_and_reports_runtime_identity() {
+        use crate::motion::{
+            CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier, MotionDonor,
+            MotionFieldSource, MotionLatticeQuality, MotionParams,
+        };
+
+        let defaults = MotionSnapshot::default();
+        assert_eq!(defaults.algorithm_version, 1);
+        assert_eq!(defaults.field_source, "auto");
+        assert_eq!(defaults.lattice_quality, "live");
+        assert_eq!(defaults.transplant, FaradayMotionSnapshot::default());
+        assert_eq!(defaults.shutter, CurvedShutterSnapshot::default());
+        assert_eq!(defaults.telemetry, MotionTelemetrySnapshot::default());
+
+        let layer_id = crate::image_routing::StableLayerId::new(91).unwrap();
+        let saved_position = SavedLayerPosition::new(3).unwrap();
+        let snapshot = MotionSnapshot::from_params(MotionParams {
+            field_source: MotionFieldSource::CodecVectors,
+            lattice_quality: MotionLatticeQuality::High,
+            transplant: FaradayParams {
+                amount: 0.75,
+                donor: MotionDonor::Selected {
+                    layer_id,
+                    saved_position,
+                },
+                carrier: MotionCarrier::FirstSourceFrame,
+                confidence_threshold: 0.4,
+                confidence_softness: 0.2,
+                refresh: 0.8,
+                decay: 0.6,
+                occlusion: 0.3,
+            },
+            shutter: CurvedShutterParams {
+                angle_degrees: 270.0,
+                phase: -0.25,
+                curvature: 1.5,
+                chromatic_lag: 0.4,
+                quality: CurvedShutterQuality::High,
+            },
+            ..MotionParams::default()
+        });
+        assert_eq!(snapshot.field_source, "codec_vectors");
+        assert_eq!(snapshot.lattice_quality, "high");
+        assert_eq!(snapshot.transplant.amount, 0.75);
+        assert_eq!(snapshot.transplant.carrier, "first_source_frame");
+        assert_eq!(
+            snapshot.transplant.donor,
+            MotionDonorSnapshot::Selected {
+                layer_id: "91".into(),
+                saved_position: 3,
+            }
+        );
+        assert_eq!(snapshot.shutter.quality, "high");
+        assert_eq!(snapshot.shutter.sample_count, 16);
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["transplant"]["donor"]["kind"], "selected");
+        assert_eq!(value["transplant"]["donor"]["layer_id"], "91");
+
+        let mut legacy = serde_json::to_value(AppSnapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("master_motion");
+        let legacy: AppSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.master_motion, MotionSnapshot::default());
+    }
+
+    #[test]
+    fn temporal_memory_commands_are_priority_ordering_barriers() {
+        let clear: WebAction =
+            serde_json::from_str(r#"{"action":"clear_temporal_memory"}"#).unwrap();
+        let trigger: WebAction =
+            serde_json::from_str(r#"{"action":"trigger_collision_score"}"#).unwrap();
+        assert!(matches!(clear, WebAction::ClearTemporalMemory));
+        assert!(matches!(trigger, WebAction::TriggerCollisionScore));
+        assert!(clear.is_priority());
+        assert!(trigger.is_priority());
+        assert!(clear.coalesce_key().is_none());
+        assert!(trigger.coalesce_key().is_none());
+
+        let edit = |value| WebAction::SetTemporal {
+            param: "loom_amount".into(),
+            value: serde_json::json!(value),
+        };
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut queue, edit(0.2)),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(enqueue_bounded(&mut queue, clear), EnqueueOutcome::Added);
+        assert_eq!(
+            enqueue_bounded(&mut queue, edit(0.8)),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(enqueue_bounded(&mut queue, trigger), EnqueueOutcome::Added);
+        assert_eq!(queue.len(), 4);
+        assert!(
+            matches!(&queue[0], WebAction::SetTemporal { value, .. } if value == &serde_json::json!(0.2))
+        );
+        assert!(matches!(queue[1], WebAction::ClearTemporalMemory));
+        assert!(
+            matches!(&queue[2], WebAction::SetTemporal { value, .. } if value == &serde_json::json!(0.8))
+        );
+        assert!(matches!(queue[3], WebAction::TriggerCollisionScore));
+    }
+
+    #[test]
+    fn motion_scalars_coalesce_but_donor_and_memory_are_priority_barriers() {
+        let edit = |value| WebAction::SetMotion {
+            scope: MotionScopeSnapshot::Layer {
+                layer_id: "91".into(),
+            },
+            param: "transplant_amount".into(),
+            value: serde_json::json!(value),
+        };
+        let donor = WebAction::SetMotionDonor {
+            layer_id: "91".into(),
+            donor_layer_id: Some("77".into()),
+            layer_stack_revision: 4,
+        };
+        let clear = WebAction::ClearMotionMemory;
+        assert_eq!(
+            edit(0.2).coalesce_key().as_deref(),
+            Some("motion:layer:91:transplant_amount")
+        );
+        assert_eq!(donor.coalesce_key(), None);
+        assert_eq!(clear.coalesce_key(), None);
+        assert!(donor.is_priority());
+        assert!(clear.is_priority());
+
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut queue, edit(0.2)),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut queue, edit(0.4)),
+            EnqueueOutcome::Coalesced
+        );
+        assert_eq!(enqueue_bounded(&mut queue, donor), EnqueueOutcome::Added);
+        assert_eq!(
+            enqueue_bounded(&mut queue, edit(0.8)),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(enqueue_bounded(&mut queue, clear), EnqueueOutcome::Added);
+        assert_eq!(queue.len(), 4);
+        assert!(
+            matches!(&queue[0], WebAction::SetMotion { value, .. } if value == &serde_json::json!(0.4))
+        );
+        assert!(matches!(queue[1], WebAction::SetMotionDonor { .. }));
+        assert!(
+            matches!(&queue[2], WebAction::SetMotion { value, .. } if value == &serde_json::json!(0.8))
+        );
+        assert!(matches!(queue[3], WebAction::ClearMotionMemory));
     }
 
     #[test]
@@ -2400,6 +5112,343 @@ mod protocol_tests {
     }
 
     #[test]
+    fn curated_blend_actions_round_trip_every_exact_key_without_aliasing() {
+        for blend_mode in crate::layers::BlendMode::ALL {
+            let wire = serde_json::json!({
+                "action": "set_layer_param",
+                "index": 2,
+                "layer_id": "17",
+                "param": "blend_mode",
+                "value": blend_mode.key(),
+            });
+            let action: WebAction = serde_json::from_value(wire).unwrap();
+            assert!(matches!(
+                &action,
+                WebAction::SetLayerParam { index: 2, layer_id: Some(id), param, value }
+                    if id == "17" && param == "blend_mode" && value.as_str() == Some(blend_mode.key())
+            ));
+            assert_eq!(
+                serde_json::to_value(&action).unwrap()["value"],
+                blend_mode.key(),
+                "browser protocol collapsed {:?}",
+                blend_mode
+            );
+            assert_eq!(
+                action.coalesce_key().as_deref(),
+                Some("layer:id:17:param:blend_mode")
+            );
+        }
+    }
+
+    #[test]
+    fn spatial_transform_protocol_coalesces_absolute_fields_and_preserves_barriers() {
+        let master: WebAction = serde_json::from_str(
+            r#"{"action":"set_master_transform","param":"rotation_deg","value":12.5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &master,
+            WebAction::SetMasterTransform { param, value }
+                if param == "rotation_deg" && value.as_f64() == Some(12.5)
+        ));
+        assert_eq!(
+            master.coalesce_key().as_deref(),
+            Some("master:transform:rotation_deg")
+        );
+
+        let first: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_transform","index":2,"layer_id":"17","param":"position_x","value":0.25}"#,
+        )
+        .unwrap();
+        let latest: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_transform","index":0,"layer_id":"17","param":"position_x","value":0.75}"#,
+        )
+        .unwrap();
+        assert_eq!(first.coalesce_key(), latest.coalesce_key());
+
+        let reset = WebAction::ResetLayerTransform {
+            index: 0,
+            layer_id: Some("17".into()),
+        };
+        let apply = WebAction::ApplyLayerTransform {
+            index: 0,
+            layer_id: Some("17".into()),
+            transform: SpatialTransform::default(),
+        };
+        assert_eq!(reset.coalesce_key(), None);
+        assert_eq!(apply.coalesce_key(), None);
+
+        let mut coalesced = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut coalesced, first.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut coalesced, latest.clone()),
+            EnqueueOutcome::Coalesced
+        );
+        assert!(matches!(
+            coalesced.as_slice(),
+            [WebAction::SetLayerTransform { value, .. }] if value.as_f64() == Some(0.75)
+        ));
+
+        let mut ordered = Vec::new();
+        enqueue_bounded(&mut ordered, first);
+        enqueue_bounded(&mut ordered, reset);
+        enqueue_bounded(&mut ordered, latest);
+        enqueue_bounded(&mut ordered, apply);
+        assert!(matches!(
+            ordered.as_slice(),
+            [
+                WebAction::SetLayerTransform { .. },
+                WebAction::ResetLayerTransform { .. },
+                WebAction::SetLayerTransform { .. },
+                WebAction::ApplyLayerTransform { .. },
+            ]
+        ));
+    }
+
+    #[test]
+    fn spatial_every_field_sentinel_round_trips_browser_edits_and_atomic_actions() {
+        use crate::spatial::{EdgeMode, SamplingMode};
+
+        // Keep every scalar distinct. A missing/wrong field mapping can then
+        // neither hide behind a default nor accidentally compare equal to a
+        // neighbouring component.
+        let sentinel = SpatialTransform {
+            position: [-0.75, 0.625],
+            scale: [-1.25, 1.75],
+            anchor: [0.2, 0.8],
+            rotation_deg: 37.0,
+            skew_deg: -11.0,
+            skew_axis_deg: 73.0,
+            fit: FitMode::Fill,
+            crop: [0.05, 0.1, 0.15, 0.2],
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+        };
+        let edits = [
+            ("position_x", serde_json::json!(-0.75)),
+            ("position_y", serde_json::json!(0.625)),
+            ("scale_x", serde_json::json!(-1.25)),
+            ("scale_y", serde_json::json!(1.75)),
+            ("anchor_x", serde_json::json!(0.2)),
+            ("anchor_y", serde_json::json!(0.8)),
+            ("rotation_deg", serde_json::json!(37.0)),
+            ("skew_deg", serde_json::json!(-11.0)),
+            ("skew_axis_deg", serde_json::json!(73.0)),
+            ("fit", serde_json::json!("fill")),
+            ("crop_left", serde_json::json!(0.05)),
+            ("crop_top", serde_json::json!(0.1)),
+            ("crop_right", serde_json::json!(0.15)),
+            ("crop_bottom", serde_json::json!(0.2)),
+            ("edge", serde_json::json!("mirror")),
+            ("sampling", serde_json::json!("nearest")),
+        ];
+
+        let mut edited = SpatialTransform::default();
+        for (param, value) in &edits {
+            assert!(
+                crate::App::apply_spatial_transform_edit(&mut edited, param, value),
+                "browser edit mapping rejected canonical field {param}"
+            );
+        }
+        assert_eq!(edited, sentinel);
+
+        let actions = [
+            WebAction::ApplyMasterTransform {
+                transform: sentinel,
+            },
+            WebAction::ApplyLayerTransform {
+                // Deliberately stale positional context: stable identity is
+                // the only authoritative selector at engine ingress.
+                index: usize::MAX,
+                layer_id: Some("71".into()),
+                transform: sentinel,
+            },
+        ];
+        for action in actions {
+            let wire = serde_json::to_string(&action).unwrap();
+            let decoded: WebAction = serde_json::from_str(&wire).unwrap();
+            let restored = match decoded {
+                WebAction::ApplyMasterTransform { transform } => transform,
+                WebAction::ApplyLayerTransform {
+                    index,
+                    layer_id,
+                    transform,
+                } => {
+                    assert_eq!(index, usize::MAX);
+                    assert_eq!(layer_id.as_deref(), Some("71"));
+                    transform
+                }
+                _ => panic!("atomic spatial action changed variant"),
+            };
+            assert_eq!(restored, sentinel);
+        }
+
+        // Static coverage couples the table above to both the numerical
+        // master controls and the data-driven layer-control generator.
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let range_specs = js
+            .split_once("const TRANSFORM_RANGE_SPECS = [")
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(table, _)| table)
+            .expect("transform range table");
+        for param in [
+            "position_x",
+            "position_y",
+            "scale_x",
+            "scale_y",
+            "anchor_x",
+            "anchor_y",
+            "rotation_deg",
+            "skew_deg",
+            "skew_axis_deg",
+            "crop_left",
+            "crop_top",
+            "crop_right",
+            "crop_bottom",
+        ] {
+            assert!(
+                range_specs.contains(&format!("['{param}',")),
+                "layer control generator omitted {param}"
+            );
+            assert!(
+                html.contains(&format!("data-master-transform=\"{param}\"")),
+                "master numerical controls omitted {param}"
+            );
+            assert!(
+                js.contains(&format!("{param}:")),
+                "browser transform projection omitted {param}"
+            );
+        }
+        for param in ["fit", "edge", "sampling"] {
+            assert!(html.contains(&format!("data-master-transform=\"{param}\"")));
+            assert!(js.contains(&format!("data-layer-transform=\"{param}\"")));
+            assert!(js.contains(&format!("{param}: t.{param}")));
+        }
+    }
+
+    #[test]
+    fn spatial_transform_browser_contract_is_complete_accessible_and_stable_id_based() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+        for contract in [
+            "id=\"master-transform-group\"",
+            "data-master-transform=\"position_x\"",
+            "data-master-transform=\"skew_axis_deg\"",
+            "data-master-transform=\"crop_bottom\"",
+            "class=\"transform-scale-link\"",
+            "class=\"transform-preset\"",
+            "role=\"status\" aria-live=\"polite\"",
+            "value=\"transparent\" selected",
+            "id=\"new-layer-fit\"",
+            "Host-session preference for future file, still, and Spout layers",
+        ] {
+            assert!(
+                html.contains(contract),
+                "missing master transform contract: {contract}"
+            );
+        }
+        for contract in [
+            "const LEGACY_SPATIAL_TRANSFORM",
+            "function normalizeSpatialTransform(raw)",
+            "function layerTransformControlsHtml(index)",
+            "action: 'set_master_transform'",
+            "action: 'reset_master_transform'",
+            "action: 'apply_master_transform'",
+            "action: 'set_layer_transform'",
+            "action: 'reset_layer_transform'",
+            "action: 'apply_layer_transform'",
+            "...currentLayerSelector(card, layer, index)",
+            "syncTransformPanel(card.querySelector('.layer-transform-body'), layer.transform)",
+            "if (!control || !canSync(control)) return",
+            "'set_layer_transform'",
+            "action: 'set_new_layer_fit'",
+            "syncNewLayerFit(msg.new_layer_fit)",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing transform JS contract: {contract}"
+            );
+        }
+        let master_targets = js
+            .split_once("const MOD_TARGETS = [")
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(targets, _)| targets)
+            .expect("master modulation target table");
+        let layer_targets = js
+            .split_once("const LAYER_FX_TARGETS = [")
+            .and_then(|(_, rest)| rest.split_once("];"))
+            .map(|(targets, _)| targets)
+            .expect("layer modulation target table");
+        for target in [
+            "position_x",
+            "position_y",
+            "scale_x",
+            "scale_y",
+            "anchor_x",
+            "anchor_y",
+            "rotation_deg",
+            "skew_deg",
+            "skew_axis_deg",
+            "crop_left",
+            "crop_top",
+            "crop_right",
+            "crop_bottom",
+        ] {
+            let needle = format!("['{target}',");
+            assert!(
+                master_targets.contains(&needle),
+                "master target menu omitted {target}"
+            );
+            assert!(
+                layer_targets.contains(&needle),
+                "layer target menu omitted {target}"
+            );
+        }
+        for contract in [
+            ".layer-transform-body[hidden]",
+            ".transform-toolbar",
+            ".transform-status",
+        ] {
+            assert!(
+                css.contains(contract),
+                "missing transform CSS contract: {contract}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_layer_fit_is_a_defaulted_host_preference_and_coalesced_action() {
+        let legacy: AppSnapshot = serde_json::from_value(serde_json::json!({
+            "type": "state",
+            "effects": EffectsSnapshot::default(),
+            "ntsc": NtscSnapshot::default(),
+            "layers": [],
+            "library": [],
+            "paused": false
+        }))
+        .expect("legacy snapshot");
+        assert_eq!(legacy.new_layer_fit, FitMode::Fit);
+
+        let action: WebAction =
+            serde_json::from_str(r#"{"action":"set_new_layer_fit","fit":"fill"}"#)
+                .expect("new-layer preference action");
+        assert!(matches!(
+            action,
+            WebAction::SetNewLayerFit { fit: FitMode::Fill }
+        ));
+        assert_eq!(action.coalesce_key().as_deref(), Some("host:new-layer-fit"));
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_new_layer_fit","fit":"diagonal"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn export_panel_exposes_safe_ntsc_quality_choices() {
         let html = include_str!("../../static/index.html");
         let js = include_str!("../../static/app.js");
@@ -2454,6 +5503,8 @@ mod protocol_tests {
             key_color: default_key_color(),
             key_tolerance: default_key_tolerance(),
             effects: EffectsSnapshot::default(),
+            motion: MotionSnapshot::default(),
+            transform: SpatialTransform::default(),
             source_kind: "image".into(),
             source_name: String::new(),
             source_active: true,
@@ -2462,13 +5513,20 @@ mod protocol_tests {
             source_sequence: 0,
             source_error: String::new(),
             offline_export_policy: String::new(),
+            performance: LayerPerformanceSnapshot::default(),
         };
         let mut value = serde_json::to_value(current).unwrap();
         value.as_object_mut().unwrap().remove("bypass_master_fx");
         value.as_object_mut().unwrap().remove("reroll_on_loop");
+        value.as_object_mut().unwrap().remove("transform");
+        value.as_object_mut().unwrap().remove("motion");
+        value.as_object_mut().unwrap().remove("performance");
         let legacy: LayerSnapshot = serde_json::from_value(value).unwrap();
         assert!(!legacy.bypass_master_fx);
+        assert_eq!(legacy.motion, MotionSnapshot::default());
         assert!(!legacy.reroll_on_loop);
+        assert_eq!(legacy.transform, SpatialTransform::default());
+        assert_eq!(legacy.performance, LayerPerformanceSnapshot::default());
     }
 
     #[test]
@@ -2676,6 +5734,7 @@ mod protocol_tests {
             "id=\"morph-group\"",
             "class=\"fx-group\" data-group=\"cellular\"",
             "class=\"fx-group\" data-group=\"motion\"",
+            "id=\"motion-fields-group\"",
             "id=\"temporal-group\"",
             "id=\"audio-group\"",
         ];
@@ -2685,7 +5744,7 @@ mod protocol_tests {
             assert!(position >= previous, "{marker} is out of column order");
             previous = position;
         }
-        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 5);
+        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 6);
         assert!(!second_column.contains("id=\"mod-group\""));
         assert!(!second_column.contains("id=\"pad-group\""));
         assert!(!second_column.contains("id=\"midi-group\""));
@@ -2762,7 +5821,8 @@ mod protocol_tests {
         assert!(js.contains("video decoder: ${layer.source_error}"));
         assert!(js.contains("chevron?.setAttribute('aria-expanded'"));
         assert!(js.contains("aria-keyshortcuts=\"ArrowUp ArrowDown Home End\""));
-        assert!(js.contains("item.setAttribute('role', 'button')"));
+        assert!(js.contains("item.setAttribute('role', 'group')"));
+        assert!(js.contains("className = 'library-actions'"));
         assert!(js.contains("window.confirm"));
         assert!(html.contains("id=\"output-status\" role=\"status\" aria-live=\"polite\""));
         assert!(js.contains("syncOutputWindow(msg.output_window, msg.output_error)"));
@@ -2809,8 +5869,8 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 62);
-        assert_eq!(assert_range_tags_are_bounded(js, false), 12);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 94);
+        assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [
             "function normalizeRangeValue(slider, rawValue)",
@@ -2852,6 +5912,11 @@ mod protocol_tests {
             "data-param=\"cellular_speed\"",
             "data-ntsc=\"snow_intensity\"",
             "data-temporal=\"feedback\"",
+            "data-temporal=\"loom_amount\"",
+            "data-temporal=\"atlas_collision\"",
+            "data-temporal=\"garden_decay\"",
+            "data-temporal=\"score_state_count\"",
+            "data-motion-param=\"shutter_angle\"",
             "id=\"audio-gain\"",
             "id=\"morph-t\"",
             "id=\"pad-x-curve-amount\"",
@@ -2863,6 +5928,7 @@ mod protocol_tests {
             "const LAYER_EFFECT_CONTROLS",
             "data-layer-effect=\"${param}\"",
             "data-param=\"opacity\"",
+            "motionRangeHtml('transplant_amount'",
             "class=\"routing-depth\"",
             "class=\"routing-curve-amount\"",
         ] {
@@ -2884,6 +5950,89 @@ mod protocol_tests {
         assert!(js.contains(
             "title=\"Reset layer effects (opacity and transport unchanged)\" aria-label=\"Reset layer effects (opacity and transport unchanged)\""
         ));
+    }
+
+    #[test]
+    fn temporal_originals_browser_surface_is_accessible_zeroed_and_protocol_complete() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+
+        for contract in [
+            "class=\"temporal-originals\" role=\"region\" aria-label=\"Temporal originals\"",
+            "<summary>TOPOLOGY LOOM</summary>",
+            "<summary>COLLISION ATLAS</summary>",
+            "<summary>REFRESH GARDEN</summary>",
+            "<summary>COLLISION SCORE</summary>",
+            "<summary>MEMORY LAW</summary>",
+            "data-temporal=\"loom_amount\" data-min=\"0\" data-max=\"1\"",
+            "data-temporal=\"atlas_seed\" data-default=\"0\"",
+            "data-temporal=\"garden_amount\" data-min=\"0\" data-max=\"1\"",
+            "data-temporal=\"score_enabled\"",
+            "id=\"temporal-score-loop-driver\" aria-label=\"Collision Score loop driver\"",
+            "id=\"temporal-clear-memory\"",
+            "id=\"temporal-score-trigger\"",
+            "id=\"temporal-telemetry\" role=\"status\" aria-live=\"polite\"",
+        ] {
+            assert!(html.contains(contract), "missing temporal HTML: {contract}");
+        }
+        for contract in [
+            "sendAction({ action: 'set_temporal', param, value",
+            "sendAction({ action: 'clear_temporal_memory' })",
+            "sendAction({ action: 'trigger_collision_score' })",
+            "syncTemporalLoopDriver(score.loop_driver)",
+            "const telemetry = t.telemetry || {}",
+            "telemetry.freeze_hold_valid",
+            "telemetry.total_reference_ticks",
+            "missing_selected_layer",
+        ] {
+            assert!(js.contains(contract), "missing temporal JS: {contract}");
+        }
+        assert!(css.contains(".temporal-study > summary"));
+        assert!(css.contains(".temporal-telemetry"));
+    }
+
+    #[test]
+    fn motion_browser_surface_is_accessible_zeroed_and_protocol_complete() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+        for contract in [
+            "id=\"motion-fields-group\"",
+            "id=\"master-motion-panel\" role=\"region\" aria-label=\"Master motion field and curved shutter\"",
+            "data-motion-param=\"field_source\"",
+            "data-motion-param=\"shutter_angle\" data-min=\"0\" data-max=\"360\"",
+            "id=\"motion-clear-memory\"",
+            "id=\"master-motion-telemetry\" role=\"status\" aria-live=\"polite\"",
+            "v1 · field idle · 0 vectors · carrier empty",
+        ] {
+            assert!(html.contains(contract), "missing Motion HTML: {contract}");
+        }
+        for contract in [
+            "function layerMotionControlsHtml(layer, index)",
+            "class=\"layer-motion-body motion-authoring\"",
+            "aria-label=\"Layer ${index + 1} motion field, Faraday transplant, and curved shutter\"",
+            "action: 'set_motion', scope, param, value",
+            "action: 'set_motion_donor'",
+            "action: 'clear_motion_memory'",
+            "function syncMasterMotion(motion)",
+            "function syncLayerMotion(card, layer)",
+            "donor.kind === 'missing'",
+            "motion.telemetry?.diagnostic",
+            "motion_shutter_angle",
+            "motion_transplant_amount",
+        ] {
+            assert!(js.contains(contract), "missing Motion JS: {contract}");
+        }
+        for contract in [
+            ".layer-motion-heading",
+            ".layer-motion-toggle",
+            ".layer-motion-body[hidden]",
+            ".motion-telemetry",
+            ".motion-telemetry.error",
+        ] {
+            assert!(css.contains(contract), "missing Motion CSS: {contract}");
+        }
     }
 
     #[test]
@@ -2916,6 +6065,62 @@ mod protocol_tests {
         assert!(js.contains("const current = currentLayerContext(card, layer, index);"));
         assert!(js.contains("paused: !current.layer.paused"));
         assert!(js.contains("visible: !current.layer.visible"));
+    }
+
+    #[test]
+    fn curated_blend_browser_contract_is_complete_accessible_and_order_explicit() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let block_start = js.find("const LAYER_BLEND_MODES").unwrap();
+        let block_tail = &js[block_start..];
+        let block_end = block_tail.find("]);\n").unwrap() + 3;
+        let block = &block_tail[..block_end];
+        assert_eq!(block.matches("{ key: '").count(), 15);
+
+        for (key, label) in [
+            ("normal", "Normal"),
+            ("screen", "Screen"),
+            ("multiply", "Multiply"),
+            ("difference", "Difference"),
+            ("add", "Add"),
+            ("subtract", "Subtract"),
+            ("darken", "Darken"),
+            ("lighten", "Lighten"),
+            ("overlay", "Overlay"),
+            ("soft_light", "Soft Light"),
+            ("hard_light", "Hard Light"),
+            ("exclusion", "Exclusion"),
+            ("dodge", "Dodge"),
+            ("burn", "Burn"),
+            ("alpha_cut", "Alpha Cut"),
+        ] {
+            let contract = format!("key: '{key}', label: '{label}'");
+            assert!(block.contains(&contract), "missing blend option {contract}");
+        }
+
+        for contract in [
+            "<label for=\"${blendSelectId}\">Blend</label>",
+            "aria-describedby=\"layer-blend-policy ${blendDescriptionId}\"",
+            "class=\"visually-hidden blend-mode-description\"",
+            "title=\"${escapeHtml(layerBlendTitle(blendMode.key))}\"",
+            "function layerBlendOptionsHtml(selected)",
+            "if (param === 'blend_mode') syncLayerBlendDescription(row, v)",
+            "select.value = layerBlendModeInfo(layer.blend_mode).key",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing blend UI contract: {contract}"
+            );
+        }
+
+        for contract in [
+            "Reordering changes the content below; the saved blend choice remains unchanged.",
+            "Subtract computes below minus layer.",
+            "Alpha Cut erases accumulated content; it is a no-op without content below.",
+        ] {
+            assert!(html.contains(contract), "missing blend policy: {contract}");
+            assert!(js.contains(contract), "missing blend tooltip: {contract}");
+        }
     }
 
     #[test]
@@ -2995,11 +6200,15 @@ mod protocol_tests {
                 scope: RerollScope::Master,
                 index: None,
                 layer_id: None,
+                group_id: None,
                 stack_revision: None,
                 seed: None,
                 mode: RerollMode::Pattern,
                 amount,
                 include_grain_controls: false,
+                include_transform: false,
+                include_rack_controls: false,
+                include_group_controls: false,
             } if (*amount - 0.7).abs() < f32::EPSILON
         ));
         assert_eq!(reroll.coalesce_key(), None);
@@ -3009,11 +6218,15 @@ mod protocol_tests {
             scope: RerollScope::All,
             index: None,
             layer_id: None,
+            group_id: None,
             stack_revision: Some(19),
             seed: Some(u32::MAX),
             mode: RerollMode::Variation,
             amount: 1.25,
             include_grain_controls: true,
+            include_transform: true,
+            include_rack_controls: true,
+            include_group_controls: true,
         };
         let encoded = serde_json::to_value(&explicit).unwrap();
         assert_eq!(encoded["action"], "reroll");
@@ -3023,6 +6236,9 @@ mod protocol_tests {
         assert_eq!(encoded["mode"], "variation");
         assert_json_number_near(&encoded["amount"], 1.25);
         assert_eq!(encoded["include_grain_controls"], true);
+        assert_eq!(encoded["include_transform"], true);
+        assert_eq!(encoded["include_rack_controls"], true);
+        assert_eq!(encoded["include_group_controls"], true);
 
         let mut queue = Vec::new();
         assert_eq!(
@@ -3081,6 +6297,67 @@ mod protocol_tests {
     }
 
     #[test]
+    fn creative_routes_keep_decimal_missing_diagnostics_and_typed_timing() {
+        let missing = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::MissingGroupOutput {
+                group_id: u64::MAX.to_string(),
+            },
+            timing: EdgeTiming::PreviousFrame,
+        };
+        let value = serde_json::to_value(&missing).unwrap();
+        assert_eq!(value["input"]["source"], "missing_group_output");
+        assert_eq!(value["input"]["group_id"], u64::MAX.to_string());
+        assert_eq!(value["timing"], "previous_frame");
+        assert_eq!(
+            serde_json::from_value::<CreativeImageTapSnapshot>(value).unwrap(),
+            missing
+        );
+        assert!(serde_json::from_str::<CreativeImageTapSnapshot>(
+            r#"{"input":{"source":"one_below"},"timing":"later"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn creative_coalescing_and_topology_barriers_are_stable_id_scoped() {
+        let matte_value = WebAction::SetCompositionGroupMatteParam {
+            group_id: "17".into(),
+            param: "softness".into(),
+            value: serde_json::json!(0.2),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            matte_value.coalesce_key().as_deref(),
+            Some("creative:group:17:matte:softness")
+        );
+        assert!(!matte_value.is_priority());
+
+        let crossfade = WebAction::SetCompositionBusCrossfade { value: 0.25 };
+        assert_eq!(
+            crossfade.coalesce_key().as_deref(),
+            Some("creative:composition:bus-crossfade")
+        );
+        assert!(!crossfade.is_priority());
+
+        let matte_route = WebAction::SetCompositionGroupMatteRoute {
+            group_id: "17".into(),
+            route: None,
+            channel: "alpha".into(),
+            invert: false,
+            composition_revision: 9,
+        };
+        let layer_bus = WebAction::SetCompositionLayerBus {
+            layer_id: "99".into(),
+            bus: "a".into(),
+            composition_revision: 9,
+        };
+        assert_eq!(matte_route.coalesce_key(), None);
+        assert!(matte_route.is_priority());
+        assert_eq!(layer_bus.coalesce_key(), None);
+        assert!(layer_bus.is_priority());
+    }
+
+    #[test]
     fn random_dice_and_layer_loop_browser_contract_is_complete() {
         let mut legacy_effects = serde_json::to_value(EffectsSnapshot::default()).unwrap();
         legacy_effects
@@ -3115,6 +6392,8 @@ mod protocol_tests {
             "id=\"reroll-scope\"",
             "<option value=\"master\">Master</option>",
             "<option value=\"all\">Everything</option>",
+            "<option value=\"group\">Group</option>",
+            "id=\"reroll-group\"",
             "id=\"reroll-mode\"",
             "<option value=\"pattern\">Pattern only</option>",
             "<option value=\"variation\">Bounded variation</option>",
@@ -3123,8 +6402,13 @@ mod protocol_tests {
             "id=\"reroll-amount\"",
             "max=\"2\"",
             "id=\"reroll-grain-controls\"",
+            "id=\"reroll-transform-controls\"",
+            "id=\"reroll-rack-controls\"",
+            "id=\"reroll-group-controls\"",
             "id=\"reroll-button\"",
             "id=\"reroll-status\"",
+            "bounded Motion numeric values for Master / Layer / Everything",
+            "never changes Motion algorithm/version, field or quality tiers, donor, carrier",
         ] {
             assert!(
                 html.contains(contract),
@@ -3134,11 +6418,16 @@ mod protocol_tests {
 
         let js = include_str!("../../static/app.js");
         for contract in [
-            "const scope = rerollScope.value === 'all' ? 'all' : 'master'",
+            "const scope = ['all', 'group'].includes(rerollScope.value) ? rerollScope.value : 'master'",
             "action: 'reroll'",
             "mode: rerollMode.value === 'variation' ? 'variation' : 'pattern'",
             "include_grain_controls: !!rerollGrainControls.checked",
+            "include_transform: !!rerollTransformControls.checked",
+            "include_rack_controls: !!rerollRackControls?.checked",
+            "include_group_controls: scope === 'group' && !!rerollGroupControls?.checked",
             "if (scope === 'all') action.stack_revision = layerStackRevision",
+            "if (scope === 'group')",
+            "action.group_id = rerollGroup.value",
             "Number(effects.random_seed) >>> 0",
             "class=\"layer-random-seed seed-input\"",
             "class=\"layer-reroll\"",
@@ -3632,10 +6921,12 @@ mod protocol_tests {
         value.as_object_mut().unwrap().remove("export_status");
         value.as_object_mut().unwrap().remove("export_warnings");
         value.as_object_mut().unwrap().remove("patch_save_status");
+        value.as_object_mut().unwrap().remove("master_transform");
         let restored: AppSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(restored.export_status, "");
         assert!(restored.export_warnings.is_empty());
         assert_eq!(restored.patch_save_status, "");
+        assert_eq!(restored.master_transform, SpatialTransform::default());
 
         let current = AppSnapshot {
             export_warnings: vec!["Layer 1 substituted deterministic black.".into()],
@@ -3643,6 +6934,67 @@ mod protocol_tests {
         };
         let serialized = serde_json::to_value(current).unwrap();
         assert_eq!(serialized["export_warnings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_snapshot_defaults_recorder_and_preview_health_safely() {
+        let mut partial = serde_json::to_value(AppSnapshot::default()).unwrap();
+        partial["recorder"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dropped_source_unavailable");
+        let restored: AppSnapshot = serde_json::from_value(partial).unwrap();
+        assert_eq!(restored.recorder.dropped_source_unavailable, 0);
+
+        let mut value = serde_json::to_value(AppSnapshot::default()).unwrap();
+        value.as_object_mut().unwrap().remove("recorder");
+        value.as_object_mut().unwrap().remove("stage_health");
+        let restored: AppSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.recorder.status, "idle");
+        assert!(restored.recorder.audio_not_muxed);
+        assert_eq!(restored.stage_health.frame_samples, 0);
+        assert!(!restored.stage_health.tools.health_hud_enabled);
+    }
+
+    #[test]
+    fn recorder_commands_are_ordered_and_stage_controls_coalesce_by_destination() {
+        let barriers = [
+            WebAction::StartProgramRecording { auto_import: false },
+            WebAction::FinishProgramRecording,
+            WebAction::CancelProgramRecording,
+            WebAction::CaptureStill {
+                target: CaptureTargetSnapshot::Program,
+                auto_import: false,
+            },
+            WebAction::StartResample {
+                target: CaptureTargetSnapshot::Layer {
+                    layer_id: "1".into(),
+                },
+                destination_layer_id: "2".into(),
+                activate: false,
+            },
+        ];
+        for action in barriers {
+            assert_eq!(action.coalesce_key(), None);
+            assert!(action.is_priority());
+        }
+        let hud = WebAction::SetStageHealthHud { enabled: true };
+        let card = WebAction::SetStageTestCard {
+            mode: crate::stage_map::TestCardMode::Grid,
+            output_endpoint_id: Some("legacy-output-1".into()),
+        };
+        let identify = WebAction::SetOutputIdentification {
+            enabled: true,
+            output_endpoint_id: Some("legacy-output-1".into()),
+        };
+        assert_eq!(hud.coalesce_key().as_deref(), Some("stage:health-hud"));
+        assert_eq!(card.coalesce_key().as_deref(), Some("stage:test-card"));
+        assert_eq!(
+            identify.coalesce_key().as_deref(),
+            Some("stage:output-identification")
+        );
+        assert!(card.is_priority());
+        assert!(identify.is_priority());
     }
 
     #[test]
@@ -3811,5 +7163,678 @@ mod protocol_tests {
         assert!(js.contains("skipped"));
         assert!(js.contains("unavailable"));
         assert!(js.contains("stale"));
+    }
+
+    #[test]
+    fn prepared_performance_snapshot_is_additive_and_uses_stable_image_identity() {
+        let mut legacy_app = serde_json::to_value(AppSnapshot::default()).unwrap();
+        legacy_app.as_object_mut().unwrap().remove("performance");
+        let restored: AppSnapshot = serde_json::from_value(legacy_app).unwrap();
+        assert_eq!(restored.performance, PerformanceSnapshot::default());
+
+        let selected = ImageInputSnapshot::SelectedLayer {
+            layer_id: "42".into(),
+            stage: LayerImageStage::PreLocalEffects,
+        };
+        let wire = serde_json::to_value(&selected).unwrap();
+        assert_eq!(wire["source"], "selected_layer");
+        assert_eq!(wire["layer_id"], "42");
+        assert_eq!(wire["stage"], "pre_local_effects");
+        assert_eq!(
+            serde_json::from_value::<ImageInputSnapshot>(wire).unwrap(),
+            selected
+        );
+    }
+
+    #[test]
+    fn prepared_performance_actions_have_typed_ids_and_only_scalar_edits_coalesce() {
+        let transport: WebAction = serde_json::from_str(
+            r#"{"action":"set_clip_transport","layer_id":"7","slot_id":3,"param":"in_point","value":0.2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            transport.coalesce_key().as_deref(),
+            Some("layer:id:7:slot:3:transport:in_point")
+        );
+        let cue: WebAction = serde_json::from_str(
+            r#"{"action":"set_clip_cue","layer_id":"7","slot_id":3,"cue_id":12,"at":0.4}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cue.coalesce_key().as_deref(),
+            Some("layer:id:7:slot:3:cue:12")
+        );
+        let matte: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_matte_param","layer_id":"7","param":"amount","value":0.7,"composition_revision":19}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            matte.coalesce_key().as_deref(),
+            Some("layer:id:7:matte:amount")
+        );
+        assert!(matches!(
+            matte,
+            WebAction::SetLayerMatteParam {
+                composition_revision: Some(19),
+                ..
+            }
+        ));
+        let matte_channel: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_matte_param","layer_id":"7","param":"channel","value":"luma"}"#,
+        )
+        .unwrap();
+        assert_eq!(matte_channel.coalesce_key(), None);
+        assert!(matte_channel.is_priority());
+
+        for barrier in [
+            r#"{"action":"activate_clip_slot","layer_id":"7","slot_id":3}"#,
+            r#"{"action":"seek_clip_slot","layer_id":"7","slot_id":3,"position":0.5}"#,
+            r#"{"action":"trigger_clip_cue","layer_id":"7","slot_id":3,"cue_id":12}"#,
+            r#"{"action":"prepare_scene","scene_id":4}"#,
+            r#"{"action":"capture_scene","name":"Opening study","trigger_mode":"next_bar"}"#,
+            r#"{"action":"capture_scene","scene_id":4,"name":"Reframed study","trigger_mode":"next_beat"}"#,
+            r#"{"action":"remove_scene","scene_id":4}"#,
+            r#"{"action":"trigger_scene","scene_id":4}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"7","input":{"source":"program_history"},"composition_revision":19}"#,
+        ] {
+            let action: WebAction = serde_json::from_str(barrier).unwrap();
+            assert_eq!(action.coalesce_key(), None, "barrier coalesced: {barrier}");
+            assert!(action.is_priority(), "barrier lacked reserve: {barrier}");
+        }
+
+        let mut ordered = Vec::new();
+        enqueue_bounded(&mut ordered, transport.clone());
+        enqueue_bounded(
+            &mut ordered,
+            serde_json::from_str(r#"{"action":"activate_clip_slot","layer_id":"7","slot_id":3}"#)
+                .unwrap(),
+        );
+        enqueue_bounded(
+            &mut ordered,
+            serde_json::from_str(
+                r#"{"action":"set_clip_transport","layer_id":"7","slot_id":3,"param":"in_point","value":0.8}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(ordered.len(), 3, "scalar edit crossed a source barrier");
+
+        let seek = |layer_id: &str, slot_id: u16, position: f64| WebAction::SeekClipSlot {
+            layer_id: layer_id.into(),
+            slot_id: ClipSlotId::new(slot_id).unwrap(),
+            position: NormalizedTime::clamped(position),
+        };
+        let mut scratches = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut scratches, seek("7", 3, 0.1)),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut scratches, seek("7", 3, 0.7)),
+            EnqueueOutcome::Coalesced
+        );
+        assert!(matches!(
+            scratches.as_slice(),
+            [WebAction::SeekClipSlot { layer_id, slot_id, position }]
+                if layer_id == "7" && slot_id.get() == 3 && position.get() == 0.7
+        ));
+        enqueue_bounded(
+            &mut scratches,
+            WebAction::ActivateClipSlot {
+                layer_id: "7".into(),
+                slot_id: ClipSlotId::new(3).unwrap(),
+                trigger_mode: TriggerMode::Immediate,
+            },
+        );
+        assert_eq!(
+            enqueue_bounded(&mut scratches, seek("7", 3, 0.9)),
+            EnqueueOutcome::Added,
+            "a newer scratch must never replace a seek across a command barrier"
+        );
+        assert_eq!(scratches.len(), 3);
+        assert_eq!(
+            enqueue_bounded(&mut scratches, seek("8", 3, 0.4)),
+            EnqueueOutcome::Added,
+            "different stable targets must retain independent seeks"
+        );
+
+        for command in [
+            WebAction::OpenPatchSnapshot,
+            WebAction::OpenPatchLook { stack_revision: 9 },
+            WebAction::QuickSavePatch,
+            WebAction::CancelExport,
+        ] {
+            assert_eq!(command.coalesce_key(), None, "command was not a barrier");
+        }
+    }
+
+    #[test]
+    fn prepared_performance_ids_reject_zero_or_out_of_range_at_deserialization() {
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"activate_clip_slot","layer_id":"7","slot_id":0}"#
+        )
+        .is_err());
+        assert!(
+            serde_json::from_str::<WebAction>(r#"{"action":"prepare_scene","scene_id":0}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"trigger_clip_cue","layer_id":"7","slot_id":3,"cue_id":4096}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"capture_scene","scene_id":0,"name":"Invalid"}"#
+        )
+        .is_err());
+        assert!(
+            serde_json::from_str::<WebAction>(r#"{"action":"remove_scene","scene_id":65536}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scene_capture_protocol_distinguishes_create_recapture_and_remove() {
+        let create: WebAction = serde_json::from_str(
+            r#"{"action":"capture_scene","name":"Runway cut","trigger_mode":"next_bar"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &create,
+            WebAction::CaptureScene {
+                scene_id: None,
+                name,
+                trigger_mode: TriggerMode::NextBar,
+            } if name == "Runway cut"
+        ));
+        let create_wire = serde_json::to_value(&create).unwrap();
+        assert_eq!(create_wire["action"], "capture_scene");
+        assert!(create_wire.get("scene_id").is_none());
+
+        let recapture: WebAction = serde_json::from_str(
+            r#"{"action":"capture_scene","scene_id":23,"name":"Runway cut II","trigger_mode":"next_beat"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &recapture,
+            WebAction::CaptureScene {
+                scene_id: Some(id),
+                name,
+                trigger_mode: TriggerMode::NextBeat,
+            } if id.get() == 23 && name == "Runway cut II"
+        ));
+        assert_eq!(recapture.coalesce_key(), None);
+        assert!(recapture.is_priority());
+
+        let remove: WebAction =
+            serde_json::from_str(r#"{"action":"remove_scene","scene_id":23}"#).unwrap();
+        assert!(matches!(remove, WebAction::RemoveScene { scene_id } if scene_id.get() == 23));
+        assert_eq!(remove.coalesce_key(), None);
+        assert!(remove.is_priority());
+
+        let mut ordered = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut ordered, WebAction::SetBpm { value: 90.0 }),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut ordered, create.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut ordered, WebAction::SetBpm { value: 130.0 }),
+            EnqueueOutcome::Added,
+            "capture must prevent scalar traffic from coalescing across it"
+        );
+        assert!(matches!(&ordered[0], WebAction::SetBpm { value } if *value == 90.0));
+        assert!(matches!(&ordered[1], WebAction::CaptureScene { .. }));
+        assert!(matches!(&ordered[2], WebAction::SetBpm { value } if *value == 130.0));
+
+        let mut saturated = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
+        assert_eq!(
+            enqueue_bounded(&mut saturated, create),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(saturated.len(), MAX_PENDING_ACTIONS);
+        assert!(matches!(
+            saturated.last(),
+            Some(WebAction::CaptureScene { .. })
+        ));
+    }
+
+    #[test]
+    fn prepared_performance_browser_contract_is_explicit_stable_and_accessible() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+        for contract in [
+            "id=\"library-slot-target\"",
+            "id=\"library-slot-trigger\"",
+            "id=\"slot-load-status\" class=\"lib-upload-status\" role=\"status\" aria-live=\"polite\"",
+            "id=\"scene-list\" role=\"list\"",
+            "id=\"scene-status\" role=\"status\" aria-live=\"polite\"",
+            "id=\"scene-capture-name\"",
+            "id=\"scene-capture-mode\"",
+            "id=\"scene-capture-submit\"",
+        ] {
+            assert!(html.contains(contract), "missing accessible HTML: {contract}");
+        }
+        assert!(js.contains("clipSeek.addEventListener('input', sendSeek)"));
+        assert!(js.contains("clipSeek.addEventListener('change', sendSeek)"));
+        for action in [
+            "action: 'load_clip_into_slot'",
+            "action: 'activate_clip_slot'",
+            "action: 'set_clip_transport'",
+            "action: 'set_clip_cue'",
+            "action: 'trigger_clip_cue'",
+            "action: 'seek_clip_slot'",
+            "action: 'prepare_scene'",
+            "action: 'capture_scene'",
+            "action: 'remove_scene'",
+            "action: 'trigger_scene'",
+            "action: 'set_layer_matte_param'",
+            "action: 'set_layer_matte_input'",
+        ] {
+            assert!(js.contains(action), "missing browser action: {action}");
+        }
+        assert!(js.contains("function stableLayerId(layer)"));
+        assert!(js.contains("/^(?:[1-9][0-9]*)$/"));
+        assert!(js.contains("source: 'selected_layer', layer_id: donorId, stage"));
+        assert!(js.contains("Staging ${filename}; the current source stays live until ready."));
+        assert!(js.contains("source_staging_status"));
+        assert!(js.contains("scene_staging_status"));
+        assert!(js.contains("image_routing_status"));
+        assert!(js.contains("function validSceneName(name)"));
+        assert!(js.contains("new TextEncoder().encode(name).length <= 128"));
+        assert!(js.contains("class=\"scene-recapture\""));
+        assert!(js.contains("class=\"scene-remove\""));
+        assert!(css.contains(".scene-row.pending"));
+        assert!(css.contains(".scene-capture-form"));
+        assert!(css.contains(".library-actions"));
+        assert!(css.contains(".layer-performance-body[hidden]"));
+        assert!(css.contains(".layer-matte-body[hidden]"));
+    }
+
+    #[test]
+    fn creative_browser_contract_covers_authoring_stable_targets_and_missing_tombstones() {
+        let js = include_str!("../../static/app.js");
+        assert!(js.contains("syncCreative(msg.creative)"));
+        assert!(js.contains("function syncCreative(creative)"));
+        for action in [
+            "action: 'set_visual_node_param'",
+            "action: 'insert_visual_node'",
+            "action: 'remove_visual_node'",
+            "action: 'move_visual_node'",
+            "action: 'set_visual_node_mask_variant'",
+            "action: 'set_visual_node_route'",
+            "action: 'set_composition_group_param'",
+            "action: 'set_composition_group_matte_route'",
+            "action: 'set_composition_group_matte_param'",
+            "action: 'create_composition_group'",
+            "action: 'remove_composition_group'",
+            "action: 'set_composition_group_members'",
+            "action: 'move_composition_root_item'",
+            "action: 'set_composition_bus_crossfade'",
+            "action: 'set_composition_layer_bus'",
+        ] {
+            assert!(
+                js.contains(action),
+                "missing creative browser action: {action}"
+            );
+        }
+        for stable_prefix in [
+            "node/${scopeKey}/${node.node_id}",
+            "nodeTargets('master'",
+            "nodeTargets(`layer/${layerId}`",
+            "nodeTargets(`group/${group.group_id}`",
+            "`group/${group.group_id}/opacity`",
+            "`group/${group.group_id}/matte.amount`",
+            "`group/${group.group_id}/matte.threshold`",
+            "`group/${group.group_id}/matte.softness`",
+            "['composition/bus_crossfade'",
+        ] {
+            assert!(
+                js.contains(stable_prefix),
+                "missing stable modulation prefix: {stable_prefix}"
+            );
+        }
+
+        // Missing routes are rendered as disabled diagnostics only. Every
+        // ingress construction path accepts current stable IDs and never
+        // constructs either output-only tombstone variant.
+        assert!(!js.contains("input = { source: 'missing_selected_layer'"));
+        assert!(!js.contains("input = { source: 'missing_group_output'"));
+        assert!(js.contains("selected disabled>Missing group"));
+        assert!(js.contains("input = { source: 'group_output', group_id: groupId }"));
+        assert!(js.contains("const groupOutputs = (latestCreative?.groups || []).map"));
+        assert!(js.contains("composition_revision: compositionRevision"));
+        assert!(js.contains("|| scope === 'all' && !!rerollGroupControls?.checked"));
+        let html = include_str!("../../static/index.html");
+        assert!(html.contains("id=\"reroll-group-controls\""));
+        assert!(html.contains("matte, and A/B value variation are explicit opt-ins"));
+        assert!(html.contains("bounded Loom, Atlas, and Garden numeric values"));
+        assert!(html.contains("bounded Motion numeric values for Master / Layer / Everything"));
+        assert!(html.contains(
+            "never changes Motion algorithm/version, field or quality tiers, donor, carrier"
+        ));
+        assert!(
+            html.contains("temporal topology, seeds, Score configuration, reset law, loop driver")
+        );
+    }
+
+    #[test]
+    fn m5_gesture_boundaries_coalesce_one_scalar_without_crossing_ordered_barriers() {
+        let begin = WebAction::BeginHistoryGesture { gesture_id: 41 };
+        let end = WebAction::EndHistoryGesture { gesture_id: 41 };
+        assert!(begin.is_priority());
+        assert!(end.is_priority());
+        assert_eq!(begin.coalesce_key(), None);
+        let mut queue = Vec::new();
+        enqueue_bounded(&mut queue, begin);
+        enqueue_bounded(
+            &mut queue,
+            WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!(0.2),
+            },
+        );
+        enqueue_bounded(
+            &mut queue,
+            WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!(0.8),
+            },
+        );
+        enqueue_bounded(&mut queue, end);
+        assert_eq!(queue.len(), 3);
+        assert!(matches!(queue[0], WebAction::BeginHistoryGesture { .. }));
+        assert!(matches!(
+            &queue[1],
+            WebAction::SetParam { value, .. } if value == &serde_json::json!(0.8)
+        ));
+        assert!(matches!(queue[2], WebAction::EndHistoryGesture { .. }));
+    }
+
+    #[tokio::test]
+    async fn m5_remote_gesture_owner_rejects_dirty_cancel_cross_client_and_second_destination() {
+        let state = WebState::new().expect("test web state");
+        assert!(state.begin_browser_history_gesture(10, 41).await);
+        assert!(!state.begin_browser_history_gesture(11, 42).await);
+
+        let brightness = WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.2),
+        };
+        let another_brightness = WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.8),
+        };
+        let contrast = WebAction::SetParam {
+            param: "contrast".into(),
+            value: serde_json::json!(0.5),
+        };
+        assert!(
+            state
+                .admit_browser_action_during_gesture(10, &brightness)
+                .await
+        );
+        assert!(
+            state
+                .admit_browser_action_during_gesture(10, &another_brightness)
+                .await
+        );
+        assert!(
+            !state
+                .admit_browser_action_during_gesture(10, &contrast)
+                .await
+        );
+        assert!(
+            !state
+                .admit_browser_action_during_gesture(11, &brightness)
+                .await
+        );
+        assert!(
+            state
+                .admit_browser_action_during_gesture(11, &WebAction::TriggerCollisionScore)
+                .await
+        );
+        assert!(!state.may_finish_browser_history_gesture(10, 41, true).await);
+        assert!(
+            state
+                .may_finish_browser_history_gesture(10, 41, false)
+                .await
+        );
+        state.finish_browser_history_gesture(10, 41).await;
+        assert!(
+            !state
+                .may_finish_browser_history_gesture(10, 41, false)
+                .await
+        );
+
+        assert!(state.begin_browser_history_gesture(10, 43).await);
+        assert!(state.may_finish_browser_history_gesture(10, 43, true).await);
+    }
+
+    #[tokio::test]
+    async fn m5_disconnect_queues_old_end_before_a_new_client_can_begin() {
+        let state = WebState::new().expect("test web state");
+        assert!(state.begin_browser_history_gesture(10, 41).await);
+        assert_eq!(
+            state
+                .enqueue_action(WebAction::BeginHistoryGesture { gesture_id: 41 })
+                .await,
+            EnqueueOutcome::Added
+        );
+
+        assert_eq!(state.disconnect_browser_history_gesture(10).await, Some(41));
+        assert!(state.begin_browser_history_gesture(11, 42).await);
+        assert_eq!(
+            state
+                .enqueue_action(WebAction::BeginHistoryGesture { gesture_id: 42 })
+                .await,
+            EnqueueOutcome::Added
+        );
+
+        let queue = state.actions.lock().await;
+        assert!(matches!(
+            queue.as_slice(),
+            [
+                WebAction::BeginHistoryGesture { gesture_id: 41 },
+                WebAction::EndHistoryGesture { gesture_id: 41 },
+                WebAction::BeginHistoryGesture { gesture_id: 42 }
+            ]
+        ));
+    }
+
+    #[test]
+    fn m5_history_preset_and_recovery_snapshot_fields_are_additive_defaults() {
+        let mut legacy = serde_json::to_value(AppSnapshot::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        for field in [
+            "history",
+            "presets",
+            "recovery_available",
+            "recovery_status",
+            "export_motion",
+            "controller_runtime",
+            "osc_runtime",
+        ] {
+            object.remove(field);
+        }
+        let restored: AppSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.history, HistorySnapshot::default());
+        assert_eq!(restored.presets, PresetLibrarySnapshot::default());
+        assert!(!restored.recovery_available);
+        assert_eq!(restored.export_motion, ExportMotionSnapshot::default());
+        assert_eq!(
+            restored.controller_runtime,
+            ControllerRuntimeSnapshot::default()
+        );
+        assert_eq!(restored.osc_runtime, OscRuntimeSnapshot::default());
+    }
+
+    #[test]
+    fn controller_and_osc_runtime_dtos_map_all_bounded_facts_and_exposure_truth() {
+        let profile = crate::controller_profile::ControllerProfileDocument::default();
+        let midi = crate::midi::MidiRuntimeSnapshot {
+            phase: crate::midi::MidiConnectionPhase::Connected,
+            input_port: Some("Input A".into()),
+            output_port: Some("Output B".into()),
+            available_inputs: vec!["Input A".into()],
+            available_outputs: vec!["Output B".into()],
+            error: None,
+            counters: crate::midi::MidiCounters {
+                raw_received: 12,
+                decoded_events: 7,
+                feedback_sent: 3,
+                reconnects: 2,
+                ..Default::default()
+            },
+        };
+        let controller = ControllerRuntimeSnapshot::from_runtime(
+            9,
+            &profile,
+            "profile ready\ncontrol removed",
+            &midi,
+        );
+        assert_eq!(controller.profile_revision, 9);
+        assert_eq!(controller.name, "Legacy four CC");
+        assert_eq!(controller.status, "profile readycontrol removed");
+        assert_eq!(controller.midi.phase, "connected");
+        assert_eq!(controller.midi.input_port, "Input A");
+        assert_eq!(controller.midi.counters.raw_received, 12);
+        assert_eq!(controller.midi.counters.decoded_events, 7);
+        assert_eq!(controller.midi.counters.feedback_sent, 3);
+        assert_eq!(controller.midi.counters.reconnects, 2);
+
+        let config = crate::osc::OscConfigDocument {
+            bind: crate::osc::OscBindMode::Lan {
+                port: 9_111,
+                enabled: true,
+            },
+            ..Default::default()
+        };
+        let runtime = crate::osc::OscRuntimeSnapshot {
+            phase: crate::osc::OscRuntimePhase::Listening,
+            bound_address: Some("0.0.0.0:9111".parse().unwrap()),
+            lan_warning: true,
+            error: None,
+            counters: crate::osc::OscCounters {
+                datagrams_received: 22,
+                messages_received: 19,
+                queue_dropped: 4,
+                feedback_send_errors: 1,
+                ..Default::default()
+            },
+        };
+        let osc = OscRuntimeSnapshot::from_runtime(&config, "", &runtime);
+        assert_eq!(osc.phase, "listening");
+        assert_eq!(osc.bind_address, "0.0.0.0:9111");
+        assert_eq!(osc.bound_address, "0.0.0.0:9111");
+        assert!(osc.running);
+        assert!(osc.lan_warning);
+        assert_eq!(osc.counters.datagrams_received, 22);
+        assert_eq!(osc.counters.messages_received, 19);
+        assert_eq!(osc.counters.queue_dropped, 4);
+        assert_eq!(osc.counters.feedback_send_errors, 1);
+        let json = serde_json::to_value(OscRuntimeSnapshot::default()).unwrap();
+        assert_eq!(json.get("lan_warning"), Some(&serde_json::json!(false)));
+
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        assert!(html.contains("id=\"controller-profile-import\""));
+        assert!(html.contains("id=\"controller-profile-export\""));
+        assert!(html.contains("MIDI input is never echoed back to the same origin"));
+        assert!(js.contains("fetch('/controller-profile'"));
+        assert!(js.contains("{ action: 'import', document: documentValue }"));
+        assert!(js.contains("{ action: 'export' }"));
+        assert!(!js.contains("controller_profile_path"));
+    }
+
+    #[test]
+    fn export_motion_snapshot_exposes_bounded_provenance_without_field_pixels() {
+        let metadata = crate::render_export::ExportMotionMetadata {
+            accepted_frame: Some(12),
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            scopes: vec![crate::render_export::ExportMotionScopeMetadata {
+                scope: crate::render_export::ExportMotionScopeIdentity::Layer {
+                    saved_position: 2,
+                    stable_id: 9,
+                    source_tap_id: 17,
+                },
+                algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+                requested_source: crate::motion::MotionFieldSource::Auto,
+                lattice_quality: crate::motion::MotionLatticeQuality::Live,
+                source_origin: crate::motion::MotionFieldOrigin::LatticeFallback,
+                source_diagnostic: crate::motion::MotionSourceDiagnostic::CodecUnavailableFallback,
+                codec_provenance: Some(crate::video::CodecMotionProvenance::FfmpegExportMvs),
+                source_generation: Some(4),
+                frame_ordinal: Some(8),
+                donor_saved_position: Some(1),
+                donor_stable_id: Some(7),
+                carrier: crate::motion::MotionCarrier::Transparent,
+                transplant_admitted: true,
+                shutter_active: true,
+                shutter_angle_degrees: 90.0,
+                shutter_quality: crate::motion::CurvedShutterQuality::Live,
+                shutter_sample_count: 8,
+            }],
+            scopes_truncated: true,
+        };
+        let snapshot = ExportMotionSnapshot::from_export(&metadata, &["fallback".into()]);
+        assert_eq!(snapshot.accepted_frame, Some(12));
+        assert_eq!(snapshot.scopes[0].source_origin, "lattice_fallback");
+        assert_eq!(snapshot.scopes[0].stable_id, "9");
+        assert!(snapshot.scopes_truncated);
+        assert!(!snapshot.cross_gpu_pixel_identity_guaranteed);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("vectors"));
+        assert!(!json.contains("pixels"));
+    }
+
+    #[test]
+    fn m5_browser_contract_is_accessible_and_never_auto_restores() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        for needle in [
+            "id=\"history-undo\"",
+            "id=\"history-redo\"",
+            "id=\"preset-list\"",
+            "id=\"recovery-restore\"",
+            "id=\"recovery-discard\"",
+            "id=\"export-motion-status\"",
+            "id=\"controller-runtime-panel\" aria-labelledby=\"controller-runtime-heading\"",
+            "id=\"midi-runtime-counters\" aria-label=\"MIDI runtime counters\"",
+            "id=\"osc-runtime-panel\" aria-labelledby=\"osc-runtime-heading\"",
+            "id=\"osc-runtime-lan-warning\" role=\"status\" aria-live=\"polite\"",
+            "id=\"osc-runtime-counters\" aria-label=\"OSC runtime counters\"",
+        ] {
+            assert!(html.contains(needle), "missing browser control {needle}");
+        }
+        for action in [
+            "action: 'begin_history_gesture'",
+            "action: 'end_history_gesture'",
+            "action: 'undo_manual'",
+            "action: 'redo_manual'",
+            "action: 'capture_scoped_preset'",
+            "action: 'apply_scoped_preset'",
+            "action: 'delete_scoped_preset'",
+            "action: 'restore_recovery_journal'",
+            "action: 'discard_recovery_journal'",
+        ] {
+            assert!(js.contains(action), "missing browser action {action}");
+        }
+        assert!(!js.contains("restore_recovery_journal' });\nconnect"));
+        assert!(html.contains("will never be applied automatically"));
+        assert!(html.contains("value=\"controller_profile\">Controller Profile"));
+        assert!(html.contains("value=\"stage_map\">Stage Map"));
+        assert!(html.contains("complete, separately bounded typed documents"));
+        assert!(js.contains("return { scope: 'controller_profile' }"));
+        assert!(js.contains("return { scope: 'stage_map' }"));
+        assert!(js.contains("syncControllerRuntime(msg.controller_runtime)"));
+        assert!(js.contains("syncOscRuntime(msg.osc_runtime)"));
+        assert!(js.contains("function syncControllerRuntime(snapshot = {})"));
+        assert!(js.contains("function syncOscRuntime(runtime = {})"));
+        assert!(js.contains("if (activeHistoryGestures.size) return false;"));
+        assert!(html.contains("Browser messages cannot invent OSC addresses"));
+        assert!(!js.contains("action: 'dispatch_osc_json'"));
     }
 }

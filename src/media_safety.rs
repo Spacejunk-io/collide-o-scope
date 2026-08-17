@@ -32,6 +32,147 @@ const EXPERT_MEMORY_BUDGET_HARD_MAX: u64 = 2 * 1024 * 1024 * 1024;
 /// Expose that fact for status surfaces instead of manufacturing a number.
 pub const PORTABLE_VRAM_BUDGET_AVAILABLE: bool = false;
 
+pub const PERFORMANCE_STAGING_WORKERS: usize = 2;
+pub const PERFORMANCE_MAX_PREPARED_SOURCES: usize = 16;
+#[allow(dead_code)]
+pub const PERFORMANCE_MAX_PRELOAD_BYTES: u64 = 512 * 1024 * 1024;
+#[allow(dead_code)]
+pub const PERFORMANCE_MAX_REVERSE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
+#[allow(dead_code)]
+pub const PERFORMANCE_MAX_REVERSE_CACHE_BYTES_PER_DECODER: u64 = 32 * 1024 * 1024;
+
+/// Host-local admission model for prepared performance media. Active sources
+/// are intentionally non-evictable; admission or LRU eviction applies only to
+/// staging/prepared entries, so a resource decision cannot blank live output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct PerformanceResourceBudget {
+    staging_workers: usize,
+    max_prepared_sources: usize,
+    max_preload_bytes: u64,
+    max_reverse_cache_bytes: u64,
+    max_reverse_cache_bytes_per_decoder: u64,
+}
+
+impl Default for PerformanceResourceBudget {
+    fn default() -> Self {
+        Self {
+            staging_workers: PERFORMANCE_STAGING_WORKERS,
+            max_prepared_sources: PERFORMANCE_MAX_PREPARED_SOURCES,
+            max_preload_bytes: PERFORMANCE_MAX_PRELOAD_BYTES,
+            max_reverse_cache_bytes: PERFORMANCE_MAX_REVERSE_CACHE_BYTES,
+            max_reverse_cache_bytes_per_decoder: PERFORMANCE_MAX_REVERSE_CACHE_BYTES_PER_DECODER,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl PerformanceResourceBudget {
+    /// Host-clamped performance budget. If physical-memory detection is not
+    /// available, preparation admission stays closed instead of silently
+    /// assuming the 512 MiB preload ceiling is safe for this host.
+    pub fn for_host() -> Self {
+        detect_physical_memory_bytes()
+            .map(Self::for_detected_physical_memory)
+            .unwrap_or_else(|| Self::for_planning_budget(0))
+    }
+
+    /// Derive host ceilings from the same planning budget used by media
+    /// admission. The hard-default 4:1 preload/reverse split is preserved
+    /// under pressure, and the combined ceilings never exceed the host value.
+    pub fn for_planning_budget(planning_budget_bytes: u64) -> Self {
+        let reverse_share = planning_budget_bytes / 5;
+        let max_reverse_cache_bytes = reverse_share.min(PERFORMANCE_MAX_REVERSE_CACHE_BYTES);
+        let max_preload_bytes = planning_budget_bytes
+            .saturating_sub(max_reverse_cache_bytes)
+            .min(PERFORMANCE_MAX_PRELOAD_BYTES);
+        Self {
+            max_preload_bytes,
+            max_reverse_cache_bytes,
+            max_reverse_cache_bytes_per_decoder: max_reverse_cache_bytes
+                .min(PERFORMANCE_MAX_REVERSE_CACHE_BYTES_PER_DECODER),
+            ..Self::default()
+        }
+    }
+
+    pub fn for_detected_physical_memory(physical_memory_bytes: u64) -> Self {
+        Self::for_planning_budget(planning_budget_for_physical_memory(physical_memory_bytes))
+    }
+
+    pub const fn staging_workers(self) -> usize {
+        self.staging_workers
+    }
+
+    pub const fn max_prepared_sources(self) -> usize {
+        self.max_prepared_sources
+    }
+
+    pub const fn max_preload_bytes(self) -> u64 {
+        self.max_preload_bytes
+    }
+
+    pub const fn max_reverse_cache_bytes(self) -> u64 {
+        self.max_reverse_cache_bytes
+    }
+
+    pub const fn max_reverse_cache_bytes_per_decoder(self) -> u64 {
+        self.max_reverse_cache_bytes_per_decoder
+    }
+
+    pub const fn active_sources_are_evictable(self) -> bool {
+        false
+    }
+
+    pub fn admit_staging_worker(self, active_workers: usize) -> Result<(), &'static str> {
+        if active_workers < self.staging_workers {
+            Ok(())
+        } else {
+            Err("performance staging worker limit reached")
+        }
+    }
+
+    pub fn admit_prepared_source(self, prepared_sources: usize) -> Result<(), &'static str> {
+        if prepared_sources < self.max_prepared_sources {
+            Ok(())
+        } else {
+            Err("prepared source limit reached")
+        }
+    }
+
+    pub fn admit_preload_bytes(
+        self,
+        currently_reserved: u64,
+        requested: u64,
+    ) -> Result<u64, &'static str> {
+        let total = currently_reserved
+            .checked_add(requested)
+            .ok_or("performance preload byte accounting overflow")?;
+        if total <= self.max_preload_bytes {
+            Ok(total)
+        } else {
+            Err("performance preload byte budget exceeded")
+        }
+    }
+
+    pub fn admit_reverse_cache_bytes(
+        self,
+        aggregate_reserved: u64,
+        requested_for_decoder: u64,
+    ) -> Result<u64, &'static str> {
+        if requested_for_decoder > self.max_reverse_cache_bytes_per_decoder {
+            return Err("per-decoder reverse cache budget exceeded");
+        }
+        let total = aggregate_reserved
+            .checked_add(requested_for_decoder)
+            .ok_or("reverse cache byte accounting overflow")?;
+        if total <= self.max_reverse_cache_bytes {
+            Ok(total)
+        } else {
+            Err("aggregate reverse cache budget exceeded")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaSafetyMode {
@@ -230,6 +371,72 @@ struct MediaSafetyInner {
     physical_memory_bytes: Option<u64>,
     planning_budget_bytes: u64,
     reserved_bytes: Mutex<u64>,
+    reverse_cache_ledger: Arc<ReverseCacheLedger>,
+}
+
+/// Session-shared accounting for decoded frames retained solely to make
+/// reverse/source-time selection cheap. Every cached frame owns a lease from
+/// this ledger; moving a cache keeps the lease alive, while eviction, clear,
+/// and drop release the exact admitted byte count.
+///
+/// This is separate from [`MediaSafetyPolicy`]'s Expert source reservation:
+/// Safe sources also retain reverse frames, so relying on Expert-only working
+/// set accounting would leave the aggregate performance-cache ceiling inert.
+#[derive(Debug)]
+pub(crate) struct ReverseCacheLedger {
+    max_bytes: u64,
+    reserved_bytes: Mutex<u64>,
+}
+
+impl ReverseCacheLedger {
+    pub(crate) fn new(max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            max_bytes,
+            reserved_bytes: Mutex::new(0),
+        })
+    }
+
+    pub(crate) fn try_reserve(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<ReverseCacheLease, &'static str> {
+        let mut reserved = lock_recover(&self.reserved_bytes);
+        let requested_total = reserved
+            .checked_add(bytes)
+            .ok_or("reverse cache byte accounting overflow")?;
+        if requested_total > self.max_bytes {
+            return Err("aggregate reverse cache budget exceeded");
+        }
+        *reserved = requested_total;
+        drop(reserved);
+        Ok(ReverseCacheLease {
+            ledger: self.clone(),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        *lock_recover(&self.reserved_bytes)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReverseCacheLease {
+    ledger: Arc<ReverseCacheLedger>,
+    bytes: u64,
+}
+
+impl Drop for ReverseCacheLease {
+    fn drop(&mut self) {
+        let mut reserved = lock_recover(&self.ledger.reserved_bytes);
+        *reserved = reserved.saturating_sub(self.bytes);
+    }
 }
 
 /// Cloneable, process-local policy shared by decoder, Spout, and export
@@ -267,18 +474,25 @@ impl MediaSafetyPolicy {
         let planning_budget_bytes = physical_memory_bytes
             .map(planning_budget_for_physical_memory)
             .unwrap_or(0);
+        let performance_budget =
+            PerformanceResourceBudget::for_planning_budget(planning_budget_bytes);
         Self {
             inner: Arc::new(MediaSafetyInner {
                 mode: AtomicU8::new(mode.as_u8()),
                 physical_memory_bytes,
                 planning_budget_bytes,
                 reserved_bytes: Mutex::new(0),
+                reverse_cache_ledger: ReverseCacheLedger::new(
+                    performance_budget.max_reverse_cache_bytes(),
+                ),
             }),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(mode: MediaSafetyMode, planning_budget_bytes: u64) -> Self {
+        let performance_budget =
+            PerformanceResourceBudget::for_planning_budget(planning_budget_bytes);
         Self {
             inner: Arc::new(MediaSafetyInner {
                 mode: AtomicU8::new(mode.as_u8()),
@@ -287,8 +501,20 @@ impl MediaSafetyPolicy {
                 ),
                 planning_budget_bytes,
                 reserved_bytes: Mutex::new(0),
+                reverse_cache_ledger: ReverseCacheLedger::new(
+                    performance_budget.max_reverse_cache_bytes(),
+                ),
             }),
         }
+    }
+
+    pub(crate) fn reverse_cache_ledger(&self) -> Arc<ReverseCacheLedger> {
+        self.inner.reverse_cache_ledger.clone()
+    }
+
+    pub(crate) fn reverse_cache_bytes_per_decoder(&self) -> u64 {
+        PerformanceResourceBudget::for_planning_budget(self.inner.planning_budget_bytes)
+            .max_reverse_cache_bytes_per_decoder()
     }
 
     pub fn mode(&self) -> MediaSafetyMode {
@@ -890,5 +1116,78 @@ mod tests {
         assert!(snapshot
             .rationale()
             .contains("Portable VRAM headroom is unavailable"));
+    }
+
+    #[test]
+    fn policy_clones_share_one_reverse_cache_ledger() {
+        let policy = MediaSafetyPolicy::for_test(MediaSafetyMode::Safe, 640);
+        let clone = policy.clone();
+        let original_ledger = policy.reverse_cache_ledger();
+        let cloned_ledger = clone.reverse_cache_ledger();
+        assert!(Arc::ptr_eq(&original_ledger, &cloned_ledger));
+        assert_eq!(original_ledger.max_bytes(), 128);
+
+        let lease = original_ledger.try_reserve(96).unwrap();
+        assert_eq!(cloned_ledger.reserved_bytes(), 96);
+        assert!(cloned_ledger.try_reserve(33).is_err());
+        drop(lease);
+        assert_eq!(cloned_ledger.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn performance_budget_is_bounded_checked_and_never_evicts_active_sources() {
+        let budget = PerformanceResourceBudget::default();
+        assert_eq!(budget.staging_workers(), 2);
+        assert_eq!(budget.max_prepared_sources(), 16);
+        assert_eq!(budget.max_preload_bytes(), 512 * 1024 * 1024);
+        assert_eq!(budget.max_reverse_cache_bytes(), 128 * 1024 * 1024);
+        assert_eq!(
+            budget.max_reverse_cache_bytes_per_decoder(),
+            32 * 1024 * 1024
+        );
+        assert!(!budget.active_sources_are_evictable());
+        assert!(budget.admit_staging_worker(1).is_ok());
+        assert!(budget.admit_staging_worker(2).is_err());
+        assert!(budget.admit_prepared_source(15).is_ok());
+        assert!(budget.admit_prepared_source(16).is_err());
+
+        assert_eq!(
+            budget
+                .admit_preload_bytes(511 * 1024 * 1024, 1024 * 1024)
+                .unwrap(),
+            512 * 1024 * 1024
+        );
+        assert!(budget.admit_preload_bytes(512 * 1024 * 1024, 1).is_err());
+        assert!(budget.admit_preload_bytes(u64::MAX, 1).is_err());
+
+        assert_eq!(
+            budget
+                .admit_reverse_cache_bytes(96 * 1024 * 1024, 32 * 1024 * 1024)
+                .unwrap(),
+            128 * 1024 * 1024
+        );
+        assert!(budget
+            .admit_reverse_cache_bytes(0, 32 * 1024 * 1024 + 1)
+            .is_err());
+        assert!(budget
+            .admit_reverse_cache_bytes(128 * 1024 * 1024, 1)
+            .is_err());
+        assert!(budget.admit_reverse_cache_bytes(u64::MAX, 1).is_err());
+
+        let clamped = PerformanceResourceBudget::for_planning_budget(100);
+        assert_eq!(clamped.max_preload_bytes(), 80);
+        assert_eq!(clamped.max_reverse_cache_bytes(), 20);
+        assert_eq!(clamped.max_reverse_cache_bytes_per_decoder(), 20);
+        assert_eq!(
+            clamped
+                .max_preload_bytes()
+                .checked_add(clamped.max_reverse_cache_bytes()),
+            Some(100)
+        );
+        let detected = PerformanceResourceBudget::for_detected_physical_memory(8 * 1024);
+        assert_eq!(
+            detected.max_preload_bytes() + detected.max_reverse_cache_bytes(),
+            1024
+        );
     }
 }

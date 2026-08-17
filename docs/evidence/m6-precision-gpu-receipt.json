@@ -1,0 +1,160 @@
+{
+  "schema": "collide-o-scope-m6-gpu-precision-receipt/2",
+  "measured_at": "2026-08-17T13:03:10.0995542-04:00",
+  "command": "cargo test --locked gpu_precision_receipt_measures_real_still_and_temporal_workloads -- --ignored --nocapture",
+  "host": {
+    "os": "windows",
+    "arch": "x86_64"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+    "cargo": "cargo 1.96.1 (356927216 2026-06-26)"
+  },
+  "source_identity": {
+    "crate_version": "0.1.0",
+    "shader_bundle_sha256": "1c30e098763ff6b1a89c56b89ca0af4fc98d489bebd03a41e5870bd940dab29c",
+    "cargo_lock_and_m6_sources_sha256": "eb7bbf8208c787bcd687842bee6abd59c311f21f535cd4389a660717ab7333f4",
+    "manifest_scope": "length-prefixed Cargo.toml, Cargo.lock, production Rust encode/resource/uniform paths, receipt helpers, and every measured WGSL source"
+  },
+  "adapter": {
+    "name": "AMD Radeon RX 6950 XT",
+    "backend": "Vulkan",
+    "device_type": "DiscreteGpu",
+    "driver": "AMD proprietary driver",
+    "driver_info": "26.7.1 (AMD proprietary shader compiler)"
+  },
+  "dimensions": [
+    192,
+    108
+  ],
+  "still": {
+    "frames": 8,
+    "workload": "production effects shader: linear brightness + contrast, then Advanced deterministic Compat8 presentation",
+    "fixture_sha256": "ddaa723b65d5d664ccb326e7bbe3acd3943391718a830e4f12b374a23ce32916",
+    "compat8_output_sha256": "5e5f663ddc8f72b0be7298960c22c7b5dd5d8eb5b0d8638abe1176dc253a855f",
+    "advanced_working_output_sha256": "25e6f3465943edd1eb5b952ccde80bc0813c01f4352bdf49a51ddaeea292cdad",
+    "advanced_presented_output_sha256": "b63f2077e59a745e740fff673b6dc4b56e0e4d05860ace9fad0e5123b2ab62cc",
+    "compat8": {
+      "rmse": 0.0009368062897244925,
+      "max_absolute_error": 0.004846841096878052,
+      "clamped_channel_events": 8,
+      "reference_gradient_events": 16210,
+      "retained_gradient_events": 11942
+    },
+    "advanced_working_rgba16f": {
+      "rmse": 0.00004699488022035341,
+      "max_absolute_error": 0.000382155179977417,
+      "clamped_channel_events": 6,
+      "reference_gradient_events": 16210,
+      "retained_gradient_events": 16208
+    },
+    "advanced_presented_compat8": {
+      "rmse": 0.0006848643326146698,
+      "max_absolute_error": 0.004206359386444092,
+      "clamped_channel_events": 40,
+      "reference_gradient_events": 16210,
+      "retained_gradient_events": 12523
+    },
+    "compat8_spatial_8x8_mean": {
+      "rmse": 0.00025520714232480285,
+      "max_absolute_error": 0.001024872064590454,
+      "clamped_channel_events": 0,
+      "reference_gradient_events": 260,
+      "retained_gradient_events": 260
+    },
+    "advanced_presented_spatial_8x8_mean": {
+      "rmse": 0.00006369797685187751,
+      "max_absolute_error": 0.0003909766674041748,
+      "clamped_channel_events": 1,
+      "reference_gradient_events": 260,
+      "retained_gradient_events": 260
+    },
+    "compat8_fixture_wall_ns_per_frame": 619737,
+    "advanced_fixture_wall_ns_per_frame": 265762
+  },
+  "temporal": {
+    "frames": 12,
+    "feedback": 0.5,
+    "workload": "production feedback shader over a moving pulse, then Advanced deterministic Compat8 presentation",
+    "fixture_sha256": "b019456a5b64d4616f8cbd8027313d0a75f2fa1692937f81373f7deca7ed9b61",
+    "compat8_output_sha256": "e697af4694a76734584cc6c281c0d83d59893012291ec5611fcf619c1a9fb8c9",
+    "advanced_working_output_sha256": "644d4afa3b88284316b52c2ebfb19b82468170bcec4ab01abaa92babd4308893",
+    "advanced_presented_output_sha256": "e0bd88d853f78a86a06307daf94789928e2d3c167445275d2ee30dc00dc0b1ec",
+    "compat8": {
+      "rmse": 0.0005016257234502776,
+      "max_absolute_error": 0.0037881433963775635,
+      "clamped_channel_events": 0,
+      "reference_gradient_events": 11949,
+      "retained_gradient_events": 10931
+    },
+    "advanced_working_rgba16f": {
+      "rmse": 0.00009034139613221204,
+      "max_absolute_error": 0.003038465976715088,
+      "clamped_channel_events": 0,
+      "reference_gradient_events": 11949,
+      "retained_gradient_events": 11949
+    },
+    "advanced_presented_compat8": {
+      "rmse": 0.0006938301507421787,
+      "max_absolute_error": 0.006556510925292969,
+      "clamped_channel_events": 0,
+      "reference_gradient_events": 11949,
+      "retained_gradient_events": 8606
+    },
+    "compat8_spatial_8x8_mean": {
+      "rmse": 0.00007042327046906307,
+      "max_absolute_error": 0.0006461739540100098,
+      "clamped_channel_events": 0,
+      "reference_gradient_events": 311,
+      "retained_gradient_events": 311
+    },
+    "advanced_presented_spatial_8x8_mean": {
+      "rmse": 0.000059626370867447566,
+      "max_absolute_error": 0.00038954615592956543,
+      "clamped_channel_events": 0,
+      "reference_gradient_events": 311,
+      "retained_gradient_events": 311
+    },
+    "compat8_fixture_wall_ns_per_frame": 2511966,
+    "advanced_fixture_wall_ns_per_frame": 23263525
+  },
+  "timing_scope": "fixture-local wall time with a per-frame GPU wait; Compat8 writes its final target in the core pass while Advanced includes its required encode_present pass; smoke evidence only, not a renderer-throughput comparison",
+  "acceptance_gates": [
+    {
+      "command": "cargo test --locked advanced_present_dithers_sub_lsb_and_filters_transparent_edges_premultiplied -- --ignored --nocapture",
+      "result": "1 passed; 0 failed",
+      "adapter": "AMD Radeon RX 6950 XT / Vulkan",
+      "facts": "Repeated frames were byte-identical; one 8x8 encoded-100.25 tile contained exactly 48 code-100 and 16 code-101 samples (mean 100.25); filtered partial coverage retained red with zero hidden green and canonical transparent RGB."
+    },
+    {
+      "command": "cargo test --locked advanced_temporal_feedback_filters_hidden_rgb_in_premultiplied_space -- --ignored --nocapture",
+      "result": "1 passed; 0 failed",
+      "adapter": "AMD Radeon RX 6950 XT / Vulkan",
+      "facts": "Advanced temporal feedback produced a partial red trail with zero hidden green/blue and canonical transparent RGB."
+    },
+    {
+      "command": "cargo test --locked gpu_legacy_active_spatial_matches_frozen_pre_m6_pixels -- --ignored --nocapture",
+      "result": "1 passed; 0 failed",
+      "adapter": "AMD Radeon RX 6950 XT / Vulkan",
+      "facts": "LegacyExact active-spatial output matched the literal frozen pre-M6 RGBA8 pixels byte-for-byte."
+    },
+    {
+      "command": "cargo test --locked exact_temporal_originals_keep_frozen_pixels_while_advanced_is_deterministic_at_24_30_and_60_fps -- --ignored --nocapture",
+      "result": "1 passed; 0 failed",
+      "adapter": "AMD Radeon RX 6950 XT / Vulkan",
+      "facts": "Exact temporal originals retained SHA-256 27eac2e718096ca775866d507ee1fd8445e2429e18db79b36e5d8c163294525c; Advanced remained deterministic at SHA-256 059b344976e75138526079dc65614f2e3f88f34b34f24ca7796c863d18c3553a across the 24/30/60-fps matrix."
+    },
+    {
+      "command": "cargo test --locked legacy_logical_lookup_1025_rejects_while_advanced_128_shader_ops_fit",
+      "result": "1 passed; 0 failed",
+      "adapter": "CPU resource-law fixture",
+      "facts": "The frozen logical frame boundary accepts exactly 1,024 lookups and rejects 1,025, while an Advanced rack at 32 logical lookups and 128 explicit shader texture operations remains admissible."
+    },
+    {
+      "command": "cargo test --locked logical_lookup_ceiling_is_frozen_while_advanced_shader_ops_are_explicit",
+      "result": "1 passed; 0 failed",
+      "adapter": "CPU resource-law fixture",
+      "facts": "Eighty-five LegacyCanonical-only layer racks are admitted at 1,020 logical units; 86 are rejected at 1,032. A production preflight at exactly 1,024 logical lookups is admitted and the same plan plus one lookup is rejected."
+    }
+  ]
+}

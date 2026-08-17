@@ -1,16 +1,44 @@
 pub mod editor;
 
+use serde::de;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use crate::effects::params::TemporalParams;
+use crate::composition::{
+    CompositionTree, RootItem, RuntimeComposition, RuntimeGroup, RuntimeGroupMembers,
+    RuntimeRootItem,
+};
+use crate::effects::params::{
+    CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, RefreshGardenGate,
+    RefreshGardenParams, TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
+    TemporalParams, TemporalTopology,
+};
 use crate::effects::EffectUniforms;
+use crate::image_routing::{
+    LayerImageStage, LayerMatte, LayerMatteConfig, SavedImageInput, StableLayerId,
+};
 use crate::layers::{BlendMode, Layer};
 use crate::modulation::{
-    Curve, GyroAxisConfig, Lfo, LfoShape, ModMatrix, ModSource, PadAxisConfig, PadConfig, Routing,
-    MAX_ROUTINGS, NUM_LFOS,
+    Curve, GyroAxisConfig, Lfo, LfoShape, ModMatrix, ModSource, PadAxisConfig, PadConfig,
+    ResolvedStableModTarget, Routing, SavedStableModScope, SavedStableModTarget,
+    StableModAddressBook, MAX_ROUTINGS, NUM_LFOS,
+};
+use crate::motion::{
+    CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier, MotionDonor,
+    MotionFieldSource, MotionLatticeQuality, MotionParams, MOTION_ALGORITHM_VERSION,
 };
 use crate::ntsc::NtscParams;
+use crate::performance::{
+    ClipSlotConfig, ClipSlotId, ClipSlots, SavedLayerPosition, SceneReferenceErrorKind,
+    SceneReferenceIssue, Scenes,
+};
+use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
+use crate::temporal::{CollisionScoreLoopDriver, TemporalEventResetMode, TemporalResetPolicy};
+use crate::visual_rack::{
+    EdgeTiming, GroupId, ImageDependency, ImageDependencyGraph, ImageGraphMode, ImageOrderingEdge,
+    LegacyRackScope, MaskParams, NodeId, RuntimeImageMatte, RuntimeVisualRack, SavedImageSource,
+    SavedImageTap, VisualNodeKind, VisualRack, VisualScopeId,
+};
 
 // --- Helpers for serde defaults ---
 
@@ -55,6 +83,10 @@ fn default_temporal_key_threshold() -> f32 {
 }
 fn default_temporal_key_softness() -> f32 {
     0.03
+}
+
+fn is_legacy_spatial_identity(value: &SpatialTransform) -> bool {
+    (*value).is_legacy_identity()
 }
 
 // --- Parameter metadata for stepping & comments ---
@@ -274,10 +306,31 @@ pub fn param_meta(name: &str) -> Option<ParamMeta> {
 
 // --- Serializable patch state ---
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 pub struct PatchState {
     pub master: EffectsConfig,
+    /// Program-wide authored geometry. Its serde default takes the exact
+    /// inactive historical sample path, so old patches remain pixel-compatible;
+    /// once moved, newly exposed canvas starts transparent.
+    #[serde(default, skip_serializing_if = "is_legacy_spatial_identity")]
+    pub master_transform: SpatialTransform,
+    /// Program-wide M4 motion authoring. Omitted is the exact historical
+    /// no-op; hidden field/carrier pixels are never persisted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_motion: Option<MotionConfig>,
     pub layers: Vec<LayerConfig>,
+    /// Omitted means the pre-rack legacy order must be synthesized. `Some`
+    /// with zero nodes is an explicitly authored empty rack and must never be
+    /// collapsed back to the legacy shader marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_rack: Option<VisualRack>,
+    /// Saved-position form of the one-level runtime composition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composition: Option<CompositionTree>,
+    /// 0/omitted is the exact legacy schema; 1 declares explicit M2 visual
+    /// topology. Future versions are rejected before any state is sanitized.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub visual_schema_version: u32,
     #[serde(default)]
     pub master_paused: bool,
     /// Hold file/Spout source images while program clocks and effects continue.
@@ -291,6 +344,73 @@ pub struct PatchState {
     pub temporal: Option<TemporalConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub morph: Option<crate::morph::MorphStateSnapshot>,
+    /// Prepared multi-layer recalls. Empty is the exact legacy behavior.
+    #[serde(default, skip_serializing_if = "Scenes::is_empty")]
+    pub scenes: Scenes,
+}
+
+impl<'de> Deserialize<'de> for PatchState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawPatchState {
+            master: EffectsConfig,
+            #[serde(default)]
+            master_transform: SpatialTransform,
+            #[serde(default)]
+            master_motion: Option<MotionConfig>,
+            layers: Vec<LayerConfig>,
+            #[serde(default)]
+            master_rack: Option<VisualRack>,
+            #[serde(default)]
+            composition: Option<CompositionTree>,
+            #[serde(default)]
+            visual_schema_version: u32,
+            #[serde(default)]
+            master_paused: bool,
+            #[serde(default)]
+            media_frozen: bool,
+            #[serde(default)]
+            ntsc: Option<NtscConfig>,
+            #[serde(default)]
+            modulation: Option<ModConfig>,
+            #[serde(default)]
+            temporal: Option<TemporalConfig>,
+            #[serde(default)]
+            morph: Option<crate::morph::MorphStateSnapshot>,
+            #[serde(default)]
+            scenes: Scenes,
+        }
+
+        let raw = RawPatchState::deserialize(deserializer)?;
+        let mut patch = Self {
+            master: raw.master,
+            master_transform: raw.master_transform,
+            master_motion: raw.master_motion,
+            layers: raw.layers,
+            master_rack: raw.master_rack,
+            composition: raw.composition,
+            visual_schema_version: raw.visual_schema_version,
+            master_paused: raw.master_paused,
+            media_frozen: raw.media_frozen,
+            ntsc: raw.ntsc,
+            modulation: raw.modulation,
+            temporal: raw.temporal,
+            morph: raw.morph,
+            scenes: raw.scenes,
+        };
+        patch
+            .validate_creative_persistence()
+            .map_err(de::Error::custom)?;
+        patch.sanitize_performance_references();
+        Ok(patch)
+    }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Transport fields captured alongside a full patch snapshot.
@@ -300,11 +420,49 @@ pub struct PatchTransportState {
     pub media_frozen: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The program-wide authored visual pair captured as one semantic unit.
+/// Keeping effects and geometry together prevents save/export call sites from
+/// accidentally omitting one half as the visual schema grows.
+#[derive(Clone, Copy)]
+pub struct PatchMasterVisual<'a> {
+    pub effects: &'a EffectUniforms,
+    pub transform: &'a SpatialTransform,
+}
+
+impl<'a> PatchMasterVisual<'a> {
+    pub fn new(effects: &'a EffectUniforms, transform: &'a SpatialTransform) -> Self {
+        Self { effects, transform }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookRackScope {
+    Master,
+    Layer(StableLayerId),
+    Group(GroupId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LookNodeRef {
+    pub scope: LookRackScope,
+    pub node_id: NodeId,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LookApplySummary {
     pub mapped_layers: usize,
     pub unused_patch_layers: usize,
     pub untouched_live_layers: usize,
+    pub applied_racks: usize,
+    pub skipped_racks: usize,
+    pub applied_groups: usize,
+    pub skipped_groups: usize,
+    pub applied_group_ids: Vec<GroupId>,
+    pub skipped_group_ids: Vec<GroupId>,
+    pub applied_nodes: Vec<LookNodeRef>,
+    pub skipped_nodes: Vec<LookNodeRef>,
+    pub applied_bus_crossfade: bool,
+    pub skipped_bus_crossfade: bool,
 }
 
 /// Serializable temporal (feedback/slit-scan) parameters for patch files.
@@ -331,6 +489,486 @@ pub struct TemporalConfig {
     pub key_softness: f32,
     #[serde(default = "one")]
     pub key_history: f32,
+    /// Additive M3 authoring state. An absent block is the exact historical
+    /// no-op, so old patches retain byte-compatible temporal behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originals: Option<TemporalOriginalsConfig>,
+}
+
+/// Stable serialized vocabulary for the Temporal Topology Loom.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalTopologyConfig {
+    #[default]
+    Linear,
+    Radial,
+    Spiral,
+    Contour,
+    Folded,
+    Kaleidoscopic,
+}
+
+impl TemporalTopologyConfig {
+    fn from_runtime(value: TemporalTopology) -> Self {
+        match value {
+            TemporalTopology::Linear => Self::Linear,
+            TemporalTopology::Radial => Self::Radial,
+            TemporalTopology::Spiral => Self::Spiral,
+            TemporalTopology::Contour => Self::Contour,
+            TemporalTopology::Folded => Self::Folded,
+            TemporalTopology::Kaleidoscopic => Self::Kaleidoscopic,
+        }
+    }
+
+    fn to_runtime(self) -> TemporalTopology {
+        match self {
+            Self::Linear => TemporalTopology::Linear,
+            Self::Radial => TemporalTopology::Radial,
+            Self::Spiral => TemporalTopology::Spiral,
+            Self::Contour => TemporalTopology::Contour,
+            Self::Folded => TemporalTopology::Folded,
+            Self::Kaleidoscopic => TemporalTopology::Kaleidoscopic,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalInterpolationConfig {
+    #[default]
+    Floor,
+    Linear,
+}
+
+impl TemporalInterpolationConfig {
+    fn from_runtime(value: TemporalInterpolation) -> Self {
+        match value {
+            TemporalInterpolation::Floor => Self::Floor,
+            TemporalInterpolation::Linear => Self::Linear,
+        }
+    }
+
+    fn to_runtime(self) -> TemporalInterpolation {
+        match self {
+            Self::Floor => TemporalInterpolation::Floor,
+            Self::Linear => TemporalInterpolation::Linear,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshGardenGateConfig {
+    #[default]
+    TemporalDelta,
+    Luma,
+    Chroma,
+    CellularRidge,
+    AudioEnergy,
+    AudioOnset,
+    Matte,
+}
+
+impl RefreshGardenGateConfig {
+    fn from_runtime(value: RefreshGardenGate) -> Self {
+        match value {
+            RefreshGardenGate::TemporalDelta => Self::TemporalDelta,
+            RefreshGardenGate::Luma => Self::Luma,
+            RefreshGardenGate::Chroma => Self::Chroma,
+            RefreshGardenGate::CellularRidge => Self::CellularRidge,
+            RefreshGardenGate::AudioEnergy => Self::AudioEnergy,
+            RefreshGardenGate::AudioOnset => Self::AudioOnset,
+            RefreshGardenGate::Matte => Self::Matte,
+        }
+    }
+
+    fn to_runtime(self) -> RefreshGardenGate {
+        match self {
+            Self::TemporalDelta => RefreshGardenGate::TemporalDelta,
+            Self::Luma => RefreshGardenGate::Luma,
+            Self::Chroma => RefreshGardenGate::Chroma,
+            Self::CellularRidge => RefreshGardenGate::CellularRidge,
+            Self::AudioEnergy => RefreshGardenGate::AudioEnergy,
+            Self::AudioOnset => RefreshGardenGate::AudioOnset,
+            Self::Matte => RefreshGardenGate::Matte,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionScoreTriggerConfig {
+    #[default]
+    Boundary,
+    Downbeat,
+    AudioOnset,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemporalEventResetModeConfig {
+    #[default]
+    None,
+    Score,
+    Memory,
+    All,
+}
+
+impl TemporalEventResetModeConfig {
+    fn from_runtime(value: TemporalEventResetMode) -> Self {
+        match value {
+            TemporalEventResetMode::None => Self::None,
+            TemporalEventResetMode::Score => Self::Score,
+            TemporalEventResetMode::Memory => Self::Memory,
+            TemporalEventResetMode::All => Self::All,
+        }
+    }
+
+    fn to_runtime(self) -> TemporalEventResetMode {
+        match self {
+            Self::None => TemporalEventResetMode::None,
+            Self::Score => TemporalEventResetMode::Score,
+            Self::Memory => TemporalEventResetMode::Memory,
+            Self::All => TemporalEventResetMode::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TemporalResetPolicyConfig {
+    pub loop_boundary: TemporalEventResetModeConfig,
+    pub downbeat: TemporalEventResetModeConfig,
+}
+
+impl TemporalResetPolicyConfig {
+    pub fn from_params(value: TemporalResetPolicy) -> Self {
+        Self {
+            loop_boundary: TemporalEventResetModeConfig::from_runtime(value.loop_boundary),
+            downbeat: TemporalEventResetModeConfig::from_runtime(value.downbeat),
+        }
+    }
+
+    pub fn to_params(self) -> TemporalResetPolicy {
+        TemporalResetPolicy {
+            loop_boundary: self.loop_boundary.to_runtime(),
+            downbeat: self.downbeat.to_runtime(),
+        }
+    }
+}
+
+impl CollisionScoreTriggerConfig {
+    fn from_runtime(value: CollisionScoreTrigger) -> Self {
+        match value {
+            CollisionScoreTrigger::Boundary => Self::Boundary,
+            CollisionScoreTrigger::Downbeat => Self::Downbeat,
+            CollisionScoreTrigger::AudioOnset => Self::AudioOnset,
+            CollisionScoreTrigger::Manual => Self::Manual,
+        }
+    }
+
+    fn to_runtime(self) -> CollisionScoreTrigger {
+        match self {
+            Self::Boundary => CollisionScoreTrigger::Boundary,
+            Self::Downbeat => CollisionScoreTrigger::Downbeat,
+            Self::AudioOnset => CollisionScoreTrigger::AudioOnset,
+            Self::Manual => CollisionScoreTrigger::Manual,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TemporalLoomConfig {
+    pub amount: f32,
+    pub topology: TemporalTopologyConfig,
+    pub interpolation: TemporalInterpolationConfig,
+    pub depth: f32,
+    pub phase: f32,
+    pub scale: f32,
+    pub angle: f32,
+    pub folds: u8,
+    pub quantization: u8,
+}
+
+impl Default for TemporalLoomConfig {
+    fn default() -> Self {
+        Self::from_params(TemporalLoomParams::default())
+    }
+}
+
+impl TemporalLoomConfig {
+    pub fn from_params(value: TemporalLoomParams) -> Self {
+        Self {
+            amount: value.amount,
+            topology: TemporalTopologyConfig::from_runtime(value.topology),
+            interpolation: TemporalInterpolationConfig::from_runtime(value.interpolation),
+            depth: value.depth,
+            phase: value.phase,
+            scale: value.scale,
+            angle: value.angle,
+            folds: value.folds,
+            quantization: value.quantization,
+        }
+    }
+
+    pub fn to_params(self) -> TemporalLoomParams {
+        TemporalLoomParams {
+            amount: finite_or(self.amount, 0.0).clamp(0.0, 1.0),
+            topology: self.topology.to_runtime(),
+            interpolation: self.interpolation.to_runtime(),
+            depth: finite_or(self.depth, 1.0).clamp(0.0, 1.0),
+            phase: finite_or(self.phase, 0.0).clamp(-1_000.0, 1_000.0),
+            scale: finite_or(self.scale, 1.0).clamp(0.01, 100.0),
+            angle: finite_or(self.angle, 0.0).clamp(-180.0, 180.0),
+            folds: self.folds.clamp(1, 16),
+            quantization: self.quantization.min(24),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollisionAtlasConfig {
+    pub amount: f32,
+    pub seed: u32,
+    pub territories: u8,
+    pub collision: f32,
+}
+
+impl Default for CollisionAtlasConfig {
+    fn default() -> Self {
+        Self::from_params(CollisionAtlasParams::default())
+    }
+}
+
+impl CollisionAtlasConfig {
+    pub fn from_params(value: CollisionAtlasParams) -> Self {
+        Self {
+            amount: value.amount,
+            seed: value.seed,
+            territories: value.territories,
+            collision: value.collision,
+        }
+    }
+
+    pub fn to_params(self) -> CollisionAtlasParams {
+        CollisionAtlasParams {
+            amount: finite_or(self.amount, 0.0).clamp(0.0, 1.0),
+            seed: self.seed,
+            territories: self.territories.clamp(1, 64),
+            collision: finite_or(self.collision, 0.0).clamp(0.0, 1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RefreshGardenConfig {
+    pub amount: f32,
+    pub gate: RefreshGardenGateConfig,
+    pub threshold: f32,
+    pub softness: f32,
+    pub decay: f32,
+    pub max_hold_ticks: u32,
+}
+
+impl Default for RefreshGardenConfig {
+    fn default() -> Self {
+        Self::from_params(RefreshGardenParams::default())
+    }
+}
+
+impl RefreshGardenConfig {
+    pub fn from_params(value: RefreshGardenParams) -> Self {
+        Self {
+            amount: value.amount,
+            gate: RefreshGardenGateConfig::from_runtime(value.gate),
+            threshold: value.threshold,
+            softness: value.softness,
+            decay: value.decay,
+            max_hold_ticks: value.max_hold_ticks,
+        }
+    }
+
+    pub fn to_params(self) -> RefreshGardenParams {
+        RefreshGardenParams {
+            amount: finite_or(self.amount, 0.0).clamp(0.0, 1.0),
+            gate: self.gate.to_runtime(),
+            threshold: finite_or(self.threshold, 0.1).clamp(0.0, 1.0),
+            softness: finite_or(self.softness, 0.03).clamp(0.0, 0.5),
+            decay: finite_or(self.decay, 1.0).clamp(0.0, 1.0),
+            max_hold_ticks: self.max_hold_ticks,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CollisionScoreConfig {
+    pub enabled: bool,
+    pub seed: u32,
+    pub state_count: u8,
+    pub trigger: CollisionScoreTriggerConfig,
+    /// Persisted position only. Live stable IDs are session-local and are
+    /// re-resolved by the app after patch/Morph recall.
+    #[serde(
+        default,
+        skip_serializing_if = "CollisionScoreLoopDriverConfig::is_none"
+    )]
+    pub loop_driver: CollisionScoreLoopDriverConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CollisionScoreLoopDriverConfig {
+    #[default]
+    None,
+    SelectedLayer {
+        saved_position: SavedLayerPosition,
+    },
+    MissingSelectedLayer {
+        saved_position: SavedLayerPosition,
+    },
+}
+
+impl CollisionScoreLoopDriverConfig {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    pub(crate) fn from_runtime_for_capture(
+        value: CollisionScoreLoopDriver,
+        layer_ids: &[StableLayerId],
+    ) -> Self {
+        match value {
+            CollisionScoreLoopDriver::None => Self::None,
+            CollisionScoreLoopDriver::SelectedLayer {
+                layer_id,
+                saved_position,
+            } => layer_ids
+                .iter()
+                .position(|candidate| *candidate == layer_id)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(SavedLayerPosition::new)
+                .map_or(
+                    Self::MissingSelectedLayer { saved_position },
+                    |saved_position| Self::SelectedLayer { saved_position },
+                ),
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position } => {
+                Self::MissingSelectedLayer { saved_position }
+            }
+        }
+    }
+
+    fn resolve_runtime(self, layer_ids: &[StableLayerId]) -> CollisionScoreLoopDriver {
+        match self {
+            Self::None => CollisionScoreLoopDriver::None,
+            Self::SelectedLayer { saved_position } => {
+                saved_position.resolve(layer_ids).copied().map_or(
+                    CollisionScoreLoopDriver::MissingSelectedLayer { saved_position },
+                    |layer_id| CollisionScoreLoopDriver::SelectedLayer {
+                        layer_id,
+                        saved_position,
+                    },
+                )
+            }
+            Self::MissingSelectedLayer { saved_position } => {
+                CollisionScoreLoopDriver::MissingSelectedLayer { saved_position }
+            }
+        }
+    }
+}
+
+impl Default for CollisionScoreConfig {
+    fn default() -> Self {
+        Self::from_params(CollisionScoreParams::default())
+    }
+}
+
+impl CollisionScoreConfig {
+    pub fn from_params(value: CollisionScoreParams) -> Self {
+        Self {
+            enabled: value.enabled,
+            seed: value.seed,
+            state_count: value.state_count,
+            trigger: CollisionScoreTriggerConfig::from_runtime(value.trigger),
+            loop_driver: match value.loop_driver {
+                CollisionScoreLoopDriver::None => CollisionScoreLoopDriverConfig::None,
+                CollisionScoreLoopDriver::SelectedLayer { saved_position, .. } => {
+                    CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
+                }
+                CollisionScoreLoopDriver::MissingSelectedLayer { saved_position } => {
+                    CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position }
+                }
+            },
+        }
+    }
+
+    pub fn to_params(self) -> CollisionScoreParams {
+        CollisionScoreParams {
+            enabled: self.enabled,
+            seed: self.seed,
+            state_count: self.state_count.clamp(2, 16),
+            trigger: self.trigger.to_runtime(),
+            loop_driver: match self.loop_driver {
+                CollisionScoreLoopDriverConfig::None => CollisionScoreLoopDriver::None,
+                CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
+                | CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position } => {
+                    // Loading never invents a session identity. The app may
+                    // resolve only an authored SelectedLayer marker.
+                    CollisionScoreLoopDriver::MissingSelectedLayer { saved_position }
+                }
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TemporalOriginalsConfig {
+    pub loom: TemporalLoomConfig,
+    pub atlas: CollisionAtlasConfig,
+    pub garden: RefreshGardenConfig,
+    pub score: CollisionScoreConfig,
+    pub reset: TemporalResetPolicyConfig,
+}
+
+impl TemporalOriginalsConfig {
+    pub fn from_params(value: TemporalOriginalsParams) -> Self {
+        Self {
+            loom: TemporalLoomConfig::from_params(value.loom),
+            atlas: CollisionAtlasConfig::from_params(value.atlas),
+            garden: RefreshGardenConfig::from_params(value.garden),
+            score: CollisionScoreConfig::from_params(value.score),
+            reset: TemporalResetPolicyConfig::from_params(value.reset),
+        }
+    }
+
+    pub fn to_params(self) -> TemporalOriginalsParams {
+        TemporalOriginalsParams {
+            loom: self.loom.to_params(),
+            atlas: self.atlas.to_params(),
+            garden: self.garden.to_params(),
+            score: self.score.to_params(),
+            reset: self.reset.to_params(),
+        }
+    }
+
+    /// Clamp every bounded value without collapsing the persisted distinction
+    /// between an authored selected conductor and an inert tombstone. Runtime
+    /// conversion cannot carry that distinction until live layer IDs exist.
+    pub fn sanitized(self) -> Self {
+        let loop_driver = self.score.loop_driver;
+        let mut sanitized = Self::from_params(self.to_params());
+        sanitized.score.loop_driver = loop_driver;
+        sanitized
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.to_params() == TemporalOriginalsParams::default()
+    }
 }
 
 impl Default for TemporalConfig {
@@ -341,6 +979,7 @@ impl Default for TemporalConfig {
 
 impl TemporalConfig {
     pub fn from_params(p: &TemporalParams) -> Self {
+        let originals = TemporalOriginalsConfig::from_params(p.originals);
         Self {
             feedback: p.feedback,
             fb_zoom: p.fb_zoom,
@@ -352,7 +991,24 @@ impl TemporalConfig {
             key_threshold: p.key_threshold,
             key_softness: p.key_softness,
             key_history: p.key_history,
+            originals: (!originals.is_default()).then_some(originals),
         }
+    }
+
+    fn from_params_for_capture(p: &TemporalParams, layer_ids: &[StableLayerId]) -> Self {
+        let mut config = Self::from_params(p);
+        let driver = CollisionScoreLoopDriverConfig::from_runtime_for_capture(
+            p.originals.score.loop_driver,
+            layer_ids,
+        );
+        if !driver.is_none() {
+            config
+                .originals
+                .get_or_insert_with(TemporalOriginalsConfig::default)
+                .score
+                .loop_driver = driver;
+        }
+        config
     }
 
     pub fn to_params(&self) -> TemporalParams {
@@ -370,8 +1026,367 @@ impl TemporalConfig {
             key_threshold: finite_or(self.key_threshold, 0.1).clamp(0.0, 1.0),
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
             key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
+            originals: self.originals.unwrap_or_default().to_params(),
         }
     }
+}
+
+fn default_motion_algorithm_version() -> u16 {
+    MOTION_ALGORITHM_VERSION
+}
+
+fn deserialize_motion_algorithm_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let version = u16::deserialize(deserializer)?;
+    if version == MOTION_ALGORITHM_VERSION {
+        Ok(version)
+    } else {
+        Err(de::Error::custom(format!(
+            "unsupported motion algorithm version {version}; expected {MOTION_ALGORITHM_VERSION}"
+        )))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionFieldSourceConfig {
+    #[default]
+    Auto,
+    CodecVectors,
+    Lattice,
+}
+
+impl MotionFieldSourceConfig {
+    fn from_runtime(value: MotionFieldSource) -> Self {
+        match value {
+            MotionFieldSource::Auto => Self::Auto,
+            MotionFieldSource::CodecVectors => Self::CodecVectors,
+            MotionFieldSource::Lattice => Self::Lattice,
+        }
+    }
+
+    fn to_runtime(self) -> MotionFieldSource {
+        match self {
+            Self::Auto => MotionFieldSource::Auto,
+            Self::CodecVectors => MotionFieldSource::CodecVectors,
+            Self::Lattice => MotionFieldSource::Lattice,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionLatticeQualityConfig {
+    Draft,
+    #[default]
+    Live,
+    High,
+}
+
+impl MotionLatticeQualityConfig {
+    fn from_runtime(value: MotionLatticeQuality) -> Self {
+        match value {
+            MotionLatticeQuality::Draft => Self::Draft,
+            MotionLatticeQuality::Live => Self::Live,
+            MotionLatticeQuality::High => Self::High,
+        }
+    }
+
+    fn to_runtime(self) -> MotionLatticeQuality {
+        match self {
+            Self::Draft => MotionLatticeQuality::Draft,
+            Self::Live => MotionLatticeQuality::Live,
+            Self::High => MotionLatticeQuality::High,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionCarrierConfig {
+    #[default]
+    Transparent,
+    Black,
+    FirstSourceFrame,
+}
+
+impl MotionCarrierConfig {
+    fn from_runtime(value: MotionCarrier) -> Self {
+        match value {
+            MotionCarrier::Transparent => Self::Transparent,
+            MotionCarrier::Black => Self::Black,
+            MotionCarrier::FirstSourceFrame => Self::FirstSourceFrame,
+        }
+    }
+
+    fn to_runtime(self) -> MotionCarrier {
+        match self {
+            Self::Transparent => MotionCarrier::Transparent,
+            Self::Black => MotionCarrier::Black,
+            Self::FirstSourceFrame => MotionCarrier::FirstSourceFrame,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MotionDonorConfig {
+    #[default]
+    None,
+    Selected {
+        saved_position: SavedLayerPosition,
+    },
+    Missing {
+        saved_position: SavedLayerPosition,
+    },
+}
+
+impl MotionDonorConfig {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    fn from_runtime_cached(value: MotionDonor) -> Self {
+        match value {
+            MotionDonor::None => Self::None,
+            MotionDonor::Selected { saved_position, .. } => Self::Selected { saved_position },
+            MotionDonor::Missing { saved_position } => Self::Missing { saved_position },
+        }
+    }
+
+    pub(crate) fn from_runtime_for_capture(
+        value: MotionDonor,
+        layer_ids: &[StableLayerId],
+    ) -> Self {
+        match value {
+            MotionDonor::None => Self::None,
+            MotionDonor::Selected {
+                layer_id,
+                saved_position,
+            } => layer_ids
+                .iter()
+                .position(|candidate| *candidate == layer_id)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(SavedLayerPosition::new)
+                .map_or(Self::Missing { saved_position }, |saved_position| {
+                    Self::Selected { saved_position }
+                }),
+            MotionDonor::Missing { saved_position } => Self::Missing { saved_position },
+        }
+    }
+
+    pub(crate) fn resolve_runtime(self, layer_ids: &[StableLayerId]) -> MotionDonor {
+        match self {
+            Self::None => MotionDonor::None,
+            Self::Selected { saved_position } => saved_position.resolve(layer_ids).copied().map_or(
+                MotionDonor::Missing { saved_position },
+                |layer_id| MotionDonor::Selected {
+                    layer_id,
+                    saved_position,
+                },
+            ),
+            Self::Missing { saved_position } => MotionDonor::Missing { saved_position },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FaradayConfig {
+    pub amount: f32,
+    #[serde(default, skip_serializing_if = "MotionDonorConfig::is_none")]
+    pub donor: MotionDonorConfig,
+    pub carrier: MotionCarrierConfig,
+    pub confidence_threshold: f32,
+    pub confidence_softness: f32,
+    pub refresh: f32,
+    pub decay: f32,
+    pub occlusion: f32,
+}
+
+impl Default for FaradayConfig {
+    fn default() -> Self {
+        Self::from_params(FaradayParams::default())
+    }
+}
+
+impl FaradayConfig {
+    pub fn from_params(value: FaradayParams) -> Self {
+        Self {
+            amount: value.amount,
+            donor: MotionDonorConfig::from_runtime_cached(value.donor),
+            carrier: MotionCarrierConfig::from_runtime(value.carrier),
+            confidence_threshold: value.confidence_threshold,
+            confidence_softness: value.confidence_softness,
+            refresh: value.refresh,
+            decay: value.decay,
+            occlusion: value.occlusion,
+        }
+    }
+
+    pub fn to_params(self) -> FaradayParams {
+        FaradayParams {
+            amount: finite_or(self.amount, 0.0).clamp(0.0, 1.0),
+            donor: match self.donor {
+                MotionDonorConfig::None => MotionDonor::None,
+                MotionDonorConfig::Selected { saved_position }
+                | MotionDonorConfig::Missing { saved_position } => {
+                    MotionDonor::Missing { saved_position }
+                }
+            },
+            carrier: self.carrier.to_runtime(),
+            confidence_threshold: finite_or(self.confidence_threshold, 0.1).clamp(0.0, 1.0),
+            confidence_softness: finite_or(self.confidence_softness, 0.05).clamp(0.0, 0.5),
+            refresh: finite_or(self.refresh, 1.0).clamp(0.0, 1.0),
+            decay: finite_or(self.decay, 1.0).clamp(0.0, 1.0),
+            occlusion: finite_or(self.occlusion, 0.0).clamp(0.0, 1.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurvedShutterQualityConfig {
+    #[default]
+    Sharp,
+    Draft,
+    Live,
+    High,
+}
+
+impl CurvedShutterQualityConfig {
+    fn from_runtime(value: CurvedShutterQuality) -> Self {
+        match value {
+            CurvedShutterQuality::Sharp => Self::Sharp,
+            CurvedShutterQuality::Draft => Self::Draft,
+            CurvedShutterQuality::Live => Self::Live,
+            CurvedShutterQuality::High => Self::High,
+        }
+    }
+
+    fn to_runtime(self) -> CurvedShutterQuality {
+        match self {
+            Self::Sharp => CurvedShutterQuality::Sharp,
+            Self::Draft => CurvedShutterQuality::Draft,
+            Self::Live => CurvedShutterQuality::Live,
+            Self::High => CurvedShutterQuality::High,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CurvedShutterConfig {
+    pub angle_degrees: f32,
+    pub phase: f32,
+    pub curvature: f32,
+    pub chromatic_lag: f32,
+    pub quality: CurvedShutterQualityConfig,
+}
+
+impl Default for CurvedShutterConfig {
+    fn default() -> Self {
+        Self::from_params(CurvedShutterParams::default())
+    }
+}
+
+impl CurvedShutterConfig {
+    pub fn from_params(value: CurvedShutterParams) -> Self {
+        Self {
+            angle_degrees: value.angle_degrees,
+            phase: value.phase,
+            curvature: value.curvature,
+            chromatic_lag: value.chromatic_lag,
+            quality: CurvedShutterQualityConfig::from_runtime(value.quality),
+        }
+    }
+
+    pub fn to_params(self) -> CurvedShutterParams {
+        CurvedShutterParams {
+            angle_degrees: finite_or(self.angle_degrees, 0.0).clamp(0.0, 360.0),
+            phase: finite_or(self.phase, 0.0).clamp(-1.0, 1.0),
+            curvature: finite_or(self.curvature, 0.0).clamp(-2.0, 2.0),
+            chromatic_lag: finite_or(self.chromatic_lag, 0.0).clamp(0.0, 1.0),
+            quality: self.quality.to_runtime(),
+        }
+    }
+}
+
+/// Serializable M4 authoring. Runtime fields, carrier pixels, codec records,
+/// telemetry, and process-local stable IDs are deliberately absent.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MotionConfig {
+    #[serde(
+        default = "default_motion_algorithm_version",
+        deserialize_with = "deserialize_motion_algorithm_version"
+    )]
+    pub algorithm_version: u16,
+    pub field_source: MotionFieldSourceConfig,
+    pub lattice_quality: MotionLatticeQualityConfig,
+    pub transplant: FaradayConfig,
+    pub shutter: CurvedShutterConfig,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self::from_params(MotionParams::default())
+    }
+}
+
+impl MotionConfig {
+    pub fn from_params(value: MotionParams) -> Self {
+        Self {
+            algorithm_version: value.algorithm_version,
+            field_source: MotionFieldSourceConfig::from_runtime(value.field_source),
+            lattice_quality: MotionLatticeQualityConfig::from_runtime(value.lattice_quality),
+            transplant: FaradayConfig::from_params(value.transplant),
+            shutter: CurvedShutterConfig::from_params(value.shutter),
+        }
+    }
+
+    pub fn from_params_for_capture(value: MotionParams, layer_ids: &[StableLayerId]) -> Self {
+        let mut config = Self::from_params(value);
+        config.transplant.donor =
+            MotionDonorConfig::from_runtime_for_capture(value.transplant.donor, layer_ids);
+        config
+    }
+
+    pub fn to_params(self) -> MotionParams {
+        MotionParams {
+            algorithm_version: if self.algorithm_version == MOTION_ALGORITHM_VERSION {
+                self.algorithm_version
+            } else {
+                MOTION_ALGORITHM_VERSION
+            },
+            field_source: self.field_source.to_runtime(),
+            lattice_quality: self.lattice_quality.to_runtime(),
+            transplant: self.transplant.to_params(),
+            shutter: self.shutter.to_params(),
+        }
+    }
+
+    /// Clamp continuous values while retaining Selected versus Missing donor
+    /// intent until a complete live layer stack is available.
+    pub fn sanitized(self) -> Self {
+        let donor = self.transplant.donor;
+        let mut sanitized = Self::from_params(self.to_params().sanitized());
+        sanitized.transplant.donor = donor;
+        sanitized
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn apply_motion_look(config: MotionConfig, live: &mut MotionParams) {
+    let donor = live.transplant.donor;
+    *live = config.to_params().sanitized();
+    // A Look transfers bounded values, never donor-route topology.
+    live.transplant.donor = donor;
 }
 
 /// Serializable modulation matrix state for patch files.
@@ -491,6 +1506,11 @@ fn default_beats() -> f32 {
 pub struct RoutingConfig {
     pub source: String,
     pub target: String,
+    /// Typed saved-position target for M2 racks/groups. The legacy string is
+    /// retained for inspectability, but this field is authoritative and never
+    /// contains a process-local stable layer ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_target: Option<SavedStableModTarget>,
     #[serde(default)]
     pub depth: f32,
     #[serde(default = "default_curve")]
@@ -593,6 +1613,7 @@ impl ModConfig {
                 .map(|r| RoutingConfig {
                     source: r.source.as_str().to_string(),
                     target: r.target().to_owned(),
+                    stable_target: None,
                     depth: r.depth,
                     curve: r.curve.as_str().to_string(),
                     curve_amount: r.curve_amount,
@@ -634,6 +1655,42 @@ impl ModConfig {
             },
             pad_position: m.pad.to_vec(),
         }
+    }
+
+    /// Capture stable rack/group targets through the saved-position boundary.
+    /// Legacy target strings keep their historical byte representation; only
+    /// typed M2 targets receive the authoritative `stable_target` field.
+    pub fn from_matrix_with_composition(
+        m: &ModMatrix,
+        book: &StableModAddressBook,
+        layer_ids: &[StableLayerId],
+        composition: &RuntimeComposition,
+    ) -> Result<Self, String> {
+        let mut captured = Self::from_matrix(m);
+        for (config, routing) in captured.routings.iter_mut().zip(&m.routings) {
+            let saved = if let Some(missing) = routing.saved_missing_target() {
+                Some(missing)
+            } else if let Some(target) = routing.stable_target() {
+                Some(target.capture(
+                    book,
+                    |wanted| {
+                        layer_ids
+                            .iter()
+                            .position(|candidate| *candidate == wanted)
+                            .and_then(|position| u32::try_from(position).ok())
+                            .and_then(SavedLayerPosition::new)
+                    },
+                    |group_id| composition.group(group_id).is_some(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(saved) = saved {
+                config.target = saved.persistence_key();
+                config.stable_target = Some(saved);
+            }
+        }
+        Ok(captured)
     }
 
     pub fn apply_to_matrix(&self, m: &mut ModMatrix) {
@@ -753,6 +1810,76 @@ impl ModConfig {
         // what lets deterministic spring return advance in live and export.
         m.pad_active = false;
         m.recompute_gyro();
+    }
+
+    /// Resolve typed saved targets against the current runtime identities.
+    /// Missing layers/groups/nodes remain explicit inert routes, so loading a
+    /// patch can never silently retarget an identity that was deleted.
+    pub fn apply_to_matrix_with_composition(
+        &self,
+        m: &mut ModMatrix,
+        book: &StableModAddressBook,
+        layer_ids: &[StableLayerId],
+        composition: &RuntimeComposition,
+    ) {
+        self.apply_to_matrix(m);
+        let canonical_key_targets: HashSet<String> = self
+            .routings
+            .iter()
+            .take(MAX_ROUTINGS)
+            .filter(|routing| {
+                routing.stable_target.is_none()
+                    && routing.target.starts_with("layer")
+                    && routing.target.ends_with("_key_threshold")
+            })
+            .map(|routing| routing.target.clone())
+            .collect();
+        m.routings = self
+            .routings
+            .iter()
+            .take(MAX_ROUTINGS)
+            .filter_map(|config| {
+                let source = ModSource::try_from_str(&config.source)?;
+                let mut routing = if let Some(saved) = config.stable_target {
+                    match saved.resolve(
+                        book,
+                        |position| position.resolve(layer_ids).copied(),
+                        |group_id| composition.group(group_id).is_some(),
+                    ) {
+                        ResolvedStableModTarget::Live(target) => Routing::new(
+                            source,
+                            target.to_string(),
+                            finite_or(config.depth, 0.0).clamp(-1.0, 1.0),
+                        ),
+                        ResolvedStableModTarget::Missing(missing) => Routing::new_missing(
+                            source,
+                            missing,
+                            finite_or(config.depth, 0.0).clamp(-1.0, 1.0),
+                        ),
+                    }
+                } else {
+                    let target = crate::modulation::canonical_target(&config.target);
+                    if target.as_ref() != config.target
+                        && canonical_key_targets.contains(target.as_ref())
+                    {
+                        return None;
+                    }
+                    if !crate::modulation::is_valid_target(target.as_ref()) {
+                        return None;
+                    }
+                    Routing::new(
+                        source,
+                        target.as_ref(),
+                        finite_or(config.depth, 0.0).clamp(-1.0, 1.0),
+                    )
+                };
+                routing.curve = Curve::from_str(&config.curve);
+                routing.curve_amount = finite_or(config.curve_amount, 0.0).clamp(-2.0, 2.0);
+                routing.attack = finite_or(config.attack, 0.0).clamp(0.0, 10.0);
+                routing.release = finite_or(config.release, 0.0).clamp(0.0, 10.0);
+                Some(routing)
+            })
+            .collect();
     }
 }
 
@@ -892,7 +2019,7 @@ impl NtscConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 pub struct LayerConfig {
     pub filename: String,
     /// Stable identity for sources loaded outside the current library. File
@@ -921,6 +2048,27 @@ pub struct LayerConfig {
     pub reroll_on_loop: bool,
     #[serde(default)]
     pub effects: EffectsConfig,
+    /// Per-layer authored geometry. Missing data in old patches must resolve
+    /// to the exact inactive historical identity. Once that state is moved,
+    /// newly exposed canvas starts transparent.
+    #[serde(default, skip_serializing_if = "is_legacy_spatial_identity")]
+    pub transform: SpatialTransform,
+    /// Omitted is the exact pre-M4 no-op. The nested donor stores a saved
+    /// position only; live stable IDs never cross this boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<MotionConfig>,
+    /// Omitted synthesizes the frozen layer legacy marker; Some(empty) is an
+    /// explicitly authored pass-through rack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rack: Option<VisualRack>,
+    /// Canonical prepared-source representation. Legacy mirrors above remain
+    /// for older readers and are synthesized into slot 1 on old patch load.
+    pub clip_slots: ClipSlots,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_clip_slot: Option<ClipSlotId>,
+    /// Saved-position matte DTO; runtime IDs are resolved only after layers exist.
+    #[serde(default, skip_serializing_if = "LayerMatteConfig::is_legacy_disabled")]
+    pub matte: LayerMatteConfig,
 }
 
 fn default_blend() -> String {
@@ -929,6 +2077,89 @@ fn default_blend() -> String {
 fn default_true() -> bool {
     true
 }
+
+impl<'de> Deserialize<'de> for LayerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawLayerConfig {
+            filename: String,
+            #[serde(default)]
+            source_path: String,
+            #[serde(default = "one")]
+            opacity: f32,
+            #[serde(default = "default_blend")]
+            blend_mode: String,
+            #[serde(default = "one")]
+            speed: f32,
+            #[serde(default = "default_fps")]
+            fps: f32,
+            #[serde(default)]
+            paused: bool,
+            #[serde(default = "default_true")]
+            visible: bool,
+            #[serde(default)]
+            bypass_master_fx: bool,
+            #[serde(default)]
+            reroll_on_loop: bool,
+            #[serde(default)]
+            effects: EffectsConfig,
+            #[serde(default)]
+            transform: SpatialTransform,
+            #[serde(default)]
+            motion: Option<MotionConfig>,
+            #[serde(default)]
+            rack: Option<VisualRack>,
+            /// `None` means the field was absent and must take the exact legacy
+            /// one-source migration. An explicit empty array remains empty.
+            #[serde(default)]
+            clip_slots: Option<ClipSlots>,
+            #[serde(default)]
+            active_clip_slot: Option<ClipSlotId>,
+            #[serde(default)]
+            matte: LayerMatteConfig,
+        }
+
+        let raw = RawLayerConfig::deserialize(deserializer)?;
+        if let Some(rack) = &raw.rack {
+            rack.validate_for_scope(LegacyRackScope::Layer)
+                .map_err(de::Error::custom)?;
+        }
+        let clip_slots = raw.clip_slots.unwrap_or_else(|| {
+            ClipSlots::singleton(ClipSlotConfig::from_legacy(
+                raw.filename.clone(),
+                raw.source_path.clone(),
+                raw.speed,
+                raw.fps,
+            ))
+        });
+        let active_clip_slot = clip_slots.active_or_first(raw.active_clip_slot);
+        let mut config = Self {
+            filename: raw.filename,
+            source_path: raw.source_path,
+            opacity: raw.opacity,
+            blend_mode: raw.blend_mode,
+            speed: raw.speed,
+            fps: raw.fps,
+            paused: raw.paused,
+            visible: raw.visible,
+            bypass_master_fx: raw.bypass_master_fx,
+            reroll_on_loop: raw.reroll_on_loop,
+            effects: raw.effects,
+            transform: raw.transform,
+            motion: raw.motion.map(MotionConfig::sanitized),
+            rack: raw.rack,
+            clip_slots,
+            active_clip_slot,
+            matte: raw.matte.sanitized(),
+        };
+        config.sync_legacy_mirrors_from_active_slot();
+        Ok(config)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EffectsConfig {
     /// Deterministic shader pattern seed. Zero is the exact legacy sequence.
@@ -1442,9 +2673,12 @@ impl EffectsConfig {
 
 impl LayerConfig {
     pub fn from_layer(layer: &Layer) -> Self {
+        let filename = layer.filename.clone();
+        let source_path = layer.source_reference_for_persistence().to_owned();
+        let clip_slots = layer.clip_slots_for_persistence();
         Self {
-            filename: layer.filename.clone(),
-            source_path: layer.source_reference_for_persistence().to_owned(),
+            filename,
+            source_path,
             opacity: layer.opacity,
             blend_mode: layer.blend_mode.key().to_string(),
             speed: layer.speed,
@@ -1454,17 +2688,85 @@ impl LayerConfig {
             bypass_master_fx: layer.bypass_master_fx,
             reroll_on_loop: layer.reroll_on_loop,
             effects: EffectsConfig::from_uniforms(&layer.effects),
+            transform: layer.transform.sanitized(),
+            motion: {
+                let motion = MotionConfig::from_params(layer.motion);
+                (!motion.is_default()).then_some(motion)
+            },
+            rack: None,
+            clip_slots,
+            active_clip_slot: Some(layer.active_clip_slot),
+            matte: LayerMatteConfig::default(),
         }
+    }
+
+    /// Re-establish the compatibility mirrors from the active canonical slot.
+    /// Slot IDs are resolved by search, never used as indices.
+    pub fn sync_legacy_mirrors_from_active_slot(&mut self) {
+        self.active_clip_slot = self.clip_slots.active_or_first(self.active_clip_slot);
+        let Some(slot) = self.active_clip_slot.and_then(|id| self.clip_slots.get(id)) else {
+            return;
+        };
+        self.filename.clone_from(&slot.filename);
+        self.source_path.clone_from(&slot.source_path);
+        self.speed = slot.transport.rate as f32;
+        if let Some(sample_fps) = slot.transport.sample_fps {
+            self.fps = sample_fps as f32;
+        }
+    }
+
+    /// Compatibility bridge for legacy/native code that still edits the
+    /// top-level source and cadence fields directly. Canonical callers should
+    /// edit the active slot instead.
+    pub fn sync_active_slot_from_legacy_mirrors(&mut self) {
+        self.active_clip_slot = self.clip_slots.active_or_first(self.active_clip_slot);
+        let Some(slot) = self
+            .active_clip_slot
+            .and_then(|id| self.clip_slots.get_mut(id))
+        else {
+            return;
+        };
+        slot.filename.clone_from(&self.filename);
+        slot.source_path.clone_from(&self.source_path);
+        slot.transport.rate = f64::from(finite_or(self.speed, 1.0));
+        slot.transport.sample_fps = Some(f64::from(finite_or(self.fps, 30.0)));
+        slot.transport = slot.transport.sanitized();
+    }
+
+    /// Procedural pieces intentionally contain one source slot and no routed
+    /// matte topology. The selected source is retained, assigned canonical ID
+    /// 1, and its transport mirrors are updated after mutation.
+    pub fn collapse_to_generated_single_slot(&mut self) {
+        let selected = self
+            .active_clip_slot
+            .and_then(|id| self.clip_slots.get(id))
+            .or_else(|| self.clip_slots.iter().next())
+            .cloned()
+            .unwrap_or_else(|| {
+                ClipSlotConfig::from_legacy(
+                    self.filename.clone(),
+                    self.source_path.clone(),
+                    self.speed,
+                    self.fps,
+                )
+            });
+        let mut selected = selected;
+        selected.id = ClipSlotId::LEGACY;
+        selected.filename.clone_from(&self.filename);
+        selected.source_path.clone_from(&self.source_path);
+        selected.transport.rate = f64::from(finite_or(self.speed, 1.0));
+        selected.transport.sample_fps = Some(f64::from(finite_or(self.fps, 30.0)));
+        selected.transport = selected.transport.sanitized();
+        self.clip_slots = ClipSlots::singleton(selected);
+        self.active_clip_slot = Some(ClipSlotId::LEGACY);
+        self.matte = LayerMatteConfig::default();
+        self.sync_legacy_mirrors_from_active_slot();
     }
 
     pub fn apply_to_layer(&self, layer: &mut Layer) {
         layer.opacity = finite_or(self.opacity, 1.0).clamp(0.0, 1.0);
-        layer.blend_mode = match self.blend_mode.as_str() {
-            "screen" => BlendMode::Screen,
-            "multiply" => BlendMode::Multiply,
-            "difference" => BlendMode::Difference,
-            _ => BlendMode::Normal,
-        };
+        layer.blend_mode =
+            BlendMode::from_key(self.blend_mode.as_str()).unwrap_or(BlendMode::Normal);
         layer.speed = finite_or(self.speed, 1.0).clamp(0.25, 4.0);
         layer.fps = finite_or(self.fps, 30.0).clamp(1.0, 240.0);
         layer.paused = self.paused;
@@ -1472,6 +2774,8 @@ impl LayerConfig {
         layer.bypass_master_fx = self.bypass_master_fx;
         layer.reroll_on_loop = self.reroll_on_loop;
         self.effects.apply_to_uniforms(&mut layer.effects);
+        layer.transform = self.transform.sanitized();
+        layer.motion = self.motion.unwrap_or_default().to_params().sanitized();
     }
 
     /// Apply only the visual contribution of this saved position. Source
@@ -1484,7 +2788,11 @@ impl LayerConfig {
             &mut layer.visible,
             &mut layer.bypass_master_fx,
             &mut layer.effects,
+            &mut layer.transform,
         );
+        if let Some(motion) = self.motion {
+            apply_motion_look(motion, &mut layer.motion);
+        }
     }
 
     fn apply_look_to_fields(
@@ -1494,17 +2802,14 @@ impl LayerConfig {
         visible: &mut bool,
         bypass_master_fx: &mut bool,
         effects: &mut EffectUniforms,
+        transform: &mut SpatialTransform,
     ) {
         *opacity = finite_or(self.opacity, 1.0).clamp(0.0, 1.0);
-        *blend_mode = match self.blend_mode.as_str() {
-            "screen" => BlendMode::Screen,
-            "multiply" => BlendMode::Multiply,
-            "difference" => BlendMode::Difference,
-            _ => BlendMode::Normal,
-        };
+        *blend_mode = BlendMode::from_key(self.blend_mode.as_str()).unwrap_or(BlendMode::Normal);
         *visible = self.visible;
         *bypass_master_fx = self.bypass_master_fx;
         self.effects.apply_to_uniforms(effects);
+        *transform = self.transform.sanitized();
     }
 
     /// Get top-level layer fields as (key, value_string) pairs.
@@ -1519,6 +2824,37 @@ impl LayerConfig {
             ("visible", format!("{}", self.visible)),
             ("bypass_master_fx", format!("{}", self.bypass_master_fx)),
             ("reroll_on_loop", format!("{}", self.reroll_on_loop)),
+            ("position_x", format!("{:.4}", self.transform.position[0])),
+            ("position_y", format!("{:.4}", self.transform.position[1])),
+            ("scale_x", format!("{:.4}", self.transform.scale[0])),
+            ("scale_y", format!("{:.4}", self.transform.scale[1])),
+            ("anchor_x", format!("{:.4}", self.transform.anchor[0])),
+            ("anchor_y", format!("{:.4}", self.transform.anchor[1])),
+            (
+                "rotation_deg",
+                format!("{:.3}", self.transform.rotation_deg),
+            ),
+            ("skew_deg", format!("{:.3}", self.transform.skew_deg)),
+            (
+                "skew_axis_deg",
+                format!("{:.3}", self.transform.skew_axis_deg),
+            ),
+            (
+                "fit",
+                format!("{:?}", self.transform.fit).to_ascii_lowercase(),
+            ),
+            ("crop_left", format!("{:.4}", self.transform.crop[0])),
+            ("crop_top", format!("{:.4}", self.transform.crop[1])),
+            ("crop_right", format!("{:.4}", self.transform.crop[2])),
+            ("crop_bottom", format!("{:.4}", self.transform.crop[3])),
+            (
+                "edge",
+                format!("{:?}", self.transform.edge).to_ascii_lowercase(),
+            ),
+            (
+                "sampling",
+                format!("{:?}", self.transform.sampling).to_ascii_lowercase(),
+            ),
         ]
     }
 
@@ -1571,6 +2907,59 @@ impl LayerConfig {
                     return true;
                 }
             }
+            "position_x" | "position_y" | "scale_x" | "scale_y" | "anchor_x" | "anchor_y"
+            | "rotation_deg" | "skew_deg" | "skew_axis_deg" | "crop_left" | "crop_top"
+            | "crop_right" | "crop_bottom" => {
+                let Ok(parsed) = value.parse::<f32>() else {
+                    return false;
+                };
+                match key {
+                    "position_x" => self.transform.position[0] = parsed,
+                    "position_y" => self.transform.position[1] = parsed,
+                    "scale_x" => self.transform.scale[0] = parsed,
+                    "scale_y" => self.transform.scale[1] = parsed,
+                    "anchor_x" => self.transform.anchor[0] = parsed,
+                    "anchor_y" => self.transform.anchor[1] = parsed,
+                    "rotation_deg" => self.transform.rotation_deg = parsed,
+                    "skew_deg" => self.transform.skew_deg = parsed,
+                    "skew_axis_deg" => self.transform.skew_axis_deg = parsed,
+                    "crop_left" => self.transform.crop[0] = parsed,
+                    "crop_top" => self.transform.crop[1] = parsed,
+                    "crop_right" => self.transform.crop[2] = parsed,
+                    "crop_bottom" => self.transform.crop[3] = parsed,
+                    _ => unreachable!(),
+                }
+                self.transform = self.transform.sanitized();
+                return true;
+            }
+            "fit" => {
+                self.transform.fit = match value.to_ascii_lowercase().as_str() {
+                    "stretch" => FitMode::Stretch,
+                    "fit" => FitMode::Fit,
+                    "fill" => FitMode::Fill,
+                    "native" => FitMode::Native,
+                    _ => return false,
+                };
+                return true;
+            }
+            "edge" => {
+                self.transform.edge = match value.to_ascii_lowercase().as_str() {
+                    "transparent" => EdgeMode::Transparent,
+                    "clamp" => EdgeMode::Clamp,
+                    "repeat" => EdgeMode::Repeat,
+                    "mirror" => EdgeMode::Mirror,
+                    _ => return false,
+                };
+                return true;
+            }
+            "sampling" => {
+                self.transform.sampling = match value.to_ascii_lowercase().as_str() {
+                    "linear" => SamplingMode::Linear,
+                    "nearest" => SamplingMode::Nearest,
+                    _ => return false,
+                };
+                return true;
+            }
             _ => {}
         }
         false
@@ -1590,14 +2979,1013 @@ fn apply_positional_looks<T>(
         mapped_layers,
         unused_patch_layers: saved_layers.len().saturating_sub(mapped_layers),
         untouched_live_layers: live_layers.len().saturating_sub(mapped_layers),
+        ..LookApplySummary::default()
+    }
+}
+
+fn apply_layer_matte_look_values(
+    sampled: LayerMatteConfig,
+    live: &mut LayerMatte,
+    layer_ids: &[StableLayerId],
+) -> bool {
+    let sampled = sampled.to_runtime(|position| position.resolve(layer_ids).copied());
+    if sampled.enabled != live.enabled
+        || sampled.input != live.input
+        || sampled.channel != live.channel
+        || sampled.invert != live.invert
+    {
+        return false;
+    }
+    live.amount = sampled.amount;
+    live.threshold = sampled.threshold;
+    live.softness = sampled.softness;
+    true
+}
+
+fn record_look_rack_nodes(
+    summary: &mut LookApplySummary,
+    scope: LookRackScope,
+    sampled: &RuntimeVisualRack,
+    applied: bool,
+) {
+    let destination = if applied {
+        &mut summary.applied_nodes
+    } else {
+        &mut summary.skipped_nodes
+    };
+    destination.extend(sampled.iter().map(|node| LookNodeRef {
+        scope,
+        node_id: node.stable_id,
+    }));
+}
+
+fn runtime_group_visual_topology_matches(sampled: &RuntimeGroup, live: &RuntimeGroup) -> bool {
+    sampled.id == live.id
+        && sampled.members == live.members
+        && match (sampled.matte, live.matte) {
+            (Some(sampled), Some(live)) => {
+                sampled.tap == live.tap
+                    && sampled.channel == live.channel
+                    && sampled.invert == live.invert
+            }
+            (None, None) => true,
+            _ => false,
+        }
+        && sampled.rack.len() == live.rack.len()
+        && sampled.rack.topology_signature() == live.rack.topology_signature()
+        && sampled
+            .rack
+            .iter()
+            .zip(live.rack.iter())
+            .all(|(sampled, live)| {
+                sampled.stable_id == live.stable_id
+                    && sampled.kind.tag() == live.kind.tag()
+                    && match (sampled.kind, live.kind) {
+                        (
+                            crate::visual_rack::RuntimeVisualNodeKind::Mask(
+                                crate::visual_rack::RuntimeMaskParams::Image(sampled),
+                            ),
+                            crate::visual_rack::RuntimeVisualNodeKind::Mask(
+                                crate::visual_rack::RuntimeMaskParams::Image(live),
+                            ),
+                        ) => {
+                            sampled.tap == live.tap
+                                && sampled.channel == live.channel
+                                && sampled.invert == live.invert
+                        }
+                        (
+                            crate::visual_rack::RuntimeVisualNodeKind::Mask(sampled),
+                            crate::visual_rack::RuntimeVisualNodeKind::Mask(live),
+                        ) => std::mem::discriminant(&sampled) == std::mem::discriminant(&live),
+                        _ => true,
+                    }
+            })
+}
+
+fn apply_runtime_group_look_values(sampled: &RuntimeGroup, live: &mut RuntimeGroup) -> bool {
+    if !runtime_group_visual_topology_matches(sampled, live) {
+        return false;
+    }
+    live.opacity = sampled.opacity;
+    live.transform = sampled.transform;
+    if !crate::morph::apply_runtime_rack_values_strict(&sampled.rack, &mut live.rack) {
+        return false;
+    }
+    if let (Some(sampled), Some(live)) = (sampled.matte, &mut live.matte) {
+        live.amount = sampled.amount;
+        live.threshold = sampled.threshold;
+        live.softness = sampled.softness;
+    }
+    true
+}
+
+fn look_root_identity_matches(
+    saved: &CompositionTree,
+    live: &RuntimeComposition,
+    layer_ids: &[StableLayerId],
+) -> bool {
+    saved.root().len() == live.root().len()
+        && saved
+            .root()
+            .iter()
+            .zip(live.root())
+            .all(|(saved, live)| match (*saved, *live) {
+                (RootItem::Layer { layer, .. }, RuntimeRootItem::Layer { layer_id, .. }) => {
+                    layer.resolve(layer_ids).copied() == Some(layer_id)
+                }
+                (
+                    RootItem::Group { group_id: saved_id },
+                    RuntimeRootItem::Group { group_id: live_id },
+                ) => saved_id == live_id,
+                _ => false,
+            })
+}
+
+fn apply_saved_composition_look(
+    saved: &CompositionTree,
+    live: &mut RuntimeComposition,
+    layer_ids: &[StableLayerId],
+    summary: &mut LookApplySummary,
+) {
+    if look_root_identity_matches(saved, live, layer_ids) {
+        live.set_bus_crossfade(saved.bus_crossfade());
+        summary.applied_bus_crossfade = true;
+    } else {
+        summary.skipped_bus_crossfade = true;
+    }
+
+    // Route resolution must not hold an immutable borrow across the eventual
+    // per-group mutation. This stable set also ensures a deleted output stays
+    // missing rather than being inferred from root position.
+    let live_group_ids: HashSet<_> = live.groups().map(|group| group.id).collect();
+    for saved_group in saved.groups() {
+        let scope = LookRackScope::Group(saved_group.id);
+        let mapped_members = saved_group
+            .members
+            .iter()
+            .map(|position| position.resolve(layer_ids).copied())
+            .collect::<Option<Vec<_>>>();
+        let sampled = mapped_members
+            .and_then(|members| RuntimeGroupMembers::try_from_vec(members).ok())
+            .map(|members| {
+                let group_exists = |group_id| live_group_ids.contains(&group_id);
+                let rack = saved_group.rack.resolve_routes(
+                    |position| position.resolve(layer_ids).copied(),
+                    group_exists,
+                );
+                let matte = saved_group.matte.map(|matte| {
+                    RuntimeImageMatte::resolve_routes(
+                        matte,
+                        &mut |position| position.resolve(layer_ids).copied(),
+                        &group_exists,
+                    )
+                });
+                RuntimeGroup {
+                    id: saved_group.id,
+                    name: saved_group.name.clone(),
+                    members,
+                    opacity: saved_group.opacity,
+                    transform: saved_group.transform,
+                    rack,
+                    matte,
+                    solo: saved_group.solo,
+                    bypass: saved_group.bypass,
+                    bus: saved_group.bus,
+                }
+            });
+
+        let applied = sampled.as_ref().is_some_and(|sampled| {
+            live.group_mut(sampled.id)
+                .is_some_and(|live_group| apply_runtime_group_look_values(sampled, live_group))
+        });
+        if applied {
+            summary.applied_groups += 1;
+            summary.applied_group_ids.push(saved_group.id);
+        } else {
+            summary.skipped_groups += 1;
+            summary.skipped_group_ids.push(saved_group.id);
+        }
+        if let Some(sampled) = &sampled {
+            record_look_rack_nodes(summary, scope, &sampled.rack, applied);
+        } else {
+            let destination = if applied {
+                &mut summary.applied_nodes
+            } else {
+                &mut summary.skipped_nodes
+            };
+            destination.extend(saved_group.rack.iter().map(|node| LookNodeRef {
+                scope,
+                node_id: node.stable_id,
+            }));
+        }
+    }
+}
+
+fn saved_position_at(position: usize) -> Result<SavedLayerPosition, String> {
+    u32::try_from(position)
+        .ok()
+        .and_then(SavedLayerPosition::new)
+        .ok_or_else(|| format!("saved layer position {position} exceeds bounds"))
+}
+
+fn legacy_composition_for_positions(
+    positions_front_to_back: &[SavedLayerPosition],
+) -> Result<CompositionTree, String> {
+    let back_to_front: Vec<_> = positions_front_to_back.iter().rev().copied().collect();
+    CompositionTree::legacy_for_layers(&back_to_front)
+        .map_err(|error| format!("synthesize legacy composition: {error}"))
+}
+
+fn validation_layer_scope(position: SavedLayerPosition) -> Result<VisualScopeId, String> {
+    StableLayerId::new(u64::from(position.get()) + 1)
+        .map(VisualScopeId::Layer)
+        .ok_or_else(|| format!("invalid validation layer position {}", position.get()))
+}
+
+fn collect_rack_dependencies(
+    rack: &VisualRack,
+    consumer: VisualScopeId,
+    below: &BTreeMap<VisualScopeId, Vec<VisualScopeId>>,
+    dependencies: &mut Vec<ImageDependency>,
+    ordering_edges: &mut Vec<ImageOrderingEdge>,
+) -> Result<(), String> {
+    for node in rack.iter().filter(|node| node.enabled && node.wet > 0.0) {
+        if let VisualNodeKind::Mask(MaskParams::Image(matte)) = node.kind {
+            if matte.amount > 0.0 {
+                collect_saved_tap_dependency(
+                    matte.tap,
+                    consumer,
+                    below,
+                    dependencies,
+                    ordering_edges,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_saved_tap_dependency(
+    tap: SavedImageTap,
+    consumer: VisualScopeId,
+    below: &BTreeMap<VisualScopeId, Vec<VisualScopeId>>,
+    dependencies: &mut Vec<ImageDependency>,
+    ordering_edges: &mut Vec<ImageOrderingEdge>,
+) -> Result<(), String> {
+    match tap.source {
+        SavedImageSource::SelectedLayer {
+            layer_position,
+            stage: LayerImageStage::PostLocalEffects,
+        } => dependencies.push(ImageDependency {
+            consumer,
+            producer: validation_layer_scope(layer_position)?,
+            timing: tap.timing,
+        }),
+        SavedImageSource::SelectedLayer {
+            layer_position,
+            stage: LayerImageStage::PreLocalEffects,
+            ..
+        } if tap.timing == EdgeTiming::PreviousFrame => dependencies.push(ImageDependency {
+            consumer,
+            producer: validation_layer_scope(layer_position)?,
+            timing: tap.timing,
+        }),
+        SavedImageSource::SelectedLayer { .. }
+        | SavedImageSource::MissingSelectedLayer { .. }
+        | SavedImageSource::MissingGroupOutput { .. } => {}
+        SavedImageSource::OneBelow => {
+            if let Some(producer) = below_for(consumer, below)?.last().copied() {
+                dependencies.push(ImageDependency {
+                    consumer,
+                    producer,
+                    timing: tap.timing,
+                });
+            }
+        }
+        SavedImageSource::AllBelow => {
+            collect_all_below_dependency(
+                consumer,
+                below_for(consumer, below)?,
+                tap.timing,
+                dependencies,
+                ordering_edges,
+            );
+        }
+        SavedImageSource::GroupOutput { group_id } => dependencies.push(ImageDependency {
+            consumer,
+            producer: VisualScopeId::Group(group_id),
+            timing: tap.timing,
+        }),
+        SavedImageSource::CleanProgram => dependencies.push(ImageDependency {
+            consumer,
+            producer: VisualScopeId::Program,
+            timing: tap.timing,
+        }),
+    }
+    Ok(())
+}
+
+fn collect_legacy_layer_matte_dependency(
+    input: SavedImageInput,
+    consumer: VisualScopeId,
+    below: &BTreeMap<VisualScopeId, Vec<VisualScopeId>>,
+    dependencies: &mut Vec<ImageDependency>,
+    ordering_edges: &mut Vec<ImageOrderingEdge>,
+) -> Result<(), String> {
+    match input {
+        SavedImageInput::SelectedLayer {
+            layer_position,
+            stage: LayerImageStage::PostLocalEffects,
+        } => dependencies.push(ImageDependency {
+            consumer,
+            producer: validation_layer_scope(layer_position)?,
+            timing: EdgeTiming::CurrentFrame,
+        }),
+        SavedImageInput::SelectedLayer {
+            stage: LayerImageStage::PreLocalEffects,
+            ..
+        }
+        | SavedImageInput::MissingSelectedLayer { .. }
+        | SavedImageInput::MissingGroupOutput { .. } => {}
+        SavedImageInput::OneBelow => {
+            if let Some(producer) = below_for(consumer, below)?.last().copied() {
+                dependencies.push(ImageDependency {
+                    consumer,
+                    producer,
+                    timing: EdgeTiming::CurrentFrame,
+                });
+            }
+        }
+        SavedImageInput::AllBelow => {
+            collect_all_below_dependency(
+                consumer,
+                below_for(consumer, below)?,
+                EdgeTiming::CurrentFrame,
+                dependencies,
+                ordering_edges,
+            );
+        }
+        SavedImageInput::ProgramHistory => dependencies.push(ImageDependency {
+            consumer,
+            producer: VisualScopeId::Program,
+            timing: EdgeTiming::PreviousFrame,
+        }),
+        SavedImageInput::CleanProgram => dependencies.push(ImageDependency {
+            consumer,
+            producer: VisualScopeId::Program,
+            timing: EdgeTiming::CurrentFrame,
+        }),
+        SavedImageInput::GroupOutput { group_id } => {
+            dependencies.push(ImageDependency {
+                consumer,
+                producer: VisualScopeId::Group(group_id),
+                timing: EdgeTiming::CurrentFrame,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// AllBelow is one authored image tap backed by a compact composited prefix.
+/// The final prefix output represents that tap for resource accounting, while
+/// the remaining producer-before-consumer relations participate only in the
+/// same-frame DAG. Previous-frame reads deliberately carry no ordering edges.
+fn collect_all_below_dependency(
+    consumer: VisualScopeId,
+    producers: &[VisualScopeId],
+    timing: EdgeTiming,
+    dependencies: &mut Vec<ImageDependency>,
+    ordering_edges: &mut Vec<ImageOrderingEdge>,
+) {
+    let Some(representative) = producers.last().copied() else {
+        return;
+    };
+    dependencies.push(ImageDependency {
+        consumer,
+        producer: representative,
+        timing,
+    });
+    if timing == EdgeTiming::CurrentFrame {
+        ordering_edges.extend(
+            producers
+                .iter()
+                .copied()
+                .map(|producer| ImageOrderingEdge { producer, consumer }),
+        );
+    }
+}
+
+fn below_for(
+    consumer: VisualScopeId,
+    below: &BTreeMap<VisualScopeId, Vec<VisualScopeId>>,
+) -> Result<&[VisualScopeId], String> {
+    below
+        .get(&consumer)
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("visual dependency consumer {consumer:?} is not in composition"))
+}
+
+type ValidationTopology = (
+    Vec<VisualScopeId>,
+    BTreeMap<VisualScopeId, Vec<VisualScopeId>>,
+    Vec<ImageOrderingEdge>,
+);
+
+/// Interpret one-level back-to-front composition order exactly as the live
+/// planner does. A group's member prefix can see preceding root outputs plus
+/// preceding siblings; the group post-scope itself can see only preceding root
+/// outputs because its member composite has not yet become an external input.
+fn validation_topology(composition: &CompositionTree) -> Result<ValidationTopology, String> {
+    let mut scopes = Vec::new();
+    let mut below: BTreeMap<VisualScopeId, Vec<VisualScopeId>> = BTreeMap::new();
+    let mut ordering_edges = Vec::new();
+    let mut preceding_root_outputs = Vec::new();
+    for item in composition.root() {
+        match *item {
+            RootItem::Layer { layer, .. } => {
+                let scope = validation_layer_scope(layer)?;
+                scopes.push(scope);
+                below.insert(scope, preceding_root_outputs.clone());
+                preceding_root_outputs.push(scope);
+            }
+            RootItem::Group { group_id } => {
+                let group = composition.group(group_id).ok_or_else(|| {
+                    format!("composition root references group {}", group_id.get())
+                })?;
+                let group_scope = VisualScopeId::Group(group_id);
+                let mut preceding_members = preceding_root_outputs.clone();
+                for layer in group.members.iter() {
+                    let member_scope = validation_layer_scope(layer)?;
+                    scopes.push(member_scope);
+                    below.insert(member_scope, preceding_members.clone());
+                    preceding_members.push(member_scope);
+                    ordering_edges.push(ImageOrderingEdge {
+                        producer: member_scope,
+                        consumer: group_scope,
+                    });
+                }
+                scopes.push(group_scope);
+                below.insert(group_scope, preceding_root_outputs.clone());
+                preceding_root_outputs.push(group_scope);
+            }
+        }
+    }
+    scopes.push(VisualScopeId::Master);
+    below.insert(VisualScopeId::Master, preceding_root_outputs);
+    Ok((scopes, below, ordering_edges))
+}
+
+fn collect_saved_rack_group_ids(rack: &VisualRack, group_ids: &mut BTreeSet<GroupId>) {
+    group_ids.extend(rack.referenced_group_ids());
+}
+
+fn collect_saved_composition_group_ids(
+    composition: &CompositionTree,
+    group_ids: &mut BTreeSet<GroupId>,
+) {
+    for item in composition.root() {
+        if let RootItem::Group { group_id } = item {
+            group_ids.insert(*group_id);
+        }
+    }
+    for group in composition.groups() {
+        group_ids.insert(group.id);
+        collect_saved_rack_group_ids(&group.rack, group_ids);
+        if let Some(group_id) = group.matte.and_then(|matte| matte.tap.referenced_group()) {
+            group_ids.insert(group_id);
+        }
+    }
+}
+
+fn collect_saved_morph_slot_group_ids(
+    slot: &crate::morph::MorphSlot,
+    group_ids: &mut BTreeSet<GroupId>,
+) {
+    if let Some(rack) = &slot.master_rack {
+        collect_saved_rack_group_ids(rack, group_ids);
+    }
+    if let Some(racks) = &slot.layer_racks {
+        for rack in racks {
+            collect_saved_rack_group_ids(rack, group_ids);
+        }
+    }
+    if let Some(composition) = &slot.composition {
+        collect_saved_composition_group_ids(composition, group_ids);
+    }
+}
+
+fn saved_modulation_group_id(target: SavedStableModTarget) -> Option<GroupId> {
+    match target {
+        SavedStableModTarget::Node {
+            scope: SavedStableModScope::Group { group_id },
+            ..
+        }
+        | SavedStableModTarget::GroupValue { group_id, .. }
+        | SavedStableModTarget::MissingGroup { group_id, .. }
+        | SavedStableModTarget::MissingNode {
+            scope: SavedStableModScope::Group { group_id },
+            ..
+        } => Some(group_id),
+        SavedStableModTarget::Node { .. }
+        | SavedStableModTarget::CompositionValue { .. }
+        | SavedStableModTarget::MissingSavedLayer { .. }
+        | SavedStableModTarget::MissingNode { .. } => None,
+    }
+}
+
+/// The allocator state retained for one logical rack owner. A zero rack
+/// cursor, or an observed `u64::MAX` node identity, exhausts the domain rather
+/// than allowing it to wrap and reuse an authored identity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PersistedNodeCursor {
+    greatest_observed: Option<NodeId>,
+    exhausted: bool,
+}
+
+impl PersistedNodeCursor {
+    fn observe_node(&mut self, node_id: NodeId) {
+        self.greatest_observed = Some(
+            self.greatest_observed
+                .map_or(node_id, |greatest| greatest.max(node_id)),
+        );
+        self.exhausted |= node_id.get() == u64::MAX;
+    }
+
+    fn observe_rack(&mut self, rack: &VisualRack) {
+        let next = rack.next_node_id_raw();
+        if next == 0 {
+            self.exhausted = true;
+            self.greatest_observed = Some(NodeId::new(u64::MAX).expect("u64::MAX is nonzero"));
+            return;
+        }
+        // A validated saved rack cursor is at least FIRST_AUTHORED, so the
+        // immediately preceding live-or-retired identity is always nonzero.
+        let preceding = NodeId::new(next - 1).expect("validated rack cursors exceed zero");
+        self.observe_node(preceding);
+    }
+
+    fn reserve_on(self, rack: &mut VisualRack) {
+        if self.exhausted {
+            rack.observe_node_reference(NodeId::new(u64::MAX).expect("u64::MAX is nonzero"));
+        } else if let Some(node_id) = self.greatest_observed {
+            rack.observe_node_reference(node_id);
+        }
+    }
+}
+
+/// Node IDs are rack-local, so retained identities are merged only inside the
+/// same master, saved-layer-position, or GroupId ownership domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PersistedNodeCursors {
+    master: PersistedNodeCursor,
+    layers: BTreeMap<SavedLayerPosition, PersistedNodeCursor>,
+    groups: BTreeMap<GroupId, PersistedNodeCursor>,
+}
+
+impl PersistedNodeCursors {
+    fn for_scope_mut(&mut self, scope: SavedStableModScope) -> &mut PersistedNodeCursor {
+        match scope {
+            SavedStableModScope::Master => &mut self.master,
+            SavedStableModScope::SavedLayer { position } => {
+                self.layers.entry(position).or_default()
+            }
+            SavedStableModScope::Group { group_id } => self.groups.entry(group_id).or_default(),
+        }
+    }
+
+    fn observe_rack(&mut self, scope: SavedStableModScope, rack: &VisualRack) {
+        self.for_scope_mut(scope).observe_rack(rack);
+    }
+
+    fn observe_modulation_target(&mut self, target: SavedStableModTarget) {
+        match target {
+            SavedStableModTarget::Node { scope, node_id, .. }
+            | SavedStableModTarget::MissingNode { scope, node_id, .. } => {
+                self.for_scope_mut(scope).observe_node(node_id)
+            }
+            SavedStableModTarget::GroupValue { .. }
+            | SavedStableModTarget::CompositionValue { .. }
+            | SavedStableModTarget::MissingSavedLayer { .. }
+            | SavedStableModTarget::MissingGroup { .. } => {}
+        }
+    }
+
+    fn reserve_master_on(&self, rack: &mut VisualRack) {
+        self.master.reserve_on(rack);
+    }
+
+    fn reserve_layer_on(&self, position: SavedLayerPosition, rack: &mut VisualRack) {
+        if let Some(cursor) = self.layers.get(&position) {
+            cursor.reserve_on(rack);
+        }
+    }
+
+    fn reserve_groups_on(&self, composition: &mut CompositionTree) {
+        for (group_id, cursor) in &self.groups {
+            if let Some(group) = composition.group_mut(*group_id) {
+                cursor.reserve_on(&mut group.rack);
+            }
+        }
+    }
+}
+
+fn collect_saved_composition_node_cursors(
+    composition: &CompositionTree,
+    cursors: &mut PersistedNodeCursors,
+) {
+    for group in composition.groups() {
+        cursors.observe_rack(
+            SavedStableModScope::Group { group_id: group.id },
+            &group.rack,
+        );
+    }
+}
+
+fn collect_saved_morph_slot_node_cursors(
+    slot: &crate::morph::MorphSlot,
+    cursors: &mut PersistedNodeCursors,
+) {
+    if let Some(rack) = &slot.master_rack {
+        cursors.observe_rack(SavedStableModScope::Master, rack);
+    }
+    if let Some(racks) = &slot.layer_racks {
+        for (position, rack) in racks.iter().enumerate() {
+            let Ok(position) = u32::try_from(position) else {
+                continue;
+            };
+            let Some(position) = SavedLayerPosition::new(position) else {
+                continue;
+            };
+            cursors.observe_rack(SavedStableModScope::SavedLayer { position }, rack);
+        }
+    }
+    if let Some(composition) = &slot.composition {
+        collect_saved_composition_node_cursors(composition, cursors);
+    }
+}
+
+fn reserve_saved_morph_slot_node_cursors(
+    slot: &mut crate::morph::MorphSlot,
+    cursors: &PersistedNodeCursors,
+) {
+    if let Some(rack) = &mut slot.master_rack {
+        cursors.reserve_master_on(rack);
+    }
+    if let Some(racks) = &mut slot.layer_racks {
+        for (position, rack) in racks.iter_mut().enumerate() {
+            let Ok(position) = u32::try_from(position) else {
+                continue;
+            };
+            let Some(position) = SavedLayerPosition::new(position) else {
+                continue;
+            };
+            cursors.reserve_layer_on(position, rack);
+        }
+    }
+    if let Some(composition) = &mut slot.composition {
+        cursors.reserve_groups_on(composition);
     }
 }
 
 // --- Full patch snapshot ---
 
 impl PatchState {
+    /// Every persisted GroupId shares one monotonic allocation domain, even
+    /// when the retaining field is dormant or explicitly missing. Keeping the
+    /// scan sorted makes cursor repair independent from serialization order.
+    fn persisted_group_ids(&self) -> BTreeSet<GroupId> {
+        let mut group_ids = BTreeSet::new();
+        if let Some(composition) = &self.composition {
+            collect_saved_composition_group_ids(composition, &mut group_ids);
+        }
+        if let Some(rack) = &self.master_rack {
+            collect_saved_rack_group_ids(rack, &mut group_ids);
+        }
+        for layer in &self.layers {
+            if let Some(rack) = &layer.rack {
+                collect_saved_rack_group_ids(rack, &mut group_ids);
+            }
+            if let SavedImageInput::GroupOutput { group_id }
+            | SavedImageInput::MissingGroupOutput { group_id } = layer.matte.input
+            {
+                group_ids.insert(group_id);
+            }
+        }
+        if let Some(morph) = &self.morph {
+            if let Some(slot) = &morph.a {
+                collect_saved_morph_slot_group_ids(slot, &mut group_ids);
+            }
+            if let Some(slot) = &morph.b {
+                collect_saved_morph_slot_group_ids(slot, &mut group_ids);
+            }
+        }
+        if let Some(modulation) = &self.modulation {
+            group_ids.extend(
+                modulation
+                    .routings
+                    .iter()
+                    .filter_map(|routing| routing.stable_target)
+                    .filter_map(saved_modulation_group_id),
+            );
+        }
+        group_ids
+    }
+
+    /// Merge every live or retired NodeId inside its rack-local ownership
+    /// domain. Morph A/B cursors carry deleted-node provenance, while typed
+    /// stable modulation Node/MissingNode targets retain identities even when
+    /// the addressed node itself is absent.
+    fn persisted_node_cursors(&self) -> PersistedNodeCursors {
+        let mut cursors = PersistedNodeCursors::default();
+        if let Some(rack) = &self.master_rack {
+            cursors.observe_rack(SavedStableModScope::Master, rack);
+        }
+        for (position, layer) in self.layers.iter().enumerate() {
+            let Ok(position) = u32::try_from(position) else {
+                continue;
+            };
+            let Some(position) = SavedLayerPosition::new(position) else {
+                continue;
+            };
+            if let Some(rack) = &layer.rack {
+                cursors.observe_rack(SavedStableModScope::SavedLayer { position }, rack);
+            }
+        }
+        if let Some(composition) = &self.composition {
+            collect_saved_composition_node_cursors(composition, &mut cursors);
+        }
+        if let Some(morph) = &self.morph {
+            if let Some(slot) = &morph.a {
+                collect_saved_morph_slot_node_cursors(slot, &mut cursors);
+            }
+            if let Some(slot) = &morph.b {
+                collect_saved_morph_slot_node_cursors(slot, &mut cursors);
+            }
+        }
+        if let Some(modulation) = &self.modulation {
+            for target in modulation
+                .routings
+                .iter()
+                .filter_map(|routing| routing.stable_target)
+            {
+                cursors.observe_modulation_target(target);
+            }
+        }
+        cursors
+    }
+
+    fn reserve_persisted_node_cursors(&mut self, cursors: &PersistedNodeCursors) {
+        if let Some(rack) = &mut self.master_rack {
+            cursors.reserve_master_on(rack);
+        }
+        for (position, layer) in self.layers.iter_mut().enumerate() {
+            let Ok(position) = u32::try_from(position) else {
+                continue;
+            };
+            let Some(position) = SavedLayerPosition::new(position) else {
+                continue;
+            };
+            if let Some(rack) = &mut layer.rack {
+                cursors.reserve_layer_on(position, rack);
+            }
+        }
+        if let Some(composition) = &mut self.composition {
+            cursors.reserve_groups_on(composition);
+        }
+        if let Some(morph) = &mut self.morph {
+            if let Some(slot) = &mut morph.a {
+                reserve_saved_morph_slot_node_cursors(slot, cursors);
+            }
+            if let Some(slot) = &mut morph.b {
+                reserve_saved_morph_slot_node_cursors(slot, cursors);
+            }
+        }
+    }
+
+    fn reserve_persisted_group_ids(&self, composition: &mut CompositionTree) {
+        for group_id in self.persisted_group_ids() {
+            composition.observe_group_reference(group_id);
+        }
+    }
+
+    fn validate_creative_persistence(&mut self) -> Result<(), String> {
+        if self.visual_schema_version > 1 {
+            return Err(format!(
+                "unsupported visual_schema_version {}; maximum is 1",
+                self.visual_schema_version
+            ));
+        }
+        if let Some(rack) = &self.master_rack {
+            rack.validate_for_scope(LegacyRackScope::Master)
+                .map_err(|error| format!("invalid saved master rack: {error}"))?;
+        }
+        for (position, layer) in self.layers.iter().enumerate() {
+            if let Some(rack) = &layer.rack {
+                rack.validate_for_scope(LegacyRackScope::Layer)
+                    .map_err(|error| format!("invalid saved layer rack {position}: {error}"))?;
+            }
+        }
+        if self.master_rack.is_some()
+            || self.composition.is_some()
+            || self.layers.iter().any(|layer| layer.rack.is_some())
+        {
+            self.visual_schema_version = 1;
+        }
+        let positions = (0..self.layers.len())
+            .map(|position| {
+                u32::try_from(position)
+                    .ok()
+                    .and_then(SavedLayerPosition::new)
+                    .ok_or_else(|| format!("saved layer position {position} exceeds patch bounds"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let persisted_group_ids = self.persisted_group_ids();
+        let persisted_node_cursors = self.persisted_node_cursors();
+        if let Some(composition) = &mut self.composition {
+            composition
+                .validate_for_layers(&positions)
+                .map_err(|error| format!("invalid saved composition: {error}"))?;
+            for group in composition.groups() {
+                group
+                    .rack
+                    .validate_for_scope(LegacyRackScope::Group)
+                    .map_err(|error| {
+                        format!("invalid saved group {} rack: {error}", group.id.get())
+                    })?;
+            }
+            // Every persisted reference participates in the same monotonic
+            // GroupId domain. Missing references deliberately advance the
+            // cursor so a future group cannot inherit their identity.
+            for group_id in persisted_group_ids {
+                composition.observe_group_reference(group_id);
+            }
+        }
+        self.reserve_persisted_node_cursors(&persisted_node_cursors);
+        self.validate_visual_graph()?;
+        Ok(())
+    }
+
+    /// Validate the whole authored current-frame image graph without pruning
+    /// missing intent. Saved positions are mapped to deterministic validation
+    /// identities only for cycle analysis; those identities are never stored.
+    fn validate_visual_graph(&self) -> Result<(), String> {
+        // The M2 advanced planner is deliberately bounded, but a globally
+        // exact legacy graph must not retroactively inherit that cap. This
+        // recognizes both omitted M2 fields and the explicit graph emitted by
+        // capture: neither form has an authored image edge to validate and
+        // both continue through the established legacy renderer path.
+        if self.layers.len() > crate::composition::MAX_COMPOSITION_LAYERS
+            && self.is_global_legacy_exact()
+        {
+            return Ok(());
+        }
+        let positions = (0..self.layers.len())
+            .map(saved_position_at)
+            .collect::<Result<Vec<_>, _>>()?;
+        let synthesized;
+        let composition = match &self.composition {
+            Some(composition) => composition,
+            None => {
+                synthesized = legacy_composition_for_positions(&positions)?;
+                &synthesized
+            }
+        };
+        let (scopes, below, mut ordering_edges) = validation_topology(composition)?;
+        let mut dependencies = Vec::new();
+
+        collect_rack_dependencies(
+            self.effective_master_rack().as_ref(),
+            VisualScopeId::Master,
+            &below,
+            &mut dependencies,
+            &mut ordering_edges,
+        )?;
+        for (position, layer) in self.layers.iter().enumerate() {
+            let saved_position = saved_position_at(position)?;
+            let consumer = validation_layer_scope(saved_position)?;
+            let rack = layer.rack.as_ref().map_or_else(
+                || std::borrow::Cow::Owned(VisualRack::synthetic_legacy(LegacyRackScope::Layer)),
+                std::borrow::Cow::Borrowed,
+            );
+            collect_rack_dependencies(
+                rack.as_ref(),
+                consumer,
+                &below,
+                &mut dependencies,
+                &mut ordering_edges,
+            )?;
+            if layer.matte.enabled && layer.matte.amount > 0.0 {
+                collect_legacy_layer_matte_dependency(
+                    layer.matte.input,
+                    consumer,
+                    &below,
+                    &mut dependencies,
+                    &mut ordering_edges,
+                )?;
+            }
+        }
+        for group in composition.groups() {
+            if group.bypass {
+                continue;
+            }
+            let consumer = VisualScopeId::Group(group.id);
+            collect_rack_dependencies(
+                &group.rack,
+                consumer,
+                &below,
+                &mut dependencies,
+                &mut ordering_edges,
+            )?;
+            if let Some(matte) = group.matte.filter(|matte| matte.amount > 0.0) {
+                collect_saved_tap_dependency(
+                    matte.tap,
+                    consumer,
+                    &below,
+                    &mut dependencies,
+                    &mut ordering_edges,
+                )?;
+            }
+        }
+        ImageDependencyGraph::validate_with_ordering_edges(
+            &scopes,
+            &dependencies,
+            &ordering_edges,
+            ImageGraphMode::Advanced,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("invalid visual image graph: {error}"))
+    }
+
+    /// Saved-form counterpart of the evaluated planner's exact-legacy law.
+    /// Layer configs are stored front-to-back while a composition root is
+    /// authored back-to-front, so an explicit capture must be the exact
+    /// reversed positional sequence on Program. Cursor values are deliberately
+    /// irrelevant: they do not affect pixels or execution topology.
+    fn is_global_legacy_exact(&self) -> bool {
+        if !self
+            .effective_master_rack()
+            .is_exact_legacy(LegacyRackScope::Master)
+        {
+            return false;
+        }
+        if !self.layers.iter().all(|layer| {
+            let matte = layer.matte.sanitized();
+            layer
+                .rack
+                .as_ref()
+                .is_none_or(|rack| rack.is_exact_legacy(LegacyRackScope::Layer))
+                && (!matte.enabled || matte.amount <= 0.0)
+        }) {
+            return false;
+        }
+
+        let Some(composition) = &self.composition else {
+            return true;
+        };
+        composition.groups().len() == 0
+            && composition.bus_crossfade() == 0.5
+            && composition.root().len() == self.layers.len()
+            && composition
+                .root()
+                .iter()
+                .zip((0..self.layers.len()).rev())
+                .all(|(item, expected_position)| {
+                    matches!(
+                        item,
+                        RootItem::Layer {
+                            layer,
+                            bus: crate::composition::BusAssignment::Program,
+                        } if usize::try_from(layer.get()).ok() == Some(expected_position)
+                    )
+                })
+    }
+
+    /// Legacy omission is resolved at the consumption boundary, never during
+    /// serde, so explicit empty racks remain observably different on disk.
+    pub fn effective_master_rack(&self) -> std::borrow::Cow<'_, VisualRack> {
+        self.master_rack.as_ref().map_or_else(
+            || std::borrow::Cow::Owned(VisualRack::synthetic_legacy(LegacyRackScope::Master)),
+            std::borrow::Cow::Borrowed,
+        )
+    }
+
+    pub fn effective_layer_rack(
+        &self,
+        position: usize,
+    ) -> Option<std::borrow::Cow<'_, VisualRack>> {
+        if position >= self.layers.len() {
+            return None;
+        }
+        match &self.layers[position].rack {
+            Some(rack) => Some(std::borrow::Cow::Borrowed(rack)),
+            None => Some(std::borrow::Cow::Owned(VisualRack::synthetic_legacy(
+                LegacyRackScope::Layer,
+            ))),
+        }
+    }
+
     pub fn capture(
-        master: &EffectUniforms,
+        master: PatchMasterVisual<'_>,
         layers: &[Layer],
         ntsc_params: &NtscParams,
         mod_matrix: &ModMatrix,
@@ -1605,29 +3993,259 @@ impl PatchState {
         transport: PatchTransportState,
         morph: &crate::morph::Morph,
     ) -> Self {
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        let mut captured_layers: Vec<_> = layers.iter().map(LayerConfig::from_layer).collect();
+        for (captured, layer) in captured_layers.iter_mut().zip(layers) {
+            captured.matte = LayerMatteConfig::from_runtime(layer.matte, |wanted| {
+                layers
+                    .iter()
+                    .position(|candidate| candidate.stable_layer_id() == wanted)
+                    .and_then(|position| u32::try_from(position).ok())
+                    .and_then(SavedLayerPosition::new)
+            })
+            .unwrap_or_default();
+            let motion = MotionConfig::from_params_for_capture(layer.motion, &layer_ids);
+            captured.motion = (!motion.is_default()).then_some(motion);
+        }
         Self {
-            master: EffectsConfig::from_uniforms(master),
-            layers: layers.iter().map(LayerConfig::from_layer).collect(),
+            master: EffectsConfig::from_uniforms(master.effects),
+            master_transform: master.transform.sanitized(),
+            master_motion: None,
+            layers: captured_layers,
+            master_rack: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: transport.master_paused,
             media_frozen: transport.media_frozen,
             ntsc: Some(NtscConfig::from_params(ntsc_params)),
             modulation: Some(ModConfig::from_matrix(mod_matrix)),
-            temporal: Some(TemporalConfig::from_params(temporal)),
+            temporal: Some(TemporalConfig::from_params_for_capture(
+                temporal, &layer_ids,
+            )),
             morph: Some(morph.snapshot_at_beat(mod_matrix.current_beat)),
+            scenes: Scenes::default(),
         }
+    }
+
+    /// M4 capture sibling. Existing callers remain exact-zero until Main owns
+    /// a live `master_motion` value and switches to this entry point.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn capture_with_motion(
+        master: PatchMasterVisual<'_>,
+        master_motion: &MotionParams,
+        layers: &[Layer],
+        ntsc_params: &NtscParams,
+        mod_matrix: &ModMatrix,
+        temporal: &TemporalParams,
+        transport: PatchTransportState,
+        morph: &crate::morph::Morph,
+    ) -> Self {
+        let mut patch = Self::capture(
+            master,
+            layers,
+            ntsc_params,
+            mod_matrix,
+            temporal,
+            transport,
+            morph,
+        );
+        let motion = MotionConfig::from_params(*master_motion);
+        patch.master_motion = (!motion.is_default()).then_some(motion);
+        patch
+    }
+
+    /// Capture the complete M2 creative graph through stable runtime IDs into
+    /// saved positional identities. Every fallible mapping is completed before
+    /// a patch value is published.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_with_composition(
+        master: PatchMasterVisual<'_>,
+        layers: &[Layer],
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[RuntimeVisualRack],
+        composition: &RuntimeComposition,
+        ntsc_params: &NtscParams,
+        mod_matrix: &ModMatrix,
+        temporal: &TemporalParams,
+        transport: PatchTransportState,
+        morph: &crate::morph::Morph,
+    ) -> Result<Self, String> {
+        if layer_racks.len() != layers.len() {
+            return Err(format!(
+                "patch capture has {} layer racks for {} layers",
+                layer_racks.len(),
+                layers.len()
+            ));
+        }
+        master_rack
+            .validate_for_scope(LegacyRackScope::Master)
+            .map_err(|error| format!("invalid runtime master rack: {error}"))?;
+        for (position, rack) in layer_racks.iter().enumerate() {
+            rack.validate_for_scope(LegacyRackScope::Layer)
+                .map_err(|error| format!("invalid runtime layer rack {position}: {error}"))?;
+        }
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        let position_of_layer = |wanted| {
+            layer_ids
+                .iter()
+                .position(|candidate| *candidate == wanted)
+                .and_then(|position| u32::try_from(position).ok())
+                .and_then(SavedLayerPosition::new)
+        };
+        let saved_master_rack = master_rack
+            .capture_routes(position_of_layer)
+            .map_err(|error| format!("capture master rack routes: {error}"))?;
+        let saved_layer_racks = layer_racks
+            .iter()
+            .enumerate()
+            .map(|(position, rack)| {
+                rack.capture_routes(position_of_layer)
+                    .map_err(|error| format!("capture layer rack {position} routes: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let saved_composition = composition
+            .capture(position_of_layer)
+            .map_err(|error| format!("capture composition: {error}"))?;
+        let address_racks: Vec<_> = layer_ids
+            .iter()
+            .copied()
+            .zip(layer_racks.iter().cloned())
+            .collect();
+        let address_book =
+            StableModAddressBook::from_composition(master_rack, &address_racks, composition)?;
+        let saved_modulation = ModConfig::from_matrix_with_composition(
+            mod_matrix,
+            &address_book,
+            &layer_ids,
+            composition,
+        )?;
+
+        let mut patch = Self::capture(
+            master,
+            layers,
+            ntsc_params,
+            mod_matrix,
+            temporal,
+            transport,
+            morph,
+        );
+        patch.master_rack = Some(saved_master_rack);
+        for (layer, rack) in patch.layers.iter_mut().zip(saved_layer_racks) {
+            layer.rack = Some(rack);
+        }
+        patch.composition = Some(saved_composition);
+        patch.visual_schema_version = 1;
+        patch.modulation = Some(saved_modulation);
+        patch.validate_creative_persistence()?;
+        Ok(patch)
+    }
+
+    /// M4-aware complete creative capture. Motion authoring is additive to the
+    /// existing graph transaction and carries no hidden field/carrier pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_with_composition_and_motion(
+        master: PatchMasterVisual<'_>,
+        master_motion: &MotionParams,
+        layers: &[Layer],
+        master_rack: &RuntimeVisualRack,
+        layer_racks: &[RuntimeVisualRack],
+        composition: &RuntimeComposition,
+        ntsc_params: &NtscParams,
+        mod_matrix: &ModMatrix,
+        temporal: &TemporalParams,
+        transport: PatchTransportState,
+        morph: &crate::morph::Morph,
+    ) -> Result<Self, String> {
+        let mut patch = Self::capture_with_composition(
+            master,
+            layers,
+            master_rack,
+            layer_racks,
+            composition,
+            ntsc_params,
+            mod_matrix,
+            temporal,
+            transport,
+            morph,
+        )?;
+        let motion = MotionConfig::from_params(*master_motion);
+        patch.master_motion = (!motion.is_default()).then_some(motion);
+        Ok(patch)
+    }
+
+    /// Canonicalize active slot mirrors and finite matte fields. Scene intent
+    /// is never pruned here; invalid references are reported by
+    /// [`Self::validate_scene_references`] so staging can reject atomically.
+    pub fn sanitize_performance_references(&mut self) {
+        for layer in &mut self.layers {
+            layer.sync_legacy_mirrors_from_active_slot();
+            layer.matte = layer.matte.sanitized();
+        }
+    }
+
+    /// Validate every saved Scene reference without mutating the patch. The
+    /// returned order is deterministic: Scene order, then binding order.
+    pub fn validate_scene_references(&self) -> Vec<SceneReferenceIssue> {
+        let mut issues = Vec::new();
+        for scene in self.scenes.iter() {
+            for binding in scene.bindings.iter() {
+                let Some(layer) = binding.layer_position.resolve(&self.layers) else {
+                    issues.push(SceneReferenceIssue {
+                        scene_id: scene.id,
+                        layer_position: binding.layer_position,
+                        slot_id: binding.slot_id,
+                        cue_id: binding.cue_id,
+                        kind: SceneReferenceErrorKind::Layer,
+                    });
+                    continue;
+                };
+                let Some(slot) = layer.clip_slots.get(binding.slot_id) else {
+                    issues.push(SceneReferenceIssue {
+                        scene_id: scene.id,
+                        layer_position: binding.layer_position,
+                        slot_id: binding.slot_id,
+                        cue_id: binding.cue_id,
+                        kind: SceneReferenceErrorKind::Slot,
+                    });
+                    continue;
+                };
+                if binding
+                    .cue_id
+                    .is_some_and(|cue_id| slot.transport.cue(cue_id).is_none())
+                {
+                    issues.push(SceneReferenceIssue {
+                        scene_id: scene.id,
+                        layer_position: binding.layer_position,
+                        slot_id: binding.slot_id,
+                        cue_id: binding.cue_id,
+                        kind: SceneReferenceErrorKind::Cue,
+                    });
+                }
+            }
+        }
+        issues
     }
 
     pub fn apply(
         &self,
         master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
         layers: &mut [Layer],
         ntsc_params: &mut NtscParams,
         mod_matrix: &mut ModMatrix,
         temporal: &mut TemporalParams,
     ) {
         self.master.apply_to_uniforms(master);
+        *master_transform = self.master_transform.sanitized();
         for (config, layer) in self.layers.iter().zip(layers.iter_mut()) {
             config.apply_to_layer(layer);
+        }
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        for (config, layer) in self.layers.iter().zip(layers.iter_mut()) {
+            if let Some(motion) = config.motion {
+                layer.motion.transplant.donor = motion.transplant.donor.resolve_runtime(&layer_ids);
+            }
         }
         if let Some(ref ntsc) = self.ntsc {
             *ntsc_params = ntsc.to_params();
@@ -1636,8 +4254,182 @@ impl PatchState {
             modulation.apply_to_matrix(mod_matrix);
         }
         if let Some(ref temporal_cfg) = self.temporal {
-            *temporal = temporal_cfg.to_params();
+            let mut restored = temporal_cfg.to_params();
+            if let Some(originals) = temporal_cfg.originals {
+                restored.originals.score.loop_driver =
+                    originals.score.loop_driver.resolve_runtime(&layer_ids);
+            }
+            *temporal = restored;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    pub fn apply_with_motion(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        layers: &mut [Layer],
+        ntsc_params: &mut NtscParams,
+        mod_matrix: &mut ModMatrix,
+        temporal: &mut TemporalParams,
+    ) {
+        self.apply(
+            master,
+            master_transform,
+            layers,
+            ntsc_params,
+            mod_matrix,
+            temporal,
+        );
+        *master_motion = self
+            .master_motion
+            .unwrap_or_default()
+            .to_params()
+            .sanitized();
+    }
+
+    /// Resolve and apply the complete persisted creative graph atomically.
+    /// The compatibility [`Self::apply`] entry point remains unchanged for the
+    /// legacy runtime until Main wires this sibling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_composition(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+        ntsc_params: &mut NtscParams,
+        mod_matrix: &mut ModMatrix,
+        temporal: &mut TemporalParams,
+    ) -> Result<(), String> {
+        if layers.len() != self.layers.len() || layer_racks.len() != layers.len() {
+            return Err(format!(
+                "patch restore requires {} layers/racks; live has {} layers and {} racks",
+                self.layers.len(),
+                layers.len(),
+                layer_racks.len()
+            ));
+        }
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        let saved_positions = (0..self.layers.len())
+            .map(|position| {
+                u32::try_from(position)
+                    .ok()
+                    .and_then(SavedLayerPosition::new)
+                    .ok_or_else(|| format!("saved layer position {position} exceeds bounds"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut saved_composition = match &self.composition {
+            Some(composition) => composition.clone(),
+            None => legacy_composition_for_positions(&saved_positions)?,
+        };
+        let persisted_node_cursors = self.persisted_node_cursors();
+        self.reserve_persisted_group_ids(&mut saved_composition);
+        persisted_node_cursors.reserve_groups_on(&mut saved_composition);
+        let resolved_composition = saved_composition
+            .resolve(|position| position.resolve(&layer_ids).copied())
+            .map_err(|error| format!("resolve composition: {error}"))?;
+        let group_exists = |group_id| resolved_composition.contains_group(group_id);
+        let mut saved_master_rack = self.effective_master_rack().into_owned();
+        persisted_node_cursors.reserve_master_on(&mut saved_master_rack);
+        let resolved_master_rack = saved_master_rack.resolve_routes(
+            |position| position.resolve(&layer_ids).copied(),
+            group_exists,
+        );
+        let resolved_layer_racks = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(position, layer)| {
+                let mut rack = layer.rack.as_ref().map_or_else(
+                    || VisualRack::synthetic_legacy(LegacyRackScope::Layer),
+                    Clone::clone,
+                );
+                if let Some(saved_position) = u32::try_from(position)
+                    .ok()
+                    .and_then(SavedLayerPosition::new)
+                {
+                    persisted_node_cursors.reserve_layer_on(saved_position, &mut rack);
+                }
+                rack.resolve_routes(
+                    |position| position.resolve(&layer_ids).copied(),
+                    group_exists,
+                )
+            })
+            .collect::<Vec<_>>();
+        let address_racks: Vec<_> = layer_ids
+            .iter()
+            .copied()
+            .zip(resolved_layer_racks.iter().cloned())
+            .collect();
+        let address_book = StableModAddressBook::from_composition(
+            &resolved_master_rack,
+            &address_racks,
+            &resolved_composition,
+        )?;
+
+        self.apply(
+            master,
+            master_transform,
+            layers,
+            ntsc_params,
+            mod_matrix,
+            temporal,
+        );
+        for (config, layer) in self.layers.iter().zip(layers.iter_mut()) {
+            layer.matte = config
+                .matte
+                .to_runtime(|position| position.resolve(&layer_ids).copied());
+        }
+        *master_rack = resolved_master_rack;
+        layer_racks.clone_from_slice(&resolved_layer_racks);
+        *composition = resolved_composition;
+        if let Some(modulation) = &self.modulation {
+            modulation.apply_to_matrix_with_composition(
+                mod_matrix,
+                &address_book,
+                &layer_ids,
+                composition,
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_composition_and_motion(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+        ntsc_params: &mut NtscParams,
+        mod_matrix: &mut ModMatrix,
+        temporal: &mut TemporalParams,
+    ) -> Result<(), String> {
+        self.apply_with_composition(
+            master,
+            master_transform,
+            layers,
+            master_rack,
+            layer_racks,
+            composition,
+            ntsc_params,
+            mod_matrix,
+            temporal,
+        )?;
+        *master_motion = self
+            .master_motion
+            .unwrap_or_default()
+            .to_params()
+            .sanitized();
+        Ok(())
     }
 
     /// Transfer a saved visual look onto the current positional stack without
@@ -1646,19 +4438,143 @@ impl PatchState {
     pub fn apply_look(
         &self,
         master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
         layers: &mut [Layer],
         ntsc_params: &mut NtscParams,
         temporal: &mut TemporalParams,
     ) -> LookApplySummary {
         self.master.apply_to_uniforms(master);
+        *master_transform = self.master_transform.sanitized();
+        let live_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
         let summary = apply_positional_looks(&self.layers, layers, |config, layer| {
             config.apply_look_to_layer(layer);
+            let _ = apply_layer_matte_look_values(config.matte, &mut layer.matte, &live_ids);
         });
         if let Some(ref ntsc) = self.ntsc {
             *ntsc_params = ntsc.to_params();
         }
         if let Some(ref temporal_cfg) = self.temporal {
+            let loop_driver = temporal.originals.score.loop_driver;
             *temporal = temporal_cfg.to_params();
+            // A Look transfers values, not donor-route topology. Preserve an
+            // exact live Selected identity and an authored tombstone alike.
+            temporal.originals.score.loop_driver = loop_driver;
+        }
+        summary
+    }
+
+    #[allow(dead_code)]
+    pub fn apply_look_with_motion(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        layers: &mut [Layer],
+        ntsc_params: &mut NtscParams,
+        temporal: &mut TemporalParams,
+    ) -> LookApplySummary {
+        let summary = self.apply_look(master, master_transform, layers, ntsc_params, temporal);
+        if let Some(motion) = self.master_motion {
+            apply_motion_look(motion, master_motion);
+        }
+        summary
+    }
+
+    /// Apply visual values from a Look while retaining the current creative
+    /// topology, route donors, IDs, ordering and monotonic cursors. Racks are
+    /// strict compatibility units; groups match independently by stable ID,
+    /// membership, rack signature, matte presence and immutable image route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_look_with_composition(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+        ntsc_params: &mut NtscParams,
+        temporal: &mut TemporalParams,
+    ) -> LookApplySummary {
+        let mut summary = self.apply_look(master, master_transform, layers, ntsc_params, temporal);
+        let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
+        let group_exists = |group_id| composition.contains_group(group_id);
+        let sampled_master = self.effective_master_rack().resolve_routes(
+            |position| position.resolve(&layer_ids).copied(),
+            group_exists,
+        );
+        if crate::morph::apply_runtime_rack_values_strict(&sampled_master, master_rack) {
+            summary.applied_racks += 1;
+            record_look_rack_nodes(&mut summary, LookRackScope::Master, &sampled_master, true);
+        } else {
+            summary.skipped_racks += 1;
+            record_look_rack_nodes(&mut summary, LookRackScope::Master, &sampled_master, false);
+        }
+
+        let mapped_racks = self.layers.len().min(layers.len()).min(layer_racks.len());
+        for (position, live) in layer_racks.iter_mut().take(mapped_racks).enumerate() {
+            let saved = self.layers[position]
+                .rack
+                .as_ref()
+                .map_or_else(
+                    || VisualRack::synthetic_legacy(LegacyRackScope::Layer),
+                    Clone::clone,
+                )
+                .resolve_routes(
+                    |position| position.resolve(&layer_ids).copied(),
+                    group_exists,
+                );
+            if crate::morph::apply_runtime_rack_values_strict(&saved, live) {
+                summary.applied_racks += 1;
+                record_look_rack_nodes(
+                    &mut summary,
+                    LookRackScope::Layer(layer_ids[position]),
+                    &saved,
+                    true,
+                );
+            } else {
+                summary.skipped_racks += 1;
+                record_look_rack_nodes(
+                    &mut summary,
+                    LookRackScope::Layer(layer_ids[position]),
+                    &saved,
+                    false,
+                );
+            }
+        }
+        summary.skipped_racks += self.layers.len().saturating_sub(mapped_racks);
+
+        if let Some(saved_composition) = &self.composition {
+            apply_saved_composition_look(saved_composition, composition, &layer_ids, &mut summary);
+        }
+        summary
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_look_with_composition_and_motion(
+        &self,
+        master: &mut EffectUniforms,
+        master_transform: &mut SpatialTransform,
+        master_motion: &mut MotionParams,
+        layers: &mut [Layer],
+        master_rack: &mut RuntimeVisualRack,
+        layer_racks: &mut [RuntimeVisualRack],
+        composition: &mut RuntimeComposition,
+        ntsc_params: &mut NtscParams,
+        temporal: &mut TemporalParams,
+    ) -> LookApplySummary {
+        let summary = self.apply_look_with_composition(
+            master,
+            master_transform,
+            layers,
+            master_rack,
+            layer_racks,
+            composition,
+            ntsc_params,
+            temporal,
+        );
+        if let Some(motion) = self.master_motion {
+            apply_motion_look(motion, master_motion);
         }
         summary
     }
@@ -1677,9 +4593,10 @@ mod tests {
         brightness: f32,
         random_seed: u32,
     ) -> LayerConfig {
+        let source_path = format!("patch://{filename}");
         LayerConfig {
             filename: filename.to_string(),
-            source_path: format!("patch://{filename}"),
+            source_path: source_path.clone(),
             opacity,
             blend_mode: blend_mode.to_string(),
             speed: 4.0,
@@ -1693,6 +4610,20 @@ mod tests {
                 random_seed,
                 ..Default::default()
             },
+            transform: SpatialTransform {
+                position: [opacity, brightness],
+                ..SpatialTransform::default()
+            },
+            motion: None,
+            rack: None,
+            clip_slots: ClipSlots::singleton(ClipSlotConfig::from_legacy(
+                filename.to_string(),
+                source_path,
+                4.0,
+                240.0,
+            )),
+            active_clip_slot: Some(ClipSlotId::LEGACY),
+            matte: LayerMatteConfig::default(),
         }
     }
 
@@ -1709,6 +4640,7 @@ mod tests {
         visible: bool,
         bypass_master_fx: bool,
         effects: EffectUniforms,
+        transform: SpatialTransform,
     }
 
     fn fake_live_layer(topology_id: u64, filename: &str, opacity: f32) -> FakeLiveLayer {
@@ -1729,7 +4661,81 @@ mod tests {
                 random_seed: topology_id as u32 + 1_000,
                 ..Default::default()
             },
+            transform: SpatialTransform::new_layer_default(),
         }
+    }
+
+    #[test]
+    fn curated_blend_keys_round_trip_exactly_through_yaml_json_and_look_application() {
+        for expected in BlendMode::ALL {
+            let config = saved_layer("blend-study.mov", 0.75, expected.key(), true, false, 0.0, 7);
+
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            let from_yaml: LayerConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(
+                from_yaml.blend_mode,
+                expected.key(),
+                "YAML collapsed {expected:?}"
+            );
+            assert!(
+                yaml.lines()
+                    .any(|line| line == format!("blend_mode: {}", expected.key())),
+                "YAML did not serialize the exact key for {expected:?}: {yaml}"
+            );
+
+            let json = serde_json::to_string(&config).unwrap();
+            let from_json: LayerConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                from_json.blend_mode,
+                expected.key(),
+                "JSON collapsed {expected:?}"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&json).unwrap()["blend_mode"],
+                expected.key()
+            );
+
+            let mut applied = BlendMode::Normal;
+            let mut opacity = 0.0;
+            let mut visible = false;
+            let mut bypass_master_fx = true;
+            let mut effects = EffectUniforms::default();
+            let mut transform = SpatialTransform::default();
+            from_json.apply_look_to_fields(
+                &mut opacity,
+                &mut applied,
+                &mut visible,
+                &mut bypass_master_fx,
+                &mut effects,
+                &mut transform,
+            );
+            assert_eq!(applied, expected, "look application collapsed {expected:?}");
+        }
+
+        let missing: LayerConfig =
+            serde_yaml::from_str("filename: legacy.mov\neffects: {}\n").unwrap();
+        assert_eq!(missing.blend_mode, BlendMode::Normal.key());
+
+        let unknown = saved_layer("future.mov", 1.0, "future_blend", true, false, 0.0, 0);
+        let mut applied = BlendMode::Difference;
+        let mut opacity = 0.0;
+        let mut visible = false;
+        let mut bypass_master_fx = true;
+        let mut effects = EffectUniforms::default();
+        let mut transform = SpatialTransform::default();
+        unknown.apply_look_to_fields(
+            &mut opacity,
+            &mut applied,
+            &mut visible,
+            &mut bypass_master_fx,
+            &mut effects,
+            &mut transform,
+        );
+        assert_eq!(
+            applied,
+            BlendMode::Normal,
+            "unknown legacy strings retain the established Normal fallback"
+        );
     }
 
     #[test]
@@ -1764,6 +4770,7 @@ mod tests {
             live[2].bypass_master_fx,
             live[2].effects.brightness,
             live[2].effects.random_seed,
+            live[2].transform,
         );
 
         let summary = apply_positional_looks(&saved, &mut live, |config, layer| {
@@ -1773,6 +4780,7 @@ mod tests {
                 &mut layer.visible,
                 &mut layer.bypass_master_fx,
                 &mut layer.effects,
+                &mut layer.transform,
             );
         });
 
@@ -1782,6 +4790,7 @@ mod tests {
                 mapped_layers: 2,
                 unused_patch_layers: 0,
                 untouched_live_layers: 1,
+                ..LookApplySummary::default()
             }
         );
         assert_eq!(live[0].opacity, 0.2);
@@ -1790,12 +4799,14 @@ mod tests {
         assert!(live[0].bypass_master_fx);
         assert_eq!(live[0].effects.brightness, 0.25);
         assert_eq!(live[0].effects.random_seed, 41);
+        assert_eq!(live[0].transform.position, [0.2, 0.25]);
         assert_eq!(live[1].opacity, 0.7);
         assert_eq!(live[1].blend_mode, BlendMode::Screen);
         assert!(live[1].visible);
         assert!(!live[1].bypass_master_fx);
         assert_eq!(live[1].effects.brightness, -0.3);
         assert_eq!(live[1].effects.random_seed, 97);
+        assert_eq!(live[1].transform.position, [0.7, -0.3]);
         assert_eq!(
             (
                 live[2].opacity,
@@ -1804,6 +4815,7 @@ mod tests {
                 live[2].bypass_master_fx,
                 live[2].effects.brightness,
                 live[2].effects.random_seed,
+                live[2].transform,
             ),
             untouched_visual_before
         );
@@ -1833,6 +4845,7 @@ mod tests {
                 mapped_layers: 1,
                 unused_patch_layers: 1,
                 untouched_live_layers: 0,
+                ..LookApplySummary::default()
             }
         );
     }
@@ -1845,18 +4858,28 @@ mod tests {
                 random_seed: 31_337,
                 ..Default::default()
             },
+            master_transform: SpatialTransform {
+                rotation_deg: 23.0,
+                ..SpatialTransform::default()
+            },
+            master_motion: None,
             layers: Vec::new(),
+            master_rack: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: true,
             media_frozen: true,
             ntsc: None,
             modulation: None,
             temporal: None,
             morph: None,
+            scenes: Scenes::default(),
         };
         let mut master = EffectUniforms {
             brightness: -0.4,
             ..Default::default()
         };
+        let mut master_transform = SpatialTransform::default();
         let mut ntsc = NtscParams {
             enabled: true,
             snow_intensity: 0.33,
@@ -1868,11 +4891,23 @@ mod tests {
             slit_angle: 73.0,
             ..Default::default()
         };
+        let live_driver = CollisionScoreLoopDriver::SelectedLayer {
+            layer_id: StableLayerId::new(81).unwrap(),
+            saved_position: SavedLayerPosition::new(2).unwrap(),
+        };
+        temporal.originals.score.loop_driver = live_driver;
 
-        let summary = patch.apply_look(&mut master, &mut [], &mut ntsc, &mut temporal);
+        let summary = patch.apply_look(
+            &mut master,
+            &mut master_transform,
+            &mut [],
+            &mut ntsc,
+            &mut temporal,
+        );
         assert_eq!(summary, LookApplySummary::default());
         assert_eq!(master.brightness, 0.55);
         assert_eq!(master.random_seed, 31_337);
+        assert_eq!(master_transform.rotation_deg, 23.0);
         assert_eq!(ntsc, original_ntsc);
         assert_eq!(temporal.feedback, 0.42);
         assert_eq!(temporal.slit_angle, 73.0);
@@ -1893,11 +4928,21 @@ mod tests {
         patch.ntsc = Some(NtscConfig::from_params(&saved_ntsc));
         patch.temporal = Some(TemporalConfig::from_params(&saved_temporal));
 
-        patch.apply_look(&mut master, &mut [], &mut ntsc, &mut temporal);
+        patch.apply_look(
+            &mut master,
+            &mut master_transform,
+            &mut [],
+            &mut ntsc,
+            &mut temporal,
+        );
         assert_eq!(ntsc, saved_ntsc);
         assert_eq!(temporal.feedback, 0.7);
         assert_eq!(temporal.fb_zoom, 1.04);
         assert_eq!(temporal.slit_angle, -35.0);
+        assert_eq!(
+            temporal.originals.score.loop_driver, live_driver,
+            "Apply Look must not retarget the live Score conductor"
+        );
     }
 
     #[test]
@@ -1907,6 +4952,209 @@ mod tests {
 
         assert!(legacy.master_paused);
         assert!(!legacy.media_frozen);
+        assert_eq!(legacy.master_transform, SpatialTransform::default());
+    }
+
+    #[test]
+    fn legacy_one_source_layer_migrates_to_exact_canonical_slot_one() {
+        let legacy: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: archive.mov
+    source_path: C:/media/archive.mov
+    speed: 1.75
+    fps: 24
+    paused: true
+    effects: {}
+"#,
+        )
+        .unwrap();
+        let layer = &legacy.layers[0];
+        assert_eq!(layer.clip_slots.len(), 1);
+        assert_eq!(layer.active_clip_slot, Some(ClipSlotId::LEGACY));
+        let slot = layer.clip_slots.get(ClipSlotId::LEGACY).unwrap();
+        assert_eq!(slot.filename, "archive.mov");
+        assert_eq!(slot.source_path, "C:/media/archive.mov");
+        assert_eq!(
+            slot.transport.direction,
+            crate::transport::PlaybackDirection::Forward
+        );
+        assert_eq!(
+            slot.transport.end_behavior,
+            crate::transport::EndBehavior::Loop
+        );
+        assert_eq!(
+            slot.transport.in_point,
+            crate::transport::NormalizedTime::ZERO
+        );
+        assert_eq!(
+            slot.transport.out_point,
+            crate::transport::NormalizedTime::ONE
+        );
+        assert_eq!(slot.transport.rate, 1.75);
+        assert_eq!(slot.transport.sample_fps, Some(24.0));
+        assert_eq!(slot.saved_playhead, crate::transport::NormalizedTime::ZERO);
+        assert!(layer.paused, "legacy layer pause remains a layer control");
+        assert!(layer.matte.is_legacy_disabled());
+        assert!(legacy.scenes.is_empty());
+
+        let canonical = serde_yaml::to_string(&legacy).unwrap();
+        assert!(canonical.contains("clip_slots:"));
+        assert!(canonical.contains("active_clip_slot: 1"));
+        assert!(!canonical.contains("matte:"));
+        assert!(!canonical.contains("scenes:"));
+    }
+
+    #[test]
+    fn canonical_slots_win_over_legacy_mirrors_and_active_id_is_lookup_based() {
+        let patch: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: stale.mov
+    source_path: stale/path.mov
+    speed: 4
+    fps: 120
+    effects: {}
+    clip_slots:
+      - id: 4000
+        name: Archive B
+        filename: canonical-b.mov
+        source_path: cos-sha256://bbbb
+        transport:
+          rate: 0.5
+          sample_fps: 18
+      - id: 7
+        name: Archive A
+        filename: canonical-a.mov
+        source_path: cos-sha256://aaaa
+        transport:
+          rate: 1.25
+          sample_fps: 25
+    active_clip_slot: 7
+"#,
+        )
+        .unwrap();
+        let layer = &patch.layers[0];
+        assert_eq!(layer.active_clip_slot.unwrap().get(), 7);
+        assert_eq!(layer.filename, "canonical-a.mov");
+        assert_eq!(layer.source_path, "cos-sha256://aaaa");
+        assert_eq!(layer.speed, 1.25);
+        assert_eq!(layer.fps, 25.0);
+        assert_eq!(layer.clip_slots.iter().next().unwrap().id.get(), 4000);
+
+        let fallback: LayerConfig = serde_yaml::from_str(
+            r#"
+filename: stale.mov
+effects: {}
+clip_slots:
+  - { id: 31, filename: first.mov, transport: {} }
+  - { id: 2, filename: second.mov, transport: {} }
+active_clip_slot: 30
+"#,
+        )
+        .unwrap();
+        assert_eq!(fallback.active_clip_slot.unwrap().get(), 31);
+        assert_eq!(fallback.filename, "first.mov");
+    }
+
+    #[test]
+    fn scene_load_preserves_invalid_intent_and_reports_deterministic_diagnostics() {
+        let patch: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: donor.mov
+    effects: {}
+    clip_slots:
+      - id: 7
+        filename: donor.mov
+        transport:
+          cues:
+            - { id: 3, at: 0.25 }
+    active_clip_slot: 7
+  - filename: carrier.mov
+    effects: {}
+scenes:
+  - id: 9
+    name: bounded
+    bindings:
+      - { layer_position: 0, slot_id: 7, cue_id: 3 }
+      - { layer_position: 1, slot_id: 999 }
+      - { layer_position: 2, slot_id: 1 }
+"#,
+        )
+        .unwrap();
+        let scene = patch
+            .scenes
+            .get(crate::performance::SceneId::new(9).unwrap())
+            .unwrap();
+        let bindings: Vec<_> = scene.bindings.iter().copied().collect();
+        assert_eq!(bindings.len(), 3, "load must never prune authored intent");
+        assert_eq!(bindings[0].layer_position.get(), 0);
+        assert_eq!(bindings[0].slot_id.get(), 7);
+        assert_eq!(bindings[0].cue_id.unwrap().get(), 3);
+        let issues = patch.validate_scene_references();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].kind, SceneReferenceErrorKind::Slot);
+        assert_eq!(issues[0].layer_position.get(), 1);
+        assert_eq!(issues[1].kind, SceneReferenceErrorKind::Layer);
+        assert_eq!(issues[1].layer_position.get(), 2);
+
+        let canonical = serde_yaml::to_string(&patch).unwrap();
+        let restored: PatchState = serde_yaml::from_str(&canonical).unwrap();
+        assert_eq!(restored.scenes, patch.scenes);
+    }
+
+    #[test]
+    fn hostile_explicit_empty_slot_array_is_rejected() {
+        let error = match serde_yaml::from_str::<LayerConfig>(
+            "filename: blank.mov\neffects: {}\nclip_slots: []\nactive_clip_slot: 9\n",
+        ) {
+            Ok(_) => panic!("explicit empty clip slot array must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("may not be empty"));
+    }
+
+    #[test]
+    fn spatial_patch_schema_preserves_legacy_identity_and_round_trips_all_modes() {
+        let legacy: PatchState = serde_yaml::from_str(
+            "master: {}\nlayers:\n  - filename: legacy.mov\n    effects: {}\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.master_transform, SpatialTransform::default());
+        assert_eq!(legacy.layers[0].transform, SpatialTransform::default());
+        let legacy_yaml = serde_yaml::to_string(&legacy).unwrap();
+        assert!(
+            !legacy_yaml.contains("transform:"),
+            "legacy identity should not churn canonical patch bytes"
+        );
+        assert!(!legacy_yaml.contains("master_transform:"));
+
+        let mut authored = legacy;
+        authored.master_transform = SpatialTransform {
+            position: [0.2, -0.3],
+            scale: [-2.0, 3.0],
+            anchor: [0.1, 0.9],
+            rotation_deg: 45.0,
+            skew_deg: -12.0,
+            skew_axis_deg: 30.0,
+            fit: FitMode::Fill,
+            crop: [0.1, 0.2, 0.3, 0.1],
+            edge: EdgeMode::Mirror,
+            sampling: SamplingMode::Nearest,
+        };
+        authored.layers[0].transform = SpatialTransform {
+            fit: FitMode::Native,
+            edge: EdgeMode::Transparent,
+            ..authored.master_transform
+        };
+        let yaml = serde_yaml::to_string(&authored).unwrap();
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.master_transform, authored.master_transform);
+        assert_eq!(restored.layers[0].transform, authored.layers[0].transform);
     }
 
     #[test]
@@ -1926,13 +5174,19 @@ mod tests {
             .collect();
         let patch = PatchState {
             master: EffectsConfig::default(),
+            master_transform: SpatialTransform::default(),
+            master_motion: None,
             layers,
+            master_rack: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: false,
             media_frozen: false,
             ntsc: None,
             modulation: None,
             temporal: None,
             morph: None,
+            scenes: Scenes::default(),
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -1951,7 +5205,7 @@ mod tests {
         morph.start_glide(1.0, 8.0, 100.0);
 
         let patch = PatchState::capture(
-            &EffectUniforms::default(),
+            PatchMasterVisual::new(&EffectUniforms::default(), &SpatialTransform::default()),
             &[],
             &NtscParams::default(),
             &matrix,
@@ -1984,6 +5238,8 @@ mod tests {
         };
         let patch = PatchState {
             master: EffectsConfig::from_uniforms(&master),
+            master_transform: SpatialTransform::default(),
+            master_motion: None,
             layers: vec![LayerConfig {
                 filename: "clip.mp4".to_string(),
                 source_path: String::new(),
@@ -1996,13 +5252,28 @@ mod tests {
                 bypass_master_fx: true,
                 reroll_on_loop: false,
                 effects: layer_effects,
+                transform: SpatialTransform::default(),
+                motion: None,
+                rack: None,
+                clip_slots: ClipSlots::singleton(ClipSlotConfig::from_legacy(
+                    "clip.mp4".to_string(),
+                    String::new(),
+                    1.0,
+                    30.0,
+                )),
+                active_clip_slot: Some(ClipSlotId::LEGACY),
+                matte: LayerMatteConfig::default(),
             }],
+            master_rack: None,
+            composition: None,
+            visual_schema_version: 0,
             master_paused: false,
             media_frozen: false,
             ntsc: None,
             modulation: None,
             temporal: None,
             morph: None,
+            scenes: Scenes::default(),
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -2236,6 +5507,336 @@ mod tests {
         assert_eq!(temporal.key_threshold, 0.1);
         assert_eq!(temporal.key_softness, 0.5);
         assert_eq!(temporal.key_history, 23.0);
+        assert_eq!(temporal.originals, TemporalOriginalsParams::default());
+    }
+
+    #[test]
+    fn temporal_originals_round_trip_only_authored_state_and_preserve_driver_tombstones() {
+        let saved_position = SavedLayerPosition::new(7).unwrap();
+        let mut originals = TemporalOriginalsConfig::default();
+        originals.loom.amount = 0.7;
+        originals.loom.topology = TemporalTopologyConfig::Kaleidoscopic;
+        originals.loom.interpolation = TemporalInterpolationConfig::Linear;
+        originals.loom.folds = 12;
+        originals.atlas.amount = 0.5;
+        originals.atlas.seed = 0xdead_beef;
+        originals.garden.amount = 0.8;
+        originals.garden.gate = RefreshGardenGateConfig::AudioOnset;
+        originals.score.enabled = true;
+        originals.score.seed = 0x1234_5678;
+        originals.score.trigger = CollisionScoreTriggerConfig::Boundary;
+        originals.score.loop_driver =
+            CollisionScoreLoopDriverConfig::SelectedLayer { saved_position };
+        originals.reset.loop_boundary = TemporalEventResetModeConfig::Memory;
+        originals.reset.downbeat = TemporalEventResetModeConfig::Score;
+
+        let configured = TemporalConfig {
+            originals: Some(originals),
+            ..TemporalConfig::default()
+        };
+        let yaml = serde_yaml::to_string(&configured).unwrap();
+        assert!(yaml.contains("originals:"));
+        assert!(yaml.contains("kind: selected_layer"));
+        assert!(!yaml.contains("layer_id"));
+        assert!(!yaml.contains("event_ordinal"));
+        assert!(!yaml.contains("history_valid"));
+        assert!(!yaml.contains("carrier"));
+        assert!(serde_yaml::from_str::<TemporalConfig>(
+            "originals:\n  score:\n    loop_driver:\n      kind: selected_layer\n      saved_position: 0\n      layer_id: 91\n"
+        )
+        .is_err());
+
+        let restored: TemporalConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.originals, Some(originals));
+        let params = restored.to_params();
+        assert_eq!(params.originals.loom.amount, 0.7);
+        assert_eq!(
+            params.originals.loom.topology,
+            TemporalTopology::Kaleidoscopic
+        );
+        assert_eq!(params.originals.atlas.seed, 0xdead_beef);
+        assert_eq!(params.originals.garden.gate, RefreshGardenGate::AudioOnset);
+        assert_eq!(params.originals.score.seed, 0x1234_5678);
+        assert_eq!(
+            params.originals.score.loop_driver,
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position }
+        );
+        assert_eq!(
+            params.originals.reset.loop_boundary,
+            TemporalEventResetMode::Memory
+        );
+
+        let tombstone = TemporalConfig {
+            originals: Some(TemporalOriginalsConfig {
+                score: CollisionScoreConfig {
+                    loop_driver: CollisionScoreLoopDriverConfig::MissingSelectedLayer {
+                        saved_position,
+                    },
+                    ..CollisionScoreConfig::default()
+                },
+                ..TemporalOriginalsConfig::default()
+            }),
+            ..TemporalConfig::default()
+        };
+        let tombstone_yaml = serde_yaml::to_string(&tombstone).unwrap();
+        assert!(tombstone_yaml.contains("kind: missing_selected_layer"));
+        let restored: TemporalConfig = serde_yaml::from_str(&tombstone_yaml).unwrap();
+        assert!(matches!(
+            restored.originals.unwrap().score.loop_driver,
+            CollisionScoreLoopDriverConfig::MissingSelectedLayer { .. }
+        ));
+    }
+
+    #[test]
+    fn motion_round_trip_is_authored_only_strict_and_resolves_selected_identity() {
+        let wanted = StableLayerId::new(91).unwrap();
+        let other = StableLayerId::new(44).unwrap();
+        let stale_position = SavedLayerPosition::new(7).unwrap();
+        let params = MotionParams {
+            algorithm_version: MOTION_ALGORITHM_VERSION,
+            field_source: MotionFieldSource::CodecVectors,
+            lattice_quality: MotionLatticeQuality::High,
+            transplant: FaradayParams {
+                amount: 0.75,
+                donor: MotionDonor::Selected {
+                    layer_id: wanted,
+                    saved_position: stale_position,
+                },
+                carrier: MotionCarrier::FirstSourceFrame,
+                confidence_threshold: 0.3,
+                confidence_softness: 0.2,
+                refresh: 0.6,
+                decay: 0.8,
+                occlusion: 0.4,
+            },
+            shutter: CurvedShutterParams {
+                angle_degrees: 225.0,
+                phase: -0.4,
+                curvature: 1.5,
+                chromatic_lag: 0.25,
+                quality: CurvedShutterQuality::High,
+            },
+        };
+        let config = MotionConfig::from_params_for_capture(params, &[other, wanted]);
+        assert_eq!(
+            config.transplant.donor,
+            MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            }
+        );
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("algorithm_version: 1"));
+        assert!(yaml.contains("field_source: codec_vectors"));
+        assert!(yaml.contains("kind: selected"));
+        assert!(!yaml.contains("layer_id"));
+        assert!(!yaml.contains("velocity_uv_per_second"));
+        assert!(!yaml.contains("carrier_valid"));
+        assert!(serde_yaml::from_str::<MotionConfig>(
+            "transplant:\n  donor:\n    kind: selected\n    saved_position: 0\n    layer_id: 91\n"
+        )
+        .is_err());
+        assert!(serde_yaml::from_str::<MotionConfig>("algorithm_version: 2\n").is_err());
+
+        let restored: MotionConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut runtime = restored.to_params();
+        assert_eq!(
+            runtime.transplant.donor,
+            MotionDonor::Missing {
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            }
+        );
+        runtime.transplant.donor = restored.transplant.donor.resolve_runtime(&[other, wanted]);
+        assert_eq!(
+            runtime.transplant.donor,
+            MotionDonor::Selected {
+                layer_id: wanted,
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            }
+        );
+        assert_eq!(runtime.shutter.quality.sample_count(), 16);
+    }
+
+    #[test]
+    fn motion_missing_tombstone_never_rebinds_and_look_preserves_live_donor() {
+        let occupied = StableLayerId::new(77).unwrap();
+        let saved_position = SavedLayerPosition::new(0).unwrap();
+        let missing = MotionDonorConfig::Missing { saved_position };
+        assert_eq!(
+            missing.resolve_runtime(&[occupied]),
+            MotionDonor::Missing { saved_position }
+        );
+
+        let selected_live = MotionDonor::Selected {
+            layer_id: occupied,
+            saved_position,
+        };
+        let mut live = MotionParams {
+            transplant: FaradayParams {
+                donor: selected_live,
+                ..FaradayParams::default()
+            },
+            ..MotionParams::default()
+        };
+        apply_motion_look(
+            MotionConfig {
+                transplant: FaradayConfig {
+                    amount: 0.9,
+                    donor: MotionDonorConfig::Missing { saved_position },
+                    ..FaradayConfig::default()
+                },
+                shutter: CurvedShutterConfig {
+                    angle_degrees: 180.0,
+                    ..CurvedShutterConfig::default()
+                },
+                ..MotionConfig::default()
+            },
+            &mut live,
+        );
+        assert_eq!(live.transplant.amount, 0.9);
+        assert_eq!(live.shutter.angle_degrees, 180.0);
+        assert_eq!(live.transplant.donor, selected_live);
+    }
+
+    #[test]
+    fn old_patch_motion_is_exact_zero_and_default_capture_stays_omitted() {
+        let old: PatchState = serde_yaml::from_str(
+            "master: {}\nmaster_transform: {}\nlayers:\n  - filename: old.mov\n",
+        )
+        .unwrap();
+        assert_eq!(old.master_motion, None);
+        assert_eq!(old.layers[0].motion, None);
+
+        let yaml = serde_yaml::to_string(&minimal_patch(1)).unwrap();
+        assert!(!yaml.contains("master_motion:"));
+        assert!(!yaml.contains("\n  motion:"));
+
+        let hostile: MotionConfig = serde_yaml::from_str(
+            "transplant:\n  amount: 8\n  confidence_threshold: .nan\n  confidence_softness: 9\n  refresh: -1\n  decay: 7\n  occlusion: 4\nshutter:\n  angle_degrees: 999\n  phase: -9\n  curvature: 7\n  chromatic_lag: 3\n",
+        )
+        .unwrap();
+        let bounded = hostile.to_params();
+        assert_eq!(bounded.transplant.amount, 1.0);
+        assert_eq!(bounded.transplant.confidence_threshold, 0.1);
+        assert_eq!(bounded.transplant.confidence_softness, 0.5);
+        assert_eq!(bounded.transplant.refresh, 0.0);
+        assert_eq!(bounded.transplant.decay, 1.0);
+        assert_eq!(bounded.transplant.occlusion, 1.0);
+        assert_eq!(bounded.shutter.angle_degrees, 360.0);
+        assert_eq!(bounded.shutter.phase, -1.0);
+        assert_eq!(bounded.shutter.curvature, 2.0);
+        assert_eq!(bounded.shutter.chromatic_lag, 1.0);
+    }
+
+    #[test]
+    fn score_driver_capture_recomputes_position_and_missing_never_rebinds() {
+        let wanted = StableLayerId::new(91).unwrap();
+        let other = StableLayerId::new(44).unwrap();
+        let stale_position = SavedLayerPosition::new(7).unwrap();
+        let actual_position = SavedLayerPosition::new(1).unwrap();
+        let selected = CollisionScoreLoopDriverConfig::from_runtime_for_capture(
+            CollisionScoreLoopDriver::SelectedLayer {
+                layer_id: wanted,
+                saved_position: stale_position,
+            },
+            &[other, wanted],
+        );
+        assert_eq!(
+            selected,
+            CollisionScoreLoopDriverConfig::SelectedLayer {
+                saved_position: actual_position
+            }
+        );
+        assert_eq!(
+            selected.resolve_runtime(&[other, wanted]),
+            CollisionScoreLoopDriver::SelectedLayer {
+                layer_id: wanted,
+                saved_position: actual_position,
+            }
+        );
+
+        let absent = CollisionScoreLoopDriverConfig::from_runtime_for_capture(
+            CollisionScoreLoopDriver::SelectedLayer {
+                layer_id: wanted,
+                saved_position: stale_position,
+            },
+            &[other],
+        );
+        assert_eq!(
+            absent,
+            CollisionScoreLoopDriverConfig::MissingSelectedLayer {
+                saved_position: stale_position
+            }
+        );
+        assert_eq!(
+            absent.resolve_runtime(&[wanted]),
+            CollisionScoreLoopDriver::MissingSelectedLayer {
+                saved_position: stale_position
+            },
+            "a tombstone must remain inert even if its old position is occupied"
+        );
+    }
+
+    #[test]
+    fn patch_apply_tombstones_an_unresolved_selected_score_driver() {
+        let saved_position = SavedLayerPosition::new(3).unwrap();
+        let mut patch = minimal_patch(0);
+        patch.temporal = Some(TemporalConfig {
+            originals: Some(TemporalOriginalsConfig {
+                score: CollisionScoreConfig {
+                    enabled: true,
+                    loop_driver: CollisionScoreLoopDriverConfig::SelectedLayer { saved_position },
+                    ..CollisionScoreConfig::default()
+                },
+                ..TemporalOriginalsConfig::default()
+            }),
+            ..TemporalConfig::default()
+        });
+
+        let mut temporal = TemporalParams::default();
+        let mut composition =
+            RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap();
+        patch
+            .apply_with_composition(
+                &mut EffectUniforms::default(),
+                &mut SpatialTransform::default(),
+                &mut [],
+                &mut RuntimeVisualRack::empty(),
+                &mut [],
+                &mut composition,
+                &mut NtscParams::default(),
+                &mut ModMatrix::new(),
+                &mut temporal,
+            )
+            .unwrap();
+        assert_eq!(
+            temporal.originals.score.loop_driver,
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position }
+        );
+
+        patch
+            .temporal
+            .as_mut()
+            .unwrap()
+            .originals
+            .as_mut()
+            .unwrap()
+            .score
+            .loop_driver = CollisionScoreLoopDriverConfig::MissingSelectedLayer { saved_position };
+        temporal.originals.score.loop_driver = CollisionScoreLoopDriver::None;
+        patch.apply(
+            &mut EffectUniforms::default(),
+            &mut SpatialTransform::default(),
+            &mut [],
+            &mut NtscParams::default(),
+            &mut ModMatrix::new(),
+            &mut temporal,
+        );
+        assert_eq!(
+            temporal.originals.score.loop_driver,
+            CollisionScoreLoopDriver::MissingSelectedLayer { saved_position },
+            "an authored tombstone must remain inert"
+        );
     }
 
     /// A patch with modulation state survives a YAML round-trip, and old
@@ -2311,10 +5912,11 @@ mod tests {
             key_threshold: 0.22,
             key_softness: 0.05,
             key_history: 4.0,
+            originals: Default::default(),
         };
 
         let patch = PatchState::capture(
-            &EffectUniforms::default(),
+            PatchMasterVisual::new(&EffectUniforms::default(), &SpatialTransform::default()),
             &[],
             &NtscParams::default(),
             &matrix,
@@ -2334,6 +5936,7 @@ mod tests {
         let mut restored_temporal = TemporalParams::default();
         parsed.apply(
             &mut EffectUniforms::default(),
+            &mut SpatialTransform::default(),
             &mut [],
             &mut NtscParams::default(),
             &mut restored,
@@ -2406,6 +6009,7 @@ mod tests {
         let lm = restored.modulate_layer_full(
             1,
             &crate::effects::EffectUniforms::default(),
+            &SpatialTransform::default(),
             0.4,
             1.0,
             30.0,
@@ -2428,6 +6032,7 @@ mod tests {
         };
         parsed.apply(
             &mut EffectUniforms::default(),
+            &mut SpatialTransform::default(),
             &mut [],
             &mut NtscParams::default(),
             &mut untouched,
@@ -2509,6 +6114,7 @@ routings:
         capped.routings.push(RoutingConfig {
             source: "lfo0".to_string(),
             target: "layer1_key".to_string(),
+            stable_target: None,
             depth: 0.5,
             curve: "linear".to_string(),
             curve_amount: 0.0,
@@ -2519,6 +6125,7 @@ routings:
             capped.routings.push(RoutingConfig {
                 source: "lfo1".to_string(),
                 target: "brightness".to_string(),
+                stable_target: None,
                 depth: 0.25,
                 curve: "linear".to_string(),
                 curve_amount: 0.0,
@@ -2529,6 +6136,7 @@ routings:
         capped.routings.push(RoutingConfig {
             source: "lfo2".to_string(),
             target: "layer1_key_threshold".to_string(),
+            stable_target: None,
             depth: 0.75,
             curve: "linear".to_string(),
             curve_amount: 0.0,
@@ -2561,6 +6169,1274 @@ routings:
         assert_eq!(
             ModConfig::from_matrix(&matrix).audio_clip_path,
             r"D:\resolved\analysis.wav"
+        );
+    }
+
+    fn empty_runtime_group_with_matte(
+        id: GroupId,
+        matte: Option<RuntimeImageMatte>,
+    ) -> RuntimeGroup {
+        RuntimeGroup {
+            id,
+            name: crate::composition::GroupName::new(format!("group-{}", id.get())).unwrap(),
+            members: RuntimeGroupMembers::default(),
+            opacity: 1.0,
+            transform: SpatialTransform::default(),
+            rack: RuntimeVisualRack::empty(),
+            matte,
+            solo: false,
+            bypass: false,
+            bus: crate::composition::BusAssignment::Program,
+        }
+    }
+
+    fn default_runtime_group_matte() -> RuntimeImageMatte {
+        RuntimeImageMatte::resolve_routes(
+            crate::visual_rack::ImageMatte::default(),
+            &mut |_| None,
+            &|_| false,
+        )
+    }
+
+    #[test]
+    fn matte_and_bus_modulation_targets_roundtrip_typed_and_never_retarget() {
+        use crate::modulation::{CompositionModParameter, GroupModParameter, SavedMissingTarget};
+
+        let target_id = GroupId::new(9).unwrap();
+        let other_id = GroupId::new(7).unwrap();
+        let target_group =
+            empty_runtime_group_with_matte(target_id, Some(default_runtime_group_matte()));
+        let other_group =
+            empty_runtime_group_with_matte(other_id, Some(default_runtime_group_matte()));
+        let composition = RuntimeComposition::try_from_parts(
+            vec![target_group.clone(), other_group.clone()],
+            vec![
+                RuntimeRootItem::Group {
+                    group_id: target_id,
+                },
+                RuntimeRootItem::Group { group_id: other_id },
+            ],
+            Some(10),
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::empty();
+        let book = StableModAddressBook::from_composition(&master, &[], &composition).unwrap();
+        let mut matrix = ModMatrix::new();
+        matrix.routings = [
+            "group/9/matte.amount",
+            "group/9/matte.threshold",
+            "group/9/matte.softness",
+            "composition/bus_crossfade",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, target)| Routing::new(ModSource::Lfo(index), target, 0.5))
+        .collect();
+
+        let captured =
+            ModConfig::from_matrix_with_composition(&matrix, &book, &[], &composition).unwrap();
+        assert_eq!(
+            captured
+                .routings
+                .iter()
+                .map(|routing| routing.stable_target)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(SavedStableModTarget::GroupValue {
+                    group_id: target_id,
+                    parameter: GroupModParameter::MatteAmount,
+                }),
+                Some(SavedStableModTarget::GroupValue {
+                    group_id: target_id,
+                    parameter: GroupModParameter::MatteThreshold,
+                }),
+                Some(SavedStableModTarget::GroupValue {
+                    group_id: target_id,
+                    parameter: GroupModParameter::MatteSoftness,
+                }),
+                Some(SavedStableModTarget::CompositionValue {
+                    parameter: CompositionModParameter::BusCrossfade,
+                }),
+            ]
+        );
+        let yaml = serde_yaml::to_string(&captured).unwrap();
+        assert!(yaml.contains("parameter: matte.amount"));
+        assert!(yaml.contains("parameter: bus_crossfade"));
+        let restored_config: ModConfig = serde_yaml::from_str(&yaml).unwrap();
+
+        // A changed internal group order cannot change the live GroupId target.
+        let reordered = RuntimeComposition::try_from_parts(
+            vec![other_group, target_group],
+            vec![
+                RuntimeRootItem::Group {
+                    group_id: target_id,
+                },
+                RuntimeRootItem::Group { group_id: other_id },
+            ],
+            Some(10),
+            0.5,
+        )
+        .unwrap();
+        let reordered_book =
+            StableModAddressBook::from_composition(&master, &[], &reordered).unwrap();
+        let mut restored_matrix = ModMatrix::new();
+        restored_config.apply_to_matrix_with_composition(
+            &mut restored_matrix,
+            &reordered_book,
+            &[],
+            &reordered,
+        );
+        assert_eq!(
+            restored_matrix.routings[0].stable_target(),
+            crate::modulation::StableModTarget::parse("group/9/matte.amount")
+        );
+        assert_eq!(
+            restored_matrix.routings[3].stable_target(),
+            crate::modulation::StableModTarget::parse("composition/bus_crossfade")
+        );
+
+        // Removing the matte makes its value address explicitly missing, but
+        // the independent composition target stays live. It cannot attach to
+        // the other group merely because that group occupies another order.
+        let missing_matte = RuntimeComposition::try_from_parts(
+            vec![empty_runtime_group_with_matte(target_id, None)],
+            vec![RuntimeRootItem::Group {
+                group_id: target_id,
+            }],
+            Some(10),
+            0.5,
+        )
+        .unwrap();
+        let missing_book =
+            StableModAddressBook::from_composition(&master, &[], &missing_matte).unwrap();
+        let mut missing_matrix = ModMatrix::new();
+        restored_config.apply_to_matrix_with_composition(
+            &mut missing_matrix,
+            &missing_book,
+            &[],
+            &missing_matte,
+        );
+        assert_eq!(
+            missing_matrix.routings[0].saved_missing_target(),
+            Some(SavedStableModTarget::MissingGroup {
+                group_id: target_id,
+                missing_target: SavedMissingTarget::GroupValue {
+                    parameter: GroupModParameter::MatteAmount,
+                },
+            })
+        );
+        assert_eq!(
+            missing_matrix.routings[3].stable_target(),
+            crate::modulation::StableModTarget::parse("composition/bus_crossfade")
+        );
+    }
+
+    fn minimal_patch(layer_count: usize) -> PatchState {
+        PatchState {
+            master: EffectsConfig::default(),
+            master_transform: SpatialTransform::default(),
+            master_motion: None,
+            layers: (0..layer_count)
+                .map(|index| {
+                    saved_layer(
+                        &format!("layer-{index}.mov"),
+                        1.0,
+                        "normal",
+                        true,
+                        false,
+                        0.0,
+                        index as u32,
+                    )
+                })
+                .collect(),
+            master_rack: None,
+            composition: None,
+            visual_schema_version: 0,
+            master_paused: false,
+            media_frozen: false,
+            ntsc: None,
+            modulation: None,
+            temporal: None,
+            morph: None,
+            scenes: Scenes::default(),
+        }
+    }
+
+    fn image_rack(source: SavedImageSource, timing: EdgeTiming) -> VisualRack {
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Mask(MaskParams::Image(
+            crate::visual_rack::ImageMatte {
+                tap: SavedImageTap { source, timing },
+                ..crate::visual_rack::ImageMatte::default()
+            },
+        )))
+        .unwrap();
+        rack
+    }
+
+    fn saved_group(
+        id: GroupId,
+        members: Vec<SavedLayerPosition>,
+        rack: VisualRack,
+    ) -> crate::composition::Group {
+        crate::composition::Group {
+            id,
+            name: crate::composition::GroupName::new(format!("group-{}", id.get())).unwrap(),
+            members: crate::composition::GroupMembers::try_from_vec(members).unwrap(),
+            opacity: 1.0,
+            transform: SpatialTransform::default(),
+            rack,
+            matte: None,
+            solo: false,
+            bypass: false,
+            bus: crate::composition::BusAssignment::Program,
+        }
+    }
+
+    #[test]
+    fn visual_schema_distinguishes_legacy_omission_explicit_empty_and_future_versions() {
+        let legacy: PatchState = serde_yaml::from_str("master: {}\nlayers: []\n").unwrap();
+        assert_eq!(legacy.visual_schema_version, 0);
+        assert!(legacy.master_rack.is_none());
+        assert!(legacy.composition.is_none());
+        assert!(legacy
+            .effective_master_rack()
+            .is_exact_legacy(LegacyRackScope::Master));
+        let legacy_yaml = serde_yaml::to_string(&legacy).unwrap();
+        assert!(!legacy_yaml.contains("visual_schema_version"));
+        assert!(!legacy_yaml.contains("master_rack"));
+
+        let mut explicit = minimal_patch(0);
+        explicit.master_rack = Some(VisualRack::empty());
+        explicit.validate_creative_persistence().unwrap();
+        assert_eq!(explicit.visual_schema_version, 1);
+        let explicit_yaml = serde_yaml::to_string(&explicit).unwrap();
+        assert!(explicit_yaml.contains("visual_schema_version: 1"));
+        let restored: PatchState = serde_yaml::from_str(&explicit_yaml).unwrap();
+        assert!(restored.master_rack.as_ref().unwrap().is_empty());
+        assert!(!restored
+            .effective_master_rack()
+            .is_exact_legacy(LegacyRackScope::Master));
+
+        assert!(serde_yaml::from_str::<PatchState>(
+            "master: {}\nlayers: []\nvisual_schema_version: 2\n"
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("unsupported visual_schema_version"));
+    }
+
+    #[test]
+    fn omitted_composition_synthesizes_legacy_back_to_front_order() {
+        let positions = (0..3)
+            .map(saved_position_at)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let flattened = legacy_composition_for_positions(&positions)
+            .unwrap()
+            .flatten()
+            .unwrap();
+        assert_eq!(
+            flattened
+                .layers
+                .iter()
+                .map(|layer| layer.layer.get())
+                .collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+    }
+
+    #[test]
+    fn exact_legacy_over_256_skips_only_the_advanced_graph_cap() {
+        const LAYERS: usize = 300;
+
+        let mut dormant = minimal_patch(LAYERS);
+        dormant.layers[0].matte = LayerMatteConfig {
+            enabled: true,
+            amount: 0.0,
+            ..LayerMatteConfig::default()
+        };
+        dormant.validate_creative_persistence().unwrap();
+
+        // This is the explicit saved shape produced by M2 patch capture. It
+        // must round-trip just like omission and remain recognizably exact.
+        let mut explicit = minimal_patch(LAYERS);
+        explicit.master_rack = Some(VisualRack::synthetic_legacy(LegacyRackScope::Master));
+        for layer in &mut explicit.layers {
+            layer.rack = Some(VisualRack::synthetic_legacy(LegacyRackScope::Layer));
+        }
+        let positions = (0..LAYERS)
+            .map(saved_position_at)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        explicit.composition = Some(legacy_composition_for_positions(&positions).unwrap());
+        explicit.validate_creative_persistence().unwrap();
+        let yaml = serde_yaml::to_string(&explicit).unwrap();
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert!(restored.is_global_legacy_exact());
+        assert_eq!(restored.layers.len(), LAYERS);
+
+        let graph_cap_error = |mut patch: PatchState| {
+            patch
+                .validate_creative_persistence()
+                .expect_err("advanced graph must retain its bounded scope cap")
+        };
+
+        let mut active_matte = minimal_patch(LAYERS);
+        active_matte.layers[0].matte = LayerMatteConfig {
+            enabled: true,
+            amount: 0.25,
+            ..LayerMatteConfig::default()
+        };
+        assert!(graph_cap_error(active_matte).contains("image graph has"));
+
+        let mut custom_rack = minimal_patch(LAYERS);
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Shift(Default::default()))
+            .unwrap();
+        custom_rack.layers[0].rack = Some(rack);
+        assert!(graph_cap_error(custom_rack).contains("image graph has"));
+
+        let mut grouped = minimal_patch(LAYERS);
+        let group_id = GroupId::new(1).unwrap();
+        let group = saved_group(group_id, vec![positions[0]], VisualRack::empty());
+        let group_root = positions
+            .iter()
+            .rev()
+            .copied()
+            .map(|layer| {
+                if layer == positions[0] {
+                    RootItem::Group { group_id }
+                } else {
+                    RootItem::Layer {
+                        layer,
+                        bus: crate::composition::BusAssignment::Program,
+                    }
+                }
+            })
+            .collect();
+        grouped.composition =
+            Some(CompositionTree::try_from_parts(vec![group], group_root, Some(2), 0.5).unwrap());
+        assert!(graph_cap_error(grouped).contains("image graph has"));
+
+        let mut non_program = minimal_patch(LAYERS);
+        let root = positions
+            .iter()
+            .rev()
+            .copied()
+            .enumerate()
+            .map(|(index, layer)| RootItem::Layer {
+                layer,
+                bus: if index == 0 {
+                    crate::composition::BusAssignment::A
+                } else {
+                    crate::composition::BusAssignment::Program
+                },
+            })
+            .collect();
+        non_program.composition =
+            Some(CompositionTree::try_from_parts(Vec::new(), root, Some(1), 0.5).unwrap());
+        assert!(graph_cap_error(non_program).contains("image graph has"));
+    }
+
+    #[test]
+    fn saved_visual_graph_rejects_current_cycles_but_allows_prelocal_and_previous_frame() {
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let pos1 = SavedLayerPosition::new(1).unwrap();
+        let mut cyclic = minimal_patch(2);
+        cyclic.layers[0].rack = Some(image_rack(
+            SavedImageSource::SelectedLayer {
+                layer_position: pos1,
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            EdgeTiming::CurrentFrame,
+        ));
+        cyclic.layers[1].rack = Some(image_rack(
+            SavedImageSource::SelectedLayer {
+                layer_position: pos0,
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            EdgeTiming::CurrentFrame,
+        ));
+        let live = minimal_patch(2);
+        let live_before = serde_yaml::to_string(&live).unwrap();
+        let hostile_yaml = serde_yaml::to_string(&cyclic).unwrap();
+        assert!(serde_yaml::from_str::<PatchState>(&hostile_yaml)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("cycle"));
+        assert_eq!(serde_yaml::to_string(&live).unwrap(), live_before);
+
+        let mut prelocal = minimal_patch(1);
+        prelocal.layers[0].rack = Some(image_rack(
+            SavedImageSource::SelectedLayer {
+                layer_position: pos0,
+                stage: LayerImageStage::PreLocalEffects,
+            },
+            EdgeTiming::CurrentFrame,
+        ));
+        prelocal.validate_creative_persistence().unwrap();
+
+        let mut previous = minimal_patch(1);
+        previous.layers[0].rack = Some(image_rack(
+            SavedImageSource::SelectedLayer {
+                layer_position: pos0,
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            EdgeTiming::PreviousFrame,
+        ));
+        previous.validate_creative_persistence().unwrap();
+    }
+
+    #[test]
+    fn group_structural_edges_reject_own_output_and_allow_a_preceding_sibling() {
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let pos1 = SavedLayerPosition::new(1).unwrap();
+        let group1 = GroupId::new(1).unwrap();
+        let group2 = GroupId::new(2).unwrap();
+
+        let mut own_output = minimal_patch(1);
+        own_output.layers[0].rack = Some(image_rack(
+            SavedImageSource::GroupOutput { group_id: group1 },
+            EdgeTiming::CurrentFrame,
+        ));
+        own_output.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![saved_group(group1, vec![pos0], VisualRack::empty())],
+                vec![RootItem::Group { group_id: group1 }],
+                Some(2),
+                0.5,
+            )
+            .unwrap(),
+        );
+        assert!(own_output
+            .validate_creative_persistence()
+            .unwrap_err()
+            .contains("cycle"));
+
+        let mut self_group = minimal_patch(1);
+        self_group.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![saved_group(
+                    group1,
+                    vec![pos0],
+                    image_rack(
+                        SavedImageSource::GroupOutput { group_id: group1 },
+                        EdgeTiming::CurrentFrame,
+                    ),
+                )],
+                vec![RootItem::Group { group_id: group1 }],
+                Some(2),
+                0.5,
+            )
+            .unwrap(),
+        );
+        assert!(self_group
+            .validate_creative_persistence()
+            .unwrap_err()
+            .contains("cycle"));
+
+        let mut sibling = minimal_patch(2);
+        sibling.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![
+                    saved_group(group1, vec![pos0], VisualRack::empty()),
+                    saved_group(
+                        group2,
+                        vec![pos1],
+                        image_rack(
+                            SavedImageSource::GroupOutput { group_id: group1 },
+                            EdgeTiming::CurrentFrame,
+                        ),
+                    ),
+                ],
+                vec![
+                    RootItem::Group { group_id: group1 },
+                    RootItem::Group { group_id: group2 },
+                ],
+                Some(3),
+                0.5,
+            )
+            .unwrap(),
+        );
+        sibling.validate_creative_persistence().unwrap();
+    }
+
+    #[test]
+    fn dormant_image_edges_round_trip_under_the_live_planner_active_edge_law() {
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let self_source = SavedImageSource::GroupOutput { group_id };
+        let round_trip = |mut patch: PatchState| {
+            patch.validate_creative_persistence().unwrap();
+            let yaml = serde_yaml::to_string(&patch).unwrap();
+            serde_yaml::from_str::<PatchState>(&yaml).unwrap()
+        };
+
+        let mut disabled = image_rack(self_source, EdgeTiming::CurrentFrame);
+        let disabled_id = disabled.iter().next().unwrap().stable_id;
+        disabled.get_mut(disabled_id).unwrap().enabled = false;
+        let mut zero_wet = image_rack(self_source, EdgeTiming::CurrentFrame);
+        let zero_wet_id = zero_wet.iter().next().unwrap().stable_id;
+        zero_wet.get_mut(zero_wet_id).unwrap().wet = 0.0;
+        let mut zero_mask_amount = image_rack(self_source, EdgeTiming::CurrentFrame);
+        let zero_amount_node = zero_mask_amount.iter().next().unwrap().stable_id;
+        let VisualNodeKind::Mask(MaskParams::Image(matte)) =
+            &mut zero_mask_amount.get_mut(zero_amount_node).unwrap().kind
+        else {
+            panic!("fixture must remain an image mask");
+        };
+        matte.amount = 0.0;
+
+        for dormant_rack in [disabled, zero_wet, zero_mask_amount] {
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], dormant_rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            let _restored = round_trip(patch);
+        }
+
+        let self_matte = |amount| crate::visual_rack::ImageMatte {
+            tap: SavedImageTap {
+                source: self_source,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount,
+            ..crate::visual_rack::ImageMatte::default()
+        };
+
+        let mut zero_group_matte = saved_group(group_id, vec![pos0], VisualRack::empty());
+        zero_group_matte.matte = Some(self_matte(0.0));
+        let mut patch = minimal_patch(1);
+        patch.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![zero_group_matte],
+                vec![RootItem::Group { group_id }],
+                Some(2),
+                0.5,
+            )
+            .unwrap(),
+        );
+        let _restored = round_trip(patch);
+
+        let mut bypassed = saved_group(
+            group_id,
+            vec![pos0],
+            image_rack(self_source, EdgeTiming::CurrentFrame),
+        );
+        bypassed.matte = Some(self_matte(1.0));
+        bypassed.bypass = true;
+        let mut patch = minimal_patch(1);
+        patch.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![bypassed],
+                vec![RootItem::Group { group_id }],
+                Some(2),
+                0.5,
+            )
+            .unwrap(),
+        );
+        let restored = round_trip(patch);
+        assert!(
+            restored
+                .composition
+                .unwrap()
+                .group(group_id)
+                .unwrap()
+                .bypass
+        );
+
+        let mut zero_layer_matte = minimal_patch(1);
+        zero_layer_matte.layers[0].matte = LayerMatteConfig {
+            enabled: true,
+            input: SavedImageInput::SelectedLayer {
+                layer_position: pos0,
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            amount: 0.0,
+            ..LayerMatteConfig::default()
+        };
+        let restored = round_trip(zero_layer_matte);
+        assert!(restored.layers[0].matte.enabled);
+        assert_eq!(restored.layers[0].matte.amount, 0.0);
+    }
+
+    #[test]
+    fn every_persisted_group_identity_advances_one_shared_cursor_without_reuse() {
+        use crate::modulation::{GroupModParameter, SavedMissingTarget, StableNodeParameter};
+
+        let group_id = |raw| GroupId::new(raw).unwrap();
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+
+        let mut live_group = saved_group(
+            group_id(1),
+            vec![pos0],
+            image_rack(
+                SavedImageSource::MissingGroupOutput {
+                    group_id: group_id(2),
+                },
+                EdgeTiming::CurrentFrame,
+            ),
+        );
+        live_group.matte = Some(crate::visual_rack::ImageMatte {
+            tap: SavedImageTap {
+                source: SavedImageSource::MissingGroupOutput {
+                    group_id: group_id(3),
+                },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            ..crate::visual_rack::ImageMatte::default()
+        });
+
+        let mut patch = minimal_patch(1);
+        patch.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![live_group],
+                vec![RootItem::Group {
+                    group_id: group_id(1),
+                }],
+                Some(4),
+                0.5,
+            )
+            .unwrap(),
+        );
+        patch.master_rack = Some(image_rack(
+            SavedImageSource::MissingGroupOutput {
+                group_id: group_id(4),
+            },
+            EdgeTiming::CurrentFrame,
+        ));
+        patch.layers[0].rack = Some(image_rack(
+            SavedImageSource::MissingGroupOutput {
+                group_id: group_id(5),
+            },
+            EdgeTiming::CurrentFrame,
+        ));
+        patch.layers[0].matte = LayerMatteConfig {
+            input: SavedImageInput::MissingGroupOutput {
+                group_id: group_id(6),
+            },
+            ..LayerMatteConfig::default()
+        };
+
+        let mut morph_group = saved_group(
+            group_id(9),
+            vec![pos0],
+            image_rack(
+                SavedImageSource::MissingGroupOutput {
+                    group_id: group_id(10),
+                },
+                EdgeTiming::CurrentFrame,
+            ),
+        );
+        morph_group.matte = Some(crate::visual_rack::ImageMatte {
+            tap: SavedImageTap {
+                source: SavedImageSource::MissingGroupOutput {
+                    group_id: group_id(11),
+                },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            ..crate::visual_rack::ImageMatte::default()
+        });
+        let morph_composition = CompositionTree::try_from_parts(
+            vec![morph_group],
+            vec![RootItem::Group {
+                group_id: group_id(9),
+            }],
+            Some(12),
+            0.5,
+        )
+        .unwrap();
+        patch.morph = Some(crate::morph::MorphStateSnapshot {
+            a: Some(crate::morph::MorphSlot {
+                master_rack: Some(image_rack(
+                    SavedImageSource::MissingGroupOutput {
+                        group_id: group_id(7),
+                    },
+                    EdgeTiming::CurrentFrame,
+                )),
+                layer_racks: Some(vec![image_rack(
+                    SavedImageSource::MissingGroupOutput {
+                        group_id: group_id(8),
+                    },
+                    EdgeTiming::CurrentFrame,
+                )]),
+                composition: Some(morph_composition),
+                ..crate::morph::MorphSlot::default()
+            }),
+            ..crate::morph::MorphStateSnapshot::default()
+        });
+
+        let node_id = NodeId::new(1).unwrap();
+        let stable_targets = [
+            SavedStableModTarget::GroupValue {
+                group_id: group_id(12),
+                parameter: GroupModParameter::Opacity,
+            },
+            SavedStableModTarget::MissingGroup {
+                group_id: group_id(13),
+                missing_target: SavedMissingTarget::GroupValue {
+                    parameter: GroupModParameter::Opacity,
+                },
+            },
+            SavedStableModTarget::Node {
+                scope: SavedStableModScope::Group {
+                    group_id: group_id(14),
+                },
+                node_id,
+                parameter: StableNodeParameter::Wet,
+            },
+            SavedStableModTarget::MissingNode {
+                scope: SavedStableModScope::Group {
+                    group_id: group_id(15),
+                },
+                node_id,
+                parameter: StableNodeParameter::Wet,
+            },
+        ];
+        let mut modulation = ModConfig::from_matrix(&ModMatrix::new());
+        modulation.routings = stable_targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, stable_target)| RoutingConfig {
+                source: format!("lfo{}", index % NUM_LFOS),
+                target: stable_target.persistence_key(),
+                stable_target: Some(stable_target),
+                depth: 0.5,
+                curve: "linear".to_string(),
+                curve_amount: 0.0,
+                attack: 0.0,
+                release: 0.0,
+            })
+            .collect();
+        patch.modulation = Some(modulation);
+
+        assert_eq!(
+            patch
+                .persisted_group_ids()
+                .into_iter()
+                .map(GroupId::get)
+                .collect::<Vec<_>>(),
+            (1..=15).collect::<Vec<_>>()
+        );
+        patch.validate_creative_persistence().unwrap();
+        assert_eq!(patch.composition.as_ref().unwrap().next_group_id_raw(), 16);
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        let mut restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        let composition = restored.composition.as_mut().unwrap();
+        assert_eq!(composition.next_group_id_raw(), 16);
+        let first = composition
+            .insert_empty_group(
+                crate::composition::GroupName::new("first-after-tombstones").unwrap(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(first, group_id(16));
+        composition.remove_group_ungroup(first).unwrap();
+        let second = composition
+            .insert_empty_group(
+                crate::composition::GroupName::new("second-after-delete").unwrap(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(second, group_id(17));
+    }
+
+    #[test]
+    fn low_cursor_yaml_reserves_morph_and_modulation_node_ids_per_owner() {
+        use crate::modulation::StableNodeParameter;
+
+        fn retired_rack(next_node_id: u64) -> VisualRack {
+            VisualRack::try_from_parts(Vec::new(), Some(next_node_id)).unwrap()
+        }
+
+        let position = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let morph_composition = |next_node_id| {
+            CompositionTree::try_from_parts(
+                vec![saved_group(
+                    group_id,
+                    vec![position],
+                    retired_rack(next_node_id),
+                )],
+                vec![RootItem::Group { group_id }],
+                Some(2),
+                0.5,
+            )
+            .unwrap()
+        };
+
+        let mut patch = minimal_patch(1);
+        // All three current owners expose the lowest valid authored cursor.
+        patch.master_rack = Some(retired_rack(3));
+        patch.layers[0].rack = Some(retired_rack(3));
+        patch.composition = Some(
+            CompositionTree::try_from_parts(
+                vec![saved_group(group_id, vec![position], retired_rack(3))],
+                vec![RootItem::Group { group_id }],
+                Some(2),
+                0.5,
+            )
+            .unwrap(),
+        );
+        // Empty Morph racks still retain every identity below their cursor.
+        // Both slots participate in the same owner-specific allocation law.
+        patch.morph = Some(crate::morph::MorphStateSnapshot {
+            a: Some(crate::morph::MorphSlot {
+                master_rack: Some(retired_rack(8)),
+                layer_racks: Some(vec![retired_rack(12)]),
+                composition: Some(morph_composition(16)),
+                ..crate::morph::MorphSlot::default()
+            }),
+            b: Some(crate::morph::MorphSlot {
+                master_rack: Some(retired_rack(9)),
+                layer_racks: Some(vec![retired_rack(13)]),
+                composition: Some(morph_composition(17)),
+                ..crate::morph::MorphSlot::default()
+            }),
+            ..crate::morph::MorphStateSnapshot::default()
+        });
+
+        let node_id = |raw| NodeId::new(raw).unwrap();
+        let stable_targets = [
+            SavedStableModTarget::Node {
+                scope: SavedStableModScope::Master,
+                node_id: node_id(9),
+                parameter: StableNodeParameter::Wet,
+            },
+            SavedStableModTarget::MissingNode {
+                scope: SavedStableModScope::Master,
+                node_id: node_id(10),
+                parameter: StableNodeParameter::Wet,
+            },
+            SavedStableModTarget::Node {
+                scope: SavedStableModScope::SavedLayer { position },
+                node_id: node_id(13),
+                parameter: StableNodeParameter::Wet,
+            },
+            SavedStableModTarget::MissingNode {
+                scope: SavedStableModScope::SavedLayer { position },
+                node_id: node_id(14),
+                parameter: StableNodeParameter::Wet,
+            },
+            SavedStableModTarget::Node {
+                scope: SavedStableModScope::Group { group_id },
+                node_id: node_id(17),
+                parameter: StableNodeParameter::Wet,
+            },
+            SavedStableModTarget::MissingNode {
+                scope: SavedStableModScope::Group { group_id },
+                node_id: node_id(18),
+                parameter: StableNodeParameter::Wet,
+            },
+        ];
+        let mut modulation = ModConfig::from_matrix(&ModMatrix::new());
+        modulation.routings = stable_targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, stable_target)| RoutingConfig {
+                source: format!("lfo{}", index % NUM_LFOS),
+                target: stable_target.persistence_key(),
+                stable_target: Some(stable_target),
+                depth: 0.5,
+                curve: "linear".to_string(),
+                curve_amount: 0.0,
+                attack: 0.0,
+                release: 0.0,
+            })
+            .collect();
+        patch.modulation = Some(modulation);
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(yaml.contains("next_node_id: 3"));
+        let mut restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+
+        let master_id = restored
+            .master_rack
+            .as_mut()
+            .unwrap()
+            .push(VisualNodeKind::Shift(Default::default()))
+            .unwrap();
+        let layer_id = restored.layers[0]
+            .rack
+            .as_mut()
+            .unwrap()
+            .push(VisualNodeKind::Shift(Default::default()))
+            .unwrap();
+        let group_node_id = restored
+            .composition
+            .as_mut()
+            .unwrap()
+            .group_mut(group_id)
+            .unwrap()
+            .rack
+            .push(VisualNodeKind::Shift(Default::default()))
+            .unwrap();
+        assert_eq!(master_id, node_id(11));
+        assert_eq!(layer_id, node_id(15));
+        assert_eq!(group_node_id, node_id(19));
+
+        // Repair is persisted across both Morph slots as well, so no saved
+        // representation of the same owner can later reintroduce reuse.
+        let morph = restored.morph.as_ref().unwrap();
+        for slot in [morph.a.as_ref().unwrap(), morph.b.as_ref().unwrap()] {
+            assert_eq!(slot.master_rack.as_ref().unwrap().next_node_id_raw(), 11);
+            assert_eq!(slot.layer_racks.as_ref().unwrap()[0].next_node_id_raw(), 15);
+            assert_eq!(
+                slot.composition
+                    .as_ref()
+                    .unwrap()
+                    .group(group_id)
+                    .unwrap()
+                    .rack
+                    .next_node_id_raw(),
+                19
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_retained_node_id_exhausts_instead_of_wrapping() {
+        use crate::modulation::StableNodeParameter;
+
+        let mut patch = minimal_patch(0);
+        patch.master_rack = Some(VisualRack::empty());
+        let target = SavedStableModTarget::MissingNode {
+            scope: SavedStableModScope::Master,
+            node_id: NodeId::new(u64::MAX).unwrap(),
+            parameter: StableNodeParameter::Wet,
+        };
+        let mut modulation = ModConfig::from_matrix(&ModMatrix::new());
+        modulation.routings = vec![RoutingConfig {
+            source: "lfo0".to_string(),
+            target: target.persistence_key(),
+            stable_target: Some(target),
+            depth: 0.5,
+            curve: "linear".to_string(),
+            curve_amount: 0.0,
+            attack: 0.0,
+            release: 0.0,
+        }];
+        patch.modulation = Some(modulation);
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        let mut restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        let rack = restored.master_rack.as_mut().unwrap();
+        assert_eq!(rack.next_node_id_raw(), 0);
+        assert_eq!(
+            rack.push(VisualNodeKind::Shift(Default::default())),
+            Err(crate::visual_rack::RackError::NodeIdExhausted)
+        );
+    }
+
+    #[test]
+    fn synthesized_legacy_rack_reserves_retired_ids_before_runtime_publication() {
+        use crate::modulation::StableNodeParameter;
+
+        let mut patch = minimal_patch(0);
+        patch.morph = Some(crate::morph::MorphStateSnapshot {
+            a: Some(crate::morph::MorphSlot {
+                master_rack: Some(VisualRack::try_from_parts(Vec::new(), Some(8)).unwrap()),
+                ..crate::morph::MorphSlot::default()
+            }),
+            ..crate::morph::MorphStateSnapshot::default()
+        });
+        let target = SavedStableModTarget::MissingNode {
+            scope: SavedStableModScope::Master,
+            node_id: NodeId::new(10).unwrap(),
+            parameter: StableNodeParameter::Wet,
+        };
+        let mut modulation = ModConfig::from_matrix(&ModMatrix::new());
+        modulation.routings = vec![RoutingConfig {
+            source: "lfo0".to_string(),
+            target: target.persistence_key(),
+            stable_target: Some(target),
+            depth: 0.5,
+            curve: "linear".to_string(),
+            curve_amount: 0.0,
+            attack: 0.0,
+            release: 0.0,
+        }];
+        patch.modulation = Some(modulation);
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert!(restored.master_rack.is_none());
+
+        let mut runtime_master = RuntimeVisualRack::empty();
+        let mut runtime_composition =
+            RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap();
+        restored
+            .apply_with_composition(
+                &mut EffectUniforms::default(),
+                &mut SpatialTransform::default(),
+                &mut [],
+                &mut runtime_master,
+                &mut [],
+                &mut runtime_composition,
+                &mut NtscParams::default(),
+                &mut ModMatrix::new(),
+                &mut TemporalParams::default(),
+            )
+            .unwrap();
+        assert_eq!(runtime_master.next_node_id_raw(), 11);
+        assert_eq!(
+            runtime_master
+                .push(crate::visual_rack::RuntimeVisualNodeKind::Shift(
+                    Default::default(),
+                ))
+                .unwrap(),
+            NodeId::new(11).unwrap()
+        );
+    }
+
+    #[test]
+    fn synthesized_legacy_composition_reserves_persisted_group_tombstones() {
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let tombstone = GroupId::new(7).unwrap();
+        let mut patch = minimal_patch(1);
+        patch.layers[0].matte = LayerMatteConfig {
+            input: SavedImageInput::MissingGroupOutput {
+                group_id: tombstone,
+            },
+            ..LayerMatteConfig::default()
+        };
+
+        let mut synthesized = legacy_composition_for_positions(&[pos0]).unwrap();
+        patch.reserve_persisted_group_ids(&mut synthesized);
+        let allocated = synthesized
+            .insert_empty_group(
+                crate::composition::GroupName::new("after-legacy-tombstone").unwrap(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(allocated, GroupId::new(8).unwrap());
+        synthesized.remove_group_ungroup(allocated).unwrap();
+        assert_eq!(synthesized.next_group_id_raw(), 9);
+    }
+
+    #[test]
+    fn image_graph_counts_logical_taps_without_expanding_all_below_prefixes() {
+        let mut previous_overflow = minimal_patch(9);
+        for (position, layer) in previous_overflow.layers.iter_mut().enumerate() {
+            layer.rack = Some(image_rack(
+                SavedImageSource::SelectedLayer {
+                    layer_position: saved_position_at(position).unwrap(),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                EdgeTiming::PreviousFrame,
+            ));
+        }
+        assert!(previous_overflow
+            .validate_creative_persistence()
+            .unwrap_err()
+            .contains("previous-frame taps"));
+
+        let mut all_below = minimal_patch(66);
+        all_below.master_rack = Some(image_rack(
+            SavedImageSource::AllBelow,
+            EdgeTiming::CurrentFrame,
+        ));
+        all_below.validate_creative_persistence().unwrap();
+    }
+
+    #[test]
+    fn below_topology_never_double_counts_members_as_their_group_output() {
+        let positions = (0..4)
+            .map(saved_position_at)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let composition = CompositionTree::try_from_parts(
+            vec![saved_group(
+                group_id,
+                vec![positions[1], positions[2]],
+                VisualRack::empty(),
+            )],
+            vec![
+                RootItem::Layer {
+                    layer: positions[0],
+                    bus: crate::composition::BusAssignment::Program,
+                },
+                RootItem::Group { group_id },
+                RootItem::Layer {
+                    layer: positions[3],
+                    bus: crate::composition::BusAssignment::Program,
+                },
+            ],
+            Some(2),
+            0.5,
+        )
+        .unwrap();
+        let (_, below, _) = validation_topology(&composition).unwrap();
+        let layer0 = validation_layer_scope(positions[0]).unwrap();
+        let member1 = validation_layer_scope(positions[1]).unwrap();
+        let member2 = validation_layer_scope(positions[2]).unwrap();
+        let layer3 = validation_layer_scope(positions[3]).unwrap();
+        let group = VisualScopeId::Group(group_id);
+        assert_eq!(below[&member1], vec![layer0]);
+        assert_eq!(below[&member2], vec![layer0, member1]);
+        assert_eq!(below[&group], vec![layer0]);
+        assert_eq!(below[&layer3], vec![layer0, group]);
+        assert_eq!(below[&VisualScopeId::Master], vec![layer0, group, layer3]);
+    }
+
+    #[test]
+    fn apply_look_matches_groups_independently_and_reports_exact_stable_ids() {
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let pos1 = SavedLayerPosition::new(1).unwrap();
+        let layer_ids = [
+            StableLayerId::new(101).unwrap(),
+            StableLayerId::new(202).unwrap(),
+        ];
+        let group1 = GroupId::new(1).unwrap();
+        let group2 = GroupId::new(2).unwrap();
+
+        let mut rack1 = VisualRack::empty();
+        let node1 = rack1
+            .push(VisualNodeKind::Transform(SpatialTransform {
+                position: [0.2, -0.3],
+                ..SpatialTransform::default()
+            }))
+            .unwrap();
+        let mut rack2 = VisualRack::empty();
+        let node2 = rack2
+            .push(VisualNodeKind::Shift(crate::visual_rack::ShiftParams {
+                amount: 0.7,
+                ..crate::visual_rack::ShiftParams::default()
+            }))
+            .unwrap();
+        let mut saved1 = saved_group(group1, vec![pos0], rack1);
+        saved1.opacity = 0.25;
+        saved1.transform.rotation_deg = 17.0;
+        let mut saved2 = saved_group(group2, vec![pos1], rack2);
+        saved2.opacity = 0.35;
+        let saved = CompositionTree::try_from_parts(
+            vec![saved1, saved2],
+            vec![
+                RootItem::Group { group_id: group1 },
+                RootItem::Group { group_id: group2 },
+            ],
+            Some(3),
+            0.2,
+        )
+        .unwrap();
+        let mut live = saved
+            .resolve(|position| position.resolve(&layer_ids).copied())
+            .unwrap();
+        {
+            let live1 = live.group_mut(group1).unwrap();
+            live1.opacity = 0.91;
+            live1.transform.rotation_deg = -44.0;
+            live1.rack.get_mut(node1).unwrap().wet = 0.1;
+        }
+        {
+            let live2 = live.group_mut(group2).unwrap();
+            live2.opacity = 0.82;
+            live2.rack.get_mut(node2).unwrap().wet = 0.2;
+            live2
+                .rack
+                .push(crate::visual_rack::RuntimeVisualNodeKind::Grain(
+                    crate::visual_rack::GrainParams::default(),
+                ))
+                .unwrap();
+        }
+        live.set_bus_crossfade(0.8);
+
+        let mut summary = LookApplySummary::default();
+        apply_saved_composition_look(&saved, &mut live, &layer_ids, &mut summary);
+
+        assert_eq!(summary.applied_group_ids, vec![group1]);
+        assert_eq!(summary.skipped_group_ids, vec![group2]);
+        assert_eq!(summary.applied_groups, 1);
+        assert_eq!(summary.skipped_groups, 1);
+        assert_eq!(
+            summary.applied_nodes,
+            vec![LookNodeRef {
+                scope: LookRackScope::Group(group1),
+                node_id: node1,
+            }]
+        );
+        assert_eq!(
+            summary.skipped_nodes,
+            vec![LookNodeRef {
+                scope: LookRackScope::Group(group2),
+                node_id: node2,
+            }]
+        );
+        assert!(summary.applied_bus_crossfade);
+        assert_eq!(live.bus_crossfade(), 0.2);
+        let applied = live.group(group1).unwrap();
+        assert_eq!(applied.opacity, 0.25);
+        assert_eq!(applied.transform.rotation_deg, 17.0);
+        assert_eq!(applied.rack.get(node1).unwrap().wet, 1.0);
+        let skipped = live.group(group2).unwrap();
+        assert_eq!(skipped.opacity, 0.82);
+        assert_eq!(skipped.rack.get(node2).unwrap().wet, 0.2);
+    }
+
+    #[test]
+    fn apply_look_never_retargets_a_live_layer_matte() {
+        let layer_ids = [
+            StableLayerId::new(101).unwrap(),
+            StableLayerId::new(202).unwrap(),
+        ];
+        let sampled = LayerMatteConfig {
+            enabled: true,
+            input: SavedImageInput::SelectedLayer {
+                layer_position: SavedLayerPosition::new(0).unwrap(),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            channel: crate::image_routing::MatteChannel::Luma,
+            invert: true,
+            amount: 0.8,
+            threshold: 0.3,
+            softness: 0.2,
+        };
+        let mut live = LayerMatte {
+            enabled: true,
+            input: crate::image_routing::ImageInput::SelectedLayer {
+                layer_id: layer_ids[1],
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            channel: crate::image_routing::MatteChannel::Luma,
+            invert: true,
+            amount: 0.1,
+            threshold: 0.6,
+            softness: 0.4,
+        };
+        let rerouted = live;
+        assert!(!apply_layer_matte_look_values(
+            sampled, &mut live, &layer_ids
+        ));
+        assert_eq!(live, rerouted);
+
+        live.input = crate::image_routing::ImageInput::SelectedLayer {
+            layer_id: layer_ids[0],
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        assert!(apply_layer_matte_look_values(
+            sampled, &mut live, &layer_ids
+        ));
+        assert_eq!(live.amount, 0.8);
+        assert_eq!(live.threshold, 0.3);
+        assert_eq!(live.softness, 0.2);
+        assert_eq!(
+            live.input,
+            crate::image_routing::ImageInput::SelectedLayer {
+                layer_id: layer_ids[0],
+                stage: LayerImageStage::PostLocalEffects,
+            }
         );
     }
 }

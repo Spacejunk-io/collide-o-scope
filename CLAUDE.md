@@ -12,7 +12,7 @@ render a saved patch offline.
 - **ffmpeg CLI** — thumbnails and final H.264/AAC muxing
 - **ntsc-rs** — CPU VHS emulation on bounded workers
 - **cpal** — live audio capture
-- **midir** — MIDI CC and clock input
+- **midir** — supervised MIDI input/output, clock, typed profiles, and feedback
 - **spout2-rs** — Windows Spout sender and receiver
 - **axum + tokio** — HTTP/HTTPS panel and WebSocket state/action protocol
 - **egui** — native preview/recovery shell and patch parameter editor
@@ -23,31 +23,53 @@ The `ffmpeg-next = "8"` crate must match the installed FFmpeg major.
 
 ```text
 src/
-├── main.rs              winit loop, recovery strip, app state, web actions, patch reconstruction
+├── main.rs              winit loop, app transactions, history, capture, web/native actions
+├── composition.rs       stable-ID groups, buses, mattes, and authored composition topology
+├── evaluated_composition.rs unified LegacyExact/Advanced planner and resource admission
+├── visual_rack.rs       ordered scope racks, typed nodes, taps, validation, persistence
+├── image_routing.rs     stable layer/group image routes and missing-target tombstones
 ├── media_safety.rs      Safe/Expert source planning, device bounds, reservations
 ├── media_source.rs      shared resolution, bounded SHA-256 fingerprinting, content references
-├── renderer/state.rs    wgpu passes, temporal state, async readbacks/output blits
+├── spatial.rs           canonical authored transforms and packed GPU pass uniforms
+├── motion.rs            canonical codec/lattice fields, Motion authoring, resource preflight
+├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
+├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
+├── renderer/composition.rs shared Advanced GPU executor and transactional histories
+├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
-├── video/threaded.rs    request-driven decoder, first-frame seed, latest-only mailbox
+├── video/threaded.rs    request decoder, codec motion, telemetry, latest-only mailbox
 ├── layers/mod.rs        video/Spout layer sources, texture upload, frame pacer
 ├── effects/params.rs    effect and temporal parameters/normalization
-├── modulation/mod.rs    clock, LFOs, expressive inputs, routes, curves, slew
+├── modulation/mod.rs    stable typed targets, clock/LFO/audio/MIDI routes, curves, slew
 ├── audio/mod.rs         cpal capture, FFT sources, configurable edges/spectrum
-├── midi/mod.rs          MIDI CC learn table and clock
+├── controller_profile.rs bounded saved-position profiles and atomic persistence
+├── midi/mod.rs          supervised typed MIDI events, hotplug, clock, feedback
+├── osc.rs               bounded typed OSC ingress/feedback and LAN-safe configuration
+├── history.rs           bounded manual gestures and two-phase undo/redo
+├── preset.rs            identity-safe scoped presets and atomic library persistence
+├── recovery_journal.rs  checksummed append-only PatchState recovery journal
 ├── morph.rs             A/B snapshots, blend laws, beat glides, persistence
 ├── ntsc/mod.rs          ntsc-rs parameters/state and worker
 ├── spout_in.rs          newest-frame-wins live receiver worker
 ├── spout_out.rs         bounded/drop-new output worker
+├── program_recorder.rs  nonblocking CFR video/still publication and sidecar reports
+├── stage_map.rs         venue endpoints/slices, monitor bindings, calibration tools
+├── stage_health.rs      preview-only timing/resource/source health HUD
+├── proxy.rs             measured proxy recommendation and content-addressed cache plan
+├── precision.rs         objective color metrics and precision/capability accounting
+├── study.rs             closed data-only SSA Study schema and authority validation
 ├── patch/               YAML model, capture/apply, editor and file dialogs
-├── procedural.rs        deterministic typed patch walk, manifests/preflight, capture worker
-├── render_export.rs     deterministic offline renderer and optional audio mux
+├── procedural.rs        deterministic v7 typed patch walk, manifests/preflight, capture worker
+├── render_export.rs     deterministic shared executor, motion report, optional audio mux
 ├── web/                 panel server, protocol snapshots/actions, embedded assets
 ├── input/keyboard.rs    key-to-action mapping
 └── shaders/
     ├── fullscreen.wgsl  fullscreen triangle vertex shader
-    ├── effects.wgsl     layer/master effect shader
-    ├── composite.wgsl   layer blending
-    └── temporal.wgsl    feedback and arbitrary-angle slit-scan
+    ├── effects.wgsl     LegacyExact and Advanced layer/master effects
+    ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
+    ├── composition_host.wgsl straight storage; premultiplied A/B/group math
+    ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
+    └── temporal*.wgsl   legacy Temporal plus Loom/Atlas/Garden/Score
 ```
 
 `src/bin/spout_probe.rs` is the external-process probe for the Spout output.
@@ -115,6 +137,42 @@ nonblocking source receive/decode
 The exporter follows the same effect, morph, modulation, NTSC, and temporal
 helpers where possible. Time-dependent offline behavior must derive from
 `frame_index`, export FPS, and patch state—not wall time or a live input.
+
+### Spatial transform contract
+
+`SpatialTransform` is the sole authored geometry for master and layer scopes.
+Position is normalized composition space; anchor is original-source UV. The
+forward order is crop/framing, independent scale, axis-directed shear,
+rotation, then position about the anchor. Rotation/shear is conjugated through
+output-aspect space so physical angles stay correct on non-square outputs.
+Changing anchor alone must remain visually inert. Sanitize all finite inputs,
+wrap angles, prevent crop collapse, and fail singular transforms to transparent.
+
+`SpatialTransform::default()` is Stretch + Transparent + Linear identity. Its
+identity is special: `spatial_modes.w == 0` selects the exact historical shader
+sample, so old patches stay pixel-compatible. Once a position, scale, crop,
+angle, fit, edge, or sampling choice activates the path, Transparent owns newly
+exposed canvas unless Clamp was explicitly authored. The host-session new-layer
+preference defaults to Fit and applies only to future interactive file/still/
+Spout layers, always with Transparent edges; PatchState and exact recall do not
+own or consume it. Do not reintroduce an implicit border clamp in Shift, Cellular, or
+another UV effect after the spatial path becomes active.
+
+Every effects pass uploads the 224-byte `EffectPassUniforms`, never the legacy
+160-byte block by itself. Build it only through `EffectPassUniforms::for_target`:
+layers use actual source dimensions and masters use output/output. Both live and
+export bind Linear and Nearest samplers and apply the same transform in ordinary,
+conditional-master, final-master, and selective-VHS passes. Spatial state is
+frame-local evaluated data, not topology; a Morph or modulation change must not
+reset/starve an asynchronous selective-VHS plan.
+
+Transforms persist in patches and Apply Look, are optional Morph ownership,
+support continuous modulation, and enter Dice only when `include_transform` is
+explicitly true. Keep Pattern-only and automatic loop rerolls transform-free.
+Discrete Fit/Edge/Sampling choices switch at the Morph midpoint and procedural
+generation preserves them while mutating continuous geometry through a separate
+deterministic RNG domain. Stable layer IDs are mandatory for remote transform
+edits; do not fall back to a stale position.
 
 ## Threading and backpressure
 
@@ -285,6 +343,7 @@ values. `target_range` additionally recognizes every positive, parseable
 - grain intensity/size, vignette, color drift;
 - breathing scale/rotation/position;
 - Shift amount/block size/density/speed;
+- spatial position/scale/anchor/rotation/skew/skew-axis/crop;
 - downsample;
 - cellular amount/scale/warp/speed and gap amount/threshold/softness.
 
@@ -446,6 +505,12 @@ the shader uniform layout tests current when changing temporal uniforms.
   and clamped, patch/Morph/modulation/Dice aware at master and layer scope, and
   must use the same shader and frame-indexed time in export. Domain-separate
   Shift's bounded-variation RNG so adding it does not perturb older Dice streams.
+- Spatial sampling must remain one pass with direct effects: output UV effects
+  feed the canonical inverse transform, then the selected edge law and crop map
+  to source UV. The inactive legacy branch keeps its historical clamp/wrap
+  behavior; an active transform delegates exposed coordinates exclusively to
+  Transparent/Clamp/Repeat/Mirror. Keep CPU/WGSL layout assertions and Naga
+  validation current when changing the four appended spatial vec4 slots.
 - A fullscreen triangle computes UVs from `vertex_index`.
 - Static keying at layer and program scope supports Off, Keep Bright, Keep
   Dark, Remove Chroma, and Keep Chroma. Luminance modes use threshold/softness;
@@ -521,6 +586,8 @@ Backward compatibility rules matter:
   panel uses `reset_visual_program` for the broader master-program revert;
 - absent Shift fields mean amount 0, block size 8 px, density 0.5, and speed 3,
   preserving the exact pre-Shift visual path;
+- absent spatial state means the inactive historical full-frame sample with a
+  Transparent authored edge for any later movement; explicit Clamp persists;
 - no media-safety field means Safe; media mode is process-local rather than
   patch-persistent, so an untrusted or legacy patch cannot enable Expert;
 - new finite/clamp defaults reject NaN/overflow without panicking.
@@ -548,11 +615,13 @@ path cache, cancellation checks, before/after metadata consistency, at most
 zero is invalid. Operational paths and filesystem metadata must not enter
 shareable manifests or receipts.
 
-Generator v2 normalizes the anchor, replaces verified file sources with content
+Generator v7 normalizes the anchor, replaces verified file sources with content
 references, reduces filenames to logical names, and hashes version-prefixed
 canonical JSON with SHA-256. `anchor_sha256`, `piece_sha256`, and lineage must be
 path-independent and source-byte-sensitive. Schema-v2 manifests retain defaulted
-v1 fields for deserialization compatibility. Each generated piece stages
+v1 fields for deserialization compatibility. Generator v7 also applies bounded,
+reflected spatial mutations through independent RNG domains without changing
+saved Fit/Edge/Sampling choices. Each generated piece stages
 `patch.yaml`, `manifest.json`, and deterministic `preflight.json`, then commits
 the directory no-replace; preflight all known names and serializations before
 the first commit. The receipt claims canonical configuration and source bytes,
@@ -666,16 +735,30 @@ mislead browser tests.
 - `P` / `Shift+P` — pixelate up/down
 - `G` / `Shift+G` — RGB split up/down
 - `0` — reset effects
-- `Space` — selected-layer pause/resume
+- `Space` — selected-layer pause/resume, or Program Freeze with no selection
+- `M` — Media Freeze
 - `F` — main-window fullscreen
 - `O` — fullscreen output window
 - `B` — blackout
 - `Ctrl+E` — patch parameter editor
 - `Ctrl+S` / `Ctrl+O` — save/load patch
+- `Ctrl+Shift+I` / `Ctrl+Shift+X` — import/export the bounded controller profile
 - `Escape` — close/quit as appropriate
 
 ## Verification
 
+- The release gate is `cargo fmt --all -- --check`, both JavaScript syntax
+  checks, `cargo check --locked --all-targets`, strict all-feature Clippy, and
+  the single-threaded locked all-target/all-feature test matrix. A publication
+  claim additionally requires Linux, macOS, and Windows CI success for the
+  exact published commit SHA; an older green run is not transferable evidence.
+- Physical-GPU proofs are opt-in and therefore separate from ordinary CI.
+  StageMap uses the five `renderer::stage_map::tests::physical_gpu_` fixtures.
+  M6 precision uses
+  `gpu_precision_receipt_measures_real_still_and_temporal_workloads` plus its
+  premultiplied-edge, temporal-feedback, LegacyExact-spatial, and 24/30/60
+  temporal parity companions. Keep the adapter/backend, exact command, source
+  manifest, and receipt hash with any claim.
 - `cargo test` covers pure protocol, persistence, modulation, morph, temporal,
   transport, audio, Spout lifecycle helpers, and export-argument behavior.
 - `cargo test effects_audit -- --ignored` renders the labeled effect suite
@@ -696,6 +779,12 @@ mislead browser tests.
 - Shift tests must preserve the amount-zero shader branch and uniform layout,
   old-seed Dice streams, bounded deterministic variation, patch defaults,
   Morph/modulation wiring, resets, static controls, and a labeled export case.
+- Spatial tests must cover the exact inactive identity, Transparent exposure,
+  explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
+  aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
+  patch/Look/Morph/modulation/Dice/procedural round trips, stable-ID ingress,
+  selective-VHS compatibility, live/export frame-rate parity, and at least one
+  real GPU reference/golden path.
 - Source-identity tests must cover cross-root canonical equality, changed-byte
   inequality, digest-enforcing load/export resolution, fingerprint/search
   budgets and cancellation, v1 manifest compatibility, private-path absence,

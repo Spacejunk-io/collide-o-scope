@@ -1,7 +1,12 @@
 #![allow(deprecated)] // egui 0.34 deprecation warnings for panel API renames
 
 mod audio;
+mod composition;
+mod controller_profile;
 mod effects;
+mod evaluated_frame;
+mod history;
+mod image_routing;
 mod input;
 mod layers;
 mod media_safety;
@@ -9,39 +14,63 @@ mod media_source;
 mod midi;
 mod modulation;
 mod morph;
+mod motion;
 mod ntsc;
+mod osc;
 mod patch;
+mod performance;
+mod performance_runtime;
+mod precision;
+mod preset;
 mod procedural;
+mod program_recorder;
+mod proxy;
 mod randomization;
+mod recovery_journal;
 mod render_export;
 mod renderer;
+mod spatial;
 mod spout_in;
 mod spout_out;
+mod stage_health;
+mod stage_map;
+mod study;
+mod temporal;
+mod transport;
 mod video;
+mod visual_rack;
 mod web;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui_wgpu::ScreenDescriptor;
+use evaluated_frame::SourceTap;
+use evaluated_frame::{EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput};
 use winit::application::ApplicationHandler;
 use winit::event::{KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 use input::{apply_action, map_key, ControlFlow};
 use layers::{is_still_image_file, is_supported_visual_file, Layer};
-use renderer::Renderer;
+use renderer::{LiveFrameResources, Renderer};
+use visual_rack::{LegacyRackScope, RuntimeVisualRack};
 use web::state::{ControlServerInfo, ControlServerStatus, WebState};
 
 const TARGET_FPS: u64 = 30;
 const FRAME_DURATION: Duration = Duration::from_millis(1000 / TARGET_FPS);
+const STILL_CAPTURE_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
 const FALLBACK_OUTPUT_WIDTH: u32 = 1280;
 const FALLBACK_OUTPUT_HEIGHT: u32 = 720;
+const STAGE_PROGRAM_SOURCE: renderer::stage_map::StageProgramSourceId =
+    renderer::stage_map::StageProgramSourceId::new(0);
+const MAX_STAGE_RUNTIME_STATUS_BYTES: usize = 4096;
 
 const fn renderer_recovery_output(width: u32, height: u32) -> Option<(u32, u32)> {
     if width == FALLBACK_OUTPUT_WIDTH && height == FALLBACK_OUTPUT_HEIGHT {
@@ -57,11 +86,168 @@ enum OutputWindowCommand {
     Toggle,
 }
 
+/// One venue-authored monitor endpoint. It is deliberately independent from
+/// the legacy audience Output target: closing or losing this surface cannot
+/// alter the creative image, preview, Spout, recorder, or another endpoint.
+struct StageMonitorTarget {
+    endpoint_id: stage_map::OutputEndpointId,
+    selector: String,
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    needs_reconfigure: bool,
+    suspended: bool,
+    last_error: String,
+}
+
+struct AcquiredStageSurface {
+    endpoint_id: stage_map::OutputEndpointId,
+    texture: wgpu::SurfaceTexture,
+    view: wgpu::TextureView,
+    format: wgpu::TextureFormat,
+    dimensions: [u32; 2],
+}
+
+fn preferred_stage_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .find(|format| format.is_srgb())
+        .copied()
+        .or_else(|| formats.first().copied())
+}
+
+fn preferred_stage_present_mode(modes: &[wgpu::PresentMode]) -> Option<wgpu::PresentMode> {
+    modes
+        .contains(&wgpu::PresentMode::Fifo)
+        .then_some(wgpu::PresentMode::Fifo)
+        .or_else(|| modes.first().copied())
+}
+
+fn exact_monitor_name_index(
+    selector: &str,
+    monitor_names: &[Option<String>],
+) -> Result<usize, String> {
+    let mut matches = monitor_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.as_deref() == Some(selector));
+    let Some((index, _)) = matches.next() else {
+        return Err(format!("monitor {selector:?} is unavailable"));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "monitor selector {selector:?} is ambiguous; exact names must be unique"
+        ));
+    }
+    Ok(index)
+}
+
+fn bounded_stage_runtime_status(value: String) -> String {
+    value.chars().take(MAX_STAGE_RUNTIME_STATUS_BYTES).collect()
+}
+
+fn stage_monitor_inventory_signature(monitors: &[MonitorHandle]) -> Vec<String> {
+    let mut signature = monitors
+        .iter()
+        .map(|monitor| {
+            let position = monitor.position();
+            let size = monitor.size();
+            format!(
+                "{}@{},{}:{}x{}",
+                monitor.name().unwrap_or_default(),
+                position.x,
+                position.y,
+                size.width,
+                size.height
+            )
+        })
+        .collect::<Vec<_>>();
+    signature.sort_unstable();
+    signature
+}
+
+fn acquire_stage_monitor_surfaces(
+    renderer: &Renderer,
+    targets: &mut [StageMonitorTarget],
+) -> Vec<AcquiredStageSurface> {
+    let mut acquired = Vec::with_capacity(targets.len());
+    for target in targets {
+        if target.suspended {
+            continue;
+        }
+        if target.needs_reconfigure {
+            match renderer.configure_compatible_surface(&target.surface, &target.config) {
+                Ok(()) => target.needs_reconfigure = false,
+                Err(error) => {
+                    target.last_error = bounded_stage_runtime_status(error);
+                    continue;
+                }
+            }
+        }
+        let texture = match target.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                target.needs_reconfigure = true;
+                texture
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                target.needs_reconfigure = true;
+                continue;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                target.needs_reconfigure = true;
+                target.last_error = "physical surface was lost; reconfiguration pending".into();
+                continue;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                continue;
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                target.last_error = "physical surface validation failed".into();
+                continue;
+            }
+        };
+        target.last_error.clear();
+        let view = texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        acquired.push(AcquiredStageSurface {
+            endpoint_id: target.endpoint_id.clone(),
+            texture,
+            view,
+            format: target.config.format,
+            dimensions: [target.config.width, target.config.height],
+        });
+    }
+    acquired
+}
+
+fn present_stage_monitor_surfaces(surfaces: Vec<AcquiredStageSurface>) {
+    for surface in surfaces {
+        surface.texture.present();
+    }
+}
+
+const fn stage_surface_target_succeeded(
+    metrics: renderer::stage_map::StageSurfaceFrameMetrics,
+) -> bool {
+    metrics.presented_surfaces == 1
+        && metrics.missing_endpoints == 0
+        && metrics.unassigned_endpoints == 0
+        && metrics.unsupported_formats == 0
+        && metrics.dimension_mismatches == 0
+        && metrics.duplicate_targets == 0
+        && metrics.excess_targets == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AppliedLookScope {
     mapped_layer_ids: Vec<u64>,
     applied_ntsc: bool,
     applied_temporal: bool,
+    applied_nodes: Vec<patch::LookNodeRef>,
+    applied_group_ids: Vec<visual_rack::GroupId>,
+    applied_bus_crossfade: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +255,11 @@ enum WebActionBatchDisposition {
     Continue,
     SnapshotCommitted,
     LookApplied(AppliedLookScope),
+    /// A complete master/post-stack reset owns the master rack, so later
+    /// actions in the same drained browser batch must not resurrect its old
+    /// authored values or topology. Layer and group creative edits remain
+    /// independent and retain their ordering.
+    MasterVisualReset,
 }
 
 enum StagedPatchAudio {
@@ -83,6 +274,107 @@ enum StagedPatchAudio {
         persisted_source_reference: Option<String>,
         clip: audio::AudioClip,
     },
+}
+
+#[derive(Clone)]
+struct PreparedSlotDescriptor {
+    layer_id: image_routing::StableLayerId,
+    slot: performance::ClipSlotConfig,
+    cue_id: Option<transport::CueId>,
+}
+
+struct CachedPerformancePayload {
+    payload: performance_runtime::GpuCommitPayload,
+    descriptors: Vec<PreparedSlotDescriptor>,
+    preload_bytes: u64,
+    deferred_history: Option<DeferredPerformanceHistory>,
+}
+
+impl CachedPerformancePayload {
+    fn key(&self) -> &performance_runtime::PreparedTransactionKey {
+        self.payload.key()
+    }
+
+    fn source_count(&self) -> usize {
+        self.descriptors.len()
+    }
+}
+
+struct PerformanceStagingIntent {
+    generation: performance_runtime::PreparationGeneration,
+    key: performance_runtime::PreparedTransactionKey,
+    descriptors: Vec<PreparedSlotDescriptor>,
+    activate: Option<transport::TriggerMode>,
+    publish_inactive_metadata: bool,
+    deferred_history: Option<DeferredPerformanceHistory>,
+}
+
+#[derive(Clone)]
+struct DeferredPerformanceHistory {
+    expected_generation: u64,
+    label: String,
+}
+
+#[derive(Clone)]
+struct ScheduledPerformanceActivation {
+    key: performance_runtime::PreparedTransactionKey,
+    trigger_mode: transport::TriggerMode,
+}
+
+/// Snapshot staging may observe a decoder's eagerly-published t=0 seed before
+/// the absolute saved-playhead selection completes. Only the requested source
+/// generation is eligible for a staged video texture; immutable stills have no
+/// asynchronous generation and publish their single frame directly.
+fn staged_playhead_frame_is_current(
+    is_video: bool,
+    requested_generation: u64,
+    frame: &video::threaded::ReadyFrame,
+) -> bool {
+    !is_video || frame.source_generation == requested_generation
+}
+
+/// Resolve the stable identities shown by one Scene card and validate every
+/// authored binding against the same live slot/cue inventory used by staging.
+/// Invalid Scenes remain authored so Recapture can repair them, but they must
+/// never look healthy in a snapshot while their atomic trigger would reject.
+fn resolve_scene_snapshot_bindings<'a>(
+    scene: &performance::Scene,
+    mut resolve: impl FnMut(
+        performance::SavedLayerPosition,
+    ) -> Option<(u64, &'a performance::ClipSlots)>,
+) -> (Vec<String>, String) {
+    let mut layer_ids = Vec::with_capacity(scene.bindings.len());
+    let mut issues = Vec::new();
+    for binding in scene.bindings.iter() {
+        let Some((layer_id, slots)) = resolve(binding.layer_position) else {
+            layer_ids.push(format!("missing-position-{}", binding.layer_position.get()));
+            issues.push(format!(
+                "missing layer position {}",
+                binding.layer_position.get()
+            ));
+            continue;
+        };
+        layer_ids.push(layer_id.to_string());
+        let Some(slot) = slots.get(binding.slot_id) else {
+            issues.push(format!(
+                "missing slot {} on layer {}",
+                binding.slot_id.get(),
+                layer_id
+            ));
+            continue;
+        };
+        if let Some(cue_id) = binding.cue_id {
+            if slot.transport.cue(cue_id).is_none() {
+                issues.push(format!(
+                    "missing cue {} in slot {} on layer {}",
+                    cue_id.get(),
+                    binding.slot_id.get(),
+                    layer_id
+                ));
+            }
+        }
+    }
+    (layer_ids, issues.join("; "))
 }
 
 /// A dedicated swapchain is useful only when it can live on a genuinely
@@ -103,6 +395,7 @@ fn is_discrete_window_key(key: PhysicalKey) -> bool {
     matches!(
         key,
         PhysicalKey::Code(KeyCode::Escape)
+            | PhysicalKey::Code(KeyCode::Space)
             | PhysicalKey::Code(KeyCode::KeyF)
             | PhysicalKey::Code(KeyCode::KeyM)
             | PhysicalKey::Code(KeyCode::KeyO)
@@ -110,7 +403,162 @@ fn is_discrete_window_key(key: PhysicalKey) -> bool {
 }
 
 fn ignore_discrete_window_key_repeat(key: PhysicalKey, repeat: bool) -> bool {
-    repeat && is_discrete_window_key(key)
+    repeat
+        && (is_discrete_window_key(key)
+            || matches!(
+                key,
+                PhysicalKey::Code(KeyCode::KeyP)
+                    | PhysicalKey::Code(KeyCode::KeyG)
+                    | PhysicalKey::Code(KeyCode::Digit0)
+                    | PhysicalKey::Code(KeyCode::KeyI)
+                    | PhysicalKey::Code(KeyCode::KeyX)
+                    | PhysicalKey::Code(KeyCode::KeyE)
+                    | PhysicalKey::Code(KeyCode::KeyS)
+            ))
+}
+
+fn select_stage_health_endpoint<'a>(
+    stage_map: &'a stage_map::StageMap,
+    presented: &BTreeSet<stage_map::OutputEndpointId>,
+) -> Option<&'a stage_map::StageEndpoint> {
+    stage_map
+        .endpoints
+        .iter()
+        .find(|endpoint| {
+            endpoint.enabled
+                && matches!(endpoint.binding, stage_map::OutputBinding::Monitor { .. })
+                && presented.contains(&endpoint.id)
+        })
+        .or_else(|| {
+            stage_map.endpoints.iter().find(|endpoint| {
+                endpoint.enabled
+                    && matches!(endpoint.binding, stage_map::OutputBinding::Monitor { .. })
+            })
+        })
+        .or_else(|| stage_map.endpoints.iter().find(|endpoint| endpoint.enabled))
+}
+
+fn stage_health_gpu_budget(
+    accepted_creative_bytes: Option<u64>,
+    accepted_motion_bytes: Option<u64>,
+    stage_presenter_bytes: Option<u64>,
+    selective_ntsc_bytes: Option<u64>,
+    stage_presenter_limit: Option<u64>,
+) -> (Option<u64>, Option<u64>) {
+    let used = accepted_creative_bytes.map(|creative| {
+        creative
+            .saturating_add(accepted_motion_bytes.unwrap_or(0))
+            .saturating_add(stage_presenter_bytes.unwrap_or(0))
+            .saturating_add(selective_ntsc_bytes.unwrap_or(0))
+    });
+    // MAX_CREATIVE_GPU_BYTES already caps the combined creative + Motion
+    // allocation in the unified planner. Motion's own 128 MiB ceiling remains
+    // visible separately, so adding it here again would double-count it.
+    let limit = stage_presenter_limit.map(|stage| {
+        stage
+            .saturating_add(visual_rack::MAX_CREATIVE_GPU_BYTES)
+            .saturating_add(ntsc::MAX_SELECTIVE_NTSC_LIVE_BYTES)
+    });
+    (used, limit)
+}
+
+fn duration_micros_u32(duration: Option<Duration>) -> u32 {
+    duration.map_or(0, |duration| {
+        duration.as_micros().min(u128::from(u32::MAX)) as u32
+    })
+}
+
+fn proxy_playback_observation(
+    telemetry: &video::threaded::DecoderTelemetry,
+    visible_layers: usize,
+) -> Option<proxy::ProxyPlaybackObservation> {
+    let sampled_frames = telemetry
+        .decode_samples
+        .min(telemetry.upload_samples)
+        .min(telemetry.consumed_frames)
+        .min(u64::from(proxy::PROXY_MAX_OBSERVATION_FRAMES));
+    let sampled_frames = u32::try_from(sampled_frames).ok()?;
+    if sampled_frames == 0 {
+        return None;
+    }
+    let dropped_frames = telemetry
+        .frame_overwrites
+        .saturating_add(telemetry.frame_drops)
+        .min(u64::from(sampled_frames)) as u32;
+    Some(proxy::ProxyPlaybackObservation {
+        sampled_frames,
+        visible_layers: u16::try_from(
+            visible_layers.clamp(1, usize::from(proxy::PROXY_MAX_VISIBLE_LAYERS)),
+        )
+        .unwrap_or(proxy::PROXY_MAX_VISIBLE_LAYERS),
+        frame_budget_micros: FRAME_DURATION.as_micros().min(u128::from(u32::MAX)) as u32,
+        decode_p95_micros: duration_micros_u32(telemetry.decode_p95_duration),
+        upload_p95_micros: duration_micros_u32(telemetry.upload_p95_duration),
+        frame_age_p95_micros: duration_micros_u32(telemetry.frame_age_p95_duration),
+        dropped_frames,
+        pending_frames_peak: u16::from(telemetry.pending_frames_peak),
+        hardware_decode_active: false,
+        zero_copy_active: false,
+    })
+}
+
+fn proxy_assessment_status(
+    layer: &Layer,
+    telemetry: &video::threaded::DecoderTelemetry,
+    visible_layers: usize,
+) -> String {
+    let Some(observation) = proxy_playback_observation(telemetry, visible_layers) else {
+        return "proxy measurement collecting (0/60 complete samples)".to_string();
+    };
+    let identity = layer.content_identity_for_proxy();
+    proxy_assessment_status_from_observation(identity.as_ref(), observation)
+}
+
+fn proxy_assessment_status_from_observation(
+    identity: Option<&media_source::ContentIdentity>,
+    observation: proxy::ProxyPlaybackObservation,
+) -> String {
+    let assessment = match identity {
+        Some(identity) => proxy::assess_content_addressed_proxy(
+            identity,
+            proxy::ProxySettings::default(),
+            observation,
+        )
+        .map(|assessment| assessment.assessment),
+        None => proxy::assess_proxy(observation),
+    };
+    let status = match assessment {
+        Ok(assessment) => match assessment {
+            proxy::ProxyAssessment::MeasurementRequired => format!(
+                "proxy measurement {}/60 complete samples",
+                observation.sampled_frames
+            ),
+            proxy::ProxyAssessment::OriginalSufficient => {
+                "measured original decode is sufficient".to_string()
+            }
+            proxy::ProxyAssessment::ProxyRecommended(reasons) => {
+                let reasons = reasons
+                    .iter()
+                    .map(|reason| match reason {
+                        proxy::ProxyRecommendationReason::DecodeExceedsFrameBudget => "decode p95",
+                        proxy::ProxyRecommendationReason::UploadExceedsFrameBudget => "upload p95",
+                        proxy::ProxyRecommendationReason::FrameAgeExceedsFrameBudget => "frame age",
+                        proxy::ProxyRecommendationReason::DroppedFramesObserved => "frame drops",
+                        proxy::ProxyRecommendationReason::DecoderQueuePressure => "queue pressure",
+                        proxy::ProxyRecommendationReason::MultiLayerPressure => "layer pressure",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("proxy recommended from measured {reasons}")
+            }
+        },
+        Err(error) => format!("proxy assessment unavailable: {error}"),
+    };
+    if identity.is_some() {
+        status
+    } else {
+        format!("{status}; cache identity unavailable")
+    }
 }
 
 const fn show_editor_panel(output_on_main: bool, editor_active: bool) -> bool {
@@ -121,6 +569,12 @@ const fn show_editor_panel(output_on_main: bool, editor_active: bool) -> bool {
 /// control must disappear there just like the YAML editor does. A dedicated
 /// output has its own clean surface and may leave this strip on the preview.
 const fn show_native_recovery_strip(output_on_main: bool) -> bool {
+    !output_on_main
+}
+
+/// The editor-only health HUD follows the same no-leak boundary as every
+/// native control when the main swapchain temporarily is the audience output.
+const fn show_stage_editor_health(output_on_main: bool) -> bool {
     !output_on_main
 }
 
@@ -365,10 +819,27 @@ fn blackout_audience_edge_action(
     }
 }
 
-fn selective_ntsc_topology_signature(
-    layers: &[Layer],
-    mods: &[(effects::EffectUniforms, f32)],
-) -> u64 {
+/// Publish non-fatal transparent-route decisions made by the unified creative
+/// planner. These diagnostics are authoritative for rack, group-matte, and
+/// legacy layer-matte consumers; silently inspecting only the legacy M1 matte
+/// table would omit missing GroupOutput and rack routes.
+fn creative_route_diagnostic_status(
+    diagnostics: &[evaluated_frame::evaluated_composition::CompositionPlanDiagnostic],
+) -> Option<String> {
+    (!diagnostics.is_empty()).then(|| {
+        let details = diagnostics
+            .iter()
+            .map(|diagnostic| format!("{diagnostic:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "Creative route diagnostic{}: {details}",
+            if diagnostics.len() == 1 { "" } else { "s" }
+        )
+    })
+}
+
+fn selective_ntsc_topology_signature(evaluated: &EvaluatedFramePlan) -> u64 {
     // Explicit FNV-1a keeps this stable across process/library versions. The
     // signature contains only topology/membership facts, not continuously
     // animated values, so normal modulation does not invalidate every job.
@@ -377,15 +848,13 @@ fn selective_ntsc_topology_signature(
         hash ^= value;
         hash = hash.wrapping_mul(0x100_0000_01b3);
     };
-    mix(layers.len() as u64);
-    for (index, layer) in layers.iter().enumerate() {
+    mix(evaluated.layers().len() as u64);
+    for (index, layer) in evaluated.layers().iter().enumerate() {
         mix(index as u64);
-        mix(layer.layer_id());
+        mix(layer.source.stable_id);
         mix(layer.visible as u64);
         mix(layer.bypass_master_fx as u64);
-        let contributes = mods
-            .get(index)
-            .is_some_and(|(_, opacity)| opacity.is_finite() && *opacity > 0.0);
+        let contributes = layer.opacity.is_finite() && layer.opacity > 0.0;
         mix(contributes as u64);
     }
     hash
@@ -404,34 +873,54 @@ fn selective_topology_generation_after_signature(
     }
 }
 
-fn selective_ntsc_transform_fingerprint(layer_id: u64) -> u64 {
+fn selective_ntsc_transform_fingerprint(
+    layer_id: u64,
+    transform: spatial::SpatialTransform,
+    master_transform: Option<spatial::SpatialTransform>,
+) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in layer_id.to_le_bytes() {
+    for byte in layer_id.to_le_bytes().into_iter().chain(
+        std::iter::once(transform.fingerprint())
+            .chain(master_transform.map(|transform| transform.fingerprint()))
+            .flat_map(u64::to_le_bytes),
+    ) {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
 }
 
+fn live_selective_ntsc_descriptors(
+    evaluated: &EvaluatedFramePlan,
+) -> impl Iterator<Item = ntsc::SelectiveNtscLayerDescriptor> + '_ {
+    evaluated.layers().iter().map(|layer| {
+        ntsc::SelectiveNtscLayerDescriptor {
+            layer_id: layer.source.stable_id,
+            visible: layer.visible,
+            bypass_master_fx: layer.bypass_master_fx,
+            opacity: layer.opacity,
+            blend_mode: layer.blend_mode.as_u32(),
+            // This digest describes the exact geometry that produced this
+            // delayed pixel batch. Compatibility deliberately treats it
+            // as frame-local, just like opacity and effect modulation.
+            transform_fingerprint: selective_ntsc_transform_fingerprint(
+                layer.source.stable_id,
+                layer.transform,
+                (!layer.bypass_master_fx).then_some(*evaluated.master_transform()),
+            ),
+        }
+    })
+}
+
 fn live_selective_ntsc_plan(
     generation: ntsc::SelectiveNtscGeneration,
     metadata: ntsc::NtscFrameMetadata,
-    layers: &[Layer],
-    mods: &[(effects::EffectUniforms, f32)],
+    evaluated: &EvaluatedFramePlan,
 ) -> Option<ntsc::SelectiveNtscPlan> {
     ntsc::plan_selective_ntsc(
         generation,
         metadata,
-        layers.iter().zip(mods).map(|(layer, (_effects, opacity))| {
-            ntsc::SelectiveNtscLayerDescriptor {
-                layer_id: layer.layer_id(),
-                visible: layer.visible,
-                bypass_master_fx: layer.bypass_master_fx,
-                opacity: *opacity,
-                blend_mode: layer.blend_mode.as_u32(),
-                transform_fingerprint: selective_ntsc_transform_fingerprint(layer.layer_id()),
-            }
-        }),
+        live_selective_ntsc_descriptors(evaluated),
     )
 }
 
@@ -464,14 +953,37 @@ fn selective_spout_sample_is_eligible(
         && sample.is_some_and(|sample| ntsc::selective_generation_compatible(sample, current))
 }
 
-/// A selective rebuild has no valid replacement sample yet. While transport
-/// is playing, clearing prevents a legacy/global frame from flashing under
-/// the new routing. While paused, the audience contract is stronger: retain
-/// the already materialized final image until Resume produces the first exact
-/// selective sample, which then replaces it in one Temporal+opaque command
-/// sequence.
-fn selective_rebuild_should_clear_audience(program_transport_paused: bool) -> bool {
-    !program_transport_paused
+fn held_spout_restore_active(
+    transition_holding: bool,
+    blackout: bool,
+    spout_enabled: bool,
+    spout_running: bool,
+) -> bool {
+    transition_holding && !blackout && spout_enabled && spout_running
+}
+
+fn held_spout_barrier_required(active: bool, barrier_epoch: Option<u64>, epoch: u64) -> bool {
+    active && barrier_epoch != Some(epoch)
+}
+
+fn held_spout_readback_required(
+    active: bool,
+    barrier_epoch: Option<u64>,
+    readback_epoch: Option<u64>,
+    epoch: u64,
+) -> bool {
+    active && barrier_epoch == Some(epoch) && readback_epoch != Some(epoch)
+}
+
+/// A selective rebuild has no valid replacement sample yet. A supported,
+/// playing transition clears to avoid flashing a legacy/global frame. Pause
+/// and an explicitly rejected topology are stronger contracts: retain the
+/// last accepted audience until a valid selective sample can replace it.
+fn selective_rebuild_should_clear_audience(
+    program_transport_paused: bool,
+    policy_rejected: bool,
+) -> bool {
+    !(program_transport_paused || policy_rejected)
 }
 
 fn direct_path_may_replace_selective_hold(
@@ -530,11 +1042,638 @@ struct RerollRequest {
     scope: web::state::RerollScope,
     index: Option<usize>,
     layer_id: Option<String>,
+    group_id: Option<String>,
     stack_revision: Option<u64>,
     supplied_seed: Option<u32>,
     mode: web::state::RerollMode,
     amount: f32,
     include_grain_controls: bool,
+    include_transform: bool,
+    include_rack_controls: bool,
+    include_group_controls: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreativeRackScope {
+    Master,
+    Layer(image_routing::StableLayerId),
+    Group(visual_rack::GroupId),
+}
+
+fn parse_nonzero_decimal(value: &str) -> Option<u64> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
+        .filter(|value| *value != 0)
+}
+
+fn parse_creative_scope(scope: &web::state::CreativeScopeSnapshot) -> Option<CreativeRackScope> {
+    match scope {
+        web::state::CreativeScopeSnapshot::Master => Some(CreativeRackScope::Master),
+        web::state::CreativeScopeSnapshot::Layer { layer_id } => parse_nonzero_decimal(layer_id)
+            .and_then(image_routing::StableLayerId::new)
+            .map(CreativeRackScope::Layer),
+        web::state::CreativeScopeSnapshot::Group { group_id } => parse_nonzero_decimal(group_id)
+            .and_then(visual_rack::GroupId::new)
+            .map(CreativeRackScope::Group),
+    }
+}
+
+fn parse_node_id(value: &str) -> Option<visual_rack::NodeId> {
+    parse_nonzero_decimal(value).and_then(visual_rack::NodeId::new)
+}
+
+fn parse_group_id(value: &str) -> Option<visual_rack::GroupId> {
+    parse_nonzero_decimal(value).and_then(visual_rack::GroupId::new)
+}
+
+fn parse_bus(value: &str) -> Option<composition::BusAssignment> {
+    match value {
+        "program" => Some(composition::BusAssignment::Program),
+        "a" => Some(composition::BusAssignment::A),
+        "b" => Some(composition::BusAssignment::B),
+        _ => None,
+    }
+}
+
+fn finite_json_f32(value: &serde_json::Value) -> Result<f32, String> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .map(|value| value as f32)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| "value must be a finite number".to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MotionEditImpact {
+    NoChange,
+    ValuesOnly,
+    MemoryTopology,
+}
+
+fn motion_memory_topology_changed(
+    before: motion::MotionParams,
+    after: motion::MotionParams,
+) -> bool {
+    before.shutter.is_exact_zero() != after.shutter.is_exact_zero()
+        || (before.transplant.amount == 0.0) != (after.transplant.amount == 0.0)
+}
+
+fn bounded_motion_value(
+    value: &serde_json::Value,
+    minimum: f32,
+    maximum: f32,
+    param: &str,
+) -> Result<f32, String> {
+    let value = finite_json_f32(value)?;
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!(
+            "motion parameter {param} must be between {minimum} and {maximum}"
+        ))
+    }
+}
+
+fn apply_motion_param(
+    params: &mut motion::MotionParams,
+    is_master: bool,
+    param: &str,
+    value: &serde_json::Value,
+) -> Result<MotionEditImpact, String> {
+    use motion::{CurvedShutterQuality, MotionCarrier, MotionFieldSource, MotionLatticeQuality};
+
+    let before = *params;
+    match param {
+        "field_source" => {
+            params.field_source = match value.as_str() {
+                Some("auto") => MotionFieldSource::Auto,
+                Some("codec_vectors") => MotionFieldSource::CodecVectors,
+                Some("lattice") => MotionFieldSource::Lattice,
+                _ => {
+                    return Err(
+                        "motion field_source must be auto, codec_vectors, or lattice".into(),
+                    )
+                }
+            };
+        }
+        "lattice_quality" => {
+            params.lattice_quality = match value.as_str() {
+                Some("draft") => MotionLatticeQuality::Draft,
+                Some("live") => MotionLatticeQuality::Live,
+                Some("high") => MotionLatticeQuality::High,
+                _ => return Err("motion lattice_quality must be draft, live, or high".into()),
+            };
+        }
+        "shutter_angle" => {
+            params.shutter.angle_degrees = bounded_motion_value(value, 0.0, 360.0, param)?;
+        }
+        "shutter_phase" => {
+            params.shutter.phase = bounded_motion_value(value, -1.0, 1.0, param)?;
+        }
+        "shutter_curvature" => {
+            params.shutter.curvature = bounded_motion_value(value, -2.0, 2.0, param)?;
+        }
+        "shutter_chromatic_lag" => {
+            params.shutter.chromatic_lag = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "shutter_quality" => {
+            params.shutter.quality = match value.as_str() {
+                Some("sharp") => CurvedShutterQuality::Sharp,
+                Some("draft") => CurvedShutterQuality::Draft,
+                Some("live") => CurvedShutterQuality::Live,
+                Some("high") => CurvedShutterQuality::High,
+                _ => {
+                    return Err("motion shutter_quality must be sharp, draft, live, or high".into())
+                }
+            };
+        }
+        "transplant_amount" if !is_master => {
+            params.transplant.amount = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "confidence_threshold" if !is_master => {
+            params.transplant.confidence_threshold = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "confidence_softness" if !is_master => {
+            params.transplant.confidence_softness = bounded_motion_value(value, 0.0, 0.5, param)?;
+        }
+        "refresh" if !is_master => {
+            params.transplant.refresh = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "decay" if !is_master => {
+            params.transplant.decay = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "occlusion" if !is_master => {
+            params.transplant.occlusion = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "carrier" if !is_master => {
+            params.transplant.carrier = match value.as_str() {
+                Some("transparent") => MotionCarrier::Transparent,
+                Some("black") => MotionCarrier::Black,
+                Some("first_source_frame") => MotionCarrier::FirstSourceFrame,
+                _ => {
+                    return Err(
+                        "motion carrier must be transparent, black, or first_source_frame".into(),
+                    )
+                }
+            };
+        }
+        "transplant_amount"
+        | "confidence_threshold"
+        | "confidence_softness"
+        | "refresh"
+        | "decay"
+        | "occlusion"
+        | "carrier" => return Err(format!("motion parameter {param} is layer-only")),
+        _ => return Err(format!("unsupported motion parameter {param}")),
+    }
+    *params = params.sanitized();
+    if *params == before {
+        return Ok(MotionEditImpact::NoChange);
+    }
+    let topology = match param {
+        "field_source" | "lattice_quality" | "shutter_quality" | "carrier" => true,
+        "shutter_angle" => before.shutter.is_exact_zero() != params.shutter.is_exact_zero(),
+        "transplant_amount" => {
+            (before.transplant.amount == 0.0) != (params.transplant.amount == 0.0)
+        }
+        _ => false,
+    };
+    Ok(if topology {
+        MotionEditImpact::MemoryTopology
+    } else {
+        MotionEditImpact::ValuesOnly
+    })
+}
+
+fn json_u32(value: &serde_json::Value) -> Result<u32, String> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "value must be an unsigned 32-bit integer".to_string())
+}
+
+fn json_vec_f32<const N: usize>(value: &serde_json::Value) -> Result<[f32; N], String> {
+    let entries = value
+        .as_array()
+        .filter(|entries| entries.len() == N)
+        .ok_or_else(|| format!("value must contain exactly {N} finite numbers"))?;
+    let mut result = [0.0; N];
+    for (slot, entry) in result.iter_mut().zip(entries) {
+        *slot = finite_json_f32(entry)?;
+    }
+    Ok(result)
+}
+
+fn json_enum<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, String> {
+    serde_json::from_value(value.clone()).map_err(|error| format!("invalid enum value: {error}"))
+}
+
+fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNodeKind> {
+    use visual_rack::RuntimeVisualNodeKind as Kind;
+    Some(match key {
+        "transform" => Kind::Transform(spatial::SpatialTransform::default()),
+        "digital_color" => Kind::DigitalColor(visual_rack::DigitalColorParams::default()),
+        "key" => Kind::Key(visual_rack::KeyParams::default()),
+        "cellular" => Kind::Cellular(visual_rack::CellularParams::default()),
+        "shift" => Kind::Shift(visual_rack::ShiftParams::default()),
+        "grain" => Kind::Grain(visual_rack::GrainParams::default()),
+        "mask" => Kind::Mask(visual_rack::RuntimeMaskParams::Rectangle(
+            visual_rack::RectangleMask::default(),
+        )),
+        // Host-boundary marker nodes are never browser-created.
+        "legacy_canonical" | "legacy_temporal" => return None,
+        _ => return None,
+    })
+}
+
+fn normalize_runtime_rack(rack: &mut RuntimeVisualRack) -> Result<(), String> {
+    *rack = RuntimeVisualRack::try_from_parts(
+        rack.iter().copied().collect(),
+        Some(rack.next_node_id_raw()),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn set_runtime_node_param(
+    rack: &mut RuntimeVisualRack,
+    node_id: visual_rack::NodeId,
+    expected_kind: &str,
+    param: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    use visual_rack::{RuntimeMaskParams as Mask, RuntimeVisualNodeKind as Kind};
+
+    let node = rack
+        .get_mut(node_id)
+        .ok_or_else(|| format!("node {} is absent", node_id.get()))?;
+    let actual_kind = visual_rack::node_kind_descriptor(node.kind.tag()).key;
+    if actual_kind != expected_kind {
+        return Err(format!(
+            "node {} is {actual_kind}, not requested {expected_kind}",
+            node_id.get()
+        ));
+    }
+    if matches!(node.kind, Kind::LegacyCanonical | Kind::LegacyTemporal) {
+        return Err("legacy marker values are immutable".to_string());
+    }
+
+    match param {
+        "enabled" => {
+            node.enabled = value
+                .as_bool()
+                .ok_or_else(|| "enabled must be boolean".to_string())?;
+        }
+        "wet" => node.wet = finite_json_f32(value)?,
+        "blend" => node.blend = json_enum(value)?,
+        _ => match &mut node.kind {
+            Kind::LegacyCanonical | Kind::LegacyTemporal => unreachable!(),
+            Kind::Transform(transform) => match param {
+                "position" => transform.position = json_vec_f32(value)?,
+                "scale" => transform.scale = json_vec_f32(value)?,
+                "anchor" => transform.anchor = json_vec_f32(value)?,
+                "rotation_deg" => transform.rotation_deg = finite_json_f32(value)?,
+                "skew_deg" => transform.skew_deg = finite_json_f32(value)?,
+                "skew_axis_deg" => transform.skew_axis_deg = finite_json_f32(value)?,
+                "fit_mode" => transform.fit = json_enum(value)?,
+                "crop_left" => transform.crop[0] = finite_json_f32(value)?,
+                "crop_top" => transform.crop[1] = finite_json_f32(value)?,
+                "crop_right" => transform.crop[2] = finite_json_f32(value)?,
+                "crop_bottom" => transform.crop[3] = finite_json_f32(value)?,
+                "edge_mode" => transform.edge = json_enum(value)?,
+                "sampling" => transform.sampling = json_enum(value)?,
+                _ => return Err(format!("unsupported transform parameter {param}")),
+            },
+            Kind::DigitalColor(params) => {
+                let slot = match param {
+                    "pixelate_size" => &mut params.pixelate_size,
+                    "rgb_split" => &mut params.rgb_split,
+                    "downsample" => &mut params.downsample,
+                    "hue_shift" => &mut params.hue_shift,
+                    "saturation" => &mut params.saturation,
+                    "brightness" => &mut params.brightness,
+                    "contrast" => &mut params.contrast,
+                    "posterize" => &mut params.posterize,
+                    "invert" => &mut params.invert,
+                    "vignette" => &mut params.vignette,
+                    "color_drift" => &mut params.color_drift,
+                    _ => return Err(format!("unsupported digital/color parameter {param}")),
+                };
+                *slot = finite_json_f32(value)?;
+            }
+            Kind::Key(params) => match param {
+                "mode" => params.mode = json_enum(value)?,
+                "threshold" => params.threshold = finite_json_f32(value)?,
+                "softness" => params.softness = finite_json_f32(value)?,
+                "color" => params.color = json_vec_f32(value)?,
+                "tolerance" => params.tolerance = finite_json_f32(value)?,
+                "invert" => {
+                    params.invert = value
+                        .as_bool()
+                        .ok_or_else(|| "invert must be boolean".to_string())?;
+                }
+                _ => return Err(format!("unsupported key parameter {param}")),
+            },
+            Kind::Cellular(params) => match param {
+                "amount" => params.amount = finite_json_f32(value)?,
+                "scale" => params.scale = finite_json_f32(value)?,
+                "warp" => params.warp = finite_json_f32(value)?,
+                "speed" => params.speed = finite_json_f32(value)?,
+                "gap_amount" => params.gap_amount = finite_json_f32(value)?,
+                "gap_threshold" => params.gap_threshold = finite_json_f32(value)?,
+                "gap_softness" => params.gap_softness = finite_json_f32(value)?,
+                "seed" => params.seed = json_u32(value)?,
+                _ => return Err(format!("unsupported cellular parameter {param}")),
+            },
+            Kind::Shift(params) => match param {
+                "amount" => params.amount = finite_json_f32(value)?,
+                "block_size" => params.block_size = finite_json_f32(value)?,
+                "density" => params.density = finite_json_f32(value)?,
+                "speed" => params.speed = finite_json_f32(value)?,
+                "seed" => params.seed = json_u32(value)?,
+                _ => return Err(format!("unsupported shift parameter {param}")),
+            },
+            Kind::Grain(params) => match param {
+                "intensity" => params.intensity = finite_json_f32(value)?,
+                "size" => params.size = finite_json_f32(value)?,
+                "algorithm" => params.algorithm = json_enum(value)?,
+                "color" => {
+                    params.color = value
+                        .as_bool()
+                        .ok_or_else(|| "color must be boolean".to_string())?;
+                }
+                "seed" => params.seed = json_u32(value)?,
+                _ => return Err(format!("unsupported grain parameter {param}")),
+            },
+            Kind::Mask(Mask::Rectangle(params)) => match param {
+                "rectangle_center" => params.center = json_vec_f32(value)?,
+                "rectangle_size" => params.size = json_vec_f32(value)?,
+                "rectangle_rotation_deg" => params.rotation_deg = finite_json_f32(value)?,
+                "rectangle_feather" => params.feather = finite_json_f32(value)?,
+                "rectangle_invert" => {
+                    params.invert = value
+                        .as_bool()
+                        .ok_or_else(|| "rectangle invert must be boolean".to_string())?;
+                }
+                _ => return Err(format!("unsupported rectangle mask parameter {param}")),
+            },
+            Kind::Mask(Mask::Ellipse(params)) => match param {
+                "ellipse_center" => params.center = json_vec_f32(value)?,
+                "ellipse_radii" => params.radii = json_vec_f32(value)?,
+                "ellipse_rotation_deg" => params.rotation_deg = finite_json_f32(value)?,
+                "ellipse_feather" => params.feather = finite_json_f32(value)?,
+                "ellipse_invert" => {
+                    params.invert = value
+                        .as_bool()
+                        .ok_or_else(|| "ellipse invert must be boolean".to_string())?;
+                }
+                _ => return Err(format!("unsupported ellipse mask parameter {param}")),
+            },
+            Kind::Mask(Mask::Image(params)) => match param {
+                "image_amount" => params.amount = finite_json_f32(value)?,
+                "image_threshold" => params.threshold = finite_json_f32(value)?,
+                "image_softness" => params.softness = finite_json_f32(value)?,
+                // Variant and route ownership use ordered topology actions.
+                "variant" | "image_tap" | "image_channel" | "image_invert" => {
+                    return Err(format!("{param} requires its ordered topology action"));
+                }
+                _ => return Err(format!("unsupported image mask parameter {param}")),
+            },
+        },
+    }
+    normalize_runtime_rack(rack)
+}
+
+#[derive(Clone)]
+struct StagedCreativeGraph {
+    master_rack: RuntimeVisualRack,
+    layer_racks: Vec<(image_routing::StableLayerId, RuntimeVisualRack)>,
+    composition: composition::RuntimeComposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreativeCommitImpact {
+    NoChange,
+    ValuesOnly,
+    TopologyOrStack,
+}
+
+const fn creative_commit_impact(
+    candidate_changed: bool,
+    topology_changed: bool,
+    stack_changed: bool,
+) -> CreativeCommitImpact {
+    if !candidate_changed {
+        CreativeCommitImpact::NoChange
+    } else if topology_changed || stack_changed {
+        CreativeCommitImpact::TopologyOrStack
+    } else {
+        CreativeCommitImpact::ValuesOnly
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StagedLayerLook {
+    layer_id: image_routing::StableLayerId,
+    opacity: f32,
+    blend_mode: layers::BlendMode,
+    visible: bool,
+    bypass_master_fx: bool,
+    effects: effects::EffectUniforms,
+    transform: spatial::SpatialTransform,
+    matte: image_routing::LayerMatte,
+    motion: motion::MotionParams,
+}
+
+#[derive(Clone)]
+struct StagedMorphWorld {
+    master_effects: effects::EffectUniforms,
+    master_transform: spatial::SpatialTransform,
+    master_motion: motion::MotionParams,
+    ntsc_params: ntsc::NtscParams,
+    temporal_params: effects::params::TemporalParams,
+    layers: Vec<StagedLayerLook>,
+    graph: StagedCreativeGraph,
+}
+
+impl StagedLayerLook {
+    fn capture(layer: &Layer) -> Self {
+        Self {
+            layer_id: layer.stable_layer_id(),
+            opacity: layer.opacity,
+            blend_mode: layer.blend_mode,
+            visible: layer.visible,
+            bypass_master_fx: layer.bypass_master_fx,
+            effects: layer.effects,
+            transform: layer.transform,
+            matte: layer.matte,
+            motion: layer.motion,
+        }
+    }
+
+    fn install(self, layer: &mut Layer) {
+        debug_assert_eq!(self.layer_id, layer.stable_layer_id());
+        layer.opacity = self.opacity;
+        layer.blend_mode = self.blend_mode;
+        layer.visible = self.visible;
+        layer.bypass_master_fx = self.bypass_master_fx;
+        layer.effects = self.effects;
+        layer.transform = self.transform;
+        layer.matte = self.matte;
+        layer.motion = self.motion;
+    }
+}
+
+impl StagedMorphWorld {
+    fn capture(app: &App, layer_racks: Vec<RuntimeVisualRack>) -> Self {
+        Self {
+            master_effects: app.master_effects,
+            master_transform: app.master_transform,
+            master_motion: app.master_motion,
+            ntsc_params: app.ntsc_params.clone(),
+            temporal_params: app.temporal_params,
+            layers: app.layers.iter().map(StagedLayerLook::capture).collect(),
+            graph: StagedCreativeGraph {
+                master_rack: app.master_rack.clone(),
+                layer_racks: app
+                    .layers
+                    .iter()
+                    .map(Layer::stable_layer_id)
+                    .zip(layer_racks)
+                    .collect(),
+                composition: app.composition.clone(),
+            },
+        }
+    }
+
+    fn capture_authored(app: &App) -> Self {
+        Self {
+            master_effects: app.master_effects,
+            master_transform: app.master_transform,
+            master_motion: app.master_motion,
+            ntsc_params: app.ntsc_params.clone(),
+            temporal_params: app.temporal_params,
+            layers: app.layers.iter().map(StagedLayerLook::capture).collect(),
+            graph: app.authored_creative_graph(),
+        }
+    }
+
+    fn install(&self, app: &mut App) {
+        app.master_effects = self.master_effects;
+        app.master_transform = self.master_transform;
+        app.master_motion = self.master_motion;
+        app.ntsc_params = self.ntsc_params.clone();
+        app.temporal_params = self.temporal_params;
+        for (layer, values) in app.layers.iter_mut().zip(self.layers.iter().copied()) {
+            values.install(layer);
+        }
+        app.master_rack = self.graph.master_rack.clone();
+        app.install_layer_racks(
+            self.graph
+                .layer_racks
+                .iter()
+                .map(|(_, rack)| rack.clone())
+                .collect(),
+        );
+        app.composition = self.graph.composition.clone();
+    }
+}
+
+impl StagedCreativeGraph {
+    fn rack(&self, scope: CreativeRackScope) -> Option<&RuntimeVisualRack> {
+        match scope {
+            CreativeRackScope::Master => Some(&self.master_rack),
+            CreativeRackScope::Layer(layer_id) => self
+                .layer_racks
+                .iter()
+                .find_map(|(candidate, rack)| (*candidate == layer_id).then_some(rack)),
+            CreativeRackScope::Group(group_id) => {
+                self.composition.group(group_id).map(|group| &group.rack)
+            }
+        }
+    }
+
+    fn rack_mut(&mut self, scope: CreativeRackScope) -> Option<&mut RuntimeVisualRack> {
+        match scope {
+            CreativeRackScope::Master => Some(&mut self.master_rack),
+            CreativeRackScope::Layer(layer_id) => self
+                .layer_racks
+                .iter_mut()
+                .find_map(|(candidate, rack)| (*candidate == layer_id).then_some(rack)),
+            CreativeRackScope::Group(group_id) => self
+                .composition
+                .group_mut(group_id)
+                .map(|group| &mut group.rack),
+        }
+    }
+
+    fn legacy_scope(&self, scope: CreativeRackScope) -> Option<LegacyRackScope> {
+        self.rack(scope)?;
+        Some(match scope {
+            CreativeRackScope::Master => LegacyRackScope::Master,
+            CreativeRackScope::Layer(_) => LegacyRackScope::Layer,
+            CreativeRackScope::Group(_) => LegacyRackScope::Group,
+        })
+    }
+}
+
+fn apply_runtime_group_param(
+    group: &mut composition::RuntimeGroup,
+    param: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match param {
+        "name" => {
+            let name = value
+                .as_str()
+                .ok_or_else(|| "group name must be a string".to_string())?;
+            if name.trim() != name || name.chars().any(char::is_control) {
+                return Err("group name must be trimmed and control-free".into());
+            }
+            group.name =
+                composition::GroupName::new(name.to_string()).map_err(|error| error.to_string())?;
+        }
+        "opacity" => group.opacity = finite_json_f32(value)?.clamp(0.0, 1.0),
+        "solo" => {
+            group.solo = value
+                .as_bool()
+                .ok_or_else(|| "solo must be boolean".to_string())?;
+        }
+        "bypass" => {
+            group.bypass = value
+                .as_bool()
+                .ok_or_else(|| "bypass must be boolean".to_string())?;
+        }
+        "bus" => {
+            group.bus = value
+                .as_str()
+                .and_then(parse_bus)
+                .ok_or_else(|| "group bus must be program, a, or b".to_string())?;
+        }
+        _ => {
+            if !App::apply_spatial_transform_edit(&mut group.transform, param, value) {
+                return Err(format!("unsupported group parameter {param}"));
+            }
+        }
+    }
+    group.transform = group.transform.sanitized();
+    Ok(())
+}
+
+fn apply_runtime_group_matte_param(
+    matte: &mut visual_rack::RuntimeImageMatte,
+    param: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    match param {
+        "amount" => matte.amount = finite_json_f32(value)?.clamp(0.0, 1.0),
+        "threshold" => matte.threshold = finite_json_f32(value)?.clamp(0.0, 1.0),
+        "softness" => matte.softness = finite_json_f32(value)?.clamp(0.0, 0.5),
+        _ => return Err(format!("unsupported group matte parameter {param}")),
+    }
+    Ok(())
 }
 
 fn transport_gates(
@@ -547,6 +1686,34 @@ fn transport_gates(
         program_running,
         media_running: program_running && !media_frozen,
     }
+}
+
+fn temporal_freeze_state(
+    program_running: bool,
+    media_frozen: bool,
+) -> temporal::TemporalFreezeState {
+    match (program_running, media_frozen) {
+        (true, false) => temporal::TemporalFreezeState::Running,
+        (true, true) => temporal::TemporalFreezeState::MediaFrozen,
+        (false, false) => temporal::TemporalFreezeState::ProgramFrozen,
+        (false, true) => temporal::TemporalFreezeState::ProgramAndMediaFrozen,
+    }
+}
+
+fn accumulate_temporal_events(
+    pending: &mut temporal::TemporalFrameEvents,
+    observed: temporal::TemporalFrameEvents,
+) {
+    pending.boundary_events = pending
+        .boundary_events
+        .saturating_add(observed.boundary_events);
+    pending.downbeat_events = pending
+        .downbeat_events
+        .saturating_add(observed.downbeat_events);
+    pending.audio_onset_events = pending
+        .audio_onset_events
+        .saturating_add(observed.audio_onset_events);
+    pending.manual_events = pending.manual_events.saturating_add(observed.manual_events);
 }
 
 fn selected_layer_after_remove(
@@ -564,6 +1731,57 @@ fn selected_layer_after_remove(
             index.min(remaining - 1)
         }
     })
+}
+
+fn preserve_motion_donor_after_remove(
+    params: &mut motion::MotionParams,
+    removed_id: image_routing::StableLayerId,
+    saved_position: performance::SavedLayerPosition,
+) {
+    if matches!(
+        params.transplant.donor,
+        motion::MotionDonor::Selected { layer_id, .. } if layer_id == removed_id
+    ) {
+        params.transplant.donor = motion::MotionDonor::Missing { saved_position };
+    }
+}
+
+fn refresh_motion_donor_saved_position(
+    params: &mut motion::MotionParams,
+    positions: &[(
+        image_routing::StableLayerId,
+        performance::SavedLayerPosition,
+    )],
+) {
+    let motion::MotionDonor::Selected {
+        layer_id,
+        saved_position,
+    } = params.transplant.donor
+    else {
+        return;
+    };
+    params.transplant.donor = positions
+        .iter()
+        .find_map(|(candidate, position)| {
+            (*candidate == layer_id).then_some(motion::MotionDonor::Selected {
+                layer_id,
+                saved_position: *position,
+            })
+        })
+        .unwrap_or(motion::MotionDonor::Missing { saved_position });
+}
+
+/// Resolve a transform action solely by its process-stable layer identity.
+/// The positional index carried on the wire is diagnostic context and must
+/// never become a fallback after a reorder or deletion.
+fn resolve_stable_layer_index(
+    layer_id: &str,
+    layer_ids: impl IntoIterator<Item = u64>,
+) -> Option<usize> {
+    let stable_id = layer_id.parse::<u64>().ok().filter(|id| *id != 0)?;
+    layer_ids
+        .into_iter()
+        .position(|candidate| candidate == stable_id)
 }
 
 /// Resolve a browser-authored modulation target against immutable layer
@@ -610,17 +1828,1164 @@ fn resolve_routing_target_for_layer_ids(
     }
 }
 
+fn new_interactive_spatial_transform(fit: spatial::FitMode) -> spatial::SpatialTransform {
+    spatial::SpatialTransform {
+        fit,
+        edge: spatial::EdgeMode::Transparent,
+        ..spatial::SpatialTransform::default()
+    }
+}
+
+fn legacy_runtime_composition(
+    layers_front_to_back: &[image_routing::StableLayerId],
+) -> Result<composition::RuntimeComposition, composition::RuntimeCompositionError> {
+    let root = layers_front_to_back
+        .iter()
+        .rev()
+        .copied()
+        .map(|layer_id| composition::RuntimeRootItem::Layer {
+            layer_id,
+            bus: composition::BusAssignment::Program,
+        })
+        .collect();
+    let composition =
+        composition::RuntimeComposition::try_from_parts(Vec::new(), root, Some(1), 0.5)?;
+    composition.validate_for_layers(layers_front_to_back)?;
+    Ok(composition)
+}
+
+fn runtime_composition_front_to_back(
+    composition: &composition::RuntimeComposition,
+) -> Result<Vec<image_routing::StableLayerId>, composition::RuntimeCompositionError> {
+    let mut layers: Vec<_> = composition
+        .flatten()?
+        .layers
+        .into_iter()
+        .map(|layer| layer.layer_id)
+        .collect();
+    layers.reverse();
+    Ok(layers)
+}
+
+/// Create a group without changing the flattened visual stack. Browser
+/// selections arrive front-to-back, but authored composition storage is
+/// back-to-front, so the request is treated as an unordered set and
+/// canonicalized against the current flattened composition.
+fn stage_create_composition_group(
+    current: &composition::RuntimeComposition,
+    name: composition::GroupName,
+    requested: Vec<image_routing::StableLayerId>,
+    empty_root_index: usize,
+) -> Result<(composition::RuntimeComposition, visual_rack::GroupId), String> {
+    let requested_set: std::collections::BTreeSet<_> = requested.iter().copied().collect();
+    if requested_set.len() != requested.len() {
+        return Err("group member request contains a duplicate stable layer ID".into());
+    }
+
+    let group_id = visual_rack::GroupId::new(current.next_group_id_raw())
+        .ok_or_else(|| "group identity space is exhausted".to_string())?;
+    let next_group_id = group_id.get().checked_add(1).unwrap_or(0);
+    let (members, group_bus, root) = if requested_set.is_empty() {
+        if empty_root_index > current.root().len() {
+            return Err(format!(
+                "group root index {empty_root_index} exceeds {}",
+                current.root().len()
+            ));
+        }
+        let mut root = current.root().to_vec();
+        root.insert(
+            empty_root_index,
+            composition::RuntimeRootItem::Group { group_id },
+        );
+        (Vec::new(), composition::BusAssignment::Program, root)
+    } else {
+        let selected_indices: Vec<_> = current
+            .root()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match *item {
+                composition::RuntimeRootItem::Layer { layer_id, bus }
+                    if requested_set.contains(&layer_id) =>
+                {
+                    Some((index, layer_id, bus))
+                }
+                _ => None,
+            })
+            .collect();
+        if selected_indices.len() != requested_set.len() {
+            let absent = requested_set
+                .iter()
+                .find(|layer_id| {
+                    !selected_indices
+                        .iter()
+                        .any(|(_, candidate, _)| candidate == *layer_id)
+                })
+                .expect("selected/direct count mismatch identifies one layer");
+            return Err(format!(
+                "layer {} is not an ungrouped root layer",
+                absent.get()
+            ));
+        }
+        if selected_indices
+            .windows(2)
+            .any(|window| window[1].0 != window[0].0.saturating_add(1))
+        {
+            return Err("group members must be one contiguous root run".into());
+        }
+        let group_bus = selected_indices[0].2;
+        if selected_indices.iter().any(|(_, _, bus)| *bus != group_bus) {
+            return Err("group members must share one A/B/Program bus".into());
+        }
+
+        let collapse_index = selected_indices[0].0;
+        let members: Vec<_> = selected_indices
+            .iter()
+            .map(|(_, layer_id, _)| *layer_id)
+            .collect();
+        let mut root = Vec::with_capacity(
+            current
+                .root()
+                .len()
+                .saturating_sub(members.len())
+                .saturating_add(1),
+        );
+        for (index, item) in current.root().iter().copied().enumerate() {
+            if index == collapse_index {
+                root.push(composition::RuntimeRootItem::Group { group_id });
+            }
+            if !matches!(item, composition::RuntimeRootItem::Layer { layer_id, .. } if requested_set.contains(&layer_id))
+            {
+                root.push(item);
+            }
+        }
+        (members, group_bus, root)
+    };
+
+    let members = composition::RuntimeGroupMembers::try_from_vec(members)
+        .map_err(|error| error.to_string())?;
+    let mut groups: Vec<_> = current.groups().cloned().collect();
+    groups.push(composition::RuntimeGroup {
+        id: group_id,
+        name,
+        members,
+        opacity: 1.0,
+        transform: spatial::SpatialTransform::default(),
+        rack: RuntimeVisualRack::empty(),
+        matte: None,
+        solo: false,
+        bypass: false,
+        bus: group_bus,
+    });
+    let staged = composition::RuntimeComposition::try_from_parts(
+        groups,
+        root,
+        Some(next_group_id),
+        current.bus_crossfade(),
+    )
+    .map_err(|error| error.to_string())?;
+    let before: Vec<_> = current
+        .flatten()
+        .map_err(|error| error.to_string())?
+        .layers
+        .into_iter()
+        .map(|layer| layer.layer_id)
+        .collect();
+    let after: Vec<_> = staged
+        .flatten()
+        .map_err(|error| error.to_string())?
+        .layers
+        .into_iter()
+        .map(|layer| layer.layer_id)
+        .collect();
+    if after != before {
+        return Err("creating a group would change the flattened layer stack".into());
+    }
+    Ok((staged, group_id))
+}
+
+/// Replace one group's membership as a contiguous-run transaction while
+/// preserving every layer's current flattened position. The request's order is
+/// deliberately ignored; stable IDs are canonicalized back-to-front.
+fn stage_set_composition_group_members(
+    current: &composition::RuntimeComposition,
+    group_id: visual_rack::GroupId,
+    requested: Vec<image_routing::StableLayerId>,
+) -> Result<composition::RuntimeComposition, String> {
+    let requested_set: std::collections::BTreeSet<_> = requested.iter().copied().collect();
+    if requested_set.len() != requested.len() {
+        return Err("group member request contains a duplicate stable layer ID".into());
+    }
+    let current_group = current
+        .group(group_id)
+        .cloned()
+        .ok_or_else(|| format!("group {} is absent", group_id.get()))?;
+    let flattened = current.flatten().map_err(|error| error.to_string())?;
+    let before: Vec<_> = flattened
+        .layers
+        .iter()
+        .map(|layer| layer.layer_id)
+        .collect();
+    let selected_positions: Vec<_> = flattened
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, layer)| {
+            requested_set.contains(&layer.layer_id).then_some((
+                index,
+                layer.layer_id,
+                layer.group_id,
+                layer.bus,
+            ))
+        })
+        .collect();
+    if selected_positions.len() != requested_set.len() {
+        let absent = requested_set
+            .iter()
+            .find(|layer_id| {
+                !selected_positions
+                    .iter()
+                    .any(|(_, candidate, _, _)| candidate == *layer_id)
+            })
+            .expect("selected/flattened count mismatch identifies one layer");
+        return Err(format!("layer {} is absent", absent.get()));
+    }
+    if let Some((_, layer_id, Some(owner), _)) = selected_positions
+        .iter()
+        .find(|(_, _, owner, _)| owner.is_some_and(|owner| owner != group_id))
+    {
+        return Err(format!(
+            "layer {} is already owned by group {}",
+            layer_id.get(),
+            owner.get()
+        ));
+    }
+    if selected_positions
+        .windows(2)
+        .any(|window| window[1].0 != window[0].0.saturating_add(1))
+    {
+        return Err("group members must be one contiguous flattened run".into());
+    }
+    if selected_positions
+        .iter()
+        .any(|(_, _, _, bus)| *bus != current_group.bus)
+    {
+        return Err(format!(
+            "group {} members must remain on its {:?} bus",
+            group_id.get(),
+            current_group.bus
+        ));
+    }
+    let canonical_members: Vec<_> = selected_positions
+        .iter()
+        .map(|(_, layer_id, _, _)| *layer_id)
+        .collect();
+
+    let root = if canonical_members.is_empty() {
+        let mut root = Vec::new();
+        for item in current.root().iter().copied() {
+            if item.key() == composition::RuntimeRootItemKey::Group(group_id) {
+                root.extend(current_group.members.iter().map(|layer_id| {
+                    composition::RuntimeRootItem::Layer {
+                        layer_id,
+                        bus: current_group.bus,
+                    }
+                }));
+                root.push(item);
+            } else {
+                root.push(item);
+            }
+        }
+        root
+    } else {
+        // Expand only the target group into its stable layer run. Other groups
+        // remain indivisible root blocks and therefore cannot be captured by a
+        // membership request.
+        let mut expanded = Vec::new();
+        for item in current.root().iter().copied() {
+            if item.key() == composition::RuntimeRootItemKey::Group(group_id) {
+                expanded.extend(current_group.members.iter().map(|layer_id| {
+                    composition::RuntimeRootItem::Layer {
+                        layer_id,
+                        bus: current_group.bus,
+                    }
+                }));
+            } else {
+                expanded.push(item);
+            }
+        }
+        let mut inserted = false;
+        let mut root = Vec::new();
+        for item in expanded {
+            if matches!(item, composition::RuntimeRootItem::Layer { layer_id, .. } if requested_set.contains(&layer_id))
+            {
+                if !inserted {
+                    root.push(composition::RuntimeRootItem::Group { group_id });
+                    inserted = true;
+                }
+            } else {
+                root.push(item);
+            }
+        }
+        if !inserted {
+            return Err(format!("group {} member run is absent", group_id.get()));
+        }
+        root
+    };
+
+    let mut groups: Vec<_> = current.groups().cloned().collect();
+    groups
+        .iter_mut()
+        .find(|group| group.id == group_id)
+        .expect("target group was resolved above")
+        .members = composition::RuntimeGroupMembers::try_from_vec(canonical_members)
+        .map_err(|error| error.to_string())?;
+    let staged = composition::RuntimeComposition::try_from_parts(
+        groups,
+        root,
+        Some(current.next_group_id_raw()),
+        current.bus_crossfade(),
+    )
+    .map_err(|error| error.to_string())?;
+    let after: Vec<_> = staged
+        .flatten()
+        .map_err(|error| error.to_string())?
+        .layers
+        .into_iter()
+        .map(|layer| layer.layer_id)
+        .collect();
+    if after != before {
+        return Err("changing group membership would reorder the flattened layer stack".into());
+    }
+    Ok(staged)
+}
+
+fn stage_layer_mattes_after_group_removal(
+    current: impl IntoIterator<Item = (image_routing::StableLayerId, image_routing::LayerMatte)>,
+    removed: visual_rack::GroupId,
+) -> Vec<(image_routing::StableLayerId, image_routing::LayerMatte)> {
+    current
+        .into_iter()
+        .map(|(layer_id, mut matte)| {
+            matte.mark_group_output_missing(removed);
+            (layer_id, matte)
+        })
+        .collect()
+}
+
+fn stage_set_composition_layer_bus(
+    current: &composition::RuntimeComposition,
+    layer_id: image_routing::StableLayerId,
+    bus: composition::BusAssignment,
+) -> Result<Option<composition::RuntimeComposition>, String> {
+    let mut found = false;
+    let root = current
+        .root()
+        .iter()
+        .copied()
+        .map(|item| match item {
+            composition::RuntimeRootItem::Layer {
+                layer_id: candidate,
+                ..
+            } if candidate == layer_id => {
+                found = true;
+                composition::RuntimeRootItem::Layer { layer_id, bus }
+            }
+            item => item,
+        })
+        .collect();
+    if !found {
+        return Ok(None);
+    }
+    composition::RuntimeComposition::try_from_parts(
+        current.groups().cloned().collect(),
+        root,
+        Some(current.next_group_id_raw()),
+        current.bus_crossfade(),
+    )
+    .map(Some)
+    .map_err(|error| error.to_string())
+}
+
+/// Stage an ordinary flat-stack reorder against the authored tree. A group's
+/// members may reorder within their own contiguous block, and complete root
+/// blocks may move, but no flat move may split a group or smuggle a layer
+/// across its ownership boundary.
+fn stage_composition_reorder(
+    current: &composition::RuntimeComposition,
+    desired_front_to_back: &[image_routing::StableLayerId],
+) -> Result<composition::RuntimeComposition, String> {
+    current
+        .validate_for_layers(desired_front_to_back)
+        .map_err(|error| format!("composition/live stack mismatch: {error}"))?;
+    let desired_back_to_front: Vec<_> = desired_front_to_back.iter().rev().copied().collect();
+    let desired_positions: std::collections::BTreeMap<_, _> = desired_back_to_front
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(position, layer_id)| (layer_id, position))
+        .collect();
+    if desired_positions.len() != desired_back_to_front.len() {
+        return Err("desired layer stack contains a duplicate stable ID".to_string());
+    }
+
+    let mut groups: Vec<_> = current.groups().cloned().collect();
+    for group in &mut groups {
+        let mut members: Vec<_> = group.members.iter().collect();
+        members.sort_by_key(|layer_id| desired_positions.get(layer_id).copied());
+        let mut positions: Vec<_> = members
+            .iter()
+            .filter_map(|layer_id| desired_positions.get(layer_id).copied())
+            .collect();
+        positions.sort_unstable();
+        if positions
+            .windows(2)
+            .any(|window| window[1] != window[0].saturating_add(1))
+        {
+            return Err(format!("layer move would split group {}", group.id.get()));
+        }
+        group.members = composition::RuntimeGroupMembers::try_from_vec(members)
+            .map_err(|error| format!("reorder group {}: {error}", group.id.get()))?;
+    }
+
+    let group_by_id: std::collections::BTreeMap<_, _> =
+        groups.iter().map(|group| (group.id, group)).collect();
+    let root_block = |item: composition::RuntimeRootItem| -> Vec<image_routing::StableLayerId> {
+        match item {
+            composition::RuntimeRootItem::Layer { layer_id, .. } => vec![layer_id],
+            composition::RuntimeRootItem::Group { group_id } => group_by_id
+                .get(&group_id)
+                .map(|group| group.members.iter().collect())
+                .unwrap_or_default(),
+        }
+    };
+    let mut root = current.root().to_vec();
+    let mut nonempty: Vec<_> = root
+        .iter()
+        .copied()
+        .filter_map(|item| {
+            let block = root_block(item);
+            block
+                .first()
+                .and_then(|layer_id| desired_positions.get(layer_id).copied())
+                .map(|position| (position, item))
+        })
+        .collect();
+    nonempty.sort_by_key(|(position, _)| *position);
+    let mut replacements = nonempty.into_iter().map(|(_, item)| item);
+    for item in &mut root {
+        if !root_block(*item).is_empty() {
+            *item = replacements
+                .next()
+                .expect("every non-empty root block has one replacement");
+        }
+    }
+
+    let staged = composition::RuntimeComposition::try_from_parts(
+        groups,
+        root,
+        Some(current.next_group_id_raw()),
+        current.bus_crossfade(),
+    )
+    .map_err(|error| format!("stage composition reorder: {error}"))?;
+    staged
+        .validate_for_layers(desired_front_to_back)
+        .map_err(|error| format!("validate composition reorder: {error}"))?;
+    if runtime_composition_front_to_back(&staged)
+        .map_err(|error| format!("flatten composition reorder: {error}"))?
+        != desired_front_to_back
+    {
+        return Err("layer move cannot be represented without splitting a group".to_string());
+    }
+    Ok(staged)
+}
+
+fn stage_composition_insert_ungrouped(
+    current: &composition::RuntimeComposition,
+    current_front_to_back: &[image_routing::StableLayerId],
+    layer_id: image_routing::StableLayerId,
+    app_index: usize,
+) -> Result<composition::RuntimeComposition, String> {
+    current
+        .validate_for_layers(current_front_to_back)
+        .map_err(|error| format!("composition/live stack mismatch: {error}"))?;
+    if app_index > current_front_to_back.len() {
+        return Err(format!(
+            "layer insertion index {app_index} exceeds stack length {}",
+            current_front_to_back.len()
+        ));
+    }
+    if current_front_to_back.contains(&layer_id) {
+        return Err(format!("layer {} already exists", layer_id.get()));
+    }
+
+    // The runtime root is back-to-front. App insertion at the bottom therefore
+    // lands at root boundary zero; insertion at the top lands at the end.
+    let wanted_offset = current_front_to_back.len() - app_index;
+    let mut flattened_offset = 0usize;
+    let mut root_index = None;
+    for (index, item) in current.root().iter().copied().enumerate() {
+        if flattened_offset == wanted_offset {
+            root_index = Some(index);
+            break;
+        }
+        let block_len = match item {
+            composition::RuntimeRootItem::Layer { .. } => 1,
+            composition::RuntimeRootItem::Group { group_id } => current
+                .group(group_id)
+                .ok_or_else(|| {
+                    format!(
+                        "composition root references missing group {}",
+                        group_id.get()
+                    )
+                })?
+                .members
+                .len(),
+        };
+        if wanted_offset < flattened_offset.saturating_add(block_len) {
+            return Err(format!(
+                "layer insertion would split group at back-to-front offset {wanted_offset}"
+            ));
+        }
+        flattened_offset = flattened_offset.saturating_add(block_len);
+        if flattened_offset == wanted_offset {
+            root_index = Some(index + 1);
+            break;
+        }
+    }
+    let root_index =
+        root_index.or_else(|| (flattened_offset == wanted_offset).then_some(current.root().len()));
+    let Some(root_index) = root_index else {
+        return Err(format!(
+            "layer insertion offset {wanted_offset} is outside the flattened composition"
+        ));
+    };
+
+    let mut root = current.root().to_vec();
+    root.insert(
+        root_index,
+        composition::RuntimeRootItem::Layer {
+            layer_id,
+            bus: composition::BusAssignment::Program,
+        },
+    );
+    let staged = composition::RuntimeComposition::try_from_parts(
+        current.groups().cloned().collect(),
+        root,
+        Some(current.next_group_id_raw()),
+        current.bus_crossfade(),
+    )
+    .map_err(|error| format!("stage layer insertion: {error}"))?;
+    let mut expected = current_front_to_back.to_vec();
+    expected.insert(app_index, layer_id);
+    staged
+        .validate_for_layers(&expected)
+        .map_err(|error| format!("validate layer insertion: {error}"))?;
+    if runtime_composition_front_to_back(&staged)
+        .map_err(|error| format!("flatten layer insertion: {error}"))?
+        != expected
+    {
+        return Err("layer insertion changed the authored flat order".to_string());
+    }
+    Ok(staged)
+}
+
+fn stage_composition_remove(
+    current: &composition::RuntimeComposition,
+    current_front_to_back: &[image_routing::StableLayerId],
+    removed: image_routing::StableLayerId,
+) -> Result<composition::RuntimeComposition, String> {
+    current
+        .validate_for_layers(current_front_to_back)
+        .map_err(|error| format!("composition/live stack mismatch: {error}"))?;
+    if !current_front_to_back.contains(&removed) {
+        return Err(format!("layer {} is absent", removed.get()));
+    }
+
+    let mut occurrences = 0usize;
+    let mut groups: Vec<_> = current.groups().cloned().collect();
+    for group in &mut groups {
+        let before = group.members.len();
+        let members: Vec<_> = group
+            .members
+            .iter()
+            .filter(|layer_id| *layer_id != removed)
+            .collect();
+        occurrences += before.saturating_sub(members.len());
+        group.members = composition::RuntimeGroupMembers::try_from_vec(members)
+            .map_err(|error| format!("remove from group {}: {error}", group.id.get()))?;
+    }
+    let mut root = Vec::with_capacity(current.root().len());
+    for item in current.root().iter().copied() {
+        if matches!(item, composition::RuntimeRootItem::Layer { layer_id, .. } if layer_id == removed)
+        {
+            occurrences += 1;
+        } else {
+            root.push(item);
+        }
+    }
+    if occurrences != 1 {
+        return Err(format!(
+            "layer {} occurs {occurrences} times in the authored composition",
+            removed.get()
+        ));
+    }
+
+    let mut staged = composition::RuntimeComposition::try_from_parts(
+        groups,
+        root,
+        Some(current.next_group_id_raw()),
+        current.bus_crossfade(),
+    )
+    .map_err(|error| format!("stage layer removal: {error}"))?;
+    staged.mark_layer_output_missing(removed);
+    let expected: Vec<_> = current_front_to_back
+        .iter()
+        .copied()
+        .filter(|layer_id| *layer_id != removed)
+        .collect();
+    staged
+        .validate_for_layers(&expected)
+        .map_err(|error| format!("validate layer removal: {error}"))?;
+    if runtime_composition_front_to_back(&staged)
+        .map_err(|error| format!("flatten layer removal: {error}"))?
+        != expected
+    {
+        return Err("layer removal changed the order of surviving layers".to_string());
+    }
+    Ok(staged)
+}
+
+struct LiveMotionFieldCache {
+    scope: visual_rack::VisualScopeId,
+    source_generation: u64,
+    frame_ordinal: u64,
+    algorithm_version: u16,
+    source_dimensions: [u32; 2],
+    grid: motion::MotionGrid,
+    field: motion::MotionField,
+}
+
+impl LiveMotionFieldCache {
+    fn attachment(&self) -> evaluated_frame::evaluated_composition::MotionFieldAttachment<'_> {
+        evaluated_frame::evaluated_composition::MotionFieldAttachment {
+            scope: self.scope,
+            source_generation: self.source_generation,
+            frame_ordinal: self.frame_ordinal,
+            algorithm_version: self.algorithm_version,
+            source_dimensions: self.source_dimensions,
+            grid: self.grid,
+            field: &self.field,
+        }
+    }
+}
+
+/// Rasterize a decoder product at most once per accepted source generation /
+/// frame ordinal / evaluated grid. The bounded cache owns only canonical
+/// low-resolution fields; sparse codec records remain paired with Layer's
+/// exact uploaded RGBA frame and no per-layer full-resolution history exists.
+fn refresh_live_codec_motion_cache(
+    layers: &[Layer],
+    plan: &evaluated_frame::evaluated_composition::AdvancedMotionPlan,
+    cache: &mut Vec<LiveMotionFieldCache>,
+) -> Vec<String> {
+    let mut previous = std::mem::take(cache);
+    let mut next = Vec::with_capacity(plan.fields().len());
+    let mut diagnostics = Vec::new();
+    for field_plan in plan
+        .fields()
+        .iter()
+        .copied()
+        .filter(|field| field.source.origin == motion::MotionFieldOrigin::CodecVectors)
+    {
+        let visual_rack::VisualScopeId::Layer(layer_id) = field_plan.scope else {
+            diagnostics.push("master Motion cannot consume codec vectors".to_string());
+            continue;
+        };
+        let Some(layer) = layers
+            .iter()
+            .find(|layer| layer.stable_layer_id() == layer_id)
+        else {
+            diagnostics.push(format!(
+                "motion codec scope layer {} disappeared before encode",
+                layer_id.get()
+            ));
+            continue;
+        };
+        let Some(codec) = layer.codec_motion() else {
+            diagnostics.push(format!(
+                "layer {} has no codec motion product for the evaluated frame",
+                layer_id.get()
+            ));
+            continue;
+        };
+        if let Some(index) = previous.iter().position(|cached| {
+            field_plan.accepts(cached.attachment())
+                && cached.source_generation == codec.source_generation
+                && cached.frame_ordinal == codec.frame_ordinal
+        }) {
+            next.push(previous.swap_remove(index));
+            continue;
+        }
+        let Some(scope_plan) = plan.scope(field_plan.scope) else {
+            diagnostics.push(format!(
+                "motion codec scope {:?} has no evaluated scope plan",
+                field_plan.scope
+            ));
+            continue;
+        };
+        match motion::rasterize_codec_motion_vectors(
+            codec.source_dimensions,
+            scope_plan.params.lattice_quality,
+            &codec.vectors,
+        ) {
+            Ok(Some(field)) => {
+                let cached = LiveMotionFieldCache {
+                    scope: field_plan.scope,
+                    source_generation: codec.source_generation,
+                    frame_ordinal: codec.frame_ordinal,
+                    algorithm_version: codec.algorithm_version,
+                    source_dimensions: codec.source_dimensions,
+                    grid: field.grid(),
+                    field,
+                };
+                if field_plan.accepts(cached.attachment()) {
+                    next.push(cached);
+                } else {
+                    diagnostics.push(format!(
+                        "layer {} codec motion product does not match its immutable field plan",
+                        layer_id.get()
+                    ));
+                }
+            }
+            Ok(None) => diagnostics.push(format!(
+                "layer {} codec motion product contains no usable past-reference vectors",
+                layer_id.get()
+            )),
+            Err(error) => diagnostics.push(format!(
+                "layer {} codec motion rasterization rejected: {error}",
+                layer_id.get()
+            )),
+        }
+    }
+    *cache = next;
+    diagnostics
+}
+
+fn motion_scope_diagnostic(
+    scope: visual_rack::VisualScopeId,
+    diagnostics: &[evaluated_frame::evaluated_composition::MotionPlanDiagnostic],
+) -> Option<String> {
+    use evaluated_frame::evaluated_composition::MotionPlanDiagnostic as Diagnostic;
+    diagnostics.iter().find_map(|diagnostic| match *diagnostic {
+        Diagnostic::Source {
+            scope: candidate,
+            diagnostic,
+        } if candidate == scope => Some(match diagnostic {
+            motion::MotionSourceDiagnostic::None => "motion source ready".to_string(),
+            motion::MotionSourceDiagnostic::CodecUnavailable => {
+                "codec vectors unavailable; explicit codec mode yields no field".to_string()
+            }
+            motion::MotionSourceDiagnostic::CodecUnavailableFallback => {
+                "codec vectors unavailable; deterministic lattice fallback active".to_string()
+            }
+        }),
+        Diagnostic::MasterTransplantRejected if scope == visual_rack::VisualScopeId::Master => {
+            Some("Faraday transplant is layer-only".to_string())
+        }
+        Diagnostic::DonorNotSelected { recipient }
+            if scope == visual_rack::VisualScopeId::Layer(recipient) =>
+        {
+            Some("Faraday donor is not selected".to_string())
+        }
+        Diagnostic::MissingDonor { recipient, .. }
+            if scope == visual_rack::VisualScopeId::Layer(recipient) =>
+        {
+            Some("Faraday donor is missing".to_string())
+        }
+        Diagnostic::ExcessTransplantRejected {
+            recipient,
+            admitted_recipient,
+        } if scope == visual_rack::VisualScopeId::Layer(recipient) => Some(format!(
+            "Faraday transplant rejected; layer {} already owns the bounded carrier",
+            admitted_recipient.get()
+        )),
+        _ => None,
+    })
+}
+
+fn motion_runtime_diagnostic(
+    scope: visual_rack::VisualScopeId,
+    diagnostics: &[renderer::motion::MotionRuntimeDiagnostic],
+) -> Option<String> {
+    use renderer::motion::MotionRuntimeDiagnostic as Diagnostic;
+    diagnostics.iter().find_map(|diagnostic| match *diagnostic {
+        Diagnostic::Planned(_) => None,
+        Diagnostic::MissingCodecAttachment { scope: candidate } if candidate == scope => {
+            Some("matching codec field attachment is missing".to_string())
+        }
+        Diagnostic::RejectedCodecAttachment { scope: candidate } if candidate == scope => {
+            Some("stale or mismatched codec field attachment was rejected".to_string())
+        }
+        Diagnostic::InvalidTransform { scope: candidate } if candidate == scope => {
+            Some("degenerate motion transform suppressed field confidence".to_string())
+        }
+        _ => None,
+    })
+}
+
+fn motion_telemetry_from_plan(
+    plan: &evaluated_frame::evaluated_composition::AdvancedMotionPlan,
+    executor: Option<&renderer::composition::CompositionGpuExecutor>,
+) -> Vec<(
+    visual_rack::VisualScopeId,
+    web::state::MotionTelemetrySnapshot,
+)> {
+    plan.scopes()
+        .iter()
+        .map(|scope| {
+            let field = scope.field_slot.and_then(|slot| plan.field(slot));
+            let runtime = executor.and_then(|executor| executor.motion_metrics(scope.scope));
+            let runtime_diagnostic = executor.and_then(|executor| {
+                motion_runtime_diagnostic(scope.scope, executor.motion_diagnostics())
+            });
+            let planned_diagnostic = motion_scope_diagnostic(scope.scope, plan.diagnostics());
+            let effective_source = match scope.source.origin {
+                motion::MotionFieldOrigin::None => "none",
+                motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
+                motion::MotionFieldOrigin::Lattice => "lattice",
+                motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+            };
+            let donor_missing = plan.diagnostics().iter().any(|diagnostic| {
+                matches!(
+                    diagnostic,
+                    evaluated_frame::evaluated_composition::MotionPlanDiagnostic::MissingDonor {
+                        recipient,
+                        ..
+                    } if scope.scope == visual_rack::VisualScopeId::Layer(*recipient)
+                )
+            });
+            (
+                scope.scope,
+                web::state::MotionTelemetrySnapshot {
+                    effective_source: effective_source.to_string(),
+                    codec_vectors_available: scope.codec.available,
+                    fallback_active: scope.source.origin
+                        == motion::MotionFieldOrigin::LatticeFallback,
+                    field_dimensions: field
+                        .map_or([0, 0], |field| [field.grid.width, field.grid.height]),
+                    vector_count: field.map_or(0, |field| field.grid.vector_count),
+                    required_as_donor: scope.required_as_donor,
+                    transplant_admitted: scope.transplant_admitted,
+                    donor_missing,
+                    carrier_valid: scope.transplant_admitted
+                        && runtime.is_some_and(|runtime| runtime.carrier_valid),
+                    memory_generation: runtime.map_or(0, |runtime| runtime.memory_generation),
+                    diagnostic: runtime_diagnostic
+                        .or(planned_diagnostic)
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Exact authored state retained by the bounded manual-history store. Runtime
+/// pixels, GPU objects, decoder queues, and worker state are deliberately
+/// absent. Stable layer IDs are retained because undoing a reorder/delete must
+/// restore every live ID-addressed route without retargeting it.
+#[derive(Clone)]
+struct ManualHistoryWorld {
+    patch: patch::PatchState,
+    stable_layer_ids: Vec<image_routing::StableLayerId>,
+    selected_layer_id: Option<image_routing::StableLayerId>,
+    patch_base_dir: Option<PathBuf>,
+    stage_map: stage_map::StageMap,
+    presets: preset::PresetLibrary,
+    controller_profile: controller_profile::ControllerProfileDocument,
+}
+
+#[derive(serde::Serialize)]
+struct ManualHistoryCanonical<'a> {
+    patch: &'a patch::PatchState,
+    stable_layer_ids: Vec<u64>,
+    selected_layer_id: Option<u64>,
+    patch_base_dir: Option<&'a std::path::Path>,
+    stage_map: &'a stage_map::StageMap,
+    presets: &'a preset::PresetLibrary,
+    controller_profile: &'a controller_profile::ControllerProfileDocument,
+}
+
+impl ManualHistoryWorld {
+    fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&ManualHistoryCanonical {
+            patch: &self.patch,
+            stable_layer_ids: self
+                .stable_layer_ids
+                .iter()
+                .map(|layer_id| layer_id.get())
+                .collect(),
+            selected_layer_id: self.selected_layer_id.map(|layer_id| layer_id.get()),
+            patch_base_dir: self.patch_base_dir.as_deref(),
+            stage_map: &self.stage_map,
+            presets: &self.presets,
+            controller_profile: &self.controller_profile,
+        })
+        .map_err(|error| format!("serialize manual history world: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveCaptureBackend {
+    Renderer,
+    Advanced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveCapturePlanKind {
+    Unavailable,
+    LegacyExact,
+    Advanced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveCaptureBackendDecision {
+    Ready(LiveCaptureBackend),
+    SourceUnavailable,
+}
+
+fn live_capture_backend(
+    target: program_recorder::CaptureTarget,
+    plan: LiveCapturePlanKind,
+    frozen: Option<LiveCaptureBackend>,
+) -> LiveCaptureBackendDecision {
+    let candidate = match target {
+        program_recorder::CaptureTarget::Program => Some(LiveCaptureBackend::Renderer),
+        program_recorder::CaptureTarget::Layer(_) => match plan {
+            LiveCapturePlanKind::LegacyExact => Some(LiveCaptureBackend::Renderer),
+            LiveCapturePlanKind::Advanced => Some(LiveCaptureBackend::Advanced),
+            LiveCapturePlanKind::Unavailable => None,
+        },
+        program_recorder::CaptureTarget::Group(_) => match plan {
+            LiveCapturePlanKind::Advanced => Some(LiveCaptureBackend::Advanced),
+            LiveCapturePlanKind::Unavailable | LiveCapturePlanKind::LegacyExact => None,
+        },
+    };
+    match (candidate, frozen) {
+        (Some(candidate), None) => LiveCaptureBackendDecision::Ready(candidate),
+        (Some(candidate), Some(frozen)) if candidate == frozen => {
+            LiveCaptureBackendDecision::Ready(candidate)
+        }
+        _ => LiveCaptureBackendDecision::SourceUnavailable,
+    }
+}
+
+enum LiveCaptureWorker {
+    Recording(program_recorder::ProgramRecorder),
+    StillWaiting {
+        config: program_recorder::StillSnapshotConfig,
+        pixels: Option<Vec<u8>>,
+        in_flight: bool,
+    },
+    StillPublishing(program_recorder::StillSnapshotJob),
+    Failed(String),
+}
+
+struct LiveCaptureSession {
+    generation: u64,
+    target: program_recorder::CaptureTarget,
+    backend: Option<LiveCaptureBackend>,
+    started_at: Instant,
+    next_capture_index: u64,
+    last_capture_index: Option<u64>,
+    in_flight_readbacks: usize,
+    rejected_capture_indices: VecDeque<u64>,
+    accepting_captures: bool,
+    finish_dispatched: bool,
+    cancel_requested: bool,
+    artifact_name: String,
+    deferred_history: Option<DeferredPerformanceHistory>,
+    worker: LiveCaptureWorker,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveCaptureFrameIntent {
+    target: program_recorder::CaptureTarget,
+    backend: LiveCaptureBackend,
+    tag: renderer::readback::RecorderReadbackTag,
+}
+
+impl LiveCaptureFrameIntent {
+    fn capture_index(self) -> u64 {
+        self.tag.metadata().capture_index
+    }
+}
+
+impl LiveCaptureSession {
+    fn recording_ready(&self) -> bool {
+        match &self.worker {
+            LiveCaptureWorker::Recording(recorder) => {
+                recorder.snapshot().status == program_recorder::RecorderStatus::Recording
+            }
+            LiveCaptureWorker::StillWaiting { in_flight, .. } => !*in_flight,
+            LiveCaptureWorker::StillPublishing(_) | LiveCaptureWorker::Failed(_) => false,
+        }
+    }
+
+    fn frame_intent(
+        &mut self,
+        plan: LiveCapturePlanKind,
+        program_time: Duration,
+        visual_epoch: u64,
+        program_frozen: bool,
+        media_frozen: bool,
+        blackout: bool,
+    ) -> Result<Option<LiveCaptureFrameIntent>, ()> {
+        if !self.accepting_captures || self.cancel_requested || !self.recording_ready() {
+            return Ok(None);
+        }
+        let capture_index = self.next_capture_index;
+        self.next_capture_index = self.next_capture_index.saturating_add(1);
+        self.last_capture_index = Some(capture_index);
+        let metadata = program_recorder::RecorderFrameMetadata {
+            capture_index,
+            capture_time_ns: duration_ns_u64(self.started_at.elapsed()),
+            program_time_ns: duration_ns_u64(program_time),
+            visual_epoch,
+            program_frozen,
+            media_frozen,
+            blackout,
+            // The current foundation is intentionally video-only. The durable
+            // report states `audio_not_muxed=true`; fabricating an analyzer
+            // clock here would imply sample-accurate PCM ownership Main lacks.
+            audio_clock: None,
+        };
+        let LiveCaptureBackendDecision::Ready(backend) =
+            live_capture_backend(self.target, plan, self.backend)
+        else {
+            self.note_source_frame_dropped();
+            return Err(());
+        };
+        Ok(Some(LiveCaptureFrameIntent {
+            target: self.target,
+            backend,
+            tag: renderer::readback::RecorderReadbackTag::new(self.generation, metadata),
+        }))
+    }
+
+    fn note_source_frame_dropped(&mut self) {
+        match &self.worker {
+            LiveCaptureWorker::Recording(recorder) => recorder.note_source_frame_dropped(),
+            LiveCaptureWorker::StillWaiting { .. } => {}
+            LiveCaptureWorker::StillPublishing(_) | LiveCaptureWorker::Failed(_) => {}
+        }
+    }
+
+    fn mark_scheduled(&mut self, intent: LiveCaptureFrameIntent) {
+        self.backend.get_or_insert(intent.backend);
+        self.in_flight_readbacks = self
+            .in_flight_readbacks
+            .saturating_add(1)
+            .min(renderer::readback::RECORDER_GPU_READBACK_SLOTS);
+        if let LiveCaptureWorker::StillWaiting { in_flight, .. } = &mut self.worker {
+            *in_flight = true;
+        }
+    }
+
+    fn mark_capture_rejected(&mut self, capture_index: u64) {
+        if self.rejected_capture_indices.len() < renderer::readback::RECORDER_GPU_READBACK_SLOTS {
+            self.rejected_capture_indices.push_back(capture_index);
+        }
+    }
+
+    fn take_rejected_capture(&mut self, capture_index: u64) -> bool {
+        let Some(position) = self
+            .rejected_capture_indices
+            .iter()
+            .position(|index| *index == capture_index)
+        else {
+            return false;
+        };
+        self.rejected_capture_indices.remove(position);
+        true
+    }
+
+    fn request_finish(&mut self) {
+        if matches!(self.worker, LiveCaptureWorker::Recording(_)) {
+            self.accepting_captures = false;
+        }
+    }
+
+    fn request_cancel(&mut self) {
+        self.accepting_captures = false;
+        self.cancel_requested = true;
+        match &self.worker {
+            LiveCaptureWorker::Recording(recorder) => recorder.cancel(),
+            LiveCaptureWorker::StillPublishing(job) => job.cancel(),
+            LiveCaptureWorker::StillWaiting { .. } | LiveCaptureWorker::Failed(_) => {}
+        }
+    }
+
+    fn complete_readback(&mut self) {
+        self.in_flight_readbacks = self.in_flight_readbacks.saturating_sub(1);
+    }
+}
+
+const fn duration_ns_u64(duration: Duration) -> u64 {
+    let nanos = duration.as_nanos();
+    if nanos > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        nanos as u64
+    }
+}
+
+fn controller_feedback_addresses(
+    profile: &controller_profile::ResolvedControllerProfile,
+) -> BTreeSet<controller_profile::RuntimeControlAddress> {
+    profile
+        .bindings
+        .iter()
+        .filter(|binding| binding.feedback.is_some())
+        .map(|binding| binding.target)
+        .collect()
+}
+
 struct App {
     initial_video: Option<String>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// Lazily allocated only for a planned advanced composition. Exact legacy
+    /// frames continue through the frozen renderer without any M2 resources.
+    composition_gpu: Option<renderer::composition::CompositionGpuExecutor>,
+    motion_field_cache: Vec<LiveMotionFieldCache>,
+    motion_telemetry: Vec<(
+        visual_rack::VisualScopeId,
+        web::state::MotionTelemetrySnapshot,
+    )>,
+    /// Exact immutable resource ledgers from the most recently accepted
+    /// audience frame. `None` means no frame has established the fact yet;
+    /// exact legacy establishes a measured zero for both advanced domains.
+    accepted_creative_resource_bytes: Option<u64>,
+    accepted_motion_resource_bytes: Option<u64>,
     layers: Vec<Layer>,
     selected_layer: Option<usize>,
     /// Monotonic generation for the live layer stack. Browser actions carry
     /// this (plus a stable layer ID) so stale multi-controller edits cannot
     /// land on a different clip after a topology change.
     layer_stack_revision: u64,
+    /// Stable-ID authored tree. Its root is back-to-front, the inverse of
+    /// `layers` (whose index zero is the top/front layer).
+    composition: composition::RuntimeComposition,
+    composition_revision: u64,
+    composition_status: String,
     master_effects: effects::EffectUniforms,
+    master_rack: RuntimeVisualRack,
+    /// Program-wide M4 motion authoring. Hidden field/carrier pixels remain
+    /// executor-owned and are never serialized with this value.
+    master_motion: motion::MotionParams,
+    /// Resolution-independent authored transform for the composite after the
+    /// layer stack. Legacy state defaults to the exact full-frame bypass.
+    master_transform: spatial::SpatialTransform,
     master_paused: bool,
     media_frozen: bool,
     last_frame_time: Instant,
@@ -628,6 +2993,11 @@ struct App {
     modifiers: ModifiersState,
     // Library
     library_folder: Option<PathBuf>,
+    /// Directory of the most recently committed exact Snapshot. Inactive
+    /// content-addressed ClipSlots may resolve relative to this directory when
+    /// they are prepared later; interactive sources remain absolute/library
+    /// based.
+    performance_patch_dir: Option<PathBuf>,
     library_files: Vec<PathBuf>,
     audio_library_files: Vec<PathBuf>,
     /// Host-session-only source admission policy. Patches deliberately cannot
@@ -635,6 +3005,9 @@ struct App {
     /// without destroying sources that already hold an Expert reservation.
     media_safety_policy: media_safety::MediaSafetyPolicy,
     media_safety_status: String,
+    /// Host-session framing preference for future interactive layers. Exact
+    /// patch reconstruction restores each saved transform and never reads it.
+    new_layer_fit: spatial::FitMode,
     // YAML editor
     yaml_editor: patch::editor::EditorState,
     // egui state
@@ -662,6 +3035,41 @@ struct App {
     /// Renderer/preflight failures are published through the existing VHS
     /// status surface. The audience retains its last exact frame meanwhile.
     selective_ntsc_runtime_error: String,
+    /// Current image-route planning failure. A rejected matte graph renders
+    /// through the untouched legacy compositor and remains operator-visible.
+    image_routing_error: String,
+    /// Operator-visible prepared-source worker/cache/GPU activation state.
+    source_staging_status: String,
+    /// Operator-visible atomic Scene schedule/commit state.
+    scene_status: String,
+    /// Two-worker source preparation front end. It is initialized only after
+    /// the GPU device exists so worker admission uses the actual host/device
+    /// ceilings.
+    performance_runtime: Option<performance_runtime::PerformancePreparationRuntime>,
+    performance_budget: media_safety::PerformanceResourceBudget,
+    /// GPU-ready inactive transactions. Resource leases travel with each
+    /// payload, making this an explicitly bounded LRU rather than an
+    /// unaccounted second cache.
+    performance_gpu_cache: VecDeque<CachedPerformancePayload>,
+    performance_staging: Option<PerformanceStagingIntent>,
+    performance_scheduled: Option<ScheduledPerformanceActivation>,
+    performance_boundaries: performance::BeatBoundaryTracker,
+    /// Program-clock downbeats use a tracker separate from Scene activation:
+    /// Media Freeze stops clip/Scene boundaries but must keep temporal effects
+    /// and Collision Score advancing.
+    temporal_boundaries: performance::BeatBoundaryTracker,
+    /// Every temporal event is counted and retained until one complete frame
+    /// is accepted. A rejected/safe-held encoder cannot silently consume a
+    /// loop, downbeat, audio onset, or operator gesture.
+    pending_temporal_events: temporal::TemporalFrameEvents,
+    /// Ordered M4 clear/topology edits are consumed by the Advanced executor
+    /// at the next encode boundary. This never clears Temporal,
+    /// ProgramHistory, image taps, or the held audience frame.
+    pending_motion_memory_clear: bool,
+    /// Shared hysteretic edge state for the analyzer's decaying onset envelope.
+    temporal_audio_onsets: temporal::TemporalAudioOnsetTracker,
+    /// Last successfully evaluated matte diagnostic per stable layer ID.
+    image_routing_diagnostics: Vec<(image_routing::StableLayerId, String)>,
     /// A selective path/topology edge committed while paused retains slot2.
     /// Entering selective holds through resumed warm-up until the first exact
     /// accepted sample; leaving selective releases on the first resumed direct
@@ -680,6 +3088,9 @@ struct App {
     mod_matrix: modulation::ModMatrix,
     // Patch morphing crossfader (A/B slots + t)
     morph: morph::Morph,
+    /// Saved performance Scenes. Source preparation/commit state lives in the
+    /// dedicated runtime; this collection is the authored, patch-owned set.
+    scenes: performance::Scenes,
     // Blackout: output cut to black (B key / panel button)
     blackout: bool,
     /// Whether the last audience presentation actually contained the absolute
@@ -700,6 +3111,20 @@ struct App {
     audio_clip_blocks_program: bool,
     // MIDI input (modulation source)
     midi: midi::MidiEngine,
+    controller_profile: controller_profile::ControllerProfileDocument,
+    controller_profile_revision: u64,
+    /// A saved-position profile loaded before the initial layer stack exists
+    /// receives one bounded resolution window. Once it resolves—or any full
+    /// patch/profile transaction supersedes it—future layer additions cannot
+    /// retarget the controller implicitly.
+    controller_profile_pending_initial_resolution: bool,
+    controller_status: String,
+    midi_events: Vec<controller_profile::ControllerEvent>,
+    controller_feedback_cache: BTreeMap<controller_profile::RuntimeControlAddress, u16>,
+    osc_config: osc::OscConfigDocument,
+    osc: osc::OscEngine,
+    osc_events: Vec<osc::OscEvent>,
+    osc_status: String,
     // Temporal effects (feedback trails, slit-scan)
     temporal_params: effects::params::TemporalParams,
     // Spout texture-sharing output
@@ -710,6 +3135,47 @@ struct App {
     /// swapchain.
     output_on_main: bool,
     output_error: String,
+    /// Separate venue document. Artistic PatchState never captures projector
+    /// geometry, monitor bindings, or calibration routes.
+    stage_map: stage_map::StageMap,
+    /// Host/venue calibration tools are separate from artistic PatchState.
+    stage_tools: stage_map::StageToolState,
+    /// Cold-prepared, bounded offscreen endpoint renderer. Warm frames only
+    /// encode into these fixed resources; map/source/surface-format changes
+    /// replace the complete presenter transactionally at a frame boundary.
+    stage_presenter: Option<renderer::stage_map::StageMapPresenter>,
+    /// Last globally accepted presenter identity. A rejected cold rebuild
+    /// retains these facts and the matching windows/resources.
+    stage_presenter_map: Option<stage_map::StageMap>,
+    stage_presenter_source_size: Option<[u32; 2]>,
+    /// Last attempted cold identity, successful or rejected. This prevents an
+    /// invalid venue document from churning windows/resources every frame.
+    stage_presenter_attempted_map: Option<stage_map::StageMap>,
+    stage_presenter_attempted_source_size: Option<[u32; 2]>,
+    stage_monitor_attempted_signature: Vec<String>,
+    stage_monitor_targets: Vec<StageMonitorTarget>,
+    stage_monitor_failures: BTreeMap<stage_map::OutputEndpointId, String>,
+    stage_closed_endpoints: BTreeSet<stage_map::OutputEndpointId>,
+    stage_monitor_signature: Vec<String>,
+    stage_presented_endpoints: BTreeSet<stage_map::OutputEndpointId>,
+    stage_presenter_error: String,
+    stage_output_status: String,
+    stage_health_monitor: stage_health::StageHealthMonitor,
+    /// One bounded live recorder, still, or resample publication transaction.
+    /// GPU readbacks retain the matching generation in their opaque tag.
+    live_capture: Option<LiveCaptureSession>,
+    next_live_capture_generation: u64,
+    recorder_snapshot: web::state::ProgramRecorderSnapshot,
+    /// Manual-only bounded transaction history. Automation paths never call
+    /// its recording methods.
+    manual_history: history::ManualHistory<ManualHistoryWorld>,
+    history_status: String,
+    history_gesture_begin: Option<(history::HistoryGestureId, history::HistoryFingerprint)>,
+    preset_library: preset::PresetLibrary,
+    preset_revision: u64,
+    preset_status: String,
+    recovery_journal: Option<recovery_journal::RecoveryJournal>,
+    recovery_status: String,
     // Web control panel
     web_state: Arc<WebState>,
     patch_collector: procedural::PatchCollector,
@@ -733,6 +3199,153 @@ impl App {
             .map(scan_audio_folder)
             .unwrap_or_default();
         let media_safety_policy = media_safety::MediaSafetyPolicy::default();
+        #[cfg(not(test))]
+        let (recovery_journal, recovery_status) =
+            match recovery_journal::RecoveryJournal::open_default() {
+                Ok(journal) => {
+                    let (_, status) = web::state::recovery_snapshot_fields(journal.latest_valid());
+                    (Some(journal), status)
+                }
+                Err(error) => (None, format!("Recovery journal unavailable: {error}")),
+            };
+        // App state tests exercise recovery through explicit temporary-path
+        // journals. They must never inspect or append to the operator's real
+        // per-user recovery journal merely by constructing an App.
+        #[cfg(test)]
+        let (recovery_journal, recovery_status) = (
+            None,
+            "Recovery journal is isolated from App state tests".to_string(),
+        );
+        #[cfg(not(test))]
+        let preset_load = preset::load_default_preset_library();
+        #[cfg(test)]
+        let preset_load = preset::PresetLibraryLoad {
+            path: preset::default_preset_library_path(),
+            library: preset::PresetLibrary::default(),
+            status: controller_profile::PersistedDocumentLoadStatus::DefaultMissing,
+        };
+        let preset::PresetLibraryLoad {
+            path: preset_path,
+            library: preset_library,
+            status: preset_load_status,
+        } = preset_load;
+        let preset_status = match preset_load_status {
+            controller_profile::PersistedDocumentLoadStatus::Loaded => {
+                format!("Loaded preset library {}", preset_path.display())
+            }
+            controller_profile::PersistedDocumentLoadStatus::DefaultMissing => format!(
+                "Preset library {} is absent; using an empty bounded library",
+                preset_path.display()
+            ),
+            controller_profile::PersistedDocumentLoadStatus::DefaultInvalid(error)
+            | controller_profile::PersistedDocumentLoadStatus::DefaultIo(error) => format!(
+                "Preset library {} was ignored safely: {error}",
+                preset_path.display()
+            ),
+        };
+        #[cfg(not(test))]
+        let stage_map_load = stage_map::load_default_stage_map();
+        #[cfg(test)]
+        let stage_map_load = stage_map::StageMapLoad {
+            path: stage_map::default_stage_map_path(),
+            document: stage_map::StageMap::default(),
+            status: stage_map::StageMapLoadStatus::DefaultMissing,
+        };
+        let stage_map::StageMapLoad {
+            path: stage_map_path,
+            document: stage_map,
+            status: stage_map_load_status,
+        } = stage_map_load;
+        let stage_map_initial_error = match stage_map_load_status {
+            stage_map::StageMapLoadStatus::Loaded
+            | stage_map::StageMapLoadStatus::DefaultMissing => String::new(),
+            stage_map::StageMapLoadStatus::DefaultInvalid(error)
+            | stage_map::StageMapLoadStatus::DefaultIo(error) => format!(
+                "StageMap {} was ignored safely: {error}",
+                stage_map_path.display()
+            ),
+        };
+        #[cfg(not(test))]
+        let controller_load = controller_profile::load_default_controller_profile();
+        #[cfg(test)]
+        let controller_load = controller_profile::ControllerProfileLoad {
+            path: controller_profile::default_controller_profile_path(),
+            document: controller_profile::ControllerProfileDocument::default(),
+            status: controller_profile::PersistedDocumentLoadStatus::DefaultMissing,
+        };
+        let controller_profile = controller_load.document;
+        let mut midi = midi::MidiEngine::new();
+        let controller_load_status = match controller_load.status {
+            controller_profile::PersistedDocumentLoadStatus::Loaded => {
+                format!(
+                    "Loaded controller profile {}",
+                    controller_load.path.display()
+                )
+            }
+            controller_profile::PersistedDocumentLoadStatus::DefaultMissing => format!(
+                "Controller profile {} is absent; using the bounded legacy four-CC default",
+                controller_load.path.display()
+            ),
+            controller_profile::PersistedDocumentLoadStatus::DefaultInvalid(error)
+            | controller_profile::PersistedDocumentLoadStatus::DefaultIo(error) => format!(
+                "Controller profile {} was ignored safely: {error}",
+                controller_load.path.display()
+            ),
+        };
+        let (mut controller_status, controller_profile_pending_initial_resolution) =
+            match controller_profile.resolve(|_| None) {
+                Ok(resolved) => match midi.apply_profile(resolved) {
+                    Ok(()) => (controller_load_status, false),
+                    Err(error) => (
+                        format!("{controller_load_status}; runtime unavailable: {error}"),
+                        false,
+                    ),
+                },
+                Err(controller_profile::ControllerProfileError::MissingLayer(position)) => (
+                    format!(
+                        "{controller_load_status}; waiting for initial saved layer position {}",
+                        position.get()
+                    ),
+                    true,
+                ),
+                Err(error) => (
+                    format!("{controller_load_status}; profile unavailable: {error}"),
+                    false,
+                ),
+            };
+        if let Err(error) = web_state.publish_controller_profile_export(&controller_profile) {
+            controller_status =
+                format!("{controller_status}; browser export publication unavailable: {error}");
+        }
+        #[cfg(not(test))]
+        let osc_load = osc::load_default_osc_config();
+        #[cfg(test)]
+        let osc_load = osc::OscConfigLoad {
+            path: osc::default_osc_config_path(),
+            document: osc::OscConfigDocument::default(),
+            status: controller_profile::PersistedDocumentLoadStatus::DefaultMissing,
+        };
+        let osc_config = osc_load.document;
+        let osc_load_status = match osc_load.status {
+            controller_profile::PersistedDocumentLoadStatus::Loaded => {
+                format!("Loaded OSC configuration {}", osc_load.path.display())
+            }
+            controller_profile::PersistedDocumentLoadStatus::DefaultMissing => format!(
+                "OSC configuration {} is absent; using safe loopback defaults",
+                osc_load.path.display()
+            ),
+            controller_profile::PersistedDocumentLoadStatus::DefaultInvalid(error)
+            | controller_profile::PersistedDocumentLoadStatus::DefaultIo(error) => format!(
+                "OSC configuration {} was ignored safely: {error}",
+                osc_load.path.display()
+            ),
+        };
+        let mut osc = osc::OscEngine::new(osc_config.clone())
+            .expect("the built-in loopback OSC configuration is valid");
+        let osc_status = match osc.start() {
+            Ok(()) => osc_load_status,
+            Err(error) => format!("{osc_load_status}; OSC unavailable: {error}"),
+        };
 
         // The web server needs the folder for clip uploads.
         if let Ok(mut lf) = web_state.library_folder.write() {
@@ -753,20 +3366,34 @@ impl App {
             initial_video,
             window: None,
             renderer: None,
+            composition_gpu: None,
+            motion_field_cache: Vec::new(),
+            motion_telemetry: Vec::new(),
+            accepted_creative_resource_bytes: None,
+            accepted_motion_resource_bytes: None,
             layers: Vec::new(),
             selected_layer: None,
             layer_stack_revision: 1,
+            composition: legacy_runtime_composition(&[])
+                .expect("the empty legacy composition is valid"),
+            composition_revision: 1,
+            composition_status: String::new(),
             master_effects: effects::EffectUniforms::default(),
+            master_rack: RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master),
+            master_motion: motion::MotionParams::default(),
+            master_transform: spatial::SpatialTransform::default(),
             master_paused: false,
             media_frozen: false,
             last_frame_time: Instant::now(),
             program_clock: ProgramClock::default(),
             modifiers: ModifiersState::empty(),
             library_folder,
+            performance_patch_dir: None,
             library_files,
             audio_library_files,
             media_safety_policy,
             media_safety_status: String::new(),
+            new_layer_fit: spatial::FitMode::Fit,
             yaml_editor: patch::editor::EditorState::default(),
             egui_ctx: egui::Context::default(),
             egui_winit: None,
@@ -783,12 +3410,27 @@ impl App {
             selective_topology_generation: 1,
             selective_sample_sequence: 0,
             selective_ntsc_runtime_error: String::new(),
+            image_routing_error: String::new(),
+            source_staging_status: String::new(),
+            scene_status: String::new(),
+            performance_runtime: None,
+            performance_budget: media_safety::PerformanceResourceBudget::for_host(),
+            performance_gpu_cache: VecDeque::new(),
+            performance_staging: None,
+            performance_scheduled: None,
+            performance_boundaries: performance::BeatBoundaryTracker::default(),
+            temporal_boundaries: performance::BeatBoundaryTracker::default(),
+            pending_temporal_events: temporal::TemporalFrameEvents::default(),
+            pending_motion_memory_clear: false,
+            temporal_audio_onsets: temporal::TemporalAudioOnsetTracker::default(),
+            image_routing_diagnostics: Vec::new(),
             selective_transition_holding: false,
             selective_hold_snapshot_valid: false,
             selective_hold_spout_barrier_epoch: None,
             selective_hold_spout_readback_epoch: None,
             mod_matrix: modulation::ModMatrix::new(),
             morph: morph::Morph::default(),
+            scenes: performance::Scenes::default(),
             blackout: false,
             blackout_presented: false,
             visual_epoch: 0,
@@ -798,12 +3440,49 @@ impl App {
             audio_clip_spectrum: [0.0; audio::AUDIO_SPECTRUM_BINS],
             audio_clip_error: String::new(),
             audio_clip_blocks_program: false,
-            midi: midi::MidiEngine::new(),
+            midi,
+            controller_profile,
+            controller_profile_revision: 1,
+            controller_profile_pending_initial_resolution,
+            controller_status,
+            midi_events: Vec::with_capacity(256),
+            controller_feedback_cache: BTreeMap::new(),
+            osc_config,
+            osc,
+            osc_events: Vec::with_capacity(256),
+            osc_status,
             temporal_params: effects::params::TemporalParams::default(),
             spout: spout_out::SpoutOut::new(),
             spout_enabled: false,
             output_on_main: false,
-            output_error: String::new(),
+            output_error: stage_map_initial_error,
+            stage_map,
+            stage_tools: stage_map::StageToolState::default(),
+            stage_presenter: None,
+            stage_presenter_map: None,
+            stage_presenter_source_size: None,
+            stage_presenter_attempted_map: None,
+            stage_presenter_attempted_source_size: None,
+            stage_monitor_attempted_signature: Vec::new(),
+            stage_monitor_targets: Vec::new(),
+            stage_monitor_failures: BTreeMap::new(),
+            stage_closed_endpoints: BTreeSet::new(),
+            stage_monitor_signature: Vec::new(),
+            stage_presented_endpoints: BTreeSet::new(),
+            stage_presenter_error: String::new(),
+            stage_output_status: String::new(),
+            stage_health_monitor: stage_health::StageHealthMonitor::default(),
+            live_capture: None,
+            next_live_capture_generation: 1,
+            recorder_snapshot: web::state::ProgramRecorderSnapshot::default(),
+            manual_history: history::ManualHistory::default(),
+            history_status: String::new(),
+            history_gesture_begin: None,
+            preset_library,
+            preset_revision: 1,
+            preset_status,
+            recovery_journal,
+            recovery_status,
             web_state,
             patch_collector: procedural::PatchCollector::new(),
             patch_load_status: String::new(),
@@ -813,17 +3492,1008 @@ impl App {
         }
     }
 
+    fn initialize_new_interactive_transform(&self, layer: &mut Layer) {
+        layer.transform = new_interactive_spatial_transform(self.new_layer_fit);
+    }
+
+    fn live_layer_ids(&self) -> Vec<image_routing::StableLayerId> {
+        self.layers.iter().map(Layer::stable_layer_id).collect()
+    }
+
+    fn layer_racks(&self) -> Vec<RuntimeVisualRack> {
+        self.layers.iter().map(|layer| layer.rack.clone()).collect()
+    }
+
+    fn install_layer_racks(&mut self, racks: Vec<RuntimeVisualRack>) {
+        debug_assert_eq!(racks.len(), self.layers.len());
+        for (layer, rack) in self.layers.iter_mut().zip(racks) {
+            layer.rack = rack;
+        }
+    }
+
+    fn bump_composition_revision(&mut self) {
+        self.composition_revision = self.composition_revision.wrapping_add(1).max(1);
+    }
+
+    fn staged_creative_graph(&self) -> StagedCreativeGraph {
+        let mut staged = StagedCreativeGraph {
+            master_rack: self.master_rack.clone(),
+            layer_racks: self
+                .layers
+                .iter()
+                .map(|layer| (layer.stable_layer_id(), layer.rack.clone()))
+                .collect(),
+            composition: self.composition.clone(),
+        };
+        if !self.morph.active() {
+            return staged;
+        }
+        let base_t = self.morph.position_at_beat(self.mod_matrix.current_beat);
+        let t = (base_t + self.mod_matrix.frame(0).morph_offset()).clamp(0.0, 1.0);
+        let Some(sample) = self.morph.sample(t) else {
+            return staged;
+        };
+        let layer_ids = self.live_layer_ids();
+        let group_exists = |group_id| staged.composition.contains_group(group_id);
+        if let Some(saved) = &sample.master_rack {
+            let sampled = saved.resolve_routes(
+                |position| position.resolve(&layer_ids).copied(),
+                group_exists,
+            );
+            let _ = morph::apply_runtime_rack_values_strict(&sampled, &mut staged.master_rack);
+        }
+        if let Some(saved_racks) = &sample.layer_racks {
+            if saved_racks.len() == staged.layer_racks.len() {
+                for (saved, (_, live)) in saved_racks.iter().zip(&mut staged.layer_racks) {
+                    let sampled = saved.resolve_routes(
+                        |position| position.resolve(&layer_ids).copied(),
+                        group_exists,
+                    );
+                    let _ = morph::apply_runtime_rack_values_strict(&sampled, live);
+                }
+            }
+        }
+        if let Some(saved) = &sample.composition {
+            if let Ok(sampled) =
+                saved.resolve(|position| position.resolve(&self.layers).map(Layer::stable_layer_id))
+            {
+                let _ = morph::apply_runtime_composition_values_strict(
+                    &sampled,
+                    &mut staged.composition,
+                );
+            }
+        }
+        staged
+    }
+
+    fn authored_creative_graph(&self) -> StagedCreativeGraph {
+        StagedCreativeGraph {
+            master_rack: self.master_rack.clone(),
+            layer_racks: self
+                .layers
+                .iter()
+                .map(|layer| (layer.stable_layer_id(), layer.rack.clone()))
+                .collect(),
+            composition: self.composition.clone(),
+        }
+    }
+
+    fn creative_revision_matches(&self, requested: u64) -> Result<(), String> {
+        if requested == 0 || requested != self.composition_revision {
+            return Err(format!(
+                "stale composition revision {requested}; current is {}",
+                self.composition_revision
+            ));
+        }
+        Ok(())
+    }
+
+    fn creative_saved_position(
+        &self,
+        layer_id: image_routing::StableLayerId,
+    ) -> Option<performance::SavedLayerPosition> {
+        self.layers
+            .iter()
+            .position(|layer| layer.stable_layer_id() == layer_id)
+            .and_then(|position| u32::try_from(position).ok())
+            .and_then(performance::SavedLayerPosition::new)
+    }
+
+    fn creative_route_from_snapshot(
+        &self,
+        route: &web::state::CreativeImageTapSnapshot,
+        composition: &composition::RuntimeComposition,
+    ) -> Result<visual_rack::ResolvedImageTap, String> {
+        route.to_runtime(
+            |layer_id| self.creative_saved_position(layer_id),
+            |group_id| composition.contains_group(group_id),
+        )
+    }
+
+    fn preflight_creative_graph(&self, staged: &StagedCreativeGraph) -> Result<(), String> {
+        let layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        self.preflight_creative_graph_with_visuals(
+            staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &layers,
+        )
+    }
+
+    /// Plan a detached candidate against detached base-layer matte edges.
+    /// Base mattes participate in the same unified DAG and resource ledger as
+    /// rack/group image taps, so their topology must never be published before
+    /// this complete graph admission succeeds.
+    fn preflight_creative_graph_with_mattes(
+        &self,
+        staged: &StagedCreativeGraph,
+        mattes: &[image_routing::LayerMatte],
+    ) -> Result<(), String> {
+        if mattes.len() != self.layers.len() {
+            return Err("creative graph does not contain exactly one matte per live layer".into());
+        }
+        let mut layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        for (layer, matte) in layers.iter_mut().zip(mattes.iter().copied()) {
+            layer.matte = matte;
+        }
+        self.preflight_creative_graph_with_visuals(
+            staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &layers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_creative_graph_with_visuals(
+        &self,
+        staged: &StagedCreativeGraph,
+        master_effects: &effects::EffectUniforms,
+        master_transform: &spatial::SpatialTransform,
+        master_motion: &motion::MotionParams,
+        ntsc_params: &ntsc::NtscParams,
+        temporal_params: &effects::params::TemporalParams,
+        layers: &[StagedLayerLook],
+    ) -> Result<(), String> {
+        let live_ids = self.live_layer_ids();
+        if layers.len() != live_ids.len()
+            || layers
+                .iter()
+                .zip(&live_ids)
+                .any(|(layer, expected)| layer.layer_id != *expected)
+        {
+            return Err(
+                "creative visual values do not exactly align with live stable layers".into(),
+            );
+        }
+        staged
+            .composition
+            .validate_for_layers(&live_ids)
+            .map_err(|error| format!("composition validation failed: {error}"))?;
+        staged
+            .master_rack
+            .validate_for_scope(LegacyRackScope::Master)
+            .map_err(|error| format!("master rack validation failed: {error}"))?;
+        for (layer_id, rack) in &staged.layer_racks {
+            if !live_ids.contains(layer_id) {
+                return Err(format!("rack references absent layer {}", layer_id.get()));
+            }
+            rack.validate_for_scope(LegacyRackScope::Layer)
+                .map_err(|error| {
+                    format!("layer {} rack validation failed: {error}", layer_id.get())
+                })?;
+        }
+        if staged.layer_racks.len() != live_ids.len() {
+            return Err("creative graph does not contain exactly one rack per live layer".into());
+        }
+        modulation::StableModAddressBook::from_composition(
+            &staged.master_rack,
+            &staged.layer_racks,
+            &staged.composition,
+        )?;
+
+        let (width, height) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| (renderer.output_width, renderer.output_height))
+            .unwrap_or((FALLBACK_OUTPUT_WIDTH, FALLBACK_OUTPUT_HEIGHT));
+        let modulation = self.mod_matrix.frame(self.layers.len());
+        let base = EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(width, height, self.program_clock.elapsed.as_secs_f32()),
+            MasterFrameInput {
+                effects: master_effects,
+                transform: master_transform,
+                ntsc: ntsc_params,
+                temporal: temporal_params,
+            },
+            self.layers
+                .iter()
+                .zip(layers)
+                .enumerate()
+                .map(|(index, (runtime, layer))| LayerFrameInput {
+                    source: SourceTap::new(
+                        runtime.layer_id(),
+                        index,
+                        runtime.width.max(1),
+                        runtime.height.max(1),
+                    ),
+                    effects: &layer.effects,
+                    transform: &layer.transform,
+                    opacity: layer.opacity,
+                    speed: runtime.speed,
+                    fps: runtime.fps,
+                    blend_mode: layer.blend_mode,
+                    visible: layer.visible && runtime.transport_visible(),
+                    paused: runtime.paused,
+                    bypass_master_fx: layer.bypass_master_fx,
+                }),
+        );
+        let mattes: Vec<_> = layers.iter().map(|layer| layer.matte).collect();
+        let motion_layers = self
+            .layers
+            .iter()
+            .zip(layers)
+            .map(|(runtime, layer)| {
+                let codec = runtime.codec_motion();
+                evaluated_frame::evaluated_composition::LayerMotionPlanInput {
+                    stable_id: runtime.stable_layer_id(),
+                    params: layer.motion,
+                    codec: codec.map_or_else(
+                        evaluated_frame::evaluated_composition::MotionCodecFrameFacts::default,
+                        |codec| evaluated_frame::evaluated_composition::MotionCodecFrameFacts {
+                            available: codec.codec_vectors_available(),
+                            source_generation: codec.source_generation,
+                            frame_ordinal: codec.frame_ordinal,
+                        },
+                    ),
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut input = evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &staged.composition,
+            &staged.master_rack,
+            &staged.layer_racks,
+        )
+        .with_layer_mattes(&mattes, false);
+        let motion_limits = self.renderer.as_ref().map_or_else(
+            || motion::MotionDeviceLimits::new(u32::MAX, u64::MAX),
+            |renderer| {
+                let limits = renderer.device.limits();
+                motion::MotionDeviceLimits::new(
+                    limits.max_texture_dimension_2d,
+                    limits.max_buffer_size,
+                )
+            },
+        );
+        input = input.with_motion(*master_motion, &motion_layers, motion_limits);
+        if let Some(renderer) = self.renderer.as_ref() {
+            let limits = renderer.device.limits();
+            input.resource_limits.max_texture_dimension_2d = limits.max_texture_dimension_2d;
+            input.resource_limits.max_texture_array_layers = limits.max_texture_array_layers;
+            input.resource_limits.max_sampled_textures_per_shader_stage =
+                limits.max_sampled_textures_per_shader_stage;
+        }
+        base.plan_composition(input)
+            .map_err(|error| format!("creative graph preflight failed: {error}"))?;
+        Ok(())
+    }
+
+    fn move_layer_storage_without_revision(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        self.remap_scenes_after_layer_move(from, to);
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+        self.mod_matrix.remap_layer_targets_after_move(from, to);
+        self.remap_quantized_layers_after_move(from, to);
+        self.selected_layer = self.selected_layer.map(|selected| {
+            if selected == from {
+                to
+            } else if from < to && selected > from && selected <= to {
+                selected - 1
+            } else if to < from && selected >= to && selected < from {
+                selected + 1
+            } else {
+                selected
+            }
+        });
+        self.morph.remap_layers_after_move(from, to);
+    }
+
+    fn commit_creative_graph(
+        &mut self,
+        staged: StagedCreativeGraph,
+        topology_changed: bool,
+        status: String,
+    ) -> Result<(), String> {
+        self.commit_creative_graph_with_mattes(staged, None, topology_changed, status)
+    }
+
+    fn commit_creative_graph_with_mattes(
+        &mut self,
+        staged: StagedCreativeGraph,
+        staged_mattes: Option<Vec<(image_routing::StableLayerId, image_routing::LayerMatte)>>,
+        topology_changed: bool,
+        status: String,
+    ) -> Result<(), String> {
+        let desired = runtime_composition_front_to_back(&staged.composition)
+            .map_err(|error| format!("flatten committed composition: {error}"))?;
+        let stack_changed = desired != self.live_layer_ids();
+        let mut racks = std::collections::BTreeMap::new();
+        for (layer_id, rack) in staged.layer_racks {
+            if racks.insert(layer_id, rack).is_some() {
+                return Err(format!(
+                    "duplicate staged rack for layer {}",
+                    layer_id.get()
+                ));
+            }
+        }
+        if desired.len() != self.layers.len()
+            || desired.iter().any(|layer_id| !racks.contains_key(layer_id))
+        {
+            return Err("staged creative graph does not exactly cover the live layer set".into());
+        }
+        let mut mattes = staged_mattes
+            .map(|entries| {
+                let mut mapped = std::collections::BTreeMap::new();
+                for (layer_id, matte) in entries {
+                    if mapped.insert(layer_id, matte).is_some() {
+                        return Err(format!(
+                            "duplicate staged matte for layer {}",
+                            layer_id.get()
+                        ));
+                    }
+                }
+                if mapped.len() != desired.len()
+                    || desired
+                        .iter()
+                        .any(|layer_id| !mapped.contains_key(layer_id))
+                {
+                    return Err(
+                        "staged creative mattes do not exactly cover the live layer set".into(),
+                    );
+                }
+                Ok(mapped)
+            })
+            .transpose()?;
+
+        if !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let graph_changed = self.master_rack != staged.master_rack
+            || self.composition != staged.composition
+            || self
+                .layers
+                .iter()
+                .any(|layer| racks.get(&layer.stable_layer_id()) != Some(&layer.rack));
+        let mattes_changed = mattes.as_ref().is_some_and(|mattes| {
+            self.layers
+                .iter()
+                .any(|layer| mattes.get(&layer.stable_layer_id()) != Some(&layer.matte))
+        });
+        let impact = creative_commit_impact(
+            stack_changed || graph_changed || mattes_changed,
+            topology_changed,
+            stack_changed,
+        );
+        if impact == CreativeCommitImpact::NoChange {
+            self.composition_status = status;
+            return Ok(());
+        }
+        if stack_changed {
+            for (to, wanted) in desired.iter().copied().enumerate() {
+                let from = self
+                    .layers
+                    .iter()
+                    .position(|layer| layer.stable_layer_id() == wanted)
+                    .expect("staged creative commit prevalidated every live layer");
+                self.move_layer_storage_without_revision(from, to);
+            }
+        }
+        for layer in &mut self.layers {
+            let layer_id = layer.stable_layer_id();
+            layer.rack = racks
+                .remove(&layer_id)
+                .expect("staged creative commit prevalidated every layer rack");
+            if let Some(mattes) = mattes.as_mut() {
+                layer.matte = mattes
+                    .remove(&layer_id)
+                    .expect("staged creative commit prevalidated every layer matte");
+            }
+        }
+        self.master_rack = staged.master_rack;
+        self.composition = staged.composition;
+        if stack_changed {
+            self.bump_layer_stack_revision();
+        }
+        if topology_changed {
+            self.bump_composition_revision();
+        }
+        self.composition_status = status;
+        if impact == CreativeCommitImpact::TopologyOrStack {
+            self.invalidate_source_cut_generation();
+        }
+        Ok(())
+    }
+
+    /// Consume every M2 creative action against stable IDs only. Each ordered
+    /// edit is staged and fully planned before Morph release or live commit.
+    fn handle_creative_web_action(&mut self, action: &web::state::WebAction) -> bool {
+        use web::state::{CompositionRootSnapshot, WebAction};
+        if !matches!(
+            action,
+            WebAction::SetVisualNodeParam { .. }
+                | WebAction::InsertVisualNode { .. }
+                | WebAction::RemoveVisualNode { .. }
+                | WebAction::MoveVisualNode { .. }
+                | WebAction::SetVisualNodeMaskVariant { .. }
+                | WebAction::SetVisualNodeRoute { .. }
+                | WebAction::SetCompositionGroupMatteRoute { .. }
+                | WebAction::SetCompositionGroupMatteParam { .. }
+                | WebAction::SetCompositionGroupParam { .. }
+                | WebAction::CreateCompositionGroup { .. }
+                | WebAction::RemoveCompositionGroup { .. }
+                | WebAction::SetCompositionGroupMembers { .. }
+                | WebAction::MoveCompositionRootItem { .. }
+                | WebAction::SetCompositionBusCrossfade { .. }
+                | WebAction::SetCompositionLayerBus { .. }
+        ) {
+            return false;
+        }
+
+        let result = (|| -> Result<(), String> {
+            match action {
+                WebAction::SetVisualNodeParam {
+                    scope,
+                    node_id,
+                    node_kind,
+                    param,
+                    value,
+                    ..
+                } => {
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(rack) = staged.rack_mut(scope) else {
+                        // Stable IDs are never reused. A scalar queued before
+                        // deletion cannot retarget and is therefore an exact
+                        // no-op, independent of its now-stale revision hint.
+                        return Ok(());
+                    };
+                    if rack.get(node_id).is_none() {
+                        return Ok(());
+                    }
+                    set_runtime_node_param(rack, node_id, node_kind, param, value)?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated {node_kind} node {} {param}", node_id.get()),
+                    )?;
+                }
+                WebAction::InsertVisualNode {
+                    scope,
+                    index,
+                    node_kind,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let kind = default_runtime_node_kind(node_kind)
+                        .ok_or_else(|| format!("node kind {node_kind} cannot be inserted"))?;
+                    let mut staged = self.staged_creative_graph();
+                    let legacy_scope = staged
+                        .legacy_scope(scope)
+                        .ok_or_else(|| "creative scope is absent".to_string())?;
+                    let node_id = staged
+                        .rack_mut(scope)
+                        .expect("scope was resolved above")
+                        .insert(*index, kind)
+                        .map_err(|error| error.to_string())?;
+                    staged
+                        .rack(scope)
+                        .expect("scope remains present")
+                        .validate_for_scope(legacy_scope)
+                        .map_err(|error| error.to_string())?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Inserted {node_kind} node {}", node_id.get()),
+                    )?;
+                }
+                WebAction::RemoveVisualNode {
+                    scope,
+                    node_id,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let legacy_scope = staged
+                        .legacy_scope(scope)
+                        .ok_or_else(|| "creative scope is absent".to_string())?;
+                    staged
+                        .rack_mut(scope)
+                        .expect("scope was resolved above")
+                        .remove(node_id)
+                        .ok_or_else(|| {
+                            format!("node {} is absent or is an immutable marker", node_id.get())
+                        })?;
+                    staged
+                        .rack(scope)
+                        .expect("scope remains present")
+                        .validate_for_scope(legacy_scope)
+                        .map_err(|error| error.to_string())?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Removed node {}", node_id.get()),
+                    )?;
+                }
+                WebAction::MoveVisualNode {
+                    scope,
+                    node_id,
+                    to,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let legacy_scope = staged
+                        .legacy_scope(scope)
+                        .ok_or_else(|| "creative scope is absent".to_string())?;
+                    staged
+                        .rack_mut(scope)
+                        .expect("scope was resolved above")
+                        .move_node(node_id, *to, legacy_scope)
+                        .map_err(|error| error.to_string())?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Moved node {} to {to}", node_id.get()),
+                    )?;
+                }
+                WebAction::SetVisualNodeMaskVariant {
+                    scope,
+                    node_id,
+                    variant,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let node = staged
+                        .rack_mut(scope)
+                        .and_then(|rack| rack.get_mut(node_id))
+                        .ok_or_else(|| format!("mask node {} is absent", node_id.get()))?;
+                    if !matches!(node.kind, visual_rack::RuntimeVisualNodeKind::Mask(_)) {
+                        return Err(format!("node {} is not a mask", node_id.get()));
+                    }
+                    let mask = match variant.as_str() {
+                        "rectangle" => visual_rack::RuntimeMaskParams::Rectangle(
+                            visual_rack::RectangleMask::default(),
+                        ),
+                        "ellipse" => visual_rack::RuntimeMaskParams::Ellipse(
+                            visual_rack::EllipseMask::default(),
+                        ),
+                        "image" => {
+                            visual_rack::RuntimeMaskParams::Image(visual_rack::RuntimeImageMatte {
+                                tap: visual_rack::ResolvedImageTap {
+                                    source: visual_rack::ResolvedImageSource::OneBelow,
+                                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                                },
+                                channel: visual_rack::MatteChannel::Alpha,
+                                invert: false,
+                                amount: 1.0,
+                                threshold: 0.5,
+                                softness: 0.1,
+                            })
+                        }
+                        _ => return Err(format!("unknown mask variant {variant}")),
+                    };
+                    node.kind = visual_rack::RuntimeVisualNodeKind::Mask(mask);
+                    normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Changed mask node {} to {variant}", node_id.get()),
+                    )?;
+                }
+                WebAction::SetVisualNodeRoute {
+                    scope,
+                    node_id,
+                    route,
+                    channel,
+                    invert,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let tap = self.creative_route_from_snapshot(route, &staged.composition)?;
+                    let channel = web::state::parse_creative_channel(channel)
+                        .ok_or_else(|| "mask channel is invalid".to_string())?;
+                    let node = staged
+                        .rack_mut(scope)
+                        .and_then(|rack| rack.get_mut(node_id))
+                        .ok_or_else(|| format!("mask node {} is absent", node_id.get()))?;
+                    let previous = match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::Mask(
+                            visual_rack::RuntimeMaskParams::Image(matte),
+                        ) => matte,
+                        visual_rack::RuntimeVisualNodeKind::Mask(_) => {
+                            visual_rack::RuntimeImageMatte {
+                                tap,
+                                channel,
+                                invert: *invert,
+                                amount: 1.0,
+                                threshold: 0.5,
+                                softness: 0.1,
+                            }
+                        }
+                        _ => return Err(format!("node {} is not a mask", node_id.get())),
+                    };
+                    node.kind = visual_rack::RuntimeVisualNodeKind::Mask(
+                        visual_rack::RuntimeMaskParams::Image(visual_rack::RuntimeImageMatte {
+                            tap,
+                            channel,
+                            invert: *invert,
+                            ..previous
+                        }),
+                    );
+                    normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Routed image mask node {}", node_id.get()),
+                    )?;
+                }
+                WebAction::SetCompositionGroupMatteRoute {
+                    group_id,
+                    route,
+                    channel,
+                    invert,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let tap = route
+                        .as_ref()
+                        .map(|route| self.creative_route_from_snapshot(route, &staged.composition))
+                        .transpose()?;
+                    let channel = web::state::parse_creative_channel(channel)
+                        .ok_or_else(|| "group matte channel is invalid".to_string())?;
+                    let group = staged
+                        .composition
+                        .group_mut(group_id)
+                        .ok_or_else(|| format!("group {} is absent", group_id.get()))?;
+                    group.matte = tap.map(|tap| {
+                        let previous = group.matte.unwrap_or(visual_rack::RuntimeImageMatte {
+                            tap,
+                            channel,
+                            invert: *invert,
+                            amount: 1.0,
+                            threshold: 0.5,
+                            softness: 0.1,
+                        });
+                        visual_rack::RuntimeImageMatte {
+                            tap,
+                            channel,
+                            invert: *invert,
+                            ..previous
+                        }
+                    });
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Updated group {} matte route", group_id.get()),
+                    )?;
+                }
+                WebAction::SetCompositionGroupMatteParam {
+                    group_id,
+                    param,
+                    value,
+                    ..
+                } => {
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(group) = staged.composition.group_mut(group_id) else {
+                        return Ok(());
+                    };
+                    let matte = group
+                        .matte
+                        .as_mut()
+                        .ok_or_else(|| format!("group {} matte is disabled", group_id.get()))?;
+                    apply_runtime_group_matte_param(matte, param, value)?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated group {} matte {param}", group_id.get()),
+                    )?;
+                }
+                WebAction::SetCompositionGroupParam {
+                    group_id,
+                    param,
+                    value,
+                    ..
+                } => {
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(group) = staged.composition.group_mut(group_id) else {
+                        return Ok(());
+                    };
+                    apply_runtime_group_param(group, param, value)?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated group {} {param}", group_id.get()),
+                    )?;
+                }
+                WebAction::CreateCompositionGroup {
+                    name,
+                    member_layer_ids,
+                    root_index,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let name = composition::GroupName::new(name.clone())
+                        .map_err(|error| error.to_string())?;
+                    let requested = member_layer_ids
+                        .iter()
+                        .map(|layer_id| {
+                            parse_nonzero_decimal(layer_id)
+                                .and_then(image_routing::StableLayerId::new)
+                                .ok_or_else(|| format!("layer ID {layer_id} is malformed"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut staged = self.staged_creative_graph();
+                    let (composition, group_id) = stage_create_composition_group(
+                        &staged.composition,
+                        name,
+                        requested,
+                        *root_index,
+                    )?;
+                    staged.composition = composition;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Created group {}", group_id.get()),
+                    )?;
+                }
+                WebAction::RemoveCompositionGroup {
+                    group_id,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    staged
+                        .composition
+                        .remove_group_ungroup(group_id)
+                        .map_err(|error| error.to_string())?;
+                    staged.master_rack.mark_group_output_missing(group_id);
+                    for (_, rack) in &mut staged.layer_racks {
+                        rack.mark_group_output_missing(group_id);
+                    }
+                    let staged_mattes = stage_layer_mattes_after_group_removal(
+                        self.layers
+                            .iter()
+                            .map(|layer| (layer.stable_layer_id(), layer.matte)),
+                        group_id,
+                    );
+                    let matte_values: Vec<_> =
+                        staged_mattes.iter().map(|(_, matte)| *matte).collect();
+                    self.preflight_creative_graph_with_mattes(&staged, &matte_values)?;
+                    self.commit_creative_graph_with_mattes(
+                        staged,
+                        Some(staged_mattes),
+                        true,
+                        format!("Removed group {}", group_id.get()),
+                    )?;
+                    self.mod_matrix
+                        .tombstone_group_targets_after_remove(group_id);
+                }
+                WebAction::SetCompositionGroupMembers {
+                    group_id,
+                    member_layer_ids,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "group ID is malformed".to_string())?;
+                    let requested = member_layer_ids
+                        .iter()
+                        .map(|layer_id| {
+                            parse_nonzero_decimal(layer_id)
+                                .and_then(image_routing::StableLayerId::new)
+                                .ok_or_else(|| format!("layer ID {layer_id} is malformed"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut staged = self.staged_creative_graph();
+                    staged.composition = stage_set_composition_group_members(
+                        &staged.composition,
+                        group_id,
+                        requested,
+                    )?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Updated group {} members", group_id.get()),
+                    )?;
+                }
+                WebAction::MoveCompositionRootItem {
+                    item,
+                    to,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let key = match item {
+                        CompositionRootSnapshot::Layer { layer_id, .. } => {
+                            composition::RuntimeRootItemKey::Layer(
+                                parse_nonzero_decimal(layer_id)
+                                    .and_then(image_routing::StableLayerId::new)
+                                    .ok_or_else(|| "layer ID is malformed".to_string())?,
+                            )
+                        }
+                        CompositionRootSnapshot::Group { group_id } => {
+                            composition::RuntimeRootItemKey::Group(
+                                parse_group_id(group_id)
+                                    .ok_or_else(|| "group ID is malformed".to_string())?,
+                            )
+                        }
+                    };
+                    let mut staged = self.staged_creative_graph();
+                    staged
+                        .composition
+                        .move_root_item(key, *to)
+                        .map_err(|error| error.to_string())?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Moved composition root item to {to}"),
+                    )?;
+                }
+                WebAction::SetCompositionBusCrossfade { value } => {
+                    if !value.is_finite() {
+                        return Err("bus crossfade must be finite".into());
+                    }
+                    let mut staged = self.staged_creative_graph();
+                    staged.composition.set_bus_crossfade(*value);
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        "Updated composition bus crossfade".into(),
+                    )?;
+                }
+                WebAction::SetCompositionLayerBus {
+                    layer_id,
+                    bus,
+                    composition_revision: _,
+                } => {
+                    let layer_id = parse_nonzero_decimal(layer_id)
+                        .and_then(image_routing::StableLayerId::new)
+                        .ok_or_else(|| "layer ID is malformed".to_string())?;
+                    let bus = parse_bus(bus)
+                        .ok_or_else(|| "layer bus must be program, a, or b".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let Some(composition) =
+                        stage_set_composition_layer_bus(&staged.composition, layer_id, bus)?
+                    else {
+                        // Stable scalar/discrete actions are allowed to cross an
+                        // unrelated topology generation. If the immutable
+                        // target vanished or became group-owned, they no-op
+                        // rather than landing positionally on another layer.
+                        return Ok(());
+                    };
+                    staged.composition = composition;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated layer {} bus", layer_id.get()),
+                    )?;
+                }
+                _ => unreachable!("creative action filter covers this match"),
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            self.composition_status = format!("Creative edit rejected: {error}");
+            log::warn!("{}", self.composition_status);
+        }
+        true
+    }
+
+    /// Commit an already-created layer at the bottom of the legacy flat
+    /// stack. Construction and composition validation happen before this
+    /// method publishes either half of the topology.
+    fn commit_new_bottom_layer(&mut self, layer: Layer) -> Result<usize, String> {
+        let old_ids = self.live_layer_ids();
+        let layer_id = layer.stable_layer_id();
+        let insertion_index = self.layers.len();
+        let _validated = stage_composition_insert_ungrouped(
+            &self.composition,
+            &old_ids,
+            layer_id,
+            insertion_index,
+        )?;
+
+        // Morph sampling changes values only. Re-stage afterward so the
+        // candidate contains the just-materialized group values as well.
+        if !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let staged = stage_composition_insert_ungrouped(
+            &self.composition,
+            &old_ids,
+            layer_id,
+            insertion_index,
+        )
+        .expect("morph materialization cannot change composition topology");
+        self.layers.push(layer);
+        self.composition = staged;
+        self.selected_layer = Some(insertion_index);
+        self.bump_layer_stack_revision();
+        self.bump_composition_revision();
+        self.composition_status = format!("Added layer {}", layer_id.get());
+        self.invalidate_source_cut_generation();
+        Ok(insertion_index)
+    }
+
     fn add_layer(&mut self, path: &str) {
         let renderer = self.renderer.as_ref().unwrap();
         match Layer::new_with_media_policy(path, &renderer.device, &self.media_safety_policy) {
-            Ok(layer) => {
+            Ok(mut layer) => {
+                self.initialize_new_interactive_transform(&mut layer);
                 let filename = layer.filename.clone();
-                self.layers.push(layer);
-                self.selected_layer = Some(self.layers.len() - 1);
-                self.bump_layer_stack_revision();
-                self.media_safety_status = format!("Loaded {filename}");
-                // Appending leaves every captured position valid. The new
-                // source is deliberately untouched by an existing morph.
+                match self.commit_new_bottom_layer(layer) {
+                    Ok(_) => self.media_safety_status = format!("Loaded {filename}"),
+                    Err(error) => {
+                        self.composition_status = format!("Layer add rejected: {error}");
+                        self.media_safety_status = format!("Rejected {filename}: {error}");
+                    }
+                }
             }
             Err(e) => {
                 let filename = std::path::Path::new(path)
@@ -847,12 +4517,19 @@ impl App {
             &renderer.queue,
             &self.media_safety_policy,
         ) {
-            Ok(layer) => {
-                self.layers.push(layer);
-                self.selected_layer = Some(self.layers.len() - 1);
-                self.bump_layer_stack_revision();
-                self.media_safety_status = format!("Listening for Spout sender {sender_name}");
-                // Appending leaves every captured position valid.
+            Ok(mut layer) => {
+                self.initialize_new_interactive_transform(&mut layer);
+                match self.commit_new_bottom_layer(layer) {
+                    Ok(_) => {
+                        self.media_safety_status =
+                            format!("Listening for Spout sender {sender_name}");
+                    }
+                    Err(error) => {
+                        self.composition_status = format!("Layer add rejected: {error}");
+                        self.media_safety_status =
+                            format!("Rejected Spout sender {sender_name}: {error}");
+                    }
+                }
             }
             Err(error) => {
                 self.media_safety_status = format!("Rejected Spout sender {sender_name}: {error}");
@@ -869,6 +4546,230 @@ impl App {
             .retain(|action| !matches!(action, web::state::WebAction::MorphCapture { .. }));
     }
 
+    /// Turn live selected-layer matte edges into an explicit missing route
+    /// before the donor is destroyed. This prevents a later patch capture or
+    /// reorder from silently retargeting the relationship by position.
+    fn preserve_matte_routes_before_remove(&mut self, removed_index: usize) {
+        let Some(removed_id) = self.layers.get(removed_index).map(Layer::stable_layer_id) else {
+            return;
+        };
+        let saved_position = u32::try_from(removed_index)
+            .ok()
+            .and_then(performance::SavedLayerPosition::new);
+        for layer in &mut self.layers {
+            let image_routing::ImageInput::SelectedLayer { layer_id, stage } = layer.matte.input
+            else {
+                continue;
+            };
+            if layer_id != removed_id {
+                continue;
+            }
+            if let Some(saved_position) = saved_position {
+                layer.matte.input = image_routing::ImageInput::MissingSelectedLayer {
+                    saved_position,
+                    stage,
+                };
+            } else {
+                // Stacks beyond the deliberately bounded persisted-position
+                // domain remain visibly missing at runtime. Capture will
+                // reject/diagnose this invariant rather than bind a new donor.
+                log::error!(
+                    "removed matte donor at layer position {removed_index}, outside the persisted position bound"
+                );
+            }
+        }
+    }
+
+    /// Preserve the Score conductor as a stable relationship. Removing its
+    /// donor creates an explicit persisted tombstone; moving or removing any
+    /// other layer refreshes the saved-position provenance used by snapshots
+    /// and later patch capture without changing the live stable identity.
+    fn preserve_temporal_driver_before_remove(
+        &mut self,
+        removed_index: usize,
+        removed_id: image_routing::StableLayerId,
+    ) {
+        let temporal::CollisionScoreLoopDriver::SelectedLayer { layer_id, .. } =
+            self.temporal_params.originals.score.loop_driver
+        else {
+            return;
+        };
+        if layer_id != removed_id {
+            return;
+        }
+        if let Some(saved_position) = u32::try_from(removed_index)
+            .ok()
+            .and_then(performance::SavedLayerPosition::new)
+        {
+            self.temporal_params.originals.score.loop_driver =
+                temporal::CollisionScoreLoopDriver::MissingSelectedLayer { saved_position };
+        }
+    }
+
+    fn refresh_temporal_driver_saved_position(&mut self) {
+        let temporal::CollisionScoreLoopDriver::SelectedLayer { layer_id, .. } =
+            self.temporal_params.originals.score.loop_driver
+        else {
+            return;
+        };
+        let Some(saved_position) = self
+            .layers
+            .iter()
+            .position(|layer| layer.stable_layer_id() == layer_id)
+            .and_then(|position| u32::try_from(position).ok())
+            .and_then(performance::SavedLayerPosition::new)
+        else {
+            return;
+        };
+        self.temporal_params.originals.score.loop_driver =
+            temporal::CollisionScoreLoopDriver::SelectedLayer {
+                layer_id,
+                saved_position,
+            };
+    }
+
+    /// Preserve every M4 Faraday donor as a stable relationship before the
+    /// selected live layer is destroyed. The saved position is provenance for
+    /// patch/Morph serialization only; it must never become a positional
+    /// fallback that can bind the successor occupying the vacated slot.
+    fn preserve_motion_donors_before_remove(
+        &mut self,
+        removed_index: usize,
+        removed_id: image_routing::StableLayerId,
+    ) {
+        let Some(saved_position) = u32::try_from(removed_index)
+            .ok()
+            .and_then(performance::SavedLayerPosition::new)
+        else {
+            log::error!(
+                "removed motion donor at layer position {removed_index}, outside the persisted position bound"
+            );
+            return;
+        };
+
+        preserve_motion_donor_after_remove(&mut self.master_motion, removed_id, saved_position);
+        for layer in &mut self.layers {
+            preserve_motion_donor_after_remove(&mut layer.motion, removed_id, saved_position);
+        }
+    }
+
+    /// Refresh only the persisted-position provenance of live M4 donors after
+    /// a stack transaction. Runtime routing remains keyed by StableLayerId;
+    /// an unexpectedly absent ID is converted to its existing tombstone
+    /// provenance instead of being rebound by position.
+    fn refresh_motion_donor_saved_positions(&mut self) {
+        let positions: Vec<_> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter_map(|(position, layer)| {
+                u32::try_from(position)
+                    .ok()
+                    .and_then(performance::SavedLayerPosition::new)
+                    .map(|saved_position| (layer.stable_layer_id(), saved_position))
+            })
+            .collect();
+
+        refresh_motion_donor_saved_position(&mut self.master_motion, &positions);
+        for layer in &mut self.layers {
+            refresh_motion_donor_saved_position(&mut layer.motion, &positions);
+        }
+    }
+
+    fn remove_layer_transactional(
+        &mut self,
+        removed_index: usize,
+    ) -> Result<Vec<performance::SceneId>, String> {
+        let old_ids = self.live_layer_ids();
+        let removed_id = old_ids
+            .get(removed_index)
+            .copied()
+            .ok_or_else(|| format!("layer index {removed_index} is absent"))?;
+        let _validated = stage_composition_remove(&self.composition, &old_ids, removed_id)?;
+
+        if !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let staged_composition = stage_composition_remove(&self.composition, &old_ids, removed_id)
+            .expect("morph materialization cannot change composition topology");
+        let mut staged_master_rack = self.master_rack.clone();
+        staged_master_rack.mark_layer_output_missing(removed_id);
+        let mut staged_layer_racks = self.layer_racks();
+        for rack in &mut staged_layer_racks {
+            rack.mark_layer_output_missing(removed_id);
+        }
+
+        self.clear_performance_transactions();
+        let invalidated_scenes = self.remap_scenes_after_layer_remove(removed_index);
+        self.preserve_matte_routes_before_remove(removed_index);
+        self.preserve_temporal_driver_before_remove(removed_index, removed_id);
+        self.preserve_motion_donors_before_remove(removed_index, removed_id);
+        self.install_layer_racks(staged_layer_racks);
+        self.master_rack = staged_master_rack;
+        self.layers.remove(removed_index);
+        self.refresh_temporal_driver_saved_position();
+        self.refresh_motion_donor_saved_positions();
+        self.composition = staged_composition;
+        self.mod_matrix
+            .remap_layer_targets_after_remove_with_stable_id(removed_index, removed_id);
+        self.remap_quantized_layers_after_remove(removed_index);
+        self.morph.remap_layers_after_remove(removed_index);
+        self.selected_layer =
+            selected_layer_after_remove(self.selected_layer, removed_index, self.layers.len());
+        self.bump_layer_stack_revision();
+        self.bump_composition_revision();
+        self.composition_status = format!("Removed layer {}", removed_id.get());
+        self.invalidate_source_cut_generation();
+        Ok(invalidated_scenes)
+    }
+
+    fn move_layer_transactional(&mut self, from: usize, to: usize) -> Result<(), String> {
+        if from >= self.layers.len() || to >= self.layers.len() {
+            return Err(format!(
+                "layer move {from} -> {to} exceeds stack length {}",
+                self.layers.len()
+            ));
+        }
+        if from == to {
+            return Ok(());
+        }
+        let mut desired_ids = self.live_layer_ids();
+        let moved_id = desired_ids.remove(from);
+        desired_ids.insert(to, moved_id);
+        let _validated = stage_composition_reorder(&self.composition, &desired_ids)?;
+
+        if !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let staged = stage_composition_reorder(&self.composition, &desired_ids)
+            .expect("morph materialization cannot change composition topology");
+        self.remap_scenes_after_layer_move(from, to);
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+        self.refresh_temporal_driver_saved_position();
+        self.refresh_motion_donor_saved_positions();
+        self.composition = staged;
+        self.mod_matrix.remap_layer_targets_after_move(from, to);
+        self.remap_quantized_layers_after_move(from, to);
+        self.selected_layer = self.selected_layer.map(|selected| {
+            if selected == from {
+                to
+            } else if from < to && selected > from && selected <= to {
+                selected - 1
+            } else if to < from && selected >= to && selected < from {
+                selected + 1
+            } else {
+                selected
+            }
+        });
+        self.morph.remap_layers_after_move(from, to);
+        self.bump_layer_stack_revision();
+        self.bump_composition_revision();
+        self.composition_status = format!("Moved layer {} from {from} to {to}", moved_id.get());
+        self.invalidate_source_cut_generation();
+        Ok(())
+    }
+
     /// Resolve a browser layer selector. When an ID is supplied it is
     /// authoritative: a stale/unknown ID is rejected instead of falling back
     /// to a positional index that may now name a different layer.
@@ -880,6 +4781,19 @@ impl App {
             }
             None => (index < self.layers.len()).then_some(index),
         }
+    }
+
+    /// New transform actions never use positional fallback. Their stable ID
+    /// remains authoritative across harmless stack reorders and becomes a
+    /// safe no-op after deletion.
+    fn resolve_stable_layer_id(&self, layer_id: &str) -> Option<usize> {
+        resolve_stable_layer_index(layer_id, self.layers.iter().map(Layer::layer_id))
+    }
+
+    fn resolve_stable_transform_layer(&self, layer_id: &Option<String>) -> Option<usize> {
+        layer_id
+            .as_deref()
+            .and_then(|id| self.resolve_stable_layer_id(id))
     }
 
     /// Resolve a browser route selector with the same stale-ID rejection used
@@ -898,6 +4812,7 @@ impl App {
     }
 
     fn reset_patch_generation(&mut self) {
+        self.clear_performance_transactions();
         // Animated effects use a piece-local clock. A recalled patch therefore
         // begins at the same t=0 phase as its deterministic offline export.
         self.program_clock.reset();
@@ -917,7 +4832,13 @@ impl App {
         // protects legacy positional clients at the exact commit boundary.
         self.web_state.actions.blocking_lock().clear();
         self.quantized_bar = Some((self.mod_matrix.current_beat / 4.0).floor() as i64);
+        self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        self.temporal_boundaries
+            .reanchor(self.mod_matrix.current_beat);
+        self.temporal_audio_onsets
+            .reanchor(self.mod_matrix.audio.onset);
         self.bump_layer_stack_revision();
+        self.bump_composition_revision();
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
         self.selective_temporal_debt = 0.0;
@@ -929,14 +4850,25 @@ impl App {
         // or restore pixels belonging to the previously loaded patch.
         self.blackout_presented = self.blackout;
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_visual_generation();
+            renderer.reset_visual_generation_for(temporal::TemporalResetCause::PatchGeneration);
         }
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.reset_history_for(temporal::TemporalResetCause::PatchGeneration);
+        }
+        self.motion_field_cache.clear();
+        self.motion_telemetry.clear();
+        self.pending_motion_memory_clear = false;
     }
 
-    fn capture_current_patch(&self) -> patch::PatchState {
-        patch::PatchState::capture(
-            &self.master_effects,
+    fn try_capture_current_patch(&self) -> Result<patch::PatchState, String> {
+        let layer_racks = self.layer_racks();
+        let mut captured = patch::PatchState::capture_with_composition_and_motion(
+            patch::PatchMasterVisual::new(&self.master_effects, &self.master_transform),
+            &self.master_motion,
             &self.layers,
+            &self.master_rack,
+            &layer_racks,
+            &self.composition,
             &self.ntsc_params,
             &self.mod_matrix,
             &self.temporal_params,
@@ -945,7 +4877,608 @@ impl App {
                 media_frozen: self.media_frozen,
             },
             &self.morph,
-        )
+        )?;
+        captured.scenes = self.scenes.clone();
+        Ok(captured)
+    }
+
+    fn capture_manual_history_world(&self) -> Result<(ManualHistoryWorld, Vec<u8>), String> {
+        let world = ManualHistoryWorld {
+            patch: self.try_capture_current_patch()?,
+            stable_layer_ids: self.live_layer_ids(),
+            selected_layer_id: self
+                .selected_layer
+                .and_then(|index| self.layers.get(index))
+                .map(Layer::stable_layer_id),
+            patch_base_dir: self.performance_patch_dir.clone(),
+            stage_map: self.stage_map.clone(),
+            presets: self.preset_library.clone(),
+            controller_profile: self.controller_profile.clone(),
+        };
+        let canonical = world.canonical_bytes()?;
+        Ok((world, canonical))
+    }
+
+    fn history_checkpoint(
+        &self,
+        label: &str,
+        category: &str,
+    ) -> Result<history::HistoryCheckpoint<ManualHistoryWorld>, String> {
+        let (world, canonical) = self.capture_manual_history_world()?;
+        history::HistoryCheckpoint::from_canonical(world, &canonical, label, category)
+            .map_err(|error| error.to_string())
+    }
+
+    fn deferred_performance_history(
+        &self,
+        label: &str,
+    ) -> Result<DeferredPerformanceHistory, String> {
+        if let Some((id, origin)) = self.manual_history.open_gesture() {
+            return Err(format!(
+                "Deferred slot authoring is unavailable while {origin:?} history gesture {} is active",
+                id.get()
+            ));
+        }
+        // Validate the fixed label/checkpoint bounds now, but do not retain
+        // this snapshot: transport may advance normally during asynchronous
+        // decode or recording. Publication captures a fresh before-state
+        // after proving that no manual-history operation intervened.
+        let _ = self.history_checkpoint(label, "performance")?;
+        Ok(DeferredPerformanceHistory {
+            expected_generation: self.manual_history.metrics().generation,
+            label: label.to_string(),
+        })
+    }
+
+    fn prepare_deferred_performance_history(
+        &self,
+        deferred: &DeferredPerformanceHistory,
+    ) -> Result<history::HistoryCheckpoint<ManualHistoryWorld>, String> {
+        if let Some((id, origin)) = self.manual_history.open_gesture() {
+            return Err(format!(
+                "Deferred slot publication rejected while {origin:?} history gesture {} is active",
+                id.get()
+            ));
+        }
+        if self.manual_history.metrics().generation != deferred.expected_generation {
+            return Err(
+                "Deferred slot publication rejected because manual history changed during preparation"
+                    .into(),
+            );
+        }
+        self.history_checkpoint(&deferred.label, "performance")
+    }
+
+    fn record_deferred_performance_history(
+        &mut self,
+        before: history::HistoryCheckpoint<ManualHistoryWorld>,
+    ) -> Result<history::HistoryRecordOutcome, String> {
+        let (_, canonical) = self.capture_manual_history_world()?;
+        let outcome = self
+            .manual_history
+            .record_manual(
+                history::MutationOrigin::BrowserManual,
+                before,
+                history::fingerprint_canonical(&canonical),
+            )
+            .map_err(|error| error.to_string())?;
+        match outcome {
+            history::HistoryRecordOutcome::Recorded => {
+                self.history_status = "Deferred slot edit committed".to_string();
+                self.append_recovery_checkpoint("deferred slot edit");
+            }
+            history::HistoryRecordOutcome::NoChange => {
+                self.history_status = "Deferred slot edit made no authored change".to_string();
+            }
+            history::HistoryRecordOutcome::IgnoredNonManual
+            | history::HistoryRecordOutcome::Cancelled => {
+                self.history_status = format!("Deferred slot edit history: {outcome:?}");
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn persist_stage_map(stage_map: &stage_map::StageMap) -> Result<(), String> {
+        #[cfg(not(test))]
+        {
+            stage_map::save_default_stage_map_atomic(stage_map)
+                .map_err(|error| format!("persist StageMap: {error}"))?;
+        }
+        #[cfg(test)]
+        {
+            // The owning module's filesystem tests cover atomic publication.
+            // App tests prove the transaction law without touching host state.
+            stage_map
+                .to_yaml_bytes()
+                .map_err(|error| format!("validate StageMap publication: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn persist_preset_library(presets: &preset::PresetLibrary) -> Result<(), String> {
+        #[cfg(not(test))]
+        {
+            preset::save_default_preset_library_atomic(presets)
+                .map_err(|error| format!("persist preset library: {error}"))?;
+        }
+        #[cfg(test)]
+        {
+            presets
+                .to_yaml()
+                .map_err(|error| format!("validate preset library publication: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn persist_controller_profile(
+        controller_profile: &controller_profile::ControllerProfileDocument,
+    ) -> Result<(), String> {
+        #[cfg(not(test))]
+        {
+            controller_profile::save_default_controller_profile_atomic(controller_profile)
+                .map_err(|error| format!("persist controller profile: {error}"))?;
+        }
+        #[cfg(test)]
+        {
+            controller_profile
+                .to_json_bytes()
+                .map_err(|error| format!("validate controller profile publication: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn install_controller_profile_document(
+        &mut self,
+        document: controller_profile::ControllerProfileDocument,
+        source: &str,
+    ) -> Result<(), String> {
+        let prepared = controller_profile::prepare_controller_profile_swap(document, |position| {
+            position.resolve(&self.layers).map(Layer::stable_layer_id)
+        })
+        .map_err(|error| error.to_string())?;
+        let prior_document = self.controller_profile.clone();
+        let (document, runtime) = prepared.into_parts();
+        // Publish the validated document before touching protocol runtime. A
+        // filesystem failure therefore leaves CC/clock/raw/feedback state
+        // completely untouched. Prepared runtime has already passed the same
+        // closed validation used by MidiEngine::apply_profile.
+        Self::persist_controller_profile(&document)?;
+        if let Err(error) = self.midi.apply_profile(runtime) {
+            let rollback = Self::persist_controller_profile(&prior_document);
+            return Err(match rollback {
+                Ok(()) => format!("install prepared controller runtime: {error}"),
+                Err(rollback) => format!(
+                    "install prepared controller runtime: {error}; prior document rollback failed: {rollback}"
+                ),
+            });
+        }
+        self.controller_feedback_cache.clear();
+        self.controller_profile = document;
+        let browser_publication_error = self
+            .web_state
+            .publish_controller_profile_export(&self.controller_profile)
+            .err();
+        self.controller_profile_pending_initial_resolution = false;
+        self.controller_profile_revision = self.controller_profile_revision.wrapping_add(1).max(1);
+        self.controller_status = format!(
+            "Controller profile '{}' {source} and saved{}",
+            self.controller_profile.name,
+            browser_publication_error
+                .map(|error| format!("; browser export unavailable: {error}"))
+                .unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    fn save_manual_history_documents(
+        stage_map: &stage_map::StageMap,
+        presets: &preset::PresetLibrary,
+        controller_profile: &controller_profile::ControllerProfileDocument,
+    ) -> Result<(), String> {
+        Self::persist_stage_map(stage_map)?;
+        Self::persist_preset_library(presets)?;
+        Self::persist_controller_profile(controller_profile)?;
+        Ok(())
+    }
+
+    fn restore_manual_history_world(&mut self, world: &ManualHistoryWorld) -> Result<(), String> {
+        world
+            .stage_map
+            .validate()
+            .map_err(|error| error.to_string())?;
+        world.presets.to_yaml().map_err(|error| error.to_string())?;
+        if world.stable_layer_ids.len() != world.patch.layers.len() {
+            return Err("history world has a mismatched stable layer identity set".to_string());
+        }
+        let resolved_controller = world
+            .controller_profile
+            .resolve(|position| position.resolve(&world.stable_layer_ids).copied())
+            .map_err(|error| format!("resolve history controller profile: {error}"))?;
+        let prior_stage_map = self.stage_map.clone();
+        let prior_presets = self.preset_library.clone();
+        let prior_controller_profile = self.controller_profile.clone();
+        let prior_runtime_controller = self.midi.resolved_profile().clone();
+        if let Err(error) = Self::save_manual_history_documents(
+            &world.stage_map,
+            &world.presets,
+            &world.controller_profile,
+        ) {
+            let rollback = Self::save_manual_history_documents(
+                &prior_stage_map,
+                &prior_presets,
+                &prior_controller_profile,
+            );
+            return Err(match rollback {
+                Ok(()) => format!("history document publication rejected: {error}"),
+                Err(rollback) => format!(
+                    "history document publication rejected: {error}; prior document rollback also failed: {rollback}"
+                ),
+            });
+        }
+        if let Err(error) = self.midi.apply_profile(resolved_controller) {
+            let rollback = Self::save_manual_history_documents(
+                &prior_stage_map,
+                &prior_presets,
+                &prior_controller_profile,
+            );
+            return Err(match rollback {
+                Ok(()) => format!("install history controller profile: {error}"),
+                Err(rollback) => format!(
+                    "install history controller profile: {error}; prior document rollback also failed: {rollback}"
+                ),
+            });
+        }
+        let restore_path = world
+            .patch_base_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(".collide-o-scope-history-restore.yaml");
+        if let Err(error) = self.apply_loaded_patch_with_history_identity(
+            world.patch.clone(),
+            &restore_path,
+            Some(&world.stable_layer_ids),
+            world.selected_layer_id,
+        ) {
+            let runtime_rollback = self.midi.apply_profile(prior_runtime_controller);
+            let document_rollback = Self::save_manual_history_documents(
+                &prior_stage_map,
+                &prior_presets,
+                &prior_controller_profile,
+            );
+            return Err(format!(
+                "history patch restore rejected: {error}{}{}",
+                runtime_rollback
+                    .err()
+                    .map(|rollback| format!(
+                        "; prior controller runtime rollback failed: {rollback}"
+                    ))
+                    .unwrap_or_default(),
+                document_rollback
+                    .err()
+                    .map(|rollback| format!("; prior document rollback failed: {rollback}"))
+                    .unwrap_or_default()
+            ));
+        }
+        self.performance_patch_dir = world.patch_base_dir.clone();
+        self.stage_map = world.stage_map.clone();
+        self.preset_library = world.presets.clone();
+        self.preset_revision = self.preset_revision.wrapping_add(1).max(1);
+        self.controller_feedback_cache.clear();
+        self.controller_profile = world.controller_profile.clone();
+        let browser_publication_error = self
+            .web_state
+            .publish_controller_profile_export(&self.controller_profile)
+            .err();
+        self.controller_profile_pending_initial_resolution = false;
+        self.controller_profile_revision = self.controller_profile_revision.wrapping_add(1).max(1);
+        self.controller_status = format!(
+            "Restored controller profile '{}' with the complete manual world{}",
+            self.controller_profile.name,
+            browser_publication_error
+                .map(|error| format!("; browser export unavailable: {error}"))
+                .unwrap_or_default()
+        );
+        Ok(())
+    }
+
+    fn append_recovery_checkpoint(&mut self, reason: &str) {
+        let patch = match self.try_capture_current_patch() {
+            Ok(patch) => patch,
+            Err(error) => {
+                self.recovery_status = format!("Recovery checkpoint rejected: {error}");
+                return;
+            }
+        };
+        let Some(journal) = self.recovery_journal.as_mut() else {
+            if self.recovery_status.is_empty() {
+                self.recovery_status = "Recovery journal is unavailable".to_string();
+            }
+            return;
+        };
+        match journal.append_patch(&patch) {
+            Ok(receipt) => {
+                self.recovery_status = format!(
+                    "Recovery checkpoint {} after {reason} ({} bytes{})",
+                    receipt.sequence,
+                    receipt.payload_bytes,
+                    if receipt.compacted { ", compacted" } else { "" }
+                );
+            }
+            Err(error) => {
+                self.recovery_status = format!("Recovery checkpoint failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn capture_current_patch(&self) -> patch::PatchState {
+        self.try_capture_current_patch()
+            .expect("live composition and rack graph remain capture-valid")
+    }
+
+    fn create_stage_monitor_target(
+        renderer: &Renderer,
+        event_loop: &ActiveEventLoop,
+        endpoint: &stage_map::StageEndpoint,
+        monitors: &[MonitorHandle],
+    ) -> Result<StageMonitorTarget, String> {
+        let stage_map::OutputBinding::Monitor { selector } = &endpoint.binding else {
+            return Err("endpoint is not bound to a monitor".to_string());
+        };
+        let monitor_names = monitors.iter().map(MonitorHandle::name).collect::<Vec<_>>();
+        let monitor_index = exact_monitor_name_index(selector, &monitor_names)?;
+        let monitor = monitors[monitor_index].clone();
+        let attributes = WindowAttributes::default()
+            .with_title(format!("collide-o-scope — stage output {}", endpoint.id))
+            .with_inner_size(winit::dpi::PhysicalSize::new(
+                endpoint.output_size[0],
+                endpoint.output_size[1],
+            ))
+            .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .map_err(|error| format!("create monitor window: {error}"))?,
+        );
+        window.set_cursor_visible(false);
+        let surface = renderer.create_compatible_surface(window.clone())?;
+        let capabilities = renderer.compatible_surface_capabilities(&surface);
+        if !capabilities
+            .usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        {
+            return Err("monitor surface cannot be used as a render attachment".to_string());
+        }
+        let format = preferred_stage_surface_format(&capabilities.formats)
+            .ok_or_else(|| "monitor surface reports no texture formats".to_string())?;
+        let present_mode = preferred_stage_present_mode(&capabilities.present_modes)
+            .ok_or_else(|| "monitor surface reports no presentation modes".to_string())?;
+        let alpha_mode = capabilities
+            .alpha_modes
+            .iter()
+            .find(|mode| **mode == wgpu::CompositeAlphaMode::Opaque)
+            .copied()
+            .or_else(|| capabilities.alpha_modes.first().copied())
+            .ok_or_else(|| "monitor surface reports no alpha modes".to_string())?;
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: endpoint.output_size[0],
+            height: endpoint.output_size[1],
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        renderer.configure_compatible_surface(&surface, &config)?;
+        Ok(StageMonitorTarget {
+            endpoint_id: endpoint.id.clone(),
+            selector: selector.clone(),
+            window,
+            surface,
+            config,
+            needs_reconfigure: false,
+            suspended: false,
+            last_error: String::new(),
+        })
+    }
+
+    /// Rebuild the cold presenter transaction only when its authored map,
+    /// immutable Program source, monitor inventory, or target formats can have
+    /// changed. Tool-only changes update preallocated uniforms below.
+    fn sync_stage_presenter(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let monitors = event_loop.available_monitors().collect::<Vec<_>>();
+        let monitor_signature = stage_monitor_inventory_signature(&monitors);
+        let source_size = [renderer.output_width, renderer.output_height];
+        let authored_changed = self.stage_presenter_attempted_map.as_ref() != Some(&self.stage_map);
+        let rebuild = authored_changed
+            || self.stage_presenter_attempted_source_size != Some(source_size)
+            || self.stage_monitor_attempted_signature != monitor_signature;
+        if !rebuild {
+            if let Some(presenter) = self.stage_presenter.as_mut() {
+                presenter.update_tools(&renderer.queue, &self.stage_tools);
+            }
+            self.refresh_stage_output_status();
+            return;
+        }
+        if authored_changed {
+            self.stage_closed_endpoints.clear();
+        }
+
+        let mut targets = Vec::new();
+        let mut failures = BTreeMap::new();
+        for endpoint in self.stage_map.endpoints.iter().filter(|endpoint| {
+            endpoint.enabled && matches!(endpoint.binding, stage_map::OutputBinding::Monitor { .. })
+        }) {
+            if self.stage_closed_endpoints.contains(&endpoint.id) {
+                failures.insert(
+                    endpoint.id.clone(),
+                    "physical output was closed by the operator".to_string(),
+                );
+                continue;
+            }
+            match Self::create_stage_monitor_target(renderer, event_loop, endpoint, &monitors) {
+                Ok(target) => targets.push(target),
+                Err(error) => {
+                    failures.insert(endpoint.id.clone(), bounded_stage_runtime_status(error));
+                }
+            }
+        }
+
+        let target_ids = targets
+            .iter()
+            .map(|target| target.endpoint_id.clone())
+            .collect::<BTreeSet<_>>();
+        let surface_formats = targets
+            .iter()
+            .map(|target| target.config.format)
+            .collect::<Vec<_>>();
+        let program_sources = [renderer::stage_map::StageProgramSource {
+            id: STAGE_PROGRAM_SOURCE,
+            view: &renderer.composite_views[2],
+        }];
+        let preparation = renderer::stage_map::StageMapPresenter::prepare(
+            &renderer.device,
+            &self.stage_map,
+            &self.stage_tools,
+            &program_sources,
+            &surface_formats,
+            renderer::stage_map::StagePresenterLimits::for_device(&renderer.device),
+            |endpoint| match &endpoint.binding {
+                stage_map::OutputBinding::Unassigned => Ok(()),
+                stage_map::OutputBinding::Monitor { .. } if target_ids.contains(&endpoint.id) => {
+                    Ok(())
+                }
+                stage_map::OutputBinding::Monitor { .. } => Err(failures
+                    .get(&endpoint.id)
+                    .cloned()
+                    .unwrap_or_else(|| "physical monitor target is unavailable".to_string())),
+            },
+        );
+
+        self.stage_presenter_attempted_map = Some(self.stage_map.clone());
+        self.stage_presenter_attempted_source_size = Some(source_size);
+        self.stage_monitor_attempted_signature = monitor_signature.clone();
+        match preparation {
+            Ok(mut presenter) => {
+                targets.retain(|target| presenter.output(&target.endpoint_id).is_some());
+                presenter.update_tools(&renderer.queue, &self.stage_tools);
+                self.stage_presenter = Some(presenter);
+                self.stage_monitor_targets = targets;
+                self.stage_monitor_failures = failures;
+                self.stage_monitor_signature = monitor_signature;
+                self.stage_presenter_source_size = Some(source_size);
+                self.stage_presenter_map = Some(self.stage_map.clone());
+                self.stage_presenter_error.clear();
+                self.stage_presented_endpoints.clear();
+            }
+            Err(error) => {
+                self.stage_presenter_error = bounded_stage_runtime_status(error.to_string());
+                // A global pipeline/resource failure publishes its attempted
+                // identity but retains the complete last accepted presenter,
+                // endpoint textures, and physical windows. Local cold targets
+                // are dropped here without ever entering a submitted frame.
+                if self.stage_presenter.is_none() {
+                    self.stage_monitor_failures = failures;
+                }
+            }
+        }
+        self.refresh_stage_output_status();
+    }
+
+    fn refresh_stage_output_status(&mut self) {
+        let mut diagnostics = Vec::new();
+        if !self.stage_presenter_error.is_empty() {
+            diagnostics.push(self.stage_presenter_error.clone());
+        }
+        diagnostics.extend(
+            self.stage_monitor_failures
+                .iter()
+                .map(|(endpoint, error)| format!("{endpoint}: {error}")),
+        );
+        if let Some(presenter) = &self.stage_presenter {
+            for endpoint in presenter.preparation() {
+                if !self
+                    .stage_monitor_failures
+                    .contains_key(&endpoint.endpoint_id)
+                {
+                    if let renderer::stage_map::StageEndpointPreparationStatus::Rejected(error) =
+                        &endpoint.status
+                    {
+                        diagnostics.push(format!("{}: {error:?}", endpoint.endpoint_id));
+                    }
+                }
+            }
+        }
+        diagnostics.extend(
+            self.stage_monitor_targets
+                .iter()
+                .filter(|target| !target.last_error.is_empty())
+                .map(|target| {
+                    format!(
+                        "{} ({:?}): {}",
+                        target.endpoint_id, target.selector, target.last_error
+                    )
+                }),
+        );
+        self.stage_output_status = bounded_stage_runtime_status(diagnostics.join("; "));
+    }
+
+    fn published_output_error(&self) -> String {
+        match (
+            self.output_error.is_empty(),
+            self.stage_output_status.is_empty(),
+        ) {
+            (true, true) => String::new(),
+            (false, true) => self.output_error.clone(),
+            (true, false) => self.stage_output_status.clone(),
+            (false, false) => bounded_stage_runtime_status(format!(
+                "{}; StageMap: {}",
+                self.output_error, self.stage_output_status
+            )),
+        }
+    }
+
+    fn stage_surface_windows_open(&self) -> bool {
+        !self.stage_monitor_targets.is_empty()
+    }
+
+    fn handle_stage_window_event(&mut self, window_id: WindowId, event: &WindowEvent) -> bool {
+        let Some(index) = self
+            .stage_monitor_targets
+            .iter()
+            .position(|target| target.window.id() == window_id)
+        else {
+            return false;
+        };
+        match event {
+            WindowEvent::CloseRequested => {
+                let target = self.stage_monitor_targets.remove(index);
+                self.stage_presented_endpoints.remove(&target.endpoint_id);
+                self.stage_closed_endpoints
+                    .insert(target.endpoint_id.clone());
+                self.stage_monitor_failures.insert(
+                    target.endpoint_id,
+                    "physical output was closed by the operator".to_string(),
+                );
+                self.refresh_stage_output_status();
+            }
+            WindowEvent::Resized(size) => {
+                let target = &mut self.stage_monitor_targets[index];
+                target.suspended = size.width == 0 || size.height == 0;
+                if !target.suspended {
+                    target.needs_reconfigure = true;
+                }
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.stage_monitor_targets[index].needs_reconfigure = true;
+            }
+            _ => {}
+        }
+        true
     }
 
     /// Open the separate-monitor audience window. The caller has already
@@ -1128,13 +5661,19 @@ impl App {
         use web::state::WebAction;
         match action {
             NativeRecoveryAction::SetProgramFrozen(frozen) => {
-                self.handle_web_action(WebAction::SetProgramFrozen { frozen });
+                self.apply_native_manual_action("Set Program Freeze", "transport", move |app| {
+                    app.handle_web_action_inner_with_feedback(WebAction::SetProgramFrozen {
+                        frozen,
+                    });
+                });
             }
             NativeRecoveryAction::SetBlackout(enabled) => {
                 self.handle_web_action(WebAction::SetBlackout { enabled });
             }
             NativeRecoveryAction::RevertVisualProgram => {
-                self.handle_web_action(WebAction::ResetVisualProgram);
+                self.apply_native_manual_action("Revert visual program", "visual_program", |app| {
+                    app.handle_web_action_inner_with_feedback(WebAction::ResetVisualProgram);
+                });
             }
             NativeRecoveryAction::RescanLibrary => {
                 self.handle_web_action(WebAction::RescanLibrary);
@@ -1242,6 +5781,71 @@ impl App {
         })
     }
 
+    /// Materialize each saved source-time selection in the staged GPU texture
+    /// before a Snapshot stack becomes live. A frozen Snapshot therefore
+    /// cannot expose a decoder's t=0 seed at a nonzero saved playhead.
+    fn stage_patch_visual_playheads(
+        layers: &mut [Layer],
+        renderer: &Renderer,
+    ) -> Result<(), String> {
+        const PLAYHEAD_TIMEOUT: Duration = Duration::from_secs(5);
+        const PLAYHEAD_POLL: Duration = Duration::from_millis(2);
+
+        for layer in layers {
+            if !layer.is_file_media() {
+                continue;
+            }
+            let is_video = layer.is_video();
+            let authored = layer.active_clip_config().transport;
+            let selection = layer.apply_transport_tick_with_overrides(
+                transport::ProgramTransportTick {
+                    program_running: false,
+                    media_running: false,
+                    ..Default::default()
+                },
+                authored.rate,
+                authored.sample_fps,
+            )?;
+            let started = Instant::now();
+            loop {
+                match layer.take_ready_media_frame()? {
+                    Some(frame)
+                        if !staged_playhead_frame_is_current(
+                            is_video,
+                            selection.generation,
+                            &frame,
+                        ) =>
+                    {
+                        // A decoder seed or superseded absolute request must
+                        // never become the texture committed by a Snapshot.
+                    }
+                    Some(mut frame) => {
+                        layer
+                            .upload_ready_media_frame(&renderer.device, &renderer.queue, &mut frame)
+                            .map_err(|error| {
+                                format!(
+                                    "could not upload saved playhead for '{}': {error}",
+                                    layer.filename
+                                )
+                            })?;
+                        break;
+                    }
+                    None if started.elapsed() < PLAYHEAD_TIMEOUT => {
+                        std::thread::sleep(PLAYHEAD_POLL);
+                    }
+                    None => {
+                        return Err(format!(
+                            "saved playhead for '{}' did not decode within {:.1}s; no state was changed",
+                            layer.filename,
+                            PLAYHEAD_TIMEOUT.as_secs_f64()
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn selected_audio_clip_name(&self) -> String {
         PathBuf::from(&self.mod_matrix.audio_clip_path)
             .file_name()
@@ -1311,6 +5915,29 @@ impl App {
         patch: patch::PatchState,
         patch_path: &std::path::Path,
     ) -> Result<(), String> {
+        self.apply_loaded_patch_with_history_identity(patch, patch_path, None, None)
+    }
+
+    fn apply_loaded_patch_with_history_identity(
+        &mut self,
+        patch: patch::PatchState,
+        patch_path: &std::path::Path,
+        restored_layer_ids: Option<&[image_routing::StableLayerId]>,
+        restored_selected_layer: Option<image_routing::StableLayerId>,
+    ) -> Result<(), String> {
+        let scene_issues = patch.validate_scene_references();
+        if !scene_issues.is_empty() {
+            return Err(format!(
+                "snapshot contains {} invalid Scene reference{}; no state was changed: {}",
+                scene_issues.len(),
+                if scene_issues.len() == 1 { "" } else { "s" },
+                scene_issues
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
         let patch_dir = patch_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -1367,24 +5994,101 @@ impl App {
             rebuilt.push(layer);
         }
 
+        if let Some(restored_layer_ids) = restored_layer_ids {
+            if restored_layer_ids.len() != rebuilt.len() {
+                return Err(format!(
+                    "history identity count {} does not match replacement layer count {}",
+                    restored_layer_ids.len(),
+                    rebuilt.len()
+                ));
+            }
+            let unique: std::collections::BTreeSet<_> =
+                restored_layer_ids.iter().copied().collect();
+            if unique.len() != restored_layer_ids.len() {
+                return Err("history replacement contains duplicate stable layer IDs".to_string());
+            }
+            for (layer, layer_id) in rebuilt.iter_mut().zip(restored_layer_ids.iter().copied()) {
+                layer.restore_stable_layer_id_for_history(layer_id)?;
+            }
+        }
+
+        // Resolve saved matte positions only after every replacement layer
+        // has received its new process-stable identity. Install the canonical
+        // Set metadata while the stack is still staged, so any invalid active
+        // slot rejects the whole snapshot before live state is touched.
+        let rebuilt_ids: Vec<_> = rebuilt.iter().map(Layer::stable_layer_id).collect();
+        let staged_controller_rebind = restored_layer_ids.is_none().then(|| {
+            self.controller_profile
+                .resolve(|position| position.resolve(&rebuilt_ids).copied())
+                .map_err(|error| error.to_string())
+        });
+        for (config, layer) in patch.layers.iter().zip(rebuilt.iter_mut()) {
+            let active_slot = config
+                .clip_slots
+                .active_or_first(config.active_clip_slot)
+                .ok_or_else(|| format!("layer '{}' has no active ClipSlot", config.filename))?;
+            let matte = config
+                .matte
+                .to_runtime(|saved_position| saved_position.resolve(&rebuilt_ids).copied());
+            layer.install_performance_state(config.clip_slots.clone(), active_slot, matte)?;
+        }
+        if !rebuilt.is_empty() {
+            let renderer = self.renderer.as_ref().ok_or("renderer is not ready")?;
+            Self::stage_patch_visual_playheads(&mut rebuilt, renderer)?;
+        }
+
         // Audio decoding is part of the same staging transaction as visual
         // decoder construction. A missing or corrupt saved clip therefore
         // rejects the snapshot before any live performance state is replaced.
         let staged_analysis_audio =
             Self::stage_patch_analysis_audio(&patch, &source_context, &mut source_fingerprints)?;
 
-        patch.apply(
-            &mut self.master_effects,
+        let mut staged_master_effects = self.master_effects;
+        let mut staged_master_transform = self.master_transform;
+        let mut staged_master_motion = motion::MotionParams::default();
+        let mut staged_master_rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut staged_layer_racks: Vec<_> =
+            rebuilt.iter().map(|layer| layer.rack.clone()).collect();
+        let mut staged_composition = legacy_runtime_composition(&rebuilt_ids)
+            .map_err(|error| format!("stage legacy composition: {error}"))?;
+        let mut staged_ntsc = self.ntsc_params.clone();
+        let mut staged_temporal = self.temporal_params;
+        let replace_modulation = patch.modulation.is_some();
+        let mut staged_mod_matrix = modulation::ModMatrix::new();
+        patch.apply_with_composition_and_motion(
+            &mut staged_master_effects,
+            &mut staged_master_transform,
+            &mut staged_master_motion,
             &mut rebuilt,
-            &mut self.ntsc_params,
-            &mut self.mod_matrix,
-            &mut self.temporal_params,
-        );
+            &mut staged_master_rack,
+            &mut staged_layer_racks,
+            &mut staged_composition,
+            &mut staged_ntsc,
+            &mut staged_mod_matrix,
+            &mut staged_temporal,
+        )?;
+        for (layer, rack) in rebuilt.iter_mut().zip(staged_layer_racks) {
+            layer.rack = rack;
+        }
         let recalled_master_paused = patch.master_paused;
         let recalled_media_frozen = patch.media_frozen;
         let preserve_audio_load_block =
             matches!(&staged_analysis_audio, StagedPatchAudio::Preserve)
                 && self.audio_clip_blocks_program;
+        // Everything above was detached staging. Publish the complete creative
+        // graph together only after every source, route and modulation address
+        // has resolved successfully against the replacement stable IDs.
+        self.master_effects = staged_master_effects;
+        self.master_transform = staged_master_transform;
+        self.master_motion = staged_master_motion;
+        self.master_rack = staged_master_rack;
+        self.composition = staged_composition;
+        self.ntsc_params = staged_ntsc;
+        self.temporal_params = staged_temporal;
+        if replace_modulation {
+            self.mod_matrix = staged_mod_matrix;
+        }
+
         // Patch modulation replacement may leave the old clock's paused flag
         // behind when loading a legacy patch with no modulation section.
         // Start from a running logical clock, then apply the recalled absolute
@@ -1407,7 +6111,37 @@ impl App {
         self.media_frozen = recalled_media_frozen;
         self.mod_matrix.reset_update_timing();
         self.layers = rebuilt;
-        self.selected_layer = (!self.layers.is_empty()).then_some(0);
+        if let Some(staged_controller_rebind) = staged_controller_rebind {
+            self.controller_profile_pending_initial_resolution = false;
+            match staged_controller_rebind.and_then(|profile| {
+                self.midi
+                    .apply_profile(profile)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(()) => {
+                    self.controller_feedback_cache.clear();
+                    self.controller_status.clear();
+                }
+                Err(error) => {
+                    // The controller document is venue state, not part of the
+                    // artistic patch transaction. Missing saved positions
+                    // therefore remain safely bound to the retired stable IDs
+                    // and are reported instead of retargeting or rejecting a
+                    // valid piece load.
+                    self.controller_status =
+                        format!("Controller profile could not follow loaded patch: {error}");
+                }
+            }
+        }
+        self.scenes = patch.scenes.clone();
+        self.performance_patch_dir = Some(patch_dir.to_path_buf());
+        self.selected_layer = restored_selected_layer
+            .and_then(|selected| {
+                self.layers
+                    .iter()
+                    .position(|layer| layer.stable_layer_id() == selected)
+            })
+            .or_else(|| (!self.layers.is_empty()).then_some(0));
         self.morph = patch
             .morph
             .clone()
@@ -1451,6 +6185,17 @@ impl App {
                 self.set_audio_clip_blocks_program_at(false, commit_time);
             }
         }
+        self.composition_status = format!(
+            "Loaded creative graph with {} layer{} and {} group{}",
+            self.layers.len(),
+            if self.layers.len() == 1 { "" } else { "s" },
+            self.composition.groups().len(),
+            if self.composition.groups().len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
         Ok(())
     }
 
@@ -1471,34 +6216,30 @@ impl App {
 
     fn action_conflicts_with_applied_look(
         action: &web::state::WebAction,
-        mapped_layer_ids: &[u64],
-        applied_ntsc: bool,
-        applied_temporal: bool,
+        applied: &AppliedLookScope,
     ) -> bool {
         use web::state::WebAction;
         match action {
-            WebAction::Quantized { inner } => Self::action_conflicts_with_applied_look(
-                inner,
-                mapped_layer_ids,
-                applied_ntsc,
-                applied_temporal,
-            ),
+            WebAction::Quantized { inner } => {
+                Self::action_conflicts_with_applied_look(inner, applied)
+            }
             WebAction::ResetGroup { group } => match group.as_str() {
-                "digital" | "analog" | "key" | "motion" | "cellular" | "shift" => true,
-                "vhs" => applied_ntsc,
-                "temporal" => applied_temporal,
+                "digital" | "analog" | "key" | "motion" | "cellular" | "shift" | "transform" => {
+                    true
+                }
+                "vhs" => applied.applied_ntsc,
+                "temporal" => applied.applied_temporal,
                 // Apply Look deliberately preserves modulation. Unknown reset
                 // groups are no-ops and likewise cannot conflict.
                 "mod" => false,
                 _ => false,
             },
             WebAction::SetParam { .. }
+            | WebAction::SetMasterTransform { .. }
+            | WebAction::ResetMasterTransform
+            | WebAction::ApplyMasterTransform { .. }
             | WebAction::ResetFx
             | WebAction::ResetVisualProgram
-            | WebAction::AddLayer { .. }
-            | WebAction::AddSpoutLayer { .. }
-            | WebAction::RemoveLayer { .. }
-            | WebAction::MoveLayer { .. }
             | WebAction::MorphCapture { .. }
             | WebAction::MorphClear
             | WebAction::SetMorph { .. }
@@ -1506,15 +6247,30 @@ impl App {
             | WebAction::MorphGlide { .. }
             | WebAction::OpenPatchSnapshot
             | WebAction::OpenPatchLook { .. } => true,
-            WebAction::SetNtscParam { .. } => applied_ntsc,
-            WebAction::SetTemporal { .. } => applied_temporal,
+            WebAction::SetNtscParam { .. } => applied.applied_ntsc,
+            WebAction::SetTemporal { .. } => applied.applied_temporal,
+            WebAction::SetMotion {
+                scope: web::state::MotionScopeSnapshot::Master,
+                ..
+            } => true,
+            WebAction::SetMotion {
+                scope: web::state::MotionScopeSnapshot::Layer { layer_id },
+                ..
+            } => parse_nonzero_decimal(layer_id)
+                .is_some_and(|id| applied.mapped_layer_ids.contains(&id)),
+            WebAction::SetLayerTransform { layer_id, .. }
+            | WebAction::ResetLayerTransform { layer_id, .. }
+            | WebAction::ApplyLayerTransform { layer_id, .. } => layer_id
+                .as_deref()
+                .and_then(|id| id.parse::<u64>().ok())
+                .is_some_and(|id| applied.mapped_layer_ids.contains(&id)),
             WebAction::SetLayerEffect {
                 index, layer_id, ..
             }
             | WebAction::ResetLayerFx { index, layer_id }
             | WebAction::SetLayerVisibility {
                 index, layer_id, ..
-            } => Self::layer_action_targets_look(*index, layer_id, mapped_layer_ids),
+            } => Self::layer_action_targets_look(*index, layer_id, &applied.mapped_layer_ids),
             WebAction::SetLayerParam {
                 index,
                 layer_id,
@@ -1535,9 +6291,25 @@ impl App {
                     | "key_tolerance"
             ) =>
             {
-                Self::layer_action_targets_look(*index, layer_id, mapped_layer_ids)
+                Self::layer_action_targets_look(*index, layer_id, &applied.mapped_layer_ids)
             }
-            WebAction::ToggleVisibility { index } => *index < mapped_layer_ids.len(),
+            WebAction::ToggleVisibility { index } => *index < applied.mapped_layer_ids.len(),
+            WebAction::SetVisualNodeParam { scope, node_id, .. } => parse_creative_scope(scope)
+                .zip(parse_node_id(node_id))
+                .is_some_and(|(scope, node_id)| {
+                    let scope = match scope {
+                        CreativeRackScope::Master => patch::LookRackScope::Master,
+                        CreativeRackScope::Layer(layer_id) => patch::LookRackScope::Layer(layer_id),
+                        CreativeRackScope::Group(group_id) => patch::LookRackScope::Group(group_id),
+                    };
+                    applied
+                        .applied_nodes
+                        .contains(&patch::LookNodeRef { scope, node_id })
+                }),
+            WebAction::SetCompositionGroupParam { group_id, .. }
+            | WebAction::SetCompositionGroupMatteParam { group_id, .. } => parse_group_id(group_id)
+                .is_some_and(|group_id| applied.applied_group_ids.contains(&group_id)),
+            WebAction::SetCompositionBusCrossfade { .. } => applied.applied_bus_crossfade,
             WebAction::Reroll {
                 scope: web::state::RerollScope::Master | web::state::RerollScope::All,
                 ..
@@ -1548,36 +6320,34 @@ impl App {
                 layer_id,
                 ..
             } => index.is_some_and(|index| {
-                Self::layer_action_targets_look(index, layer_id, mapped_layer_ids)
+                Self::layer_action_targets_look(index, layer_id, &applied.mapped_layer_ids)
             }),
+            WebAction::Reroll {
+                scope: web::state::RerollScope::Group,
+                group_id,
+                include_rack_controls,
+                include_group_controls,
+                ..
+            } => {
+                (*include_rack_controls || *include_group_controls)
+                    && group_id
+                        .as_deref()
+                        .and_then(parse_group_id)
+                        .is_some_and(|group_id| applied.applied_group_ids.contains(&group_id))
+            }
             _ => false,
         }
     }
 
     /// Invalidate retained pixels/history after a bulk visual transfer without
     /// resetting piece time, modulation, source identity, or stack revision.
-    fn invalidate_visual_generation_after_look(
-        &mut self,
-        mapped_layer_ids: &[u64],
-        applied_ntsc: bool,
-        applied_temporal: bool,
-    ) {
-        self.quantized_actions.retain(|action| {
-            !Self::action_conflicts_with_applied_look(
-                action,
-                mapped_layer_ids,
-                applied_ntsc,
-                applied_temporal,
-            )
-        });
-        self.web_state.actions.blocking_lock().retain(|action| {
-            !Self::action_conflicts_with_applied_look(
-                action,
-                mapped_layer_ids,
-                applied_ntsc,
-                applied_temporal,
-            )
-        });
+    fn invalidate_visual_generation_after_look(&mut self, applied: &AppliedLookScope) {
+        self.quantized_actions
+            .retain(|action| !Self::action_conflicts_with_applied_look(action, applied));
+        self.web_state
+            .actions
+            .blocking_lock()
+            .retain(|action| !Self::action_conflicts_with_applied_look(action, applied));
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
         self.selective_temporal_debt = 0.0;
@@ -1585,43 +6355,162 @@ impl App {
         self.selective_hold_snapshot_valid = false;
         self.selective_hold_spout_barrier_epoch = None;
         self.selective_hold_spout_readback_epoch = None;
+        self.pending_temporal_events = temporal::TemporalFrameEvents::default();
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_visual_generation();
+            renderer.reset_visual_generation_for(temporal::TemporalResetCause::ApplyLook);
         }
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.reset_history_for(temporal::TemporalResetCause::ApplyLook);
+        }
+        self.motion_field_cache.clear();
+        self.motion_telemetry.clear();
+        self.pending_motion_memory_clear = false;
+    }
+
+    /// A source cut or source-time discontinuity invalidates every retained
+    /// pixel generation, but is not an authored Look transfer. In particular,
+    /// unrelated queued controls, the program clock, stack revision, and
+    /// stable layer identities remain untouched.
+    fn invalidate_source_cut_generation(&mut self) {
+        self.visual_epoch = self.visual_epoch.wrapping_add(1);
+        self.ntsc_presented = None;
+        self.selective_temporal_debt = 0.0;
+        self.selective_transition_holding = false;
+        self.selective_hold_snapshot_valid = false;
+        self.selective_hold_spout_barrier_epoch = None;
+        self.selective_hold_spout_readback_epoch = None;
+        self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.reset_visual_generation_for(temporal::TemporalResetCause::SourceCut);
+        }
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.reset_history_for(temporal::TemporalResetCause::SourceCut);
+        }
+        self.motion_field_cache.clear();
+        self.motion_telemetry.clear();
+        self.pending_motion_memory_clear = false;
     }
 
     fn apply_patch_look(
         &mut self,
         patch: patch::PatchState,
-    ) -> (patch::LookApplySummary, AppliedLookScope) {
-        self.release_active_morph_for_manual_edit();
+    ) -> Result<(patch::LookApplySummary, AppliedLookScope), String> {
+        // Applying a Look is a values-only transaction, but those values can
+        // activate a previously dormant image edge. Sample any active Morph
+        // and apply the saved values to a detached candidate, then restore the
+        // authored world before unified DAG/resource preflight. Rejection is
+        // therefore unable to leak a half-applied master, layer, rack, matte,
+        // group, NTSC, temporal, Morph, revision, or visual generation.
+        let prior_master_effects = self.master_effects;
+        let prior_master_transform = self.master_transform;
+        let prior_master_motion = self.master_motion;
+        let prior_ntsc = self.ntsc_params.clone();
+        let prior_temporal = self.temporal_params;
+        let prior_layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        let prior_graph = self.authored_creative_graph();
+        let prior_morph = self.morph.clone();
+
+        if !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".into());
+        }
         let applied_ntsc = patch.ntsc.is_some();
         let applied_temporal = patch.temporal.is_some();
-        let summary = patch.apply_look(
+        let mut layer_racks = self.layer_racks();
+        let summary = patch.apply_look_with_composition_and_motion(
             &mut self.master_effects,
+            &mut self.master_transform,
+            &mut self.master_motion,
             &mut self.layers,
+            &mut self.master_rack,
+            &mut layer_racks,
+            &mut self.composition,
             &mut self.ntsc_params,
             &mut self.temporal_params,
         );
+        let candidate_master_effects = self.master_effects;
+        let candidate_master_transform = self.master_transform;
+        let candidate_master_motion = self.master_motion;
+        let candidate_ntsc = self.ntsc_params.clone();
+        let candidate_temporal = self.temporal_params;
+        let candidate_layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        let candidate_graph = StagedCreativeGraph {
+            master_rack: self.master_rack.clone(),
+            layer_racks: self
+                .layers
+                .iter()
+                .map(Layer::stable_layer_id)
+                .zip(layer_racks)
+                .collect(),
+            composition: self.composition.clone(),
+        };
+
+        self.master_effects = prior_master_effects;
+        self.master_transform = prior_master_transform;
+        self.master_motion = prior_master_motion;
+        self.ntsc_params = prior_ntsc;
+        self.temporal_params = prior_temporal;
+        for (layer, values) in self.layers.iter_mut().zip(prior_layers.iter().copied()) {
+            values.install(layer);
+        }
+        self.master_rack = prior_graph.master_rack;
+        self.install_layer_racks(
+            prior_graph
+                .layer_racks
+                .into_iter()
+                .map(|(_, rack)| rack)
+                .collect(),
+        );
+        self.composition = prior_graph.composition;
+        self.morph = prior_morph;
+
+        if let Err(error) = self.preflight_creative_graph_with_visuals(
+            &candidate_graph,
+            &candidate_master_effects,
+            &candidate_master_transform,
+            &candidate_master_motion,
+            &candidate_ntsc,
+            &candidate_temporal,
+            &candidate_layers,
+        ) {
+            self.composition_status = format!("Apply Look rejected: {error}");
+            return Err(self.composition_status.clone());
+        }
+
+        self.master_effects = candidate_master_effects;
+        self.master_transform = candidate_master_transform;
+        self.master_motion = candidate_master_motion;
+        self.ntsc_params = candidate_ntsc;
+        self.temporal_params = candidate_temporal;
+        for (layer, values) in self.layers.iter_mut().zip(candidate_layers.iter().copied()) {
+            values.install(layer);
+        }
+        self.master_rack = candidate_graph.master_rack;
+        self.install_layer_racks(
+            candidate_graph
+                .layer_racks
+                .into_iter()
+                .map(|(_, rack)| rack)
+                .collect(),
+        );
+        self.composition = candidate_graph.composition;
+        self.morph.clear();
         let mapped_layer_ids: Vec<_> = self
             .layers
             .iter()
             .take(summary.mapped_layers)
             .map(Layer::layer_id)
             .collect();
-        self.invalidate_visual_generation_after_look(
-            &mapped_layer_ids,
+        let applied_scope = AppliedLookScope {
+            mapped_layer_ids,
             applied_ntsc,
             applied_temporal,
-        );
-        (
-            summary,
-            AppliedLookScope {
-                mapped_layer_ids,
-                applied_ntsc,
-                applied_temporal,
-            },
-        )
+            applied_nodes: summary.applied_nodes.clone(),
+            applied_group_ids: summary.applied_group_ids.clone(),
+            applied_bus_crossfade: summary.applied_bus_crossfade,
+        };
+        self.invalidate_visual_generation_after_look(&applied_scope);
+        self.composition_status = "Applied Look creative values".into();
+        Ok((summary, applied_scope))
     }
 
     fn choose_snapshot_patch(&mut self) -> bool {
@@ -1666,7 +6555,14 @@ impl App {
                         "Error: layer stack changed while choosing the look".into();
                     return None;
                 }
-                let (summary, scope) = self.apply_patch_look(loaded);
+                let (summary, scope) = match self.apply_patch_look(loaded) {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        self.patch_load_status = format!("Error: {error}");
+                        log::error!("{}", self.patch_load_status);
+                        return None;
+                    }
+                };
                 self.patch_load_status = format!(
                     "Applied {} to {} layer{}; {} current unchanged; {} saved unused",
                     path.file_name()
@@ -1696,6 +6592,9 @@ impl App {
         use web::state::WebAction;
         match action {
             WebAction::SetParam { param, .. } => Some(format!("master:{param}")),
+            WebAction::SetMasterTransform { param, .. } => {
+                Some(format!("master:transform:{param}"))
+            }
             WebAction::SetLayerParam {
                 index,
                 layer_id,
@@ -1714,8 +6613,25 @@ impl App {
                 Some(id) => format!("layer:id:{id}:effect:{param}"),
                 None => format!("layer:index:{index}:effect:{param}"),
             }),
+            WebAction::SetLayerTransform {
+                index,
+                layer_id,
+                param,
+                ..
+            } => Some(match layer_id.as_deref().filter(|id| !id.is_empty()) {
+                Some(id) => format!("layer:id:{id}:transform:{param}"),
+                None => format!("layer:index:{index}:transform:{param}"),
+            }),
             WebAction::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
             WebAction::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
+            WebAction::SetMotion { scope, param, .. } => Some(match scope {
+                web::state::MotionScopeSnapshot::Master => {
+                    format!("motion:master:{param}")
+                }
+                web::state::MotionScopeSnapshot::Layer { layer_id } => {
+                    format!("motion:layer:{layer_id}:{param}")
+                }
+            }),
             WebAction::SetMorph { .. } => Some("morph:t".to_string()),
             WebAction::MorphGlide { .. } => Some("morph:glide".to_string()),
             WebAction::MorphCapture { slot, .. } => Some(format!("morph:capture:{slot}")),
@@ -1745,14 +6661,38 @@ impl App {
         match disposition {
             WebActionBatchDisposition::Continue => {}
             WebActionBatchDisposition::SnapshotCommitted => pending.clear(),
-            WebActionBatchDisposition::LookApplied(scope) => pending.retain(|action| {
-                !Self::action_conflicts_with_applied_look(
-                    action,
-                    &scope.mapped_layer_ids,
-                    scope.applied_ntsc,
-                    scope.applied_temporal,
-                )
-            }),
+            WebActionBatchDisposition::LookApplied(scope) => {
+                pending.retain(|action| !Self::action_conflicts_with_applied_look(action, &scope))
+            }
+            WebActionBatchDisposition::MasterVisualReset => {
+                pending.retain(|action| !Self::action_targets_master_rack(action));
+            }
+        }
+    }
+
+    fn action_targets_master_rack(action: &web::state::WebAction) -> bool {
+        use web::state::{CreativeScopeSnapshot, RerollScope, WebAction};
+
+        match action {
+            WebAction::Quantized { inner } => Self::action_targets_master_rack(inner),
+            WebAction::SetVisualNodeParam { scope, .. }
+            | WebAction::InsertVisualNode { scope, .. }
+            | WebAction::RemoveVisualNode { scope, .. }
+            | WebAction::MoveVisualNode { scope, .. }
+            | WebAction::SetVisualNodeMaskVariant { scope, .. }
+            | WebAction::SetVisualNodeRoute { scope, .. } => {
+                matches!(scope, CreativeScopeSnapshot::Master)
+            }
+            WebAction::Reroll {
+                scope: RerollScope::Master | RerollScope::All,
+                include_rack_controls: true,
+                ..
+            } => true,
+            WebAction::SetMotion {
+                scope: web::state::MotionScopeSnapshot::Master,
+                ..
+            } => true,
+            _ => false,
         }
     }
 
@@ -1884,21 +6824,110 @@ impl App {
         self.set_media_frozen_at(frozen, Instant::now());
     }
 
+    /// Clear only temporal-domain memory. The renderer/executor keep their
+    /// authored controls, non-temporal M2 donor histories, and the exact
+    /// audience image held by Program Freeze.
+    fn clear_temporal_memory(&mut self) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_temporal_memory();
+        }
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.clear_temporal_memory();
+        }
+        self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        self.temporal_boundaries
+            .reanchor(self.mod_matrix.current_beat);
+        self.temporal_audio_onsets
+            .reanchor(self.mod_matrix.audio.onset);
+        self.selective_temporal_debt = 0.0;
+    }
+
+    /// Clear only M4 field/carrier memory. If the exact path currently owns no
+    /// Advanced executor, retain the ordered request until the next Advanced
+    /// prepare boundary; a newly created executor is already cold but still
+    /// consumes the request explicitly.
+    fn clear_motion_memory(&mut self) {
+        self.motion_field_cache.clear();
+        self.motion_telemetry.clear();
+        self.pending_motion_memory_clear = true;
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.clear_motion_memory();
+            self.pending_motion_memory_clear = false;
+        }
+    }
+
     /// Commit the exact effective morph world at the current authoritative
     /// beat. This is also the ordering boundary used before slot capture.
-    fn materialize_morph_at_current_beat_with_offset(&mut self, morph_offset: f32) {
+    fn try_materialize_morph_at_current_beat_with_offset(&mut self, morph_offset: f32) -> bool {
         if !self.morph.active() {
-            return;
+            return true;
         }
+        let baseline = StagedMorphWorld::capture_authored(self);
         let base_t = self.morph.position_at_beat(self.mod_matrix.current_beat);
         let t = (base_t + morph_offset).clamp(0.0, 1.0);
-        self.morph.apply(
-            t,
-            &mut self.master_effects,
-            &mut self.ntsc_params,
-            &mut self.temporal_params,
-            &mut self.layers,
+        let mut requested_error = None;
+        for (attempt_index, sample_t) in
+            morph::preflight_sample_positions(t).into_iter().enumerate()
+        {
+            let fallback = attempt_index != 0;
+            baseline.install(self);
+            let mut layer_racks = self.layer_racks();
+            self.morph.apply_with_composition_and_motion(
+                sample_t,
+                &mut self.master_effects,
+                &mut self.master_transform,
+                &mut self.master_motion,
+                &mut self.ntsc_params,
+                &mut self.temporal_params,
+                &mut self.layers,
+                &mut self.master_rack,
+                &mut layer_racks,
+                &mut self.composition,
+            );
+            let candidate = StagedMorphWorld::capture(self, layer_racks);
+            baseline.install(self);
+
+            match self.preflight_creative_graph_with_visuals(
+                &candidate.graph,
+                &candidate.master_effects,
+                &candidate.master_transform,
+                &candidate.master_motion,
+                &candidate.ntsc_params,
+                &candidate.temporal_params,
+                &candidate.layers,
+            ) {
+                Ok(()) => {
+                    candidate.install(self);
+                    if fallback {
+                        self.composition_status = format!(
+                            "Morph sample {t:.4} was invalid ({}); used captured endpoint {sample_t:.1}",
+                            requested_error.as_deref().unwrap_or("creative graph rejected")
+                        );
+                        log::warn!("{}", self.composition_status);
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    if !fallback {
+                        requested_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        baseline.install(self);
+        self.composition_status = format!(
+            "Morph sample {t:.4} and both captured endpoints were rejected: {}",
+            requested_error
+                .as_deref()
+                .unwrap_or("creative graph rejected")
         );
+        log::warn!("{}", self.composition_status);
+        false
+    }
+
+    fn materialize_morph_at_current_beat_with_offset(&mut self, morph_offset: f32) {
+        let _ = self.try_materialize_morph_at_current_beat_with_offset(morph_offset);
     }
 
     fn materialize_morph_at_current_beat(&mut self) {
@@ -1911,12 +6940,16 @@ impl App {
     /// new base, then the caller's edit is applied on top of it. A single
     /// captured slot is deliberately preserved so the performer can continue
     /// authoring its partner.
-    fn release_active_morph_for_manual_edit(&mut self) {
+    fn release_active_morph_for_manual_edit(&mut self) -> bool {
         if !self.morph.active() {
-            return;
+            return true;
         }
-        self.materialize_morph_at_current_beat();
-        self.morph.clear();
+        let morph_offset = self.mod_matrix.frame(0).morph_offset();
+        let materialized = self.try_materialize_morph_at_current_beat_with_offset(morph_offset);
+        if materialized {
+            self.morph.clear();
+        }
+        materialized
     }
 
     fn reroll_effect_target(
@@ -1962,6 +6995,7 @@ impl App {
         mode: web::state::RerollMode,
         amount: f32,
         include_grain_controls: bool,
+        include_transform: bool,
         stream: u64,
     ) {
         Self::reroll_effect_target(
@@ -1972,6 +7006,25 @@ impl App {
             amount,
             include_grain_controls,
         );
+        if include_transform && amount.is_finite() && amount > 0.0 {
+            let mut target = if mode == web::state::RerollMode::Pattern {
+                spatial::SpatialTransform {
+                    fit: self.master_transform.fit,
+                    edge: self.master_transform.edge,
+                    sampling: self.master_transform.sampling,
+                    ..spatial::SpatialTransform::default()
+                }
+            } else {
+                self.master_transform
+            };
+            randomization::mutate_live_transform(
+                &mut target,
+                amount,
+                self.master_effects.random_seed,
+                stream,
+            );
+            self.master_transform = target;
+        }
         let master_seed = self.master_effects.random_seed;
         for (index, lfo) in self.mod_matrix.lfos.iter_mut().enumerate() {
             let lfo_stream = 0x4c46_4f00_u64 + index as u64;
@@ -1979,21 +7032,113 @@ impl App {
         }
     }
 
+    fn commit_reroll_creative(&mut self, staged: StagedCreativeGraph, scope: &str) -> bool {
+        if let Err(error) = self.preflight_creative_graph(&staged) {
+            self.composition_status = format!("Creative Dice rejected for {scope}: {error}");
+            log::warn!("{}", self.composition_status);
+            return false;
+        }
+        if let Err(error) =
+            self.commit_creative_graph(staged, false, format!("Applied creative Dice to {scope}"))
+        {
+            self.composition_status = format!("Creative Dice rejected for {scope}: {error}");
+            log::warn!("{}", self.composition_status);
+            return false;
+        }
+        true
+    }
+
     fn apply_reroll(&mut self, request: RerollRequest) {
         let RerollRequest {
             scope,
             index,
             layer_id,
+            group_id,
             stack_revision,
             supplied_seed,
             mode,
             amount,
             include_grain_controls,
+            include_transform,
+            include_rack_controls,
+            include_group_controls,
         } = request;
         use web::state::RerollScope;
         match scope {
             RerollScope::Master => {
-                self.reroll_master(supplied_seed, mode, amount, include_grain_controls, 0)
+                let predicted_seed = supplied_seed
+                    .unwrap_or_else(|| randomization::next_seed(self.master_effects.random_seed));
+                let mut candidate = StagedMorphWorld::capture_authored(self);
+                if include_rack_controls {
+                    randomization::mutate_runtime_rack_values(
+                        &mut candidate.graph.master_rack,
+                        amount,
+                        predicted_seed,
+                        0,
+                        randomization::DiceRackScope::Master,
+                    );
+                }
+                if mode == web::state::RerollMode::Variation {
+                    randomization::mutate_live_motion(
+                        &mut candidate.master_motion,
+                        amount,
+                        predicted_seed,
+                        0,
+                        randomization::DiceMotionScope::Master,
+                    );
+                }
+                if include_rack_controls || mode == web::state::RerollMode::Variation {
+                    if let Err(error) = self.preflight_creative_graph_with_visuals(
+                        &candidate.graph,
+                        &candidate.master_effects,
+                        &candidate.master_transform,
+                        &candidate.master_motion,
+                        &candidate.ntsc_params,
+                        &candidate.temporal_params,
+                        &candidate.layers,
+                    ) {
+                        self.composition_status =
+                            format!("Creative Dice rejected for master: {error}");
+                        log::warn!("{}", self.composition_status);
+                        return;
+                    }
+                    if include_rack_controls {
+                        if let Err(error) = self.commit_creative_graph(
+                            candidate.graph.clone(),
+                            false,
+                            "Applied creative Dice to master rack".into(),
+                        ) {
+                            self.composition_status =
+                                format!("Creative Dice rejected for master: {error}");
+                            return;
+                        }
+                    }
+                    let topology_changed =
+                        motion_memory_topology_changed(self.master_motion, candidate.master_motion);
+                    self.master_motion = candidate.master_motion;
+                    if topology_changed {
+                        self.clear_motion_memory();
+                        self.bump_composition_revision();
+                    }
+                }
+                if mode == web::state::RerollMode::Variation {
+                    randomization::mutate_live_temporal_originals(
+                        &mut self.temporal_params.originals,
+                        amount,
+                        predicted_seed,
+                        0,
+                    );
+                }
+                self.reroll_master(
+                    include_rack_controls
+                        .then_some(predicted_seed)
+                        .or(supplied_seed),
+                    mode,
+                    amount,
+                    include_grain_controls,
+                    include_transform,
+                    0,
+                );
             }
             RerollScope::Layer => {
                 let Some(index) =
@@ -2001,29 +7146,323 @@ impl App {
                 else {
                     return;
                 };
+                let stable_id = self.layers[index].stable_layer_id();
+                let predicted_seed = supplied_seed.unwrap_or_else(|| {
+                    randomization::next_seed(self.layers[index].effects.random_seed)
+                });
+                let mut candidate = StagedMorphWorld::capture_authored(self);
+                if include_rack_controls {
+                    let Some((_, rack)) = candidate
+                        .graph
+                        .layer_racks
+                        .iter_mut()
+                        .find(|(layer_id, _)| *layer_id == stable_id)
+                    else {
+                        self.composition_status = format!(
+                            "Creative Dice rejected for layer {}: stable rack is absent",
+                            stable_id.get()
+                        );
+                        return;
+                    };
+                    randomization::mutate_runtime_rack_values(
+                        rack,
+                        amount,
+                        predicted_seed,
+                        0,
+                        randomization::DiceRackScope::Layer(stable_id),
+                    );
+                }
+                if mode == web::state::RerollMode::Variation {
+                    let Some(layer) = candidate
+                        .layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == stable_id)
+                    else {
+                        self.composition_status = format!(
+                            "Creative Dice rejected for layer {}: stable values are absent",
+                            stable_id.get()
+                        );
+                        return;
+                    };
+                    randomization::mutate_live_motion(
+                        &mut layer.motion,
+                        amount,
+                        predicted_seed,
+                        0,
+                        randomization::DiceMotionScope::Layer(stable_id),
+                    );
+                }
+                if include_rack_controls || mode == web::state::RerollMode::Variation {
+                    if let Err(error) = self.preflight_creative_graph_with_visuals(
+                        &candidate.graph,
+                        &candidate.master_effects,
+                        &candidate.master_transform,
+                        &candidate.master_motion,
+                        &candidate.ntsc_params,
+                        &candidate.temporal_params,
+                        &candidate.layers,
+                    ) {
+                        self.composition_status = format!(
+                            "Creative Dice rejected for layer {}: {error}",
+                            stable_id.get()
+                        );
+                        log::warn!("{}", self.composition_status);
+                        return;
+                    }
+                    if include_rack_controls {
+                        if let Err(error) = self.commit_creative_graph(
+                            candidate.graph.clone(),
+                            false,
+                            format!("Applied creative Dice to layer {} rack", stable_id.get()),
+                        ) {
+                            self.composition_status = format!(
+                                "Creative Dice rejected for layer {}: {error}",
+                                stable_id.get()
+                            );
+                            return;
+                        }
+                    }
+                    let next_motion = candidate.layers[index].motion;
+                    let topology_changed =
+                        motion_memory_topology_changed(self.layers[index].motion, next_motion);
+                    self.layers[index].motion = next_motion;
+                    if topology_changed {
+                        self.clear_motion_memory();
+                        self.bump_composition_revision();
+                    }
+                }
                 Self::reroll_effect_target(
                     &mut self.layers[index].effects,
-                    supplied_seed,
+                    include_rack_controls
+                        .then_some(predicted_seed)
+                        .or(supplied_seed),
                     0,
                     mode,
                     amount,
                     include_grain_controls,
                 );
+                if include_transform && amount.is_finite() && amount > 0.0 {
+                    let layer = &mut self.layers[index];
+                    let mut target = if mode == web::state::RerollMode::Pattern {
+                        spatial::SpatialTransform {
+                            fit: layer.transform.fit,
+                            edge: layer.transform.edge,
+                            sampling: layer.transform.sampling,
+                            ..spatial::SpatialTransform::default()
+                        }
+                    } else {
+                        layer.transform
+                    };
+                    randomization::mutate_live_transform(
+                        &mut target,
+                        amount,
+                        layer.effects.random_seed,
+                        0,
+                    );
+                    layer.transform = target;
+                }
+            }
+            RerollScope::Group => {
+                let Some(group_id) = group_id
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .and_then(visual_rack::GroupId::new)
+                    .filter(|group_id| self.composition.contains_group(*group_id))
+                else {
+                    return;
+                };
+                if !include_rack_controls && !include_group_controls {
+                    return;
+                }
+                let seed = supplied_seed.unwrap_or(self.master_effects.random_seed);
+                let mut staged = self.staged_creative_graph();
+                let mut randomized = staged.composition.clone();
+                randomization::mutate_runtime_composition_values(
+                    &mut randomized,
+                    amount,
+                    seed,
+                    0,
+                    include_rack_controls,
+                    include_group_controls,
+                );
+                let Some(mutated) = randomized.group(group_id).cloned() else {
+                    return;
+                };
+                let Some(group) = staged.composition.group_mut(group_id) else {
+                    return;
+                };
+                if include_group_controls {
+                    group.opacity = mutated.opacity;
+                    group.transform = mutated.transform;
+                    group.matte = mutated.matte;
+                }
+                if include_rack_controls {
+                    group.rack = mutated.rack;
+                }
+                let _ = self.commit_reroll_creative(staged, &format!("group {}", group_id.get()));
             }
             RerollScope::All => {
                 if stack_revision != Some(self.layer_stack_revision) {
                     return;
                 }
-                self.reroll_master(supplied_seed, mode, amount, include_grain_controls, 0);
+                let predicted_master_seed = supplied_seed
+                    .unwrap_or_else(|| randomization::next_seed(self.master_effects.random_seed));
+                let layer_seed_bases: Vec<_> = self
+                    .layers
+                    .iter()
+                    .map(|layer| {
+                        supplied_seed
+                            .unwrap_or_else(|| randomization::next_seed(layer.effects.random_seed))
+                    })
+                    .collect();
+                let predicted_layer_seeds: Vec<_> = layer_seed_bases
+                    .iter()
+                    .enumerate()
+                    .map(|(index, seed)| randomization::stream_seed(*seed, index as u64 + 1))
+                    .collect();
+                let mut candidate = StagedMorphWorld::capture_authored(self);
+                if include_rack_controls || include_group_controls {
+                    if include_rack_controls {
+                        randomization::mutate_runtime_rack_values(
+                            &mut candidate.graph.master_rack,
+                            amount,
+                            supplied_seed.unwrap_or(predicted_master_seed),
+                            0,
+                            randomization::DiceRackScope::Master,
+                        );
+                        for ((layer_id, rack), seed) in candidate
+                            .graph
+                            .layer_racks
+                            .iter_mut()
+                            .zip(predicted_layer_seeds.iter().copied())
+                        {
+                            randomization::mutate_runtime_rack_values(
+                                rack,
+                                amount,
+                                supplied_seed.unwrap_or(seed),
+                                0,
+                                randomization::DiceRackScope::Layer(*layer_id),
+                            );
+                        }
+                    }
+                    randomization::mutate_runtime_composition_values(
+                        &mut candidate.graph.composition,
+                        amount,
+                        supplied_seed.unwrap_or(predicted_master_seed),
+                        0,
+                        include_rack_controls,
+                        include_group_controls,
+                    );
+                }
+                if mode == web::state::RerollMode::Variation {
+                    randomization::mutate_live_motion(
+                        &mut candidate.master_motion,
+                        amount,
+                        predicted_master_seed,
+                        0,
+                        randomization::DiceMotionScope::Master,
+                    );
+                    for (layer, seed) in candidate.layers.iter_mut().zip(&layer_seed_bases) {
+                        randomization::mutate_live_motion(
+                            &mut layer.motion,
+                            amount,
+                            *seed,
+                            0,
+                            randomization::DiceMotionScope::Layer(layer.layer_id),
+                        );
+                    }
+                }
+                if include_rack_controls
+                    || include_group_controls
+                    || mode == web::state::RerollMode::Variation
+                {
+                    if let Err(error) = self.preflight_creative_graph_with_visuals(
+                        &candidate.graph,
+                        &candidate.master_effects,
+                        &candidate.master_transform,
+                        &candidate.master_motion,
+                        &candidate.ntsc_params,
+                        &candidate.temporal_params,
+                        &candidate.layers,
+                    ) {
+                        self.composition_status =
+                            format!("Creative Dice rejected for all scopes: {error}");
+                        log::warn!("{}", self.composition_status);
+                        return;
+                    }
+                    if include_rack_controls || include_group_controls {
+                        if let Err(error) = self.commit_creative_graph(
+                            candidate.graph.clone(),
+                            false,
+                            "Applied creative Dice to all creative scopes".into(),
+                        ) {
+                            self.composition_status =
+                                format!("Creative Dice rejected for all scopes: {error}");
+                            return;
+                        }
+                    }
+                    let mut motion_topology_changed =
+                        motion_memory_topology_changed(self.master_motion, candidate.master_motion);
+                    self.master_motion = candidate.master_motion;
+                    for (layer, candidate_layer) in self.layers.iter_mut().zip(&candidate.layers) {
+                        motion_topology_changed |=
+                            motion_memory_topology_changed(layer.motion, candidate_layer.motion);
+                        layer.motion = candidate_layer.motion;
+                    }
+                    if motion_topology_changed {
+                        self.clear_motion_memory();
+                        self.bump_composition_revision();
+                    }
+                }
+                if mode == web::state::RerollMode::Variation {
+                    randomization::mutate_live_temporal_originals(
+                        &mut self.temporal_params.originals,
+                        amount,
+                        predicted_master_seed,
+                        0,
+                    );
+                }
+                self.reroll_master(
+                    (include_rack_controls || include_group_controls)
+                        .then_some(predicted_master_seed)
+                        .or(supplied_seed),
+                    mode,
+                    amount,
+                    include_grain_controls,
+                    include_transform,
+                    0,
+                );
                 for (index, layer) in self.layers.iter_mut().enumerate() {
+                    let stream = index as u64 + 1;
                     Self::reroll_effect_target(
                         &mut layer.effects,
-                        supplied_seed,
-                        index as u64 + 1,
+                        (include_rack_controls || include_group_controls)
+                            .then_some(layer_seed_bases[index])
+                            .or(supplied_seed),
+                        stream,
                         mode,
                         amount,
                         include_grain_controls,
                     );
+                    if include_transform && amount.is_finite() && amount > 0.0 {
+                        let mut target = if mode == web::state::RerollMode::Pattern {
+                            spatial::SpatialTransform {
+                                fit: layer.transform.fit,
+                                edge: layer.transform.edge,
+                                sampling: layer.transform.sampling,
+                                ..spatial::SpatialTransform::default()
+                            }
+                        } else {
+                            layer.transform
+                        };
+                        randomization::mutate_live_transform(
+                            &mut target,
+                            amount,
+                            layer.effects.random_seed,
+                            stream,
+                        );
+                        layer.transform = target;
+                    }
                 }
             }
         }
@@ -2072,6 +7511,452 @@ impl App {
         }
     }
 
+    fn valid_spatial_transform_edit(param: &str, value: &serde_json::Value) -> bool {
+        let bounded = |min: f32, max: f32| {
+            value
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .is_some_and(|number| (min as f64..=max as f64).contains(&number))
+        };
+        match param {
+            "position_x" | "position_y" => bounded(spatial::POSITION_MIN, spatial::POSITION_MAX),
+            "scale_x" | "scale_y" => bounded(spatial::SCALE_MIN, spatial::SCALE_MAX),
+            "anchor_x" | "anchor_y" => bounded(spatial::ANCHOR_MIN, spatial::ANCHOR_MAX),
+            "rotation_deg" | "skew_axis_deg" => bounded(-180.0, 180.0),
+            "skew_deg" => bounded(-spatial::SKEW_LIMIT_DEGREES, spatial::SKEW_LIMIT_DEGREES),
+            "crop_left" | "crop_top" | "crop_right" | "crop_bottom" => {
+                bounded(0.0, spatial::CROP_MAX)
+            }
+            "fit" => matches!(value.as_str(), Some("stretch" | "fit" | "fill" | "native")),
+            "edge" => matches!(
+                value.as_str(),
+                Some("transparent" | "clamp" | "repeat" | "mirror")
+            ),
+            "sampling" => matches!(value.as_str(), Some("linear" | "nearest")),
+            _ => false,
+        }
+    }
+
+    fn apply_spatial_transform_edit(
+        transform: &mut spatial::SpatialTransform,
+        param: &str,
+        value: &serde_json::Value,
+    ) -> bool {
+        if !Self::valid_spatial_transform_edit(param, value) {
+            return false;
+        }
+        match param {
+            "position_x" => transform.position[0] = value.as_f64().unwrap() as f32,
+            "position_y" => transform.position[1] = value.as_f64().unwrap() as f32,
+            "scale_x" => transform.scale[0] = value.as_f64().unwrap() as f32,
+            "scale_y" => transform.scale[1] = value.as_f64().unwrap() as f32,
+            "anchor_x" => transform.anchor[0] = value.as_f64().unwrap() as f32,
+            "anchor_y" => transform.anchor[1] = value.as_f64().unwrap() as f32,
+            "rotation_deg" => transform.rotation_deg = value.as_f64().unwrap() as f32,
+            "skew_deg" => transform.skew_deg = value.as_f64().unwrap() as f32,
+            "skew_axis_deg" => transform.skew_axis_deg = value.as_f64().unwrap() as f32,
+            "crop_left" => transform.crop[0] = value.as_f64().unwrap() as f32,
+            "crop_top" => transform.crop[1] = value.as_f64().unwrap() as f32,
+            "crop_right" => transform.crop[2] = value.as_f64().unwrap() as f32,
+            "crop_bottom" => transform.crop[3] = value.as_f64().unwrap() as f32,
+            "fit" => {
+                transform.fit = match value.as_str().unwrap() {
+                    "stretch" => spatial::FitMode::Stretch,
+                    "fit" => spatial::FitMode::Fit,
+                    "fill" => spatial::FitMode::Fill,
+                    "native" => spatial::FitMode::Native,
+                    _ => unreachable!("validated above"),
+                };
+            }
+            "edge" => {
+                transform.edge = match value.as_str().unwrap() {
+                    "transparent" => spatial::EdgeMode::Transparent,
+                    "clamp" => spatial::EdgeMode::Clamp,
+                    "repeat" => spatial::EdgeMode::Repeat,
+                    "mirror" => spatial::EdgeMode::Mirror,
+                    _ => unreachable!("validated above"),
+                };
+            }
+            "sampling" => {
+                transform.sampling = match value.as_str().unwrap() {
+                    "linear" => spatial::SamplingMode::Linear,
+                    "nearest" => spatial::SamplingMode::Nearest,
+                    _ => unreachable!("validated above"),
+                };
+            }
+            _ => unreachable!("validated above"),
+        }
+        *transform = transform.sanitized();
+        true
+    }
+
+    fn apply_clip_transport_edit(
+        transport: &mut transport::ClipTransportConfig,
+        param: &str,
+        value: &serde_json::Value,
+    ) -> bool {
+        use transport::{BeatLoop, ClipBeatGrid, EndBehavior, PlaybackDirection, TriggerMode};
+
+        let number = || value.as_f64().filter(|number| number.is_finite());
+        match param {
+            "direction" => {
+                transport.direction = match value.as_str() {
+                    Some("forward") => PlaybackDirection::Forward,
+                    Some("reverse") => PlaybackDirection::Reverse,
+                    _ => return false,
+                };
+            }
+            "end_behavior" => {
+                transport.end_behavior = match value.as_str() {
+                    Some("loop") => EndBehavior::Loop,
+                    Some("ping_pong") => EndBehavior::PingPong,
+                    Some("one_shot") => EndBehavior::OneShot,
+                    Some("hold") => EndBehavior::Hold,
+                    _ => return false,
+                };
+            }
+            "trigger_mode" => {
+                transport.trigger_mode = match value.as_str() {
+                    Some("immediate") => TriggerMode::Immediate,
+                    Some("next_beat") => TriggerMode::NextBeat,
+                    Some("next_bar") => TriggerMode::NextBar,
+                    _ => return false,
+                };
+            }
+            "in_point" => {
+                let Some(value) = number().and_then(transport::NormalizedTime::new) else {
+                    return false;
+                };
+                transport.in_point = value;
+            }
+            "out_point" => {
+                let Some(value) = number().and_then(transport::NormalizedTime::new) else {
+                    return false;
+                };
+                transport.out_point = value;
+            }
+            "rate" => {
+                let Some(value) = number().filter(|value| (0.0..=16.0).contains(value)) else {
+                    return false;
+                };
+                transport.rate = value;
+            }
+            "sample_fps" => {
+                if value.is_null() {
+                    transport.sample_fps = None;
+                } else {
+                    let Some(value) = number().filter(|value| (0.25..=480.0).contains(value))
+                    else {
+                        return false;
+                    };
+                    transport.sample_fps = Some(value);
+                }
+            }
+            "beat_grid_enabled" => match value.as_bool() {
+                Some(true) => {
+                    transport
+                        .beat_grid
+                        .get_or_insert_with(ClipBeatGrid::default);
+                }
+                Some(false) => transport.beat_grid = None,
+                None => return false,
+            },
+            "sync_to_program" => {
+                let Some(enabled) = value.as_bool() else {
+                    return false;
+                };
+                transport
+                    .beat_grid
+                    .get_or_insert_with(ClipBeatGrid::default)
+                    .sync_to_program = enabled;
+            }
+            "clip_bpm" => {
+                let Some(value) = number().filter(|value| (1.0..=999.0).contains(value)) else {
+                    return false;
+                };
+                transport
+                    .beat_grid
+                    .get_or_insert_with(ClipBeatGrid::default)
+                    .bpm = value;
+            }
+            "length_beats" => {
+                let length = if value.is_null() {
+                    None
+                } else {
+                    let Some(value) =
+                        number().filter(|value| (1.0 / 64.0..=65_536.0).contains(value))
+                    else {
+                        return false;
+                    };
+                    Some(value)
+                };
+                transport
+                    .beat_grid
+                    .get_or_insert_with(ClipBeatGrid::default)
+                    .length_beats = length;
+            }
+            "beats_per_bar" => {
+                let Some(value) = value.as_u64().and_then(|value| u8::try_from(value).ok()) else {
+                    return false;
+                };
+                if !(1..=32).contains(&value) {
+                    return false;
+                }
+                transport
+                    .beat_grid
+                    .get_or_insert_with(ClipBeatGrid::default)
+                    .beats_per_bar = value;
+            }
+            "beat_loop_enabled" => match value.as_bool() {
+                Some(true) => {
+                    transport.beat_loop.get_or_insert_with(BeatLoop::default);
+                }
+                Some(false) => transport.beat_loop = None,
+                None => return false,
+            },
+            "beat_loop_start" => {
+                let Some(value) = number().filter(|value| (0.0..=65_536.0).contains(value)) else {
+                    return false;
+                };
+                transport
+                    .beat_loop
+                    .get_or_insert_with(BeatLoop::default)
+                    .start_beat = value;
+            }
+            "beat_loop_length" => {
+                let Some(value) = number().filter(|value| (1.0 / 64.0..=64.0).contains(value))
+                else {
+                    return false;
+                };
+                transport
+                    .beat_loop
+                    .get_or_insert_with(BeatLoop::default)
+                    .length_beats = value;
+            }
+            _ => return false,
+        }
+        *transport = transport.sanitized();
+        true
+    }
+
+    fn apply_matte_param(
+        matte: &mut image_routing::LayerMatte,
+        param: &str,
+        value: &serde_json::Value,
+    ) -> bool {
+        match param {
+            "enabled" => {
+                let Some(value) = value.as_bool() else {
+                    return false;
+                };
+                matte.enabled = value;
+            }
+            "invert" => {
+                let Some(value) = value.as_bool() else {
+                    return false;
+                };
+                matte.invert = value;
+            }
+            "channel" => {
+                matte.channel = match value.as_str() {
+                    Some("alpha") => image_routing::MatteChannel::Alpha,
+                    Some("luma") => image_routing::MatteChannel::Luma,
+                    Some("red") => image_routing::MatteChannel::Red,
+                    Some("green") => image_routing::MatteChannel::Green,
+                    Some("blue") => image_routing::MatteChannel::Blue,
+                    _ => return false,
+                };
+            }
+            "amount" | "threshold" | "softness" => {
+                let Some(value) = value
+                    .as_f64()
+                    .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                    .map(|value| value as f32)
+                else {
+                    return false;
+                };
+                match param {
+                    "amount" => matte.amount = value,
+                    "threshold" => matte.threshold = value,
+                    "softness" => matte.softness = value,
+                    _ => unreachable!("matched above"),
+                }
+            }
+            _ => return false,
+        }
+        *matte = matte.sanitized();
+        true
+    }
+
+    fn image_input_from_snapshot(
+        &self,
+        input: web::state::ImageInputSnapshot,
+    ) -> Option<image_routing::ImageInput> {
+        use image_routing::ImageInput;
+        use web::state::ImageInputSnapshot;
+        Some(match input {
+            ImageInputSnapshot::SelectedLayer { layer_id, stage } => ImageInput::SelectedLayer {
+                layer_id: image_routing::StableLayerId::new(layer_id.parse().ok()?)?,
+                stage,
+            },
+            ImageInputSnapshot::OneBelow => ImageInput::OneBelow,
+            ImageInputSnapshot::AllBelow => ImageInput::AllBelow,
+            ImageInputSnapshot::CleanProgram => ImageInput::CleanProgram,
+            ImageInputSnapshot::ProgramHistory => ImageInput::ProgramHistory,
+            ImageInputSnapshot::GroupOutput { group_id } => ImageInput::GroupOutput {
+                group_id: parse_group_id(&group_id)?,
+            },
+            // These are restore-only/reserved and server ingress rejects them.
+            ImageInputSnapshot::MissingSelectedLayer { .. }
+            | ImageInputSnapshot::MissingGroupOutput { .. } => return None,
+        })
+    }
+
+    fn image_input_snapshot(input: image_routing::ImageInput) -> web::state::ImageInputSnapshot {
+        use image_routing::ImageInput;
+        use web::state::ImageInputSnapshot;
+        match input {
+            ImageInput::SelectedLayer { layer_id, stage } => ImageInputSnapshot::SelectedLayer {
+                layer_id: layer_id.get().to_string(),
+                stage,
+            },
+            ImageInput::MissingSelectedLayer {
+                saved_position,
+                stage,
+            } => ImageInputSnapshot::MissingSelectedLayer {
+                saved_position,
+                stage,
+            },
+            ImageInput::OneBelow => ImageInputSnapshot::OneBelow,
+            ImageInput::AllBelow => ImageInputSnapshot::AllBelow,
+            ImageInput::CleanProgram => ImageInputSnapshot::CleanProgram,
+            ImageInput::ProgramHistory => ImageInputSnapshot::ProgramHistory,
+            ImageInput::GroupOutput { group_id } => ImageInputSnapshot::GroupOutput {
+                group_id: group_id.get().to_string(),
+            },
+            ImageInput::MissingGroupOutput { group_id } => ImageInputSnapshot::MissingGroupOutput {
+                group_id: group_id.get().to_string(),
+            },
+        }
+    }
+
+    fn validate_live_layer_matte_input(
+        &self,
+        input: image_routing::ImageInput,
+    ) -> Result<(), String> {
+        match input {
+            image_routing::ImageInput::SelectedLayer { layer_id, .. }
+                if !self
+                    .layers
+                    .iter()
+                    .any(|layer| layer.stable_layer_id() == layer_id) =>
+            {
+                Err(format!("matte donor layer {} is absent", layer_id.get()))
+            }
+            image_routing::ImageInput::GroupOutput { group_id }
+                if !self.composition.contains_group(group_id) =>
+            {
+                Err(format!("matte donor group {} is absent", group_id.get()))
+            }
+            image_routing::ImageInput::MissingSelectedLayer { .. }
+            | image_routing::ImageInput::MissingGroupOutput { .. } => {
+                Err("missing matte routes are restore-only diagnostics".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Publish one base-layer matte edit only after the unified advanced DAG
+    /// and resource planner has admitted the detached candidate. A rejected
+    /// route therefore cannot partially mutate the layer, Morph state, or
+    /// either topology revision.
+    fn commit_layer_matte_candidate(
+        &mut self,
+        index: usize,
+        candidate: image_routing::LayerMatte,
+        topology_changed: bool,
+        status: String,
+    ) -> Result<(), String> {
+        if self.layers[index].matte == candidate {
+            self.composition_status = status;
+            return Ok(());
+        }
+        let staged = self.staged_creative_graph();
+        let mut mattes: Vec<_> = self.layers.iter().map(|layer| layer.matte).collect();
+        mattes[index] = candidate;
+        self.preflight_creative_graph_with_mattes(&staged, &mattes)?;
+
+        // The preflight above is detached. Only now may an active Morph be
+        // materialized/released and the live matte edge become visible.
+        if topology_changed && !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let impact = creative_commit_impact(
+            self.layers[index].matte != candidate,
+            topology_changed,
+            false,
+        );
+        if impact == CreativeCommitImpact::NoChange {
+            self.composition_status = status;
+            return Ok(());
+        }
+        self.layers[index].matte = candidate;
+        if topology_changed {
+            self.bump_composition_revision();
+        }
+        self.composition_status = status;
+        if impact == CreativeCommitImpact::TopologyOrStack {
+            self.invalidate_source_cut_generation();
+        }
+        Ok(())
+    }
+
+    fn cached_slot_is_prepared(
+        &self,
+        layer_id: image_routing::StableLayerId,
+        slot_id: performance::ClipSlotId,
+    ) -> bool {
+        self.performance_gpu_cache.iter().any(|cached| {
+            cached
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.layer_id == layer_id && descriptor.slot.id == slot_id)
+        })
+    }
+
+    fn slot_is_staging(
+        &self,
+        layer_id: image_routing::StableLayerId,
+        slot_id: performance::ClipSlotId,
+    ) -> bool {
+        self.performance_staging.as_ref().is_some_and(|intent| {
+            intent
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.layer_id == layer_id && descriptor.slot.id == slot_id)
+        })
+    }
+
+    fn matte_diagnostic_for(&self, layer_id: image_routing::StableLayerId) -> String {
+        self.image_routing_diagnostics
+            .iter()
+            .find_map(|(candidate, diagnostic)| {
+                (*candidate == layer_id).then(|| diagnostic.clone())
+            })
+            .unwrap_or_else(|| {
+                if self
+                    .layers
+                    .iter()
+                    .find(|layer| layer.stable_layer_id() == layer_id)
+                    .is_some_and(|layer| layer.matte.enabled)
+                {
+                    "pending".to_string()
+                } else {
+                    "disabled".to_string()
+                }
+            })
+    }
+
     fn finite_f32_edit(value: &serde_json::Value) -> bool {
         value
             .as_f64()
@@ -2105,12 +7990,90 @@ impl App {
 
     fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         match param {
-            "slit_axis" | "key_mode" => value.as_u64().is_some(),
-            "slit_angle" => Self::finite_f32_edit(value),
-            "feedback" | "fb_zoom" | "fb_rotate" | "slitscan" | "key_threshold"
-            | "key_softness" | "key_history" => value.as_f64().is_some_and(f64::is_finite),
+            "feedback" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=0.95).contains(&number)),
+            "fb_zoom" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.9..=1.1).contains(&number)),
+            "fb_rotate" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-5.0..=5.0).contains(&number)),
+            "slitscan" | "slit_axis" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            "slit_angle" | "loom_angle" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-180.0..=180.0).contains(&number)),
+            "key_mode" => value.as_u64().is_some_and(|number| number <= 4),
+            "key_threshold" | "loom_amount" | "loom_depth" | "atlas_amount" | "atlas_collision"
+            | "garden_amount" | "garden_threshold" | "garden_decay" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            "key_softness" | "garden_softness" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=0.5).contains(&number)),
+            "key_history" => value
+                .as_u64()
+                .is_some_and(|number| (1..=23).contains(&number)),
+            "loom_topology" => matches!(
+                value.as_str(),
+                Some("linear" | "radial" | "spiral" | "contour" | "folded" | "kaleidoscopic")
+            ),
+            "loom_interpolation" => matches!(value.as_str(), Some("floor" | "linear")),
+            "loom_phase" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-1_000.0..=1_000.0).contains(&number)),
+            "loom_scale" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.01..=100.0).contains(&number)),
+            "loom_folds" => value
+                .as_u64()
+                .is_some_and(|number| (1..=16).contains(&number)),
+            "loom_quantization" => value.as_u64().is_some_and(|number| number <= 24),
+            "atlas_seed" | "score_seed" | "garden_max_hold_ticks" => value
+                .as_u64()
+                .is_some_and(|number| u32::try_from(number).is_ok()),
+            "atlas_territories" => value
+                .as_u64()
+                .is_some_and(|number| (1..=64).contains(&number)),
+            "garden_gate" => matches!(
+                value.as_str(),
+                Some(
+                    "temporal_delta"
+                        | "luma"
+                        | "chroma"
+                        | "cellular_ridge"
+                        | "audio_energy"
+                        | "audio_onset"
+                        | "matte"
+                )
+            ),
+            "score_enabled" => value.as_bool().is_some(),
+            "score_state_count" => value
+                .as_u64()
+                .is_some_and(|number| (2..=16).contains(&number)),
+            "score_trigger" => matches!(
+                value.as_str(),
+                Some("boundary" | "downbeat" | "audio_onset" | "manual")
+            ),
+            "score_loop_driver" => value.as_str().is_some_and(|driver| {
+                driver == "none"
+                    || driver
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(image_routing::StableLayerId::new)
+                        .is_some()
+            }),
+            "reset_loop_boundary" | "reset_downbeat" => {
+                matches!(value.as_str(), Some("none" | "score" | "memory" | "all"))
+            }
             _ => false,
         }
+    }
+
+    fn blend_mode_edit(value: &serde_json::Value) -> Option<layers::BlendMode> {
+        value.as_str().and_then(layers::BlendMode::from_key)
     }
 
     fn layer_param_morph_control(
@@ -2122,14 +8085,7 @@ impl App {
             "opacity" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::Opacity),
             "speed" if value.as_f64().is_some_and(f64::is_finite) => Some(Control::Speed),
             "fps" if Self::finite_f32_edit(value) => Some(Control::Fps),
-            "blend_mode"
-                if matches!(
-                    value.as_str(),
-                    Some("normal" | "screen" | "multiply" | "difference")
-                ) =>
-            {
-                Some(Control::BlendMode)
-            }
+            "blend_mode" if Self::blend_mode_edit(value).is_some() => Some(Control::BlendMode),
             "bypass_master_fx" if value.as_bool().is_some() => Some(Control::BypassMasterFx),
             "key_threshold" if value.as_f64().is_some_and(f64::is_finite) => {
                 Some(Control::KeyThreshold)
@@ -2154,6 +8110,14 @@ impl App {
             return false;
         }
         match action {
+            WebAction::SetMasterTransform { param, value }
+                if Self::valid_spatial_transform_edit(param, value) =>
+            {
+                self.morph.controls_master_transform()
+            }
+            WebAction::ResetMasterTransform | WebAction::ApplyMasterTransform { .. } => {
+                self.morph.controls_master_transform()
+            }
             WebAction::SetParam { param, value }
                 if param == "random_seed" && Self::valid_effect_edit(param, value) =>
             {
@@ -2162,6 +8126,9 @@ impl App {
             WebAction::SetParam { param, value } => Self::valid_effect_edit(param, value),
             WebAction::SetNtscParam { param, value } => Self::valid_ntsc_edit(param, value),
             WebAction::SetTemporal { param, value } => Self::valid_temporal_edit(param, value),
+            WebAction::ResetGroup { group } if group == "transform" => {
+                self.morph.controls_master_transform()
+            }
             WebAction::ResetGroup { group } => matches!(
                 group.as_str(),
                 "digital" | "analog" | "key" | "motion" | "cellular" | "shift" | "vhs" | "temporal"
@@ -2192,11 +8159,47 @@ impl App {
                 self.resolve_layer_index(*index, layer_id)
                     .is_some_and(|resolved| self.morph.controls_layer_field(resolved, control))
             }
+            WebAction::SetLayerTransform {
+                index: _,
+                layer_id,
+                param,
+                value,
+            } if Self::valid_spatial_transform_edit(param, value) => self
+                .resolve_stable_transform_layer(layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::Transform)
+                }),
+            WebAction::ResetLayerTransform { index: _, layer_id }
+            | WebAction::ApplyLayerTransform {
+                index: _, layer_id, ..
+            } => self
+                .resolve_stable_transform_layer(layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::Transform)
+                }),
+            WebAction::SetMotion {
+                scope: web::state::MotionScopeSnapshot::Master,
+                ..
+            } => self.morph.controls_master_motion(),
+            WebAction::SetMotion {
+                scope: web::state::MotionScopeSnapshot::Layer { layer_id },
+                ..
+            } => self
+                .resolve_stable_layer_id(layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::Motion)
+                }),
             WebAction::ResetLayerFx { index, layer_id } => self
                 .resolve_layer_index(*index, layer_id)
                 .is_some_and(|resolved| {
                     self.morph
                         .controls_layer_field(resolved, morph::LayerMorphControl::AnyEffect)
+                        || self
+                            .morph
+                            .controls_layer_field(resolved, morph::LayerMorphControl::Motion)
                 }),
             WebAction::SetLayerVisibility {
                 index, layer_id, ..
@@ -2223,10 +8226,45 @@ impl App {
                 *index < self.layers.len() && self.morph.controls_layer_field(*index, control)
             }
             WebAction::Reroll {
+                mode: web::state::RerollMode::Pattern,
+                scope,
+                index,
+                layer_id,
+                group_id,
+                stack_revision,
+                amount,
+                include_transform: true,
+                ..
+            } if amount.is_finite() && *amount > 0.0 => match scope {
+                web::state::RerollScope::Master => self.morph.controls_master_transform(),
+                web::state::RerollScope::Layer => index
+                    .and_then(|index| self.resolve_layer_index(index, layer_id))
+                    .is_some_and(|resolved| {
+                        self.morph
+                            .controls_layer_field(resolved, morph::LayerMorphControl::Transform)
+                    }),
+                web::state::RerollScope::Group => group_id
+                    .as_deref()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .and_then(visual_rack::GroupId::new)
+                    .is_some_and(|id| self.composition.contains_group(id)),
+                web::state::RerollScope::All => {
+                    *stack_revision == Some(self.layer_stack_revision)
+                        && (self.morph.controls_master_transform()
+                            || (0..self.layers.len()).any(|resolved| {
+                                self.morph.controls_layer_field(
+                                    resolved,
+                                    morph::LayerMorphControl::Transform,
+                                )
+                            }))
+                }
+            },
+            WebAction::Reroll {
                 mode: web::state::RerollMode::Variation,
                 scope,
                 index,
                 layer_id,
+                group_id,
                 stack_revision,
                 ..
             } => match scope {
@@ -2234,6 +8272,11 @@ impl App {
                 web::state::RerollScope::Layer => index
                     .and_then(|index| self.resolve_layer_index(index, layer_id))
                     .is_some(),
+                web::state::RerollScope::Group => group_id
+                    .as_deref()
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .and_then(visual_rack::GroupId::new)
+                    .is_some_and(|id| self.composition.contains_group(id)),
                 web::state::RerollScope::All => *stack_revision == Some(self.layer_stack_revision),
             },
             _ => false,
@@ -2243,27 +8286,63 @@ impl App {
     /// Restore the complete post-stack visual program to neutral while
     /// preserving layers, transport, BPM, and live input/device choices.
     /// Automation that could immediately overwrite the defaults is cleared.
-    fn revert_master_visual_state(&mut self) {
+    fn revert_master_visual_state(&mut self) -> bool {
+        // Preserve the monotonic allocator even though authored master nodes
+        // are removed. This prevents a delayed stable-ID action from ever
+        // addressing a newly created node after reset. An exhausted allocator
+        // cannot be represented by an otherwise-empty synthetic rack, so fail
+        // closed without partially resetting the live program.
+        let previous_rack_signature = self.master_rack.topology_signature();
+        let next_node_id = self.master_rack.next_node_id_raw();
+        let synthetic = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let reset_master_rack = match RuntimeVisualRack::try_from_parts(
+            synthetic.iter().cloned().collect(),
+            Some(next_node_id),
+        ) {
+            Ok(rack) => rack,
+            Err(error) => {
+                self.composition_status = format!("Master visual reset rejected: {error}");
+                log::error!("{}", self.composition_status);
+                return false;
+            }
+        };
+        let rack_topology_changed =
+            previous_rack_signature != reset_master_rack.topology_signature();
+        let master_motion_changed = self.master_motion != motion::MotionParams::default();
+
         self.master_effects.reset();
+        self.master_transform = spatial::SpatialTransform::default();
+        self.master_motion = motion::MotionParams::default();
+        self.master_rack = reset_master_rack;
         self.ntsc_params = ntsc::NtscParams::default();
         self.temporal_params = effects::params::TemporalParams::default();
         self.mod_matrix.reset();
         self.morph = morph::Morph::default();
 
+        if rack_topology_changed || master_motion_changed {
+            self.bump_composition_revision();
+        }
+
         // A previously latched master command must not resurrect state on a
         // later downbeat. Pending layer edits remain valid and are preserved.
         self.quantized_actions.retain(|action| {
-            !matches!(
-                action,
-                web::state::WebAction::SetParam { .. }
-                    | web::state::WebAction::SetNtscParam { .. }
-                    | web::state::WebAction::SetTemporal { .. }
-                    | web::state::WebAction::SetMorph { .. }
-                    | web::state::WebAction::SetMorphLaw { .. }
-                    | web::state::WebAction::MorphCapture { .. }
-                    | web::state::WebAction::MorphClear
-                    | web::state::WebAction::MorphGlide { .. }
-            )
+            !Self::action_targets_master_rack(action)
+                && !matches!(
+                    action,
+                    web::state::WebAction::SetParam { .. }
+                        | web::state::WebAction::SetMasterTransform { .. }
+                        | web::state::WebAction::ResetMasterTransform
+                        | web::state::WebAction::ApplyMasterTransform { .. }
+                        | web::state::WebAction::SetNtscParam { .. }
+                        | web::state::WebAction::SetTemporal { .. }
+                        | web::state::WebAction::ClearTemporalMemory
+                        | web::state::WebAction::TriggerCollisionScore
+                        | web::state::WebAction::SetMorph { .. }
+                        | web::state::WebAction::SetMorphLaw { .. }
+                        | web::state::WebAction::MorphCapture { .. }
+                        | web::state::WebAction::MorphClear
+                        | web::state::WebAction::MorphGlide { .. }
+                )
         });
 
         // Invalidate temporal history and delayed NTSC/readback frames from
@@ -2275,13 +8354,22 @@ impl App {
         self.selective_hold_snapshot_valid = false;
         self.selective_hold_spout_barrier_epoch = None;
         self.selective_hold_spout_readback_epoch = None;
+        self.pending_temporal_events = temporal::TemporalFrameEvents::default();
         // A broad revert starts a new visual generation. If a blackout is
         // already requested, consider its audience edge consumed so the next
         // frame cannot capture (and later restore) pre-revert pixels.
         self.blackout_presented = self.blackout;
         if let Some(renderer) = self.renderer.as_mut() {
-            renderer.reset_visual_generation();
+            renderer.reset_visual_generation_for(temporal::TemporalResetCause::BroadRevert);
         }
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.reset_history_for(temporal::TemporalResetCause::BroadRevert);
+        }
+        self.motion_field_cache.clear();
+        self.motion_telemetry.clear();
+        self.pending_motion_memory_clear = false;
+        self.composition_status = "Reset master visual program".to_string();
+        true
     }
 
     fn set_blackout(&mut self, enabled: bool) {
@@ -2318,6 +8406,17 @@ impl App {
         &mut self,
         action: web::state::WebAction,
     ) -> WebActionBatchDisposition {
+        if matches!(
+            action,
+            web::state::WebAction::SetMotionDonor { .. }
+                | web::state::WebAction::ClearMotionMemory
+                | web::state::WebAction::ClearTemporalMemory
+                | web::state::WebAction::TriggerCollisionScore
+        ) {
+            self.composition_status =
+                "Ordered memory/event and donor actions cannot be quantized".to_string();
+            return WebActionBatchDisposition::Continue;
+        }
         let Some(key) = Self::quantized_action_key(&action) else {
             // Quantization is deliberately limited to non-emergency,
             // continuously expressive controls. Unknown wrappers retain
@@ -2353,6 +8452,1908 @@ impl App {
         WebActionBatchDisposition::Continue
     }
 
+    fn performance_resolve_context(&self) -> media_source::ResolveContext {
+        media_source::ResolveContext::new(
+            self.performance_patch_dir.clone(),
+            self.library_folder.clone(),
+        )
+    }
+
+    fn resolve_capture_target(
+        &self,
+        target: web::state::CaptureTargetSnapshot,
+    ) -> Result<program_recorder::CaptureTarget, String> {
+        match target {
+            web::state::CaptureTargetSnapshot::Program => {
+                Ok(program_recorder::CaptureTarget::Program)
+            }
+            web::state::CaptureTargetSnapshot::Layer { layer_id } => {
+                let stable_id = parse_nonzero_decimal(&layer_id)
+                    .and_then(image_routing::StableLayerId::new)
+                    .ok_or_else(|| "capture layer ID must be a non-zero decimal".to_string())?;
+                self.layers
+                    .iter()
+                    .any(|layer| layer.stable_layer_id() == stable_id)
+                    .then_some(program_recorder::CaptureTarget::Layer(stable_id))
+                    .ok_or_else(|| format!("capture layer {} is absent", stable_id.get()))
+            }
+            web::state::CaptureTargetSnapshot::Group { group_id } => {
+                let stable_id = parse_nonzero_decimal(&group_id)
+                    .and_then(visual_rack::GroupId::new)
+                    .ok_or_else(|| "capture group ID must be a non-zero decimal".to_string())?;
+                self.composition
+                    .groups()
+                    .any(|group| group.id == stable_id)
+                    .then_some(program_recorder::CaptureTarget::Group(stable_id))
+                    .ok_or_else(|| format!("capture group {} is absent", stable_id.get()))
+            }
+        }
+    }
+
+    fn choose_capture_destination(
+        &mut self,
+        title: &str,
+        default_name: &str,
+        filter_name: &str,
+        extensions: &[&str],
+    ) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(title)
+            .set_file_name(default_name)
+            .add_filter(filter_name, extensions);
+        if let Some(folder) = &self.library_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let path = dialog.save_file();
+        self.finish_native_modal(was_program_paused, Instant::now());
+        path
+    }
+
+    fn choose_controller_profile_import(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Import collide-o-scope controller profile")
+            .add_filter("Controller profile JSON", &["json"]);
+        if let Some(folder) = &self.library_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let path = dialog.pick_file();
+        self.finish_native_modal(was_program_paused, Instant::now());
+        let Some(path) = path else {
+            return;
+        };
+        let document = match controller_profile::read_controller_profile_import(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                self.controller_status = format!("Controller profile import rejected: {error}");
+                return;
+            }
+        };
+        self.apply_native_manual_action(
+            "Import controller profile",
+            "controller_profile",
+            move |app| {
+                if let Err(error) = app.install_controller_profile_document(document, "imported") {
+                    app.controller_status = format!("Controller profile import rejected: {error}");
+                }
+            },
+        );
+    }
+
+    fn choose_controller_profile_export(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export collide-o-scope controller profile")
+            .set_file_name("controller_profile.json")
+            .add_filter("Controller profile JSON", &["json"]);
+        if let Some(folder) = &self.library_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        let modal_started = Instant::now();
+        let was_program_paused = self.program_transport_paused();
+        self.mod_matrix.clock.set_paused(true, modal_started);
+        let path = dialog.save_file();
+        self.finish_native_modal(was_program_paused, Instant::now());
+        let Some(path) = path else {
+            return;
+        };
+        match controller_profile::save_controller_profile_atomic(&self.controller_profile, &path) {
+            Ok(()) => {
+                self.controller_status = format!(
+                    "Controller profile '{}' exported",
+                    self.controller_profile.name
+                );
+            }
+            Err(error) => {
+                self.controller_status = format!("Controller profile export failed: {error}");
+            }
+        }
+    }
+
+    fn capture_dimensions(&self) -> Result<program_recorder::RecorderDimensions, String> {
+        let renderer = self
+            .renderer
+            .as_ref()
+            .ok_or_else(|| "capture renderer is not initialized".to_string())?;
+        program_recorder::RecorderDimensions::new(renderer.output_width, renderer.output_height)
+    }
+
+    fn allocate_live_capture_generation(&mut self) -> u64 {
+        let generation = self.next_live_capture_generation.max(1);
+        self.next_live_capture_generation = generation.wrapping_add(1).max(1);
+        generation
+    }
+
+    fn set_capture_starting_snapshot(&mut self, artifact_name: String) {
+        self.recorder_snapshot = web::state::ProgramRecorderSnapshot {
+            status: "starting".into(),
+            artifact_name,
+            ..web::state::ProgramRecorderSnapshot::default()
+        };
+    }
+
+    fn prepare_program_capture_readback(&mut self) -> Result<(), String> {
+        self.renderer
+            .as_mut()
+            .ok_or_else(|| "capture renderer is not initialized".to_string())?
+            .prepare_program_recorder_readback()
+            .map(|_| ())
+            .map_err(|error| format!("prepare Program capture readback: {error}"))
+    }
+
+    fn begin_recording_to_path(
+        &mut self,
+        output_path: PathBuf,
+        target: program_recorder::CaptureTarget,
+        purpose: program_recorder::CapturePurpose,
+    ) -> Result<(), String> {
+        if self.live_capture.is_some() {
+            return Err("another recording, still, or resample transaction is active".into());
+        }
+        let dimensions = self.capture_dimensions()?;
+        if matches!(target, program_recorder::CaptureTarget::Program) {
+            self.prepare_program_capture_readback()?;
+        }
+        let artifact_name = output_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "recording.mp4".into());
+        let recorder =
+            program_recorder::ProgramRecorder::spawn(program_recorder::RecorderConfig {
+                dimensions,
+                frame_rate: program_recorder::RecorderFrameRate::FPS_30,
+                output_path,
+                target,
+                purpose,
+            })?;
+        let generation = self.allocate_live_capture_generation();
+        self.set_capture_starting_snapshot(artifact_name.clone());
+        self.live_capture = Some(LiveCaptureSession {
+            generation,
+            target,
+            backend: matches!(target, program_recorder::CaptureTarget::Program)
+                .then_some(LiveCaptureBackend::Renderer),
+            started_at: Instant::now(),
+            next_capture_index: 0,
+            last_capture_index: None,
+            in_flight_readbacks: 0,
+            rejected_capture_indices: VecDeque::with_capacity(
+                renderer::readback::RECORDER_GPU_READBACK_SLOTS,
+            ),
+            accepting_captures: true,
+            finish_dispatched: false,
+            cancel_requested: false,
+            artifact_name,
+            deferred_history: None,
+            worker: LiveCaptureWorker::Recording(recorder),
+        });
+        self.output_error.clear();
+        Ok(())
+    }
+
+    fn begin_still_to_path(
+        &mut self,
+        output_path: PathBuf,
+        target: program_recorder::CaptureTarget,
+        purpose: program_recorder::CapturePurpose,
+    ) -> Result<(), String> {
+        if self.live_capture.is_some() {
+            return Err("another recording, still, or resample transaction is active".into());
+        }
+        let dimensions = self.capture_dimensions()?;
+        let pixels = vec![0; dimensions.frame_bytes()?];
+        if matches!(target, program_recorder::CaptureTarget::Program) {
+            self.prepare_program_capture_readback()?;
+        }
+        let artifact_name = output_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "still.png".into());
+        let config = program_recorder::StillSnapshotConfig {
+            dimensions,
+            output_path,
+            target,
+            purpose,
+        };
+        let generation = self.allocate_live_capture_generation();
+        self.set_capture_starting_snapshot(artifact_name.clone());
+        self.live_capture = Some(LiveCaptureSession {
+            generation,
+            target,
+            backend: matches!(target, program_recorder::CaptureTarget::Program)
+                .then_some(LiveCaptureBackend::Renderer),
+            started_at: Instant::now(),
+            next_capture_index: 0,
+            last_capture_index: None,
+            in_flight_readbacks: 0,
+            rejected_capture_indices: VecDeque::with_capacity(
+                renderer::readback::RECORDER_GPU_READBACK_SLOTS,
+            ),
+            accepting_captures: true,
+            finish_dispatched: false,
+            cancel_requested: false,
+            artifact_name,
+            deferred_history: None,
+            worker: LiveCaptureWorker::StillWaiting {
+                config,
+                pixels: Some(pixels),
+                in_flight: false,
+            },
+        });
+        self.output_error.clear();
+        Ok(())
+    }
+
+    fn start_program_recording(&mut self, auto_import: bool) {
+        let Some(path) = self.choose_capture_destination(
+            "Record collide-o-scope Program",
+            "collide-o-scope-recording.mp4",
+            "MPEG-4 video",
+            &["mp4"],
+        ) else {
+            return;
+        };
+        let purpose = if auto_import {
+            program_recorder::CapturePurpose::AutoImport
+        } else {
+            program_recorder::CapturePurpose::External
+        };
+        if let Err(error) =
+            self.begin_recording_to_path(path, program_recorder::CaptureTarget::Program, purpose)
+        {
+            self.output_error = error;
+        }
+    }
+
+    fn capture_still(&mut self, target: web::state::CaptureTargetSnapshot, auto_import: bool) {
+        let target = match self.resolve_capture_target(target) {
+            Ok(target) => target,
+            Err(error) => {
+                self.output_error = error;
+                return;
+            }
+        };
+        let Some(path) = self.choose_capture_destination(
+            "Capture collide-o-scope still",
+            "collide-o-scope-still.png",
+            "PNG image",
+            &["png"],
+        ) else {
+            return;
+        };
+        let purpose = if auto_import {
+            program_recorder::CapturePurpose::AutoImport
+        } else {
+            program_recorder::CapturePurpose::External
+        };
+        if let Err(error) = self.begin_still_to_path(path, target, purpose) {
+            self.output_error = error;
+        }
+    }
+
+    fn start_resample(
+        &mut self,
+        target: web::state::CaptureTargetSnapshot,
+        destination_layer_id: String,
+        activate: bool,
+    ) {
+        let target = match self.resolve_capture_target(target) {
+            Ok(target) => target,
+            Err(error) => {
+                self.output_error = error;
+                return;
+            }
+        };
+        let destination_layer = match parse_nonzero_decimal(&destination_layer_id)
+            .and_then(image_routing::StableLayerId::new)
+            .filter(|stable_id| {
+                self.layers
+                    .iter()
+                    .any(|layer| layer.stable_layer_id() == *stable_id)
+            }) {
+            Some(stable_id) => stable_id,
+            None => {
+                self.output_error = format!(
+                    "resample destination layer {destination_layer_id} is absent or invalid"
+                );
+                return;
+            }
+        };
+        let Some(path) = self.choose_capture_destination(
+            "Resample collide-o-scope scope",
+            "collide-o-scope-resample.mp4",
+            "MPEG-4 video",
+            &["mp4"],
+        ) else {
+            return;
+        };
+        let deferred_history = match self.deferred_performance_history("Create resample slot") {
+            Ok(deferred) => deferred,
+            Err(error) => {
+                self.history_status = error;
+                return;
+            }
+        };
+        if let Err(error) = self.begin_recording_to_path(
+            path,
+            target,
+            program_recorder::CapturePurpose::Resample {
+                destination_layer,
+                activate,
+            },
+        ) {
+            self.output_error = error;
+        } else if let Some(session) = self.live_capture.as_mut() {
+            session.deferred_history = Some(deferred_history);
+        }
+    }
+
+    fn finish_live_capture(&mut self) {
+        match self.live_capture.as_mut() {
+            Some(session) if matches!(session.worker, LiveCaptureWorker::Recording(_)) => {
+                session.request_finish();
+                self.output_error.clear();
+            }
+            Some(_) => {
+                self.output_error = "only a running video capture can be finished".into();
+            }
+            None => self.output_error = "no live capture is active".into(),
+        }
+    }
+
+    fn cancel_live_capture(&mut self) {
+        match self.live_capture.as_mut() {
+            Some(session) => {
+                session.request_cancel();
+                self.output_error.clear();
+            }
+            None => self.output_error = "no live capture is active".into(),
+        }
+    }
+
+    fn capture_request_belongs_to_session(
+        session: &LiveCaptureSession,
+        request: renderer::readback::RecorderReadbackRequest,
+        backend: LiveCaptureBackend,
+    ) -> bool {
+        request.target == session.target
+            && request.tag.capture_generation() == session.generation
+            && session.backend == Some(backend)
+    }
+
+    fn capture_request_is_current(
+        session: &LiveCaptureSession,
+        request: renderer::readback::RecorderReadbackRequest,
+        backend: LiveCaptureBackend,
+    ) -> bool {
+        !session.cancel_requested
+            && Self::capture_request_belongs_to_session(session, request, backend)
+    }
+
+    fn fail_waiting_still(session: &mut LiveCaptureSession, error: String) {
+        if matches!(session.worker, LiveCaptureWorker::StillWaiting { .. }) {
+            session.worker = LiveCaptureWorker::Failed(error);
+            session.accepting_captures = false;
+        }
+    }
+
+    fn harvest_renderer_capture_readbacks(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        for _ in 0..renderer::readback::RECORDER_GPU_READBACK_SLOTS {
+            let readiness = match renderer.recorder_readback_readiness() {
+                Ok(readiness) => readiness,
+                Err(error) => {
+                    self.output_error = format!("poll recorder readback: {error}");
+                    return;
+                }
+            };
+            let request = match readiness {
+                renderer::readback::RecorderReadbackReadiness::Idle
+                | renderer::readback::RecorderReadbackReadiness::Pending => return,
+                renderer::readback::RecorderReadbackReadiness::Ready(request)
+                | renderer::readback::RecorderReadbackReadiness::Dropped { request, .. } => request,
+            };
+            let is_current = self.live_capture.as_ref().is_some_and(|session| {
+                Self::capture_request_is_current(session, request, LiveCaptureBackend::Renderer)
+            });
+            let belongs_to_session = self.live_capture.as_ref().is_some_and(|session| {
+                Self::capture_request_belongs_to_session(
+                    session,
+                    request,
+                    LiveCaptureBackend::Renderer,
+                )
+            });
+            let rejected = is_current
+                && self.live_capture.as_mut().is_some_and(|session| {
+                    session.take_rejected_capture(request.tag.metadata().capture_index)
+                });
+            if !is_current || rejected {
+                if let Err(error) = renderer.recycle_ready_recorder_readback_without_copy() {
+                    self.output_error = format!("recycle stale recorder readback: {error}");
+                    return;
+                }
+                if rejected {
+                    if let Some(session) = self.live_capture.as_mut() {
+                        session.note_source_frame_dropped();
+                        if let LiveCaptureWorker::StillWaiting { in_flight, .. } =
+                            &mut session.worker
+                        {
+                            *in_flight = false;
+                        }
+                    }
+                }
+                if belongs_to_session {
+                    if let Some(session) = self.live_capture.as_mut() {
+                        session.complete_readback();
+                    }
+                }
+                continue;
+            }
+            if matches!(
+                readiness,
+                renderer::readback::RecorderReadbackReadiness::Dropped { .. }
+            ) {
+                let _ = renderer.recycle_ready_recorder_readback_without_copy();
+                if let Some(session) = self.live_capture.as_mut() {
+                    session.complete_readback();
+                    match &session.worker {
+                        LiveCaptureWorker::Recording(_) => session.note_source_frame_dropped(),
+                        LiveCaptureWorker::StillWaiting { .. } => Self::fail_waiting_still(
+                            session,
+                            "GPU mapping failed for the requested still".into(),
+                        ),
+                        LiveCaptureWorker::StillPublishing(_) | LiveCaptureWorker::Failed(_) => {}
+                    }
+                }
+                continue;
+            }
+            let Some(session) = self.live_capture.as_mut() else {
+                continue;
+            };
+            // Ready is consumed by either poll_into or the explicit recycle
+            // below; release the session-side aggregate ownership exactly
+            // once before borrowing its worker variant.
+            session.complete_readback();
+            match &mut session.worker {
+                LiveCaptureWorker::Recording(recorder) => {
+                    let mut lease = match recorder.try_acquire_frame() {
+                        program_recorder::RecorderAcquire::Lease(lease) => lease,
+                        program_recorder::RecorderAcquire::NotReady
+                        | program_recorder::RecorderAcquire::DroppedPoolEmpty => {
+                            let _ = renderer.recycle_ready_recorder_readback_without_copy();
+                            continue;
+                        }
+                    };
+                    match renderer.poll_recorder_readback_into(lease.pixels_mut()) {
+                        Ok(renderer::readback::RecorderReadbackPoll::Ready(completed)) => {
+                            if completed.request != request {
+                                self.output_error =
+                                    "recorder readback metadata order changed unexpectedly".into();
+                                continue;
+                            }
+                            let _ = recorder.try_submit(lease, request.tag.metadata());
+                        }
+                        Ok(renderer::readback::RecorderReadbackPoll::Dropped { .. }) => {
+                            // The readiness gate normally routes this case
+                            // above. The lease returns to the fixed pool here.
+                        }
+                        Ok(
+                            renderer::readback::RecorderReadbackPoll::Idle
+                            | renderer::readback::RecorderReadbackPoll::Pending,
+                        ) => {
+                            self.output_error =
+                                "ready recorder readback became pending unexpectedly".into();
+                            return;
+                        }
+                        Err(error) => {
+                            self.output_error = format!("harvest recorder readback: {error}");
+                            return;
+                        }
+                    }
+                }
+                LiveCaptureWorker::StillWaiting {
+                    config,
+                    pixels,
+                    in_flight: _,
+                } => {
+                    let Some(mut destination) = pixels.take() else {
+                        session.worker = LiveCaptureWorker::Failed(
+                            "still capture lost its bounded destination buffer".into(),
+                        );
+                        return;
+                    };
+                    let config = config.clone();
+                    match renderer.poll_recorder_readback_into(&mut destination) {
+                        Ok(renderer::readback::RecorderReadbackPoll::Ready(completed))
+                            if completed.request == request =>
+                        {
+                            session.accepting_captures = false;
+                            session.worker = match program_recorder::StillSnapshotJob::spawn(
+                                config,
+                                destination,
+                                request.tag.metadata(),
+                            ) {
+                                Ok(job) => LiveCaptureWorker::StillPublishing(job),
+                                Err(error) => LiveCaptureWorker::Failed(error),
+                            };
+                        }
+                        Ok(_) => {
+                            session.worker = LiveCaptureWorker::Failed(
+                                "ready still readback changed state or identity unexpectedly"
+                                    .into(),
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            session.worker = LiveCaptureWorker::Failed(format!(
+                                "harvest still readback: {error}"
+                            ));
+                            return;
+                        }
+                    }
+                }
+                LiveCaptureWorker::StillPublishing(_) | LiveCaptureWorker::Failed(_) => {
+                    let _ = renderer.recycle_ready_recorder_readback_without_copy();
+                }
+            }
+        }
+    }
+
+    fn harvest_advanced_capture_readbacks(&mut self) {
+        let (Some(renderer), Some(executor)) =
+            (self.renderer.as_ref(), self.composition_gpu.as_mut())
+        else {
+            return;
+        };
+        for _ in 0..renderer::readback::RECORDER_GPU_READBACK_SLOTS {
+            let readiness = executor.scope_recorder_readback_readiness(&renderer.device);
+            let request = match readiness {
+                renderer::readback::RecorderReadbackReadiness::Idle
+                | renderer::readback::RecorderReadbackReadiness::Pending => return,
+                renderer::readback::RecorderReadbackReadiness::Ready(request)
+                | renderer::readback::RecorderReadbackReadiness::Dropped { request, .. } => request,
+            };
+            let is_current = self.live_capture.as_ref().is_some_and(|session| {
+                Self::capture_request_is_current(session, request, LiveCaptureBackend::Advanced)
+            });
+            let belongs_to_session = self.live_capture.as_ref().is_some_and(|session| {
+                Self::capture_request_belongs_to_session(
+                    session,
+                    request,
+                    LiveCaptureBackend::Advanced,
+                )
+            });
+            let rejected = is_current
+                && self.live_capture.as_mut().is_some_and(|session| {
+                    session.take_rejected_capture(request.tag.metadata().capture_index)
+                });
+            if !is_current || rejected {
+                if let Err(error) =
+                    executor.recycle_ready_scope_recorder_readback_without_copy(&renderer.device)
+                {
+                    self.output_error = format!("recycle stale scope readback: {error}");
+                    return;
+                }
+                if rejected {
+                    if let Some(session) = self.live_capture.as_mut() {
+                        session.note_source_frame_dropped();
+                        if let LiveCaptureWorker::StillWaiting { in_flight, .. } =
+                            &mut session.worker
+                        {
+                            *in_flight = false;
+                        }
+                    }
+                }
+                if belongs_to_session {
+                    if let Some(session) = self.live_capture.as_mut() {
+                        session.complete_readback();
+                    }
+                }
+                continue;
+            }
+            if matches!(
+                readiness,
+                renderer::readback::RecorderReadbackReadiness::Dropped { .. }
+            ) {
+                let _ =
+                    executor.recycle_ready_scope_recorder_readback_without_copy(&renderer.device);
+                if let Some(session) = self.live_capture.as_mut() {
+                    session.complete_readback();
+                    match &session.worker {
+                        LiveCaptureWorker::Recording(_) => session.note_source_frame_dropped(),
+                        LiveCaptureWorker::StillWaiting { .. } => Self::fail_waiting_still(
+                            session,
+                            "GPU mapping failed for the requested still".into(),
+                        ),
+                        LiveCaptureWorker::StillPublishing(_) | LiveCaptureWorker::Failed(_) => {}
+                    }
+                }
+                continue;
+            }
+            let Some(session) = self.live_capture.as_mut() else {
+                continue;
+            };
+            session.complete_readback();
+            match &mut session.worker {
+                LiveCaptureWorker::Recording(recorder) => {
+                    let mut lease = match recorder.try_acquire_frame() {
+                        program_recorder::RecorderAcquire::Lease(lease) => lease,
+                        program_recorder::RecorderAcquire::NotReady
+                        | program_recorder::RecorderAcquire::DroppedPoolEmpty => {
+                            let _ = executor.recycle_ready_scope_recorder_readback_without_copy(
+                                &renderer.device,
+                            );
+                            continue;
+                        }
+                    };
+                    match executor
+                        .poll_scope_recorder_readback_into(&renderer.device, lease.pixels_mut())
+                    {
+                        Ok(renderer::readback::RecorderReadbackPoll::Ready(completed)) => {
+                            if completed.request != request {
+                                self.output_error =
+                                    "scope readback metadata order changed unexpectedly".into();
+                                continue;
+                            }
+                            let _ = recorder.try_submit(lease, request.tag.metadata());
+                        }
+                        Ok(renderer::readback::RecorderReadbackPoll::Dropped { .. }) => {}
+                        Ok(
+                            renderer::readback::RecorderReadbackPoll::Idle
+                            | renderer::readback::RecorderReadbackPoll::Pending,
+                        ) => {
+                            self.output_error =
+                                "ready scope readback became pending unexpectedly".into();
+                            return;
+                        }
+                        Err(error) => {
+                            self.output_error = format!("harvest scope readback: {error}");
+                            return;
+                        }
+                    }
+                }
+                LiveCaptureWorker::StillWaiting {
+                    config,
+                    pixels,
+                    in_flight: _,
+                } => {
+                    let Some(mut destination) = pixels.take() else {
+                        session.worker = LiveCaptureWorker::Failed(
+                            "still capture lost its bounded destination buffer".into(),
+                        );
+                        return;
+                    };
+                    let config = config.clone();
+                    match executor
+                        .poll_scope_recorder_readback_into(&renderer.device, &mut destination)
+                    {
+                        Ok(renderer::readback::RecorderReadbackPoll::Ready(completed))
+                            if completed.request == request =>
+                        {
+                            session.accepting_captures = false;
+                            session.worker = match program_recorder::StillSnapshotJob::spawn(
+                                config,
+                                destination,
+                                request.tag.metadata(),
+                            ) {
+                                Ok(job) => LiveCaptureWorker::StillPublishing(job),
+                                Err(error) => LiveCaptureWorker::Failed(error),
+                            };
+                        }
+                        Ok(_) => {
+                            session.worker = LiveCaptureWorker::Failed(
+                                "ready still scope readback changed state or identity unexpectedly"
+                                    .into(),
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            session.worker = LiveCaptureWorker::Failed(format!(
+                                "harvest still scope readback: {error}"
+                            ));
+                            return;
+                        }
+                    }
+                }
+                LiveCaptureWorker::StillPublishing(_) | LiveCaptureWorker::Failed(_) => {
+                    let _ = executor
+                        .recycle_ready_scope_recorder_readback_without_copy(&renderer.device);
+                }
+            }
+        }
+    }
+
+    fn live_capture_backend_idle(&self, backend: Option<LiveCaptureBackend>) -> bool {
+        match backend {
+            None => true,
+            Some(LiveCaptureBackend::Renderer) => self
+                .renderer
+                .as_ref()
+                .and_then(|renderer| renderer.recorder_readback_readiness().ok())
+                .is_none_or(|readiness| {
+                    matches!(
+                        readiness,
+                        renderer::readback::RecorderReadbackReadiness::Idle
+                    )
+                }),
+            Some(LiveCaptureBackend::Advanced) => {
+                let (Some(renderer), Some(executor)) =
+                    (self.renderer.as_ref(), self.composition_gpu.as_ref())
+                else {
+                    return true;
+                };
+                matches!(
+                    executor.scope_recorder_readback_readiness(&renderer.device),
+                    renderer::readback::RecorderReadbackReadiness::Idle
+                )
+            }
+        }
+    }
+
+    fn discard_advanced_capture_executor_readbacks(live_capture: &mut Option<LiveCaptureSession>) {
+        let Some(session) = live_capture.as_mut().filter(|session| {
+            session.backend == Some(LiveCaptureBackend::Advanced)
+                && session.in_flight_readbacks != 0
+        }) else {
+            return;
+        };
+        let dropped = std::mem::take(&mut session.in_flight_readbacks);
+        for _ in 0..dropped {
+            session.note_source_frame_dropped();
+        }
+        if let LiveCaptureWorker::StillWaiting { in_flight, .. } = &mut session.worker {
+            *in_flight = false;
+        }
+    }
+
+    fn active_recorder_snapshot(
+        session: &LiveCaptureSession,
+    ) -> web::state::ProgramRecorderSnapshot {
+        let (status, counters, error) = match &session.worker {
+            LiveCaptureWorker::Recording(recorder) => {
+                let snapshot = recorder.snapshot();
+                (
+                    snapshot.status.as_str().to_string(),
+                    snapshot.counters,
+                    snapshot.error,
+                )
+            }
+            LiveCaptureWorker::StillWaiting { .. } => (
+                "starting".into(),
+                program_recorder::RecorderCounters::default(),
+                String::new(),
+            ),
+            LiveCaptureWorker::StillPublishing(_) => (
+                "finishing".into(),
+                program_recorder::RecorderCounters {
+                    attempted: 1,
+                    accepted: 1,
+                    ..program_recorder::RecorderCounters::default()
+                },
+                String::new(),
+            ),
+            LiveCaptureWorker::Failed(error) => (
+                "failed".into(),
+                program_recorder::RecorderCounters::default(),
+                error.clone(),
+            ),
+        };
+        web::state::ProgramRecorderSnapshot {
+            status,
+            attempted: counters.attempted,
+            accepted: counters.accepted,
+            encoded: counters.encoded,
+            duplicated: counters.duplicated,
+            dropped_not_ready: counters.dropped_not_ready,
+            dropped_source_unavailable: counters.dropped_source_unavailable,
+            dropped_pool_empty: counters.dropped_pool_empty,
+            dropped_queue_full: counters.dropped_queue_full,
+            rejected_metadata: counters.rejected_metadata,
+            encoder_failures: counters.encoder_failures,
+            audio_not_muxed: true,
+            artifact_name: session.artifact_name.clone(),
+            error,
+        }
+    }
+
+    fn poll_live_capture(&mut self) {
+        self.harvest_renderer_capture_readbacks();
+        self.harvest_advanced_capture_readbacks();
+
+        let waiting_still_failure = self.live_capture.as_ref().and_then(|session| {
+            if !matches!(session.worker, LiveCaptureWorker::StillWaiting { .. })
+                || session.cancel_requested
+            {
+                return None;
+            }
+            let target_exists = match session.target {
+                program_recorder::CaptureTarget::Program => true,
+                program_recorder::CaptureTarget::Layer(layer_id) => self
+                    .layers
+                    .iter()
+                    .any(|layer| layer.stable_layer_id() == layer_id),
+                program_recorder::CaptureTarget::Group(group_id) => {
+                    self.composition.group(group_id).is_some()
+                }
+            };
+            if !target_exists {
+                return Some("still capture target is no longer available".to_string());
+            }
+            (session.started_at.elapsed() >= STILL_CAPTURE_SOURCE_TIMEOUT).then(|| {
+                format!(
+                    "still capture source did not become available within {} seconds",
+                    STILL_CAPTURE_SOURCE_TIMEOUT.as_secs()
+                )
+            })
+        });
+        if let (Some(session), Some(error)) = (self.live_capture.as_mut(), waiting_still_failure) {
+            Self::fail_waiting_still(session, error);
+        }
+
+        let should_dispatch_finish = self.live_capture.as_ref().is_some_and(|session| {
+            !session.accepting_captures
+                && !session.cancel_requested
+                && !session.finish_dispatched
+                && session.in_flight_readbacks == 0
+                && matches!(session.worker, LiveCaptureWorker::Recording(_))
+                && self.live_capture_backend_idle(session.backend)
+        });
+        if should_dispatch_finish {
+            if let Some(session) = self.live_capture.as_mut() {
+                if let LiveCaptureWorker::Recording(recorder) = &session.worker {
+                    recorder.request_finish(session.last_capture_index.unwrap_or(0));
+                    session.finish_dispatched = true;
+                }
+            }
+        }
+
+        let terminal = self
+            .live_capture
+            .as_mut()
+            .and_then(|session| match &mut session.worker {
+                LiveCaptureWorker::Recording(recorder) => recorder.poll_terminal(),
+                LiveCaptureWorker::StillPublishing(job) => job.poll_terminal(),
+                LiveCaptureWorker::StillWaiting { .. } if session.cancel_requested => {
+                    Some(program_recorder::RecorderTerminalEvent::Cancelled)
+                }
+                LiveCaptureWorker::Failed(error) => Some(
+                    program_recorder::RecorderTerminalEvent::Failed(error.clone()),
+                ),
+                LiveCaptureWorker::StillWaiting { .. } => None,
+            });
+        if let Some(session) = self.live_capture.as_ref() {
+            self.recorder_snapshot = Self::active_recorder_snapshot(session);
+        }
+        let Some(terminal) = terminal else {
+            return;
+        };
+        let mut session = self
+            .live_capture
+            .take()
+            .expect("terminal capture event has an active session");
+        match terminal {
+            program_recorder::RecorderTerminalEvent::Succeeded(committed) => {
+                let counters = committed.counters;
+                self.recorder_snapshot = web::state::ProgramRecorderSnapshot {
+                    status: "succeeded".into(),
+                    attempted: counters.attempted,
+                    accepted: counters.accepted,
+                    encoded: counters.encoded,
+                    duplicated: counters.duplicated,
+                    dropped_not_ready: counters.dropped_not_ready,
+                    dropped_source_unavailable: counters.dropped_source_unavailable,
+                    dropped_pool_empty: counters.dropped_pool_empty,
+                    dropped_queue_full: counters.dropped_queue_full,
+                    rejected_metadata: counters.rejected_metadata,
+                    encoder_failures: counters.encoder_failures,
+                    audio_not_muxed: true,
+                    artifact_name: session.artifact_name,
+                    error: String::new(),
+                };
+                self.publish_committed_capture(committed, session.deferred_history.take());
+            }
+            program_recorder::RecorderTerminalEvent::Failed(error) => {
+                self.recorder_snapshot.status = "failed".into();
+                self.recorder_snapshot.error.clone_from(&error);
+                self.output_error = format!("Capture failed: {error}");
+            }
+            program_recorder::RecorderTerminalEvent::Cancelled => {
+                self.recorder_snapshot.status = "cancelled".into();
+                self.recorder_snapshot.error.clear();
+                self.output_error = "Capture cancelled; temporary artifacts were removed".into();
+            }
+        }
+    }
+
+    fn publish_committed_capture(
+        &mut self,
+        committed: program_recorder::CommittedCapture,
+        deferred_history: Option<DeferredPerformanceHistory>,
+    ) {
+        match committed.publication_intent() {
+            program_recorder::CommittedCaptureIntent::None => {
+                self.output_error = format!(
+                    "Capture committed as {}",
+                    committed
+                        .media_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy())
+                        .unwrap_or_default()
+                );
+            }
+            program_recorder::CommittedCaptureIntent::AutoImport { committed_path } => {
+                if !is_supported_visual_file(&committed_path) {
+                    self.output_error =
+                        "Capture committed, but its format is not importable".into();
+                    return;
+                }
+                if !self.library_files.contains(&committed_path) {
+                    self.library_files.push(committed_path.clone());
+                    self.library_files.sort();
+                }
+                let generation = self.web_state.begin_library_generation();
+                generate_thumbnails(
+                    std::slice::from_ref(&committed_path),
+                    self.web_state.clone(),
+                    generation,
+                    self.media_safety_policy.clone(),
+                    self.renderer.as_ref().map_or_else(
+                        media_safety::MediaDeviceLimits::none,
+                        |renderer| {
+                            let limits = renderer.device.limits();
+                            media_safety::MediaDeviceLimits::new(
+                                limits.max_texture_dimension_2d,
+                                limits.max_buffer_size,
+                            )
+                        },
+                    ),
+                );
+                self.output_error = "Capture committed and imported into the library".into();
+            }
+            program_recorder::CommittedCaptureIntent::NewClipSlot {
+                committed_path,
+                destination_layer,
+                activate,
+            } => self.stage_committed_capture_slot(
+                committed_path,
+                destination_layer,
+                activate,
+                deferred_history,
+            ),
+        }
+    }
+
+    fn stage_committed_capture_slot(
+        &mut self,
+        committed_path: PathBuf,
+        destination_layer: image_routing::StableLayerId,
+        activate: bool,
+        deferred_history: Option<DeferredPerformanceHistory>,
+    ) {
+        let Some(layer_index) = self
+            .layers
+            .iter()
+            .position(|layer| layer.stable_layer_id() == destination_layer)
+        else {
+            self.source_staging_status = format!(
+                "Resample committed, but destination layer {} is absent",
+                destination_layer.get()
+            );
+            return;
+        };
+        let Some(slot_id) = self.next_clip_slot_id(&self.layers[layer_index]) else {
+            self.source_staging_status = format!(
+                "Resample committed, but layer {} has no free ClipSlot identity",
+                destination_layer.get()
+            );
+            return;
+        };
+        let filename = committed_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "resample.mp4".into());
+        let mut desired = performance::ClipSlotConfig::from_legacy(
+            filename.clone(),
+            committed_path.to_string_lossy().into_owned(),
+            1.0,
+            30.0,
+        );
+        desired.id = slot_id;
+        desired.name.clone_from(&filename);
+        desired.transport.trigger_mode = transport::TriggerMode::Immediate;
+        let layer = &self.layers[layer_index];
+        let descriptor = PreparedSlotDescriptor {
+            layer_id: destination_layer,
+            slot: desired.clone(),
+            cue_id: None,
+        };
+        let source = Self::resolved_prepared_source(&desired, self.performance_resolve_context());
+        match performance_runtime::PreparationRequest::for_layer_slot_update(
+            layer, desired, None, source,
+        ) {
+            Ok(request) => self.submit_performance_request(
+                request,
+                vec![descriptor],
+                activate.then_some(transport::TriggerMode::Immediate),
+                !activate,
+                deferred_history,
+                format!(
+                    "committed resample {filename} as layer {} slot {}",
+                    destination_layer.get(),
+                    slot_id.get()
+                ),
+            ),
+            Err(error) => {
+                self.source_staging_status =
+                    format!("Resample committed, but ClipSlot preparation failed: {error}");
+            }
+        }
+    }
+
+    fn resolved_prepared_source(
+        slot: &performance::ClipSlotConfig,
+        context: media_source::ResolveContext,
+    ) -> performance_runtime::ResolvedPreparedSource {
+        let source = if slot.source_path.is_empty() {
+            slot.filename.as_str()
+        } else {
+            slot.source_path.as_str()
+        };
+        if let Some(sender) = source.strip_prefix(layers::SPOUT_SOURCE_PREFIX) {
+            performance_runtime::ResolvedPreparedSource::spout(sender)
+        } else {
+            performance_runtime::ResolvedPreparedSource::authored(
+                slot.source_path.clone(),
+                slot.filename.clone(),
+                context,
+            )
+        }
+    }
+
+    fn next_clip_slot_id(&self, layer: &Layer) -> Option<performance::ClipSlotId> {
+        (1..=u16::MAX).find_map(|raw| {
+            let id = performance::ClipSlotId::new(raw)?;
+            let live = layer.clip_slots.get(id).is_some();
+            let staged = self
+                .performance_staging
+                .as_ref()
+                .into_iter()
+                .flat_map(|intent| intent.descriptors.iter())
+                .chain(
+                    self.performance_gpu_cache
+                        .iter()
+                        .flat_map(|cached| cached.descriptors.iter()),
+                )
+                .any(|descriptor| {
+                    descriptor.layer_id == layer.stable_layer_id() && descriptor.slot.id == id
+                });
+            (!live && !staged).then_some(id)
+        })
+    }
+
+    fn clear_performance_transactions(&mut self) {
+        if let Some(runtime) = self.performance_runtime.as_mut() {
+            if let Err(error) = runtime.cancel_pending() {
+                log::error!("Could not cancel performance preparation: {error}");
+            }
+            runtime.clear_ready();
+        }
+        self.performance_gpu_cache.clear();
+        self.performance_staging = None;
+        self.performance_scheduled = None;
+        self.performance_boundaries
+            .reanchor(self.mod_matrix.current_beat);
+    }
+
+    fn cached_performance_position(
+        &self,
+        key: &performance_runtime::PreparedTransactionKey,
+    ) -> Option<usize> {
+        self.performance_gpu_cache
+            .iter()
+            .position(|cached| cached.key() == key)
+    }
+
+    fn evict_cached_performance_key(&mut self, key: &performance_runtime::PreparedTransactionKey) {
+        if let Some(position) = self.cached_performance_position(key) {
+            self.performance_gpu_cache.remove(position);
+        }
+        if self
+            .performance_scheduled
+            .as_ref()
+            .is_some_and(|scheduled| &scheduled.key == key)
+        {
+            self.performance_scheduled = None;
+        }
+    }
+
+    fn evict_oldest_unarmed_performance(&mut self) -> bool {
+        let armed = self
+            .performance_scheduled
+            .as_ref()
+            .map(|scheduled| &scheduled.key);
+        let position = self
+            .performance_gpu_cache
+            .iter()
+            .position(|cached| armed != Some(cached.key()));
+        position
+            .and_then(|position| self.performance_gpu_cache.remove(position))
+            .is_some()
+    }
+
+    fn submit_performance_request(
+        &mut self,
+        request: performance_runtime::PreparationRequest,
+        descriptors: Vec<PreparedSlotDescriptor>,
+        activate: Option<transport::TriggerMode>,
+        publish_inactive_metadata: bool,
+        deferred_history: Option<DeferredPerformanceHistory>,
+        status: String,
+    ) {
+        let key = request.key.clone();
+        let replacement_count = request.replacement_count();
+        self.evict_cached_performance_key(&key);
+
+        loop {
+            let accounted = self
+                .performance_runtime
+                .as_ref()
+                .map_or(0, |runtime| runtime.budget_snapshot().source_count);
+            if accounted.saturating_add(replacement_count)
+                <= self.performance_budget.max_prepared_sources()
+            {
+                break;
+            }
+            if !self.evict_oldest_unarmed_performance() {
+                self.source_staging_status = format!(
+                    "Cannot prepare {status}: all {} prepared-source slots are armed",
+                    self.performance_budget.max_prepared_sources()
+                );
+                return;
+            }
+        }
+
+        let Some(runtime) = self.performance_runtime.as_mut() else {
+            self.source_staging_status =
+                format!("Cannot prepare {status}: performance staging is unavailable");
+            return;
+        };
+        match runtime.submit(request) {
+            Ok(generation) => {
+                self.performance_staging = Some(PerformanceStagingIntent {
+                    generation,
+                    key,
+                    descriptors,
+                    activate,
+                    publish_inactive_metadata,
+                    deferred_history,
+                });
+                self.source_staging_status =
+                    format!("Preparing {status} (generation {})", generation.get());
+            }
+            Err(error) => {
+                self.performance_staging = None;
+                self.source_staging_status = format!("Preparation rejected for {status}: {error}");
+                log::error!("{}", self.source_staging_status);
+            }
+        }
+    }
+
+    fn stage_clip_slot_update(
+        &mut self,
+        layer_id: &str,
+        requested_slot: Option<performance::ClipSlotId>,
+        filename: String,
+        activate: bool,
+        trigger_mode: transport::TriggerMode,
+    ) {
+        let Some(layer_index) = self.resolve_stable_layer_id(layer_id) else {
+            self.source_staging_status = format!("Layer {layer_id} is absent");
+            return;
+        };
+        let Some(path) = self.library_files.iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy() == filename)
+        }) else {
+            self.source_staging_status =
+                format!("Source not found in the active library: {filename}");
+            return;
+        };
+        let slot_id = match requested_slot {
+            Some(slot_id) => slot_id,
+            None => match self.next_clip_slot_id(&self.layers[layer_index]) {
+                Some(slot_id) => slot_id,
+                None => {
+                    self.source_staging_status =
+                        format!("Layer {layer_id} has no available non-zero ClipSlot identity");
+                    return;
+                }
+            },
+        };
+        let layer = &self.layers[layer_index];
+        let mut desired = layer.clip_slots.get(slot_id).cloned().unwrap_or_else(|| {
+            let mut slot = performance::ClipSlotConfig::from_legacy(
+                filename.clone(),
+                path.to_string_lossy().into_owned(),
+                1.0,
+                30.0,
+            );
+            slot.id = slot_id;
+            slot.name.clone_from(&filename);
+            slot.transport.trigger_mode = trigger_mode;
+            slot
+        });
+        desired.filename.clone_from(&filename);
+        desired.source_path = path.to_string_lossy().into_owned();
+        let descriptor = PreparedSlotDescriptor {
+            layer_id: layer.stable_layer_id(),
+            slot: desired.clone(),
+            cue_id: None,
+        };
+        let source = Self::resolved_prepared_source(&desired, self.performance_resolve_context());
+        match performance_runtime::PreparationRequest::for_layer_slot_update(
+            layer, desired, None, source,
+        ) {
+            Ok(request) => {
+                let deferred_history =
+                    match self.deferred_performance_history("Load clip into slot") {
+                        Ok(deferred) => deferred,
+                        Err(error) => {
+                            self.history_status = error;
+                            return;
+                        }
+                    };
+                self.submit_performance_request(
+                    request,
+                    vec![descriptor],
+                    activate.then_some(trigger_mode),
+                    !activate,
+                    Some(deferred_history),
+                    format!("{filename} as layer {layer_id} slot {}", slot_id.get()),
+                );
+            }
+            Err(error) => {
+                self.source_staging_status = format!("Cannot prepare {filename}: {error}");
+            }
+        }
+    }
+
+    fn stage_existing_clip_slot(
+        &mut self,
+        layer_index: usize,
+        slot_id: performance::ClipSlotId,
+        cue_id: Option<transport::CueId>,
+        trigger_mode: transport::TriggerMode,
+    ) {
+        let layer = &self.layers[layer_index];
+        let Some(slot) = layer.clip_slots.get(slot_id).cloned() else {
+            self.source_staging_status = format!(
+                "Slot {} is absent from layer {}",
+                slot_id.get(),
+                layer.layer_id()
+            );
+            return;
+        };
+        let descriptor = PreparedSlotDescriptor {
+            layer_id: layer.stable_layer_id(),
+            slot: slot.clone(),
+            cue_id,
+        };
+        let source = Self::resolved_prepared_source(&slot, self.performance_resolve_context());
+        match performance_runtime::PreparationRequest::for_layer_slot(
+            layer, slot_id, cue_id, source,
+        ) {
+            Ok(request) => self.submit_performance_request(
+                request,
+                vec![descriptor],
+                Some(trigger_mode),
+                false,
+                None,
+                format!("layer {} slot {}", layer.layer_id(), slot_id.get()),
+            ),
+            Err(error) => {
+                self.source_staging_status = format!(
+                    "Cannot prepare layer {} slot {}: {error}",
+                    layer.layer_id(),
+                    slot_id.get()
+                );
+            }
+        }
+    }
+
+    fn stage_scene(
+        &mut self,
+        scene_id: performance::SceneId,
+        activate: Option<transport::TriggerMode>,
+    ) {
+        let Some(scene) = self.scenes.get(scene_id).cloned() else {
+            self.scene_status = format!("Scene {} is absent", scene_id.get());
+            return;
+        };
+        if scene.bindings.is_empty() {
+            self.scene_status = format!(
+                "Scene {} is invalid: an atomic Scene must bind at least one layer",
+                scene_id.get()
+            );
+            return;
+        }
+        let mut descriptors = Vec::with_capacity(scene.bindings.len());
+        for binding in scene.bindings.iter() {
+            let Some(layer) = binding.layer_position.resolve(&self.layers) else {
+                self.scene_status = format!(
+                    "Scene {} is invalid: layer position {} is absent",
+                    scene_id.get(),
+                    binding.layer_position.get()
+                );
+                return;
+            };
+            let Some(slot) = layer.clip_slots.get(binding.slot_id).cloned() else {
+                self.scene_status = format!(
+                    "Scene {} is invalid: slot {} is absent from layer {}",
+                    scene_id.get(),
+                    binding.slot_id.get(),
+                    layer.layer_id()
+                );
+                return;
+            };
+            descriptors.push(PreparedSlotDescriptor {
+                layer_id: layer.stable_layer_id(),
+                slot,
+                cue_id: binding.cue_id,
+            });
+        }
+        let context = self.performance_resolve_context();
+        match performance_runtime::PreparationRequest::for_scene(
+            &scene,
+            &self.layers,
+            |_layer_id, slot| Ok(Self::resolved_prepared_source(slot, context.clone())),
+        ) {
+            Ok(request) => {
+                self.submit_performance_request(
+                    request,
+                    descriptors,
+                    activate,
+                    false,
+                    None,
+                    format!("Scene {}", scene_id.get()),
+                );
+                self.scene_status = format!("Preparing Scene {}", scene_id.get());
+            }
+            Err(error) => {
+                self.scene_status = format!("Cannot prepare Scene {}: {error}", scene_id.get());
+            }
+        }
+    }
+
+    fn cached_direct_slot_matches(
+        &self,
+        layer_id: image_routing::StableLayerId,
+        slot_id: performance::ClipSlotId,
+        cue_id: Option<transport::CueId>,
+    ) -> bool {
+        let key = performance_runtime::PreparedTransactionKey::LayerSlot { layer_id, slot_id };
+        self.cached_performance_position(&key)
+            .is_some_and(|position| {
+                self.performance_gpu_cache[position]
+                    .descriptors
+                    .iter()
+                    .any(|descriptor| {
+                        descriptor.layer_id == layer_id
+                            && descriptor.slot.id == slot_id
+                            && descriptor.cue_id == cue_id
+                    })
+            })
+    }
+
+    fn arm_performance_activation(
+        &mut self,
+        key: performance_runtime::PreparedTransactionKey,
+        trigger_mode: transport::TriggerMode,
+    ) -> bool {
+        let Some(position) = self.cached_performance_position(&key) else {
+            return false;
+        };
+        if let Some(cached) = self.performance_gpu_cache.remove(position) {
+            self.performance_gpu_cache.push_back(cached);
+        }
+        self.performance_scheduled = Some(ScheduledPerformanceActivation {
+            key: key.clone(),
+            trigger_mode,
+        });
+        match key {
+            performance_runtime::PreparedTransactionKey::Scene(scene_id) => {
+                self.scene_status = format!("Scene {} armed for {trigger_mode:?}", scene_id.get());
+            }
+            performance_runtime::PreparedTransactionKey::LayerSlot { layer_id, slot_id } => {
+                self.source_staging_status = format!(
+                    "Layer {} slot {} armed for {trigger_mode:?}",
+                    layer_id.get(),
+                    slot_id.get()
+                );
+            }
+        }
+        true
+    }
+
+    fn cache_gpu_payload(&mut self, cached: CachedPerformancePayload) {
+        self.evict_cached_performance_key(cached.key());
+        while self
+            .performance_gpu_cache
+            .iter()
+            .map(CachedPerformancePayload::source_count)
+            .sum::<usize>()
+            .saturating_add(cached.source_count())
+            > self.performance_budget.max_prepared_sources()
+        {
+            if !self.evict_oldest_unarmed_performance() {
+                break;
+            }
+        }
+        while self
+            .performance_gpu_cache
+            .iter()
+            .map(|entry| entry.preload_bytes)
+            .sum::<u64>()
+            .saturating_add(cached.preload_bytes)
+            > self.performance_budget.max_preload_bytes()
+        {
+            if !self.evict_oldest_unarmed_performance() {
+                break;
+            }
+        }
+        self.performance_gpu_cache.push_back(cached);
+    }
+
+    fn commit_cached_performance(
+        &mut self,
+        key: &performance_runtime::PreparedTransactionKey,
+        now: Instant,
+    ) -> Vec<image_routing::StableLayerId> {
+        let Some(position) = self.cached_performance_position(key) else {
+            self.source_staging_status = "Armed prepared source was evicted".to_string();
+            return Vec::new();
+        };
+        let cached = self
+            .performance_gpu_cache
+            .remove(position)
+            .expect("cache position was resolved immediately before removal");
+        let deferred_before = match cached.deferred_history.as_ref() {
+            Some(deferred) => match self.prepare_deferred_performance_history(deferred) {
+                Ok(before) => Some(before),
+                Err(error) => {
+                    self.source_staging_status = error;
+                    return Vec::new();
+                }
+            },
+            None => None,
+        };
+        match cached.payload.commit(&mut self.layers, now) {
+            Ok(receipt) => {
+                let committed = receipt.committed_layers;
+                let uncached_displaced = receipt.uncached_displaced_slots;
+                for payload in receipt.displaced_sources {
+                    let preload_bytes = payload.preload_bytes();
+                    let Some((layer_id, slot, cue_id)) = payload.single_layer_slot_descriptor()
+                    else {
+                        log::error!("Displaced prepared source lacked a single-slot descriptor");
+                        continue;
+                    };
+                    self.cache_gpu_payload(CachedPerformancePayload {
+                        payload,
+                        descriptors: vec![PreparedSlotDescriptor {
+                            layer_id,
+                            slot,
+                            cue_id,
+                        }],
+                        preload_bytes,
+                        deferred_history: None,
+                    });
+                }
+                match receipt.key {
+                    performance_runtime::PreparedTransactionKey::Scene(scene_id) => {
+                        self.scene_status = format!(
+                            "Scene {} committed atomically to {} layer{}",
+                            scene_id.get(),
+                            committed.len(),
+                            if committed.len() == 1 { "" } else { "s" }
+                        );
+                    }
+                    performance_runtime::PreparedTransactionKey::LayerSlot {
+                        layer_id,
+                        slot_id,
+                    } => {
+                        self.source_staging_status =
+                            format!("Activated layer {} slot {}", layer_id.get(), slot_id.get());
+                    }
+                }
+                if !uncached_displaced.is_empty() {
+                    self.source_staging_status.push_str(&format!(
+                        "; {} displaced source{} exceeded the prepared cache budget and must reopen if recalled",
+                        uncached_displaced.len(),
+                        if uncached_displaced.len() == 1 { "" } else { "s" }
+                    ));
+                }
+                self.invalidate_source_cut_generation();
+                if let Some(before) = deferred_before {
+                    if let Err(error) = self.record_deferred_performance_history(before) {
+                        self.history_status =
+                            format!("Deferred slot history bookkeeping failed: {error}");
+                    }
+                }
+                committed
+            }
+            Err(rejected) => {
+                let failure = rejected.failure;
+                self.source_staging_status = format!("Prepared commit rejected: {failure}");
+                if matches!(
+                    failure.key,
+                    performance_runtime::PreparedTransactionKey::Scene(_)
+                ) {
+                    self.scene_status.clone_from(&self.source_staging_status);
+                }
+                log::error!("{}", self.source_staging_status);
+                Vec::new()
+            }
+        }
+    }
+
+    fn poll_and_release_performance(
+        &mut self,
+        crossings: performance::BeatCrossings,
+        gates: TransportGates,
+        now: Instant,
+    ) -> Vec<image_routing::StableLayerId> {
+        let poll = self
+            .performance_runtime
+            .as_mut()
+            .map(performance_runtime::PerformancePreparationRuntime::poll)
+            .unwrap_or(performance_runtime::PreparationPoll::Idle);
+        let mut armed_from_new_readiness = false;
+        match poll {
+            performance_runtime::PreparationPoll::Idle => {}
+            performance_runtime::PreparationPoll::Pending { generation } => {
+                if self
+                    .performance_staging
+                    .as_ref()
+                    .is_some_and(|intent| intent.generation == generation)
+                {
+                    self.source_staging_status =
+                        format!("Preparing source generation {}", generation.get());
+                }
+            }
+            performance_runtime::PreparationPoll::Ready { generation, key } => {
+                let intent = self
+                    .performance_staging
+                    .take()
+                    .filter(|intent| intent.generation == generation && intent.key == key);
+                let Some(intent) = intent else {
+                    if let Some(runtime) = self.performance_runtime.as_mut() {
+                        let _ = runtime.take_ready(&key);
+                    }
+                    self.source_staging_status =
+                        format!("Discarded unowned prepared generation {}", generation.get());
+                    return Vec::new();
+                };
+                let Some(prepared) = self
+                    .performance_runtime
+                    .as_mut()
+                    .and_then(|runtime| runtime.take_ready(&key))
+                else {
+                    self.source_staging_status = format!(
+                        "Prepared generation {} disappeared before GPU activation",
+                        generation.get()
+                    );
+                    return Vec::new();
+                };
+                let preload_bytes = prepared.preload_bytes();
+                let activation = self.renderer.as_ref().map_or_else(
+                    || {
+                        Err(performance_runtime::PreparationFailure {
+                            generation,
+                            key: key.clone(),
+                            kind: performance_runtime::PreparationFailureKind::GpuActivation,
+                            message: "renderer is not ready for GPU source activation".to_string(),
+                        })
+                    },
+                    |renderer| {
+                        prepared.activate_gpu(&renderer.device, &renderer.queue, &self.layers)
+                    },
+                );
+                match activation {
+                    Ok(mut payload) => {
+                        let mut deferred_history = intent.deferred_history;
+                        if intent.publish_inactive_metadata {
+                            let deferred_before = match deferred_history.as_ref() {
+                                Some(deferred) => {
+                                    match self.prepare_deferred_performance_history(deferred) {
+                                        Ok(before) => Some(before),
+                                        Err(error) => {
+                                            self.source_staging_status = error;
+                                            return Vec::new();
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
+                            if let Err(error) =
+                                payload.publish_inactive_slot_metadata(&mut self.layers)
+                            {
+                                self.source_staging_status =
+                                    format!("Prepared metadata publication rejected: {error}");
+                                return Vec::new();
+                            }
+                            if let Some(before) = deferred_before {
+                                deferred_history = None;
+                                if let Err(error) = self.record_deferred_performance_history(before)
+                                {
+                                    self.history_status = format!(
+                                        "Deferred slot history bookkeeping failed: {error}"
+                                    );
+                                }
+                            }
+                        }
+                        self.cache_gpu_payload(CachedPerformancePayload {
+                            payload,
+                            descriptors: intent.descriptors,
+                            preload_bytes,
+                            deferred_history,
+                        });
+                        self.source_staging_status = format!(
+                            "Prepared source generation {} is GPU-ready",
+                            generation.get()
+                        );
+                        if let Some(trigger_mode) = intent.activate {
+                            armed_from_new_readiness =
+                                self.arm_performance_activation(key, trigger_mode);
+                        }
+                    }
+                    Err(error) => {
+                        self.source_staging_status = format!("GPU preparation failed: {error}");
+                        if matches!(
+                            error.key,
+                            performance_runtime::PreparedTransactionKey::Scene(_)
+                        ) {
+                            self.scene_status.clone_from(&self.source_staging_status);
+                        }
+                    }
+                }
+            }
+            performance_runtime::PreparationPoll::Failed(error) => {
+                self.performance_staging = None;
+                self.source_staging_status = format!("Source preparation failed: {error}");
+                if matches!(
+                    error.key,
+                    performance_runtime::PreparedTransactionKey::Scene(_)
+                ) {
+                    self.scene_status.clone_from(&self.source_staging_status);
+                }
+                log::error!("{}", self.source_staging_status);
+            }
+        }
+
+        let Some(scheduled) = self.performance_scheduled.clone() else {
+            return Vec::new();
+        };
+        if !gates.media_running {
+            return Vec::new();
+        }
+        let due = match scheduled.trigger_mode {
+            transport::TriggerMode::Immediate => true,
+            transport::TriggerMode::NextBeat => {
+                !armed_from_new_readiness && crossings.crossed_beat()
+            }
+            transport::TriggerMode::NextBar => !armed_from_new_readiness && crossings.crossed_bar(),
+        };
+        if !due {
+            return Vec::new();
+        }
+        self.performance_scheduled = None;
+        self.commit_cached_performance(&scheduled.key, now)
+    }
+
+    fn remap_scenes_after_layer_move(&mut self, from: usize, to: usize) {
+        for scene in self.scenes.iter_mut() {
+            let remapped: Vec<_> = scene
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let position =
+                        usize::try_from(binding.layer_position.get()).unwrap_or(usize::MAX);
+                    let next = if position == from {
+                        to
+                    } else if from < to && position > from && position <= to {
+                        position - 1
+                    } else if to < from && position >= to && position < from {
+                        position + 1
+                    } else {
+                        position
+                    };
+                    performance::SceneBinding {
+                        layer_position: performance::SavedLayerPosition::new(
+                            u32::try_from(next).expect("live layer positions fit the saved bound"),
+                        )
+                        .expect("live layer positions fit the saved bound"),
+                        ..*binding
+                    }
+                })
+                .collect();
+            scene.bindings = performance::SceneBindings::try_from_vec(remapped)
+                .expect("a permutation preserves unique bounded Scene bindings");
+        }
+    }
+
+    fn remap_scenes_after_layer_remove(&mut self, removed: usize) -> Vec<performance::SceneId> {
+        let removed_u32 = u32::try_from(removed).unwrap_or(u32::MAX);
+        let invalidated: Vec<_> = self
+            .scenes
+            .iter()
+            .filter(|scene| {
+                scene
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.layer_position.get() == removed_u32)
+            })
+            .map(|scene| scene.id)
+            .collect();
+        for scene_id in &invalidated {
+            self.scenes.remove(*scene_id);
+        }
+        for scene in self.scenes.iter_mut() {
+            let remapped: Vec<_> = scene
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let position = binding.layer_position.get();
+                    let next = if position > removed_u32 {
+                        position - 1
+                    } else {
+                        position
+                    };
+                    performance::SceneBinding {
+                        layer_position: performance::SavedLayerPosition::new(next)
+                            .expect("decremented saved positions remain bounded"),
+                        ..*binding
+                    }
+                })
+                .collect();
+            scene.bindings = performance::SceneBindings::try_from_vec(remapped)
+                .expect("removing one position preserves unique Scene bindings");
+        }
+        invalidated
+    }
+
+    fn invalidate_prepared_scene(&mut self, scene_id: performance::SceneId) {
+        let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
+        self.evict_cached_performance_key(&key);
+        if self
+            .performance_staging
+            .as_ref()
+            .is_some_and(|intent| intent.key == key)
+        {
+            if let Some(runtime) = self.performance_runtime.as_mut() {
+                if let Err(error) = runtime.cancel_pending() {
+                    log::error!("Could not cancel Scene preparation: {error}");
+                }
+            }
+            self.performance_staging = None;
+        }
+    }
+
+    fn capture_scene(
+        &mut self,
+        requested_id: Option<performance::SceneId>,
+        name: String,
+        trigger_mode: transport::TriggerMode,
+    ) {
+        if self.layers.is_empty() {
+            self.scene_status = "Cannot capture an empty layer stack as a Scene".to_string();
+            return;
+        }
+        if self.layers.len() > performance::MAX_SCENE_BINDINGS {
+            self.scene_status = format!(
+                "Cannot capture {} layers; a Scene may bind at most {}",
+                self.layers.len(),
+                performance::MAX_SCENE_BINDINGS
+            );
+            return;
+        }
+        let name = name.trim().to_string();
+        if name.len() > 128 || name.chars().any(char::is_control) {
+            self.scene_status =
+                "Scene name must be control-free UTF-8 no longer than 128 bytes".to_string();
+            return;
+        }
+        let scene_id = match requested_id {
+            Some(scene_id) if self.scenes.get(scene_id).is_some() => scene_id,
+            Some(scene_id) => {
+                self.scene_status = format!(
+                    "Cannot recapture missing Scene {}; no Scene was changed",
+                    scene_id.get()
+                );
+                return;
+            }
+            None => {
+                let available = (1..=u16::MAX)
+                    .filter_map(performance::SceneId::new)
+                    .find(|candidate| self.scenes.get(*candidate).is_none());
+                let Some(scene_id) = available else {
+                    self.scene_status = "No non-zero Scene identity is available".to_string();
+                    return;
+                };
+                scene_id
+            }
+        };
+        let bindings = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(position, layer)| {
+                let position = u32::try_from(position)
+                    .ok()
+                    .and_then(performance::SavedLayerPosition::new)
+                    .ok_or_else(|| {
+                        format!("layer position {position} is outside the Scene bound")
+                    })?;
+                Ok(performance::SceneBinding {
+                    layer_position: position,
+                    slot_id: layer.active_clip_slot,
+                    cue_id: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>();
+        let bindings = match bindings.and_then(|bindings| {
+            performance::SceneBindings::try_from_vec(bindings).map_err(|error| error.to_string())
+        }) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                self.scene_status = format!("Cannot capture Scene {}: {error}", scene_id.get());
+                return;
+            }
+        };
+        self.invalidate_prepared_scene(scene_id);
+        if let Err(error) = self.scenes.upsert(performance::Scene {
+            id: scene_id,
+            name,
+            trigger_mode,
+            bindings,
+        }) {
+            self.scene_status = format!("Cannot capture Scene {}: {error}", scene_id.get());
+            return;
+        }
+        self.scene_status = format!(
+            "Captured Scene {} from {} active layer slot{}",
+            scene_id.get(),
+            self.layers.len(),
+            if self.layers.len() == 1 { "" } else { "s" }
+        );
+    }
+
     fn release_quantized_actions_on_downbeat(&mut self) {
         let bar = (self.mod_matrix.current_beat / 4.0).floor() as i64;
         // A downbeat is a forward crossing. Tap/MIDI reanchors may move the
@@ -2371,11 +10372,1888 @@ impl App {
         }
     }
 
-    /// Handle an action from the web UI.
+    /// Apply M4 authoring against a detached full visual world. If an active
+    /// Morph must first be materialized, any later validation/preflight error
+    /// restores both the authored world and the Morph slots exactly.
+    fn handle_motion_web_action(&mut self, action: &web::state::WebAction) -> bool {
+        use web::state::{MotionScopeSnapshot, WebAction};
+        if !matches!(
+            action,
+            WebAction::SetMotion { .. }
+                | WebAction::SetMotionDonor { .. }
+                | WebAction::ClearMotionMemory
+        ) {
+            return false;
+        }
+
+        if matches!(action, WebAction::ClearMotionMemory) {
+            self.clear_motion_memory();
+            self.composition_status = "Motion memory clear queued".to_string();
+            return true;
+        }
+
+        let baseline = StagedMorphWorld::capture_authored(self);
+        let prior_morph = self.morph.clone();
+        let result = (|| -> Result<(StagedMorphWorld, MotionEditImpact, String), String> {
+            if !self.release_active_morph_for_manual_edit() {
+                return Err("active Morph sample cannot be materialized safely".into());
+            }
+            let mut candidate = StagedMorphWorld::capture_authored(self);
+            let (impact, status) = match action {
+                WebAction::SetMotion {
+                    scope,
+                    param,
+                    value,
+                } => match scope {
+                    MotionScopeSnapshot::Master => {
+                        let impact =
+                            apply_motion_param(&mut candidate.master_motion, true, param, value)?;
+                        (impact, format!("Updated master Motion {param}"))
+                    }
+                    MotionScopeSnapshot::Layer { layer_id } => {
+                        let layer_id = parse_nonzero_decimal(layer_id)
+                            .and_then(image_routing::StableLayerId::new)
+                            .ok_or_else(|| "motion layer ID is malformed".to_string())?;
+                        let layer = candidate
+                            .layers
+                            .iter_mut()
+                            .find(|layer| layer.layer_id == layer_id)
+                            .ok_or_else(|| format!("motion layer {} is absent", layer_id.get()))?;
+                        let impact = apply_motion_param(&mut layer.motion, false, param, value)?;
+                        (
+                            impact,
+                            format!("Updated layer {} Motion {param}", layer_id.get()),
+                        )
+                    }
+                },
+                WebAction::SetMotionDonor {
+                    layer_id,
+                    donor_layer_id,
+                    layer_stack_revision,
+                } => {
+                    if *layer_stack_revision == 0
+                        || *layer_stack_revision != self.layer_stack_revision
+                    {
+                        return Err(format!(
+                            "motion donor edit revision {} is stale; current layer revision is {}",
+                            layer_stack_revision, self.layer_stack_revision
+                        ));
+                    }
+                    let recipient_id = parse_nonzero_decimal(layer_id)
+                        .and_then(image_routing::StableLayerId::new)
+                        .ok_or_else(|| "motion recipient layer ID is malformed".to_string())?;
+                    let donor = match donor_layer_id.as_deref() {
+                        None => motion::MotionDonor::None,
+                        Some(value) => {
+                            let donor_id = parse_nonzero_decimal(value)
+                                .and_then(image_routing::StableLayerId::new)
+                                .ok_or_else(|| "motion donor layer ID is malformed".to_string())?;
+                            if donor_id == recipient_id {
+                                return Err("a Faraday recipient cannot donate to itself".into());
+                            }
+                            let saved_position =
+                                self.creative_saved_position(donor_id).ok_or_else(|| {
+                                    format!("motion donor layer {} is absent", donor_id.get())
+                                })?;
+                            motion::MotionDonor::Selected {
+                                layer_id: donor_id,
+                                saved_position,
+                            }
+                        }
+                    };
+                    let recipient = candidate
+                        .layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == recipient_id)
+                        .ok_or_else(|| {
+                            format!("motion recipient layer {} is absent", recipient_id.get())
+                        })?;
+                    let impact = if recipient.motion.transplant.donor == donor {
+                        MotionEditImpact::NoChange
+                    } else {
+                        recipient.motion.transplant.donor = donor;
+                        MotionEditImpact::MemoryTopology
+                    };
+                    (
+                        impact,
+                        format!("Updated layer {} Faraday donor", recipient_id.get()),
+                    )
+                }
+                WebAction::ClearMotionMemory => unreachable!("handled before staging"),
+                _ => unreachable!("motion action family was matched"),
+            };
+            self.preflight_creative_graph_with_visuals(
+                &candidate.graph,
+                &candidate.master_effects,
+                &candidate.master_transform,
+                &candidate.master_motion,
+                &candidate.ntsc_params,
+                &candidate.temporal_params,
+                &candidate.layers,
+            )?;
+            Ok((candidate, impact, status))
+        })();
+
+        match result {
+            Ok((candidate, impact, status)) => {
+                candidate.install(self);
+                if impact == MotionEditImpact::MemoryTopology {
+                    self.clear_motion_memory();
+                    self.bump_composition_revision();
+                }
+                self.composition_status = status;
+            }
+            Err(error) => {
+                baseline.install(self);
+                self.morph = prior_morph;
+                self.composition_status = format!("Motion edit rejected: {error}");
+                log::warn!("{}", self.composition_status);
+            }
+        }
+        true
+    }
+
+    fn history_action_is_performance_only(action: &web::state::WebAction) -> bool {
+        use web::state::WebAction;
+        matches!(
+            action,
+            WebAction::Quantized { .. }
+                | WebAction::LoadClipIntoSlot { .. }
+                | WebAction::ActivateClipSlot { .. }
+                | WebAction::TriggerClipCue { .. }
+                | WebAction::SeekClipSlot { .. }
+                | WebAction::PrepareScene { .. }
+                | WebAction::TriggerScene { .. }
+                | WebAction::TapTempo
+                | WebAction::Gyro { .. }
+                | WebAction::GyroStream { .. }
+                | WebAction::GyroCalibrate
+                | WebAction::Pad { .. }
+                | WebAction::TriggerCollisionScore
+                | WebAction::ClearTemporalMemory
+                | WebAction::ClearMotionMemory
+                | WebAction::SetOutputWindow { .. }
+                | WebAction::ToggleOutputWindow
+                | WebAction::SetSpout { .. }
+                | WebAction::StartProgramRecording { .. }
+                | WebAction::FinishProgramRecording
+                | WebAction::CancelProgramRecording
+                | WebAction::CaptureStill { .. }
+                | WebAction::StartResample { .. }
+                | WebAction::SetStageHealthHud { .. }
+                | WebAction::SetStageTestCard { .. }
+                | WebAction::SetOutputIdentification { .. }
+                | WebAction::RescanLibrary
+                | WebAction::QuickSavePatch
+                | WebAction::StartExport { .. }
+                | WebAction::CancelExport
+                | WebAction::ControllerProfile {
+                    request: controller_profile::ControllerProfileAction::Export {},
+                }
+        )
+    }
+
+    fn begin_history_gesture(&mut self, raw_id: u64) {
+        let Some(id) = history::HistoryGestureId::new(raw_id) else {
+            self.history_status = "History gesture ID must be non-zero".to_string();
+            return;
+        };
+        let checkpoint = match self.history_checkpoint("Adjust controls", "gesture") {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.history_status = format!("History gesture rejected before mutation: {error}");
+                return;
+            }
+        };
+        let fingerprint = checkpoint.fingerprint();
+        match self.manual_history.begin_gesture(
+            id,
+            history::MutationOrigin::BrowserManual,
+            checkpoint,
+        ) {
+            Ok(_) => {
+                self.history_gesture_begin = Some((id, fingerprint));
+                self.history_status = format!("History gesture {} started", id.get());
+            }
+            Err(error) => self.history_status = error.to_string(),
+        }
+    }
+
+    fn finish_history_gesture(&mut self, raw_id: u64) {
+        let Some(id) = history::HistoryGestureId::new(raw_id) else {
+            self.history_status = "History gesture ID must be non-zero".to_string();
+            return;
+        };
+        let (_, canonical) = match self.capture_manual_history_world() {
+            Ok(captured) => captured,
+            Err(error) => {
+                self.history_status = format!("History gesture could not finish: {error}");
+                return;
+            }
+        };
+        match self
+            .manual_history
+            .finish_gesture(id, history::fingerprint_canonical(&canonical))
+        {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("History gesture {} committed", id.get());
+                self.append_recovery_checkpoint("manual gesture");
+            }
+            Ok(history::HistoryRecordOutcome::NoChange) => {
+                self.history_gesture_begin = None;
+                self.history_status = "History gesture made no authored change".to_string();
+            }
+            Ok(outcome) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("History gesture finished: {outcome:?}");
+            }
+            Err(error) => self.history_status = error.to_string(),
+        }
+    }
+
+    fn cancel_history_gesture(&mut self, raw_id: u64) {
+        let Some(id) = history::HistoryGestureId::new(raw_id) else {
+            self.history_status = "History gesture ID must be non-zero".to_string();
+            return;
+        };
+        let current_fingerprint = match self.capture_manual_history_world() {
+            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+            Err(error) => {
+                self.history_status = format!("History gesture could not cancel: {error}");
+                return;
+            }
+        };
+        if self
+            .history_gesture_begin
+            .is_some_and(|(open, before)| open == id && before != current_fingerprint)
+        {
+            self.history_status =
+                "A changed gesture cannot be cancelled; end it after restoring its start value"
+                    .to_string();
+            return;
+        }
+        match self.manual_history.cancel_gesture(id) {
+            Ok(_) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("History gesture {} cancelled", id.get());
+            }
+            Err(error) => self.history_status = error.to_string(),
+        }
+    }
+
+    fn apply_native_history_boundaries(
+        &mut self,
+        boundaries: Vec<patch::editor::EditorHistoryBoundary>,
+        mut before_frame: Option<history::HistoryCheckpoint<ManualHistoryWorld>>,
+    ) {
+        for boundary in boundaries {
+            match boundary {
+                patch::editor::EditorHistoryBoundary::Begin {
+                    gesture_id,
+                    label,
+                    category,
+                } => {
+                    let Some(id) = history::HistoryGestureId::new(gesture_id) else {
+                        self.history_status = "Native history gesture ID is invalid".into();
+                        continue;
+                    };
+                    let checkpoint = before_frame
+                        .take()
+                        .map_or_else(|| self.history_checkpoint(&label, &category), Ok);
+                    match checkpoint.and_then(|checkpoint| {
+                        let fingerprint = checkpoint.fingerprint();
+                        self.manual_history
+                            .begin_gesture(id, history::MutationOrigin::NativeManual, checkpoint)
+                            .map(|outcome| (outcome, fingerprint))
+                            .map_err(|error| error.to_string())
+                    }) {
+                        Ok((_, fingerprint)) => {
+                            self.history_gesture_begin = Some((id, fingerprint));
+                            self.history_status = format!("Native edit {} started", id.get());
+                        }
+                        Err(error) => {
+                            self.history_status = format!("Native edit rejected: {error}");
+                        }
+                    }
+                }
+                patch::editor::EditorHistoryBoundary::End { gesture_id } => {
+                    let Some(id) = history::HistoryGestureId::new(gesture_id) else {
+                        self.history_status = "Native history gesture ID is invalid".into();
+                        continue;
+                    };
+                    let after = self
+                        .capture_manual_history_world()
+                        .map(|(_, canonical)| history::fingerprint_canonical(&canonical));
+                    match after.and_then(|fingerprint| {
+                        self.manual_history
+                            .finish_gesture(id, fingerprint)
+                            .map_err(|error| error.to_string())
+                    }) {
+                        Ok(history::HistoryRecordOutcome::Recorded) => {
+                            self.history_gesture_begin = None;
+                            self.history_status = format!("Native edit {} committed", id.get());
+                            self.append_recovery_checkpoint("native edit");
+                        }
+                        Ok(history::HistoryRecordOutcome::NoChange) => {
+                            self.history_gesture_begin = None;
+                            self.history_status = "Native edit made no authored change".into();
+                        }
+                        Ok(outcome) => {
+                            self.history_gesture_begin = None;
+                            self.history_status = format!("Native edit history: {outcome:?}");
+                        }
+                        Err(error) => {
+                            self.history_status = format!("Native edit could not finish: {error}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wrap an immediate native authored mutation in the same bounded manual
+    /// history/recovery transaction used by browser one-shot edits. Native
+    /// shortcuts and drag/drop must not become an untracked authority merely
+    /// because they bypass the WebAction dispatcher.
+    fn apply_native_manual_action(
+        &mut self,
+        label: &str,
+        category: &str,
+        action: impl FnOnce(&mut Self),
+    ) -> bool {
+        if let Some((id, origin)) = self.manual_history.open_gesture() {
+            self.history_status = format!(
+                "Native action rejected while {:?} history gesture {} is active",
+                origin,
+                id.get()
+            );
+            return false;
+        }
+        let before = match self.history_checkpoint(label, category) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.history_status = format!("Native action rejected before mutation: {error}");
+                return false;
+            }
+        };
+        action(self);
+        let after_fingerprint = match self.capture_manual_history_world() {
+            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+            Err(error) => {
+                self.history_status = format!("Native action history capture failed: {error}");
+                return true;
+            }
+        };
+        match self.manual_history.record_manual(
+            history::MutationOrigin::NativeManual,
+            before,
+            after_fingerprint,
+        ) {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.history_status = format!("{label} committed");
+                self.append_recovery_checkpoint("native manual action");
+            }
+            Ok(history::HistoryRecordOutcome::NoChange) => {}
+            Ok(outcome) => self.history_status = format!("Native action history: {outcome:?}"),
+            Err(error) => self.history_status = format!("Native action history failed: {error}"),
+        }
+        true
+    }
+
+    fn apply_native_transport_flow(
+        &mut self,
+        flow: ControlFlow,
+        selected_layer: Option<usize>,
+    ) -> bool {
+        match flow {
+            ControlFlow::TogglePause => match selected_layer {
+                Some(index) if index < self.layers.len() => self.apply_native_manual_action(
+                    "Toggle selected layer pause",
+                    "transport",
+                    move |app| {
+                        if let Some(layer) = app.layers.get_mut(index) {
+                            layer.paused = !layer.paused;
+                            layer.reset_transport_timing();
+                        }
+                    },
+                ),
+                Some(_) => false,
+                None => {
+                    self.apply_native_manual_action("Toggle Program Freeze", "transport", |app| {
+                        app.set_master_paused(!app.master_paused)
+                    })
+                }
+            },
+            ControlFlow::ToggleMediaFreeze => {
+                self.apply_native_manual_action("Toggle Media Freeze", "transport", |app| {
+                    app.set_media_frozen(!app.media_frozen)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    fn restore_history_direction(&mut self, redo: bool) {
+        let (current_world, current_canonical) = match self.capture_manual_history_world() {
+            Ok(captured) => captured,
+            Err(error) => {
+                self.history_status = format!("Undo/redo rejected before mutation: {error}");
+                return;
+            }
+        };
+        let prepared = if redo {
+            self.manual_history.prepare_redo()
+        } else {
+            self.manual_history.prepare_undo()
+        };
+        let candidate = match prepared {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                self.history_status = if redo {
+                    "Nothing to redo".to_string()
+                } else {
+                    "Nothing to undo".to_string()
+                };
+                return;
+            }
+            Err(error) => {
+                self.history_status = error.to_string();
+                return;
+            }
+        };
+        let token = candidate.token();
+        let reverse = match candidate.checkpoint_current(current_world, &current_canonical) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ = self.manual_history.reject_restore(token);
+                self.history_status = format!("Undo/redo reverse checkpoint rejected: {error}");
+                return;
+            }
+        };
+        match self.restore_manual_history_world(candidate.target()) {
+            Ok(()) => match self.manual_history.commit_restore(token, reverse) {
+                Ok(()) => {
+                    self.history_status = if redo {
+                        format!("Redid {}", candidate.label())
+                    } else {
+                        format!("Undid {}", candidate.label())
+                    };
+                    self.append_recovery_checkpoint(if redo { "redo" } else { "undo" });
+                }
+                Err(error) => {
+                    self.history_status = format!("Undo/redo bookkeeping failed: {error}");
+                }
+            },
+            Err(error) => {
+                let _ = self.manual_history.reject_restore(token);
+                self.history_status = format!("Undo/redo restore rejected atomically: {error}");
+            }
+        }
+    }
+
+    fn validate_preset_revisions(
+        &self,
+        preset_revision: u64,
+        layer_stack_revision: u64,
+        composition_revision: u64,
+    ) -> Result<(), String> {
+        if preset_revision == 0 || preset_revision != self.preset_revision {
+            return Err(format!(
+                "stale preset revision {preset_revision}; current is {}",
+                self.preset_revision
+            ));
+        }
+        if layer_stack_revision == 0 || layer_stack_revision != self.layer_stack_revision {
+            return Err(format!(
+                "stale layer-stack revision {layer_stack_revision}; current is {}",
+                self.layer_stack_revision
+            ));
+        }
+        if composition_revision == 0 || composition_revision != self.composition_revision {
+            return Err(format!(
+                "stale composition revision {composition_revision}; current is {}",
+                self.composition_revision
+            ));
+        }
+        Ok(())
+    }
+
+    fn preset_layer_id(&self, value: &str) -> Result<image_routing::StableLayerId, String> {
+        let layer_id = parse_nonzero_decimal(value)
+            .and_then(image_routing::StableLayerId::new)
+            .ok_or_else(|| "preset layer ID is malformed".to_string())?;
+        self.layers
+            .iter()
+            .any(|layer| layer.stable_layer_id() == layer_id)
+            .then_some(layer_id)
+            .ok_or_else(|| format!("preset layer {} is absent", layer_id.get()))
+    }
+
+    fn capture_preset_payload(
+        &self,
+        kind: preset::PresetKind,
+        target: &web::state::PresetTargetSnapshot,
+    ) -> Result<preset::PresetPayload, String> {
+        use preset::{PresetKind, PresetPayload};
+        use web::state::PresetTargetSnapshot;
+        let saved_position = |layer_id| self.creative_saved_position(layer_id);
+        Ok(match (kind, target) {
+            (PresetKind::Transform, PresetTargetSnapshot::Master) => {
+                PresetPayload::Transform(self.master_transform)
+            }
+            (PresetKind::Transform, PresetTargetSnapshot::Layer { layer_id }) => {
+                let layer_id = self.preset_layer_id(layer_id)?;
+                let layer = self
+                    .layers
+                    .iter()
+                    .find(|layer| layer.stable_layer_id() == layer_id)
+                    .expect("preset layer existence was checked");
+                PresetPayload::Transform(layer.transform)
+            }
+            (PresetKind::Transform, PresetTargetSnapshot::Group { group_id }) => {
+                let group_id = parse_group_id(group_id)
+                    .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                let group = self
+                    .composition
+                    .group(group_id)
+                    .ok_or_else(|| format!("preset group {} is absent", group_id.get()))?;
+                PresetPayload::Transform(group.transform)
+            }
+            (PresetKind::Rack, PresetTargetSnapshot::Master) => PresetPayload::Rack(
+                preset::RackPreset::capture_runtime(&self.master_rack, saved_position)
+                    .map_err(|error| error.to_string())?,
+            ),
+            (PresetKind::Rack, PresetTargetSnapshot::Layer { layer_id }) => {
+                let layer_id = self.preset_layer_id(layer_id)?;
+                let rack = &self
+                    .layers
+                    .iter()
+                    .find(|layer| layer.stable_layer_id() == layer_id)
+                    .expect("preset layer existence was checked")
+                    .rack;
+                PresetPayload::Rack(
+                    preset::RackPreset::capture_runtime(rack, saved_position)
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+            (PresetKind::Rack, PresetTargetSnapshot::Group { group_id }) => {
+                let group_id = parse_group_id(group_id)
+                    .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                let rack = &self
+                    .composition
+                    .group(group_id)
+                    .ok_or_else(|| format!("preset group {} is absent", group_id.get()))?
+                    .rack;
+                PresetPayload::Rack(
+                    preset::RackPreset::capture_runtime(rack, saved_position)
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+            (PresetKind::Matte, PresetTargetSnapshot::Layer { layer_id }) => {
+                let layer_id = self.preset_layer_id(layer_id)?;
+                let matte = self
+                    .layers
+                    .iter()
+                    .find(|layer| layer.stable_layer_id() == layer_id)
+                    .expect("preset layer existence was checked")
+                    .matte;
+                PresetPayload::Matte(preset::MattePreset::from_layer(matte))
+            }
+            (PresetKind::Matte, PresetTargetSnapshot::Group { group_id }) => {
+                let group_id = parse_group_id(group_id)
+                    .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                let matte = self
+                    .composition
+                    .group(group_id)
+                    .and_then(|group| group.matte)
+                    .ok_or_else(|| "preset group has no matte value topology".to_string())?;
+                PresetPayload::Matte(preset::MattePreset::from_runtime_group(matte))
+            }
+            (PresetKind::Group, PresetTargetSnapshot::Group { group_id }) => {
+                let group_id = parse_group_id(group_id)
+                    .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                let group = self
+                    .composition
+                    .group(group_id)
+                    .ok_or_else(|| format!("preset group {} is absent", group_id.get()))?;
+                PresetPayload::Group(
+                    preset::GroupPreset::capture_runtime(group, saved_position)
+                        .map_err(|error| error.to_string())?,
+                )
+            }
+            (PresetKind::ControllerProfile, PresetTargetSnapshot::ControllerProfile) => {
+                PresetPayload::ControllerProfile(self.controller_profile.clone())
+            }
+            (PresetKind::StageMap, PresetTargetSnapshot::StageMap) => {
+                PresetPayload::StageMap(self.stage_map.clone())
+            }
+            _ => return Err("preset kind is incompatible with the selected target".to_string()),
+        })
+    }
+
+    fn apply_scoped_preset(
+        &mut self,
+        preset: &preset::ScopedPreset,
+        target: &web::state::PresetTargetSnapshot,
+    ) -> Result<(), String> {
+        use preset::PresetPayload;
+        use web::state::PresetTargetSnapshot;
+
+        match (&preset.payload, target) {
+            (
+                PresetPayload::ControllerProfile(profile),
+                PresetTargetSnapshot::ControllerProfile,
+            ) => {
+                self.install_controller_profile_document(profile.clone(), "applied")?;
+                return Ok(());
+            }
+            (PresetPayload::StageMap(stage_map), PresetTargetSnapshot::StageMap) => {
+                stage_map.validate().map_err(|error| error.to_string())?;
+                Self::persist_stage_map(stage_map)?;
+                self.stage_map = stage_map.clone();
+                return Ok(());
+            }
+            (PresetPayload::ControllerProfile(_), _) | (PresetPayload::StageMap(_), _) => {
+                return Err("document preset target is incompatible".to_string());
+            }
+            _ => {}
+        }
+
+        let baseline = StagedMorphWorld::capture_authored(self);
+        let prior_morph = self.morph.clone();
+        if !self.release_active_morph_for_manual_edit() {
+            return Err("active Morph sample cannot be materialized safely".to_string());
+        }
+        let result = (|| -> Result<(StagedMorphWorld, bool), String> {
+            let mut candidate = StagedMorphWorld::capture_authored(self);
+            let changed = match (&preset.payload, target) {
+                (PresetPayload::Transform(transform), PresetTargetSnapshot::Master) => {
+                    let changed = candidate.master_transform != *transform;
+                    candidate.master_transform = *transform;
+                    changed
+                }
+                (PresetPayload::Transform(transform), PresetTargetSnapshot::Layer { layer_id }) => {
+                    let layer_id = self.preset_layer_id(layer_id)?;
+                    let layer = candidate
+                        .layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == layer_id)
+                        .ok_or_else(|| "preset layer disappeared during staging".to_string())?;
+                    let changed = layer.transform != *transform;
+                    layer.transform = *transform;
+                    changed
+                }
+                (PresetPayload::Transform(transform), PresetTargetSnapshot::Group { group_id }) => {
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                    let group = candidate
+                        .graph
+                        .composition
+                        .group_mut(group_id)
+                        .ok_or_else(|| "preset group is absent".to_string())?;
+                    let changed = group.transform != *transform;
+                    group.transform = *transform;
+                    changed
+                }
+                (PresetPayload::Rack(values), PresetTargetSnapshot::Master) => {
+                    let before = candidate.graph.master_rack.clone();
+                    values
+                        .apply_to_runtime(&mut candidate.graph.master_rack)
+                        .map_err(|error| error.to_string())?;
+                    before != candidate.graph.master_rack
+                }
+                (PresetPayload::Rack(values), PresetTargetSnapshot::Layer { layer_id }) => {
+                    let layer_id = self.preset_layer_id(layer_id)?;
+                    let rack = candidate
+                        .graph
+                        .layer_racks
+                        .iter_mut()
+                        .find_map(|(candidate, rack)| (*candidate == layer_id).then_some(rack))
+                        .ok_or_else(|| "preset layer rack is absent".to_string())?;
+                    let before = rack.clone();
+                    values
+                        .apply_to_runtime(rack)
+                        .map_err(|error| error.to_string())?;
+                    before != *rack
+                }
+                (PresetPayload::Rack(values), PresetTargetSnapshot::Group { group_id }) => {
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                    let rack = &mut candidate
+                        .graph
+                        .composition
+                        .group_mut(group_id)
+                        .ok_or_else(|| "preset group is absent".to_string())?
+                        .rack;
+                    let before = rack.clone();
+                    values
+                        .apply_to_runtime(rack)
+                        .map_err(|error| error.to_string())?;
+                    before != *rack
+                }
+                (PresetPayload::Matte(values), PresetTargetSnapshot::Layer { layer_id }) => {
+                    let layer_id = self.preset_layer_id(layer_id)?;
+                    let layer = candidate
+                        .layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == layer_id)
+                        .ok_or_else(|| "preset layer is absent".to_string())?;
+                    let before = layer.matte;
+                    values.apply_to_layer(&mut layer.matte);
+                    before != layer.matte
+                }
+                (PresetPayload::Matte(values), PresetTargetSnapshot::Group { group_id }) => {
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                    let matte = candidate
+                        .graph
+                        .composition
+                        .group_mut(group_id)
+                        .and_then(|group| group.matte.as_mut())
+                        .ok_or_else(|| "preset group has no matte value topology".to_string())?;
+                    let before = *matte;
+                    values
+                        .apply_to_runtime_group(matte)
+                        .map_err(|error| error.to_string())?;
+                    before != *matte
+                }
+                (PresetPayload::Group(values), PresetTargetSnapshot::Group { group_id }) => {
+                    let group_id = parse_group_id(group_id)
+                        .ok_or_else(|| "preset group ID is malformed".to_string())?;
+                    let group = candidate
+                        .graph
+                        .composition
+                        .group_mut(group_id)
+                        .ok_or_else(|| "preset group is absent".to_string())?;
+                    let before = group.clone();
+                    values
+                        .apply_to_runtime(group)
+                        .map_err(|error| error.to_string())?;
+                    before != *group
+                }
+                _ => {
+                    return Err(
+                        "preset payload is incompatible with the selected target".to_string()
+                    );
+                }
+            };
+
+            self.preflight_creative_graph_with_visuals(
+                &candidate.graph,
+                &candidate.master_effects,
+                &candidate.master_transform,
+                &candidate.master_motion,
+                &candidate.ntsc_params,
+                &candidate.temporal_params,
+                &candidate.layers,
+            )?;
+            Ok((candidate, changed))
+        })();
+        match result {
+            Ok((candidate, changed)) => {
+                if changed {
+                    candidate.install(self);
+                    self.bump_composition_revision();
+                    self.invalidate_source_cut_generation();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                baseline.install(self);
+                self.morph = prior_morph;
+                Err(error)
+            }
+        }
+    }
+
+    fn normalized_range(value: f32, minimum: f32, maximum: f32) -> f32 {
+        if !value.is_finite() || maximum <= minimum {
+            0.0
+        } else {
+            ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
+        }
+    }
+
+    fn denormalized_range(value: f32, minimum: f32, maximum: f32) -> f32 {
+        minimum + value.clamp(0.0, 1.0) * (maximum - minimum)
+    }
+
+    const fn normalized_bool(value: bool) -> f32 {
+        if value {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn automation_requested_value(
+        value: controller_profile::AutomationValue,
+        current: f32,
+    ) -> Option<f32> {
+        match value.finite_bounded()? {
+            controller_profile::AutomationValue::Absolute(value) => Some(value),
+            controller_profile::AutomationValue::Delta(delta) => {
+                Some((current + delta).clamp(0.0, 1.0))
+            }
+            controller_profile::AutomationValue::Trigger => Some(1.0),
+            controller_profile::AutomationValue::Gate(enabled) => {
+                Some(Self::normalized_bool(enabled))
+            }
+        }
+    }
+
+    fn rack_for_runtime_node_scope(
+        &self,
+        scope: controller_profile::RuntimeNodeScope,
+    ) -> Option<&RuntimeVisualRack> {
+        match scope {
+            controller_profile::RuntimeNodeScope::Master => Some(&self.master_rack),
+            controller_profile::RuntimeNodeScope::Layer(layer_id) => self
+                .layers
+                .iter()
+                .find(|layer| layer.stable_layer_id() == layer_id)
+                .map(|layer| &layer.rack),
+            controller_profile::RuntimeNodeScope::Group(group_id) => {
+                self.composition.group(group_id).map(|group| &group.rack)
+            }
+        }
+    }
+
+    fn automation_current_normalized(
+        &self,
+        address: controller_profile::RuntimeControlAddress,
+    ) -> Option<f32> {
+        use controller_profile::{ControlParameter as Param, RuntimeControlAddress as Address};
+        match address {
+            Address::LegacyMidiSlot(slot) => self.mod_matrix.midi.get(usize::from(slot)).copied(),
+            Address::Master(param) => Some(match param {
+                Param::PositionX => Self::normalized_range(
+                    self.master_transform.position[0],
+                    spatial::POSITION_MIN,
+                    spatial::POSITION_MAX,
+                ),
+                Param::PositionY => Self::normalized_range(
+                    self.master_transform.position[1],
+                    spatial::POSITION_MIN,
+                    spatial::POSITION_MAX,
+                ),
+                Param::ScaleX => Self::normalized_range(
+                    self.master_transform.scale[0],
+                    spatial::SCALE_MIN,
+                    spatial::SCALE_MAX,
+                ),
+                Param::ScaleY => Self::normalized_range(
+                    self.master_transform.scale[1],
+                    spatial::SCALE_MIN,
+                    spatial::SCALE_MAX,
+                ),
+                Param::Rotation => {
+                    Self::normalized_range(self.master_transform.rotation_deg, -180.0, 180.0)
+                }
+                Param::Brightness => {
+                    Self::normalized_range(self.master_effects.brightness, -1.0, 1.0)
+                }
+                Param::Contrast => Self::normalized_range(self.master_effects.contrast, -1.0, 1.0),
+                Param::Saturation => {
+                    Self::normalized_range(self.master_effects.saturation, -1.0, 1.0)
+                }
+                Param::Hue => Self::normalized_range(self.master_effects.hue_shift, -180.0, 180.0),
+                Param::BusCrossfade => self.composition.bus_crossfade(),
+                Param::Paused | Param::ProgramFreeze => Self::normalized_bool(self.master_paused),
+                Param::MediaFreeze => Self::normalized_bool(self.media_frozen),
+                Param::Blackout => Self::normalized_bool(self.blackout),
+                _ => return None,
+            }),
+            Address::Layer {
+                layer_id,
+                parameter,
+            } => {
+                let layer = self
+                    .layers
+                    .iter()
+                    .find(|layer| layer.stable_layer_id() == layer_id)?;
+                Some(match parameter {
+                    Param::Opacity | Param::Amount | Param::Value => layer.opacity,
+                    Param::Speed | Param::Rate => Self::normalized_range(layer.speed, 0.25, 4.0),
+                    Param::Visibility | Param::Enabled => Self::normalized_bool(layer.visible),
+                    Param::Paused => Self::normalized_bool(layer.paused),
+                    Param::PositionX => Self::normalized_range(
+                        layer.transform.position[0],
+                        spatial::POSITION_MIN,
+                        spatial::POSITION_MAX,
+                    ),
+                    Param::PositionY => Self::normalized_range(
+                        layer.transform.position[1],
+                        spatial::POSITION_MIN,
+                        spatial::POSITION_MAX,
+                    ),
+                    Param::ScaleX => Self::normalized_range(
+                        layer.transform.scale[0],
+                        spatial::SCALE_MIN,
+                        spatial::SCALE_MAX,
+                    ),
+                    Param::ScaleY => Self::normalized_range(
+                        layer.transform.scale[1],
+                        spatial::SCALE_MIN,
+                        spatial::SCALE_MAX,
+                    ),
+                    Param::Rotation => {
+                        Self::normalized_range(layer.transform.rotation_deg, -180.0, 180.0)
+                    }
+                    Param::Brightness => {
+                        Self::normalized_range(layer.effects.brightness, -1.0, 1.0)
+                    }
+                    Param::Contrast => Self::normalized_range(layer.effects.contrast, -1.0, 1.0),
+                    Param::Saturation => {
+                        Self::normalized_range(layer.effects.saturation, -1.0, 1.0)
+                    }
+                    Param::Hue => Self::normalized_range(layer.effects.hue_shift, -180.0, 180.0),
+                    _ => return None,
+                })
+            }
+            Address::Group {
+                group_id,
+                parameter,
+            } => {
+                let group = self.composition.group(group_id)?;
+                Some(match parameter {
+                    Param::Opacity | Param::Amount | Param::Value => group.opacity,
+                    Param::Solo => Self::normalized_bool(group.solo),
+                    Param::Bypass => Self::normalized_bool(group.bypass),
+                    Param::PositionX => Self::normalized_range(
+                        group.transform.position[0],
+                        spatial::POSITION_MIN,
+                        spatial::POSITION_MAX,
+                    ),
+                    Param::PositionY => Self::normalized_range(
+                        group.transform.position[1],
+                        spatial::POSITION_MIN,
+                        spatial::POSITION_MAX,
+                    ),
+                    Param::ScaleX => Self::normalized_range(
+                        group.transform.scale[0],
+                        spatial::SCALE_MIN,
+                        spatial::SCALE_MAX,
+                    ),
+                    Param::ScaleY => Self::normalized_range(
+                        group.transform.scale[1],
+                        spatial::SCALE_MIN,
+                        spatial::SCALE_MAX,
+                    ),
+                    Param::Rotation => {
+                        Self::normalized_range(group.transform.rotation_deg, -180.0, 180.0)
+                    }
+                    _ => return None,
+                })
+            }
+            Address::Node {
+                scope,
+                node_id,
+                parameter,
+            } => {
+                let node = self.rack_for_runtime_node_scope(scope)?.get(node_id)?;
+                Some(match parameter {
+                    Param::Wet | Param::Value => node.wet,
+                    Param::Enabled => Self::normalized_bool(node.enabled),
+                    Param::Bypass => Self::normalized_bool(!node.enabled),
+                    Param::Amount => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::Cellular(params) => params.amount,
+                        visual_rack::RuntimeVisualNodeKind::Shift(params) => params.amount,
+                        visual_rack::RuntimeVisualNodeKind::Grain(params) => params.intensity,
+                        visual_rack::RuntimeVisualNodeKind::Mask(
+                            visual_rack::RuntimeMaskParams::Image(params),
+                        ) => params.amount,
+                        _ => return None,
+                    },
+                    Param::Brightness => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::DigitalColor(params) => {
+                            Self::normalized_range(params.brightness, -1.0, 1.0)
+                        }
+                        _ => return None,
+                    },
+                    Param::Contrast => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::DigitalColor(params) => {
+                            Self::normalized_range(params.contrast, -1.0, 1.0)
+                        }
+                        _ => return None,
+                    },
+                    Param::Saturation => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::DigitalColor(params) => {
+                            Self::normalized_range(params.saturation, -1.0, 1.0)
+                        }
+                        _ => return None,
+                    },
+                    Param::Hue => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::DigitalColor(params) => {
+                            Self::normalized_range(params.hue_shift, -180.0, 180.0)
+                        }
+                        _ => return None,
+                    },
+                    Param::Threshold => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::Key(params) => params.threshold,
+                        visual_rack::RuntimeVisualNodeKind::Mask(
+                            visual_rack::RuntimeMaskParams::Image(params),
+                        ) => params.threshold,
+                        _ => return None,
+                    },
+                    Param::Softness => match node.kind {
+                        visual_rack::RuntimeVisualNodeKind::Key(params) => params.softness,
+                        visual_rack::RuntimeVisualNodeKind::Mask(
+                            visual_rack::RuntimeMaskParams::Image(params),
+                        ) => Self::normalized_range(params.softness, 0.0, 0.5),
+                        _ => return None,
+                    },
+                    _ => return None,
+                })
+            }
+            Address::Transport(parameter) => Some(match parameter {
+                Param::ProgramFreeze | Param::Paused => Self::normalized_bool(self.master_paused),
+                Param::MediaFreeze => Self::normalized_bool(self.media_frozen),
+                Param::Blackout => Self::normalized_bool(self.blackout),
+                Param::Play => Self::normalized_bool(!self.master_paused),
+                Param::Bpm => Self::normalized_range(self.mod_matrix.clock.bpm, 30.0, 300.0),
+                Param::SeekNormalized => self
+                    .selected_layer
+                    .and_then(|index| self.layers.get(index))
+                    .map_or(0.0, |layer| layer.clip_transport.position.get() as f32),
+                _ => return None,
+            }),
+        }
+    }
+
+    fn automation_node_scope_snapshot(
+        scope: controller_profile::RuntimeNodeScope,
+    ) -> web::state::CreativeScopeSnapshot {
+        match scope {
+            controller_profile::RuntimeNodeScope::Master => {
+                web::state::CreativeScopeSnapshot::Master
+            }
+            controller_profile::RuntimeNodeScope::Layer(layer_id) => {
+                web::state::CreativeScopeSnapshot::Layer {
+                    layer_id: layer_id.get().to_string(),
+                }
+            }
+            controller_profile::RuntimeNodeScope::Group(group_id) => {
+                web::state::CreativeScopeSnapshot::Group {
+                    group_id: group_id.get().to_string(),
+                }
+            }
+        }
+    }
+
+    fn apply_automation_control(
+        &mut self,
+        address: controller_profile::RuntimeControlAddress,
+        value: controller_profile::AutomationValue,
+    ) -> Result<f32, String> {
+        use controller_profile::{ControlParameter as Param, RuntimeControlAddress as Address};
+        use web::state::WebAction;
+        let current = self.automation_current_normalized(address).unwrap_or(0.0);
+        let requested = Self::automation_requested_value(value, current)
+            .ok_or_else(|| "automation value is non-finite".to_string())?;
+        let bool_value = requested >= 0.5;
+        let action = match address {
+            Address::LegacyMidiSlot(slot) => {
+                let slot = usize::from(slot);
+                let current = self
+                    .mod_matrix
+                    .midi
+                    .get(slot)
+                    .copied()
+                    .ok_or_else(|| "legacy MIDI slot is outside 0..4".to_string())?;
+                // The compatibility slots are sampled atomically from the
+                // learned CC numbers in `mod_matrix.midi_ccs`. The default
+                // four-CC profile observes those same bytes for typed
+                // telemetry, but must not overwrite a slot after MIDI Learn
+                // has rebound it to another controller.
+                return Ok(current);
+            }
+            Address::Master(parameter) => match parameter {
+                Param::PositionX
+                | Param::PositionY
+                | Param::ScaleX
+                | Param::ScaleY
+                | Param::Rotation => {
+                    let (param, actual) = match parameter {
+                        Param::PositionX => (
+                            "position_x",
+                            Self::denormalized_range(
+                                requested,
+                                spatial::POSITION_MIN,
+                                spatial::POSITION_MAX,
+                            ),
+                        ),
+                        Param::PositionY => (
+                            "position_y",
+                            Self::denormalized_range(
+                                requested,
+                                spatial::POSITION_MIN,
+                                spatial::POSITION_MAX,
+                            ),
+                        ),
+                        Param::ScaleX => (
+                            "scale_x",
+                            Self::denormalized_range(
+                                requested,
+                                spatial::SCALE_MIN,
+                                spatial::SCALE_MAX,
+                            ),
+                        ),
+                        Param::ScaleY => (
+                            "scale_y",
+                            Self::denormalized_range(
+                                requested,
+                                spatial::SCALE_MIN,
+                                spatial::SCALE_MAX,
+                            ),
+                        ),
+                        Param::Rotation => (
+                            "rotation_deg",
+                            Self::denormalized_range(requested, -180.0, 180.0),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    WebAction::SetMasterTransform {
+                        param: param.into(),
+                        value: serde_json::json!(actual),
+                    }
+                }
+                Param::Brightness | Param::Contrast | Param::Saturation | Param::Hue => {
+                    let (param, actual) = match parameter {
+                        Param::Brightness => {
+                            ("brightness", Self::denormalized_range(requested, -1.0, 1.0))
+                        }
+                        Param::Contrast => {
+                            ("contrast", Self::denormalized_range(requested, -1.0, 1.0))
+                        }
+                        Param::Saturation => {
+                            ("saturation", Self::denormalized_range(requested, -1.0, 1.0))
+                        }
+                        Param::Hue => (
+                            "hue_shift",
+                            Self::denormalized_range(requested, -180.0, 180.0),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    WebAction::SetParam {
+                        param: param.into(),
+                        value: serde_json::json!(actual),
+                    }
+                }
+                Param::BusCrossfade => WebAction::SetCompositionBusCrossfade { value: requested },
+                Param::Paused | Param::ProgramFreeze => {
+                    WebAction::SetProgramFrozen { frozen: bool_value }
+                }
+                Param::MediaFreeze => WebAction::SetMediaFrozen { frozen: bool_value },
+                Param::Blackout => WebAction::SetBlackout {
+                    enabled: bool_value,
+                },
+                _ => return Err("parameter is unsupported for master automation".to_string()),
+            },
+            Address::Layer {
+                layer_id,
+                parameter,
+            } => {
+                let index = self
+                    .layers
+                    .iter()
+                    .position(|layer| layer.stable_layer_id() == layer_id)
+                    .ok_or_else(|| format!("automation layer {} is absent", layer_id.get()))?;
+                let layer_id_text = Some(layer_id.get().to_string());
+                match parameter {
+                    Param::Opacity | Param::Amount | Param::Value => WebAction::SetLayerParam {
+                        index,
+                        layer_id: layer_id_text,
+                        param: "opacity".into(),
+                        value: serde_json::json!(requested),
+                    },
+                    Param::Speed | Param::Rate => WebAction::SetLayerParam {
+                        index,
+                        layer_id: layer_id_text,
+                        param: "speed".into(),
+                        value: serde_json::json!(Self::denormalized_range(requested, 0.25, 4.0)),
+                    },
+                    Param::Visibility | Param::Enabled => WebAction::SetLayerVisibility {
+                        index,
+                        layer_id: layer_id_text,
+                        visible: bool_value,
+                    },
+                    Param::Paused => WebAction::SetLayerPaused {
+                        index,
+                        layer_id: layer_id_text,
+                        paused: bool_value,
+                    },
+                    Param::PositionX
+                    | Param::PositionY
+                    | Param::ScaleX
+                    | Param::ScaleY
+                    | Param::Rotation => {
+                        let (param, actual) = match parameter {
+                            Param::PositionX => (
+                                "position_x",
+                                Self::denormalized_range(
+                                    requested,
+                                    spatial::POSITION_MIN,
+                                    spatial::POSITION_MAX,
+                                ),
+                            ),
+                            Param::PositionY => (
+                                "position_y",
+                                Self::denormalized_range(
+                                    requested,
+                                    spatial::POSITION_MIN,
+                                    spatial::POSITION_MAX,
+                                ),
+                            ),
+                            Param::ScaleX => (
+                                "scale_x",
+                                Self::denormalized_range(
+                                    requested,
+                                    spatial::SCALE_MIN,
+                                    spatial::SCALE_MAX,
+                                ),
+                            ),
+                            Param::ScaleY => (
+                                "scale_y",
+                                Self::denormalized_range(
+                                    requested,
+                                    spatial::SCALE_MIN,
+                                    spatial::SCALE_MAX,
+                                ),
+                            ),
+                            Param::Rotation => (
+                                "rotation_deg",
+                                Self::denormalized_range(requested, -180.0, 180.0),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        WebAction::SetLayerTransform {
+                            index,
+                            layer_id: layer_id_text,
+                            param: param.into(),
+                            value: serde_json::json!(actual),
+                        }
+                    }
+                    Param::Brightness | Param::Contrast | Param::Saturation | Param::Hue => {
+                        let (param, actual) = match parameter {
+                            Param::Brightness => {
+                                ("brightness", Self::denormalized_range(requested, -1.0, 1.0))
+                            }
+                            Param::Contrast => {
+                                ("contrast", Self::denormalized_range(requested, -1.0, 1.0))
+                            }
+                            Param::Saturation => {
+                                ("saturation", Self::denormalized_range(requested, -1.0, 1.0))
+                            }
+                            Param::Hue => (
+                                "hue_shift",
+                                Self::denormalized_range(requested, -180.0, 180.0),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        WebAction::SetLayerEffect {
+                            index,
+                            layer_id: layer_id_text,
+                            param: param.into(),
+                            value: serde_json::json!(actual),
+                        }
+                    }
+                    _ => return Err("parameter is unsupported for layer automation".to_string()),
+                }
+            }
+            Address::Group {
+                group_id,
+                parameter,
+            } => {
+                if !self.composition.contains_group(group_id) {
+                    return Err(format!("automation group {} is absent", group_id.get()));
+                }
+                let (param, value) = match parameter {
+                    Param::Opacity | Param::Amount | Param::Value => {
+                        ("opacity", serde_json::json!(requested))
+                    }
+                    Param::Solo => ("solo", serde_json::json!(bool_value)),
+                    Param::Bypass => ("bypass", serde_json::json!(bool_value)),
+                    Param::PositionX => (
+                        "position_x",
+                        serde_json::json!(Self::denormalized_range(
+                            requested,
+                            spatial::POSITION_MIN,
+                            spatial::POSITION_MAX
+                        )),
+                    ),
+                    Param::PositionY => (
+                        "position_y",
+                        serde_json::json!(Self::denormalized_range(
+                            requested,
+                            spatial::POSITION_MIN,
+                            spatial::POSITION_MAX
+                        )),
+                    ),
+                    Param::ScaleX => (
+                        "scale_x",
+                        serde_json::json!(Self::denormalized_range(
+                            requested,
+                            spatial::SCALE_MIN,
+                            spatial::SCALE_MAX
+                        )),
+                    ),
+                    Param::ScaleY => (
+                        "scale_y",
+                        serde_json::json!(Self::denormalized_range(
+                            requested,
+                            spatial::SCALE_MIN,
+                            spatial::SCALE_MAX
+                        )),
+                    ),
+                    Param::Rotation => (
+                        "rotation_deg",
+                        serde_json::json!(Self::denormalized_range(requested, -180.0, 180.0)),
+                    ),
+                    _ => return Err("parameter is unsupported for group automation".to_string()),
+                };
+                WebAction::SetCompositionGroupParam {
+                    group_id: group_id.get().to_string(),
+                    param: param.into(),
+                    value,
+                    composition_revision: self.composition_revision,
+                }
+            }
+            Address::Node {
+                scope,
+                node_id,
+                parameter,
+            } => {
+                let node = self
+                    .rack_for_runtime_node_scope(scope)
+                    .and_then(|rack| rack.get(node_id))
+                    .ok_or_else(|| format!("automation node {} is absent", node_id.get()))?;
+                let node_kind = visual_rack::node_kind_descriptor(node.kind.tag()).key;
+                let (param, value) = match parameter {
+                    Param::Wet | Param::Value => ("wet", serde_json::json!(requested)),
+                    Param::Enabled => ("enabled", serde_json::json!(bool_value)),
+                    Param::Bypass => ("enabled", serde_json::json!(!bool_value)),
+                    Param::Amount => {
+                        let param = match node.kind {
+                            visual_rack::RuntimeVisualNodeKind::Cellular(_)
+                            | visual_rack::RuntimeVisualNodeKind::Shift(_) => "amount",
+                            visual_rack::RuntimeVisualNodeKind::Grain(_) => "intensity",
+                            visual_rack::RuntimeVisualNodeKind::Mask(
+                                visual_rack::RuntimeMaskParams::Image(_),
+                            ) => "image_amount",
+                            _ => return Err("amount is unsupported for this node kind".to_string()),
+                        };
+                        (param, serde_json::json!(requested))
+                    }
+                    Param::Brightness | Param::Contrast | Param::Saturation | Param::Hue => {
+                        if !matches!(
+                            node.kind,
+                            visual_rack::RuntimeVisualNodeKind::DigitalColor(_)
+                        ) {
+                            return Err("color automation requires a digital_color node".into());
+                        }
+                        let param = match parameter {
+                            Param::Brightness => "brightness",
+                            Param::Contrast => "contrast",
+                            Param::Saturation => "saturation",
+                            Param::Hue => "hue_shift",
+                            _ => unreachable!(),
+                        };
+                        let actual = if parameter == Param::Hue {
+                            Self::denormalized_range(requested, -180.0, 180.0)
+                        } else {
+                            Self::denormalized_range(requested, -1.0, 1.0)
+                        };
+                        (param, serde_json::json!(actual))
+                    }
+                    Param::Threshold | Param::Softness => {
+                        let param = match (parameter, node.kind) {
+                            (Param::Threshold, visual_rack::RuntimeVisualNodeKind::Key(_)) => {
+                                "threshold"
+                            }
+                            (Param::Softness, visual_rack::RuntimeVisualNodeKind::Key(_)) => {
+                                "softness"
+                            }
+                            (
+                                Param::Threshold,
+                                visual_rack::RuntimeVisualNodeKind::Mask(
+                                    visual_rack::RuntimeMaskParams::Image(_),
+                                ),
+                            ) => "image_threshold",
+                            (
+                                Param::Softness,
+                                visual_rack::RuntimeVisualNodeKind::Mask(
+                                    visual_rack::RuntimeMaskParams::Image(_),
+                                ),
+                            ) => "image_softness",
+                            _ => return Err("key parameter is unsupported for this node".into()),
+                        };
+                        let actual = if parameter == Param::Softness
+                            && matches!(
+                                node.kind,
+                                visual_rack::RuntimeVisualNodeKind::Mask(
+                                    visual_rack::RuntimeMaskParams::Image(_)
+                                )
+                            ) {
+                            requested * 0.5
+                        } else {
+                            requested
+                        };
+                        (param, serde_json::json!(actual))
+                    }
+                    _ => return Err("parameter is unsupported for node automation".to_string()),
+                };
+                WebAction::SetVisualNodeParam {
+                    scope: Self::automation_node_scope_snapshot(scope),
+                    node_id: node_id.get().to_string(),
+                    node_kind: node_kind.into(),
+                    param: param.into(),
+                    value,
+                    composition_revision: self.composition_revision,
+                }
+            }
+            Address::Transport(parameter) => match parameter {
+                Param::ProgramFreeze | Param::Paused => {
+                    WebAction::SetProgramFrozen { frozen: bool_value }
+                }
+                Param::MediaFreeze => WebAction::SetMediaFrozen { frozen: bool_value },
+                Param::Blackout => WebAction::SetBlackout {
+                    enabled: bool_value,
+                },
+                Param::Play => WebAction::SetProgramFrozen {
+                    frozen: !bool_value,
+                },
+                Param::Bpm => WebAction::SetBpm {
+                    value: Self::denormalized_range(requested, 30.0, 300.0),
+                },
+                Param::SeekNormalized => {
+                    let layer = self
+                        .selected_layer
+                        .and_then(|index| self.layers.get(index))
+                        .ok_or_else(|| {
+                            "transport seek requires a selected live layer".to_string()
+                        })?;
+                    WebAction::SeekClipSlot {
+                        layer_id: layer.stable_layer_id().get().to_string(),
+                        slot_id: layer.active_clip_slot,
+                        position: transport::NormalizedTime::clamped(f64::from(requested)),
+                    }
+                }
+                Param::TapTempo
+                    if matches!(value, controller_profile::AutomationValue::Trigger) =>
+                {
+                    WebAction::TapTempo
+                }
+                Param::Downbeat
+                    if matches!(value, controller_profile::AutomationValue::Trigger) =>
+                {
+                    WebAction::TapTempo
+                }
+                Param::ClearMotionMemory
+                    if matches!(value, controller_profile::AutomationValue::Trigger) =>
+                {
+                    WebAction::ClearMotionMemory
+                }
+                Param::ClearTemporalMemory
+                    if matches!(value, controller_profile::AutomationValue::Trigger) =>
+                {
+                    WebAction::ClearTemporalMemory
+                }
+                _ => return Err("parameter is unsupported for transport automation".to_string()),
+            },
+        };
+        self.handle_web_action_inner(action);
+        Ok(self
+            .automation_current_normalized(address)
+            .unwrap_or(requested))
+    }
+
+    fn feedback_code(value: f32) -> u16 {
+        (value.clamp(0.0, 1.0) * f32::from(u16::MAX)).round() as u16
+    }
+
+    fn publish_controller_feedback(
+        &mut self,
+        address: controller_profile::RuntimeControlAddress,
+        normalized: f32,
+        origin: controller_profile::AutomationOrigin,
+    ) {
+        let normalized = if normalized.is_finite() {
+            normalized.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.controller_feedback_cache
+            .insert(address, Self::feedback_code(normalized));
+        self.midi.queue_feedback(address, normalized, origin);
+        self.osc.queue_feedback(address, normalized, origin);
+    }
+
+    /// Reflect authoritative host/native/browser changes to every controller
+    /// address that has explicit MIDI feedback. The value cache prevents a
+    /// warm frame from filling either bounded protocol queue, while inbound
+    /// events update the same cache before this pass to retain source-loop
+    /// suppression.
+    fn sync_controller_profile_feedback(&mut self) {
+        // Runtime addresses were resolved exactly once when this profile was
+        // installed. Re-resolving saved positions here would retarget motor
+        // feedback after an ordinary layer reorder even though input events
+        // correctly remain attached to their StableLayerIds.
+        let active = controller_feedback_addresses(self.midi.resolved_profile());
+        for address in active.iter().copied() {
+            let Some(normalized) = self.automation_current_normalized(address) else {
+                continue;
+            };
+            let code = Self::feedback_code(normalized);
+            if self.controller_feedback_cache.get(&address).copied() == Some(code) {
+                continue;
+            }
+            self.publish_controller_feedback(
+                address,
+                normalized,
+                controller_profile::AutomationOrigin::HostAutomation,
+            );
+        }
+        self.controller_feedback_cache
+            .retain(|address, _| active.contains(address));
+    }
+
+    fn resolve_pending_initial_controller_profile(&mut self) {
+        if !self.controller_profile_pending_initial_resolution {
+            return;
+        }
+        let layer_ids = self.live_layer_ids();
+        let resolved = self
+            .controller_profile
+            .resolve(|position| position.resolve(&layer_ids).copied());
+        match resolved {
+            Ok(profile) => {
+                self.controller_profile_pending_initial_resolution = false;
+                match self.midi.apply_profile(profile) {
+                    Ok(()) => {
+                        self.controller_feedback_cache.clear();
+                        self.controller_status = format!(
+                            "Resolved initial controller profile '{}' against the live layer identities",
+                            self.controller_profile.name
+                        );
+                    }
+                    Err(error) => {
+                        self.controller_status =
+                            format!("Initial controller profile runtime unavailable: {error}");
+                    }
+                }
+            }
+            Err(controller_profile::ControllerProfileError::MissingLayer(_)) => {}
+            Err(error) => {
+                self.controller_profile_pending_initial_resolution = false;
+                self.controller_status =
+                    format!("Initial controller profile resolution rejected: {error}");
+            }
+        }
+    }
+
+    fn drain_controller_events(&mut self) {
+        self.midi_events.clear();
+        self.midi.drain_events(&mut self.midi_events);
+        for index in 0..self.midi_events.len() {
+            let event = self.midi_events[index];
+            match event.kind {
+                controller_profile::ControllerEventKind::Control { address, value, .. } => {
+                    match self.apply_automation_control(address, value) {
+                        Ok(normalized) => {
+                            self.publish_controller_feedback(address, normalized, event.origin);
+                        }
+                        Err(error) => {
+                            self.controller_status = format!("MIDI control ignored: {error}")
+                        }
+                    }
+                }
+                controller_profile::ControllerEventKind::Transport(transport) => {
+                    let action = match transport {
+                        controller_profile::MidiTransportEvent::Start
+                        | controller_profile::MidiTransportEvent::Continue => {
+                            Some(web::state::WebAction::SetProgramFrozen { frozen: false })
+                        }
+                        controller_profile::MidiTransportEvent::Stop => {
+                            Some(web::state::WebAction::SetProgramFrozen { frozen: true })
+                        }
+                        controller_profile::MidiTransportEvent::Clock => None,
+                    };
+                    if let Some(action) = action {
+                        self.handle_web_action_inner(action);
+                    }
+                }
+            }
+        }
+        self.midi_events.clear();
+
+        self.osc_events.clear();
+        self.osc.drain_events(&mut self.osc_events);
+        for index in 0..self.osc_events.len() {
+            let event = self.osc_events[index];
+            match self.apply_automation_control(event.address, event.value) {
+                Ok(normalized) => {
+                    self.publish_controller_feedback(event.address, normalized, event.origin);
+                }
+                Err(error) => self.osc_status = format!("OSC control ignored: {error}"),
+            }
+        }
+        self.osc_events.clear();
+    }
+
+    fn feedback_address_for_web_action(
+        &self,
+        action: &web::state::WebAction,
+    ) -> Option<controller_profile::RuntimeControlAddress> {
+        use controller_profile::{
+            ControlParameter as Param, RuntimeControlAddress as Address,
+            RuntimeNodeScope as NodeScope,
+        };
+        use web::state::{CreativeScopeSnapshot, WebAction};
+
+        let master_param = |param: &str| match param {
+            "brightness" => Some(Param::Brightness),
+            "contrast" => Some(Param::Contrast),
+            "saturation" => Some(Param::Saturation),
+            "hue_shift" => Some(Param::Hue),
+            _ => None,
+        };
+        let transform_param = |param: &str| match param {
+            "position_x" => Some(Param::PositionX),
+            "position_y" => Some(Param::PositionY),
+            "scale_x" => Some(Param::ScaleX),
+            "scale_y" => Some(Param::ScaleY),
+            "rotation_deg" => Some(Param::Rotation),
+            _ => None,
+        };
+        let layer_address = |index: usize, layer_id: &Option<String>, parameter| {
+            self.resolve_layer_index(index, layer_id)
+                .and_then(|index| self.layers.get(index))
+                .map(|layer| Address::Layer {
+                    layer_id: layer.stable_layer_id(),
+                    parameter,
+                })
+        };
+
+        match action {
+            WebAction::SetParam { param, .. } => master_param(param).map(Address::Master),
+            WebAction::SetMasterTransform { param, .. } => {
+                transform_param(param).map(Address::Master)
+            }
+            WebAction::SetProgramFrozen { .. } => Some(Address::Transport(Param::ProgramFreeze)),
+            WebAction::SetMediaFrozen { .. } => Some(Address::Transport(Param::MediaFreeze)),
+            WebAction::SetBlackout { .. } => Some(Address::Transport(Param::Blackout)),
+            WebAction::SetBpm { .. } => Some(Address::Transport(Param::Bpm)),
+            WebAction::SetLayerParam {
+                index,
+                layer_id,
+                param,
+                ..
+            } => layer_address(
+                *index,
+                layer_id,
+                match param.as_str() {
+                    "opacity" => Param::Opacity,
+                    "speed" => Param::Speed,
+                    _ => return None,
+                },
+            ),
+            WebAction::SetLayerEffect {
+                index,
+                layer_id,
+                param,
+                ..
+            } => layer_address(*index, layer_id, master_param(param)?),
+            WebAction::SetLayerTransform {
+                index,
+                layer_id,
+                param,
+                ..
+            } => layer_address(*index, layer_id, transform_param(param)?),
+            WebAction::SetLayerVisibility {
+                index, layer_id, ..
+            } => layer_address(*index, layer_id, Param::Visibility),
+            WebAction::SetLayerPaused {
+                index, layer_id, ..
+            } => layer_address(*index, layer_id, Param::Paused),
+            WebAction::SetCompositionBusCrossfade { .. } => {
+                Some(Address::Master(Param::BusCrossfade))
+            }
+            WebAction::SetCompositionGroupParam {
+                group_id, param, ..
+            } => Some(Address::Group {
+                group_id: parse_group_id(group_id)?,
+                parameter: match param.as_str() {
+                    "opacity" => Param::Opacity,
+                    "solo" => Param::Solo,
+                    "bypass" => Param::Bypass,
+                    "position_x" => Param::PositionX,
+                    "position_y" => Param::PositionY,
+                    "scale_x" => Param::ScaleX,
+                    "scale_y" => Param::ScaleY,
+                    "rotation_deg" => Param::Rotation,
+                    _ => return None,
+                },
+            }),
+            WebAction::SetVisualNodeParam {
+                scope,
+                node_id,
+                param,
+                ..
+            } => {
+                let scope = match scope {
+                    CreativeScopeSnapshot::Master => NodeScope::Master,
+                    CreativeScopeSnapshot::Layer { layer_id } => NodeScope::Layer(
+                        image_routing::StableLayerId::new(parse_nonzero_decimal(layer_id)?)?,
+                    ),
+                    CreativeScopeSnapshot::Group { group_id } => {
+                        NodeScope::Group(parse_group_id(group_id)?)
+                    }
+                };
+                Some(Address::Node {
+                    scope,
+                    node_id: parse_node_id(node_id)?,
+                    parameter: match param.as_str() {
+                        "wet" => Param::Wet,
+                        "enabled" => Param::Enabled,
+                        "amount" | "intensity" | "image_amount" => Param::Amount,
+                        "brightness" => Param::Brightness,
+                        "contrast" => Param::Contrast,
+                        "saturation" => Param::Saturation,
+                        "hue_shift" => Param::Hue,
+                        "threshold" | "image_threshold" => Param::Threshold,
+                        "softness" | "image_softness" => Param::Softness,
+                        _ => return None,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_web_action_inner_with_feedback(
+        &mut self,
+        action: web::state::WebAction,
+    ) -> WebActionBatchDisposition {
+        let address = self.feedback_address_for_web_action(&action);
+        let disposition = self.handle_web_action_inner(action);
+        if let Some(address) = address {
+            if let Some(normalized) = self.automation_current_normalized(address) {
+                self.publish_controller_feedback(
+                    address,
+                    normalized,
+                    controller_profile::AutomationOrigin::HostAutomation,
+                );
+            }
+        }
+        disposition
+    }
+
+    /// Handle an action from the web UI with one manual transaction around
+    /// every non-gesture authored edit. Performance triggers and automation
+    /// deliberately bypass the history store.
     fn handle_web_action(&mut self, action: web::state::WebAction) -> WebActionBatchDisposition {
         use web::state::WebAction;
-        if self.manual_action_targets_active_morph(&action) {
-            self.release_active_morph_for_manual_edit();
+        match action {
+            WebAction::BeginHistoryGesture { gesture_id } => {
+                self.begin_history_gesture(gesture_id);
+                return WebActionBatchDisposition::Continue;
+            }
+            WebAction::EndHistoryGesture { gesture_id } => {
+                self.finish_history_gesture(gesture_id);
+                return WebActionBatchDisposition::Continue;
+            }
+            WebAction::CancelHistoryGesture { gesture_id } => {
+                self.cancel_history_gesture(gesture_id);
+                return WebActionBatchDisposition::Continue;
+            }
+            WebAction::UndoManual => {
+                self.restore_history_direction(false);
+                return WebActionBatchDisposition::Continue;
+            }
+            WebAction::RedoManual => {
+                self.restore_history_direction(true);
+                return WebActionBatchDisposition::Continue;
+            }
+            _ => {}
+        }
+
+        if Self::history_action_is_performance_only(&action) {
+            return self.handle_web_action_inner_with_feedback(action);
+        }
+        match self.manual_history.open_gesture() {
+            Some((_, history::MutationOrigin::BrowserManual)) => {
+                // Absolute browser values inside the owned gesture remain
+                // coalescible and become one manual history entry at End.
+                return self.handle_web_action_inner_with_feedback(action);
+            }
+            Some((id, history::MutationOrigin::NativeManual)) => {
+                // Do not let a remote editor silently fold authored values
+                // into a native text-field gesture that it does not own.
+                self.history_status = format!(
+                    "Browser edit rejected while native history gesture {} is active",
+                    id.get()
+                );
+                return WebActionBatchDisposition::Continue;
+            }
+            Some((id, origin)) => {
+                self.history_status = format!(
+                    "Browser edit rejected while {:?} history gesture {} is active",
+                    origin,
+                    id.get()
+                );
+                return WebActionBatchDisposition::Continue;
+            }
+            None => {}
+        }
+        let before = match self.history_checkpoint("Manual edit", "manual") {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.history_status = format!("Manual edit rejected before mutation: {error}");
+                self.composition_status.clone_from(&self.history_status);
+                return WebActionBatchDisposition::Continue;
+            }
+        };
+        let disposition = self.handle_web_action_inner_with_feedback(action);
+        let after_fingerprint = match self.capture_manual_history_world() {
+            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+            Err(error) => {
+                self.history_status = format!("Manual edit history capture failed: {error}");
+                return disposition;
+            }
+        };
+        match self.manual_history.record_manual(
+            history::MutationOrigin::BrowserManual,
+            before,
+            after_fingerprint,
+        ) {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.history_status = "Manual edit committed".to_string();
+                self.append_recovery_checkpoint("manual edit");
+            }
+            Ok(history::HistoryRecordOutcome::NoChange) => {}
+            Ok(outcome) => self.history_status = format!("Manual edit history: {outcome:?}"),
+            Err(error) => self.history_status = format!("Manual edit history failed: {error}"),
+        }
+        disposition
+    }
+
+    fn handle_web_action_inner(
+        &mut self,
+        action: web::state::WebAction,
+    ) -> WebActionBatchDisposition {
+        use web::state::WebAction;
+        if self.handle_creative_web_action(&action) {
+            return WebActionBatchDisposition::Continue;
+        }
+        if self.handle_motion_web_action(&action) {
+            return WebActionBatchDisposition::Continue;
+        }
+        if self.manual_action_targets_active_morph(&action)
+            && !self.release_active_morph_for_manual_edit()
+        {
+            return WebActionBatchDisposition::Continue;
         }
         let mut disposition = WebActionBatchDisposition::Continue;
         match action {
@@ -2390,18 +12268,33 @@ impl App {
                     disposition = WebActionBatchDisposition::LookApplied(scope);
                 }
             }
-            WebAction::QuickSavePatch => {
-                let result = self
-                    .patch_collector
-                    .try_submit(self.capture_current_patch(), PathBuf::from("patches"));
-                if result == procedural::CaptureSubmit::Busy {
-                    log::warn!("Patch capture queue is busy; capture was not enqueued");
+            WebAction::QuickSavePatch => match self.try_capture_current_patch() {
+                Ok(patch) => {
+                    let result = self
+                        .patch_collector
+                        .try_submit(patch, PathBuf::from("patches"));
+                    if result == procedural::CaptureSubmit::Busy {
+                        log::warn!("Patch capture queue is busy; capture was not enqueued");
+                    }
                 }
-            }
+                Err(error) => {
+                    self.composition_status = format!("Patch capture rejected: {error}");
+                    log::warn!("{}", self.composition_status);
+                }
+            },
             WebAction::SetParam { param, value } => {
                 let mut snap = web::state::EffectsSnapshot::from_uniforms(&self.master_effects);
                 snap.apply_param(&param, &value);
                 snap.apply_to_uniforms(&mut self.master_effects);
+            }
+            WebAction::SetMasterTransform { param, value } => {
+                Self::apply_spatial_transform_edit(&mut self.master_transform, &param, &value);
+            }
+            WebAction::ResetMasterTransform => {
+                self.master_transform = spatial::SpatialTransform::default();
+            }
+            WebAction::ApplyMasterTransform { transform } => {
+                self.master_transform = transform.sanitized();
             }
             WebAction::AddLayer { filename } => {
                 // Find the full path from the library
@@ -2418,16 +12311,241 @@ impl App {
                         format!("Source not found in the active library: {filename}");
                 }
             }
+            WebAction::LoadClipIntoSlot {
+                layer_id,
+                slot_id,
+                filename,
+                activate,
+                trigger_mode,
+            } => {
+                self.stage_clip_slot_update(&layer_id, slot_id, filename, activate, trigger_mode);
+            }
+            WebAction::RemoveClipSlot { layer_id, slot_id } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    if self.layers[index].active_clip_slot == slot_id {
+                        self.source_staging_status = format!(
+                            "Cannot remove active slot {} from layer {}",
+                            slot_id.get(),
+                            self.layers[index].layer_id()
+                        );
+                    } else if self.layers[index].clip_slots.get(slot_id).is_some() {
+                        self.clear_performance_transactions();
+                        let layer = &mut self.layers[index];
+                        let removed = layer.clip_slots.remove_if_not_last(slot_id).is_some();
+                        debug_assert!(removed);
+                        self.source_staging_status = format!(
+                            "Removed slot {} from layer {}",
+                            slot_id.get(),
+                            layer.layer_id()
+                        );
+                    } else {
+                        self.source_staging_status = format!(
+                            "Slot {} is absent or is the layer's final slot",
+                            slot_id.get()
+                        );
+                    }
+                }
+            }
+            WebAction::ActivateClipSlot {
+                layer_id,
+                slot_id,
+                trigger_mode,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    let stable_id = self.layers[index].stable_layer_id();
+                    let key = performance_runtime::PreparedTransactionKey::LayerSlot {
+                        layer_id: stable_id,
+                        slot_id,
+                    };
+                    if !self.cached_direct_slot_matches(stable_id, slot_id, None)
+                        || !self.arm_performance_activation(key, trigger_mode)
+                    {
+                        self.stage_existing_clip_slot(index, slot_id, None, trigger_mode);
+                    }
+                } else {
+                    self.source_staging_status = format!("Layer {layer_id} is absent");
+                }
+            }
+            WebAction::SetClipTransport {
+                layer_id,
+                slot_id,
+                param,
+                value,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    let present = self.layers[index].clip_slots.get(slot_id).is_some();
+                    if present {
+                        self.clear_performance_transactions();
+                    }
+                    let layer = &mut self.layers[index];
+                    let active = layer.active_clip_slot == slot_id;
+                    let updated = layer.clip_slots.get_mut(slot_id).is_some_and(|slot| {
+                        Self::apply_clip_transport_edit(&mut slot.transport, &param, &value)
+                    });
+                    if updated && active {
+                        let transport = layer.active_clip_config().transport;
+                        layer.speed = transport.rate as f32;
+                        if let Some(fps) = transport.sample_fps {
+                            layer.fps = fps as f32;
+                        }
+                    }
+                }
+            }
+            WebAction::SetClipCue {
+                layer_id,
+                slot_id,
+                cue_id,
+                at,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    if self.layers[index].clip_slots.get(slot_id).is_some() {
+                        self.clear_performance_transactions();
+                    }
+                    if let Some(slot) = self.layers[index].clip_slots.get_mut(slot_id) {
+                        if !slot
+                            .transport
+                            .cues
+                            .insert(transport::CuePoint { id: cue_id, at })
+                        {
+                            self.source_staging_status = format!(
+                                "Slot {} already has the maximum {} cues",
+                                slot_id.get(),
+                                transport::MAX_CUE_POINTS
+                            );
+                        }
+                    }
+                }
+            }
+            WebAction::RemoveClipCue {
+                layer_id,
+                slot_id,
+                cue_id,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    if self.layers[index].clip_slots.get(slot_id).is_some() {
+                        self.clear_performance_transactions();
+                    }
+                    if let Some(slot) = self.layers[index].clip_slots.get_mut(slot_id) {
+                        slot.transport.cues.remove(cue_id);
+                    }
+                }
+            }
+            WebAction::TriggerClipCue {
+                layer_id,
+                slot_id,
+                cue_id,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    if self.layers[index].active_clip_slot == slot_id
+                        && self.layers[index]
+                            .active_clip_config()
+                            .transport
+                            .cue(cue_id)
+                            .is_some()
+                    {
+                        self.layers[index].request_transport_cue(cue_id);
+                    } else {
+                        let stable_id = self.layers[index].stable_layer_id();
+                        let key = performance_runtime::PreparedTransactionKey::LayerSlot {
+                            layer_id: stable_id,
+                            slot_id,
+                        };
+                        if !self.cached_direct_slot_matches(stable_id, slot_id, Some(cue_id))
+                            || !self
+                                .arm_performance_activation(key, transport::TriggerMode::Immediate)
+                        {
+                            self.stage_existing_clip_slot(
+                                index,
+                                slot_id,
+                                Some(cue_id),
+                                transport::TriggerMode::Immediate,
+                            );
+                        }
+                    }
+                }
+            }
+            WebAction::SeekClipSlot {
+                layer_id,
+                slot_id,
+                position,
+            } => {
+                if let Some(index) = self.resolve_stable_layer_id(&layer_id) {
+                    if self.layers[index].clip_slots.get(slot_id).is_some() {
+                        self.clear_performance_transactions();
+                    }
+                    let layer = &mut self.layers[index];
+                    if let Some(slot) = layer.clip_slots.get_mut(slot_id) {
+                        slot.saved_playhead = position;
+                        if layer.active_clip_slot == slot_id {
+                            layer.request_transport_seek(position);
+                        }
+                    }
+                }
+            }
+            WebAction::PrepareScene { scene_id } => {
+                let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
+                if self.cached_performance_position(&key).is_some() {
+                    self.scene_status = format!("Scene {} is GPU-ready", scene_id.get());
+                } else {
+                    self.stage_scene(scene_id, None);
+                }
+            }
+            WebAction::CaptureScene {
+                scene_id,
+                name,
+                trigger_mode,
+            } => self.capture_scene(scene_id, name, trigger_mode),
+            WebAction::RemoveScene { scene_id } => {
+                if self.scenes.get(scene_id).is_none() {
+                    self.scene_status = format!("Scene {} is absent", scene_id.get());
+                } else {
+                    self.invalidate_prepared_scene(scene_id);
+                    self.scenes.remove(scene_id);
+                    self.scene_status = format!("Removed Scene {}", scene_id.get());
+                }
+            }
+            WebAction::TriggerScene {
+                scene_id,
+                trigger_mode,
+            } => {
+                let Some(mode) = self
+                    .scenes
+                    .get(scene_id)
+                    .map(|scene| trigger_mode.unwrap_or(scene.trigger_mode))
+                else {
+                    self.scene_status = format!("Scene {} is absent", scene_id.get());
+                    return disposition;
+                };
+                let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
+                if !self.arm_performance_activation(key, mode) {
+                    self.stage_scene(scene_id, Some(mode));
+                }
+            }
             WebAction::AddSpoutLayer { sender } => self.add_spout_layer(&sender),
             WebAction::RemoveLayer { index, layer_id } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
-                    self.layers.remove(index);
-                    self.mod_matrix.remap_layer_targets_after_remove(index);
-                    self.remap_quantized_layers_after_remove(index);
-                    self.bump_layer_stack_revision();
-                    self.morph.remap_layers_after_remove(index);
-                    self.selected_layer =
-                        selected_layer_after_remove(self.selected_layer, index, self.layers.len());
+                    match self.remove_layer_transactional(index) {
+                        Ok(invalidated_scenes) if !invalidated_scenes.is_empty() => {
+                            self.scene_status = format!(
+                                "Removed layer invalidated Scene{} {}",
+                                if invalidated_scenes.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                                invalidated_scenes
+                                    .iter()
+                                    .map(|id| id.get().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.composition_status = format!("Layer removal rejected: {error}");
+                            log::warn!("{}", self.composition_status);
+                        }
+                    }
                 }
             }
             WebAction::MoveLayer {
@@ -2448,23 +12566,10 @@ impl App {
                     );
                 } else if let Some(from) = resolved_from {
                     if to < self.layers.len() && from != to {
-                        let layer = self.layers.remove(from);
-                        self.layers.insert(to, layer);
-                        self.mod_matrix.remap_layer_targets_after_move(from, to);
-                        self.remap_quantized_layers_after_move(from, to);
-                        self.bump_layer_stack_revision();
-                        self.selected_layer = self.selected_layer.map(|selected| {
-                            if selected == from {
-                                to
-                            } else if from < to && selected > from && selected <= to {
-                                selected - 1
-                            } else if to < from && selected >= to && selected < from {
-                                selected + 1
-                            } else {
-                                selected
-                            }
-                        });
-                        self.morph.remap_layers_after_move(from, to);
+                        if let Err(error) = self.move_layer_transactional(from, to) {
+                            self.composition_status = format!("Layer move rejected: {error}");
+                            log::warn!("{}", self.composition_status);
+                        }
                     }
                 }
             }
@@ -2505,6 +12610,75 @@ impl App {
                     }
                 }
             }
+            WebAction::SetLayerMatteParam {
+                layer_id,
+                param,
+                value,
+                composition_revision,
+            } => {
+                let result = (|| -> Result<(), String> {
+                    // Only `enabled` admits/removes an edge. The remaining
+                    // fields are stable-layer scalar provenance and must land
+                    // after unrelated topology revisions.
+                    if param == "enabled" {
+                        if let Some(revision) = composition_revision {
+                            self.creative_revision_matches(revision)?;
+                        }
+                    }
+                    let index = self
+                        .resolve_stable_layer_id(&layer_id)
+                        .ok_or_else(|| format!("layer {layer_id} is absent"))?;
+                    let mut candidate = self.layers[index].matte;
+                    let topology_changed = param == "enabled"
+                        && value
+                            .as_bool()
+                            .is_some_and(|enabled| enabled != candidate.enabled);
+                    if !Self::apply_matte_param(&mut candidate, &param, &value) {
+                        return Err(format!("invalid layer matte parameter {param}"));
+                    }
+                    self.commit_layer_matte_candidate(
+                        index,
+                        candidate,
+                        topology_changed,
+                        format!("Updated layer {layer_id} matte {param}"),
+                    )
+                })();
+                if let Err(error) = result {
+                    self.composition_status = format!("Layer matte edit rejected: {error}");
+                    log::warn!("{}", self.composition_status);
+                }
+            }
+            WebAction::SetLayerMatteInput {
+                layer_id,
+                input,
+                composition_revision,
+            } => {
+                let result = (|| -> Result<(), String> {
+                    if let Some(revision) = composition_revision {
+                        self.creative_revision_matches(revision)?;
+                    }
+                    let index = self
+                        .resolve_stable_layer_id(&layer_id)
+                        .ok_or_else(|| format!("layer {layer_id} is absent"))?;
+                    let input = self
+                        .image_input_from_snapshot(input)
+                        .ok_or_else(|| "matte input is malformed or restore-only".to_string())?;
+                    self.validate_live_layer_matte_input(input)?;
+                    let mut candidate = self.layers[index].matte;
+                    let topology_changed = candidate.input != input;
+                    candidate.input = input;
+                    self.commit_layer_matte_candidate(
+                        index,
+                        candidate,
+                        topology_changed,
+                        format!("Updated layer {layer_id} matte route"),
+                    )
+                })();
+                if let Err(error) = result {
+                    self.composition_status = format!("Layer matte edit rejected: {error}");
+                    log::warn!("{}", self.composition_status);
+                }
+            }
             WebAction::SetMasterPaused { paused } => {
                 self.set_master_paused(paused);
             }
@@ -2532,24 +12706,44 @@ impl App {
                     }
                 }
             }
+            WebAction::SetNewLayerFit { fit } => {
+                self.new_layer_fit = fit;
+                self.media_safety_status = format!(
+                    "Future interactive layers will use {} framing",
+                    match fit {
+                        spatial::FitMode::Stretch => "Stretch",
+                        spatial::FitMode::Fit => "Fit",
+                        spatial::FitMode::Fill => "Fill",
+                        spatial::FitMode::Native => "Native",
+                    }
+                );
+            }
             WebAction::Reroll {
                 scope,
                 index,
                 layer_id,
+                group_id,
                 stack_revision,
                 seed,
                 mode,
                 amount,
                 include_grain_controls,
+                include_transform,
+                include_rack_controls,
+                include_group_controls,
             } => self.apply_reroll(RerollRequest {
                 scope,
                 index,
                 layer_id,
+                group_id,
                 stack_revision,
                 supplied_seed: seed,
                 mode,
                 amount,
                 include_grain_controls,
+                include_transform,
+                include_rack_controls,
+                include_group_controls,
             }),
             WebAction::SetLayerRerollOnLoop {
                 index,
@@ -2566,7 +12760,11 @@ impl App {
             // `reset_fx` predates the enriched visual program. Keep its wire
             // contract exact for older remotes: direct master uniforms only.
             WebAction::ResetFx => self.master_effects.reset(),
-            WebAction::ResetVisualProgram => self.revert_master_visual_state(),
+            WebAction::ResetVisualProgram => {
+                if self.revert_master_visual_state() {
+                    disposition = WebActionBatchDisposition::MasterVisualReset;
+                }
+            }
             WebAction::ResetGroup { group } => {
                 let defaults = crate::effects::EffectUniforms::default();
                 match group.as_str() {
@@ -2617,6 +12815,9 @@ impl App {
                         self.master_effects.shift_density = defaults.shift_density;
                         self.master_effects.shift_speed = defaults.shift_speed;
                     }
+                    "transform" => {
+                        self.master_transform = spatial::SpatialTransform::default();
+                    }
                     "vhs" => {
                         self.ntsc_params = ntsc::NtscParams::default();
                     }
@@ -2625,6 +12826,7 @@ impl App {
                     }
                     "temporal" => {
                         self.temporal_params = effects::params::TemporalParams::default();
+                        self.clear_temporal_memory();
                     }
                     _ => {}
                 }
@@ -2823,6 +13025,33 @@ impl App {
                     _ => {}
                 }
             }
+            WebAction::ControllerProfile { request } => match request {
+                controller_profile::ControllerProfileAction::Import { document } => {
+                    if let Err(error) =
+                        self.install_controller_profile_document(document, "imported from browser")
+                    {
+                        self.controller_status =
+                            format!("Controller profile browser import rejected: {error}");
+                    }
+                }
+                controller_profile::ControllerProfileAction::Export {} => {
+                    match self
+                        .web_state
+                        .publish_controller_profile_export(&self.controller_profile)
+                    {
+                        Ok(()) => {
+                            self.controller_status = format!(
+                                "Controller profile '{}' prepared for browser export",
+                                self.controller_profile.name
+                            );
+                        }
+                        Err(error) => {
+                            self.controller_status =
+                                format!("Controller profile browser export rejected: {error}");
+                        }
+                    }
+                }
+            },
             WebAction::Gyro { alpha, beta, gamma } => {
                 // DeviceOrientation degrees → unipolar 0..1 (0.5 = level).
                 self.mod_matrix.set_gyro_degrees(alpha, beta, gamma);
@@ -2911,22 +13140,46 @@ impl App {
             WebAction::MorphCapture {
                 slot,
                 stack_revision,
+                composition_revision,
             } => {
                 if stack_revision.is_some_and(|revision| revision != self.layer_stack_revision) {
-                    log::warn!(
-                        "Rejected stale morph capture at revision {:?}; current revision is {}",
-                        stack_revision,
-                        self.layer_stack_revision
+                    self.composition_status = format!(
+                        "Morph capture rejected: stale layer-stack revision {:?}; current is {}",
+                        stack_revision, self.layer_stack_revision
                     );
+                    log::warn!("{}", self.composition_status);
+                    return disposition;
+                }
+                if composition_revision
+                    .is_some_and(|revision| revision == 0 || revision != self.composition_revision)
+                {
+                    self.composition_status = format!(
+                        "Morph capture rejected: stale composition revision {:?}; current is {}",
+                        composition_revision, self.composition_revision
+                    );
+                    log::warn!("{}", self.composition_status);
                     return disposition;
                 }
                 self.materialize_morph_at_current_beat();
-                let snap = morph::MorphSlot::capture(
+                let layer_racks = self.layer_racks();
+                let snap = match morph::MorphSlot::capture_with_composition_and_motion(
                     &self.master_effects,
+                    &self.master_transform,
+                    &self.master_motion,
                     &self.ntsc_params,
                     &self.temporal_params,
                     &self.layers,
-                );
+                    &self.master_rack,
+                    &layer_racks,
+                    &self.composition,
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.composition_status = format!("Morph capture rejected: {error}");
+                        log::warn!("{}", self.composition_status);
+                        return disposition;
+                    }
+                };
                 match slot.as_str() {
                     "a" => self.morph.a = Some(snap),
                     "b" => self.morph.b = Some(snap),
@@ -3020,6 +13273,28 @@ impl App {
                 }
             }
             WebAction::SetTemporal { param, value } => {
+                let score_loop_driver = if param == "score_loop_driver" {
+                    value.as_str().and_then(|driver| {
+                        if driver == "none" {
+                            return Some(temporal::CollisionScoreLoopDriver::None);
+                        }
+                        let requested = driver.parse::<u64>().ok()?;
+                        let (position, layer) = self
+                            .layers
+                            .iter()
+                            .enumerate()
+                            .find(|(_, layer)| layer.layer_id() == requested)?;
+                        let saved_position = u32::try_from(position)
+                            .ok()
+                            .and_then(performance::SavedLayerPosition::new)?;
+                        Some(temporal::CollisionScoreLoopDriver::SelectedLayer {
+                            layer_id: layer.stable_layer_id(),
+                            saved_position,
+                        })
+                    })
+                } else {
+                    None
+                };
                 let p = &mut self.temporal_params;
                 match param.as_str() {
                     "feedback" => {
@@ -3043,8 +13318,8 @@ impl App {
                         }
                     }
                     "slit_axis" => {
-                        if let Some(n) = value.as_u64() {
-                            p.slit_axis = (n.min(1)) as f32;
+                        if let Some(n) = value.as_f64() {
+                            p.slit_axis = (n as f32).clamp(0.0, 1.0);
                             p.slit_angle = p.slit_axis * 90.0;
                         }
                     }
@@ -3072,15 +13347,362 @@ impl App {
                         }
                     }
                     "key_history" => {
+                        if let Some(n) = value.as_u64() {
+                            p.key_history = n.clamp(1, 23) as f32;
+                        }
+                    }
+                    "loom_amount" => {
                         if let Some(n) = value.as_f64() {
-                            p.key_history = (n as f32).round().clamp(1.0, 23.0);
+                            p.originals.loom.amount = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "loom_topology" => {
+                        p.originals.loom.topology = match value.as_str() {
+                            Some("linear") => temporal::TemporalTopology::Linear,
+                            Some("radial") => temporal::TemporalTopology::Radial,
+                            Some("spiral") => temporal::TemporalTopology::Spiral,
+                            Some("contour") => temporal::TemporalTopology::Contour,
+                            Some("folded") => temporal::TemporalTopology::Folded,
+                            Some("kaleidoscopic") => temporal::TemporalTopology::Kaleidoscopic,
+                            _ => p.originals.loom.topology,
+                        };
+                    }
+                    "loom_interpolation" => {
+                        p.originals.loom.interpolation = match value.as_str() {
+                            Some("floor") => temporal::TemporalInterpolation::Floor,
+                            Some("linear") => temporal::TemporalInterpolation::Linear,
+                            _ => p.originals.loom.interpolation,
+                        };
+                    }
+                    "loom_depth" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.loom.depth = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "loom_phase" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.loom.phase = (n as f32).clamp(-1_000.0, 1_000.0);
+                        }
+                    }
+                    "loom_scale" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.loom.scale = (n as f32).clamp(0.01, 100.0);
+                        }
+                    }
+                    "loom_angle" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.loom.angle = (n as f32).clamp(-180.0, 180.0);
+                        }
+                    }
+                    "loom_folds" => {
+                        if let Some(n) = value.as_u64() {
+                            p.originals.loom.folds = n.clamp(1, 16) as u8;
+                        }
+                    }
+                    "loom_quantization" => {
+                        if let Some(n) = value.as_u64() {
+                            p.originals.loom.quantization = n.min(24) as u8;
+                        }
+                    }
+                    "atlas_amount" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.atlas.amount = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "atlas_seed" => {
+                        if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                            p.originals.atlas.seed = n;
+                        }
+                    }
+                    "atlas_territories" => {
+                        if let Some(n) = value.as_u64() {
+                            p.originals.atlas.territories = n.clamp(1, 64) as u8;
+                        }
+                    }
+                    "atlas_collision" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.atlas.collision = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "garden_amount" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.garden.amount = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "garden_gate" => {
+                        p.originals.garden.gate = match value.as_str() {
+                            Some("temporal_delta") => temporal::RefreshGardenGate::TemporalDelta,
+                            Some("luma") => temporal::RefreshGardenGate::Luma,
+                            Some("chroma") => temporal::RefreshGardenGate::Chroma,
+                            Some("cellular_ridge") => temporal::RefreshGardenGate::CellularRidge,
+                            Some("audio_energy") => temporal::RefreshGardenGate::AudioEnergy,
+                            Some("audio_onset") => temporal::RefreshGardenGate::AudioOnset,
+                            Some("matte") => temporal::RefreshGardenGate::Matte,
+                            _ => p.originals.garden.gate,
+                        };
+                    }
+                    "garden_threshold" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.garden.threshold = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "garden_softness" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.garden.softness = (n as f32).clamp(0.0, 0.5);
+                        }
+                    }
+                    "garden_decay" => {
+                        if let Some(n) = value.as_f64() {
+                            p.originals.garden.decay = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "garden_max_hold_ticks" => {
+                        if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                            p.originals.garden.max_hold_ticks = n;
+                        }
+                    }
+                    "score_enabled" => {
+                        if let Some(enabled) = value.as_bool() {
+                            p.originals.score.enabled = enabled;
+                        }
+                    }
+                    "score_seed" => {
+                        if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                            p.originals.score.seed = n;
+                        }
+                    }
+                    "score_state_count" => {
+                        if let Some(n) = value.as_u64() {
+                            p.originals.score.state_count = n.clamp(2, 16) as u8;
+                        }
+                    }
+                    "score_trigger" => {
+                        p.originals.score.trigger = match value.as_str() {
+                            Some("boundary") => temporal::CollisionScoreTrigger::Boundary,
+                            Some("downbeat") => temporal::CollisionScoreTrigger::Downbeat,
+                            Some("audio_onset") => temporal::CollisionScoreTrigger::AudioOnset,
+                            Some("manual") => temporal::CollisionScoreTrigger::Manual,
+                            _ => p.originals.score.trigger,
+                        };
+                    }
+                    "score_loop_driver" => {
+                        if let Some(driver) = score_loop_driver {
+                            p.originals.score.loop_driver = driver;
+                        }
+                    }
+                    "reset_loop_boundary" | "reset_downbeat" => {
+                        let mode = match value.as_str() {
+                            Some("none") => Some(temporal::TemporalEventResetMode::None),
+                            Some("score") => Some(temporal::TemporalEventResetMode::Score),
+                            Some("memory") => Some(temporal::TemporalEventResetMode::Memory),
+                            Some("all") => Some(temporal::TemporalEventResetMode::All),
+                            _ => None,
+                        };
+                        if let Some(mode) = mode {
+                            if param == "reset_loop_boundary" {
+                                p.originals.reset.loop_boundary = mode;
+                            } else {
+                                p.originals.reset.downbeat = mode;
+                            }
                         }
                     }
                     _ => {}
                 }
             }
+            WebAction::ClearTemporalMemory => {
+                self.clear_temporal_memory();
+                self.composition_status = "Cleared temporal memory".to_string();
+            }
+            WebAction::TriggerCollisionScore => {
+                self.pending_temporal_events.manual_events =
+                    self.pending_temporal_events.manual_events.saturating_add(1);
+            }
+            WebAction::SetMotion { .. }
+            | WebAction::SetMotionDonor { .. }
+            | WebAction::ClearMotionMemory => {
+                unreachable!("motion actions are handled transactionally before this match")
+            }
             WebAction::SetSpout { enabled } => {
                 self.spout_enabled = enabled;
+            }
+            WebAction::StartProgramRecording { auto_import } => {
+                self.start_program_recording(auto_import);
+            }
+            WebAction::FinishProgramRecording => self.finish_live_capture(),
+            WebAction::CancelProgramRecording => self.cancel_live_capture(),
+            WebAction::CaptureStill {
+                target,
+                auto_import,
+            } => self.capture_still(target, auto_import),
+            WebAction::StartResample {
+                target,
+                destination_layer_id,
+                activate,
+            } => self.start_resample(target, destination_layer_id, activate),
+            WebAction::SetStageHealthHud { enabled } => {
+                self.stage_tools.set_health_hud(enabled);
+            }
+            WebAction::SetStageTestCard {
+                mode,
+                output_endpoint_id,
+            } => {
+                let endpoint = output_endpoint_id
+                    .map(stage_map::OutputEndpointId::parse)
+                    .transpose();
+                match endpoint.and_then(|endpoint| self.stage_tools.set_test_card(mode, endpoint)) {
+                    Ok(()) => self.output_error.clear(),
+                    Err(error) => self.output_error = error.to_string(),
+                }
+            }
+            WebAction::SetOutputIdentification {
+                enabled,
+                output_endpoint_id,
+            } => {
+                let endpoint = output_endpoint_id
+                    .map(stage_map::OutputEndpointId::parse)
+                    .transpose();
+                match endpoint.and_then(|endpoint| {
+                    self.stage_tools
+                        .set_output_identification(enabled, endpoint)
+                }) {
+                    Ok(()) => self.output_error.clear(),
+                    Err(error) => self.output_error = error.to_string(),
+                }
+            }
+            WebAction::BeginHistoryGesture { .. }
+            | WebAction::EndHistoryGesture { .. }
+            | WebAction::CancelHistoryGesture { .. }
+            | WebAction::UndoManual
+            | WebAction::RedoManual => {
+                unreachable!("manual-history control actions are handled before mutation")
+            }
+            WebAction::CaptureScopedPreset {
+                name,
+                kind,
+                target,
+                preset_revision,
+                layer_stack_revision,
+                composition_revision,
+            } => {
+                let result = (|| -> Result<preset::PresetId, String> {
+                    self.validate_preset_revisions(
+                        preset_revision,
+                        layer_stack_revision,
+                        composition_revision,
+                    )?;
+                    let payload = self.capture_preset_payload(kind, &target)?;
+                    let mut candidate = self.preset_library.clone();
+                    let id = candidate
+                        .insert(name, payload)
+                        .map_err(|error| error.to_string())?;
+                    Self::persist_preset_library(&candidate)?;
+                    self.preset_library = candidate;
+                    Ok(id)
+                })();
+                match result {
+                    Ok(id) => {
+                        self.preset_revision = self.preset_revision.wrapping_add(1).max(1);
+                        self.preset_status = format!("Captured preset {}", id.get());
+                    }
+                    Err(error) => self.preset_status = format!("Preset capture rejected: {error}"),
+                }
+            }
+            WebAction::ApplyScopedPreset {
+                preset_id,
+                target,
+                preset_revision,
+                layer_stack_revision,
+                composition_revision,
+            } => {
+                let result = self
+                    .validate_preset_revisions(
+                        preset_revision,
+                        layer_stack_revision,
+                        composition_revision,
+                    )
+                    .and_then(|()| {
+                        let id = parse_nonzero_decimal(&preset_id)
+                            .and_then(preset::PresetId::new)
+                            .ok_or_else(|| "preset ID is malformed".to_string())?;
+                        let preset = self
+                            .preset_library
+                            .get(id)
+                            .cloned()
+                            .ok_or_else(|| format!("preset {} is absent", id.get()))?;
+                        self.apply_scoped_preset(&preset, &target)?;
+                        Ok(id)
+                    });
+                match result {
+                    Ok(id) => {
+                        self.preset_revision = self.preset_revision.wrapping_add(1).max(1);
+                        self.preset_status = format!("Applied preset {}", id.get());
+                    }
+                    Err(error) => self.preset_status = format!("Preset apply rejected: {error}"),
+                }
+            }
+            WebAction::DeleteScopedPreset {
+                preset_id,
+                preset_revision,
+            } => {
+                let result = (|| -> Result<preset::PresetId, String> {
+                    if preset_revision == 0 || preset_revision != self.preset_revision {
+                        return Err(format!(
+                            "stale preset revision {preset_revision}; current is {}",
+                            self.preset_revision
+                        ));
+                    }
+                    let id = parse_nonzero_decimal(&preset_id)
+                        .and_then(preset::PresetId::new)
+                        .ok_or_else(|| "preset ID is malformed".to_string())?;
+                    let mut candidate = self.preset_library.clone();
+                    candidate.remove(id).map_err(|error| error.to_string())?;
+                    Self::persist_preset_library(&candidate)?;
+                    self.preset_library = candidate;
+                    Ok(id)
+                })();
+                match result {
+                    Ok(id) => {
+                        self.preset_revision = self.preset_revision.wrapping_add(1).max(1);
+                        self.preset_status = format!("Deleted preset {}", id.get());
+                    }
+                    Err(error) => self.preset_status = format!("Preset delete rejected: {error}"),
+                }
+            }
+            WebAction::RestoreRecoveryJournal => {
+                let candidate = self.recovery_journal.as_ref().and_then(|journal| {
+                    journal.latest_valid().latest.as_ref().map(|checkpoint| {
+                        (
+                            checkpoint.patch.clone(),
+                            journal.path().to_path_buf(),
+                            checkpoint.sequence,
+                        )
+                    })
+                });
+                match candidate {
+                    Some((patch, path, sequence)) => match self.apply_loaded_patch(patch, &path) {
+                        Ok(()) => {
+                            self.recovery_status =
+                                format!("Restored recovery checkpoint {sequence}");
+                        }
+                        Err(error) => {
+                            self.recovery_status =
+                                format!("Recovery restore rejected atomically: {error}");
+                        }
+                    },
+                    None => self.recovery_status = "No recovery checkpoint is available".into(),
+                }
+            }
+            WebAction::DiscardRecoveryJournal => {
+                if let Some(journal) = self.recovery_journal.as_mut() {
+                    match journal.discard() {
+                        Ok(()) => self.recovery_status = "Recovery journal discarded".into(),
+                        Err(error) => {
+                            self.recovery_status = format!("Recovery discard failed: {error}")
+                        }
+                    }
+                } else {
+                    self.recovery_status = "Recovery journal is unavailable".into();
+                }
             }
             WebAction::SetRouting {
                 index,
@@ -3180,6 +13802,9 @@ impl App {
                 value,
             } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
+                    if matches!(param.as_str(), "speed" | "fps") {
+                        self.clear_performance_transactions();
+                    }
                     let layer = &mut self.layers[index];
                     match param.as_str() {
                         "opacity" => {
@@ -3190,6 +13815,10 @@ impl App {
                         "speed" => {
                             if let Some(v) = value.as_f64() {
                                 layer.speed = (v as f32).clamp(0.25, 4.0);
+                                let active_slot = layer.active_clip_slot;
+                                if let Some(slot) = layer.clip_slots.get_mut(active_slot) {
+                                    slot.transport.rate = f64::from(layer.speed);
+                                }
                             }
                         }
                         "fps" => {
@@ -3197,22 +13826,17 @@ impl App {
                                 let fps = v as f32;
                                 if fps.is_finite() {
                                     layer.fps = fps.clamp(1.0, 240.0);
+                                    let active_slot = layer.active_clip_slot;
+                                    if let Some(slot) = layer.clip_slots.get_mut(active_slot) {
+                                        slot.transport.sample_fps = Some(f64::from(layer.fps));
+                                    }
                                     layer.reset_transport_timing();
                                 }
                             }
                         }
                         "blend_mode" => {
-                            if let Some(s) = value.as_str() {
-                                let blend_mode = match s {
-                                    "normal" => Some(crate::layers::BlendMode::Normal),
-                                    "screen" => Some(crate::layers::BlendMode::Screen),
-                                    "multiply" => Some(crate::layers::BlendMode::Multiply),
-                                    "difference" => Some(crate::layers::BlendMode::Difference),
-                                    _ => None,
-                                };
-                                if let Some(blend_mode) = blend_mode {
-                                    layer.blend_mode = blend_mode;
-                                }
+                            if let Some(blend_mode) = Self::blend_mode_edit(&value) {
+                                layer.blend_mode = blend_mode;
                             }
                         }
                         "bypass_master_fx" => {
@@ -3270,9 +13894,53 @@ impl App {
                     snapshot.apply_to_uniforms(&mut layer.effects);
                 }
             }
+            WebAction::SetLayerTransform {
+                index: _,
+                layer_id,
+                param,
+                value,
+            } => {
+                if let Some(index) = layer_id
+                    .as_deref()
+                    .and_then(|id| self.resolve_stable_layer_id(id))
+                {
+                    Self::apply_spatial_transform_edit(
+                        &mut self.layers[index].transform,
+                        &param,
+                        &value,
+                    );
+                }
+            }
+            WebAction::ResetLayerTransform { index: _, layer_id } => {
+                if let Some(index) = layer_id
+                    .as_deref()
+                    .and_then(|id| self.resolve_stable_layer_id(id))
+                {
+                    self.layers[index].transform = spatial::SpatialTransform::default();
+                }
+            }
+            WebAction::ApplyLayerTransform {
+                index: _,
+                layer_id,
+                transform,
+            } => {
+                if let Some(index) = layer_id
+                    .as_deref()
+                    .and_then(|id| self.resolve_stable_layer_id(id))
+                {
+                    self.layers[index].transform = transform.sanitized();
+                }
+            }
             WebAction::ResetLayerFx { index, layer_id } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
+                    let motion_changed =
+                        self.layers[index].motion != motion::MotionParams::default();
                     self.layers[index].effects.reset();
+                    self.layers[index].reset_motion();
+                    if motion_changed {
+                        self.clear_motion_memory();
+                        self.bump_composition_revision();
+                    }
                 }
             }
             WebAction::SetNtscParam { param, value } => {
@@ -3309,7 +13977,14 @@ impl App {
                         }
                         None => audio_layer.filter(|index| *index < self.layers.len()),
                     };
-                    let patch = self.capture_current_patch();
+                    let patch = match self.try_capture_current_patch() {
+                        Ok(patch) => patch,
+                        Err(error) => {
+                            self.output_error = format!("Export capture rejected: {error}");
+                            log::warn!("{}", self.output_error);
+                            return disposition;
+                        }
+                    };
                     // Millisecond resolution prevents a second completed/failed
                     // export launched in the same wall-clock second from
                     // overwriting the first one (ffmpeg intentionally uses -y).
@@ -3384,6 +14059,23 @@ impl App {
                     job.cancel();
                 }
             }
+            WebAction::SetVisualNodeParam { .. }
+            | WebAction::InsertVisualNode { .. }
+            | WebAction::RemoveVisualNode { .. }
+            | WebAction::MoveVisualNode { .. }
+            | WebAction::SetVisualNodeMaskVariant { .. }
+            | WebAction::SetVisualNodeRoute { .. }
+            | WebAction::SetCompositionGroupMatteRoute { .. }
+            | WebAction::SetCompositionGroupMatteParam { .. }
+            | WebAction::SetCompositionGroupParam { .. }
+            | WebAction::CreateCompositionGroup { .. }
+            | WebAction::RemoveCompositionGroup { .. }
+            | WebAction::SetCompositionGroupMembers { .. }
+            | WebAction::MoveCompositionRootItem { .. }
+            | WebAction::SetCompositionBusCrossfade { .. }
+            | WebAction::SetCompositionLayerBus { .. } => {
+                unreachable!("creative actions are consumed before legacy dispatch")
+            }
         }
         disposition
     }
@@ -3395,12 +14087,193 @@ impl App {
         }
     }
 
+    fn stage_health_snapshot(&self) -> stage_health::StageHealthSnapshot {
+        let decoder_telemetry: Vec<_> = self.layers.iter().map(Layer::video_telemetry).collect();
+        let visible_layers = self
+            .layers
+            .iter()
+            .filter(|layer| layer.visible && layer.opacity > 0.0)
+            .count()
+            .max(1);
+        let layer_statuses: Vec<String> = self
+            .layers
+            .iter()
+            .zip(&decoder_telemetry)
+            .map(|(layer, telemetry)| {
+                let base = if !layer.source_error().is_empty() {
+                    layer.source_error().to_string()
+                } else if let Some(video::threaded::DecoderHealth::Failed(error)) =
+                    layer.video_health()
+                {
+                    error
+                } else {
+                    format!("{} ready", layer.source_kind())
+                };
+                telemetry.as_ref().map_or(base.clone(), |telemetry| {
+                    let last_upload_us = telemetry
+                        .last_upload_duration
+                        .map_or(0, |duration| duration.as_micros().min(u128::from(u64::MAX)) as u64);
+                    let decode_p95_us = duration_micros_u32(telemetry.decode_p95_duration);
+                    let upload_p95_us = duration_micros_u32(telemetry.upload_p95_duration);
+                    let frame_age_p95_us = duration_micros_u32(telemetry.frame_age_p95_duration);
+                    let proxy_status = proxy_assessment_status(layer, telemetry, visible_layers);
+                    format!(
+                        "{base}; decoded {}/{} frames, command queue {}, command drops {}, upload {} us ({} samples), p95 decode/upload/age {decode_p95_us}/{upload_p95_us}/{frame_age_p95_us} us; {proxy_status}",
+                        telemetry.consumed_frames,
+                        telemetry.published_frames,
+                        telemetry.pending_command_depth,
+                        telemetry.command_drops.saturating_add(telemetry.command_overwrites),
+                        last_upload_us,
+                        telemetry.upload_samples,
+                    )
+                })
+            })
+            .collect();
+        let layer_inputs: Vec<_> = self
+            .layers
+            .iter()
+            .zip(&layer_statuses)
+            .zip(&decoder_telemetry)
+            .map(|((layer, status), telemetry)| {
+                let dropped_frames = telemetry.as_ref().map_or(0, |telemetry| {
+                    telemetry
+                        .frame_overwrites
+                        .saturating_add(telemetry.frame_drops)
+                });
+                stage_health::LayerStageHealthInput {
+                    layer_id: layer.stable_layer_id(),
+                    name: &layer.filename,
+                    decoded_age: telemetry
+                        .as_ref()
+                        .and_then(|telemetry| telemetry.last_publish_age),
+                    pending_frames: telemetry
+                        .as_ref()
+                        .map_or(0, |telemetry| u32::from(telemetry.pending_frames)),
+                    dropped_frames,
+                    status,
+                }
+            })
+            .collect();
+
+        let (width, height, adapter, backend, device) = self.renderer.as_ref().map_or_else(
+            || (0, 0, String::new(), String::new(), String::new()),
+            |renderer| {
+                let (adapter, backend, device) = renderer.gpu_identity();
+                (
+                    renderer.output_width,
+                    renderer.output_height,
+                    adapter,
+                    backend,
+                    device,
+                )
+            },
+        );
+        let runtime_stage_map = self.stage_presenter_map.as_ref().unwrap_or(&self.stage_map);
+        let legacy_endpoint = stage_map::OutputEndpointId::legacy();
+        let configured_endpoint =
+            select_stage_health_endpoint(runtime_stage_map, &self.stage_presented_endpoints);
+        let endpoint_id = configured_endpoint.map_or(&legacy_endpoint, |endpoint| &endpoint.id);
+        let output_identity =
+            configured_endpoint.map_or("Legacy audience output", |endpoint| endpoint.name.as_str());
+        let refresh_millihz =
+            configured_endpoint.map_or(60_000, |endpoint| endpoint.refresh_millihz);
+        let (stage_width, stage_height) = configured_endpoint
+            .map(|endpoint| (endpoint.output_size[0], endpoint.output_size[1]))
+            .unwrap_or((width, height));
+        let configured_endpoint_usable = configured_endpoint.is_none_or(|endpoint| {
+            self.stage_presenter
+                .as_ref()
+                .and_then(|presenter| presenter.output(&endpoint.id))
+                .is_some()
+        });
+        let configured_endpoint_active = configured_endpoint.map_or_else(
+            || self.output_window_open(),
+            |endpoint| {
+                matches!(endpoint.binding, stage_map::OutputBinding::Monitor { .. })
+                    && self.stage_presented_endpoints.contains(&endpoint.id)
+            },
+        );
+        let stage_gpu_bytes = self.stage_presenter.as_ref().map(|presenter| {
+            let allocation = presenter.allocation_snapshot();
+            allocation
+                .texture_bytes
+                .saturating_add(allocation.buffer_bytes)
+        });
+        let stage_gpu_limit = self.renderer.as_ref().map(|renderer| {
+            renderer::stage_map::StagePresenterLimits::for_device(&renderer.device)
+                .max_total_gpu_bytes
+        });
+        let ntsc_gpu_bytes = self
+            .renderer
+            .as_ref()
+            .and_then(Renderer::selective_ntsc_allocation_bytes);
+        let (planned_gpu_bytes, planned_gpu_limit) = stage_health_gpu_budget(
+            self.accepted_creative_resource_bytes,
+            self.accepted_motion_resource_bytes,
+            stage_gpu_bytes,
+            ntsc_gpu_bytes,
+            stage_gpu_limit,
+        );
+        let cached_media_bytes = self
+            .performance_gpu_cache
+            .iter()
+            .fold(0_u64, |total, payload| {
+                total.saturating_add(payload.preload_bytes)
+            });
+
+        self.stage_health_monitor
+            .snapshot(stage_health::StageHealthPublishInput {
+                layers: &layer_inputs,
+                output: stage_health::StageOutputInput {
+                    endpoint_id,
+                    identity: output_identity,
+                    width: stage_width,
+                    height: stage_height,
+                    refresh_millihz,
+                    active: configured_endpoint_active && configured_endpoint_usable,
+                },
+                gpu: stage_health::StageGpuInput {
+                    adapter: &adapter,
+                    backend: &backend,
+                    device: &device,
+                },
+                budgets: stage_health::StageBudgetSetInput {
+                    gpu: stage_health::StageBudgetInput {
+                        unit: "bytes",
+                        used: planned_gpu_bytes,
+                        limit: planned_gpu_limit,
+                        detail: "accepted Advanced creative/motion plan plus selective NTSC and StageMap presenter (fixed renderer baseline is reported separately by precision evidence)",
+                    },
+                    media: stage_health::StageBudgetInput {
+                        unit: "bytes",
+                        used: Some(cached_media_bytes),
+                        limit: Some(self.performance_budget.max_preload_bytes()),
+                        detail: "prepared inactive source cache",
+                    },
+                    ntsc: stage_health::StageBudgetInput {
+                        unit: "bytes",
+                        used: ntsc_gpu_bytes,
+                        limit: Some(ntsc::MAX_SELECTIVE_NTSC_LIVE_BYTES),
+                        detail: "selective VHS ceiling",
+                    },
+                    motion: stage_health::StageBudgetInput {
+                        unit: "bytes",
+                        used: self.accepted_motion_resource_bytes,
+                        limit: Some(motion::MOTION_RESOURCE_MAX_BYTES),
+                        detail: "planned motion resource ceiling",
+                    },
+                },
+                tools: &self.stage_tools,
+            })
+    }
+
     /// Push full app state to the web UI via broadcast.
     fn push_web_state(&self) {
         use web::state::{
-            AppSnapshot, AudioSnapshot, EffectsSnapshot, LayerSnapshot, MidiSlotSnapshot,
-            MidiSnapshot, ModSnapshot, MorphSnapshot, NtscSnapshot, SpoutSnapshot,
-            TemporalSnapshot,
+            AppSnapshot, AudioSnapshot, ClipSlotSnapshot, EffectsSnapshot,
+            LayerPerformanceSnapshot, LayerSnapshot, MatteSnapshot, MidiSlotSnapshot, MidiSnapshot,
+            ModSnapshot, MorphSnapshot, NtscSnapshot, PerformanceSnapshot, SceneBindingSnapshot,
+            SceneSnapshot, SpoutSnapshot, TemporalSnapshot, TemporalTelemetrySnapshot,
         };
 
         let (export_progress, export_error, export_status) = match self.export_job.as_ref() {
@@ -3435,6 +14308,15 @@ impl App {
             .as_ref()
             .map(|job| job.progress.warnings())
             .unwrap_or_default();
+        let export_motion = self.export_job.as_ref().map_or_else(
+            web::state::ExportMotionSnapshot::default,
+            |job| {
+                web::state::ExportMotionSnapshot::from_export(
+                    &job.progress.motion_metadata(),
+                    &export_warnings,
+                )
+            },
+        );
 
         let mut ntsc_snapshot = NtscSnapshot::from_params(&self.ntsc_params);
         ntsc_snapshot.live_metrics = web::state::NtscLiveMetricsSnapshot {
@@ -3506,15 +14388,156 @@ impl App {
             })
             .unwrap_or(0.0);
 
+        let prepared_scene_id = self.performance_gpu_cache.iter().rev().find_map(|cached| {
+            if let performance_runtime::PreparedTransactionKey::Scene(scene_id) = cached.key() {
+                Some(*scene_id)
+            } else {
+                None
+            }
+        });
+        let pending_scene_id = self
+            .performance_scheduled
+            .as_ref()
+            .and_then(|scheduled| {
+                if let performance_runtime::PreparedTransactionKey::Scene(scene_id) = scheduled.key
+                {
+                    Some(scene_id)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                self.performance_staging.as_ref().and_then(|intent| {
+                    if let performance_runtime::PreparedTransactionKey::Scene(scene_id) = intent.key
+                    {
+                        Some(scene_id)
+                    } else {
+                        None
+                    }
+                })
+            });
+        let scene_snapshots = self
+            .scenes
+            .iter()
+            .map(|scene| {
+                let prepared = self.performance_gpu_cache.iter().any(|cached| {
+                    cached.key() == &performance_runtime::PreparedTransactionKey::Scene(scene.id)
+                });
+                let pending = pending_scene_id == Some(scene.id);
+                let (layer_ids, binding_status) =
+                    resolve_scene_snapshot_bindings(scene, |saved_position| {
+                        saved_position
+                            .resolve(&self.layers)
+                            .map(|layer| (layer.layer_id(), &layer.clip_slots))
+                    });
+                let bindings = scene
+                    .bindings
+                    .iter()
+                    .zip(layer_ids)
+                    .map(|(binding, layer_id)| SceneBindingSnapshot {
+                        layer_id,
+                        slot_id: binding.slot_id,
+                        cue_id: binding.cue_id,
+                    })
+                    .collect();
+                let status = if !binding_status.is_empty() {
+                    binding_status
+                } else if pending {
+                    self.scene_status.clone()
+                } else if prepared {
+                    "gpu_ready".to_string()
+                } else {
+                    String::new()
+                };
+                SceneSnapshot {
+                    id: scene.id,
+                    name: scene.name.clone(),
+                    trigger_mode: scene.trigger_mode,
+                    bindings,
+                    prepared,
+                    pending,
+                    status,
+                }
+            })
+            .collect();
+        let prepared_budget = self
+            .performance_runtime
+            .as_ref()
+            .map(performance_runtime::PerformancePreparationRuntime::budget_snapshot)
+            .unwrap_or_default();
+        let creative_layer_racks: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| (layer.stable_layer_id(), layer.rack.clone()))
+            .collect();
+        let mut creative = web::state::CreativeCompositionSnapshot::from_runtime(
+            &self.master_rack,
+            &creative_layer_racks,
+            &self.composition,
+        );
+        creative.status = self.composition_status.clone();
+        let temporal_metrics = self
+            .composition_gpu
+            .as_ref()
+            .and_then(renderer::composition::CompositionGpuExecutor::temporal_state_metrics)
+            .or_else(|| {
+                self.renderer
+                    .as_ref()
+                    .map(renderer::Renderer::temporal_state_metrics)
+            })
+            .unwrap_or_else(|| temporal::TemporalState::default().metrics());
+        let mut temporal_snapshot = TemporalSnapshot::from_params(&self.temporal_params);
+        temporal_snapshot.telemetry = TemporalTelemetrySnapshot {
+            history_valid: temporal_metrics.history_valid,
+            history_capacity: temporal_metrics.history_capacity,
+            carrier_valid: temporal_metrics.carrier_valid,
+            freeze_hold_valid: temporal_metrics.freeze_hold_valid,
+            total_reference_ticks: temporal_metrics.total_reference_ticks,
+            score_state: temporal_metrics.score_state,
+            score_event_ordinal: temporal_metrics.score_event_ordinal,
+            frame_staged: temporal_metrics.frame_staged,
+            last_reset: temporal_metrics
+                .last_reset
+                .map_or_else(String::new, |cause| {
+                    match cause {
+                        temporal::TemporalResetCause::PatchGeneration => "patch_generation",
+                        temporal::TemporalResetCause::ApplyLook => "apply_look",
+                        temporal::TemporalResetCause::SourceCut => "source_cut",
+                        temporal::TemporalResetCause::Seek => "seek",
+                        temporal::TemporalResetCause::Resize => "resize",
+                        temporal::TemporalResetCause::BroadRevert => "broad_revert",
+                        temporal::TemporalResetCause::ManualClear => "manual_clear",
+                        temporal::TemporalResetCause::LoopBoundary => "loop_boundary",
+                        temporal::TemporalResetCause::Downbeat => "downbeat",
+                        temporal::TemporalResetCause::BlackoutTransition => "blackout_transition",
+                    }
+                    .to_string()
+                }),
+        };
+
         let snapshot = AppSnapshot {
             msg_type: "state".to_string(),
             effects: EffectsSnapshot::from_uniforms(&self.master_effects),
+            master_transform: self.master_transform.sanitized(),
+            master_motion: {
+                let mut snapshot = web::state::MotionSnapshot::from_params(self.master_motion);
+                snapshot.telemetry = self
+                    .motion_telemetry
+                    .iter()
+                    .find_map(|(scope, telemetry)| {
+                        (*scope == visual_rack::VisualScopeId::Master).then(|| telemetry.clone())
+                    })
+                    .unwrap_or_default();
+                snapshot
+            },
             ntsc: ntsc_snapshot,
             media_safety: media_safety_snapshot,
+            new_layer_fit: self.new_layer_fit,
             layers: self
                 .layers
                 .iter()
                 .map(|layer| {
+                    let stable_layer_id = layer.stable_layer_id();
                     let spout_status = layer.spout_status();
                     let video_health = layer.video_health();
                     let (video_active, video_error) = if layer.source_error().is_empty() {
@@ -3526,6 +14549,50 @@ impl App {
                         }
                     } else {
                         (false, layer.source_error().to_string())
+                    };
+                    let performance = LayerPerformanceSnapshot {
+                        active_slot_id: Some(layer.active_clip_slot),
+                        slots: layer
+                            .clip_slots
+                            .iter()
+                            .map(|slot| {
+                                let active = slot.id == layer.active_clip_slot;
+                                let cached = self.cached_slot_is_prepared(stable_layer_id, slot.id);
+                                let staging = self.slot_is_staging(stable_layer_id, slot.id);
+                                ClipSlotSnapshot {
+                                    id: slot.id,
+                                    name: slot.name.clone(),
+                                    filename: slot.filename.clone(),
+                                    transport: slot.transport,
+                                    playhead: if active {
+                                        layer.clip_transport.position
+                                    } else {
+                                        slot.saved_playhead
+                                    },
+                                    active,
+                                    prepared: active || cached,
+                                    status: if active {
+                                        "active".to_string()
+                                    } else if staging {
+                                        "preparing".to_string()
+                                    } else if cached {
+                                        "gpu_ready".to_string()
+                                    } else {
+                                        String::new()
+                                    },
+                                }
+                            })
+                            .collect(),
+                        matte: MatteSnapshot {
+                            enabled: layer.matte.enabled,
+                            input: Self::image_input_snapshot(layer.matte.input),
+                            channel: layer.matte.channel,
+                            invert: layer.matte.invert,
+                            amount: layer.matte.amount,
+                            threshold: layer.matte.threshold,
+                            softness: layer.matte.softness,
+                            diagnostic: self.matte_diagnostic_for(stable_layer_id),
+                        },
                     };
                     LayerSnapshot {
                         layer_id: layer.layer_id().to_string(),
@@ -3545,6 +14612,20 @@ impl App {
                         key_color: layer.effects.key_color,
                         key_tolerance: layer.effects.key_tolerance,
                         effects: EffectsSnapshot::from_uniforms(&layer.effects),
+                        motion: {
+                            let mut snapshot =
+                                web::state::MotionSnapshot::from_params(layer.motion);
+                            snapshot.telemetry = self
+                                .motion_telemetry
+                                .iter()
+                                .find_map(|(scope, telemetry)| {
+                                    (*scope == visual_rack::VisualScopeId::Layer(stable_layer_id))
+                                        .then(|| telemetry.clone())
+                                })
+                                .unwrap_or_default();
+                            snapshot
+                        },
+                        transform: layer.transform.sanitized(),
                         source_kind: layer.source_kind().to_string(),
                         source_name: spout_status
                             .as_ref()
@@ -3574,10 +14655,28 @@ impl App {
                         } else {
                             "Live Spout input renders as deterministic black offline".to_string()
                         },
+                        performance,
                     }
                 })
                 .collect(),
+            performance: PerformanceSnapshot {
+                scenes: scene_snapshots,
+                prepared_scene_id,
+                pending_scene_id,
+                status: format!(
+                    "{} / {} prepared sources, {} / {} MiB",
+                    prepared_budget.source_count,
+                    self.performance_budget.max_prepared_sources(),
+                    prepared_budget.preload_bytes / (1024 * 1024),
+                    self.performance_budget.max_preload_bytes() / (1024 * 1024)
+                ),
+                scene_staging_status: self.scene_status.clone(),
+                source_staging_status: self.source_staging_status.clone(),
+                image_routing_status: self.image_routing_error.clone(),
+            },
             layer_stack_revision: self.layer_stack_revision,
+            composition_revision: self.composition_revision,
+            creative,
             library: self
                 .library_files
                 .iter()
@@ -3650,7 +14749,18 @@ impl App {
                 port: self.midi.port_name.clone(),
                 error: self.midi.error.clone(),
             },
-            temporal: TemporalSnapshot::from_params(&self.temporal_params),
+            controller_runtime: web::state::ControllerRuntimeSnapshot::from_runtime(
+                self.controller_profile_revision,
+                &self.controller_profile,
+                &self.controller_status,
+                &self.midi.runtime_snapshot(),
+            ),
+            osc_runtime: web::state::OscRuntimeSnapshot::from_runtime(
+                &self.osc_config,
+                &self.osc_status,
+                &self.osc.runtime_snapshot(),
+            ),
+            temporal: temporal_snapshot,
             spout: {
                 let status = self.spout.status();
                 SpoutSnapshot {
@@ -3659,14 +14769,16 @@ impl App {
                     error: status.error,
                 }
             },
+            recorder: self.recorder_snapshot.clone(),
+            stage_health: self.stage_health_snapshot(),
             remote_url: self
                 .web_state
                 .lan_url
                 .read()
                 .map(|s| s.clone())
                 .unwrap_or_default(),
-            output_window: self.output_window_open(),
-            output_error: self.output_error.clone(),
+            output_window: self.output_window_open() || self.stage_surface_windows_open(),
+            output_error: self.published_output_error(),
             blackout: self.blackout,
             morph: MorphSnapshot {
                 has_a: self.morph.a.is_some(),
@@ -3688,6 +14800,21 @@ impl App {
             export_error,
             export_status: export_status.to_string(),
             export_warnings,
+            export_motion,
+            history: web::state::HistorySnapshot::from_history(
+                &self.manual_history,
+                self.history_status.clone(),
+            ),
+            presets: web::state::PresetLibrarySnapshot::from_library(
+                self.preset_revision,
+                &self.preset_library,
+                self.preset_status.clone(),
+            ),
+            recovery_available: self
+                .recovery_journal
+                .as_ref()
+                .is_some_and(|journal| journal.latest_valid().recovery_available()),
+            recovery_status: self.recovery_status.clone(),
             patch_save_status: self.patch_collector.status(),
             patch_load_status: self.patch_load_status.clone(),
             quantized_pending: self.quantized_actions.len(),
@@ -4398,6 +15525,30 @@ impl ApplicationHandler for App {
             wgpu::FilterMode::Linear,
         );
 
+        let device_limits = {
+            let limits = renderer.device.limits();
+            media_safety::MediaDeviceLimits::new(
+                limits.max_texture_dimension_2d,
+                limits.max_buffer_size,
+            )
+        };
+        match performance_runtime::PerformancePreparationRuntime::new(
+            self.media_safety_policy.clone(),
+            device_limits,
+            self.performance_budget,
+        ) {
+            Ok(runtime) => {
+                self.performance_runtime = Some(runtime);
+                self.source_staging_status = "Performance source staging ready".to_string();
+            }
+            Err(error) => {
+                self.performance_runtime = None;
+                self.source_staging_status =
+                    format!("Performance source staging unavailable: {error}");
+                log::error!("{}", self.source_staging_status);
+            }
+        }
+
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.egui_winit = Some(egui_winit);
@@ -4415,6 +15566,13 @@ impl ApplicationHandler for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Every StageMap monitor is an independent host-owned surface. Consume
+        // its events before legacy Output/main-window routing so a failed or
+        // closed projector can never resize or close the creative UI.
+        if self.handle_stage_window_event(window_id, &event) {
+            return;
+        }
+
         // Events for the dedicated output window: it only needs to close,
         // resize, and yield to Escape/O — everything else stays with the
         // main window and never reaches egui.
@@ -4531,7 +15689,11 @@ impl ApplicationHandler for App {
                 } else if is_supported_visual_file(&path) {
                     if let Some(path_str) = path.to_str() {
                         let path_owned = path_str.to_string();
-                        self.add_layer(&path_owned);
+                        self.apply_native_manual_action(
+                            "Add dropped visual layer",
+                            "layer_stack",
+                            move |app| app.add_layer(&path_owned),
+                        );
                     }
                 }
             }
@@ -4548,14 +15710,33 @@ impl ApplicationHandler for App {
                 // Ctrl+key shortcuts (editor toggle, save, load)
                 if state == winit::event::ElementState::Pressed && self.modifiers.control_key() {
                     match physical_key {
+                        PhysicalKey::Code(KeyCode::KeyI) if self.modifiers.shift_key() => {
+                            self.choose_controller_profile_import();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::KeyX) if self.modifiers.shift_key() => {
+                            self.choose_controller_profile_export();
+                            return;
+                        }
                         PhysicalKey::Code(KeyCode::KeyE) => {
+                            if self.yaml_editor.active {
+                                self.yaml_editor.finish_active_edit();
+                            }
                             self.yaml_editor.active = !self.yaml_editor.active;
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
-                            patch::editor::save_patch(
-                                &self.master_effects,
+                            let layer_racks = self.layer_racks();
+                            match patch::editor::save_patch_with_composition_and_motion(
+                                patch::PatchMasterVisual::new(
+                                    &self.master_effects,
+                                    &self.master_transform,
+                                ),
+                                &self.master_motion,
                                 &self.layers,
+                                &self.master_rack,
+                                &layer_racks,
+                                &self.composition,
                                 &self.ntsc_params,
                                 &self.mod_matrix,
                                 &self.temporal_params,
@@ -4564,14 +15745,34 @@ impl ApplicationHandler for App {
                                     media_frozen: self.media_frozen,
                                 },
                                 &self.morph,
-                            );
+                                &self.scenes,
+                            ) {
+                                Ok(()) => self.append_recovery_checkpoint("native patch save"),
+                                Err(error) => {
+                                    self.composition_status =
+                                        format!("Complete patch save failed: {error}");
+                                    log::error!("{}", self.composition_status);
+                                }
+                            }
                             return;
                         }
                         PhysicalKey::Code(KeyCode::KeyO) => {
                             if self.modifiers.shift_key() {
-                                self.choose_and_apply_patch_look(None);
+                                self.apply_native_manual_action(
+                                    "Apply patch look",
+                                    "patch_look",
+                                    |app| {
+                                        app.choose_and_apply_patch_look(None);
+                                    },
+                                );
                             } else {
-                                self.choose_snapshot_patch();
+                                self.apply_native_manual_action(
+                                    "Load patch snapshot",
+                                    "patch_snapshot",
+                                    |app| {
+                                        app.choose_snapshot_patch();
+                                    },
+                                );
                             }
                             return;
                         }
@@ -4582,6 +15783,31 @@ impl ApplicationHandler for App {
                 let shift = self.modifiers.shift_key();
                 let action = map_key(physical_key, state, shift);
 
+                if matches!(
+                    action,
+                    input::keyboard::Action::IncreasePixelate
+                        | input::keyboard::Action::DecreasePixelate
+                        | input::keyboard::Action::IncreaseRgbSplit
+                        | input::keyboard::Action::DecreaseRgbSplit
+                        | input::keyboard::Action::ResetEffects
+                ) {
+                    self.apply_native_manual_action(
+                        "Adjust keyboard effects",
+                        "effects",
+                        move |app| {
+                            if !app.release_active_morph_for_manual_edit() {
+                                return;
+                            }
+                            if let Some(index) = app.selected_layer {
+                                if let Some(layer) = app.layers.get_mut(index) {
+                                    apply_action(action, &mut layer.effects);
+                                }
+                            }
+                        },
+                    );
+                    return;
+                }
+
                 if let Some(idx) = self.selected_layer {
                     if idx < self.layers.len() {
                         let flow = {
@@ -4590,13 +15816,8 @@ impl ApplicationHandler for App {
                         };
                         match flow {
                             ControlFlow::Quit => event_loop.exit(),
-                            ControlFlow::TogglePause => {
-                                let layer = &mut self.layers[idx];
-                                layer.paused = !layer.paused;
-                                layer.reset_transport_timing();
-                            }
-                            ControlFlow::ToggleMediaFreeze => {
-                                self.set_media_frozen(!self.media_frozen)
+                            ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
+                                self.apply_native_transport_flow(flow, Some(idx));
                             }
                             ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
                             ControlFlow::ToggleOutputWindow => self.apply_output_window_command(
@@ -4609,14 +15830,16 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     let mut dummy = effects::EffectUniforms::default();
-                    match apply_action(action, &mut dummy) {
+                    let flow = apply_action(action, &mut dummy);
+                    match flow {
                         ControlFlow::Quit => event_loop.exit(),
                         ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
                         ControlFlow::ToggleOutputWindow => self
                             .apply_output_window_command(event_loop, OutputWindowCommand::Toggle),
                         ControlFlow::ToggleBlackout => self.toggle_blackout(),
-                        ControlFlow::TogglePause => self.set_master_paused(!self.master_paused),
-                        ControlFlow::ToggleMediaFreeze => self.set_media_frozen(!self.media_frozen),
+                        ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
+                            self.apply_native_transport_flow(flow, None);
+                        }
                         _ => {}
                     }
                 }
@@ -4631,6 +15854,14 @@ impl ApplicationHandler for App {
                 if now - self.last_frame_time >= FRAME_DURATION {
                     let wall_frame_delta = now.saturating_duration_since(self.last_frame_time);
                     self.last_frame_time = now;
+                    self.stage_health_monitor
+                        .observe_frame(wall_frame_delta, FRAME_DURATION);
+
+                    // Drive only nonblocking GPU-map/worker completion before
+                    // accepting another control action. A terminal success may
+                    // publish its library/ClipSlot intent here; a new Start in
+                    // this same browser batch then sees the transaction idle.
+                    self.poll_live_capture();
 
                     // Process actions from web UI
                     let mut pending_actions: VecDeque<_> = self
@@ -4664,6 +15895,10 @@ impl ApplicationHandler for App {
                             return;
                         }
                     }
+                    self.sync_stage_presenter(event_loop);
+                    if self.exit_if_device_lost(event_loop) {
+                        return;
+                    }
                     let audio_load_completed = self.poll_audio_clip_loader();
 
                     // Build the preview and the native recovery controls. The
@@ -4685,12 +15920,33 @@ impl ApplicationHandler for App {
                         library_folder: self.library_folder.clone(),
                         visual_files: self.library_files.len(),
                         audio_files: self.audio_library_files.len(),
-                        output_status: self.output_error.clone(),
+                        output_status: self.published_output_error(),
                         media_status: self.media_safety_status.clone(),
                     };
                     let mut native_recovery_actions = Vec::new();
 
                     let egui_context = self.egui_ctx.clone();
+                    let stage_health_snapshot = self.stage_health_snapshot();
+                    let stage_tools = &self.stage_tools;
+                    let native_editor_blocked_by_browser = matches!(
+                        self.manual_history.open_gesture(),
+                        Some((_, history::MutationOrigin::BrowserManual))
+                    );
+                    let native_history_before =
+                        if self.yaml_editor.active && !self.manual_history.metrics().gesture_open {
+                            match self.history_checkpoint("Edit patch value", "native_editor") {
+                                Ok(checkpoint) => Some(checkpoint),
+                                Err(error) => {
+                                    self.yaml_editor.finish_active_edit();
+                                    self.yaml_editor.active = false;
+                                    self.history_status =
+                                        format!("Native editor disabled before mutation: {error}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
                     let yaml_editor = &mut self.yaml_editor;
                     let layers = &mut self.layers;
                     let master_effects = &mut self.master_effects;
@@ -4710,12 +15966,18 @@ impl ApplicationHandler for App {
                                     ui.heading("Patch editor");
                                     ui.weak("Ctrl+E closes · edits apply live");
                                     ui.separator();
-                                    patch::editor::build_yaml_editor_content(
-                                        ui,
-                                        layers,
-                                        master_effects,
-                                        yaml_editor,
-                                    );
+                                    if native_editor_blocked_by_browser {
+                                        ui.weak(
+                                            "Editing is locked while a browser control gesture is active.",
+                                        );
+                                    } else {
+                                        patch::editor::build_yaml_editor_content(
+                                            ui,
+                                            layers,
+                                            master_effects,
+                                            yaml_editor,
+                                        );
+                                    }
                                 });
                         }
                         // Video remains visible beside the optional code editor.
@@ -4733,14 +15995,82 @@ impl ApplicationHandler for App {
                                         ));
                                     });
                                 }
+                                if show_stage_editor_health(output_on_main) {
+                                    if let Some(permit) = stage_health::editor_preview_permit(
+                                        stage_tools,
+                                        &stage_map::StageSurface::EditorPreview,
+                                    ) {
+                                        stage_health::paint_editor_preview_health(
+                                            ui,
+                                            permit,
+                                            &stage_health_snapshot,
+                                        );
+                                    }
+                                }
                             });
                     });
+
+                    let native_history_boundaries = self.yaml_editor.take_history_boundaries();
+                    self.apply_native_history_boundaries(
+                        native_history_boundaries,
+                        native_history_before,
+                    );
 
                     // Browser ingress was drained first; a physical operator's
                     // native action is therefore deterministic local-last and
                     // does not depend on the server queue or any live browser.
                     for action in native_recovery_actions {
                         self.apply_native_recovery_action(action);
+                    }
+
+                    // Controller transport is sampled before this frame's
+                    // gates and clocks, so Start/Continue/Stop and OSC Freeze
+                    // affect the same accepted program frame rather than one
+                    // frame later. MIDI Learn's raw compatibility sampler owns
+                    // the four legacy slots; typed profile events are drained
+                    // immediately after that authoritative sample.
+                    self.resolve_pending_initial_controller_profile();
+                    if self.mod_matrix.midi_enabled && !self.midi.is_running() {
+                        self.midi.start();
+                        if !self.midi.error.is_empty() {
+                            self.mod_matrix.midi_enabled = false;
+                        }
+                    } else if !self.mod_matrix.midi_enabled && self.midi.is_running() {
+                        self.midi.stop();
+                    }
+                    if let Some(slot) = self.mod_matrix.midi_learn {
+                        if let Some(cc) = self.midi.take_last_cc() {
+                            self.mod_matrix.midi_ccs[slot] = cc;
+                            self.mod_matrix.midi_learn = None;
+                            log::info!("MIDI learn: slot {slot} -> CC{cc}");
+                        }
+                    }
+                    for i in 0..modulation::NUM_MIDI_SLOTS {
+                        self.mod_matrix.midi[i] = self.midi.cc_value(self.mod_matrix.midi_ccs[i]);
+                    }
+                    self.drain_controller_events();
+                    self.sync_controller_profile_feedback();
+
+                    // MIDI clock sync owns tempo and beat before the frame's
+                    // modulation clock advances. When pulses disappear the
+                    // internal clock resumes from the same anchored phase.
+                    if self.mod_matrix.midi_clock_sync && self.midi.is_running() {
+                        match self.midi.clock_state() {
+                            Some((bpm, beat)) => {
+                                let now = Instant::now();
+                                self.mod_matrix.clock.set_bpm_at(bpm, now);
+                                self.mod_matrix.clock.set_external_beat(Some(beat), now);
+                            }
+                            None => {
+                                self.mod_matrix
+                                    .clock
+                                    .set_external_beat(None, Instant::now());
+                            }
+                        }
+                    } else if self.mod_matrix.clock.is_external() {
+                        self.mod_matrix
+                            .clock
+                            .set_external_beat(None, Instant::now());
                     }
 
                     let gates = transport_gates(
@@ -4773,48 +16103,6 @@ impl ApplicationHandler for App {
                         layer.effects.time = elapsed;
                     }
                     self.master_effects.time = elapsed;
-
-                    // Harvest completed file frames before modulation is
-                    // sampled. Authoritative loop generations can therefore
-                    // reroll the base seed used by the very first rendered
-                    // frame of the new loop, even when the worker mailbox has
-                    // overwritten intermediate decoded images.
-                    {
-                        let renderer = self.renderer.as_ref().unwrap();
-                        for layer in &mut self.layers {
-                            let playing = gates.media_running && !layer.paused;
-                            if !layer.is_file_media()
-                                || (!playing && layer.source_frame_initialized())
-                            {
-                                continue;
-                            }
-                            match layer.take_ready_media_frame() {
-                                Ok(Some(frame)) => {
-                                    randomization::apply_live_loop_reroll(
-                                        &mut layer.effects,
-                                        layer.reroll_on_loop,
-                                        frame.loops_advanced,
-                                    );
-                                    if let Err(error) = layer.upload_frame(
-                                        &renderer.device,
-                                        &renderer.queue,
-                                        &frame.rgba,
-                                    ) {
-                                        log::error!(
-                                            "Layer '{}' GPU upload failed: {error}",
-                                            layer.filename
-                                        );
-                                        layer.restore_ready_media_frame_after_failed_upload(frame);
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(error) => log::error!(
-                                    "Layer '{}' decoder failed: {error}",
-                                    layer.filename
-                                ),
-                            }
-                        }
-                    }
 
                     // Sync audio capture with the requested state, then feed
                     // the latest analysis into the matrix as a source.
@@ -4867,48 +16155,6 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // Same for MIDI: sync connection state, run learn, read slots.
-                    if self.mod_matrix.midi_enabled && !self.midi.is_running() {
-                        self.midi.start();
-                        if !self.midi.error.is_empty() {
-                            self.mod_matrix.midi_enabled = false;
-                        }
-                    } else if !self.mod_matrix.midi_enabled && self.midi.is_running() {
-                        self.midi.stop();
-                    }
-                    if let Some(slot) = self.mod_matrix.midi_learn {
-                        if let Some(cc) = self.midi.take_last_cc() {
-                            self.mod_matrix.midi_ccs[slot] = cc;
-                            self.mod_matrix.midi_learn = None;
-                            log::info!("MIDI learn: slot {slot} → CC{cc}");
-                        }
-                    }
-                    for i in 0..modulation::NUM_MIDI_SLOTS {
-                        self.mod_matrix.midi[i] = self.midi.cc_value(self.mod_matrix.midi_ccs[i]);
-                    }
-
-                    // MIDI clock sync: while pulses arrive, the external clock
-                    // owns BPM and beat position; when they stop, the internal
-                    // clock resumes from the same position.
-                    if self.mod_matrix.midi_clock_sync && self.midi.is_running() {
-                        match self.midi.clock_state() {
-                            Some((bpm, beat)) => {
-                                let now = Instant::now();
-                                self.mod_matrix.clock.set_bpm_at(bpm, now);
-                                self.mod_matrix.clock.set_external_beat(Some(beat), now);
-                            }
-                            None => {
-                                self.mod_matrix
-                                    .clock
-                                    .set_external_beat(None, Instant::now());
-                            }
-                        }
-                    } else if self.mod_matrix.clock.is_external() {
-                        self.mod_matrix
-                            .clock
-                            .set_external_beat(None, Instant::now());
-                    }
-
                     // Sample the modulation matrix and derive modulated copies.
                     // Base values (what the UI edits) stay untouched; LFOs
                     // breathe around them.
@@ -4936,50 +16182,210 @@ impl ApplicationHandler for App {
                         );
                     }
 
-                    // Broadcast after this frame's program-time sampling and
-                    // morph application so the panel reflects the exact
-                    // authoritative state being rendered, not the prior one.
-                    self.push_web_state();
-
-                    // Resolve all per-layer route destinations in one O(routes)
-                    // batch and reuse the exact results for transport and GPU
-                    // rendering. This also prevents duplicated route work from
-                    // giving either consumer a subtly different future path.
-                    let layer_modulations = modulation_frame.modulate_layers(
-                        self.layers
-                            .iter()
-                            .map(|layer| (&layer.effects, layer.opacity, layer.speed, layer.fps)),
+                    // Source preparation is independent of piece time, while
+                    // activation obeys both Freeze gates. A quantized payload
+                    // that becomes ready on this tick cannot consume a beat
+                    // which elapsed before readiness.
+                    let performance_crossings = self.performance_boundaries.observe(
+                        self.mod_matrix.current_beat,
+                        4,
+                        !gates.media_running,
+                    );
+                    let committed_layers = self.poll_and_release_performance(
+                        performance_crossings,
+                        gates,
+                        Instant::now(),
                     );
 
-                    // Advance live sources only after this frame's audio,
-                    // MIDI, slew, beat latch, and morph state are current.
-                    // This gives transport the same modulation phase used by
-                    // rendering and by the deterministic exporter.
-                    let renderer = self.renderer.as_ref().unwrap();
-                    for (layer, layer_mod) in self.layers.iter_mut().zip(layer_modulations.iter()) {
-                        let playing = gates.media_running && !layer.paused;
+                    // The pure transport owns source time. Frame-local
+                    // modulation offsets are applied around the canonical
+                    // slot rate/FPS without narrowing authored 0..=16 rates
+                    // to the legacy modulation target's 0.25..=4 range.
+                    let mut transport_discontinuity = false;
+                    let score_loop_driver = match self.temporal_params.originals.score.loop_driver {
+                        temporal::CollisionScoreLoopDriver::SelectedLayer { layer_id, .. } => {
+                            Some(layer_id)
+                        }
+                        temporal::CollisionScoreLoopDriver::None
+                        | temporal::CollisionScoreLoopDriver::MissingSelectedLayer { .. } => None,
+                    };
+                    let mut temporal_loop_events = 0_u32;
+                    for index in 0..self.layers.len() {
+                        let (modulated, rate_proxy, fps_proxy) = {
+                            let layer = &self.layers[index];
+                            let authored_rate = if layer.speed.is_finite() {
+                                layer.speed.clamp(0.0, 16.0)
+                            } else {
+                                0.0
+                            };
+                            let authored_fps = if layer.fps.is_finite() && layer.fps > 0.0 {
+                                layer.fps.clamp(0.25, 480.0)
+                            } else {
+                                layer
+                                    .active_clip_config()
+                                    .transport
+                                    .sample_fps
+                                    .unwrap_or(30.0) as f32
+                            };
+                            let proxy_speed = authored_rate.clamp(0.25, 4.0);
+                            let proxy_fps = authored_fps.clamp(1.0, 240.0);
+                            (
+                                modulation_frame.modulate_layer(
+                                    index,
+                                    &layer.effects,
+                                    &layer.transform,
+                                    layer.opacity,
+                                    proxy_speed,
+                                    proxy_fps,
+                                ),
+                                proxy_speed,
+                                proxy_fps,
+                            )
+                        };
+                        let layer = &mut self.layers[index];
+                        let authored = layer.active_clip_config().transport;
+                        let base_rate = if layer.speed.is_finite() {
+                            f64::from(layer.speed).clamp(0.0, 16.0)
+                        } else {
+                            0.0
+                        };
+                        let rate_delta = f64::from(modulated.speed - rate_proxy);
+                        let effective_rate = (base_rate + rate_delta).clamp(0.0, 16.0);
+                        let base_fps = if layer.fps.is_finite() && layer.fps > 0.0 {
+                            f64::from(layer.fps).clamp(0.25, 480.0)
+                        } else {
+                            authored.sample_fps.unwrap_or(30.0)
+                        };
+                        let fps_delta = f64::from(modulated.fps - fps_proxy);
+                        let morph_controls_fps = self
+                            .morph
+                            .controls_layer_field(index, morph::LayerMorphControl::Fps);
+                        let effective_sample_fps = if authored.sample_fps.is_some()
+                            || morph_controls_fps
+                            || fps_delta != 0.0
+                        {
+                            Some((base_fps + fps_delta).clamp(0.25, 480.0))
+                        } else {
+                            None
+                        };
+                        let just_committed = committed_layers.contains(&layer.stable_layer_id());
+                        let tick = transport::ProgramTransportTick {
+                            delta_seconds: if just_committed {
+                                0.0
+                            } else {
+                                f64::from(program_delta)
+                            },
+                            program_beat: self.mod_matrix.current_beat,
+                            program_running: gates.program_running,
+                            media_running: gates.media_running && !layer.paused,
+                            ..Default::default()
+                        };
+                        match layer.apply_transport_tick_with_overrides(
+                            tick,
+                            effective_rate,
+                            effective_sample_fps,
+                        ) {
+                            Ok(selection) => {
+                                if selection.cue_miss {
+                                    self.source_staging_status =
+                                        format!("Layer {} ignored a missing cue", layer.layer_id());
+                                }
+                                if matches!(
+                                    authored.end_behavior,
+                                    transport::EndBehavior::Loop | transport::EndBehavior::PingPong
+                                ) {
+                                    randomization::apply_live_loop_reroll(
+                                        &mut layer.effects,
+                                        layer.reroll_on_loop,
+                                        u64::from(selection.boundary_events),
+                                    );
+                                }
+                                if score_loop_driver == Some(layer.stable_layer_id()) {
+                                    temporal_loop_events = temporal_loop_events
+                                        .saturating_add(selection.boundary_events);
+                                }
+                                transport_discontinuity |=
+                                    selection.discontinuity && !just_committed;
+                            }
+                            Err(error) => log::error!(
+                                "Layer '{}' transport selection failed: {error}",
+                                layer.filename
+                            ),
+                        }
+                    }
+                    if transport_discontinuity {
+                        self.invalidate_source_cut_generation();
+                    }
+                    let temporal_crossings = self.temporal_boundaries.observe(
+                        self.mod_matrix.current_beat,
+                        4,
+                        !gates.program_running,
+                    );
+                    let temporal_audio_onsets = self
+                        .temporal_audio_onsets
+                        .observe(self.mod_matrix.audio.onset, gates.program_running);
+                    accumulate_temporal_events(
+                        &mut self.pending_temporal_events,
+                        temporal::TemporalFrameEvents {
+                            boundary_events: temporal_loop_events,
+                            downbeat_events: temporal_crossings.bars,
+                            audio_onset_events: temporal_audio_onsets,
+                            manual_events: 0,
+                        },
+                    );
 
-                        if layer.is_file_media() {
-                            if !playing {
-                                layer.reset_transport_timing();
+                    // Generation-tagged absolute selections are published
+                    // before harvesting. Thus an old decoder completion can
+                    // never cross a seek/cue/loop discontinuity into the GPU.
+                    {
+                        let renderer = self.renderer.as_ref().unwrap();
+                        for layer in &mut self.layers {
+                            let playing = gates.media_running && !layer.paused;
+                            if !layer.is_file_media()
+                                || (!playing && layer.source_frame_initialized())
+                            {
                                 continue;
                             }
-                            if let Err(error) =
-                                layer.request_due_video_frames_at(layer_mod.fps, layer_mod.speed)
-                            {
-                                log::error!("Layer '{}' decoder failed: {error}", layer.filename);
+                            match layer.take_ready_media_frame() {
+                                Ok(Some(mut frame)) => {
+                                    if let Err(error) = layer.upload_ready_media_frame(
+                                        &renderer.device,
+                                        &renderer.queue,
+                                        &mut frame,
+                                    ) {
+                                        log::error!(
+                                            "Layer '{}' GPU upload failed: {error}",
+                                            layer.filename
+                                        );
+                                        layer.restore_ready_media_frame_after_failed_upload(frame);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => log::error!(
+                                    "Layer '{}' decoder failed: {error}",
+                                    layer.filename
+                                ),
                             }
+                        }
+                    }
+
+                    // Harvest overwrite-style live sources before evaluation:
+                    // a Spout frame may change source dimensions, and Fit/Fill
+                    // must plan against the pixels rendered in this frame.
+                    let (frame_output_width, frame_output_height) = {
+                        let renderer = self.renderer.as_ref().unwrap();
+                        (renderer.output_width, renderer.output_height)
+                    };
+                    let renderer = self.renderer.as_ref().unwrap();
+                    for layer in &mut self.layers {
+                        if layer.is_file_media() {
                             continue;
                         }
-
+                        let playing = gates.media_running && !layer.paused;
                         if !playing {
                             layer.reset_transport_timing();
                             continue;
                         }
-
-                        // A real-time Spout layer owns one overwrite slot;
-                        // pause holds the last frame and video pacing does not
-                        // apply.
                         if let Some(frame) = layer.try_spout_frame() {
                             if let Err(error) =
                                 layer.upload_spout_frame(&renderer.device, &renderer.queue, frame)
@@ -4992,11 +16398,453 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    let (mod_master, mod_ntsc, mod_temporal) = modulation_frame.modulate(
-                        &self.master_effects,
-                        &self.ntsc_params,
-                        &self.temporal_params,
+                    // Resolve the complete post-morph program once. Transport,
+                    // direct rendering, selective rendering, and export all
+                    // consume this same immutable frame-plan contract.
+                    let mut evaluated_master_rack = self.master_rack.clone();
+                    let mut evaluated_layer_racks: Vec<_> = self
+                        .layers
+                        .iter()
+                        .map(|layer| (layer.stable_layer_id(), layer.rack.clone()))
+                        .collect();
+                    let mut evaluated_composition = self.composition.clone();
+                    match modulation::StableModAddressBook::from_composition(
+                        &evaluated_master_rack,
+                        &evaluated_layer_racks,
+                        &evaluated_composition,
+                    ) {
+                        Ok(address_book) => {
+                            let stable_frame = self.mod_matrix.stable_frame(&address_book);
+                            modulation::apply_stable_modulation(
+                                &address_book,
+                                &stable_frame,
+                                &mut evaluated_master_rack,
+                                &mut evaluated_layer_racks,
+                                &mut evaluated_composition,
+                            );
+                        }
+                        Err(error) => {
+                            let diagnostic =
+                                format!("Stable creative modulation rejected: {error}");
+                            if diagnostic != self.composition_status {
+                                log::error!("{diagnostic}");
+                                self.composition_status = diagnostic;
+                            }
+                        }
+                    }
+                    let frame_resources = LiveFrameResources::capture(&self.layers);
+                    // Advanced history is executor-owned and never inherits a
+                    // legacy renderer frame. A cold Advanced plan remains
+                    // topology-identical while diagnosing ProgramHistory as
+                    // unavailable until its own accepted N-1 commit.
+                    let advanced_program_history_initialized = self
+                        .composition_gpu
+                        .as_ref()
+                        .is_some_and(|executor| executor.program_history_initialized());
+                    let mut evaluated_frame = EvaluatedFramePlan::evaluate(
+                        &modulation_frame,
+                        FramePlanContext::new(frame_output_width, frame_output_height, elapsed),
+                        MasterFrameInput {
+                            effects: &self.master_effects,
+                            transform: &self.master_transform,
+                            ntsc: &self.ntsc_params,
+                            temporal: &self.temporal_params,
+                        },
+                        self.layers
+                            .iter()
+                            .zip(frame_resources.sources())
+                            .map(|(layer, source)| LayerFrameInput {
+                                source,
+                                effects: &layer.effects,
+                                transform: &layer.transform,
+                                opacity: layer.opacity,
+                                speed: layer.speed,
+                                fps: layer.fps,
+                                blend_mode: layer.blend_mode,
+                                visible: layer.visible && layer.transport_visible(),
+                                paused: layer.paused,
+                                bypass_master_fx: layer.bypass_master_fx,
+                            }),
                     );
+                    let authored_layer_mattes: Vec<_> =
+                        self.layers.iter().map(|layer| layer.matte).collect();
+                    let evaluated_master_motion =
+                        modulation_frame.modulate_motion(&self.master_motion);
+                    let evaluated_layer_motion = self
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .map(|(index, layer)| {
+                            let codec = layer.codec_motion();
+                            evaluated_frame::evaluated_composition::LayerMotionPlanInput {
+                                stable_id: layer.stable_layer_id(),
+                                params: modulation_frame
+                                    .modulate_layer_motion(index, &layer.motion),
+                                codec: codec.map_or_else(
+                                    evaluated_frame::evaluated_composition::MotionCodecFrameFacts::default,
+                                    |codec| {
+                                        evaluated_frame::evaluated_composition::MotionCodecFrameFacts {
+                                            available: codec.codec_vectors_available(),
+                                            source_generation: codec.source_generation,
+                                            frame_ordinal: codec.frame_ordinal,
+                                        }
+                                    },
+                                ),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let limits = renderer.device.limits();
+                    let motion_limits = motion::MotionDeviceLimits::new(
+                        limits.max_texture_dimension_2d,
+                        limits.max_buffer_size,
+                    );
+                    let mut creative_input =
+                        evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                            &evaluated_composition,
+                            &evaluated_master_rack,
+                            &evaluated_layer_racks,
+                        )
+                        .with_layer_mattes(
+                            &authored_layer_mattes,
+                            advanced_program_history_initialized,
+                        )
+                        .with_motion(
+                            evaluated_master_motion,
+                            &evaluated_layer_motion,
+                            motion_limits,
+                        );
+                    creative_input.resource_limits.max_texture_dimension_2d =
+                        limits.max_texture_dimension_2d;
+                    creative_input.resource_limits.max_texture_array_layers =
+                        limits.max_texture_array_layers;
+                    creative_input
+                        .resource_limits
+                        .max_sampled_textures_per_shader_stage =
+                        limits.max_sampled_textures_per_shader_stage;
+                    let mut evaluated_creative =
+                        match evaluated_frame.plan_composition(creative_input) {
+                            Ok(plan) => Some(plan),
+                            Err(error) => {
+                                let diagnostic = format!("Creative frame plan rejected: {error}");
+                                if diagnostic != self.composition_status {
+                                    log::error!("{diagnostic}");
+                                    self.composition_status = diagnostic;
+                                }
+                                None
+                            }
+                        };
+                    if advanced_program_history_initialized {
+                        let warmed_identity_matches = evaluated_creative.as_ref().is_some_and(
+                            |plan| {
+                                let evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                    advanced,
+                                ) = plan
+                                else {
+                                    return true;
+                                };
+                                let source_keys = advanced
+                                    .layers()
+                                    .iter()
+                                    .map(|layer_plan| {
+                                        let evaluated = &advanced.base().layers()
+                                            [layer_plan.base_layer_index];
+                                        let epoch = self
+                                            .layers
+                                            .iter()
+                                            .find(|layer| {
+                                                layer.stable_layer_id() == layer_plan.stable_id
+                                            })
+                                            .map_or(0, Layer::source_resource_epoch);
+                                        (layer_plan.stable_id, evaluated.source.size, epoch)
+                                    })
+                                    .collect::<Vec<_>>();
+                                self.composition_gpu.as_ref().is_some_and(|executor| {
+                                    executor.is_prepared_for(plan, &source_keys)
+                                })
+                            },
+                        );
+                        if !warmed_identity_matches {
+                            let mut cold_input =
+                                evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                                    &evaluated_composition,
+                                    &evaluated_master_rack,
+                                    &evaluated_layer_racks,
+                                )
+                                .with_layer_mattes(&authored_layer_mattes, false)
+                                .with_motion(
+                                    evaluated_master_motion,
+                                    &evaluated_layer_motion,
+                                    motion_limits,
+                                );
+                            cold_input.resource_limits.max_texture_dimension_2d =
+                                limits.max_texture_dimension_2d;
+                            cold_input.resource_limits.max_texture_array_layers =
+                                limits.max_texture_array_layers;
+                            cold_input
+                                .resource_limits
+                                .max_sampled_textures_per_shader_stage =
+                                limits.max_sampled_textures_per_shader_stage;
+                            evaluated_creative = match evaluated_frame.plan_composition(cold_input)
+                            {
+                                Ok(plan) => Some(plan),
+                                Err(error) => {
+                                    let diagnostic =
+                                        format!("Creative cold frame plan rejected: {error}");
+                                    if diagnostic != self.composition_status {
+                                        log::error!("{diagnostic}");
+                                        self.composition_status.clone_from(&diagnostic);
+                                    }
+                                    None
+                                }
+                            };
+                        }
+                    }
+                    match evaluated_creative.as_ref() {
+                        Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::LegacyExact(_),
+                        ) => {
+                            // Crossing through Exact is a hard history/resource
+                            // boundary. Re-entering the same Advanced topology
+                            // must start cold rather than revive stale donors.
+                            Self::discard_advanced_capture_executor_readbacks(
+                                &mut self.live_capture,
+                            );
+                            self.composition_gpu = None;
+                            self.motion_field_cache.clear();
+                            match evaluated_frame.attach_image_routing(
+                                authored_layer_mattes.iter().copied(),
+                                renderer.program_history_initialized(),
+                            ) {
+                            Ok(()) => {
+                                self.image_routing_error.clear();
+                                self.image_routing_diagnostics = self
+                                    .layers
+                                    .iter()
+                                    .zip(evaluated_frame.image_routing().mattes())
+                                    .map(|(layer, matte)| {
+                                        let diagnostic = match matte.diagnostic {
+                                            image_routing::ImageRouteDiagnostic::Disabled => {
+                                                "disabled"
+                                            }
+                                            image_routing::ImageRouteDiagnostic::Ready => "ready",
+                                            image_routing::ImageRouteDiagnostic::Missing(_) => {
+                                                "missing"
+                                            }
+                                            image_routing::ImageRouteDiagnostic::Cycle(_) => "cycle",
+                                        };
+                                        (layer.stable_layer_id(), diagnostic.to_string())
+                                    })
+                                    .collect();
+                            }
+                            Err(error) => {
+                                if error != self.image_routing_error {
+                                    log::error!("Image routing rejected: {error}");
+                                }
+                                self.image_routing_error = error;
+                                self.image_routing_diagnostics = self
+                                    .layers
+                                    .iter()
+                                    .map(|layer| {
+                                        (layer.stable_layer_id(), "rejected".to_string())
+                                    })
+                                    .collect();
+                            }
+                            }
+                        }
+                        Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                plan,
+                            ),
+                        ) => {
+                            if let Some(motion_plan) = plan.motion().advanced() {
+                                let motion_diagnostics = refresh_live_codec_motion_cache(
+                                    &self.layers,
+                                    motion_plan,
+                                    &mut self.motion_field_cache,
+                                );
+                                if let Some(diagnostic) = motion_diagnostics.first() {
+                                    let diagnostic =
+                                        format!("Motion source diagnostic: {diagnostic}");
+                                    if diagnostic != self.composition_status {
+                                        log::warn!("{diagnostic}");
+                                        self.composition_status.clone_from(&diagnostic);
+                                    }
+                                }
+                            } else {
+                                self.motion_field_cache.clear();
+                            }
+                            // The unified M2 graph is the sole authority for
+                            // advanced base mattes. Do not run M1 routing first:
+                            // it cannot resolve group outputs and would either
+                            // misdiagnose or execute the matte twice.
+                            self.image_routing_error.clear();
+                            self.image_routing_diagnostics = plan
+                                .layers()
+                                .iter()
+                                .map(|layer| {
+                                    let diagnostic = layer
+                                        .legacy_matte
+                                        .as_ref()
+                                        .map_or("disabled", |matte| match matte.diagnostic {
+                                            image_routing::ImageRouteDiagnostic::Disabled => {
+                                                "disabled"
+                                            }
+                                            image_routing::ImageRouteDiagnostic::Ready => "ready",
+                                            image_routing::ImageRouteDiagnostic::Missing(_) => {
+                                                "missing"
+                                            }
+                                            image_routing::ImageRouteDiagnostic::Cycle(_) => "cycle",
+                                        });
+                                    (layer.stable_id, diagnostic.to_string())
+                                })
+                                .collect();
+                            if let Some(diagnostic) =
+                                creative_route_diagnostic_status(plan.diagnostics())
+                            {
+                                if diagnostic != self.composition_status {
+                                    log::warn!("{diagnostic}");
+                                    self.composition_status = diagnostic;
+                                }
+                            } else if self
+                                .composition_status
+                                .starts_with("Creative route diagnostic")
+                            {
+                                self.composition_status = "Creative graph ready".to_string();
+                            }
+                        }
+                        None => {
+                            self.image_routing_diagnostics = self
+                                .layers
+                                .iter()
+                                .map(|layer| {
+                                    (layer.stable_layer_id(), "rejected".to_string())
+                                })
+                                .collect();
+                        }
+                    }
+                    self.motion_telemetry = match evaluated_creative.as_ref() {
+                        Some(
+                            plan @ evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                advanced,
+                            ),
+                        ) => advanced.motion().advanced().map_or_else(Vec::new, |motion_plan| {
+                            // Runtime metrics belong to the last accepted GPU
+                            // world. Publish them only when that world has the
+                            // exact immutable plan/source identity selected for
+                            // this frame; otherwise report planned facts with a
+                            // cold memory generation instead of stale carrier
+                            // state from an earlier topology.
+                            let source_keys = advanced
+                                .layers()
+                                .iter()
+                                .map(|layer_plan| {
+                                    let evaluated = &advanced.base().layers()
+                                        [layer_plan.base_layer_index];
+                                    let epoch = self
+                                        .layers
+                                        .iter()
+                                        .find(|layer| {
+                                            layer.stable_layer_id() == layer_plan.stable_id
+                                        })
+                                        .map_or(0, Layer::source_resource_epoch);
+                                    (layer_plan.stable_id, evaluated.source.size, epoch)
+                                })
+                                .collect::<Vec<_>>();
+                            let executor = self.composition_gpu.as_ref().filter(|executor| {
+                                executor.is_prepared_for(plan, &source_keys)
+                            });
+                            motion_telemetry_from_plan(motion_plan, executor)
+                        }),
+                        _ => Vec::new(),
+                    };
+                    let mut creative_safe_hold = evaluated_creative.is_none();
+                    if let Some(plan) = evaluated_creative.as_ref() {
+                        if let Err(error) =
+                            renderer::composition::CompositionGpuExecutor::validate_plan(plan)
+                        {
+                            let diagnostic = format!("Creative GPU plan rejected: {error}");
+                            if diagnostic != self.composition_status {
+                                log::error!("{diagnostic}");
+                                self.composition_status.clone_from(&diagnostic);
+                            }
+                            self.output_error.clone_from(&diagnostic);
+                            creative_safe_hold = true;
+                        }
+                    }
+                    debug_assert_eq!(
+                        evaluated_frame.context().output_size,
+                        [frame_output_width, frame_output_height]
+                    );
+                    debug_assert_eq!(
+                        evaluated_frame.master_pass_uniforms().spatial,
+                        evaluated_frame.master_transform().gpu_uniforms(
+                            frame_output_width,
+                            frame_output_height,
+                            frame_output_width,
+                            frame_output_height,
+                        )
+                    );
+                    debug_assert!(evaluated_frame.layers().iter().enumerate().all(
+                        |(index, layer)| evaluated_frame
+                            .layer_pass_uniforms(index)
+                            .is_some_and(|pass| pass.spatial == layer.spatial)
+                    ));
+
+                    // Broadcast the exact transport/routing state selected for
+                    // this frame, including GPU cache and matte diagnostics.
+                    self.push_web_state();
+
+                    let mod_ntsc = evaluated_frame.ntsc().clone();
+                    let mod_temporal = *evaluated_frame.temporal();
+                    let temporal_input = temporal::TemporalFrameInput::new(
+                        program_delta,
+                        temporal_freeze_state(gates.program_running, self.media_frozen),
+                        self.blackout,
+                        self.pending_temporal_events,
+                    )
+                    .with_audio_energy(self.mod_matrix.audio.level);
+                    let motion_attachments = self
+                        .motion_field_cache
+                        .iter()
+                        .map(LiveMotionFieldCache::attachment)
+                        .collect::<Vec<_>>();
+                    let motion_held_scopes = self
+                        .layers
+                        .iter()
+                        .filter(|layer| layer.paused)
+                        .map(|layer| visual_rack::VisualScopeId::Layer(layer.stable_layer_id()))
+                        .collect::<Vec<_>>();
+
+                    let capture_plan_kind = match evaluated_creative.as_ref() {
+                        Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::LegacyExact(_),
+                        ) => LiveCapturePlanKind::LegacyExact,
+                        Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(_),
+                        ) => LiveCapturePlanKind::Advanced,
+                        None => LiveCapturePlanKind::Unavailable,
+                    };
+                    let capture_intent_result = self.live_capture.as_mut().map(|session| {
+                        session.frame_intent(
+                            capture_plan_kind,
+                            elapsed_duration,
+                            self.visual_epoch,
+                            self.master_paused,
+                            self.media_frozen,
+                            self.blackout,
+                        )
+                    });
+                    let mut capture_frame_intent = match capture_intent_result {
+                        Some(Ok(intent)) => intent,
+                        Some(Err(())) => {
+                            let target = self.live_capture.as_ref().map(|session| session.target);
+                            self.output_error = format!(
+                                "Capture source {target:?} is unavailable in the current creative plan"
+                            );
+                            None
+                        }
+                        None => None,
+                    };
 
                     let renderer = self.renderer.as_mut().unwrap();
                     let mut encoder =
@@ -5006,265 +16854,1039 @@ impl ApplicationHandler for App {
                                 label: Some("Frame Encoder"),
                             });
 
-                    // Snapshot the audience at the actual blackout edge before
-                    // any render or absolute clear can overwrite slot2. This is
-                    // path-independent: VHS/bypass controls may change while
-                    // black, yet releasing the cut under Pause must restore the
-                    // exact pre-cut pixels. A running release renders afresh.
-                    if let Some(action) = blackout_audience_edge_action(
-                        self.blackout,
-                        self.blackout_presented,
-                        program_transport_paused,
-                        self.selective_hold_snapshot_valid,
-                    ) {
-                        match action {
-                            HeldAudienceAction::Capture => {
-                                renderer.capture_held_audience(&mut encoder);
-                                self.selective_hold_snapshot_valid = true;
-                            }
-                            HeldAudienceAction::Restore => {
-                                renderer.restore_held_audience(&mut encoder);
-                            }
-                            HeldAudienceAction::Keep => {}
-                        }
-                        if program_transport_paused {
-                            self.selective_transition_holding = true;
-                            self.selective_hold_spout_barrier_epoch = None;
-                            self.selective_hold_spout_readback_epoch = None;
-                        }
-                    }
-                    if !self.blackout && self.blackout_presented {
-                        self.blackout_presented = false;
-                    }
-
-                    // Per-layer modulated copies: opacity crossfades, key
-                    // thresholds breathing shapes in and out — bases untouched.
-                    let layer_mods: Vec<(effects::EffectUniforms, f32)> = layer_modulations
-                        .iter()
-                        .map(|lm| (lm.effects, lm.opacity))
-                        .collect();
-
-                    let selective_required = mod_ntsc.enabled
-                        && !self.blackout
-                        && ntsc::selective_ntsc_required(self.layers.iter().zip(&layer_mods).map(
-                            |(layer, (_, opacity))| ntsc::SelectiveNtscLayerDescriptor {
-                                layer_id: layer.layer_id(),
-                                visible: layer.visible,
-                                bypass_master_fx: layer.bypass_master_fx,
-                                opacity: *opacity,
-                                blend_mode: layer.blend_mode.as_u32(),
-                                transform_fingerprint: 0,
-                            },
-                        ));
-                    let selective_contributing_layers = self
-                        .layers
-                        .iter()
-                        .zip(&layer_mods)
-                        .filter(|(layer, (_, opacity))| {
-                            layer.visible && opacity.is_finite() && *opacity > 0.0
-                        })
-                        .count();
-                    let selective_budget_error = selective_required
-                        .then(|| {
-                            ntsc::validate_selective_ntsc_live_memory(
-                                renderer.output_width,
-                                renderer.output_height,
-                                selective_contributing_layers,
+                    // Prepare and encode Advanced only into executor-owned
+                    // RGBA16F surfaces plus compat slot0. Slot2 (the accepted
+                    // audience) remains untouched until the entire advanced
+                    // traversal succeeds and the ordinary opaque boundary is
+                    // explicitly recorded below.
+                    let mut advanced_encoded = false;
+                    let mut advanced_audience_rendered = false;
+                    let mut temporal_frame_accepted = false;
+                    let mut scope_readback_to_map: Option<(
+                        LiveCaptureFrameIntent,
+                        renderer::readback::RecorderReadbackReservation,
+                    )> = None;
+                    let mut advanced_scope_armed: Option<(
+                        LiveCaptureFrameIntent,
+                        renderer::readback::RecorderReadbackReservation,
+                    )> = None;
+                    let mut capture_source_dropped = false;
+                    if !creative_safe_hold
+                        && matches!(
+                            evaluated_creative.as_ref(),
+                            Some(
+                                evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(_)
                             )
-                            .and_then(|memory| {
-                                ntsc::validate_selective_ntsc_gpu_staging_limit(
-                                    memory,
-                                    renderer.device.limits().max_buffer_size,
-                                )
-                            })
-                        })
-                        .and_then(Result::err);
-                    let next_runtime_error = selective_budget_error.clone().unwrap_or_default();
-                    if next_runtime_error != self.selective_ntsc_runtime_error {
-                        if !next_runtime_error.is_empty() {
-                            log::error!("{next_runtime_error}");
-                        }
-                        self.selective_ntsc_runtime_error = next_runtime_error;
-                    }
-                    let requested_ntsc_path = if !mod_ntsc.enabled || self.blackout {
-                        LiveNtscPath::Disabled
-                    } else if selective_required {
-                        LiveNtscPath::SelectivePerLayer
-                    } else {
-                        LiveNtscPath::LegacyGlobal
-                    };
-                    let mut selective_audience_sample = None;
-                    let ntsc_path_changed = requested_ntsc_path != self.ntsc_pipeline_path;
-                    let selective_edge =
-                        is_selective_path_edge(self.ntsc_pipeline_path, requested_ntsc_path);
-                    let topology_signature =
-                        selective_ntsc_topology_signature(&self.layers, &layer_mods);
-                    let selective_topology_changed = selective_required
-                        && topology_signature != self.selective_topology_signature;
-                    let selective_rebuild = selective_edge || selective_topology_changed;
-                    let hold_rebuild = program_transport_paused || selective_budget_error.is_some();
-
-                    // Path and topology can change in the same frame (most
-                    // notably on first entry into selective VHS). Treat them
-                    // as one committed generation boundary so async work is
-                    // invalidated exactly once.
-                    if selective_generation_boundary(ntsc_path_changed, selective_topology_changed)
+                        )
                     {
-                        self.visual_epoch = self.visual_epoch.wrapping_add(1);
-                        self.ntsc_presented = None;
+                        let advanced_result: Result<(), String> = (|| {
+                            let plan = evaluated_creative
+                                .as_ref()
+                                .expect("advanced plan was matched");
+                            let evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                advanced,
+                            ) = plan
+                            else {
+                                unreachable!("advanced plan was matched")
+                            };
+                            let sources = advanced
+                                .layers()
+                                .iter()
+                                .map(|layer_plan| {
+                                    let evaluated = &advanced.base().layers()
+                                        [layer_plan.base_layer_index];
+                                    let view = frame_resources
+                                        .texture_view(evaluated.source)
+                                        .map_err(|error| {
+                                            format!("advanced source view: {error}")
+                                        })?;
+                                    let epoch = self
+                                        .layers
+                                        .iter()
+                                        .find(|layer| {
+                                            layer.stable_layer_id() == layer_plan.stable_id
+                                        })
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "advanced source layer {} is absent",
+                                                layer_plan.stable_id.get()
+                                            )
+                                        })?
+                                        .source_resource_epoch();
+                                    Ok(renderer::composition::CompositionSourceDescriptor::new(
+                                        layer_plan.stable_id,
+                                        view,
+                                        evaluated.source.size,
+                                    )
+                                    .with_resource_epoch(epoch))
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            let dimensions = [renderer.output_width, renderer.output_height];
+                            if self
+                                .composition_gpu
+                                .as_ref()
+                                .is_none_or(|executor| executor.dimensions() != dimensions)
+                            {
+                                self.composition_gpu = Some(
+                                    renderer::composition::CompositionGpuExecutor::new(
+                                        &renderer.device,
+                                        &renderer.queue,
+                                        dimensions,
+                                    )
+                                    .map_err(|error| error.to_string())?,
+                                );
+                            }
+                            let executor = self
+                                .composition_gpu
+                                .as_mut()
+                                .expect("advanced executor was initialized");
+                            if self.pending_motion_memory_clear {
+                                executor.clear_motion_memory();
+                                self.pending_motion_memory_clear = false;
+                            }
+                            executor
+                                .prepare(&renderer.device, &renderer.queue, plan, &sources)
+                                .map_err(|error| error.to_string())?;
+                            if capture_frame_intent
+                                .is_some_and(|intent| intent.backend == LiveCaptureBackend::Advanced)
+                            {
+                                let intent = capture_frame_intent
+                                    .take()
+                                    .expect("advanced capture intent was matched");
+                                match executor.prepare_scope_recorder_readback(
+                                    &renderer.device,
+                                    intent.target,
+                                ) {
+                                    Ok(_) => match executor
+                                        .begin_scope_recorder_readback(intent.tag)
+                                    {
+                                        renderer::readback::RecorderReadbackAdmission::Scheduled(
+                                            reservation,
+                                        ) => {
+                                            advanced_scope_armed = Some((intent, reservation));
+                                        }
+                                        renderer::readback::RecorderReadbackAdmission::Busy
+                                        | renderer::readback::RecorderReadbackAdmission::Unprepared
+                                        | renderer::readback::RecorderReadbackAdmission::SourceUnavailable => {
+                                            capture_source_dropped = true;
+                                        }
+                                    },
+                                    Err(error) => {
+                                        self.output_error =
+                                            format!("prepare Advanced scope capture: {error}");
+                                        capture_source_dropped = true;
+                                    }
+                                }
+                            }
+                            executor
+                                .encode_with_motion(
+                                    &renderer.queue,
+                                    &mut encoder,
+                                    plan,
+                                    renderer::composition::CompositionFrameTiming::from_temporal_input(
+                                        temporal_input,
+                                    ),
+                                    renderer::composition::CompositionMotionFrameInput {
+                                        attachments: &motion_attachments,
+                                        held_scopes: &motion_held_scopes,
+                                    },
+                                )
+                                .map_err(|error| error.to_string())?;
+                            if let Some((intent, reservation)) = advanced_scope_armed.take() {
+                                match executor
+                                    .finish_scope_recorder_readback(reservation)
+                                    .map_err(|error| error.to_string())?
+                                {
+                                    renderer::readback::RecorderReadbackCaptureStatus::Captured => {
+                                        if let Some(session) = self.live_capture.as_mut() {
+                                            session.mark_scheduled(intent);
+                                        }
+                                        scope_readback_to_map = Some((intent, reservation));
+                                    }
+                                    renderer::readback::RecorderReadbackCaptureStatus::SourceUnavailable => {
+                                        capture_source_dropped = true;
+                                    }
+                                }
+                            }
+                            executor
+                                .encode_present(
+                                    &mut encoder,
+                                    &renderer.composite_views[0],
+                                    renderer::composition::COMPOSITION_PRESENT_FORMAT,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            Ok(())
+                        })();
+                        match advanced_result {
+                            Ok(()) => advanced_encoded = true,
+                            Err(error) => {
+                                if advanced_scope_armed.take().is_some() {
+                                    capture_source_dropped = true;
+                                }
+                                if let Some(executor) = &mut self.composition_gpu {
+                                    executor.discard_frame_history();
+                                }
+                                let diagnostic =
+                                    format!("Advanced composition safe-hold: {error}");
+                                if diagnostic != self.composition_status {
+                                    log::error!("{diagnostic}");
+                                    self.composition_status.clone_from(&diagnostic);
+                                }
+                                self.output_error.clone_from(&diagnostic);
+                                creative_safe_hold = true;
+                            }
+                        }
                     }
-                    if ntsc_path_changed {
-                        self.ntsc_pipeline_path = requested_ntsc_path;
-                    }
-                    if selective_topology_changed {
-                        self.selective_topology_signature = topology_signature;
-                        self.selective_topology_generation =
-                            self.selective_topology_generation.wrapping_add(1).max(1);
-                    }
-                    if selective_rebuild {
-                        let was_holding = self.selective_transition_holding;
-                        self.selective_temporal_debt = 0.0;
-                        renderer.reset_visual_generation();
-                        if hold_rebuild {
-                            match held_audience_action(
-                                was_holding,
-                                self.blackout,
-                                self.selective_hold_snapshot_valid,
-                            ) {
+
+                    if !creative_safe_hold {
+                        // Snapshot the audience at the actual blackout edge before
+                        // any render or absolute clear can overwrite slot2. This is
+                        // path-independent: VHS/bypass controls may change while
+                        // black, yet releasing the cut under Pause must restore the
+                        // exact pre-cut pixels. A running release renders afresh.
+                        if let Some(action) = blackout_audience_edge_action(
+                            self.blackout,
+                            self.blackout_presented,
+                            program_transport_paused,
+                            self.selective_hold_snapshot_valid,
+                        ) {
+                            match action {
                                 HeldAudienceAction::Capture => {
                                     renderer.capture_held_audience(&mut encoder);
                                     self.selective_hold_snapshot_valid = true;
                                 }
                                 HeldAudienceAction::Restore => {
-                                    // Blackout clears slot2, but never the
-                                    // saved audience texture. Restore it on a
-                                    // paused return to selective/direct output.
                                     renderer.restore_held_audience(&mut encoder);
                                 }
                                 HeldAudienceAction::Keep => {}
                             }
-                            self.selective_transition_holding = true;
-                            self.selective_hold_spout_barrier_epoch = None;
-                            self.selective_hold_spout_readback_epoch = None;
-                        } else {
-                            self.selective_transition_holding = false;
-                            // A playing blackout may later be paused before it
-                            // is released. Retain the pre-cut snapshot for that
-                            // entire interval; a real non-black render below or
-                            // an accepted selective sample disposes of it.
-                            if rendered_audience_may_discard_blackout_snapshot(
-                                program_transport_paused,
-                                self.blackout,
-                            ) {
-                                self.selective_hold_snapshot_valid = false;
-                            }
-                            self.selective_hold_spout_barrier_epoch = None;
-                            self.selective_hold_spout_readback_epoch = None;
-                            if requested_ntsc_path == LiveNtscPath::SelectivePerLayer
-                                && selective_budget_error.is_none()
-                                && selective_rebuild_should_clear_audience(false)
-                            {
-                                // Never flash a globally processed frame while
-                                // the first selective generation is prepared.
-                                renderer.clear_composite(&mut encoder);
-                            }
-                        }
-                    }
-
-                    // The established global pipeline remains literally the
-                    // same command order unless a visible, positive-opacity
-                    // bypass layer requires selective VHS.
-                    if !selective_required {
-                        if direct_path_may_replace_selective_hold(
-                            program_transport_paused,
-                            self.selective_transition_holding,
-                        ) {
-                            renderer.render_layers_and_master(
-                                &mut encoder,
-                                &self.layers,
-                                &layer_mods,
-                                &mod_master,
-                            );
-                            renderer.render_temporal_with_dt(
-                                &mut encoder,
-                                &mod_temporal,
-                                program_delta,
-                                !program_transport_paused,
-                            );
-                            renderer.render_opaque_output(&mut encoder);
-                            if rendered_audience_may_discard_blackout_snapshot(
-                                program_transport_paused,
-                                self.blackout,
-                            ) {
-                                self.selective_transition_holding = false;
-                                self.selective_hold_snapshot_valid = false;
+                            if program_transport_paused {
+                                self.selective_transition_holding = true;
                                 self.selective_hold_spout_barrier_epoch = None;
                                 self.selective_hold_spout_readback_epoch = None;
                             }
                         }
-                    } else {
-                        if !program_transport_paused && selective_budget_error.is_none() {
-                            self.selective_temporal_debt =
-                                (self.selective_temporal_debt.clamp(0.0, 1.0) + program_delta)
-                                    .min(1.0);
-                        } else if selective_budget_error.is_some() {
-                            self.selective_temporal_debt = 0.0;
+                        if !self.blackout && self.blackout_presented {
+                            self.blackout_presented = false;
                         }
-                        let generation = ntsc::SelectiveNtscGeneration {
-                            visual_epoch: self.visual_epoch,
-                            topology_generation: self.selective_topology_generation,
-                            width: renderer.output_width,
-                            height: renderer.output_height,
-                            sample_sequence: self.selective_sample_sequence,
-                        };
-                        let worker = self
-                            .selective_ntsc_worker
-                            .get_or_insert_with(ntsc::SelectiveNtscWorker::new);
-                        let current_plan = live_selective_ntsc_plan(
-                            generation,
-                            ntsc::NtscFrameMetadata {
-                                params: mod_ntsc.clone(),
-                                reference_frame: ntsc::reference_frame_for_time(
-                                    elapsed_duration.as_secs_f64(),
-                                ),
-                            },
-                            &self.layers,
-                            &layer_mods,
+
+                        let legacy_exact_frame = matches!(
+                        evaluated_creative.as_ref(),
+                        Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::LegacyExact(_)
+                        )
+                    );
+                        let selective_required = legacy_exact_frame
+                            && mod_ntsc.enabled
+                            && !self.blackout
+                            && ntsc::selective_ntsc_required(live_selective_ntsc_descriptors(
+                                &evaluated_frame,
+                            ));
+                        let selective_contributing_layers = evaluated_frame
+                            .layers()
+                            .iter()
+                            .filter(|layer| {
+                                layer.visible && layer.opacity.is_finite() && layer.opacity > 0.0
+                            })
+                            .count();
+                        // Reject unsupported topology before the rebuild is
+                        // allowed to clear the audience. The same preflight also
+                        // owns memory admission, so every policy failure follows
+                        // one visible hold/skip path.
+                        let selective_policy_error = selective_required
+                            .then(|| {
+                                renderer::compositor::validate_selective_matte_topology(
+                                    evaluated_frame.image_routing().is_active(),
+                                )?;
+                                let memory = ntsc::validate_selective_ntsc_live_memory(
+                                    renderer.output_width,
+                                    renderer.output_height,
+                                    selective_contributing_layers,
+                                )?;
+                                ntsc::validate_selective_ntsc_gpu_staging_limit(
+                                    memory,
+                                    renderer.device.limits().max_buffer_size,
+                                )
+                            })
+                            .and_then(Result::err);
+                        let next_runtime_error = selective_policy_error.clone().unwrap_or_default();
+                        if next_runtime_error != self.selective_ntsc_runtime_error {
+                            if !next_runtime_error.is_empty() {
+                                log::error!("{next_runtime_error}");
+                            }
+                            self.selective_ntsc_runtime_error = next_runtime_error;
+                        }
+                        let requested_ntsc_path = match evaluated_creative.as_ref() {
+                        Some(
+                            evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(
+                                plan,
+                            ),
+                        ) if mod_ntsc.enabled && !self.blackout => match plan.ntsc_path() {
+                            evaluated_frame::evaluated_composition::AdvancedNtscPath::AllApplying => {
+                                LiveNtscPath::LegacyGlobal
+                            }
+                            evaluated_frame::evaluated_composition::AdvancedNtscPath::Disabled
+                            | evaluated_frame::evaluated_composition::AdvancedNtscPath::AllBypass => {
+                                LiveNtscPath::Disabled
+                            }
+                            evaluated_frame::evaluated_composition::AdvancedNtscPath::Mixed => {
+                                unreachable!("mixed Advanced NTSC was rejected before encoding")
+                            }
+                        },
+                        _ if !mod_ntsc.enabled || self.blackout => LiveNtscPath::Disabled,
+                        _ if selective_required => LiveNtscPath::SelectivePerLayer,
+                        _ => LiveNtscPath::LegacyGlobal,
+                    };
+                        let mut selective_audience_sample = None;
+                        let ntsc_path_changed = requested_ntsc_path != self.ntsc_pipeline_path;
+                        let selective_edge =
+                            is_selective_path_edge(self.ntsc_pipeline_path, requested_ntsc_path);
+                        let topology_signature =
+                            selective_ntsc_topology_signature(&evaluated_frame);
+                        let selective_topology_changed = selective_required
+                            && topology_signature != self.selective_topology_signature;
+                        let selective_rebuild = selective_edge || selective_topology_changed;
+                        let hold_rebuild = !selective_rebuild_should_clear_audience(
+                            program_transport_paused,
+                            selective_policy_error.is_some(),
                         );
 
-                        // Move the newest complete GPU batch into the bounded
-                        // CPU worker before checking for a processed result.
-                        // Stale mapped batches are recycled without submission.
-                        let worker_admission = worker.admission_outcome();
-                        if selective_budget_error.is_none()
-                            && !matches!(worker_admission, ntsc::NtscSubmitOutcome::Busy)
-                        {
-                            if let Some(batch) = renderer.poll_selective_ntsc_readback() {
-                                if current_plan.as_ref().is_some_and(|current| {
-                                    ntsc::selective_plan_compatible(&batch.plan, current)
-                                }) {
-                                    let outcome = match worker_admission {
-                                        ntsc::NtscSubmitOutcome::Accepted => {
-                                            worker.try_submit_outcome(batch)
-                                        }
-                                        ntsc::NtscSubmitOutcome::Unavailable => {
-                                            ntsc::NtscSubmitOutcome::Unavailable
-                                        }
-                                        ntsc::NtscSubmitOutcome::Busy => unreachable!(
-                                            "busy worker is excluded from selective polling"
-                                        ),
-                                    };
-                                    if !outcome.is_accepted() {
-                                        // The GPU sample was already admitted. Keep a
-                                        // downstream worker rejection distinct from a
-                                        // topology/epoch incompatibility.
-                                        self.ntsc_live_metrics
-                                            .selective
-                                            .record_downstream_rejection(outcome);
+                        // Path and topology can change in the same frame (most
+                        // notably on first entry into selective VHS). Treat them
+                        // as one committed generation boundary so async work is
+                        // invalidated exactly once.
+                        if selective_generation_boundary(
+                            ntsc_path_changed,
+                            selective_topology_changed,
+                        ) {
+                            self.visual_epoch = self.visual_epoch.wrapping_add(1);
+                            self.ntsc_presented = None;
+                        }
+                        if ntsc_path_changed {
+                            self.ntsc_pipeline_path = requested_ntsc_path;
+                        }
+                        if selective_topology_changed {
+                            self.selective_topology_signature = topology_signature;
+                            self.selective_topology_generation =
+                                self.selective_topology_generation.wrapping_add(1).max(1);
+                        }
+                        if selective_rebuild {
+                            let was_holding = self.selective_transition_holding;
+                            self.selective_temporal_debt = 0.0;
+                            renderer.reset_visual_generation();
+                            if hold_rebuild {
+                                match held_audience_action(
+                                    was_holding,
+                                    self.blackout,
+                                    self.selective_hold_snapshot_valid,
+                                ) {
+                                    HeldAudienceAction::Capture => {
+                                        renderer.capture_held_audience(&mut encoder);
+                                        self.selective_hold_snapshot_valid = true;
                                     }
+                                    HeldAudienceAction::Restore => {
+                                        // Blackout clears slot2, but never the
+                                        // saved audience texture. Restore it on a
+                                        // paused return to selective/direct output.
+                                        renderer.restore_held_audience(&mut encoder);
+                                    }
+                                    HeldAudienceAction::Keep => {}
+                                }
+                                self.selective_transition_holding = true;
+                                self.selective_hold_spout_barrier_epoch = None;
+                                self.selective_hold_spout_readback_epoch = None;
+                            } else {
+                                self.selective_transition_holding = false;
+                                // A playing blackout may later be paused before it
+                                // is released. Retain the pre-cut snapshot for that
+                                // entire interval; a real non-black render below or
+                                // an accepted selective sample disposes of it.
+                                if rendered_audience_may_discard_blackout_snapshot(
+                                    program_transport_paused,
+                                    self.blackout,
+                                ) {
+                                    self.selective_hold_snapshot_valid = false;
+                                }
+                                self.selective_hold_spout_barrier_epoch = None;
+                                self.selective_hold_spout_readback_epoch = None;
+                                if requested_ntsc_path == LiveNtscPath::SelectivePerLayer
+                                    && selective_policy_error.is_none()
+                                    && selective_rebuild_should_clear_audience(false, false)
+                                {
+                                    // Never flash a globally processed frame while
+                                    // the first selective generation is prepared.
+                                    renderer.clear_composite(&mut encoder);
+                                }
+                            }
+                        }
+
+                        // The established global pipeline remains literally the
+                        // same command order unless a visible, positive-opacity
+                        // bypass layer requires selective VHS.
+                        if !selective_required {
+                            if direct_path_may_replace_selective_hold(
+                                program_transport_paused,
+                                self.selective_transition_holding,
+                            ) {
+                                if advanced_encoded {
+                                    // Advanced already authored every ordered host
+                                    // boundary, including LegacyTemporal, into
+                                    // compat slot0. The established opaque resolve
+                                    // remains the sole audience handoff.
+                                    renderer.render_opaque_output(&mut encoder);
+                                    advanced_audience_rendered = true;
+                                    temporal_frame_accepted = true;
                                 } else {
+                                    let legacy_scope_armed = if capture_frame_intent.is_some_and(
+                                        |intent| {
+                                            intent.backend == LiveCaptureBackend::Renderer
+                                                && matches!(
+                                                    intent.target,
+                                                    program_recorder::CaptureTarget::Layer(_)
+                                                )
+                                        },
+                                    ) {
+                                        let intent = capture_frame_intent
+                                            .take()
+                                            .expect("Exact layer capture intent was matched");
+                                        match renderer.prepare_legacy_scope_recorder_readback(
+                                            intent.target,
+                                        ) {
+                                            Ok(_) => match renderer
+                                                .begin_legacy_scope_recorder_readback(intent.tag)
+                                            {
+                                                renderer::readback::RecorderReadbackAdmission::Scheduled(
+                                                    reservation,
+                                                ) => Some((intent, reservation)),
+                                                renderer::readback::RecorderReadbackAdmission::Busy
+                                                | renderer::readback::RecorderReadbackAdmission::Unprepared
+                                                | renderer::readback::RecorderReadbackAdmission::SourceUnavailable => {
+                                                    capture_source_dropped = true;
+                                                    None
+                                                }
+                                            },
+                                            Err(error) => {
+                                                self.output_error =
+                                                    format!("prepare Exact layer capture: {error}");
+                                                capture_source_dropped = true;
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                    let legacy_render_result = renderer.render_evaluated_frame(
+                                        &mut encoder,
+                                        &frame_resources,
+                                        &evaluated_frame,
+                                    );
+                                    match &legacy_render_result {
+                                        Ok(()) => {
+                                            renderer.render_temporal_frame(
+                                                &mut encoder,
+                                                &mod_temporal,
+                                                temporal_input,
+                                            );
+                                            temporal_frame_accepted = true;
+                                            renderer.render_opaque_output(&mut encoder);
+                                        }
+                                        Err(error) => {
+                                            // Slot 2 is the last accepted audience
+                                            // image. A rejected creative plan must
+                                            // neither replace it with black nor
+                                            // consume temporal/reset/Score events.
+                                            log::error!("Live frame plan rejected: {error}");
+                                            self.output_error.clone_from(error);
+                                        }
+                                    }
+                                    if let Some((intent, reservation)) = legacy_scope_armed {
+                                        match renderer
+                                            .finish_legacy_scope_recorder_readback(reservation)
+                                        {
+                                            Ok(
+                                                renderer::readback::RecorderReadbackCaptureStatus::Captured,
+                                            ) => {
+                                                if let Some(session) = self.live_capture.as_mut() {
+                                                    session.mark_scheduled(intent);
+                                                    if legacy_render_result.is_err() {
+                                                        session.mark_capture_rejected(
+                                                            intent.capture_index(),
+                                                        );
+                                                    }
+                                                }
+                                                scope_readback_to_map = Some((intent, reservation));
+                                            }
+                                            Ok(
+                                                renderer::readback::RecorderReadbackCaptureStatus::SourceUnavailable,
+                                            ) => capture_source_dropped = true,
+                                            Err(error) => {
+                                                self.output_error = format!(
+                                                    "finish Exact layer capture: {error}"
+                                                );
+                                                capture_source_dropped = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if temporal_frame_accepted
+                                    && rendered_audience_may_discard_blackout_snapshot(
+                                        program_transport_paused,
+                                        self.blackout,
+                                    )
+                                {
+                                    self.selective_transition_holding = false;
+                                    self.selective_hold_snapshot_valid = false;
+                                    self.selective_hold_spout_barrier_epoch = None;
+                                    self.selective_hold_spout_readback_epoch = None;
+                                }
+                            }
+                        } else {
+                            if !program_transport_paused && selective_policy_error.is_none() {
+                                self.selective_temporal_debt =
+                                    (self.selective_temporal_debt.clamp(0.0, 1.0) + program_delta)
+                                        .min(1.0);
+                            } else if selective_policy_error.is_some() {
+                                self.selective_temporal_debt = 0.0;
+                            }
+                            let generation = ntsc::SelectiveNtscGeneration {
+                                visual_epoch: self.visual_epoch,
+                                topology_generation: self.selective_topology_generation,
+                                width: renderer.output_width,
+                                height: renderer.output_height,
+                                sample_sequence: self.selective_sample_sequence,
+                            };
+                            let worker = self
+                                .selective_ntsc_worker
+                                .get_or_insert_with(ntsc::SelectiveNtscWorker::new);
+                            let current_plan = live_selective_ntsc_plan(
+                                generation,
+                                ntsc::NtscFrameMetadata {
+                                    params: mod_ntsc.clone(),
+                                    reference_frame: ntsc::reference_frame_for_time(
+                                        elapsed_duration.as_secs_f64(),
+                                    ),
+                                },
+                                &evaluated_frame,
+                            );
+
+                            // Move the newest complete GPU batch into the bounded
+                            // CPU worker before checking for a processed result.
+                            // Stale mapped batches are recycled without submission.
+                            let worker_admission = worker.admission_outcome();
+                            if selective_policy_error.is_none()
+                                && !matches!(worker_admission, ntsc::NtscSubmitOutcome::Busy)
+                            {
+                                if let Some(batch) = renderer.poll_selective_ntsc_readback() {
+                                    if current_plan.as_ref().is_some_and(|current| {
+                                        ntsc::selective_plan_compatible(&batch.plan, current)
+                                    }) {
+                                        let outcome = match worker_admission {
+                                            ntsc::NtscSubmitOutcome::Accepted => {
+                                                worker.try_submit_outcome(batch)
+                                            }
+                                            ntsc::NtscSubmitOutcome::Unavailable => {
+                                                ntsc::NtscSubmitOutcome::Unavailable
+                                            }
+                                            ntsc::NtscSubmitOutcome::Busy => unreachable!(
+                                                "busy worker is excluded from selective polling"
+                                            ),
+                                        };
+                                        if !outcome.is_accepted() {
+                                            // The GPU sample was already admitted. Keep a
+                                            // downstream worker rejection distinct from a
+                                            // topology/epoch incompatibility.
+                                            self.ntsc_live_metrics
+                                                .selective
+                                                .record_downstream_rejection(outcome);
+                                        }
+                                    } else {
+                                        self.ntsc_live_metrics.selective.record_stale();
+                                    }
+                                }
+                                if exit_on_renderer_device_loss(
+                                    renderer,
+                                    &mut self.output_error,
+                                    event_loop,
+                                ) {
+                                    return;
+                                }
+                            }
+
+                            // A finished generation becomes the sole input to the
+                            // downstream temporal stage. Paused transport holds the
+                            // last output exactly; no new batch is submitted.
+                            if selective_policy_error.is_none() && !program_transport_paused {
+                                if let Some(processed) = worker.try_recv() {
+                                    if current_plan.as_ref().is_some_and(|current| {
+                                        ntsc::selective_plan_compatible(&processed.plan, current)
+                                    }) {
+                                        if let Err(error) =
+                                            renderer.write_engine_composite(&processed.pixels)
+                                        {
+                                            log::error!("Rejected selective NTSC result: {error}");
+                                            self.selective_ntsc_runtime_error = error;
+                                        } else {
+                                            renderer.render_temporal_frame(
+                                                &mut encoder,
+                                                &mod_temporal,
+                                                temporal::TemporalFrameInput::new(
+                                                    self.selective_temporal_debt,
+                                                    temporal_input.freeze,
+                                                    temporal_input.blackout,
+                                                    temporal_input.events,
+                                                )
+                                                .with_audio_energy(temporal_input.audio_energy),
+                                            );
+                                            temporal_frame_accepted = true;
+                                            renderer.render_opaque_output(&mut encoder);
+                                            self.selective_temporal_debt = 0.0;
+                                            self.selective_transition_holding = false;
+                                            self.selective_hold_snapshot_valid = false;
+                                            self.selective_hold_spout_barrier_epoch = None;
+                                            self.selective_hold_spout_readback_epoch = None;
+                                            selective_audience_sample =
+                                                Some(processed.plan.generation);
+                                        }
+                                    } else {
+                                        self.ntsc_live_metrics.selective.record_stale();
+                                    }
+                                }
+                            }
+
+                            if selective_policy_error.is_none() && !program_transport_paused {
+                                if let Some(mut plan) = current_plan {
+                                    let worker_admission = worker.admission_outcome();
+                                    if selective_ntsc_gpu_gate_is_open(
+                                        worker_admission,
+                                        &mut self.ntsc_live_metrics.selective,
+                                    ) {
+                                        let submitted_sequence =
+                                            self.selective_sample_sequence.wrapping_add(1);
+                                        plan.generation.sample_sequence = submitted_sequence;
+                                        match renderer.begin_selective_ntsc_readback(
+                                            &mut encoder,
+                                            &frame_resources,
+                                            &evaluated_frame,
+                                            plan,
+                                        ) {
+                                            Ok(accepted) => {
+                                                self.ntsc_live_metrics
+                                                    .selective
+                                                    .record_attempt(accepted);
+                                                if accepted {
+                                                    self.selective_sample_sequence =
+                                                        submitted_sequence;
+                                                    self.selective_ntsc_runtime_error.clear();
+                                                }
+                                            }
+                                            Err(error) => {
+                                                log::error!(
+                                                    "Selective NTSC snapshot rejected: {error}"
+                                                );
+                                                self.selective_ntsc_runtime_error = error;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // A paused selective transition advances Spout's colour
+                        // intent before copying the held audience. The barrier
+                        // drops pending/dequeued old-epoch frames without changing
+                        // the receiver's last texture; the tagged readback then
+                        // converges it to the exact slot2 image. If Spout starts
+                        // during the hold, this same branch runs on the next frame.
+                        let held_spout_active = held_spout_restore_active(
+                            self.selective_transition_holding,
+                            self.blackout,
+                            self.spout_enabled,
+                            self.spout.is_running(),
+                        );
+                        if !held_spout_active {
+                            self.selective_hold_spout_barrier_epoch = None;
+                            self.selective_hold_spout_readback_epoch = None;
+                        }
+                        if held_spout_barrier_required(
+                            held_spout_active,
+                            self.selective_hold_spout_barrier_epoch,
+                            self.visual_epoch,
+                        ) && self.spout.hold_colour_epoch(self.visual_epoch)
+                        {
+                            self.selective_hold_spout_barrier_epoch = Some(self.visual_epoch);
+                            self.selective_hold_spout_readback_epoch = None;
+                        }
+                        let held_audience_readback = if held_spout_readback_required(
+                            held_spout_active,
+                            self.selective_hold_spout_barrier_epoch,
+                            self.selective_hold_spout_readback_epoch,
+                            self.visual_epoch,
+                        ) {
+                            match renderer
+                                .begin_held_audience_readback(&mut encoder, self.visual_epoch)
+                            {
+                                Ok(slot) => slot,
+                                Err(error) => {
+                                    self.output_error = format!(
+                                        "Spout held-audience readback unavailable: {error}"
+                                    );
+                                    log::error!("{}", self.output_error);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if held_audience_readback.is_some() {
+                            self.selective_hold_spout_readback_epoch = Some(self.visual_epoch);
+                        }
+
+                        // Commit the raw GPU render before any CPU-processed
+                        // queue write. A later command buffer would otherwise
+                        // overwrite the queued NTSC upload.
+                        // Selective Spout coupling is encoded immediately after
+                        // the exact sample's Temporal+opaque passes, in this same
+                        // command stream. A held redraw schedules no duplicate
+                        // readback and can therefore never masquerade as a newer
+                        // sample.
+                        let selective_audience_readback =
+                            if self.spout_enabled && self.spout.is_running() {
+                                selective_audience_sample.and_then(|sample| {
+                                    match renderer
+                                        .begin_selective_audience_readback(&mut encoder, sample)
+                                    {
+                                        Ok(slot) => slot,
+                                        Err(error) => {
+                                            self.output_error = format!(
+                                        "Spout selective-audience readback unavailable: {error}"
+                                    );
+                                            log::error!("{}", self.output_error);
+                                            None
+                                        }
+                                    }
+                                })
+                            } else {
+                                None
+                            };
+
+                        if advanced_encoded && !advanced_audience_rendered {
+                            // Paused selective-transition hold accepted no new
+                            // audience frame, so its staged N-1 writes must remain
+                            // unpublished even though harmless internal commands
+                            // may be submitted with the UI frame.
+                            if let Some(executor) = &mut self.composition_gpu {
+                                executor.discard_frame_history();
+                            }
+                        }
+                        if capture_frame_intent.is_some_and(|intent| {
+                            !matches!(intent.target, program_recorder::CaptureTarget::Program)
+                        }) {
+                            capture_frame_intent = None;
+                            capture_source_dropped = true;
+                        }
+                        renderer.queue.submit(std::iter::once(encoder.finish()));
+                        if let Some((intent, reservation)) = scope_readback_to_map.take() {
+                            let mapped = match intent.backend {
+                                LiveCaptureBackend::Renderer => {
+                                    renderer.map_recorder_readback(reservation)
+                                }
+                                LiveCaptureBackend::Advanced => self
+                                    .composition_gpu
+                                    .as_ref()
+                                    .ok_or(renderer::readback::RecorderReadbackError::InvalidReservation)
+                                    .and_then(|executor| {
+                                        executor.map_scope_recorder_readback(reservation)
+                                    }),
+                            };
+                            if let Err(error) = mapped {
+                                self.output_error = format!("map scope capture readback: {error}");
+                            }
+                        }
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            renderer.discard_temporal_frame();
+                            if let Some(executor) = &mut self.composition_gpu {
+                                executor.discard_frame_history();
+                            }
+                            return;
+                        }
+                        renderer.commit_temporal_frame();
+                        if advanced_audience_rendered {
+                            if let Some(executor) = &mut self.composition_gpu {
+                                executor.commit_frame_history();
+                            }
+                        }
+                        if temporal_frame_accepted {
+                            match evaluated_creative.as_ref() {
+                                Some(
+                                    evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::LegacyExact(_),
+                                ) => {
+                                    self.accepted_creative_resource_bytes = Some(0);
+                                    self.accepted_motion_resource_bytes = Some(0);
+                                }
+                                Some(
+                                    evaluated_frame::evaluated_composition::EvaluatedCompositionPlan::Advanced(plan),
+                                ) => {
+                                    let allocated = self
+                                        .composition_gpu
+                                        .as_ref()
+                                        .map(renderer::composition::CompositionGpuExecutor::allocation_snapshot);
+                                    self.accepted_creative_resource_bytes = Some(allocated.map_or(
+                                        plan.resources().creative_bytes,
+                                        |snapshot| snapshot.creative_bytes,
+                                    ));
+                                    self.accepted_motion_resource_bytes = Some(allocated.map_or_else(
+                                        || {
+                                            plan.motion().advanced().map_or(0, |motion| {
+                                                motion.resources().total_bytes
+                                            })
+                                        },
+                                        |snapshot| snapshot.motion_bytes,
+                                    ));
+                                }
+                                None => {}
+                            }
+                        }
+                        if temporal_frame_accepted && temporal_input.freeze.program_advances() {
+                            self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+                        }
+                        if selective_required {
+                            renderer.map_selective_ntsc_readback();
+                        }
+                        if let Some(index) = selective_audience_readback {
+                            renderer.map_readback(index);
+                        }
+                        if let Some(index) = held_audience_readback {
+                            renderer.map_readback(index);
+                        }
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            return;
+                        }
+                        encoder = renderer.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor {
+                                label: Some("Post-Process Encoder"),
+                            },
+                        );
+
+                        // Sync the Spout output worker with its toggle.
+                        if self.spout_enabled && !self.spout.is_running() {
+                            self.spout.start();
+                        } else if !self.spout_enabled && self.spout.is_running() {
+                            self.spout.stop();
+                        }
+                        if self.blackout
+                            && self.spout_enabled
+                            && self.spout.is_running()
+                            && !self.spout.black_delivered(self.visual_epoch)
+                        {
+                            self.spout.cut_to_black(
+                                renderer.output_width,
+                                renderer.output_height,
+                                self.visual_epoch,
+                            );
+                        }
+
+                        // NTSC/VHS post-process — fully asynchronous. The render
+                        // thread never waits on GPU readback or CPU processing.
+                        // Latency is bounded/latest-only but depends on resolution,
+                        // contributing layers, settings, and hardware. Spout is
+                        // tagged to exact processed audience samples instead of
+                        // inferring identity from a later held redraw.
+                        // Blackout bypasses the stylized post-process: VHS snow
+                        // must never turn an emergency cut into visible texture.
+                        let ntsc_path = requested_ntsc_path;
+                        if ntsc_path_changed
+                            && self.blackout
+                            && self.spout_enabled
+                            && self.spout.is_running()
+                        {
+                            // Entering blackout while NTSC was active advances the
+                            // visual epoch here after the first cut request. Replace
+                            // it immediately with a cut carrying the final epoch.
+                            self.spout.cut_to_black(
+                                renderer.output_width,
+                                renderer.output_height,
+                                self.visual_epoch,
+                            );
+                        }
+                        let spout_active = self.spout_enabled && self.spout.is_running();
+                        // Harvest a completed raw readback. The generation tag
+                        // rejects both pre-blackout content and delayed blackout
+                        // frames that finish after the cut is released.
+                        let readback_poll = renderer.poll_readback();
+                        if exit_on_renderer_device_loss(
+                            renderer,
+                            &mut self.output_error,
+                            event_loop,
+                        ) {
+                            return;
+                        }
+                        if readback_poll.held_audience_not_harvested
+                            && self.selective_transition_holding
+                        {
+                            // Retry after a GPU map failure or a rarer superseded
+                            // map. The Spout epoch barrier remains authoritative;
+                            // only the exact held-image copy is rescheduled.
+                            self.selective_hold_spout_readback_epoch = None;
+                        }
+                        if let Some(frame) = readback_poll.frame {
+                            if frame.epoch != self.visual_epoch {
+                                // Stale visual generation; deliberately discarded.
+                                if frame.ntsc_metadata.is_some() {
+                                    self.ntsc_live_metrics.global.record_stale();
+                                }
+                                if frame.selective_sample.is_some() {
                                     self.ntsc_live_metrics.selective.record_stale();
                                 }
+                                if frame.held_audience && self.selective_transition_holding {
+                                    self.selective_hold_spout_readback_epoch = None;
+                                }
+                            } else if self.blackout {
+                                if spout_active {
+                                    self.spout.try_submit(
+                                        frame.pixels,
+                                        renderer.output_width,
+                                        renderer.output_height,
+                                        frame.epoch,
+                                    );
+                                }
+                            } else if frame.held_audience {
+                                if self.selective_transition_holding
+                                    && spout_active
+                                    && !self.spout.try_submit(
+                                        frame.pixels,
+                                        renderer.output_width,
+                                        renderer.output_height,
+                                        frame.epoch,
+                                    )
+                                {
+                                    // Retry with another exact held readback;
+                                    // normal Spout submission is deliberately
+                                    // nonblocking and may lose a lock race.
+                                    self.selective_hold_spout_readback_epoch = None;
+                                }
+                            } else if ntsc_path == LiveNtscPath::LegacyGlobal {
+                                if let Some(metadata) = frame.ntsc_metadata {
+                                    let outcome = self.ntsc_worker.try_submit_outcome(
+                                        frame.pixels,
+                                        renderer.output_width,
+                                        renderer.output_height,
+                                        metadata,
+                                        frame.epoch,
+                                    );
+                                    self.ntsc_live_metrics.global.record_admission(outcome);
+                                } else {
+                                    log::warn!(
+                                        "Discarded an NTSC readback without its sampled parameters"
+                                    );
+                                }
+                            } else if ntsc_path == LiveNtscPath::SelectivePerLayer {
+                                if selective_spout_sample_is_eligible(
+                                    frame.epoch,
+                                    frame.selective_sample,
+                                    ntsc::SelectiveNtscGeneration {
+                                        visual_epoch: self.visual_epoch,
+                                        topology_generation: self.selective_topology_generation,
+                                        width: renderer.output_width,
+                                        height: renderer.output_height,
+                                        sample_sequence: self.selective_sample_sequence,
+                                    },
+                                    spout_active,
+                                    self.blackout,
+                                ) {
+                                    self.spout.try_submit(
+                                        frame.pixels,
+                                        renderer.output_width,
+                                        renderer.output_height,
+                                        frame.epoch,
+                                    );
+                                }
+                            } else if spout_active {
+                                self.spout.try_submit(
+                                    frame.pixels,
+                                    renderer.output_width,
+                                    renderer.output_height,
+                                    frame.epoch,
+                                );
+                            }
+                            // Otherwise a stale readback from a just-disabled
+                            // feature; dropped.
+                        }
+
+                        // Retain the newest processed frame between CPU
+                        // completions so NTSC does not alternate with raw frames.
+                        if let Some(processed) = self.ntsc_worker.try_recv() {
+                            if processed.epoch == self.visual_epoch
+                                && ntsc_path == LiveNtscPath::LegacyGlobal
+                            {
+                                if spout_active {
+                                    self.spout.try_submit(
+                                        processed.pixels.clone(),
+                                        renderer.output_width,
+                                        renderer.output_height,
+                                        processed.epoch,
+                                    );
+                                }
+                                self.ntsc_presented = Some((processed.epoch, processed.pixels));
+                            } else {
+                                self.ntsc_live_metrics.global.record_stale();
+                            }
+                        }
+
+                        // Read back the clean raw composite before overlaying the
+                        // delayed NTSC result, preventing recursive reprocessing.
+                        let need_raw_readback = raw_audience_readback_required(
+                            self.blackout,
+                            self.selective_transition_holding,
+                            ntsc_path,
+                            spout_active,
+                        );
+                        if need_raw_readback {
+                            let ntsc_metadata =
+                                (ntsc_path == LiveNtscPath::LegacyGlobal).then(|| {
+                                    ntsc::NtscFrameMetadata {
+                                        params: mod_ntsc.clone(),
+                                        reference_frame: ntsc::reference_frame_for_time(
+                                            elapsed_duration.as_secs_f64(),
+                                        ),
+                                    }
+                                });
+                            let slot = match renderer.begin_readback(
+                                &mut encoder,
+                                self.visual_epoch,
+                                ntsc_metadata,
+                            ) {
+                                Ok(slot) => slot,
+                                Err(error) => {
+                                    if ntsc_path == LiveNtscPath::LegacyGlobal {
+                                        self.ntsc_live_metrics
+                                            .global
+                                            .record_admission(ntsc::NtscSubmitOutcome::Unavailable);
+                                    }
+                                    self.output_error = format!(
+                                        "NTSC/Spout audience readback unavailable: {error}"
+                                    );
+                                    log::error!("{}", self.output_error);
+                                    None
+                                }
+                            };
+                            renderer.queue.submit(std::iter::once(encoder.finish()));
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
+                            if let Some(idx) = slot {
+                                renderer.map_readback(idx);
                             }
                             if exit_on_renderer_device_loss(
                                 renderer,
@@ -5273,421 +17895,308 @@ impl ApplicationHandler for App {
                             ) {
                                 return;
                             }
-                        }
-
-                        // A finished generation becomes the sole input to the
-                        // downstream temporal stage. Paused transport holds the
-                        // last output exactly; no new batch is submitted.
-                        if selective_budget_error.is_none() && !program_transport_paused {
-                            if let Some(processed) = worker.try_recv() {
-                                if current_plan.as_ref().is_some_and(|current| {
-                                    ntsc::selective_plan_compatible(&processed.plan, current)
-                                }) {
-                                    if let Err(error) =
-                                        renderer.write_engine_composite(&processed.pixels)
-                                    {
-                                        log::error!("Rejected selective NTSC result: {error}");
-                                        self.selective_ntsc_runtime_error = error;
-                                    } else {
-                                        renderer.render_temporal_with_dt(
-                                            &mut encoder,
-                                            &mod_temporal,
-                                            self.selective_temporal_debt,
-                                            !program_transport_paused,
-                                        );
-                                        renderer.render_opaque_output(&mut encoder);
-                                        self.selective_temporal_debt = 0.0;
-                                        self.selective_transition_holding = false;
-                                        self.selective_hold_snapshot_valid = false;
-                                        self.selective_hold_spout_barrier_epoch = None;
-                                        self.selective_hold_spout_readback_epoch = None;
-                                        selective_audience_sample = Some(processed.plan.generation);
-                                    }
-                                } else {
-                                    self.ntsc_live_metrics.selective.record_stale();
-                                }
-                            }
-                        }
-
-                        if selective_budget_error.is_none() && !program_transport_paused {
-                            if let Some(mut plan) = current_plan {
-                                let worker_admission = worker.admission_outcome();
-                                if selective_ntsc_gpu_gate_is_open(
-                                    worker_admission,
-                                    &mut self.ntsc_live_metrics.selective,
-                                ) {
-                                    let submitted_sequence =
-                                        self.selective_sample_sequence.wrapping_add(1);
-                                    plan.generation.sample_sequence = submitted_sequence;
-                                    match renderer.begin_selective_ntsc_readback(
-                                        &mut encoder,
-                                        &self.layers,
-                                        &layer_mods,
-                                        &mod_master,
-                                        plan,
-                                    ) {
-                                        Ok(accepted) => {
-                                            self.ntsc_live_metrics
-                                                .selective
-                                                .record_attempt(accepted);
-                                            if accepted {
-                                                self.selective_sample_sequence = submitted_sequence;
-                                                self.selective_ntsc_runtime_error.clear();
-                                            }
-                                        }
-                                        Err(error) => {
-                                            log::error!(
-                                                "Selective NTSC snapshot rejected: {error}"
-                                            );
-                                            self.selective_ntsc_runtime_error = error;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // A paused selective transition advances Spout's colour
-                    // intent before copying the held audience. The barrier
-                    // drops pending/dequeued old-epoch frames without changing
-                    // the receiver's last texture; the tagged readback then
-                    // converges it to the exact slot2 image. If Spout starts
-                    // during the hold, this same branch runs on the next frame.
-                    let held_spout_active = self.selective_transition_holding
-                        && !self.blackout
-                        && self.spout_enabled
-                        && self.spout.is_running();
-                    if !held_spout_active {
-                        self.selective_hold_spout_barrier_epoch = None;
-                        self.selective_hold_spout_readback_epoch = None;
-                    }
-                    if held_spout_active
-                        && self.selective_hold_spout_barrier_epoch != Some(self.visual_epoch)
-                        && self.spout.hold_colour_epoch(self.visual_epoch)
-                    {
-                        self.selective_hold_spout_barrier_epoch = Some(self.visual_epoch);
-                        self.selective_hold_spout_readback_epoch = None;
-                    }
-                    let held_audience_readback = if held_spout_active
-                        && self.selective_hold_spout_barrier_epoch == Some(self.visual_epoch)
-                        && self.selective_hold_spout_readback_epoch != Some(self.visual_epoch)
-                    {
-                        match renderer.begin_held_audience_readback(&mut encoder, self.visual_epoch)
-                        {
-                            Ok(slot) => slot,
-                            Err(error) => {
-                                self.output_error =
-                                    format!("Spout held-audience readback unavailable: {error}");
-                                log::error!("{}", self.output_error);
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if held_audience_readback.is_some() {
-                        self.selective_hold_spout_readback_epoch = Some(self.visual_epoch);
-                    }
-
-                    // Commit the raw GPU render before any CPU-processed
-                    // queue write. A later command buffer would otherwise
-                    // overwrite the queued NTSC upload.
-                    // Selective Spout coupling is encoded immediately after
-                    // the exact sample's Temporal+opaque passes, in this same
-                    // command stream. A held redraw schedules no duplicate
-                    // readback and can therefore never masquerade as a newer
-                    // sample.
-                    let selective_audience_readback = if self.spout_enabled
-                        && self.spout.is_running()
-                    {
-                        selective_audience_sample.and_then(|sample| {
-                            match renderer.begin_selective_audience_readback(&mut encoder, sample) {
-                                Ok(slot) => slot,
-                                Err(error) => {
-                                    self.output_error = format!(
-                                        "Spout selective-audience readback unavailable: {error}"
-                                    );
-                                    log::error!("{}", self.output_error);
-                                    None
-                                }
-                            }
-                        })
-                    } else {
-                        None
-                    };
-
-                    renderer.queue.submit(std::iter::once(encoder.finish()));
-                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
-                        return;
-                    }
-                    if selective_required {
-                        renderer.map_selective_ntsc_readback();
-                    }
-                    if let Some(index) = selective_audience_readback {
-                        renderer.map_readback(index);
-                    }
-                    if let Some(index) = held_audience_readback {
-                        renderer.map_readback(index);
-                    }
-                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
-                        return;
-                    }
-                    encoder =
-                        renderer
-                            .device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("Post-Process Encoder"),
-                            });
-
-                    // Sync the Spout output worker with its toggle.
-                    if self.spout_enabled && !self.spout.is_running() {
-                        self.spout.start();
-                    } else if !self.spout_enabled && self.spout.is_running() {
-                        self.spout.stop();
-                    }
-                    if self.blackout
-                        && self.spout_enabled
-                        && self.spout.is_running()
-                        && !self.spout.black_delivered(self.visual_epoch)
-                    {
-                        self.spout.cut_to_black(
-                            renderer.output_width,
-                            renderer.output_height,
-                            self.visual_epoch,
-                        );
-                    }
-
-                    // NTSC/VHS post-process — fully asynchronous. The render
-                    // thread never waits on GPU readback or CPU processing.
-                    // Latency is bounded/latest-only but depends on resolution,
-                    // contributing layers, settings, and hardware. Spout is
-                    // tagged to exact processed audience samples instead of
-                    // inferring identity from a later held redraw.
-                    // Blackout bypasses the stylized post-process: VHS snow
-                    // must never turn an emergency cut into visible texture.
-                    let ntsc_path = requested_ntsc_path;
-                    if ntsc_path_changed
-                        && self.blackout
-                        && self.spout_enabled
-                        && self.spout.is_running()
-                    {
-                        // Entering blackout while NTSC was active advances the
-                        // visual epoch here after the first cut request. Replace
-                        // it immediately with a cut carrying the final epoch.
-                        self.spout.cut_to_black(
-                            renderer.output_width,
-                            renderer.output_height,
-                            self.visual_epoch,
-                        );
-                    }
-                    let spout_active = self.spout_enabled && self.spout.is_running();
-                    // Harvest a completed raw readback. The generation tag
-                    // rejects both pre-blackout content and delayed blackout
-                    // frames that finish after the cut is released.
-                    let readback_poll = renderer.poll_readback();
-                    if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
-                        return;
-                    }
-                    if readback_poll.held_audience_not_harvested
-                        && self.selective_transition_holding
-                    {
-                        // Retry after a GPU map failure or a rarer superseded
-                        // map. The Spout epoch barrier remains authoritative;
-                        // only the exact held-image copy is rescheduled.
-                        self.selective_hold_spout_readback_epoch = None;
-                    }
-                    if let Some(frame) = readback_poll.frame {
-                        if frame.epoch != self.visual_epoch {
-                            // Stale visual generation; deliberately discarded.
-                            if frame.ntsc_metadata.is_some() {
-                                self.ntsc_live_metrics.global.record_stale();
-                            }
-                            if frame.selective_sample.is_some() {
-                                self.ntsc_live_metrics.selective.record_stale();
-                            }
-                            if frame.held_audience && self.selective_transition_holding {
-                                self.selective_hold_spout_readback_epoch = None;
-                            }
-                        } else if self.blackout {
-                            if spout_active {
-                                self.spout.try_submit(
-                                    frame.pixels,
-                                    renderer.output_width,
-                                    renderer.output_height,
-                                    frame.epoch,
-                                );
-                            }
-                        } else if frame.held_audience {
-                            if self.selective_transition_holding
-                                && spout_active
-                                && !self.spout.try_submit(
-                                    frame.pixels,
-                                    renderer.output_width,
-                                    renderer.output_height,
-                                    frame.epoch,
-                                )
-                            {
-                                // Retry with another exact held readback;
-                                // normal Spout submission is deliberately
-                                // nonblocking and may lose a lock race.
-                                self.selective_hold_spout_readback_epoch = None;
-                            }
-                        } else if ntsc_path == LiveNtscPath::LegacyGlobal {
-                            if let Some(metadata) = frame.ntsc_metadata {
-                                let outcome = self.ntsc_worker.try_submit_outcome(
-                                    frame.pixels,
-                                    renderer.output_width,
-                                    renderer.output_height,
-                                    metadata,
-                                    frame.epoch,
-                                );
-                                self.ntsc_live_metrics.global.record_admission(outcome);
-                            } else {
-                                log::warn!(
-                                    "Discarded an NTSC readback without its sampled parameters"
-                                );
-                            }
-                        } else if ntsc_path == LiveNtscPath::SelectivePerLayer {
-                            if selective_spout_sample_is_eligible(
-                                frame.epoch,
-                                frame.selective_sample,
-                                ntsc::SelectiveNtscGeneration {
-                                    visual_epoch: self.visual_epoch,
-                                    topology_generation: self.selective_topology_generation,
-                                    width: renderer.output_width,
-                                    height: renderer.output_height,
-                                    sample_sequence: self.selective_sample_sequence,
+                            encoder = renderer.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("Audience Encoder"),
                                 },
-                                spout_active,
-                                self.blackout,
-                            ) {
-                                self.spout.try_submit(
-                                    frame.pixels,
-                                    renderer.output_width,
-                                    renderer.output_height,
-                                    frame.epoch,
-                                );
-                            }
-                        } else if spout_active {
-                            self.spout.try_submit(
-                                frame.pixels,
-                                renderer.output_width,
-                                renderer.output_height,
-                                frame.epoch,
                             );
                         }
-                        // Otherwise a stale readback from a just-disabled
-                        // feature; dropped.
-                    }
 
-                    // Retain the newest processed frame between CPU
-                    // completions so NTSC does not alternate with raw frames.
-                    if let Some(processed) = self.ntsc_worker.try_recv() {
-                        if processed.epoch == self.visual_epoch
-                            && ntsc_path == LiveNtscPath::LegacyGlobal
-                        {
-                            if spout_active {
-                                self.spout.try_submit(
-                                    processed.pixels.clone(),
+                        if ntsc_path == LiveNtscPath::LegacyGlobal {
+                            if let Some((epoch, pixels)) = self.ntsc_presented.as_ref() {
+                                if *epoch == self.visual_epoch {
+                                    // Ordered after submitted raw render/readback
+                                    // and before all audience presentation passes.
+                                    renderer.write_composite(pixels);
+                                }
+                            }
+                        }
+
+                        // Absolute final image operation: the emergency cut wins
+                        // over every delayed post-process result.
+                        if self.blackout {
+                            renderer.clear_composite(&mut encoder);
+                            renderer.queue.submit(std::iter::once(encoder.finish()));
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
+                            self.blackout_presented = true;
+                            encoder = renderer.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("Blackout Audience Encoder"),
+                                },
+                            );
+                        }
+                    } // accepted creative frame; rejected plans preserve slot2 exactly
+
+                    // Creative safe-hold never outranks the emergency cut.
+                    // Preserve/restore the pre-cut audience at the same
+                    // path-independent edge, but skip all creative, temporal,
+                    // NTSC, and history advancement while the plan is invalid.
+                    if creative_safe_hold {
+                        if let Some(action) = blackout_audience_edge_action(
+                            self.blackout,
+                            self.blackout_presented,
+                            program_transport_paused,
+                            self.selective_hold_snapshot_valid,
+                        ) {
+                            match action {
+                                HeldAudienceAction::Capture => {
+                                    renderer.capture_held_audience(&mut encoder);
+                                    self.selective_hold_snapshot_valid = true;
+                                }
+                                HeldAudienceAction::Restore => {
+                                    renderer.restore_held_audience(&mut encoder);
+                                }
+                                HeldAudienceAction::Keep => {}
+                            }
+                            if program_transport_paused {
+                                self.selective_transition_holding = true;
+                                self.selective_hold_spout_barrier_epoch = None;
+                                self.selective_hold_spout_readback_epoch = None;
+                            }
+                        }
+                        if !self.blackout && self.blackout_presented {
+                            self.blackout_presented = false;
+                        }
+                        if self.spout_enabled && !self.spout.is_running() {
+                            self.spout.start();
+                        } else if !self.spout_enabled && self.spout.is_running() {
+                            self.spout.stop();
+                        }
+                        if self.blackout {
+                            if self.spout_enabled && self.spout.is_running() {
+                                self.spout.cut_to_black(
                                     renderer.output_width,
                                     renderer.output_height,
-                                    processed.epoch,
+                                    self.visual_epoch,
                                 );
                             }
-                            self.ntsc_presented = Some((processed.epoch, processed.pixels));
+                            renderer.clear_composite(&mut encoder);
+                            renderer.queue.submit(std::iter::once(encoder.finish()));
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
+                            self.blackout_presented = true;
+                            encoder = renderer.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("Rejected creative blackout audience encoder"),
+                                },
+                            );
                         } else {
-                            self.ntsc_live_metrics.global.record_stale();
-                        }
-                    }
-
-                    // Read back the clean raw composite before overlaying the
-                    // delayed NTSC result, preventing recursive reprocessing.
-                    let need_raw_readback = raw_audience_readback_required(
-                        self.blackout,
-                        self.selective_transition_holding,
-                        ntsc_path,
-                        spout_active,
-                    );
-                    if need_raw_readback {
-                        let ntsc_metadata = (ntsc_path == LiveNtscPath::LegacyGlobal).then(|| {
-                            ntsc::NtscFrameMetadata {
-                                params: mod_ntsc.clone(),
-                                reference_frame: ntsc::reference_frame_for_time(
-                                    elapsed_duration.as_secs_f64(),
-                                ),
-                            }
-                        });
-                        let slot = match renderer.begin_readback(
-                            &mut encoder,
-                            self.visual_epoch,
-                            ntsc_metadata,
-                        ) {
-                            Ok(slot) => slot,
-                            Err(error) => {
-                                if ntsc_path == LiveNtscPath::LegacyGlobal {
-                                    self.ntsc_live_metrics
-                                        .global
-                                        .record_admission(ntsc::NtscSubmitOutcome::Unavailable);
+                            // A rejected creative graph deliberately preserves
+                            // slot2, but releasing an emergency cut while Pause
+                            // is holding still has to rebase the external Spout
+                            // audience to that exact restored image. This is the
+                            // same epoch barrier/readback transaction used by an
+                            // accepted selective transition; it never advances
+                            // creative, temporal, NTSC, or retained histories.
+                            let held_spout_active = held_spout_restore_active(
+                                self.selective_transition_holding,
+                                self.blackout,
+                                self.spout_enabled,
+                                self.spout.is_running(),
+                            );
+                            if !held_spout_active {
+                                self.selective_hold_spout_barrier_epoch = None;
+                                self.selective_hold_spout_readback_epoch = None;
+                            } else {
+                                let readback_poll = renderer.poll_readback();
+                                if exit_on_renderer_device_loss(
+                                    renderer,
+                                    &mut self.output_error,
+                                    event_loop,
+                                ) {
+                                    return;
                                 }
-                                self.output_error =
-                                    format!("NTSC/Spout audience readback unavailable: {error}");
-                                log::error!("{}", self.output_error);
-                                None
+                                if readback_poll.held_audience_not_harvested {
+                                    self.selective_hold_spout_readback_epoch = None;
+                                }
+                                let held_submit_failed = readback_poll
+                                    .frame
+                                    .filter(|frame| frame.held_audience)
+                                    .is_some_and(|frame| {
+                                        frame.epoch != self.visual_epoch
+                                            || !self.spout.try_submit(
+                                                frame.pixels,
+                                                renderer.output_width,
+                                                renderer.output_height,
+                                                frame.epoch,
+                                            )
+                                    });
+                                if held_submit_failed {
+                                    // A stale map, failed map, or nonblocking
+                                    // Spout lock race is retried from the
+                                    // retained slot2 image on a later safe-hold
+                                    // frame.
+                                    self.selective_hold_spout_readback_epoch = None;
+                                }
+
+                                if held_spout_barrier_required(
+                                    held_spout_active,
+                                    self.selective_hold_spout_barrier_epoch,
+                                    self.visual_epoch,
+                                ) && self.spout.hold_colour_epoch(self.visual_epoch)
+                                {
+                                    self.selective_hold_spout_barrier_epoch =
+                                        Some(self.visual_epoch);
+                                    self.selective_hold_spout_readback_epoch = None;
+                                }
+                                let held_audience_readback = if held_spout_readback_required(
+                                    held_spout_active,
+                                    self.selective_hold_spout_barrier_epoch,
+                                    self.selective_hold_spout_readback_epoch,
+                                    self.visual_epoch,
+                                ) {
+                                    match renderer.begin_held_audience_readback(
+                                        &mut encoder,
+                                        self.visual_epoch,
+                                    ) {
+                                        Ok(slot) => slot,
+                                        Err(error) => {
+                                            self.output_error = format!(
+                                                "Spout held-audience readback unavailable: {error}"
+                                            );
+                                            log::error!("{}", self.output_error);
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                                if let Some(index) = held_audience_readback {
+                                    self.selective_hold_spout_readback_epoch =
+                                        Some(self.visual_epoch);
+                                    renderer.queue.submit(std::iter::once(encoder.finish()));
+                                    if exit_on_renderer_device_loss(
+                                        renderer,
+                                        &mut self.output_error,
+                                        event_loop,
+                                    ) {
+                                        return;
+                                    }
+                                    renderer.map_readback(index);
+                                    if exit_on_renderer_device_loss(
+                                        renderer,
+                                        &mut self.output_error,
+                                        event_loop,
+                                    ) {
+                                        return;
+                                    }
+                                    encoder = renderer.device.create_command_encoder(
+                                        &wgpu::CommandEncoderDescriptor {
+                                            label: Some("Rejected creative held-audience encoder"),
+                                        },
+                                    );
+                                }
                             }
-                        };
-                        renderer.queue.submit(std::iter::once(encoder.finish()));
-                        if exit_on_renderer_device_loss(
-                            renderer,
-                            &mut self.output_error,
-                            event_loop,
-                        ) {
-                            return;
                         }
-                        if let Some(idx) = slot {
-                            renderer.map_readback(idx);
-                        }
-                        if exit_on_renderer_device_loss(
-                            renderer,
-                            &mut self.output_error,
-                            event_loop,
-                        ) {
-                            return;
-                        }
-                        encoder = renderer.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("Audience Encoder"),
-                            },
-                        );
                     }
 
-                    if ntsc_path == LiveNtscPath::LegacyGlobal {
-                        if let Some((epoch, pixels)) = self.ntsc_presented.as_ref() {
-                            if *epoch == self.visual_epoch {
-                                // Ordered after submitted raw render/readback
-                                // and before all audience presentation passes.
-                                renderer.write_composite(pixels);
+                    // Final StageMap source boundary. Global NTSC, the held
+                    // safe audience, and the absolute blackout operation have
+                    // all materialized in slot 2 before any endpoint samples
+                    // it. Tool uniforms still update while Program is frozen.
+                    if let Some(presenter) = self.stage_presenter.as_mut() {
+                        presenter.update_tools(&renderer.queue, &self.stage_tools);
+                        presenter.encode(&mut encoder, Some(STAGE_PROGRAM_SOURCE));
+                    }
+
+                    // Program capture is a distinct final-audience tap. At
+                    // this point global NTSC (including its held result) and
+                    // the absolute blackout cut have already materialized in
+                    // slot 2. Scope intents left by a rejected/held creative
+                    // frame are explicit drops and can never fall back here.
+                    if let Some(intent) = capture_frame_intent.take() {
+                        if matches!(intent.target, program_recorder::CaptureTarget::Program) {
+                            match renderer.begin_final_program_recorder_readback(
+                                &mut encoder,
+                                intent.tag,
+                            ) {
+                                Ok(
+                                    renderer::readback::RecorderReadbackAdmission::Scheduled(
+                                        reservation,
+                                    ),
+                                ) => {
+                                    if let Some(session) = self.live_capture.as_mut() {
+                                        session.mark_scheduled(intent);
+                                    }
+                                    // The copy must share the command stream
+                                    // that materialized safe-hold, NTSC, and
+                                    // blackout. Submitting a separate recorder
+                                    // encoder first could capture the prior
+                                    // slot-2 contents. Surface presentation can
+                                    // continue in a fresh encoder after this
+                                    // exact final-program submission.
+                                    renderer.queue.submit(std::iter::once(encoder.finish()));
+                                    if let Err(error) =
+                                        renderer.map_recorder_readback(reservation)
+                                    {
+                                        self.output_error =
+                                            format!("map Program capture readback: {error}");
+                                    }
+                                    encoder = renderer.device.create_command_encoder(
+                                        &wgpu::CommandEncoderDescriptor {
+                                            label: Some("Audience Presentation Encoder"),
+                                        },
+                                    );
+                                }
+                                Ok(
+                                    renderer::readback::RecorderReadbackAdmission::Busy
+                                    | renderer::readback::RecorderReadbackAdmission::Unprepared
+                                    | renderer::readback::RecorderReadbackAdmission::SourceUnavailable,
+                                ) => capture_source_dropped = true,
+                                Err(error) => {
+                                    self.output_error =
+                                        format!("schedule Program capture readback: {error}");
+                                    capture_source_dropped = true;
+                                }
                             }
+                        } else {
+                            capture_source_dropped = true;
+                        }
+                    }
+                    if capture_source_dropped {
+                        if let Some(session) = self.live_capture.as_mut() {
+                            session.note_source_frame_dropped();
                         }
                     }
 
-                    // Absolute final image operation: the emergency cut wins
-                    // over every delayed post-process result.
-                    if self.blackout {
-                        renderer.clear_composite(&mut encoder);
-                        renderer.queue.submit(std::iter::once(encoder.finish()));
-                        if exit_on_renderer_device_loss(
-                            renderer,
-                            &mut self.output_error,
-                            event_loop,
-                        ) {
-                            return;
+                    // Acquire every StageMap monitor independently of the main
+                    // preview and legacy audience swapchains. The views are
+                    // encoded into this submission even if either older
+                    // presentation path is minimized, outdated, or lost.
+                    self.stage_presented_endpoints.clear();
+                    let acquired_stage_surfaces =
+                        acquire_stage_monitor_surfaces(renderer, &mut self.stage_monitor_targets);
+                    let mut stage_surface_frames =
+                        Vec::with_capacity(acquired_stage_surfaces.len());
+                    if let Some(presenter) = &self.stage_presenter {
+                        for surface in acquired_stage_surfaces {
+                            let target = renderer::stage_map::StageEndpointSurfaceTarget {
+                                endpoint_id: &surface.endpoint_id,
+                                view: &surface.view,
+                                format: surface.format,
+                                dimensions: surface.dimensions,
+                            };
+                            let metrics = presenter.encode_surface_targets(
+                                &mut encoder,
+                                std::slice::from_ref(&target),
+                            );
+                            if stage_surface_target_succeeded(metrics) {
+                                self.stage_presented_endpoints
+                                    .insert(surface.endpoint_id.clone());
+                                stage_surface_frames.push(surface);
+                            }
                         }
-                        self.blackout_presented = true;
-                        encoder = renderer.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("Blackout Audience Encoder"),
-                            },
-                        );
                     }
 
                     // Surface configuration is intentionally inside the
@@ -5711,6 +18220,7 @@ impl ApplicationHandler for App {
                                     &mut self.output_error,
                                     event_loop,
                                 ) {
+                                    present_stage_monitor_surfaces(stage_surface_frames);
                                     return;
                                 }
                                 false
@@ -5752,12 +18262,14 @@ impl ApplicationHandler for App {
                                 log::error!("Output presentation failed: {}", self.output_error);
                                 if failure.device_lost {
                                     event_loop.exit();
+                                    present_stage_monitor_surfaces(stage_surface_frames);
                                     return;
                                 }
                                 None
                             }
                         };
                         renderer.queue.submit(std::iter::once(encoder.finish()));
+                        present_stage_monitor_surfaces(stage_surface_frames);
                         // Once acquired, always consume a surface texture with
                         // present before honoring device loss. Dropping it
                         // would ask wgpu to discard through the invalid device.
@@ -5805,12 +18317,14 @@ impl ApplicationHandler for App {
                                     );
                                     if failure.device_lost {
                                         event_loop.exit();
+                                        present_stage_monitor_surfaces(stage_surface_frames);
                                         return;
                                     }
                                     None
                                 }
                             };
                             renderer.queue.submit(std::iter::once(encoder.finish()));
+                            present_stage_monitor_surfaces(stage_surface_frames);
                             if let Some(texture) = output_present {
                                 texture.present();
                             }
@@ -5869,12 +18383,14 @@ impl ApplicationHandler for App {
                                     );
                                     if failure.device_lost {
                                         event_loop.exit();
+                                        present_stage_monitor_surfaces(stage_surface_frames);
                                         return;
                                     }
                                     None
                                 }
                             };
                             renderer.queue.submit(std::iter::once(encoder.finish()));
+                            present_stage_monitor_surfaces(stage_surface_frames);
                             if let Some(texture) = output_present {
                                 texture.present();
                             }
@@ -5946,6 +18462,7 @@ impl ApplicationHandler for App {
                         // the terminal error. Consume it without submitting
                         // more work so Drop cannot attempt an invalid discard.
                         surface_texture.present();
+                        present_stage_monitor_surfaces(stage_surface_frames);
                         return;
                     }
                     renderer.queue.submit(std::iter::once(encoder.finish()));
@@ -5955,6 +18472,7 @@ impl ApplicationHandler for App {
                     if let Some(t) = output_present {
                         t.present();
                     }
+                    present_stage_monitor_surfaces(stage_surface_frames);
                     if exit_on_renderer_device_loss(renderer, &mut self.output_error, event_loop) {
                         return;
                     }
@@ -6204,6 +18722,1450 @@ fn main() {
 mod app_state_tests {
     use super::*;
 
+    fn stable_layer(value: u64) -> image_routing::StableLayerId {
+        image_routing::StableLayerId::new(value).unwrap()
+    }
+
+    #[test]
+    fn m3_event_acceptance_rejected_exact_retains_events_and_manual_clear_holds() {
+        use renderer::state::TemporalState;
+        use temporal::{
+            CollisionScoreParams, CollisionScoreTrigger, TemporalFrameAction, TemporalFrameEvents,
+            TemporalFrameInput, TemporalFreezeState, TemporalResetCause,
+        };
+        use web::state::WebAction;
+
+        // Pin the production rejection arm itself: the rejected creative pass
+        // must not encode Temporal, flatten opaque output, clear slot 2, or
+        // publish/dispose the held audience snapshot.
+        let source = include_str!("main.rs");
+        let exact_match = source
+            .find("let legacy_render_result = renderer.render_evaluated_frame(")
+            .expect("LegacyExact creative acceptance match");
+        let exact_tail = &source[exact_match..];
+        let rejection = exact_tail
+            .find("// Slot 2 is the last accepted audience")
+            .map(|start| &exact_tail[start..])
+            .expect("documented rejection arm");
+        let rejection = &rejection[..rejection
+            .find("if temporal_frame_accepted")
+            .expect("post-acceptance snapshot gate")];
+        for forbidden in [
+            "render_temporal_frame",
+            "render_opaque_output",
+            "clear_composite",
+            "temporal_frame_accepted = true",
+            "selective_hold_snapshot_valid = false",
+        ] {
+            assert!(
+                !rejection.contains(forbidden),
+                "rejected Exact arm unexpectedly contains {forbidden}"
+            );
+        }
+        assert!(source
+            .contains("if temporal_frame_accepted && temporal_input.freeze.program_advances()"));
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.temporal_params.originals.score = CollisionScoreParams {
+            enabled: true,
+            state_count: 8,
+            trigger: CollisionScoreTrigger::Manual,
+            ..CollisionScoreParams::default()
+        };
+        for _ in 0..3 {
+            app.handle_web_action(WebAction::TriggerCollisionScore);
+        }
+        assert_eq!(app.pending_temporal_events.manual_events, 3);
+
+        let mut state = TemporalState::default();
+        state.stage_frame(
+            &app.temporal_params,
+            TemporalFrameInput::new(
+                1.0 / 30.0,
+                TemporalFreezeState::Running,
+                false,
+                TemporalFrameEvents::default(),
+            ),
+            [64, 36],
+        );
+        state.commit_staged();
+        let before_rejection = state.metrics();
+
+        // Model the production Err arm: no Temporal call was encoded, hence no
+        // staged transaction exists and the counted batch remains untouched.
+        assert!(!state.has_staged_frame());
+        assert_eq!(state.metrics(), before_rejection);
+        assert_eq!(app.pending_temporal_events.manual_events, 3);
+
+        // An accepted Program Freeze frame may maintain the held image but may
+        // neither consume Score events nor release the pending batch.
+        let frozen_input = TemporalFrameInput::new(
+            1.0 / 30.0,
+            TemporalFreezeState::ProgramFrozen,
+            false,
+            app.pending_temporal_events,
+        );
+        let frozen_plan = state.stage_frame(&app.temporal_params, frozen_input, [64, 36]);
+        assert!(matches!(
+            frozen_plan.action,
+            TemporalFrameAction::HoldFrozenOutput
+        ));
+        assert_eq!(frozen_plan.score_events_consumed, 0);
+        state.commit_staged();
+        if frozen_input.freeze.program_advances() {
+            app.pending_temporal_events = TemporalFrameEvents::default();
+        }
+        assert_eq!(state.metrics(), before_rejection);
+        assert_eq!(app.pending_temporal_events.manual_events, 3);
+
+        // The next accepted advancing frame consumes all three events exactly
+        // once and only then releases the live pending batch.
+        let accepted_input = TemporalFrameInput::new(
+            1.0 / 30.0,
+            TemporalFreezeState::Running,
+            false,
+            app.pending_temporal_events,
+        );
+        let accepted_plan = state.stage_frame(&app.temporal_params, accepted_input, [64, 36]);
+        assert_eq!(accepted_plan.score_events_consumed, 3);
+        state.commit_staged();
+        if accepted_input.freeze.program_advances() {
+            app.pending_temporal_events = TemporalFrameEvents::default();
+        }
+        assert_eq!(state.metrics().score_event_ordinal, 3);
+        assert_eq!(app.pending_temporal_events, TemporalFrameEvents::default());
+
+        // Trigger is saturating; Clear is domain-specific and preserves the
+        // already materialized Program Freeze audience image.
+        app.pending_temporal_events.manual_events = u32::MAX;
+        app.handle_web_action(WebAction::TriggerCollisionScore);
+        assert_eq!(app.pending_temporal_events.manual_events, u32::MAX);
+        let held_before_clear = state.metrics().freeze_hold_valid;
+        assert!(held_before_clear);
+        state.reset_for(TemporalResetCause::ManualClear);
+        app.handle_web_action(WebAction::ClearTemporalMemory);
+        let cleared = state.metrics();
+        assert_eq!(cleared.history_valid, 0);
+        assert!(!cleared.carrier_valid);
+        assert_eq!(cleared.score_event_ordinal, 0);
+        assert_eq!(cleared.score_state, 0);
+        assert_eq!(cleared.freeze_hold_valid, held_before_clear);
+        assert_eq!(cleared.last_reset, Some(TemporalResetCause::ManualClear));
+        assert_eq!(app.pending_temporal_events, TemporalFrameEvents::default());
+        assert_eq!(app.selective_temporal_debt, 0.0);
+    }
+
+    fn legacy_look_scope(
+        mapped_layer_ids: Vec<u64>,
+        applied_ntsc: bool,
+        applied_temporal: bool,
+    ) -> AppliedLookScope {
+        AppliedLookScope {
+            mapped_layer_ids,
+            applied_ntsc,
+            applied_temporal,
+            applied_nodes: Vec::new(),
+            applied_group_ids: Vec::new(),
+            applied_bus_crossfade: false,
+        }
+    }
+
+    fn runtime_group(
+        value: u64,
+        members: &[image_routing::StableLayerId],
+    ) -> composition::RuntimeGroup {
+        composition::RuntimeGroup {
+            id: visual_rack::GroupId::new(value).unwrap(),
+            name: composition::GroupName::new(format!("Group {value}")).unwrap(),
+            members: composition::RuntimeGroupMembers::try_from_vec(members.to_vec()).unwrap(),
+            opacity: 1.0,
+            transform: spatial::SpatialTransform::default(),
+            rack: RuntimeVisualRack::empty(),
+            matte: None,
+            solo: false,
+            bypass: false,
+            bus: composition::BusAssignment::Program,
+        }
+    }
+
+    fn push_image_mask(
+        rack: &mut RuntimeVisualRack,
+        source: visual_rack::ResolvedImageSource,
+    ) -> visual_rack::NodeId {
+        rack.push(visual_rack::RuntimeVisualNodeKind::Mask(
+            visual_rack::RuntimeMaskParams::Image(visual_rack::RuntimeImageMatte {
+                tap: visual_rack::ResolvedImageTap {
+                    source,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                channel: visual_rack::MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 0.1,
+            }),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_runtime_composition_inverts_app_front_order_exactly() {
+        for ids in [
+            Vec::new(),
+            vec![stable_layer(1)],
+            vec![stable_layer(1), stable_layer(2), stable_layer(3)],
+        ] {
+            let composition = legacy_runtime_composition(&ids).unwrap();
+            assert_eq!(
+                runtime_composition_front_to_back(&composition).unwrap(),
+                ids
+            );
+            let root_ids: Vec<_> = composition
+                .root()
+                .iter()
+                .map(|item| match *item {
+                    composition::RuntimeRootItem::Layer { layer_id, .. } => layer_id,
+                    composition::RuntimeRootItem::Group { .. } => {
+                        panic!("legacy composition cannot synthesize a group")
+                    }
+                })
+                .collect();
+            assert_eq!(
+                root_ids,
+                ids.iter().rev().copied().collect::<Vec<_>>(),
+                "runtime root is back-to-front"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_add_move_remove_preserve_stable_ids_and_exact_flat_order() {
+        let one = stable_layer(11);
+        let two = stable_layer(22);
+        let three = stable_layer(33);
+        let four = stable_layer(44);
+        let initial = vec![one, two, three];
+        let composition = legacy_runtime_composition(&initial).unwrap();
+
+        let added = stage_composition_insert_ungrouped(&composition, &initial, four, initial.len())
+            .unwrap();
+        assert_eq!(
+            runtime_composition_front_to_back(&added).unwrap(),
+            [one, two, three, four]
+        );
+
+        let moved_order = [three, one, two, four];
+        let moved = stage_composition_reorder(&added, &moved_order).unwrap();
+        assert_eq!(
+            runtime_composition_front_to_back(&moved).unwrap(),
+            moved_order
+        );
+
+        let removed = stage_composition_remove(&moved, &moved_order, one).unwrap();
+        assert_eq!(
+            runtime_composition_front_to_back(&removed).unwrap(),
+            [three, two, four]
+        );
+        assert_eq!(
+            removed
+                .flatten()
+                .unwrap()
+                .layers
+                .iter()
+                .map(|layer| layer.layer_id.get())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [22, 33, 44].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn group_create_and_membership_canonicalize_browser_order_without_restacking() {
+        let top = stable_layer(11);
+        let middle = stable_layer(22);
+        let bottom = stable_layer(33);
+        let initial_front_to_back = vec![top, middle, bottom];
+        let composition = legacy_runtime_composition(&initial_front_to_back).unwrap();
+
+        // The browser sends selected rows front-to-back and defaults the root
+        // insertion to the end. Non-empty grouping instead collapses the
+        // selected run in place and stores members back-to-front.
+        let (grouped, group_id) = stage_create_composition_group(
+            &composition,
+            composition::GroupName::new("Run").unwrap(),
+            vec![middle, bottom],
+            composition.root().len(),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_composition_front_to_back(&grouped).unwrap(),
+            initial_front_to_back
+        );
+        assert_eq!(
+            grouped
+                .group(group_id)
+                .unwrap()
+                .members
+                .iter()
+                .collect::<Vec<_>>(),
+            [bottom, middle]
+        );
+
+        // Membership input order is likewise only a set. Expanding the same
+        // contiguous run to include the adjacent top layer keeps all three
+        // visual positions unchanged.
+        let expanded =
+            stage_set_composition_group_members(&grouped, group_id, vec![top, middle, bottom])
+                .unwrap();
+        assert_eq!(
+            runtime_composition_front_to_back(&expanded).unwrap(),
+            initial_front_to_back
+        );
+        assert_eq!(
+            expanded
+                .group(group_id)
+                .unwrap()
+                .members
+                .iter()
+                .collect::<Vec<_>>(),
+            [bottom, middle, top]
+        );
+    }
+
+    #[test]
+    fn grouping_preserves_one_bus_and_rejects_mixed_or_mismatched_admission() {
+        let top = stable_layer(11);
+        let middle = stable_layer(22);
+        let bottom = stable_layer(33);
+        let base = legacy_runtime_composition(&[top, middle, bottom]).unwrap();
+        let selected_b =
+            stage_set_composition_layer_bus(&base, middle, composition::BusAssignment::B)
+                .unwrap()
+                .unwrap();
+        let selected_b =
+            stage_set_composition_layer_bus(&selected_b, bottom, composition::BusAssignment::B)
+                .unwrap()
+                .unwrap();
+
+        let (grouped, group_id) = stage_create_composition_group(
+            &selected_b,
+            composition::GroupName::new("B run").unwrap(),
+            vec![middle, bottom],
+            selected_b.root().len(),
+        )
+        .unwrap();
+        assert_eq!(
+            grouped.group(group_id).unwrap().bus,
+            composition::BusAssignment::B
+        );
+        assert_eq!(
+            runtime_composition_front_to_back(&grouped).unwrap(),
+            [top, middle, bottom]
+        );
+
+        let shrunk = stage_set_composition_group_members(&grouped, group_id, vec![bottom]).unwrap();
+        assert!(shrunk.root().iter().any(|item| matches!(
+            item,
+            composition::RuntimeRootItem::Layer {
+                layer_id,
+                bus: composition::BusAssignment::B
+            } if *layer_id == middle
+        )));
+        assert_eq!(
+            shrunk.group(group_id).unwrap().bus,
+            composition::BusAssignment::B
+        );
+
+        let mixed = stage_set_composition_layer_bus(&base, middle, composition::BusAssignment::A)
+            .unwrap()
+            .unwrap();
+        let before = mixed.clone();
+        assert!(stage_create_composition_group(
+            &mixed,
+            composition::GroupName::new("mixed").unwrap(),
+            vec![middle, bottom],
+            mixed.root().len(),
+        )
+        .unwrap_err()
+        .contains("share one"));
+        assert_eq!(mixed, before);
+
+        // A direct Program layer cannot be smuggled into the retained B bus.
+        let direct_program = stage_set_composition_group_members(&grouped, group_id, vec![top]);
+        assert!(direct_program.unwrap_err().contains("must remain"));
+        assert_eq!(
+            grouped
+                .group(group_id)
+                .unwrap()
+                .members
+                .iter()
+                .collect::<Vec<_>>(),
+            [bottom, middle]
+        );
+    }
+
+    #[test]
+    fn discontiguous_group_create_is_rejected_without_mutating_the_tree() {
+        let top = stable_layer(11);
+        let middle = stable_layer(22);
+        let bottom = stable_layer(33);
+        let composition = legacy_runtime_composition(&[top, middle, bottom]).unwrap();
+        let before = composition.clone();
+
+        let error = stage_create_composition_group(
+            &composition,
+            composition::GroupName::new("Split").unwrap(),
+            vec![top, bottom],
+            composition.root().len(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("contiguous"));
+        assert_eq!(composition, before);
+    }
+
+    #[test]
+    fn deleting_group_stages_base_matte_tombstone_atomically_and_never_retargets() {
+        let layer_id = stable_layer(11);
+        let removed = visual_rack::GroupId::new(7).unwrap();
+        let replacement = visual_rack::GroupId::new(8).unwrap();
+        let composition = composition::RuntimeComposition::try_from_parts(
+            vec![runtime_group(removed.get(), &[])],
+            vec![
+                composition::RuntimeRootItem::Group { group_id: removed },
+                composition::RuntimeRootItem::Layer {
+                    layer_id,
+                    bus: composition::BusAssignment::Program,
+                },
+            ],
+            Some(replacement.get()),
+            0.5,
+        )
+        .unwrap();
+        let before_composition = composition.clone();
+        let matte = image_routing::LayerMatte {
+            enabled: true,
+            input: image_routing::ImageInput::GroupOutput { group_id: removed },
+            ..image_routing::LayerMatte::default()
+        };
+        let before_matte = matte;
+
+        let mut staged_composition = composition.clone();
+        staged_composition.remove_group_ungroup(removed).unwrap();
+        let staged_mattes = stage_layer_mattes_after_group_removal([(layer_id, matte)], removed);
+
+        assert_eq!(composition, before_composition);
+        assert_eq!(matte, before_matte);
+        assert!(matches!(
+            staged_mattes[0].1.input,
+            image_routing::ImageInput::MissingGroupOutput { group_id } if group_id == removed
+        ));
+        assert!(!staged_composition.contains_group(removed));
+        staged_composition
+            .insert_empty_group(composition::GroupName::new("Replacement").unwrap(), 0)
+            .unwrap();
+        assert!(matches!(
+            staged_mattes[0].1.input,
+            image_routing::ImageInput::MissingGroupOutput { group_id } if group_id == removed
+        ));
+    }
+
+    #[test]
+    fn stable_layer_bus_edit_survives_unrelated_reorder_without_revision_identity() {
+        let top = stable_layer(11);
+        let middle = stable_layer(22);
+        let bottom = stable_layer(33);
+        let mut reordered = legacy_runtime_composition(&[top, middle, bottom]).unwrap();
+        reordered
+            .move_root_item(composition::RuntimeRootItemKey::Layer(top), 0)
+            .unwrap();
+        let before = reordered.clone();
+
+        let updated =
+            stage_set_composition_layer_bus(&reordered, middle, composition::BusAssignment::B)
+                .unwrap()
+                .expect("stable direct layer still exists after unrelated reorder");
+
+        assert_eq!(reordered, before);
+        assert!(updated.root().iter().any(|item| matches!(
+            item,
+            composition::RuntimeRootItem::Layer { layer_id, bus: composition::BusAssignment::B }
+                if *layer_id == middle
+        )));
+        assert!(stage_set_composition_layer_bus(
+            &updated,
+            stable_layer(999),
+            composition::BusAssignment::A,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn ordinary_move_rejects_group_split_without_mutating_the_tree() {
+        let back = stable_layer(1);
+        let grouped_back = stable_layer(2);
+        let grouped_front = stable_layer(3);
+        let group = runtime_group(7, &[grouped_back, grouped_front]);
+        let composition = composition::RuntimeComposition::try_from_parts(
+            vec![group],
+            vec![
+                composition::RuntimeRootItem::Group {
+                    group_id: visual_rack::GroupId::new(7).unwrap(),
+                },
+                composition::RuntimeRootItem::Layer {
+                    layer_id: back,
+                    bus: composition::BusAssignment::Program,
+                },
+            ],
+            Some(8),
+            0.5,
+        )
+        .unwrap();
+        let before = composition.clone();
+
+        // Back-to-front would become [group member, direct layer, group
+        // member], which cannot be represented without breaking the group.
+        let error = stage_composition_reorder(&composition, &[grouped_front, back, grouped_back])
+            .unwrap_err();
+        assert!(error.contains("split group"));
+        assert_eq!(composition, before);
+    }
+
+    #[test]
+    fn removed_image_donor_becomes_explicitly_missing_and_never_retargets() {
+        let consumer = stable_layer(10);
+        let donor = stable_layer(42);
+        let donor_position = performance::SavedLayerPosition::new(1).unwrap();
+        let mut group = runtime_group(7, &[consumer]);
+        let node_id = group
+            .rack
+            .push(visual_rack::RuntimeVisualNodeKind::Mask(
+                visual_rack::RuntimeMaskParams::Image(visual_rack::RuntimeImageMatte {
+                    tap: visual_rack::ResolvedImageTap {
+                        source: visual_rack::ResolvedImageSource::SelectedLayer {
+                            layer_id: donor,
+                            saved_position: donor_position,
+                            stage: image_routing::LayerImageStage::PostLocalEffects,
+                        },
+                        timing: visual_rack::EdgeTiming::CurrentFrame,
+                    },
+                    channel: visual_rack::MatteChannel::Luma,
+                    invert: false,
+                    amount: 1.0,
+                    threshold: 0.5,
+                    softness: 0.1,
+                }),
+            ))
+            .unwrap();
+        let group_id = group.id;
+        let composition = composition::RuntimeComposition::try_from_parts(
+            vec![group],
+            vec![
+                composition::RuntimeRootItem::Layer {
+                    layer_id: donor,
+                    bus: composition::BusAssignment::Program,
+                },
+                composition::RuntimeRootItem::Group { group_id },
+            ],
+            Some(8),
+            0.5,
+        )
+        .unwrap();
+        let removed = stage_composition_remove(&composition, &[consumer, donor], donor).unwrap();
+        assert!(matches!(
+            removed
+                .group(group_id)
+                .unwrap()
+                .rack
+                .image_mask_route(node_id)
+                .unwrap()
+                .source,
+            visual_rack::ResolvedImageSource::MissingSelectedLayer {
+                saved_position,
+                stage: image_routing::LayerImageStage::PostLocalEffects,
+            } if saved_position == donor_position
+        ));
+        assert_eq!(
+            runtime_composition_front_to_back(&removed).unwrap(),
+            [consumer]
+        );
+    }
+
+    #[test]
+    fn motion_donor_reorder_refreshes_provenance_and_removal_never_retargets() {
+        let donor = stable_layer(42);
+        let replacement = stable_layer(99);
+        let zero = performance::SavedLayerPosition::new(0).unwrap();
+        let one = performance::SavedLayerPosition::new(1).unwrap();
+        let mut params = motion::MotionParams::default();
+        params.transplant.donor = motion::MotionDonor::Selected {
+            layer_id: donor,
+            saved_position: zero,
+        };
+
+        refresh_motion_donor_saved_position(&mut params, &[(replacement, zero), (donor, one)]);
+        assert_eq!(
+            params.transplant.donor,
+            motion::MotionDonor::Selected {
+                layer_id: donor,
+                saved_position: one,
+            }
+        );
+
+        preserve_motion_donor_after_remove(&mut params, donor, one);
+        assert_eq!(
+            params.transplant.donor,
+            motion::MotionDonor::Missing {
+                saved_position: one
+            }
+        );
+
+        // Filling the vacated persisted position with a different live layer
+        // cannot revive or redirect the explicit tombstone.
+        refresh_motion_donor_saved_position(&mut params, &[(replacement, one)]);
+        assert_eq!(
+            params.transplant.donor,
+            motion::MotionDonor::Missing {
+                saved_position: one
+            }
+        );
+    }
+
+    #[test]
+    fn stale_creative_topology_edit_is_atomic_and_publishes_authoritative_status() {
+        use web::state::{CreativeScopeSnapshot, WebAction};
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state.clone());
+        app.quantized_actions
+            .push(WebAction::SetProgramFrozen { frozen: true });
+        let before_master = app.master_rack.clone();
+        let before_composition = app.composition.clone();
+        let before_stack_revision = app.layer_stack_revision;
+        let before_composition_revision = app.composition_revision;
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "shift".into(),
+            composition_revision: app.composition_revision.wrapping_add(1).max(1),
+        });
+
+        assert_eq!(app.master_rack, before_master);
+        assert_eq!(app.composition, before_composition);
+        assert_eq!(app.layer_stack_revision, before_stack_revision);
+        assert_eq!(app.composition_revision, before_composition_revision);
+        assert_eq!(app.quantized_actions.len(), 1);
+        assert!(matches!(
+            app.quantized_actions[0],
+            WebAction::SetProgramFrozen { frozen: true }
+        ));
+        assert!(app
+            .composition_status
+            .contains("stale composition revision"));
+
+        app.push_web_state();
+        let published = web_state.app.try_read().expect("published app snapshot");
+        assert_eq!(published.composition_revision, before_composition_revision);
+        assert_eq!(published.creative.status, app.composition_status);
+        assert_eq!(
+            published.creative.master_rack.nodes.len(),
+            before_master.len()
+        );
+    }
+
+    #[test]
+    fn creative_commit_impact_resets_only_real_topology_or_stack_changes() {
+        assert_eq!(
+            creative_commit_impact(false, false, false),
+            CreativeCommitImpact::NoChange
+        );
+        assert_eq!(
+            creative_commit_impact(false, true, true),
+            CreativeCommitImpact::NoChange,
+            "a duplicate topology command is not a generation boundary"
+        );
+        assert_eq!(
+            creative_commit_impact(true, false, false),
+            CreativeCommitImpact::ValuesOnly
+        );
+        assert_eq!(
+            creative_commit_impact(true, true, false),
+            CreativeCommitImpact::TopologyOrStack
+        );
+        assert_eq!(
+            creative_commit_impact(true, false, true),
+            CreativeCommitImpact::TopologyOrStack
+        );
+    }
+
+    #[test]
+    fn creative_values_and_duplicates_preserve_history_but_topology_resets_once() {
+        use web::state::{CreativeScopeSnapshot, RerollMode, RerollScope, WebAction};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+        let initial_epoch = app.visual_epoch;
+        let initial_revision = app.composition_revision;
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "shift".into(),
+            composition_revision: initial_revision,
+        });
+        let node_id = app.master_rack.iter().next().unwrap().stable_id;
+        assert_eq!(app.visual_epoch, initial_epoch.wrapping_add(1));
+        assert_eq!(
+            app.composition_revision,
+            initial_revision.wrapping_add(1).max(1)
+        );
+
+        app.master_rack.get_mut(node_id).unwrap().wet = 0.2;
+        let empty_racks = app.layer_racks();
+        let a = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.master_rack.get_mut(node_id).unwrap().wet = 0.8;
+        let b = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.master_rack.get_mut(node_id).unwrap().wet = 0.2;
+        app.morph.a = Some(a);
+        app.morph.b = Some(b);
+        app.morph.t = 0.5;
+
+        let warm_epoch = app.visual_epoch;
+        let stable_revision = app.composition_revision;
+        let set_wet = |value| WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            node_kind: "shift".into(),
+            param: "wet".into(),
+            value: serde_json::json!(value),
+            composition_revision: stable_revision,
+        };
+        app.handle_web_action(set_wet(0.6));
+        assert!(!app.morph.active());
+        assert!((app.master_rack.get(node_id).unwrap().wet - 0.6).abs() < 1.0e-6);
+        assert_eq!(app.visual_epoch, warm_epoch);
+        assert_eq!(app.composition_revision, stable_revision);
+
+        app.handle_web_action(set_wet(0.6));
+        assert_eq!(app.visual_epoch, warm_epoch);
+        assert_eq!(app.composition_revision, stable_revision);
+
+        app.handle_web_action(WebAction::SetCompositionBusCrossfade { value: 0.25 });
+        assert_eq!(app.composition.bus_crossfade(), 0.25);
+        assert_eq!(app.visual_epoch, warm_epoch);
+        app.handle_web_action(WebAction::SetCompositionBusCrossfade { value: 0.25 });
+        assert_eq!(app.visual_epoch, warm_epoch);
+
+        let before_dice = app.master_rack.clone();
+        app.handle_web_action(WebAction::Reroll {
+            scope: RerollScope::Master,
+            index: None,
+            layer_id: None,
+            group_id: None,
+            stack_revision: None,
+            seed: Some(73),
+            mode: RerollMode::Variation,
+            amount: 2.0,
+            include_grain_controls: false,
+            include_transform: false,
+            include_rack_controls: true,
+            include_group_controls: false,
+        });
+        assert_ne!(app.master_rack, before_dice);
+        assert!(!app.master_motion.shutter.is_exact_zero());
+        assert_eq!(app.visual_epoch, warm_epoch);
+        assert_eq!(
+            app.composition_revision,
+            stable_revision.wrapping_add(1).max(1),
+            "M4 Variation activates the previously zero shutter once without resetting visual history"
+        );
+        let post_dice_revision = app.composition_revision;
+
+        app.handle_web_action(WebAction::MoveVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            to: 0,
+            composition_revision: post_dice_revision,
+        });
+        assert_eq!(app.visual_epoch, warm_epoch);
+        assert_eq!(app.composition_revision, post_dice_revision);
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 1,
+            node_kind: "grain".into(),
+            composition_revision: post_dice_revision,
+        });
+        assert_eq!(app.visual_epoch, warm_epoch.wrapping_add(1));
+        assert_eq!(
+            app.composition_revision,
+            post_dice_revision.wrapping_add(1).max(1),
+            "one actual topology edge is exactly one revision boundary"
+        );
+    }
+
+    #[test]
+    fn group_and_matte_values_preserve_history_around_real_route_edges() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, RerollMode, RerollScope,
+            WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let initial_epoch = app.visual_epoch;
+        let initial_revision = app.composition_revision;
+        app.handle_web_action(WebAction::CreateCompositionGroup {
+            name: "History law".into(),
+            member_layer_ids: Vec::new(),
+            root_index: 0,
+            composition_revision: initial_revision,
+        });
+        let group_id = app.composition.groups().next().unwrap().id;
+        assert_eq!(app.visual_epoch, initial_epoch.wrapping_add(1));
+        let group_epoch = app.visual_epoch;
+        let group_revision = app.composition_revision;
+
+        let set_opacity = |value| WebAction::SetCompositionGroupParam {
+            group_id: group_id.get().to_string(),
+            param: "opacity".into(),
+            value: serde_json::json!(value),
+            composition_revision: group_revision,
+        };
+        app.handle_web_action(set_opacity(0.4));
+        app.handle_web_action(set_opacity(0.4));
+        assert_eq!(app.composition.group(group_id).unwrap().opacity, 0.4);
+        assert_eq!(app.visual_epoch, group_epoch);
+        assert_eq!(app.composition_revision, group_revision);
+
+        app.handle_web_action(WebAction::SetCompositionGroupMatteRoute {
+            group_id: group_id.get().to_string(),
+            route: Some(CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::OneBelow,
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            }),
+            channel: "alpha".into(),
+            invert: false,
+            composition_revision: group_revision,
+        });
+        assert_eq!(app.visual_epoch, group_epoch.wrapping_add(1));
+        assert_eq!(
+            app.composition_revision,
+            group_revision.wrapping_add(1).max(1)
+        );
+        let matte_epoch = app.visual_epoch;
+        let matte_revision = app.composition_revision;
+
+        let set_amount = |value| WebAction::SetCompositionGroupMatteParam {
+            group_id: group_id.get().to_string(),
+            param: "amount".into(),
+            value: serde_json::json!(value),
+            composition_revision: matte_revision,
+        };
+        app.handle_web_action(set_amount(0.35));
+        app.handle_web_action(set_amount(0.35));
+        assert_eq!(
+            app.composition
+                .group(group_id)
+                .unwrap()
+                .matte
+                .unwrap()
+                .amount,
+            0.35
+        );
+        assert_eq!(app.visual_epoch, matte_epoch);
+        assert_eq!(app.composition_revision, matte_revision);
+
+        let before_dice = app.composition.group(group_id).unwrap().matte.unwrap();
+        app.handle_web_action(WebAction::Reroll {
+            scope: RerollScope::Group,
+            index: None,
+            layer_id: None,
+            group_id: Some(group_id.get().to_string()),
+            stack_revision: None,
+            seed: Some(107),
+            mode: RerollMode::Variation,
+            amount: 2.0,
+            include_grain_controls: false,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: true,
+        });
+        let after_dice = app.composition.group(group_id).unwrap().matte.unwrap();
+        assert_ne!(after_dice, before_dice);
+        assert_eq!(after_dice.tap, before_dice.tap);
+        assert_eq!(after_dice.channel, before_dice.channel);
+        assert_eq!(after_dice.invert, before_dice.invert);
+        assert_eq!(app.visual_epoch, matte_epoch);
+        assert_eq!(app.composition_revision, matte_revision);
+    }
+
+    #[test]
+    fn successful_group_delete_tombstones_stable_modulation_only_after_commit() {
+        use modulation::{
+            GroupModParameter, SavedMissingTarget, SavedStableModTarget, StableModTarget,
+        };
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.handle_web_action(WebAction::CreateCompositionGroup {
+            name: "Mod owner".into(),
+            member_layer_ids: Vec::new(),
+            root_index: 0,
+            composition_revision: app.composition_revision,
+        });
+        let group_id = app.composition.groups().next().unwrap().id;
+        let target = StableModTarget::parse(&format!("group/{}/opacity", group_id.get())).unwrap();
+        app.mod_matrix.routings.push(modulation::Routing::new(
+            modulation::ModSource::Lfo(0),
+            target.to_string(),
+            0.75,
+        ));
+        let route_id = app.mod_matrix.routings[0].route_id();
+        let revision = app.composition_revision;
+
+        app.handle_web_action(WebAction::RemoveCompositionGroup {
+            group_id: group_id.get().to_string(),
+            composition_revision: revision.wrapping_add(1).max(1),
+        });
+        assert!(app.composition.contains_group(group_id));
+        assert_eq!(app.mod_matrix.routings[0].stable_target(), Some(target));
+        assert!(app.mod_matrix.routings[0].saved_missing_target().is_none());
+
+        app.handle_web_action(WebAction::RemoveCompositionGroup {
+            group_id: group_id.get().to_string(),
+            composition_revision: revision,
+        });
+        assert!(!app.composition.contains_group(group_id));
+        let routing = &app.mod_matrix.routings[0];
+        assert_eq!(routing.route_id(), route_id);
+        assert!(routing.stable_target().is_none());
+        assert_eq!(
+            routing.saved_missing_target(),
+            Some(SavedStableModTarget::MissingGroup {
+                group_id,
+                missing_target: SavedMissingTarget::GroupValue {
+                    parameter: GroupModParameter::Opacity,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn stable_scalar_edits_land_after_unrelated_topology_then_reorder_and_delete_by_id() {
+        use web::state::{CreativeScopeSnapshot, WebAction};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "shift".into(),
+            composition_revision: app.composition_revision,
+        });
+        let shift_id = app.master_rack.iter().next().unwrap().stable_id;
+        let node_scalar_revision = app.composition_revision;
+
+        app.handle_web_action(WebAction::CreateCompositionGroup {
+            name: "Stable group".into(),
+            member_layer_ids: Vec::new(),
+            root_index: 0,
+            composition_revision: app.composition_revision,
+        });
+        let group_id = app.composition.groups().next().unwrap().id;
+        assert_ne!(app.composition_revision, node_scalar_revision);
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: shift_id.get().to_string(),
+            node_kind: "shift".into(),
+            param: "wet".into(),
+            value: serde_json::json!(0.37),
+            composition_revision: node_scalar_revision,
+        });
+        assert!((app.master_rack.get(shift_id).unwrap().wet - 0.37).abs() < 1.0e-6);
+
+        let group_scalar_revision = app.composition_revision;
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 1,
+            node_kind: "grain".into(),
+            composition_revision: app.composition_revision,
+        });
+        let grain_id = app
+            .master_rack
+            .iter()
+            .find(|node| node.stable_id != shift_id)
+            .unwrap()
+            .stable_id;
+        let after_insert_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetCompositionGroupParam {
+            group_id: group_id.get().to_string(),
+            param: "opacity".into(),
+            value: serde_json::json!(0.42),
+            composition_revision: group_scalar_revision,
+        });
+        assert_eq!(app.composition_revision, after_insert_revision);
+        assert!((app.composition.group(group_id).unwrap().opacity - 0.42).abs() < 1.0e-6);
+
+        app.handle_web_action(WebAction::MoveVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: shift_id.get().to_string(),
+            to: 1,
+            composition_revision: app.composition_revision,
+        });
+        assert_eq!(
+            app.master_rack
+                .iter()
+                .map(|node| node.stable_id)
+                .collect::<Vec<_>>(),
+            [grain_id, shift_id]
+        );
+        app.handle_web_action(WebAction::RemoveVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: grain_id.get().to_string(),
+            composition_revision: app.composition_revision,
+        });
+        assert_eq!(
+            app.master_rack
+                .iter()
+                .map(|node| node.stable_id)
+                .collect::<Vec<_>>(),
+            [shift_id]
+        );
+        assert!((app.master_rack.get(shift_id).unwrap().wet - 0.37).abs() < 1.0e-6);
+
+        let revision_after_delete = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: grain_id.get().to_string(),
+            node_kind: "grain".into(),
+            param: "wet".into(),
+            value: serde_json::json!(0.9),
+            composition_revision: group_scalar_revision,
+        });
+        assert_eq!(app.composition_revision, revision_after_delete);
+        assert!(app.master_rack.get(grain_id).is_none());
+    }
+
+    #[test]
+    fn failed_current_frame_group_cycle_keeps_graph_revisions_and_queues_unchanged() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+        let mut first = runtime_group(7, &[]);
+        let second_id = visual_rack::GroupId::new(8).unwrap();
+        push_image_mask(
+            &mut first.rack,
+            visual_rack::ResolvedImageSource::GroupOutput(second_id),
+        );
+        let mut second = runtime_group(8, &[]);
+        let second_mask =
+            push_image_mask(&mut second.rack, visual_rack::ResolvedImageSource::OneBelow);
+        app.composition = composition::RuntimeComposition::try_from_parts(
+            vec![first, second],
+            vec![
+                composition::RuntimeRootItem::Group {
+                    group_id: visual_rack::GroupId::new(7).unwrap(),
+                },
+                composition::RuntimeRootItem::Group {
+                    group_id: second_id,
+                },
+            ],
+            Some(9),
+            0.5,
+        )
+        .unwrap();
+        app.quantized_actions
+            .push(WebAction::SetBlackout { enabled: true });
+        let before_master = app.master_rack.clone();
+        let before_composition = app.composition.clone();
+        let before_stack_revision = app.layer_stack_revision;
+        let before_composition_revision = app.composition_revision;
+
+        app.handle_web_action(WebAction::SetVisualNodeRoute {
+            scope: CreativeScopeSnapshot::Group {
+                group_id: second_id.get().to_string(),
+            },
+            node_id: second_mask.get().to_string(),
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::GroupOutput {
+                    group_id: "7".into(),
+                },
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            },
+            channel: "alpha".into(),
+            invert: false,
+            composition_revision: app.composition_revision,
+        });
+
+        assert_eq!(app.master_rack, before_master);
+        assert_eq!(app.composition, before_composition);
+        assert_eq!(app.layer_stack_revision, before_stack_revision);
+        assert_eq!(app.composition_revision, before_composition_revision);
+        assert_eq!(app.quantized_actions.len(), 1);
+        assert!(matches!(
+            app.quantized_actions[0],
+            WebAction::SetBlackout { enabled: true }
+        ));
+        assert!(
+            app.composition_status
+                .to_ascii_lowercase()
+                .contains("cycle"),
+            "unexpected status: {}",
+            app.composition_status
+        );
+    }
+
+    #[test]
+    fn failed_full_graph_load_is_creative_state_and_revision_atomic() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_effects.brightness = 0.37;
+        let before = serde_yaml::to_string(&app.capture_current_patch()).unwrap();
+        let stack_revision = app.layer_stack_revision;
+        let composition_revision = app.composition_revision;
+        let mut invalid = app.capture_current_patch();
+        invalid.composition = Some(
+            composition::CompositionTree::legacy_for_layers(&[
+                performance::SavedLayerPosition::new(0).unwrap(),
+            ])
+            .unwrap(),
+        );
+
+        let error = app
+            .apply_loaded_patch(invalid, std::path::Path::new("invalid-graph.yaml"))
+            .expect_err("a composition member without a staged layer must reject");
+        assert!(error.contains("composition"), "unexpected error: {error}");
+        assert_eq!(
+            serde_yaml::to_string(&app.capture_current_patch()).unwrap(),
+            before
+        );
+        assert_eq!(app.layer_stack_revision, stack_revision);
+        assert_eq!(app.composition_revision, composition_revision);
+    }
+
+    #[test]
+    fn successful_full_graph_load_round_trips_and_bumps_each_revision_once() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let mut patch = app.capture_current_patch();
+        patch.master.brightness = 0.81;
+        let expected_master_rack = patch.master_rack.clone();
+        let expected_composition = patch.composition.clone();
+        let stack_revision = app.layer_stack_revision;
+        let composition_revision = app.composition_revision;
+
+        app.apply_loaded_patch(patch, std::path::Path::new("roundtrip.yaml"))
+            .unwrap();
+        let captured = app.capture_current_patch();
+        assert!((captured.master.brightness - 0.81).abs() < 1.0e-6);
+        assert_eq!(captured.master_rack, expected_master_rack);
+        assert_eq!(captured.composition, expected_composition);
+        assert_eq!(
+            app.layer_stack_revision,
+            stack_revision.wrapping_add(1).max(1)
+        );
+        assert_eq!(
+            app.composition_revision,
+            composition_revision.wrapping_add(1).max(1)
+        );
+    }
+
+    #[test]
+    fn morph_rack_values_apply_only_to_matching_live_topology_and_route() {
+        fn image_amount(rack: &RuntimeVisualRack, node: visual_rack::NodeId) -> f32 {
+            let visual_rack::RuntimeVisualNodeKind::Mask(visual_rack::RuntimeMaskParams::Image(
+                matte,
+            )) = rack.get(node).unwrap().kind
+            else {
+                panic!("fixture node remains an image mask")
+            };
+            matte.amount
+        }
+        fn set_image(
+            rack: &mut RuntimeVisualRack,
+            node: visual_rack::NodeId,
+            amount: f32,
+            source: visual_rack::ResolvedImageSource,
+        ) {
+            let visual_rack::RuntimeVisualNodeKind::Mask(visual_rack::RuntimeMaskParams::Image(
+                matte,
+            )) = &mut rack.get_mut(node).unwrap().kind
+            else {
+                panic!("fixture node remains an image mask")
+            };
+            matte.amount = amount;
+            matte.tap.source = source;
+        }
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let mut rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let node = rack
+            .insert(
+                1,
+                visual_rack::RuntimeVisualNodeKind::Mask(visual_rack::RuntimeMaskParams::Image(
+                    visual_rack::RuntimeImageMatte {
+                        tap: visual_rack::ResolvedImageTap {
+                            source: visual_rack::ResolvedImageSource::CleanProgram,
+                            timing: visual_rack::EdgeTiming::PreviousFrame,
+                        },
+                        channel: visual_rack::MatteChannel::Alpha,
+                        invert: false,
+                        amount: 0.2,
+                        threshold: 0.5,
+                        softness: 0.1,
+                    },
+                )),
+            )
+            .unwrap();
+        app.master_rack = rack;
+        let empty_racks = app.layer_racks();
+        let a = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        set_image(
+            &mut app.master_rack,
+            node,
+            0.8,
+            visual_rack::ResolvedImageSource::CleanProgram,
+        );
+        let b = morph::MorphSlot::capture_with_composition(
+            &app.master_effects,
+            &app.master_transform,
+            &app.ntsc_params,
+            &app.temporal_params,
+            &app.layers,
+            &app.master_rack,
+            &empty_racks,
+            &app.composition,
+        )
+        .unwrap();
+        app.morph.a = Some(a);
+        app.morph.b = Some(b);
+        app.morph.t = 0.5;
+        app.materialize_morph_at_current_beat_with_offset(0.0);
+        assert!((image_amount(&app.master_rack, node) - 0.5).abs() < 1.0e-6);
+
+        let mismatched_route = visual_rack::ResolvedImageSource::MissingGroupOutput(
+            visual_rack::GroupId::new(99).unwrap(),
+        );
+        set_image(&mut app.master_rack, node, 0.17, mismatched_route);
+        app.materialize_morph_at_current_beat_with_offset(0.0);
+        assert!(
+            (image_amount(&app.master_rack, node) - 0.17).abs() < 1.0e-6,
+            "morph must not write values through a different live image edge"
+        );
+        assert_eq!(
+            app.master_rack.image_mask_route(node).unwrap().source,
+            mismatched_route
+        );
+    }
+
+    fn scene_with_positions(id: u16, positions: &[u32]) -> performance::Scene {
+        performance::Scene {
+            id: performance::SceneId::new(id).unwrap(),
+            name: format!("Scene {id}"),
+            trigger_mode: transport::TriggerMode::Immediate,
+            bindings: performance::SceneBindings::try_from_vec(
+                positions
+                    .iter()
+                    .map(|position| performance::SceneBinding {
+                        layer_position: performance::SavedLayerPosition::new(*position).unwrap(),
+                        slot_id: performance::ClipSlotId::LEGACY,
+                        cue_id: None,
+                    })
+                    .collect(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn scene_positions_follow_layer_move_without_retargeting() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.scenes =
+            performance::Scenes::try_from_vec(vec![scene_with_positions(1, &[0, 2, 4])]).unwrap();
+        app.remap_scenes_after_layer_move(0, 3);
+        let positions: Vec<_> = app
+            .scenes
+            .get(performance::SceneId::new(1).unwrap())
+            .unwrap()
+            .bindings
+            .iter()
+            .map(|binding| binding.layer_position.get())
+            .collect();
+        assert_eq!(positions, [3, 1, 4]);
+    }
+
+    #[test]
+    fn layer_removal_invalidates_whole_targeting_scene_and_shifts_survivors() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.scenes = performance::Scenes::try_from_vec(vec![
+            scene_with_positions(1, &[1, 3]),
+            scene_with_positions(2, &[0, 3]),
+        ])
+        .unwrap();
+        let invalidated = app.remap_scenes_after_layer_remove(1);
+        assert_eq!(invalidated, [performance::SceneId::new(1).unwrap()]);
+        assert!(app
+            .scenes
+            .get(performance::SceneId::new(1).unwrap())
+            .is_none());
+        let survivor: Vec<_> = app
+            .scenes
+            .get(performance::SceneId::new(2).unwrap())
+            .unwrap()
+            .bindings
+            .iter()
+            .map(|binding| binding.layer_position.get())
+            .collect();
+        assert_eq!(survivor, [0, 2]);
+    }
+
+    #[test]
+    fn empty_scene_is_rejected_before_zero_target_preparation() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let scene_id = performance::SceneId::new(9).unwrap();
+        app.scenes = performance::Scenes::try_from_vec(vec![performance::Scene {
+            id: scene_id,
+            name: "Empty".into(),
+            trigger_mode: transport::TriggerMode::Immediate,
+            bindings: performance::SceneBindings::default(),
+        }])
+        .unwrap();
+        app.stage_scene(scene_id, Some(transport::TriggerMode::Immediate));
+        assert!(app.scene_status.contains("must bind at least one layer"));
+        assert!(app.performance_staging.is_none());
+        assert!(app.performance_scheduled.is_none());
+    }
+
+    #[test]
+    fn scene_snapshot_exposes_removed_slot_and_cue_until_recapture_repairs_it() {
+        let active_slot = performance::ClipSlotConfig::from_legacy(
+            "active.png".into(),
+            "active.png".into(),
+            1.0,
+            30.0,
+        );
+        let cue_id = transport::CueId::new(7).unwrap();
+        let mut prepared_slot = performance::ClipSlotConfig {
+            id: performance::ClipSlotId::new(2).unwrap(),
+            name: "Prepared".into(),
+            filename: "prepared.png".into(),
+            source_path: "prepared.png".into(),
+            transport: transport::ClipTransportConfig::default(),
+            saved_playhead: transport::NormalizedTime::ZERO,
+        };
+        assert!(prepared_slot.transport.cues.insert(transport::CuePoint {
+            id: cue_id,
+            at: transport::NormalizedTime::clamped(0.5),
+        }));
+        let mut slots =
+            performance::ClipSlots::try_from_vec(vec![active_slot.clone(), prepared_slot.clone()])
+                .unwrap();
+        let mut scene = performance::Scene {
+            id: performance::SceneId::new(12).unwrap(),
+            name: "Repairable".into(),
+            trigger_mode: transport::TriggerMode::Immediate,
+            bindings: performance::SceneBindings::try_from_vec(vec![performance::SceneBinding {
+                layer_position: performance::SavedLayerPosition::new(0).unwrap(),
+                slot_id: prepared_slot.id,
+                cue_id: Some(cue_id),
+            }])
+            .unwrap(),
+        };
+        let status = |scene: &performance::Scene, slots: &performance::ClipSlots| {
+            resolve_scene_snapshot_bindings(scene, |_| Some((42, slots))).1
+        };
+        assert_eq!(status(&scene, &slots), "");
+
+        let removed = slots.remove_if_not_last(prepared_slot.id).unwrap();
+        assert_eq!(removed.id, prepared_slot.id);
+        assert!(
+            slots.get(active_slot.id).is_some(),
+            "the active slot survives"
+        );
+        assert_eq!(
+            status(&scene, &slots),
+            "missing slot 2 on layer 42",
+            "an inactive-slot removal must not leave a falsely healthy Scene card"
+        );
+
+        slots.upsert(prepared_slot.clone()).unwrap();
+        prepared_slot.transport.cues.remove(cue_id);
+        slots.upsert(prepared_slot).unwrap();
+        assert_eq!(
+            status(&scene, &slots),
+            "missing cue 7 in slot 2 on layer 42"
+        );
+
+        // Recapture retains the Scene identity but replaces stale bindings
+        // with the currently active slot and no implicit cue.
+        scene.bindings =
+            performance::SceneBindings::try_from_vec(vec![performance::SceneBinding {
+                layer_position: performance::SavedLayerPosition::new(0).unwrap(),
+                slot_id: active_slot.id,
+                cue_id: None,
+            }])
+            .unwrap();
+        assert_eq!(scene.id, performance::SceneId::new(12).unwrap());
+        assert_eq!(status(&scene, &slots), "");
+    }
+
+    #[test]
+    fn saved_playhead_staging_discards_a_preloaded_zero_seed() {
+        let requested_generation = 7;
+        let frame = |source_generation, source_seconds| video::threaded::ReadyFrame {
+            rgba: vec![source_generation as u8; 4],
+            codec_motion: None,
+            loops_advanced: 0,
+            source_generation,
+            pts: None,
+            source_seconds,
+            duration_seconds: 10.0,
+        };
+        let seed = frame(0, 0.0);
+        let selected = frame(requested_generation, 6.25);
+
+        let accepted = [seed, selected]
+            .into_iter()
+            .find(|ready| staged_playhead_frame_is_current(true, requested_generation, ready))
+            .expect("the requested saved-playhead generation is eventually published");
+
+        assert_eq!(accepted.source_generation, requested_generation);
+        assert_eq!(accepted.source_seconds, 6.25);
+    }
+
     #[test]
     fn thumbnail_workers_are_policy_bounded_and_expert_is_sequential() {
         assert_eq!(
@@ -6405,6 +20367,7 @@ mod app_state_tests {
     fn held_discrete_window_keys_do_not_repeat_actions() {
         for key in [
             PhysicalKey::Code(KeyCode::Escape),
+            PhysicalKey::Code(KeyCode::Space),
             PhysicalKey::Code(KeyCode::KeyF),
             PhysicalKey::Code(KeyCode::KeyM),
             PhysicalKey::Code(KeyCode::KeyO),
@@ -6412,10 +20375,14 @@ mod app_state_tests {
             assert!(ignore_discrete_window_key_repeat(key, true));
             assert!(!ignore_discrete_window_key_repeat(key, false));
         }
-        assert!(!ignore_discrete_window_key_repeat(
+        for key in [
             PhysicalKey::Code(KeyCode::KeyP),
-            true
-        ));
+            PhysicalKey::Code(KeyCode::KeyG),
+            PhysicalKey::Code(KeyCode::Digit0),
+        ] {
+            assert!(ignore_discrete_window_key_repeat(key, true));
+            assert!(!ignore_discrete_window_key_repeat(key, false));
+        }
     }
 
     #[test]
@@ -6425,12 +20392,133 @@ mod app_state_tests {
         assert!(!show_editor_panel(false, false));
         assert!(show_native_recovery_strip(false));
         assert!(!show_native_recovery_strip(true));
+        assert!(show_stage_editor_health(false));
+        assert!(!show_stage_editor_health(true));
+    }
+
+    #[test]
+    fn stage_monitor_names_are_exact_stable_and_ambiguous_names_fail_closed() {
+        let names = vec![
+            Some("Editor".to_string()),
+            Some("Projector A".to_string()),
+            None,
+        ];
+        assert_eq!(exact_monitor_name_index("Projector A", &names), Ok(1));
+        assert!(exact_monitor_name_index("projector a", &names).is_err());
+        assert!(exact_monitor_name_index("", &names).is_err());
+        assert!(exact_monitor_name_index(
+            "Projector A",
+            &[Some("Projector A".into()), Some("Projector A".into())]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stage_surface_failures_do_not_suppress_successful_endpoint_ids() {
+        let success = renderer::stage_map::StageSurfaceFrameMetrics {
+            presented_surfaces: 1,
+            ..Default::default()
+        };
+        let mismatch = renderer::stage_map::StageSurfaceFrameMetrics {
+            dimension_mismatches: 1,
+            ..Default::default()
+        };
+        let successful = [
+            ("projector-a", success),
+            ("projector-b", success),
+            ("bad-target", mismatch),
+        ]
+        .into_iter()
+        .filter_map(|(id, metrics)| stage_surface_target_succeeded(metrics).then_some(id))
+        .collect::<Vec<_>>();
+        assert_eq!(successful, ["projector-a", "projector-b"]);
+    }
+
+    #[test]
+    fn stage_health_prefers_a_presented_endpoint_and_reconciles_budget_domains() {
+        let mut failed = stage_map::StageEndpoint::new(
+            stage_map::OutputEndpointId::parse("projector-a").unwrap(),
+            "Projector A",
+            [1920, 1080],
+        );
+        failed.binding = stage_map::OutputBinding::Monitor {
+            selector: "A".to_string(),
+        };
+        let mut presented = stage_map::StageEndpoint::new(
+            stage_map::OutputEndpointId::parse("projector-b").unwrap(),
+            "Projector B",
+            [3840, 2160],
+        );
+        presented.binding = stage_map::OutputBinding::Monitor {
+            selector: "B".to_string(),
+        };
+        let stage_map = stage_map::StageMap {
+            endpoints: vec![failed, presented],
+            ..Default::default()
+        };
+        let presented_ids = [stage_map::OutputEndpointId::parse("projector-b").unwrap()]
+            .into_iter()
+            .collect();
+        let endpoint = select_stage_health_endpoint(&stage_map, &presented_ids).unwrap();
+        assert_eq!(endpoint.id.as_str(), "projector-b");
+        assert_eq!(endpoint.output_size, [3840, 2160]);
+
+        let (used, limit) =
+            stage_health_gpu_budget(Some(100), Some(20), Some(30), Some(40), Some(50));
+        assert_eq!(used, Some(190));
+        assert_eq!(
+            limit,
+            Some(
+                50_u64
+                    .saturating_add(visual_rack::MAX_CREATIVE_GPU_BYTES)
+                    .saturating_add(ntsc::MAX_SELECTIVE_NTSC_LIVE_BYTES)
+            )
+        );
+
+        let telemetry = video::threaded::DecoderTelemetry {
+            consumed_frames: 90,
+            decode_samples: 90,
+            upload_samples: 90,
+            decode_p95_duration: Some(FRAME_DURATION + Duration::from_millis(1)),
+            upload_p95_duration: Some(FRAME_DURATION),
+            frame_age_p95_duration: Some(FRAME_DURATION.saturating_mul(3)),
+            frame_drops: 2,
+            pending_frames_peak: 3,
+            ..Default::default()
+        };
+        let observation = proxy_playback_observation(&telemetry, 8).unwrap();
+        assert_eq!(observation.sampled_frames, 90);
+        assert_eq!(observation.visible_layers, 8);
+        assert_eq!(observation.dropped_frames, 2);
+        assert!(matches!(
+            proxy::assess_proxy(observation).unwrap(),
+            proxy::ProxyAssessment::ProxyRecommended(_)
+        ));
+        let unkeyed_status = proxy_assessment_status_from_observation(None, observation);
+        assert!(unkeyed_status.starts_with("proxy recommended from measured"));
+        assert!(unkeyed_status.ends_with("cache identity unavailable"));
     }
 
     #[test]
     fn selective_rebuild_holds_paused_audience_until_resume() {
-        assert!(!selective_rebuild_should_clear_audience(true));
-        assert!(selective_rebuild_should_clear_audience(false));
+        assert!(!selective_rebuild_should_clear_audience(true, false));
+        assert!(selective_rebuild_should_clear_audience(false, false));
+    }
+
+    #[test]
+    fn selective_matte_policy_rejection_holds_playing_audience_before_any_clear() {
+        let policy_error = renderer::compositor::validate_selective_matte_topology(true)
+            .expect_err("Milestone 1 rejects selective VHS with an active matte");
+        assert_eq!(
+            policy_error,
+            renderer::compositor::SELECTIVE_MATTE_TOPOLOGY_ERROR
+        );
+        assert!(!selective_rebuild_should_clear_audience(false, true));
+        assert_eq!(
+            held_audience_action(false, false, false),
+            HeldAudienceAction::Capture,
+            "a playing policy rejection must preserve the accepted audience, not clear it"
+        );
     }
 
     #[test]
@@ -6524,12 +20612,146 @@ mod app_state_tests {
     }
 
     #[test]
+    fn rejected_creative_blackout_release_rebases_spout_to_exact_held_epoch() {
+        let epoch = 41;
+        assert!(held_spout_restore_active(true, false, true, true));
+        assert!(held_spout_barrier_required(true, Some(epoch - 1), epoch));
+        assert!(!held_spout_readback_required(
+            true,
+            Some(epoch - 1),
+            None,
+            epoch
+        ));
+
+        // Once the path-independent colour barrier accepts this release
+        // generation, the exact held slot2 copy is required once. A mapped or
+        // nonblocking-submit failure clears the readback epoch and therefore
+        // deterministically schedules another copy on the next safe-hold frame.
+        assert!(held_spout_readback_required(true, Some(epoch), None, epoch));
+        assert!(!held_spout_readback_required(
+            true,
+            Some(epoch),
+            Some(epoch),
+            epoch
+        ));
+        assert!(held_spout_readback_required(true, Some(epoch), None, epoch));
+
+        assert!(!held_spout_restore_active(true, true, true, true));
+        assert!(!held_spout_restore_active(false, false, true, true));
+    }
+
+    #[test]
+    fn unified_creative_route_diagnostics_are_operator_visible() {
+        use evaluated_frame::evaluated_composition::{CompositionPlanDiagnostic, ImageTapConsumer};
+
+        assert!(creative_route_diagnostic_status(&[]).is_none());
+        let diagnostic = CompositionPlanDiagnostic::NoOneBelow {
+            consumer: ImageTapConsumer::LayerMatte {
+                layer_id: image_routing::StableLayerId::new(7).unwrap(),
+            },
+        };
+        let status = creative_route_diagnostic_status(&[diagnostic]).unwrap();
+        assert!(status.starts_with("Creative route diagnostic:"));
+        assert!(status.contains("NoOneBelow"));
+        assert!(status.contains("7"));
+    }
+
+    #[test]
     fn committed_topology_signature_is_the_single_generation_boundary() {
         assert_eq!(selective_topology_generation_after_signature(9, 9, 41), 41);
         assert_eq!(selective_topology_generation_after_signature(9, 10, 41), 42);
         assert_eq!(
             selective_topology_generation_after_signature(9, 10, u64::MAX),
             1
+        );
+    }
+
+    #[test]
+    fn spatial_morph_is_a_coherent_selective_sample_not_a_topology_edge() {
+        let matrix = modulation::ModMatrix::new();
+        let modulation = matrix.frame(1);
+        let master_effects = effects::EffectUniforms::default();
+        let master_transform = spatial::SpatialTransform::default();
+        let ntsc = ntsc::NtscParams {
+            enabled: true,
+            ..Default::default()
+        };
+        let temporal = effects::params::TemporalParams::default();
+        let layer_effects = effects::EffectUniforms::default();
+        let a = spatial::SpatialTransform {
+            position: [-0.6, 0.0],
+            rotation_deg: -45.0,
+            ..spatial::SpatialTransform::new_layer_default()
+        };
+        let b = spatial::SpatialTransform {
+            position: [0.6, 0.0],
+            rotation_deg: 75.0,
+            ..spatial::SpatialTransform::new_layer_default()
+        };
+        let evaluate_at = |t: f32| {
+            let transform = spatial::SpatialTransform::interpolate(a, b, [1.0 - t, t], t >= 0.5);
+            EvaluatedFramePlan::evaluate(
+                &modulation,
+                FramePlanContext::new(1920, 1080, t),
+                MasterFrameInput {
+                    effects: &master_effects,
+                    transform: &master_transform,
+                    ntsc: &ntsc,
+                    temporal: &temporal,
+                },
+                [LayerFrameInput {
+                    source: SourceTap::new(91, 0, 640, 480),
+                    effects: &layer_effects,
+                    transform: &transform,
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: layers::BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: true,
+                }],
+            )
+        };
+        let earlier = evaluate_at(0.25);
+        let later = evaluate_at(0.75);
+
+        assert_eq!(
+            selective_ntsc_topology_signature(&earlier),
+            selective_ntsc_topology_signature(&later),
+            "continuous Morph geometry must not rebuild selective topology"
+        );
+        let earlier_descriptor = live_selective_ntsc_descriptors(&earlier).next().unwrap();
+        let later_descriptor = live_selective_ntsc_descriptors(&later).next().unwrap();
+        assert_ne!(
+            earlier_descriptor.transform_fingerprint, later_descriptor.transform_fingerprint,
+            "each delayed batch must retain the exact evaluated geometry which produced it"
+        );
+
+        let generation = ntsc::SelectiveNtscGeneration {
+            visual_epoch: 7,
+            topology_generation: 3,
+            width: 1920,
+            height: 1080,
+            sample_sequence: 11,
+        };
+        let metadata = |reference_frame| ntsc::NtscFrameMetadata {
+            params: ntsc.clone(),
+            reference_frame,
+        };
+        let completed = live_selective_ntsc_plan(generation, metadata(10), &earlier).unwrap();
+        let current = live_selective_ntsc_plan(
+            ntsc::SelectiveNtscGeneration {
+                sample_sequence: 12,
+                ..generation
+            },
+            metadata(11),
+            &later,
+        )
+        .unwrap();
+        assert!(
+            ntsc::selective_plan_compatible(&completed, &current),
+            "an async selective worker must accept the prior coherent Morph sample"
         );
     }
 
@@ -6708,6 +20930,154 @@ mod app_state_tests {
     }
 
     #[test]
+    fn stable_transform_actions_follow_reorder_and_noop_after_target_deletion() {
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        struct FixtureLayer {
+            id: u64,
+            transform: spatial::SpatialTransform,
+        }
+
+        // This test-only dispatcher intentionally uses the same two seams as
+        // App's production branches: stable-ID resolution and the canonical
+        // per-field edit function. It owns no positional fallback.
+        fn apply_transform_action(layers: &mut [FixtureLayer], action: web::state::WebAction) {
+            use web::state::WebAction;
+            match action {
+                WebAction::SetLayerTransform {
+                    layer_id,
+                    param,
+                    value,
+                    ..
+                } => {
+                    let resolved = layer_id.as_deref().and_then(|id| {
+                        resolve_stable_layer_index(id, layers.iter().map(|layer| layer.id))
+                    });
+                    if let Some(index) = resolved {
+                        App::apply_spatial_transform_edit(
+                            &mut layers[index].transform,
+                            &param,
+                            &value,
+                        );
+                    }
+                }
+                WebAction::ResetLayerTransform { layer_id, .. } => {
+                    let resolved = layer_id.as_deref().and_then(|id| {
+                        resolve_stable_layer_index(id, layers.iter().map(|layer| layer.id))
+                    });
+                    if let Some(index) = resolved {
+                        layers[index].transform = spatial::SpatialTransform::default();
+                    }
+                }
+                WebAction::ApplyLayerTransform {
+                    layer_id,
+                    transform,
+                    ..
+                } => {
+                    let resolved = layer_id.as_deref().and_then(|id| {
+                        resolve_stable_layer_index(id, layers.iter().map(|layer| layer.id))
+                    });
+                    if let Some(index) = resolved {
+                        layers[index].transform = transform.sanitized();
+                    }
+                }
+                _ => panic!("fixture accepted a non-transform action"),
+            }
+        }
+
+        let untouched = |rotation_deg| spatial::SpatialTransform {
+            rotation_deg,
+            ..spatial::SpatialTransform::default()
+        };
+        let mut layers = vec![
+            FixtureLayer {
+                id: 11,
+                transform: untouched(11.0),
+            },
+            FixtureLayer {
+                id: 22,
+                transform: spatial::SpatialTransform::default(),
+            },
+            FixtureLayer {
+                id: 33,
+                transform: untouched(33.0),
+            },
+        ];
+        let set_while_at_index_one = web::state::WebAction::SetLayerTransform {
+            index: 1,
+            layer_id: Some("22".into()),
+            param: "position_x".into(),
+            value: serde_json::json!(0.75),
+        };
+
+        // The queued action was authored against [11, 22, 33]. By execution
+        // time the target is first; using its stale index would corrupt 33.
+        layers.rotate_left(1);
+        assert_eq!(
+            layers.iter().map(|layer| layer.id).collect::<Vec<_>>(),
+            [22, 33, 11]
+        );
+        apply_transform_action(&mut layers, set_while_at_index_one);
+        assert_eq!(layers[0].transform.position[0], 0.75);
+        assert_eq!(layers[1].transform, untouched(33.0));
+        assert_eq!(layers[2].transform, untouched(11.0));
+
+        let sentinel = spatial::SpatialTransform {
+            position: [-0.2, 0.3],
+            scale: [-1.25, 1.5],
+            anchor: [0.25, 0.8],
+            rotation_deg: 41.0,
+            skew_deg: -9.0,
+            skew_axis_deg: 67.0,
+            fit: spatial::FitMode::Native,
+            crop: [0.05, 0.1, 0.15, 0.2],
+            edge: spatial::EdgeMode::Mirror,
+            sampling: spatial::SamplingMode::Nearest,
+        };
+        apply_transform_action(
+            &mut layers,
+            web::state::WebAction::ApplyLayerTransform {
+                index: 1,
+                layer_id: Some("22".into()),
+                transform: sentinel,
+            },
+        );
+        assert_eq!(layers[0].transform, sentinel);
+        apply_transform_action(
+            &mut layers,
+            web::state::WebAction::ResetLayerTransform {
+                index: 1,
+                layer_id: Some("22".into()),
+            },
+        );
+        assert_eq!(layers[0].transform, spatial::SpatialTransform::default());
+
+        // Once 22 is deleted, every variant becomes a no-op even though the
+        // stale positional spelling now names surviving layer 33.
+        layers.remove(0);
+        let before = layers.clone();
+        for stale in [
+            web::state::WebAction::SetLayerTransform {
+                index: 0,
+                layer_id: Some("22".into()),
+                param: "position_y".into(),
+                value: serde_json::json!(-0.5),
+            },
+            web::state::WebAction::ApplyLayerTransform {
+                index: 0,
+                layer_id: Some("22".into()),
+                transform: sentinel,
+            },
+            web::state::WebAction::ResetLayerTransform {
+                index: 0,
+                layer_id: Some("22".into()),
+            },
+        ] {
+            apply_transform_action(&mut layers, stale);
+        }
+        assert_eq!(layers, before);
+    }
+
+    #[test]
     fn routing_ids_reject_stale_actions_and_target_changes_reset_runtime_once() {
         let web_state = WebState::new().expect("test token");
         let mut app = App::new(None, None, web_state);
@@ -6852,11 +21222,15 @@ mod app_state_tests {
             scope: web::state::RerollScope::Master,
             index: None,
             layer_id: None,
+            group_id: None,
             stack_revision: None,
             seed: Some(0x1234_5678),
             mode: web::state::RerollMode::Pattern,
             amount: 2.0,
             include_grain_controls: true,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: false,
         };
         first.handle_web_action(action.clone());
         second.handle_web_action(action);
@@ -6883,6 +21257,224 @@ mod app_state_tests {
                 .collect::<Vec<_>>()
         );
         assert!(first.mod_matrix.lfos.iter().all(|lfo| lfo.seed != 0));
+        assert_eq!(
+            first.master_motion,
+            motion::MotionParams::default(),
+            "Pattern Dice must not author or activate M4 Motion"
+        );
+        assert_eq!(first.master_motion, second.master_motion);
+    }
+
+    #[test]
+    fn spatial_dice_is_explicit_and_does_not_perturb_effect_randomization() {
+        let mut effects_only = App::new(None, None, WebState::new().expect("test token"));
+        let mut with_spatial = App::new(None, None, WebState::new().expect("test token"));
+        let base = web::state::WebAction::Reroll {
+            scope: web::state::RerollScope::Master,
+            index: None,
+            layer_id: None,
+            group_id: None,
+            stack_revision: None,
+            seed: Some(0x1357_9bdf),
+            mode: web::state::RerollMode::Pattern,
+            amount: 1.0,
+            include_grain_controls: true,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: false,
+        };
+        effects_only.handle_web_action(base.clone());
+        let web::state::WebAction::Reroll {
+            scope,
+            index,
+            layer_id,
+            group_id,
+            stack_revision,
+            seed,
+            mode,
+            amount,
+            include_grain_controls,
+            ..
+        } = base
+        else {
+            unreachable!()
+        };
+        with_spatial.handle_web_action(web::state::WebAction::Reroll {
+            scope,
+            index,
+            layer_id,
+            group_id,
+            stack_revision,
+            seed,
+            mode,
+            amount,
+            include_grain_controls,
+            include_transform: true,
+            include_rack_controls: false,
+            include_group_controls: false,
+        });
+
+        assert_eq!(
+            bytemuck::bytes_of(&effects_only.master_effects),
+            bytemuck::bytes_of(&with_spatial.master_effects),
+            "the opt-in geometry stream must not consume an effects RNG draw"
+        );
+        assert_eq!(
+            effects_only.master_transform,
+            spatial::SpatialTransform::default()
+        );
+        assert_ne!(
+            with_spatial.master_transform,
+            spatial::SpatialTransform::default()
+        );
+    }
+
+    #[test]
+    fn temporal_originals_web_edits_and_master_dice_use_the_closed_runtime_contract() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        for (param, value) in [
+            ("loom_amount", serde_json::json!(0.8)),
+            ("loom_topology", serde_json::json!("kaleidoscopic")),
+            ("loom_interpolation", serde_json::json!("linear")),
+            ("loom_depth", serde_json::json!(0.7)),
+            ("loom_phase", serde_json::json!(-12.5)),
+            ("loom_scale", serde_json::json!(3.0)),
+            ("loom_angle", serde_json::json!(45.0)),
+            ("loom_folds", serde_json::json!(7)),
+            ("loom_quantization", serde_json::json!(9)),
+            ("atlas_amount", serde_json::json!(0.6)),
+            ("atlas_seed", serde_json::json!(17)),
+            ("atlas_territories", serde_json::json!(13)),
+            ("atlas_collision", serde_json::json!(0.4)),
+            ("garden_amount", serde_json::json!(0.5)),
+            ("garden_gate", serde_json::json!("audio_energy")),
+            ("garden_threshold", serde_json::json!(0.3)),
+            ("garden_softness", serde_json::json!(0.2)),
+            ("garden_decay", serde_json::json!(0.9)),
+            ("garden_max_hold_ticks", serde_json::json!(31)),
+            ("score_enabled", serde_json::json!(true)),
+            ("score_seed", serde_json::json!(29)),
+            ("score_state_count", serde_json::json!(11)),
+            ("score_trigger", serde_json::json!("manual")),
+            ("score_loop_driver", serde_json::json!("none")),
+            ("reset_loop_boundary", serde_json::json!("memory")),
+            ("reset_downbeat", serde_json::json!("score")),
+        ] {
+            app.handle_web_action(web::state::WebAction::SetTemporal {
+                param: param.to_string(),
+                value,
+            });
+        }
+
+        let authored = app.temporal_params.originals;
+        assert_eq!(authored.loom.amount, 0.8);
+        assert_eq!(
+            authored.loom.topology,
+            temporal::TemporalTopology::Kaleidoscopic
+        );
+        assert_eq!(
+            authored.loom.interpolation,
+            temporal::TemporalInterpolation::Linear
+        );
+        assert_eq!(authored.loom.folds, 7);
+        assert_eq!(authored.loom.quantization, 9);
+        assert_eq!(authored.atlas.seed, 17);
+        assert_eq!(authored.atlas.territories, 13);
+        assert_eq!(
+            authored.garden.gate,
+            temporal::RefreshGardenGate::AudioEnergy
+        );
+        assert_eq!(authored.garden.max_hold_ticks, 31);
+        assert!(authored.score.enabled);
+        assert_eq!(authored.score.seed, 29);
+        assert_eq!(authored.score.state_count, 11);
+        assert_eq!(
+            authored.score.trigger,
+            temporal::CollisionScoreTrigger::Manual
+        );
+        assert_eq!(
+            authored.reset.loop_boundary,
+            temporal::TemporalEventResetMode::Memory
+        );
+        assert_eq!(
+            authored.reset.downbeat,
+            temporal::TemporalEventResetMode::Score
+        );
+
+        app.handle_web_action(web::state::WebAction::Reroll {
+            scope: web::state::RerollScope::Master,
+            index: None,
+            layer_id: None,
+            group_id: None,
+            stack_revision: None,
+            seed: Some(0x1020_3040),
+            mode: web::state::RerollMode::Variation,
+            amount: 2.0,
+            include_grain_controls: false,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: false,
+        });
+        let mutated = app.temporal_params.originals;
+        assert_ne!(mutated, authored);
+        assert_eq!(mutated.loom.topology, authored.loom.topology);
+        assert_eq!(mutated.loom.interpolation, authored.loom.interpolation);
+        assert_eq!(mutated.atlas.seed, authored.atlas.seed);
+        assert_eq!(mutated.garden.gate, authored.garden.gate);
+        assert_eq!(mutated.score, authored.score);
+        assert_eq!(mutated.reset, authored.reset);
+    }
+
+    #[test]
+    fn master_transform_actions_are_sanitized_and_reset_exactly() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.handle_web_action(web::state::WebAction::SetMasterTransform {
+            param: "position_x".into(),
+            value: serde_json::json!(0.375),
+        });
+        app.handle_web_action(web::state::WebAction::SetMasterTransform {
+            param: "fit".into(),
+            value: serde_json::json!("fit"),
+        });
+        assert_eq!(app.master_transform.position[0], 0.375);
+        assert_eq!(app.master_transform.fit, spatial::FitMode::Fit);
+
+        app.handle_web_action(web::state::WebAction::ApplyMasterTransform {
+            transform: spatial::SpatialTransform {
+                scale: [f32::NAN, 2.0],
+                ..spatial::SpatialTransform::default()
+            },
+        });
+        assert_eq!(app.master_transform.scale, [1.0, 2.0]);
+        app.handle_web_action(web::state::WebAction::ResetMasterTransform);
+        assert_eq!(app.master_transform, spatial::SpatialTransform::default());
+    }
+
+    #[test]
+    fn new_layer_framing_is_host_session_only_and_future_facing() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        assert_eq!(app.new_layer_fit, spatial::FitMode::Fit);
+        let existing = spatial::SpatialTransform {
+            fit: spatial::FitMode::Native,
+            edge: spatial::EdgeMode::Mirror,
+            rotation_deg: 17.0,
+            ..spatial::SpatialTransform::default()
+        };
+
+        app.handle_web_action(web::state::WebAction::SetNewLayerFit {
+            fit: spatial::FitMode::Fill,
+        });
+        assert_eq!(app.new_layer_fit, spatial::FitMode::Fill);
+        assert_eq!(existing.fit, spatial::FitMode::Native);
+        assert_eq!(existing.edge, spatial::EdgeMode::Mirror);
+
+        let future = new_interactive_spatial_transform(app.new_layer_fit);
+        assert_eq!(future.fit, spatial::FitMode::Fill);
+        assert_eq!(future.edge, spatial::EdgeMode::Transparent);
+        assert_eq!(future.position, [0.0, 0.0]);
+
+        let yaml = serde_yaml::to_string(&app.capture_current_patch()).unwrap();
+        assert!(!yaml.contains("new_layer_fit"));
     }
 
     #[test]
@@ -6896,11 +21488,15 @@ mod app_state_tests {
             scope: web::state::RerollScope::All,
             index: None,
             layer_id: None,
+            group_id: None,
             stack_revision: Some(stale_revision),
             seed: Some(77),
             mode: web::state::RerollMode::Variation,
             amount: 1.0,
             include_grain_controls: true,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: false,
         });
         assert!(app.morph.active());
         assert_eq!(app.master_effects.random_seed, stale_seed);
@@ -6909,11 +21505,15 @@ mod app_state_tests {
             scope: web::state::RerollScope::Master,
             index: None,
             layer_id: None,
+            group_id: None,
             stack_revision: None,
             seed: Some(77),
             mode: web::state::RerollMode::Variation,
             amount: 1.0,
             include_grain_controls: true,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: false,
         });
         assert!(!app.morph.active());
         assert_eq!(app.master_effects.random_seed, 77);
@@ -6933,11 +21533,15 @@ mod app_state_tests {
             scope: web::state::RerollScope::Master,
             index: None,
             layer_id: None,
+            group_id: None,
             stack_revision: None,
             seed: Some(0),
             mode: web::state::RerollMode::Pattern,
             amount: 0.7,
             include_grain_controls: false,
+            include_transform: false,
+            include_rack_controls: false,
+            include_group_controls: false,
         });
         assert_eq!(app.master_effects.random_seed, 0);
         assert!(app.mod_matrix.lfos.iter().all(|lfo| lfo.seed == 0));
@@ -6977,6 +21581,7 @@ mod app_state_tests {
                 brightness: 0.0,
                 ..Default::default()
             },
+            &spatial::SpatialTransform::default(),
             &ntsc::NtscParams::default(),
             &effects::params::TemporalParams::default(),
             &[],
@@ -6986,6 +21591,7 @@ mod app_state_tests {
                 brightness: 1.0,
                 ..Default::default()
             },
+            &spatial::SpatialTransform::default(),
             &ntsc::NtscParams::default(),
             &effects::params::TemporalParams::default(),
             &[],
@@ -6999,6 +21605,7 @@ mod app_state_tests {
         app.handle_web_action(web::state::WebAction::MorphCapture {
             slot: "a".into(),
             stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
         });
         assert!(
             (app.morph.a.as_ref().unwrap().master.brightness - 0.8).abs() < 1.0e-6,
@@ -7016,6 +21623,7 @@ mod app_state_tests {
                 saturation: 0.0,
                 ..Default::default()
             },
+            &spatial::SpatialTransform::default(),
             &ntsc::NtscParams::default(),
             &effects::params::TemporalParams::default(),
             &[],
@@ -7026,6 +21634,7 @@ mod app_state_tests {
                 saturation: 1.0,
                 ..Default::default()
             },
+            &spatial::SpatialTransform::default(),
             &ntsc::NtscParams::default(),
             &effects::params::TemporalParams::default(),
             &[],
@@ -7097,6 +21706,7 @@ mod app_state_tests {
                 brightness: 0.0,
                 ..Default::default()
             },
+            &spatial::SpatialTransform::default(),
             &ntsc::NtscParams::default(),
             &effects::params::TemporalParams::default(),
             &[],
@@ -7106,6 +21716,7 @@ mod app_state_tests {
                 brightness: 1.0,
                 ..Default::default()
             },
+            &spatial::SpatialTransform::default(),
             &ntsc::NtscParams::default(),
             &effects::params::TemporalParams::default(),
             &[],
@@ -7148,8 +21759,40 @@ mod app_state_tests {
         app.handle_web_action(web::state::WebAction::MorphCapture {
             slot: "a".into(),
             stack_revision: Some(stale),
+            composition_revision: Some(app.composition_revision),
         });
         assert!(app.morph.a.is_none());
+    }
+
+    #[test]
+    fn queued_morph_capture_cannot_cross_a_creative_topology_generation() {
+        use web::state::{CreativeScopeSnapshot, WebAction};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+        app.quantized_bar = Some(0);
+        let captured_revision = app.composition_revision;
+        app.queue_quantized_action(WebAction::MorphCapture {
+            slot: "a".into(),
+            stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(captured_revision),
+        });
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "shift".into(),
+            composition_revision: captured_revision,
+        });
+        assert_ne!(app.composition_revision, captured_revision);
+
+        app.mod_matrix.current_beat = 4.0;
+        app.release_quantized_actions_on_downbeat();
+
+        assert!(app.quantized_actions.is_empty());
+        assert!(app.morph.a.is_none());
+        assert!(app
+            .composition_status
+            .contains("stale composition revision"));
     }
 
     #[test]
@@ -7160,11 +21803,13 @@ mod app_state_tests {
         app.queue_quantized_action(web::state::WebAction::MorphCapture {
             slot: "a".into(),
             stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
         });
         app.queue_quantized_action(web::state::WebAction::SetMorph { value: 0.8 });
         app.queue_quantized_action(web::state::WebAction::MorphCapture {
             slot: "a".into(),
             stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
         });
 
         assert_eq!(app.quantized_actions.len(), 4);
@@ -7229,7 +21874,35 @@ mod app_state_tests {
     fn master_revert_is_complete_but_preserves_transport_inputs_and_layer_latches() {
         let web_state = WebState::new().expect("test token");
         let mut app = App::new(None, None, web_state);
+        let master_node = app
+            .master_rack
+            .insert(
+                1,
+                visual_rack::RuntimeVisualNodeKind::DigitalColor(
+                    visual_rack::DigitalColorParams::default(),
+                ),
+            )
+            .expect("custom master node");
+        let preserved_next_node_id = app.master_rack.next_node_id_raw();
+        let group_id = app
+            .composition
+            .insert_empty_group(composition::GroupName::new("preserved group").unwrap(), 0)
+            .expect("empty creative group");
+        {
+            let group = app.composition.group_mut(group_id).unwrap();
+            group.opacity = 0.37;
+            group.bus = composition::BusAssignment::B;
+            group
+                .rack
+                .push(visual_rack::RuntimeVisualNodeKind::Shift(
+                    visual_rack::ShiftParams::default(),
+                ))
+                .expect("custom group rack");
+        }
+        let preserved_composition = app.composition.clone();
+        let composition_revision_before = app.composition_revision;
         app.master_effects.brightness = 0.8;
+        app.master_transform.skew_deg = 12.0;
         app.ntsc_params.enabled = true;
         app.temporal_params.feedback = 0.9;
         app.mod_matrix.clock.set_bpm(147.0);
@@ -7245,6 +21918,7 @@ mod app_state_tests {
         ));
         let slot = morph::MorphSlot::capture(
             &app.master_effects,
+            &app.master_transform,
             &app.ntsc_params,
             &app.temporal_params,
             &[],
@@ -7268,6 +21942,14 @@ mod app_state_tests {
                 param: "snow_intensity".to_string(),
                 value: serde_json::json!(0.8),
             },
+            web::state::WebAction::SetVisualNodeParam {
+                scope: web::state::CreativeScopeSnapshot::Master,
+                node_id: master_node.get().to_string(),
+                node_kind: "digital_color".to_string(),
+                param: "brightness".to_string(),
+                value: serde_json::json!(0.4),
+                composition_revision: app.composition_revision,
+            },
             web::state::WebAction::SetLayerEffect {
                 index: 0,
                 layer_id: None,
@@ -7277,9 +21959,10 @@ mod app_state_tests {
         ];
         let old_epoch = app.visual_epoch;
 
-        app.revert_master_visual_state();
+        assert!(app.revert_master_visual_state());
 
         assert_eq!(app.master_effects.brightness, 0.0);
+        assert_eq!(app.master_transform, spatial::SpatialTransform::default());
         assert_eq!(app.ntsc_params, ntsc::NtscParams::default());
         assert_eq!(app.temporal_params.feedback, 0.0);
         assert!(app.mod_matrix.routings.is_empty());
@@ -7291,6 +21974,18 @@ mod app_state_tests {
             app.quantized_actions[0],
             web::state::WebAction::SetLayerEffect { .. }
         ));
+        assert!(app.master_rack.is_exact_legacy(LegacyRackScope::Master));
+        assert_eq!(
+            app.master_rack.next_node_id_raw(),
+            preserved_next_node_id,
+            "reset must not recycle stable node IDs"
+        );
+        assert_eq!(app.composition, preserved_composition);
+        assert_eq!(
+            app.composition_revision,
+            composition_revision_before + 1,
+            "removing custom master topology is one composition transaction"
+        );
         assert_eq!(app.mod_matrix.clock.bpm, 147.0);
         assert!(app.mod_matrix.audio_enabled);
         assert_eq!(app.mod_matrix.audio_gain, 2.25);
@@ -7305,6 +22000,14 @@ mod app_state_tests {
         assert!(app.blackout);
         assert!(app.blackout_presented);
         assert_ne!(app.visual_epoch, old_epoch);
+
+        let settled_revision = app.composition_revision;
+        assert!(app.revert_master_visual_state());
+        assert_eq!(
+            app.composition_revision, settled_revision,
+            "an already-synthetic master reset has no topology revision"
+        );
+        assert_eq!(app.composition, preserved_composition);
     }
 
     #[test]
@@ -7314,6 +22017,7 @@ mod app_state_tests {
         app.master_effects.resolution = [1920.0, 1080.0];
         app.master_effects.brightness = 0.8;
         app.master_effects.random_seed = 41;
+        app.master_transform.rotation_deg = 31.0;
         app.ntsc_params.enabled = true;
         app.ntsc_params.snow_intensity = 0.6;
         app.temporal_params.feedback = 0.9;
@@ -7324,6 +22028,7 @@ mod app_state_tests {
         ));
         let slot = morph::MorphSlot::capture(
             &app.master_effects,
+            &app.master_transform,
             &app.ntsc_params,
             &app.temporal_params,
             &[],
@@ -7343,6 +22048,7 @@ mod app_state_tests {
         assert_eq!(app.master_effects.brightness, 0.0);
         assert_eq!(app.master_effects.random_seed, 0);
         assert_eq!(app.master_effects.resolution, [1920.0, 1080.0]);
+        assert_eq!(app.master_transform.rotation_deg, 31.0);
         assert!(app.ntsc_params.enabled);
         assert_eq!(app.ntsc_params.snow_intensity, 0.6);
         assert_eq!(app.temporal_params.feedback, 0.9);
@@ -7355,6 +22061,7 @@ mod app_state_tests {
             serde_json::from_str(r#"{"action":"reset_visual_program"}"#).unwrap();
         app.handle_web_action(broad);
 
+        assert_eq!(app.master_transform, spatial::SpatialTransform::default());
         assert_eq!(app.ntsc_params, ntsc::NtscParams::default());
         assert_eq!(
             app.temporal_params.feedback,
@@ -7420,6 +22127,27 @@ mod app_state_tests {
             1,
             "native controls do not depend on or mutate browser ingress"
         );
+    }
+
+    #[test]
+    fn native_recovery_authored_actions_record_and_undo_manual_history() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.recovery_journal = None;
+        let initial_depth = app.manual_history.metrics().undo_depth;
+
+        app.apply_native_recovery_action(NativeRecoveryAction::SetProgramFrozen(true));
+        app.apply_native_recovery_action(NativeRecoveryAction::SetProgramFrozen(true));
+        assert!(app.master_paused);
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth + 1);
+        app.restore_history_direction(false);
+        assert!(!app.master_paused);
+
+        app.master_effects.brightness = 0.8;
+        app.apply_native_recovery_action(NativeRecoveryAction::RevertVisualProgram);
+        assert_eq!(app.master_effects.brightness, 0.0);
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth + 1);
+        app.restore_history_direction(false);
+        assert_eq!(app.master_effects.brightness, 0.8);
     }
 
     #[test]
@@ -7775,6 +22503,46 @@ mod app_state_tests {
     }
 
     #[test]
+    fn curated_blend_actions_share_exact_parsing_morph_validation_and_look_conflicts() {
+        use web::state::WebAction;
+
+        for expected in layers::BlendMode::ALL {
+            let value = serde_json::json!(expected.key());
+            assert_eq!(App::blend_mode_edit(&value), Some(expected));
+            assert_eq!(
+                App::layer_param_morph_control("blend_mode", &value),
+                Some(morph::LayerMorphControl::BlendMode)
+            );
+
+            let action = WebAction::SetLayerParam {
+                index: 0,
+                layer_id: Some("17".to_string()),
+                param: "blend_mode".to_string(),
+                value,
+            };
+            assert!(App::action_conflicts_with_applied_look(
+                &action,
+                &legacy_look_scope(vec![17], false, false),
+            ));
+            assert!(!App::action_conflicts_with_applied_look(
+                &action,
+                &legacy_look_scope(vec![18], false, false),
+            ));
+        }
+
+        for invalid in [
+            serde_json::json!("soft-light"),
+            serde_json::json!("Alpha Cut"),
+            serde_json::json!("future_blend"),
+            serde_json::json!(14),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(App::blend_mode_edit(&invalid), None);
+            assert_eq!(App::layer_param_morph_control("blend_mode", &invalid), None);
+        }
+    }
+
+    #[test]
     fn successful_patch_dispositions_filter_only_the_remaining_conflicting_scope() {
         use web::state::{RerollMode, RerollScope, WebAction};
 
@@ -7795,6 +22563,50 @@ mod app_state_tests {
             WebActionBatchDisposition::SnapshotCommitted,
         );
         assert!(snapshot_remainder.is_empty());
+
+        let mut master_reset_remainder = VecDeque::from(vec![
+            WebAction::SetVisualNodeParam {
+                scope: web::state::CreativeScopeSnapshot::Master,
+                node_id: "3".to_string(),
+                node_kind: "digital_color".to_string(),
+                param: "brightness".to_string(),
+                value: serde_json::json!(0.5),
+                composition_revision: 7,
+            },
+            WebAction::MoveVisualNode {
+                scope: web::state::CreativeScopeSnapshot::Master,
+                node_id: "3".to_string(),
+                to: 0,
+                composition_revision: 7,
+            },
+            WebAction::SetVisualNodeParam {
+                scope: web::state::CreativeScopeSnapshot::Group {
+                    group_id: "9".to_string(),
+                },
+                node_id: "4".to_string(),
+                node_kind: "shift".to_string(),
+                param: "amount".to_string(),
+                value: serde_json::json!(0.25),
+                composition_revision: 7,
+            },
+            WebAction::SetBlackout { enabled: true },
+        ]);
+        App::apply_web_action_batch_disposition(
+            &mut master_reset_remainder,
+            WebActionBatchDisposition::MasterVisualReset,
+        );
+        assert_eq!(master_reset_remainder.len(), 2);
+        assert!(matches!(
+            &master_reset_remainder[0],
+            WebAction::SetVisualNodeParam {
+                scope: web::state::CreativeScopeSnapshot::Group { group_id },
+                ..
+            } if group_id == "9"
+        ));
+        assert!(matches!(
+            master_reset_remainder[1],
+            WebAction::SetBlackout { enabled: true }
+        ));
 
         let mut look_remainder = VecDeque::from(vec![
             WebAction::AddLayer {
@@ -7827,11 +22639,15 @@ mod app_state_tests {
                 scope: RerollScope::Master,
                 index: None,
                 layer_id: None,
+                group_id: None,
                 stack_revision: None,
                 seed: Some(99),
                 mode: RerollMode::Pattern,
                 amount: 1.0,
                 include_grain_controls: false,
+                include_transform: false,
+                include_rack_controls: false,
+                include_group_controls: false,
             },
             WebAction::SetLayerEffect {
                 index: 0,
@@ -7889,38 +22705,45 @@ mod app_state_tests {
                 mapped_layer_ids: vec![11],
                 applied_ntsc: true,
                 applied_temporal: false,
+                applied_nodes: Vec::new(),
+                applied_group_ids: Vec::new(),
+                applied_bus_crossfade: false,
             }),
         );
 
-        assert_eq!(look_remainder.len(), 8);
+        assert_eq!(look_remainder.len(), 12);
+        assert!(matches!(look_remainder[0], WebAction::AddLayer { .. }));
+        assert!(matches!(look_remainder[1], WebAction::AddSpoutLayer { .. }));
+        assert!(matches!(look_remainder[2], WebAction::RemoveLayer { .. }));
+        assert!(matches!(look_remainder[3], WebAction::MoveLayer { .. }));
         assert!(matches!(
-            &look_remainder[0],
+            &look_remainder[4],
             WebAction::SetLayerParam { layer_id, .. } if layer_id.as_deref() == Some("22")
         ));
         assert!(matches!(
-            &look_remainder[1],
+            &look_remainder[5],
             WebAction::SetLayerParam { layer_id, param, .. }
                 if layer_id.as_deref() == Some("11") && param == "speed"
         ));
-        assert!(matches!(look_remainder[2], WebAction::SetTemporal { .. }));
+        assert!(matches!(look_remainder[6], WebAction::SetTemporal { .. }));
         assert!(matches!(
-            &look_remainder[3],
+            &look_remainder[7],
             WebAction::ResetGroup { group } if group == "temporal"
         ));
         assert!(matches!(
-            &look_remainder[4],
+            &look_remainder[8],
             WebAction::ResetGroup { group } if group == "mod"
         ));
         assert!(matches!(
-            look_remainder[5],
+            look_remainder[9],
             WebAction::SetProgramFrozen { frozen: true }
         ));
         assert!(matches!(
-            look_remainder[6],
+            look_remainder[10],
             WebAction::SetMediaSafetyMode { .. }
         ));
         assert!(matches!(
-            look_remainder[7],
+            look_remainder[11],
             WebAction::SetBlackout { enabled: true }
         ));
     }
@@ -7992,7 +22815,7 @@ mod app_state_tests {
             },
         ]);
 
-        app.invalidate_visual_generation_after_look(&[11], false, false);
+        app.invalidate_visual_generation_after_look(&legacy_look_scope(vec![11], false, false));
 
         assert_eq!(app.quantized_actions.len(), 4);
         assert!(matches!(
@@ -8035,17 +22858,132 @@ mod app_state_tests {
             &WebAction::ResetGroup {
                 group: "temporal".to_string(),
             },
-            &[],
-            false,
-            true,
+            &legacy_look_scope(Vec::new(), false, true),
         ));
         assert!(!App::action_conflicts_with_applied_look(
             &WebAction::ResetGroup {
                 group: "mod".to_string(),
             },
-            &[],
-            true,
-            true,
+            &legacy_look_scope(Vec::new(), true, true),
+        ));
+    }
+
+    #[test]
+    fn applied_look_filters_only_owned_stable_creative_values_in_all_queues() {
+        use web::state::{CreativeScopeSnapshot, RerollMode, RerollScope, WebAction};
+
+        let applied = AppliedLookScope {
+            mapped_layer_ids: Vec::new(),
+            applied_ntsc: false,
+            applied_temporal: false,
+            applied_nodes: vec![patch::LookNodeRef {
+                scope: patch::LookRackScope::Master,
+                node_id: visual_rack::NodeId::new(3).unwrap(),
+            }],
+            applied_group_ids: vec![visual_rack::GroupId::new(7).unwrap()],
+            applied_bus_crossfade: true,
+        };
+        let matching_node = WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "3".into(),
+            node_kind: "shift".into(),
+            param: "wet".into(),
+            value: serde_json::json!(0.8),
+            composition_revision: 2,
+        };
+        let unrelated_node = WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "4".into(),
+            node_kind: "grain".into(),
+            param: "wet".into(),
+            value: serde_json::json!(0.3),
+            composition_revision: 2,
+        };
+        let matching_group = WebAction::SetCompositionGroupParam {
+            group_id: "7".into(),
+            param: "opacity".into(),
+            value: serde_json::json!(0.4),
+            composition_revision: 2,
+        };
+        let unrelated_group = WebAction::SetCompositionGroupMatteParam {
+            group_id: "8".into(),
+            param: "amount".into(),
+            value: serde_json::json!(0.6),
+            composition_revision: 2,
+        };
+        let topology = WebAction::MoveVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "3".into(),
+            to: 0,
+            composition_revision: 2,
+        };
+        let matching_group_reroll = WebAction::Reroll {
+            scope: RerollScope::Group,
+            index: None,
+            layer_id: None,
+            group_id: Some("7".into()),
+            stack_revision: None,
+            seed: Some(11),
+            mode: RerollMode::Variation,
+            amount: 0.5,
+            include_grain_controls: false,
+            include_transform: false,
+            include_rack_controls: true,
+            include_group_controls: false,
+        };
+        let bus = WebAction::SetCompositionBusCrossfade { value: 0.75 };
+        let ordered = vec![
+            matching_node.clone(),
+            unrelated_node.clone(),
+            topology.clone(),
+            matching_group.clone(),
+            unrelated_group.clone(),
+            matching_group_reroll.clone(),
+            bus.clone(),
+            WebAction::SetBlackout { enabled: true },
+        ];
+
+        let mut local = VecDeque::from(ordered.clone());
+        App::apply_web_action_batch_disposition(
+            &mut local,
+            WebActionBatchDisposition::LookApplied(applied.clone()),
+        );
+        assert_eq!(local.len(), 4);
+        assert!(matches!(
+            &local[0],
+            WebAction::SetVisualNodeParam { node_id, .. } if node_id == "4"
+        ));
+        assert!(matches!(local[1], WebAction::MoveVisualNode { .. }));
+        assert!(matches!(
+            &local[2],
+            WebAction::SetCompositionGroupMatteParam { group_id, .. } if group_id == "8"
+        ));
+        assert!(matches!(local[3], WebAction::SetBlackout { enabled: true }));
+
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.quantized_actions = ordered.clone();
+        app.web_state.actions.blocking_lock().extend(ordered);
+        app.invalidate_visual_generation_after_look(&applied);
+
+        assert_eq!(app.quantized_actions.len(), 4);
+        assert!(matches!(
+            &app.quantized_actions[0],
+            WebAction::SetVisualNodeParam { node_id, .. } if node_id == "4"
+        ));
+        assert!(matches!(
+            app.quantized_actions[1],
+            WebAction::MoveVisualNode { .. }
+        ));
+        let shared = app.web_state.actions.blocking_lock();
+        assert_eq!(shared.len(), 4);
+        assert!(matches!(
+            &shared[2],
+            WebAction::SetCompositionGroupMatteParam { group_id, .. } if group_id == "8"
+        ));
+        assert!(matches!(
+            shared[3],
+            WebAction::SetBlackout { enabled: true }
         ));
     }
 
@@ -8179,5 +23117,523 @@ mod app_state_tests {
         let yaml = serde_yaml::to_string(&app.capture_current_patch()).unwrap();
         assert!(!yaml.contains("media_safety"));
         assert!(!yaml.contains("expert"));
+    }
+
+    #[test]
+    fn browser_gesture_is_one_undo_while_automation_and_other_manual_origins_stay_isolated() {
+        use controller_profile::{AutomationValue, ControlParameter, RuntimeControlAddress};
+        use patch::editor::EditorHistoryBoundary;
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.recovery_journal = None;
+        let initial = app.master_effects.brightness;
+
+        app.handle_web_action(WebAction::BeginHistoryGesture { gesture_id: 41 });
+        for value in [0.2, 0.5, 0.8] {
+            app.handle_web_action(WebAction::SetParam {
+                param: "brightness".into(),
+                value: serde_json::json!(value),
+            });
+        }
+        app.handle_web_action(WebAction::EndHistoryGesture { gesture_id: 41 });
+        assert_eq!(app.manual_history.metrics().undo_depth, 1);
+        assert_eq!(app.master_effects.brightness, 0.8);
+
+        app.handle_web_action(WebAction::UndoManual);
+        assert_eq!(app.master_effects.brightness, initial);
+        assert_eq!(app.manual_history.metrics().redo_depth, 1);
+        app.handle_web_action(WebAction::RedoManual);
+        assert_eq!(app.master_effects.brightness, 0.8);
+
+        let depth = app.manual_history.metrics().undo_depth;
+        app.apply_automation_control(
+            RuntimeControlAddress::Master(ControlParameter::Brightness),
+            AutomationValue::Absolute(0.25),
+        )
+        .unwrap();
+        assert_eq!(app.master_effects.brightness, -0.5);
+        assert_eq!(app.manual_history.metrics().undo_depth, depth);
+
+        let before_native = app.history_checkpoint("Native", "native_editor").unwrap();
+        app.apply_native_history_boundaries(
+            vec![EditorHistoryBoundary::Begin {
+                gesture_id: 7,
+                label: "Native".into(),
+                category: "native_editor".into(),
+            }],
+            Some(before_native),
+        );
+        let native_value = app.master_effects.brightness;
+        app.handle_web_action(WebAction::SetParam {
+            param: "brightness".into(),
+            value: serde_json::json!(0.9),
+        });
+        assert_eq!(app.master_effects.brightness, native_value);
+        assert!(app.history_status.contains("native history gesture"));
+        app.apply_native_history_boundaries(
+            vec![EditorHistoryBoundary::End { gesture_id: 7 }],
+            None,
+        );
+    }
+
+    #[test]
+    fn immediate_native_actions_record_once_and_cannot_fold_into_browser_gestures() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let initial_depth = app.manual_history.metrics().undo_depth;
+        assert!(
+            app.apply_native_manual_action("Native brightness", "effects", |app| {
+                app.master_effects.brightness = 0.35;
+            })
+        );
+        assert_eq!(app.master_effects.brightness, 0.35);
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth + 1);
+
+        app.begin_history_gesture(99);
+        let before = app.master_effects.brightness;
+        assert!(
+            !app.apply_native_manual_action("Nested native", "effects", |app| {
+                app.master_effects.brightness = -0.75;
+            })
+        );
+        assert_eq!(app.master_effects.brightness, before);
+        assert!(app
+            .history_status
+            .contains("BrowserManual history gesture 99"));
+        app.cancel_history_gesture(99);
+    }
+
+    #[test]
+    fn deferred_slot_publication_uses_fresh_state_and_rejects_manual_interleaving() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.recovery_journal = None;
+        let initial_depth = app.manual_history.metrics().undo_depth;
+
+        let deferred = app
+            .deferred_performance_history("Load clip into slot")
+            .unwrap();
+        // Performance-only transport may advance while decode runs. The
+        // deferred transaction keys conflict detection to history generation
+        // and captures this current state immediately before publication.
+        app.master_paused = true;
+        let before = app.prepare_deferred_performance_history(&deferred).unwrap();
+        app.master_effects.brightness = 0.4;
+        assert_eq!(
+            app.record_deferred_performance_history(before).unwrap(),
+            history::HistoryRecordOutcome::Recorded
+        );
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth + 1);
+        app.restore_history_direction(false);
+        assert!(app.master_paused, "fresh before-state preserves transport");
+        assert_eq!(app.master_effects.brightness, 0.0);
+
+        let deferred = app
+            .deferred_performance_history("Create resample slot")
+            .unwrap();
+        assert!(
+            app.apply_native_manual_action("Intervening edit", "effects", |app| {
+                app.master_effects.brightness = 0.25;
+            })
+        );
+        let depth_after_interleaving = app.manual_history.metrics().undo_depth;
+        assert!(app
+            .prepare_deferred_performance_history(&deferred)
+            .unwrap_err()
+            .contains("manual history changed"));
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            depth_after_interleaving
+        );
+    }
+
+    #[test]
+    fn failed_clip_slot_preparation_records_no_manual_history() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.recovery_journal = None;
+        let initial_depth = app.manual_history.metrics().undo_depth;
+        app.handle_web_action(web::state::WebAction::LoadClipIntoSlot {
+            layer_id: "1".into(),
+            slot_id: None,
+            filename: "missing-history-fixture.mp4".into(),
+            activate: true,
+            trigger_mode: transport::TriggerMode::Immediate,
+        });
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth);
+        assert!(app.performance_staging.is_none());
+        assert!(app.source_staging_status.contains("Layer 1 is absent"));
+    }
+
+    #[test]
+    fn native_space_and_m_record_and_undo_authored_transport() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.recovery_journal = None;
+        let initial_depth = app.manual_history.metrics().undo_depth;
+
+        assert!(app.apply_native_transport_flow(ControlFlow::TogglePause, None));
+        assert!(app.master_paused);
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth + 1);
+        app.restore_history_direction(false);
+        assert!(!app.master_paused);
+
+        assert!(app.apply_native_transport_flow(ControlFlow::ToggleMediaFreeze, None));
+        assert!(app.media_frozen);
+        assert_eq!(app.manual_history.metrics().undo_depth, initial_depth + 1);
+        app.restore_history_direction(false);
+        assert!(!app.media_frozen);
+
+        let source = include_str!("main.rs");
+        let window = source.find("fn window_event(").unwrap();
+        let redraw = source[window..]
+            .find("WindowEvent::RedrawRequested")
+            .map(|offset| window + offset)
+            .unwrap();
+        let body = &source[window..redraw];
+        assert!(body.contains("apply_native_transport_flow(flow, Some(idx))"));
+        assert!(body.contains("apply_native_transport_flow(flow, None)"));
+    }
+
+    #[test]
+    fn native_window_authored_paths_use_the_manual_history_boundary() {
+        let source = include_str!("main.rs");
+        let window = source.find("fn window_event(").unwrap();
+        let redraw = source[window..]
+            .find("WindowEvent::RedrawRequested")
+            .map(|offset| window + offset)
+            .unwrap();
+        let body = &source[window..redraw];
+        assert!(body.contains("Add dropped visual layer"));
+        assert!(body.contains("Apply patch look"));
+        assert!(body.contains("Load patch snapshot"));
+        assert!(body.contains("Adjust keyboard effects"));
+        assert!(body.contains("choose_controller_profile_import"));
+        assert!(body.contains("choose_controller_profile_export"));
+    }
+
+    fn waiting_capture_session(target: program_recorder::CaptureTarget) -> LiveCaptureSession {
+        let dimensions = program_recorder::RecorderDimensions::new(2, 2).unwrap();
+        LiveCaptureSession {
+            generation: 41,
+            target,
+            backend: matches!(target, program_recorder::CaptureTarget::Program)
+                .then_some(LiveCaptureBackend::Renderer),
+            started_at: Instant::now(),
+            next_capture_index: 0,
+            last_capture_index: None,
+            in_flight_readbacks: 0,
+            rejected_capture_indices: VecDeque::with_capacity(
+                renderer::readback::RECORDER_GPU_READBACK_SLOTS,
+            ),
+            accepting_captures: true,
+            finish_dispatched: false,
+            cancel_requested: false,
+            artifact_name: "capture.png".into(),
+            deferred_history: None,
+            worker: LiveCaptureWorker::StillWaiting {
+                config: program_recorder::StillSnapshotConfig {
+                    dimensions,
+                    output_path: PathBuf::from("capture.png"),
+                    target,
+                    purpose: program_recorder::CapturePurpose::External,
+                },
+                pixels: Some(vec![0; dimensions.frame_bytes().unwrap()]),
+                in_flight: false,
+            },
+        }
+    }
+
+    #[test]
+    fn live_capture_backend_never_retargets_or_falls_back() {
+        let layer = image_routing::StableLayerId::new(7).unwrap();
+        let group = visual_rack::GroupId::new(9).unwrap();
+        assert_eq!(
+            live_capture_backend(
+                program_recorder::CaptureTarget::Program,
+                LiveCapturePlanKind::Unavailable,
+                None,
+            ),
+            LiveCaptureBackendDecision::Ready(LiveCaptureBackend::Renderer)
+        );
+        assert_eq!(
+            live_capture_backend(
+                program_recorder::CaptureTarget::Layer(layer),
+                LiveCapturePlanKind::LegacyExact,
+                None,
+            ),
+            LiveCaptureBackendDecision::Ready(LiveCaptureBackend::Renderer)
+        );
+        assert_eq!(
+            live_capture_backend(
+                program_recorder::CaptureTarget::Layer(layer),
+                LiveCapturePlanKind::Advanced,
+                None,
+            ),
+            LiveCaptureBackendDecision::Ready(LiveCaptureBackend::Advanced)
+        );
+        assert_eq!(
+            live_capture_backend(
+                program_recorder::CaptureTarget::Group(group),
+                LiveCapturePlanKind::LegacyExact,
+                None,
+            ),
+            LiveCaptureBackendDecision::SourceUnavailable
+        );
+        assert_eq!(
+            live_capture_backend(
+                program_recorder::CaptureTarget::Layer(layer),
+                LiveCapturePlanKind::Advanced,
+                Some(LiveCaptureBackend::Renderer),
+            ),
+            LiveCaptureBackendDecision::SourceUnavailable,
+            "a topology transition cannot pair another capture surface with the session"
+        );
+    }
+
+    #[test]
+    fn capture_tag_keeps_generation_index_clock_and_freeze_cut_truth() {
+        let mut session = waiting_capture_session(program_recorder::CaptureTarget::Program);
+        let intent = session
+            .frame_intent(
+                LiveCapturePlanKind::Unavailable,
+                Duration::from_millis(1_250),
+                17,
+                true,
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.tag.capture_generation(), 41);
+        assert_eq!(intent.tag.metadata().capture_index, 0);
+        assert_eq!(intent.tag.metadata().program_time_ns, 1_250_000_000);
+        assert_eq!(intent.tag.metadata().visual_epoch, 17);
+        assert!(intent.tag.metadata().program_frozen);
+        assert!(!intent.tag.metadata().media_frozen);
+        assert!(intent.tag.metadata().blackout);
+        assert_eq!(intent.tag.metadata().audio_clock, None);
+
+        session.mark_scheduled(intent);
+        assert!(session
+            .frame_intent(
+                LiveCapturePlanKind::Unavailable,
+                Duration::from_secs(2),
+                18,
+                false,
+                true,
+                false,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(session.next_capture_index, 1);
+    }
+
+    #[test]
+    fn scope_capture_backend_is_frozen_after_first_submitted_frame() {
+        let layer = image_routing::StableLayerId::new(5).unwrap();
+        let mut session = waiting_capture_session(program_recorder::CaptureTarget::Layer(layer));
+        let exact = session
+            .frame_intent(
+                LiveCapturePlanKind::LegacyExact,
+                Duration::ZERO,
+                1,
+                false,
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        session.mark_scheduled(exact);
+        if let LiveCaptureWorker::StillWaiting { in_flight, .. } = &mut session.worker {
+            *in_flight = false;
+        }
+        assert!(session
+            .frame_intent(
+                LiveCapturePlanKind::Advanced,
+                Duration::from_millis(33),
+                1,
+                false,
+                false,
+                false,
+            )
+            .is_err());
+        assert_eq!(session.backend, Some(LiveCaptureBackend::Renderer));
+        assert_eq!(session.next_capture_index, 2);
+    }
+
+    #[test]
+    fn waiting_still_fails_boundedly_and_releases_the_capture_slot() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let mut stalled = waiting_capture_session(program_recorder::CaptureTarget::Program);
+        stalled.started_at = Instant::now()
+            .checked_sub(STILL_CAPTURE_SOURCE_TIMEOUT + Duration::from_millis(1))
+            .expect("bounded timeout fits Instant");
+        app.live_capture = Some(stalled);
+
+        app.poll_live_capture();
+
+        assert!(app.live_capture.is_none());
+        assert_eq!(app.recorder_snapshot.status, "failed");
+        assert!(app.recorder_snapshot.error.contains("within 5 seconds"));
+        assert!(app
+            .live_capture
+            .replace(waiting_capture_session(
+                program_recorder::CaptureTarget::Program
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn missing_still_scope_fails_without_waiting_for_the_timeout() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.live_capture = Some(waiting_capture_session(
+            program_recorder::CaptureTarget::Layer(stable_layer(999)),
+        ));
+
+        app.poll_live_capture();
+
+        assert!(app.live_capture.is_none());
+        assert_eq!(app.recorder_snapshot.status, "failed");
+        assert!(app.recorder_snapshot.error.contains("no longer available"));
+    }
+
+    #[test]
+    fn installed_controller_feedback_identity_survives_saved_position_reorder() {
+        use controller_profile::{
+            ControlParameter, ControllerBinding, ControllerProfileDocument, MidiOutputMessage,
+            RuntimeControlAddress, SavedControlAddress,
+        };
+
+        let original = stable_layer(41);
+        let replacement_at_saved_position = stable_layer(99);
+        let document = ControllerProfileDocument {
+            bindings: vec![ControllerBinding {
+                target: SavedControlAddress::Layer {
+                    position: performance::SavedLayerPosition::new(0).unwrap(),
+                    parameter: ControlParameter::Opacity,
+                },
+                feedback: Some(MidiOutputMessage::ControlChange {
+                    channel: 1,
+                    controller: 12,
+                }),
+                ..ControllerBinding::default()
+            }],
+            ..ControllerProfileDocument::default()
+        };
+        let installed = document.resolve(|_| Some(original)).unwrap();
+        let hypothetical_reresolve = document
+            .resolve(|_| Some(replacement_at_saved_position))
+            .unwrap();
+
+        assert_eq!(
+            controller_feedback_addresses(&installed),
+            BTreeSet::from([RuntimeControlAddress::Layer {
+                layer_id: original,
+                parameter: ControlParameter::Opacity,
+            }])
+        );
+        assert_ne!(
+            controller_feedback_addresses(&installed),
+            controller_feedback_addresses(&hypothetical_reresolve),
+            "warm feedback must use the installed StableLayerId mapping"
+        );
+    }
+
+    #[test]
+    fn valid_controller_preset_replaces_an_unresolved_prior_document() {
+        use controller_profile::{ControlParameter, SavedControlAddress};
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let prior_runtime = app.midi.resolved_profile().clone();
+        let mut unresolved = controller_profile::ControllerProfileDocument {
+            name: "Unresolved prior document".into(),
+            ..Default::default()
+        };
+        unresolved.bindings[0].target = SavedControlAddress::Layer {
+            position: performance::SavedLayerPosition::new(17).unwrap(),
+            parameter: ControlParameter::Opacity,
+        };
+        app.controller_profile = unresolved;
+
+        let replacement = controller_profile::ControllerProfileDocument::default();
+        let scoped = preset::ScopedPreset {
+            schema_version: preset::PRESET_SCHEMA_VERSION,
+            id: preset::PresetId::new(1).unwrap(),
+            name: "Controller replacement".into(),
+            created_ordinal: 1,
+            payload: preset::PresetPayload::ControllerProfile(replacement.clone()),
+        };
+        app.apply_scoped_preset(
+            &scoped,
+            &web::state::PresetTargetSnapshot::ControllerProfile,
+        )
+        .unwrap();
+
+        assert_eq!(app.controller_profile, replacement);
+        assert_eq!(app.midi.resolved_profile(), &prior_runtime);
+        assert!(app.controller_status.contains("applied and saved"));
+        let browser_export = controller_profile::ControllerProfileDocument::from_json_bytes(
+            &app.web_state.controller_profile_export(),
+        )
+        .unwrap();
+        assert_eq!(browser_export, app.controller_profile);
+    }
+
+    #[test]
+    fn main_capture_order_is_post_blackout_and_scope_boundaries_are_armed() {
+        let source = include_str!("main.rs");
+        let poll = source.find("self.poll_live_capture();").unwrap();
+        let actions = source.find("// Process actions from web UI").unwrap();
+        assert!(
+            poll < actions,
+            "terminal publication precedes a replacement Start"
+        );
+
+        let exact_begin = source
+            .find(".begin_legacy_scope_recorder_readback(intent.tag)")
+            .unwrap();
+        let exact_render = source
+            .find("let legacy_render_result = renderer.render_evaluated_frame(")
+            .unwrap();
+        let exact_finish = source
+            .find(".finish_legacy_scope_recorder_readback(reservation)")
+            .unwrap();
+        assert!(exact_begin < exact_render && exact_render < exact_finish);
+
+        let blackout = source.find("// Absolute final image operation").unwrap();
+        let stage = source.find("// Final StageMap source boundary").unwrap();
+        let program = source
+            .find("// Program capture is a distinct final-audience tap")
+            .unwrap();
+        let presentation = source
+            .find("// Surface configuration is intentionally inside")
+            .unwrap();
+        assert!(blackout < stage && stage < program && program < presentation);
+        assert!(source[stage..program].contains("presenter.encode(&mut encoder"));
+        let program_body = &source[program..presentation];
+        assert!(program_body.contains(
+            "begin_final_program_recorder_readback(\n                                &mut encoder"
+        ));
+        assert!(program_body.contains("renderer.queue.submit(std::iter::once(encoder.finish()))"));
+        assert!(program_body.contains("Audience Presentation Encoder"));
+        assert!(!program_body.contains("Final Program Recorder Readback Encoder"));
+        assert!(source.contains("view: &renderer.composite_views[2]"));
+        assert!(source.contains("recycle_ready_recorder_readback_without_copy"));
+        assert!(source.contains("recycle_ready_scope_recorder_readback_without_copy"));
+    }
+
+    #[test]
+    fn global_stage_presenter_rebuild_failure_retains_the_accepted_runtime() {
+        let source = include_str!("main.rs");
+        let start = source.find("fn sync_stage_presenter(").unwrap();
+        let end = source[start..]
+            .find("fn refresh_stage_output_status(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        let publication = body.find("match preparation {").unwrap();
+        let rejection = body[publication..].find("Err(error) =>").unwrap() + publication;
+        let rejected_body = &body[rejection..];
+        assert!(rejected_body.contains("if self.stage_presenter.is_none()"));
+        assert!(!rejected_body.contains("self.stage_presenter = None"));
+        assert!(body.contains("self.stage_presenter = Some(presenter)"));
     }
 }

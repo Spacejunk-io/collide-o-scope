@@ -2,17 +2,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::effects::EffectUniforms;
+use crate::image_routing::{LayerMatte, StableLayerId};
 use crate::media_safety::{
     validate_safe_dimensions, MediaAllocationPlan, MediaDeviceLimits, MediaSafetyPolicy,
     MediaSourceKind,
 };
+use crate::motion::MotionParams;
+use crate::performance::{ClipSlotConfig, ClipSlotId, ClipSlots};
+use crate::spatial::SpatialTransform;
 use crate::spout_in::{SpoutFrame, SpoutIn, SpoutStatus};
-use crate::video::threaded::{DecoderHealth, ReadyFrame, MAX_ADVANCE_FRAMES};
-use crate::video::{decode_still_image_with_media_policy, StillImage, ThreadedDecoder};
+use crate::transport::{
+    ClipTransportState, CueId, FrameSelection, NormalizedTime, PlaybackDirection,
+    ProgramTransportTick, TransportTimeline,
+};
+use crate::video::threaded::{DecoderHealth, DecoderTelemetry, ReadyFrame};
+use crate::video::{
+    decode_still_image_with_media_policy, CodecMotionFrame, StillImage, ThreadedDecoder,
+};
+use crate::visual_rack::{LegacyRackScope, RuntimeVisualRack};
 
-/// Bounds decoder/channel work on any one render tick while retaining excess
-/// transport debt for subsequent ticks.
-pub const MAX_DECODE_FRAMES_PER_TICK: u32 = MAX_ADVANCE_FRAMES;
 pub const SPOUT_SOURCE_PREFIX: &str = "spout://";
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv"];
 pub const STILL_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp"];
@@ -31,22 +39,110 @@ fn allocate_layer_id() -> u64 {
         .expect("live layer identity space exhausted")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Advance the process-lifetime allocator beyond an identity restored by the
+/// private manual-history transaction store. History is the only path that
+/// restores runtime identities: persisted patches continue to allocate fresh
+/// IDs, so a file can never manufacture or reuse a live identity.
+fn observe_restored_layer_id(layer_id: u64) -> Result<(), &'static str> {
+    let next = layer_id
+        .checked_add(1)
+        .filter(|next| *next != 0)
+        .ok_or("restored layer identity exhausts the process identity space")?;
+    NEXT_LAYER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.max(next))
+        })
+        .map(|_| ())
+        .map_err(|_| "could not advance the process layer identity cursor")
+}
+
+fn default_layer_rack() -> RuntimeVisualRack {
+    RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer)
+}
+
+fn default_layer_motion() -> MotionParams {
+    MotionParams::default()
+}
+
+fn reset_layer_motion(motion: &mut MotionParams) {
+    *motion = MotionParams::default();
+}
+
+fn take_matching_codec_motion(
+    frame: &mut ReadyFrame,
+    source_dimensions: [u32; 2],
+) -> Option<CodecMotionFrame> {
+    frame.codec_motion.take().filter(|motion| {
+        motion.source_generation == frame.source_generation
+            && motion.source_dimensions == source_dimensions
+            && motion.algorithm_version == crate::motion::MOTION_ALGORITHM_VERSION
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlendMode {
     Normal,
     Screen,
     Multiply,
     Difference,
+    Add,
+    Subtract,
+    Darken,
+    Lighten,
+    Overlay,
+    SoftLight,
+    HardLight,
+    Exclusion,
+    Dodge,
+    Burn,
+    AlphaCut,
 }
 
 impl BlendMode {
+    /// Every protocol value in its permanent append-only numeric order.
+    pub const ALL: [Self; 15] = [
+        Self::Normal,
+        Self::Screen,
+        Self::Multiply,
+        Self::Difference,
+        Self::Add,
+        Self::Subtract,
+        Self::Darken,
+        Self::Lighten,
+        Self::Overlay,
+        Self::SoftLight,
+        Self::HardLight,
+        Self::Exclusion,
+        Self::Dodge,
+        Self::Burn,
+        Self::AlphaCut,
+    ];
+
+    /// Stable append-only shader/protocol code. Never reorder or recycle one.
     pub fn as_u32(self) -> u32 {
         match self {
-            BlendMode::Normal => 0,
-            BlendMode::Screen => 1,
-            BlendMode::Multiply => 2,
-            BlendMode::Difference => 3,
+            Self::Normal => 0,
+            Self::Screen => 1,
+            Self::Multiply => 2,
+            Self::Difference => 3,
+            Self::Add => 4,
+            Self::Subtract => 5,
+            Self::Darken => 6,
+            Self::Lighten => 7,
+            Self::Overlay => 8,
+            Self::SoftLight => 9,
+            Self::HardLight => 10,
+            Self::Exclusion => 11,
+            Self::Dodge => 12,
+            Self::Burn => 13,
+            Self::AlphaCut => 14,
         }
+    }
+
+    /// Decode a stable shader/protocol code. Unknown future values must be
+    /// rejected by callers rather than silently reinterpreted.
+    pub fn from_u32(code: u32) -> Option<Self> {
+        Self::ALL.get(code as usize).copied()
     }
 
     /// Stable lowercase value used by patches and the web protocol.
@@ -54,11 +150,44 @@ impl BlendMode {
     /// snapshot always matches the HTML `<option value>` exactly.
     pub fn key(self) -> &'static str {
         match self {
-            BlendMode::Normal => "normal",
-            BlendMode::Screen => "screen",
-            BlendMode::Multiply => "multiply",
-            BlendMode::Difference => "difference",
+            Self::Normal => "normal",
+            Self::Screen => "screen",
+            Self::Multiply => "multiply",
+            Self::Difference => "difference",
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Darken => "darken",
+            Self::Lighten => "lighten",
+            Self::Overlay => "overlay",
+            Self::SoftLight => "soft_light",
+            Self::HardLight => "hard_light",
+            Self::Exclusion => "exclusion",
+            Self::Dodge => "dodge",
+            Self::Burn => "burn",
+            Self::AlphaCut => "alpha_cut",
         }
+    }
+
+    /// Parse the exact stable patch/web key without inventing aliases.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Some(match key {
+            "normal" => Self::Normal,
+            "screen" => Self::Screen,
+            "multiply" => Self::Multiply,
+            "difference" => Self::Difference,
+            "add" => Self::Add,
+            "subtract" => Self::Subtract,
+            "darken" => Self::Darken,
+            "lighten" => Self::Lighten,
+            "overlay" => Self::Overlay,
+            "soft_light" => Self::SoftLight,
+            "hard_light" => Self::HardLight,
+            "exclusion" => Self::Exclusion,
+            "dodge" => Self::Dodge,
+            "burn" => Self::Burn,
+            "alpha_cut" => Self::AlphaCut,
+            _ => return None,
+        })
     }
 }
 
@@ -66,6 +195,87 @@ pub enum LayerSource {
     Video(ThreadedDecoder),
     Still(StillImage),
     Spout(SpoutIn),
+}
+
+/// A fully allocated and initialized replacement for a layer's source-only
+/// resources. Building this value is fallible; installing it is an infallible
+/// field swap performed only after an entire Scene transaction is ready.
+pub(crate) struct LayerSourceActivation {
+    source_path: String,
+    persisted_source_reference: Option<String>,
+    filename: String,
+    source: LayerSource,
+    texture: wgpu::Texture,
+    texture_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    source_fps: f32,
+    preload_bytes: u64,
+    source_error: String,
+    source_frame_initialized: bool,
+    codec_motion: Option<CodecMotionFrame>,
+}
+
+/// Ownership returned when an already-live source is displaced by a prepared
+/// activation. The source texture and decoder remain intact so the caller can
+/// keep this exact slot GPU-ready instead of reopening it on the next switch.
+pub(crate) struct DisplacedLayerSource {
+    pub(crate) target_layer: StableLayerId,
+    pub(crate) slot: ClipSlotConfig,
+    pub(crate) start_position: NormalizedTime,
+    pub(crate) activation: LayerSourceActivation,
+}
+
+impl LayerSourceActivation {
+    pub(crate) const fn preload_bytes(&self) -> u64 {
+        self.preload_bytes
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source_path: String,
+        persisted_source_reference: Option<String>,
+        filename: String,
+        source: LayerSource,
+        width: u32,
+        height: u32,
+        source_fps: f32,
+        preload_bytes: u64,
+        first_rgba: &[u8],
+    ) -> Result<Self, String> {
+        let (texture, texture_view) =
+            create_layer_texture(device, width, height, "Prepared Layer Texture")?;
+        write_layer_texture_checked(
+            device,
+            queue,
+            &texture,
+            first_rgba,
+            width,
+            height,
+            "Prepared Layer Texture",
+        )?;
+        Ok(Self {
+            source_path,
+            persisted_source_reference,
+            filename,
+            source,
+            texture,
+            texture_view,
+            width,
+            height,
+            source_fps: if source_fps.is_finite() && source_fps > 0.0 {
+                source_fps
+            } else {
+                30.0
+            },
+            preload_bytes,
+            source_error: String::new(),
+            source_frame_initialized: true,
+            codec_motion: None,
+        })
+    }
 }
 
 impl LayerSource {
@@ -76,10 +286,6 @@ impl LayerSource {
             Self::Spout(_) => "spout",
         }
     }
-
-    fn has_transport(&self) -> bool {
-        matches!(self, Self::Video(_))
-    }
 }
 
 fn source_reference_for_persistence<'a>(
@@ -87,6 +293,14 @@ fn source_reference_for_persistence<'a>(
     persisted_reference: Option<&'a str>,
 ) -> &'a str {
     persisted_reference.unwrap_or(runtime_path)
+}
+
+fn content_identity_for_proxy_reference(
+    reference: &str,
+) -> Option<crate::media_source::ContentIdentity> {
+    crate::media_source::parse_content_reference(reference)
+        .ok()
+        .flatten()
 }
 
 pub struct Layer {
@@ -108,6 +322,11 @@ pub struct Layer {
     pub source: LayerSource,
     pub texture: wgpu::Texture,
     pub texture_view: wgpu::TextureView,
+    /// Generation of the GPU texture/view identity (not its pixel contents).
+    /// Advanced composition bind groups retain views, so same-size source
+    /// replacement must invalidate them without rebuilding on ordinary frame
+    /// uploads.
+    source_resource_epoch: u64,
     pub opacity: f32,
     pub blend_mode: BlendMode,
     pub paused: bool,
@@ -119,6 +338,32 @@ pub struct Layer {
     /// video-loop boundary. Stills and live inputs ignore the flag.
     pub reroll_on_loop: bool,
     pub effects: EffectUniforms,
+    /// Ordered creative processing owned by this stable live layer. Legacy
+    /// sources begin with the frozen whole-scope marker rack; source swaps do
+    /// not replace it because the rack belongs to the layer, not its decoder.
+    pub rack: RuntimeVisualRack,
+    /// Resolution-independent authored geometry. New interactive layers use
+    /// Fit + Transparent; patch application may replace this with the exact
+    /// persisted value (including the inactive historical identity).
+    pub transform: SpatialTransform,
+    /// Bounded motion-field, transplant, and curved-shutter authoring owned by
+    /// this stable visual identity. Source swaps preserve it exactly.
+    pub motion: MotionParams,
+    /// Prepared source set owned by this persistent visual identity. Slot IDs
+    /// are searched, never interpreted as vector indices.
+    pub clip_slots: ClipSlots,
+    pub active_clip_slot: ClipSlotId,
+    /// Runtime-only playhead/generation state for the active slot.
+    pub clip_transport: ClipTransportState,
+    /// Explicit image relationship evaluated after local effects and before
+    /// opacity/blending. Disabled is the exact legacy compositor path.
+    pub matte: LayerMatte,
+    /// One-shot UI requests consumed by the next authoritative program tick.
+    pending_transport_seek: Option<NormalizedTime>,
+    pending_transport_cue: Option<CueId>,
+    /// Last pure timeline result. Transport transparency is kept separate from
+    /// authored visibility so a completed OneShot never edits the patch.
+    last_transport_selection: Option<FrameSelection>,
     pub width: u32,
     pub height: u32,
     /// Render-side source error (for example a live frame exceeding GPU
@@ -128,65 +373,41 @@ pub struct Layer {
     /// layer may upload its decoder seed while globally frozen, but no later
     /// in-flight completion may leak through that freeze.
     source_frame_initialized: bool,
+    /// Decoder metadata committed with the exact RGBA upload currently held
+    /// by `texture`. Runtime-only: patches and prepared authoring never see it.
+    codec_motion: Option<CodecMotionFrame>,
+    /// Conservative CPU/GPU working-set charge used while this source is an
+    /// inactive prepared slot. Active sources are deliberately outside that
+    /// evictable ledger, but the exact charge follows ownership on a swap.
+    source_preload_bytes: u64,
     // Transport
     pub speed: f32, // 0.25..4.0 playback multiplier (1.0 = normal)
     pub fps: f32,   // target decode FPS (e.g. 30.0)
-    /// Legacy public timestamp retained for source compatibility. Transport
-    /// cadence is governed by `frame_pacer`; callers no longer need to reset
-    /// this after decoding a frame.
-    pub last_decode: Instant,
-    frame_pacer: FramePacer,
 }
 
-/// Accumulates fractional media frames instead of resetting a wall clock each
-/// time the renderer happens to consume one. That preserves source cadence
-/// across uneven redraw intervals: a delayed redraw produces multiple due
-/// frames that can be drained by the caller rather than slowing playback.
-#[derive(Debug)]
-struct FramePacer {
-    last_tick: Instant,
-    fractional_frames: f64,
-    due_frames: u32,
+fn initial_performance_state(
+    filename: &str,
+    source_path: &str,
+    fps: f32,
+) -> (ClipSlots, ClipSlotId, ClipTransportState) {
+    let slot = ClipSlotConfig::from_legacy(filename.to_owned(), source_path.to_owned(), 1.0, fps);
+    (
+        ClipSlots::singleton(slot),
+        ClipSlotId::LEGACY,
+        ClipTransportState::at(NormalizedTime::ZERO, PlaybackDirection::Forward),
+    )
 }
 
-impl FramePacer {
-    fn new(now: Instant) -> Self {
-        Self {
-            last_tick: now,
-            fractional_frames: 0.0,
-            due_frames: 0,
-        }
+fn evaluate_transport_selection(
+    config: &crate::transport::ClipTransportConfig,
+    mut state: ClipTransportState,
+    tick: ProgramTransportTick,
+    decoder_generation: Option<u64>,
+) -> (ClipTransportState, FrameSelection) {
+    if let Some(decoder_generation) = decoder_generation {
+        state.generation = state.generation.max(decoder_generation);
     }
-
-    fn advance(&mut self, now: Instant, fps: f32, speed: f32) {
-        let elapsed = now.saturating_duration_since(self.last_tick);
-        self.last_tick = now;
-
-        let fps = if fps.is_finite() && fps > 0.0 {
-            fps as f64
-        } else {
-            30.0
-        };
-        let speed = if speed.is_finite() {
-            speed.max(0.01) as f64
-        } else {
-            1.0
-        };
-
-        self.fractional_frames += elapsed.as_secs_f64() * fps * speed;
-        let whole_frames = self.fractional_frames.floor();
-        if whole_frames >= 1.0 {
-            let newly_due = whole_frames.min(u32::MAX as f64) as u32;
-            self.fractional_frames -= newly_due as f64;
-            self.due_frames = self.due_frames.saturating_add(newly_due);
-        }
-    }
-
-    fn reset(&mut self, now: Instant) {
-        self.last_tick = now;
-        self.fractional_frames = 0.0;
-        self.due_frames = 0;
-    }
+    TransportTimeline::select(config, state, tick)
 }
 
 impl Layer {
@@ -223,6 +444,7 @@ impl Layer {
         let height = decoder.height;
         let fps = decoder.fps;
         let media_plan = decoder.media_allocation_plan();
+        let source_preload_bytes = media_plan.working_set_bytes;
         debug_assert_eq!((media_plan.width, media_plan.height), (width, height));
         validate_source_texture_dimensions_with_media_policy(
             width,
@@ -252,8 +474,9 @@ impl Layer {
             resolution: [width as f32, height as f32],
             ..Default::default()
         };
+        let (clip_slots, active_clip_slot, clip_transport) =
+            initial_performance_state(&filename, &source_path, fps);
 
-        let now = Instant::now();
         Ok(Self {
             layer_id: allocate_layer_id(),
             source_path,
@@ -262,6 +485,7 @@ impl Layer {
             source: LayerSource::Video(decoder),
             texture,
             texture_view,
+            source_resource_epoch: 1,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
@@ -269,14 +493,24 @@ impl Layer {
             bypass_master_fx: default_bypass_master_fx(),
             reroll_on_loop: false,
             effects,
+            rack: default_layer_rack(),
+            transform: SpatialTransform::new_layer_default(),
+            motion: default_layer_motion(),
+            clip_slots,
+            active_clip_slot,
+            clip_transport,
+            matte: LayerMatte::default(),
+            pending_transport_seek: None,
+            pending_transport_cue: None,
+            last_transport_selection: None,
             width,
             height,
             source_error: String::new(),
             source_frame_initialized: false,
+            codec_motion: None,
+            source_preload_bytes,
             speed: 1.0,
             fps,
-            last_decode: now,
-            frame_pacer: FramePacer::new(now),
         })
     }
 
@@ -293,6 +527,7 @@ impl Layer {
         )?;
         let width = decoded.width;
         let height = decoded.height;
+        let source_preload_bytes = decoded.media_allocation_plan().working_set_bytes;
         debug_assert_eq!(
             (
                 decoded.media_allocation_plan().width,
@@ -323,8 +558,8 @@ impl Layer {
             resolution: [width as f32, height as f32],
             ..Default::default()
         };
-        let now = Instant::now();
-
+        let (clip_slots, active_clip_slot, clip_transport) =
+            initial_performance_state(&filename, &source_path, 30.0);
         Ok(Self {
             layer_id: allocate_layer_id(),
             source_path,
@@ -333,6 +568,7 @@ impl Layer {
             source: LayerSource::Still(StillImage::from_decoded(decoded)),
             texture,
             texture_view,
+            source_resource_epoch: 1,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
@@ -340,17 +576,27 @@ impl Layer {
             bypass_master_fx: default_bypass_master_fx(),
             reroll_on_loop: false,
             effects,
+            rack: default_layer_rack(),
+            transform: SpatialTransform::new_layer_default(),
+            motion: default_layer_motion(),
+            clip_slots,
+            active_clip_slot,
+            clip_transport,
+            matte: LayerMatte::default(),
+            pending_transport_seek: None,
+            pending_transport_cue: None,
+            last_transport_selection: None,
             width,
             height,
             source_error: String::new(),
             source_frame_initialized: false,
+            codec_motion: None,
+            source_preload_bytes,
             speed: 1.0,
             // A still has no source cadence. Retaining the conventional value
             // keeps old patch/config consumers finite while transport methods
             // below deliberately schedule no decode work.
             fps: 30.0,
-            last_decode: now,
-            frame_pacer: FramePacer::new(now),
         })
     }
 
@@ -384,6 +630,10 @@ impl Layer {
 
         let width = 1;
         let height = 1;
+        let source_preload_bytes = media_policy
+            .plan(MediaSourceKind::Spout, width, height, device_limits)
+            .map_err(|error| format!("Spout source rejected: {error}"))?
+            .working_set_bytes;
         let (texture, texture_view) =
             create_layer_texture(device, width, height, "Spout Layer Texture")?;
         write_layer_texture_checked(
@@ -401,15 +651,19 @@ impl Layer {
             resolution: [width as f32, height as f32],
             ..Default::default()
         };
-        let now = Instant::now();
+        let source_path = format!("{SPOUT_SOURCE_PREFIX}{sanitized_name}");
+        let filename = format!("Spout: {sanitized_name}");
+        let (clip_slots, active_clip_slot, clip_transport) =
+            initial_performance_state(&filename, &source_path, 30.0);
         Ok(Self {
             layer_id: allocate_layer_id(),
-            source_path: format!("{SPOUT_SOURCE_PREFIX}{sanitized_name}"),
+            source_path,
             persisted_source_reference: None,
-            filename: format!("Spout: {sanitized_name}"),
+            filename,
             source: LayerSource::Spout(receiver),
             texture,
             texture_view,
+            source_resource_epoch: 1,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             paused: false,
@@ -417,14 +671,24 @@ impl Layer {
             bypass_master_fx: default_bypass_master_fx(),
             reroll_on_loop: false,
             effects,
+            rack: default_layer_rack(),
+            transform: SpatialTransform::new_layer_default(),
+            motion: default_layer_motion(),
+            clip_slots,
+            active_clip_slot,
+            clip_transport,
+            matte: LayerMatte::default(),
+            pending_transport_seek: None,
+            pending_transport_cue: None,
+            last_transport_selection: None,
             width,
             height,
             source_error: String::new(),
             source_frame_initialized: false,
+            codec_motion: None,
+            source_preload_bytes,
             speed: 1.0,
             fps: 30.0,
-            last_decode: now,
-            frame_pacer: FramePacer::new(now),
         })
     }
 
@@ -432,9 +696,302 @@ impl Layer {
         self.source.kind()
     }
 
+    /// Reset only authored M4 motion controls. Source/transport resources,
+    /// stable identity, geometry, effects, and routing remain untouched.
+    pub fn reset_motion(&mut self) {
+        reset_layer_motion(&mut self.motion);
+    }
+
     /// Immutable identity of this live layer instance.
     pub fn layer_id(&self) -> u64 {
         self.layer_id
+    }
+
+    pub fn stable_layer_id(&self) -> StableLayerId {
+        StableLayerId::new(self.layer_id)
+            .expect("allocated live layer identities are always non-zero")
+    }
+
+    /// Restore an exact process-local identity while a complete replacement
+    /// stack is still detached. Main validates uniqueness and stack length
+    /// before calling this; creative routes are resolved only afterwards.
+    pub(crate) fn restore_stable_layer_id_for_history(
+        &mut self,
+        layer_id: StableLayerId,
+    ) -> Result<(), String> {
+        observe_restored_layer_id(layer_id.get()).map_err(str::to_string)?;
+        self.layer_id = layer_id.get();
+        Ok(())
+    }
+
+    pub fn source_resource_epoch(&self) -> u64 {
+        self.source_resource_epoch
+    }
+
+    pub fn active_clip_config(&self) -> &ClipSlotConfig {
+        self.clip_slots
+            .get(self.active_clip_slot)
+            .expect("Layer maintains a valid active ClipSlot ID")
+    }
+
+    /// Install already-sanitized Set metadata after exact source
+    /// reconstruction. The current decoder/texture must already represent the
+    /// selected slot; this method changes no GPU or source resource.
+    pub fn install_performance_state(
+        &mut self,
+        clip_slots: ClipSlots,
+        active_clip_slot: ClipSlotId,
+        matte: LayerMatte,
+    ) -> Result<(), String> {
+        let slot = clip_slots.get(active_clip_slot).ok_or_else(|| {
+            format!(
+                "active clip slot {} is absent from layer '{}'",
+                active_clip_slot.get(),
+                self.filename
+            )
+        })?;
+        let saved_playhead = slot.saved_playhead;
+        self.filename.clone_from(&slot.filename);
+        let transport = slot.transport.sanitized();
+        // `ClipTransportConfig` is authoritative. These public fields remain
+        // compatibility mirrors only; they must not narrow the 0..=16 law.
+        self.speed = transport.rate as f32;
+        self.fps = slot
+            .transport
+            .sample_fps
+            .unwrap_or(f64::from(self.fps))
+            .clamp(0.25, 480.0) as f32;
+        self.clip_transport = ClipTransportState::at(slot.saved_playhead, transport.direction);
+        self.clip_slots = clip_slots;
+        self.active_clip_slot = active_clip_slot;
+        self.matte = matte.sanitized();
+        // Layer construction seeds video at t=0. Exact patch reconstruction
+        // must publish an absolute generation-tagged selection for the saved
+        // playhead on its first program tick, including while Media Freeze is
+        // holding presentation pixels, so resume can never expose the seed.
+        self.pending_transport_seek = Some(saved_playhead);
+        self.pending_transport_cue = None;
+        self.last_transport_selection = None;
+        self.codec_motion = None;
+        Ok(())
+    }
+
+    /// Capture the canonical Set while keeping the legacy public cadence
+    /// mirrors synchronized with the active slot.
+    pub fn clip_slots_for_persistence(&self) -> ClipSlots {
+        let mut slots = self.clip_slots.clone();
+        if let Some(active) = slots.get_mut(self.active_clip_slot) {
+            active.filename.clone_from(&self.filename);
+            active.source_path = self.source_reference_for_persistence().to_owned();
+            active.saved_playhead = self.clip_transport.position;
+        }
+        slots
+    }
+
+    /// Source duration supplied to the pure transport evaluator. Still and
+    /// live inputs have no finite seekable duration and therefore report zero.
+    pub fn source_duration_seconds(&self) -> f64 {
+        match &self.source {
+            LayerSource::Video(decoder) => decoder.duration_seconds,
+            LayerSource::Still(_) | LayerSource::Spout(_) => 0.0,
+        }
+    }
+
+    /// Bounded source-frame estimate used only to derive an exact selected
+    /// frame index for deterministic diagnostics/export parity.
+    pub fn source_frame_count(&self) -> u64 {
+        match &self.source {
+            LayerSource::Video(decoder) => {
+                let estimate = decoder.duration_seconds * f64::from(decoder.fps);
+                if estimate.is_finite() && estimate > 0.0 {
+                    estimate.round().clamp(1.0, f64::from(u32::MAX)) as u64
+                } else {
+                    0
+                }
+            }
+            LayerSource::Still(_) => 1,
+            LayerSource::Spout(_) => 0,
+        }
+    }
+
+    pub fn request_transport_seek(&mut self, position: NormalizedTime) {
+        self.pending_transport_seek = Some(position);
+        self.pending_transport_cue = None;
+        self.codec_motion = None;
+    }
+
+    pub fn request_transport_cue(&mut self, cue_id: CueId) {
+        self.pending_transport_cue = Some(cue_id);
+        self.pending_transport_seek = None;
+        self.codec_motion = None;
+    }
+
+    /// Apply one shared program-clock observation to the active slot and, for
+    /// seekable video, publish a generation-tagged absolute selection to the
+    /// decoder's newest-only mailbox. Still/Spout sources retain the same pure
+    /// timeline snapshot but deliberately schedule no decoder work.
+    /// Apply one program-clock observation using frame-local cadence
+    /// overrides without mutating the authored ClipSlot. This preserves the
+    /// legacy speed/FPS modulation surface while the Set retains the wider
+    /// canonical transport ranges used by live and offline playback.
+    pub fn apply_transport_tick_with_overrides(
+        &mut self,
+        mut tick: ProgramTransportTick,
+        effective_rate: f64,
+        effective_sample_fps: Option<f64>,
+    ) -> Result<FrameSelection, String> {
+        tick.source_duration_seconds = self.source_duration_seconds();
+        tick.source_frame_count = self.source_frame_count();
+
+        let queued_seek = self.pending_transport_seek.take();
+        let queued_cue = self.pending_transport_cue.take();
+        if tick.seek_to.is_none() {
+            tick.seek_to = queued_seek;
+        }
+        if tick.cue_id.is_none() && tick.seek_to.is_none() {
+            tick.cue_id = queued_cue;
+        }
+
+        // A decoder may already have received compatibility seek requests.
+        // Rebase the pure state's generation before selecting so the next
+        // absolute request can never be rejected as stale.
+        let decoder_generation = match &self.source {
+            LayerSource::Video(decoder) => Some(decoder.source_generation()),
+            LayerSource::Still(_) | LayerSource::Spout(_) => None,
+        };
+        let mut config = self.active_clip_config().transport;
+        config.rate = effective_rate;
+        config.sample_fps = effective_sample_fps;
+        let config = config.sanitized();
+        let (next_state, selection) =
+            evaluate_transport_selection(&config, self.clip_transport, tick, decoder_generation);
+        self.clip_transport = next_state;
+        if selection.discontinuity {
+            self.codec_motion = None;
+        }
+
+        if selection.sample_due && !selection.transparent {
+            if let LayerSource::Video(decoder) = &mut self.source {
+                let accepted =
+                    decoder.request_source_time(selection.generation, selection.source_seconds)?;
+                if !accepted {
+                    return Err(format!(
+                        "decoder rejected stale transport generation {} for layer '{}'",
+                        selection.generation, self.filename
+                    ));
+                }
+            }
+        }
+        self.last_transport_selection = Some(selection);
+        Ok(selection)
+    }
+
+    /// Authored `visible` remains independent; the evaluator combines it with
+    /// this gate when deciding whether a OneShot source contributes.
+    pub fn transport_visible(&self) -> bool {
+        self.last_transport_selection
+            .is_none_or(|selection| !selection.transparent)
+    }
+
+    pub(crate) fn prepared_slot_state_matches(
+        &self,
+        slot_id: ClipSlotId,
+        expected_prior: Option<&ClipSlotConfig>,
+    ) -> bool {
+        self.clip_slots.get(slot_id) == expected_prior
+            && (expected_prior.is_some()
+                || self.clip_slots.len() < crate::performance::MAX_CLIP_SLOTS_PER_LAYER)
+    }
+
+    /// Infallible source-only half of an already validated atomic commit.
+    /// Layer identity, effects, transform, blend, modulation-facing fields,
+    /// matte, authored visibility, and pause state are deliberately untouched.
+    pub(crate) fn commit_prepared_source(
+        &mut self,
+        activation: LayerSourceActivation,
+        slot: &ClipSlotConfig,
+        start_position: NormalizedTime,
+        now: Instant,
+    ) -> DisplacedLayerSource {
+        // Persist the actual runtime playhead and source identity before the
+        // active ownership is moved out. This exact value is also the
+        // optimistic-concurrency revision of the returned prepared payload.
+        let target_layer = self.stable_layer_id();
+        let prior_start_position = self.clip_transport.position;
+        let prior_source_fps = match &self.source {
+            LayerSource::Video(decoder) => decoder.fps,
+            LayerSource::Still(_) | LayerSource::Spout(_) => 30.0,
+        };
+        let mut prior_slot = self.active_clip_config().clone();
+        prior_slot.filename.clone_from(&self.filename);
+        prior_slot.source_path = self.source_reference_for_persistence().to_owned();
+        prior_slot.saved_playhead = prior_start_position;
+        self.clip_slots
+            .upsert(prior_slot.clone())
+            .expect("the active slot already occupies bounded Set capacity");
+
+        let LayerSourceActivation {
+            source_path,
+            persisted_source_reference,
+            filename,
+            source,
+            texture,
+            texture_view,
+            width,
+            height,
+            source_fps,
+            preload_bytes,
+            source_error,
+            source_frame_initialized,
+            codec_motion,
+        } = activation;
+        let displaced = LayerSourceActivation {
+            source_path: std::mem::replace(&mut self.source_path, source_path),
+            persisted_source_reference: std::mem::replace(
+                &mut self.persisted_source_reference,
+                persisted_source_reference,
+            ),
+            filename: std::mem::replace(&mut self.filename, filename),
+            source: std::mem::replace(&mut self.source, source),
+            texture: std::mem::replace(&mut self.texture, texture),
+            texture_view: std::mem::replace(&mut self.texture_view, texture_view),
+            width: self.width,
+            height: self.height,
+            source_fps: prior_source_fps,
+            preload_bytes: self.source_preload_bytes,
+            source_error: std::mem::replace(&mut self.source_error, source_error),
+            source_frame_initialized: self.source_frame_initialized,
+            codec_motion: std::mem::replace(&mut self.codec_motion, codec_motion),
+        };
+        self.width = width;
+        self.height = height;
+        self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
+        self.effects.resolution = [width as f32, height as f32];
+        self.source_frame_initialized = source_frame_initialized;
+        self.source_preload_bytes = preload_bytes;
+
+        let transport = slot.transport.sanitized();
+        self.clip_slots
+            .upsert(slot.clone())
+            .expect("prepared slot capacity and prior state were validated before commit");
+        self.active_clip_slot = slot.id;
+        self.clip_transport = ClipTransportState::at(start_position, transport.direction);
+        self.speed = transport.rate as f32;
+        self.fps = transport
+            .sample_fps
+            .unwrap_or(f64::from(source_fps))
+            .clamp(0.25, 480.0) as f32;
+        self.pending_transport_seek = None;
+        self.pending_transport_cue = None;
+        self.last_transport_selection = None;
+        self.reset_transport_timing_at(now);
+
+        DisplacedLayerSource {
+            target_layer,
+            slot: prior_slot,
+            start_position: prior_start_position,
+            activation: displaced,
+        }
     }
 
     /// Keep a verified content reference while the decoder uses its resolved
@@ -449,6 +1006,13 @@ impl Layer {
             &self.source_path,
             self.persisted_source_reference.as_deref(),
         )
+    }
+
+    /// Return a previously verified portable identity for proxy assessment.
+    /// Ordinary/invalid host paths intentionally produce no identity and this
+    /// accessor performs no filesystem read or warm-path fingerprinting.
+    pub fn content_identity_for_proxy(&self) -> Option<crate::media_source::ContentIdentity> {
+        content_identity_for_proxy_reference(self.source_reference_for_persistence())
     }
 
     pub fn is_video(&self) -> bool {
@@ -473,16 +1037,20 @@ impl Layer {
         self.source_frame_initialized
     }
 
+    /// Codec metadata committed with the exact pixels currently in the source
+    /// texture. Intra/unavailable/rejected products remain visible here for
+    /// truthful source diagnostics; only `Available` products yield vectors.
+    pub fn codec_motion(&self) -> Option<&CodecMotionFrame> {
+        self.codec_motion.as_ref()
+    }
+
     /// Take a file source's initial/newest frame. Video publishes the initial
     /// seed plus requested advances; a still publishes exactly one immutable
     /// RGBA frame. Call this before pause gating so either kind starts defined.
     pub fn take_ready_media_frame(&mut self) -> Result<Option<ReadyFrame>, String> {
         match &mut self.source {
             LayerSource::Video(decoder) => decoder.try_next_ready_frame_result(),
-            LayerSource::Still(image) => Ok(image.take_frame().map(|rgba| ReadyFrame {
-                rgba,
-                loops_advanced: 0,
-            })),
+            LayerSource::Still(image) => Ok(image.take_frame().map(ReadyFrame::still)),
             LayerSource::Spout(_) => Ok(None),
         }
     }
@@ -491,6 +1059,28 @@ impl Layer {
         if let LayerSource::Still(image) = &mut self.source {
             image.restore_frame_after_failed_upload(frame.rgba);
         }
+    }
+
+    /// Upload one decoded/still product and commit its codec metadata only
+    /// after the matching RGBA write succeeds. On error the caller retains the
+    /// complete frame for existing still-image retry behavior.
+    pub fn upload_ready_media_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &mut ReadyFrame,
+    ) -> Result<(), String> {
+        let upload_started = Instant::now();
+        let upload_result = self.upload_frame(device, queue, &frame.rgba);
+        let upload_duration = upload_started.elapsed();
+        if upload_result.is_ok() {
+            if let LayerSource::Video(decoder) = &mut self.source {
+                decoder.record_upload_duration(upload_duration);
+            }
+        }
+        upload_result?;
+        self.codec_motion = take_matching_codec_motion(frame, [self.width, self.height]);
+        Ok(())
     }
 
     /// Compatibility name retained for existing render-loop callers. It now
@@ -502,38 +1092,22 @@ impl Layer {
             .map(|ready| ready.map(|frame| frame.rgba))
     }
 
-    /// Queue a bounded video advancement request. The returned count is the
-    /// number accepted by the worker (zero when its single pending slot is
-    /// occupied); only accepted pacing debt is retired.
-    pub fn request_video_frames(&mut self, count: u32) -> Result<u32, String> {
-        let accepted = match &mut self.source {
-            LayerSource::Video(decoder) => decoder.request_frames(count)?,
-            LayerSource::Still(_) => 0,
-            LayerSource::Spout(_) => 0,
-        };
-        self.mark_frames_consumed(accepted);
-        Ok(accepted)
-    }
-
-    /// Advance the transport clock and queue as much due work as the bounded
-    /// decoder accepts this tick.
-    /// Modulated-cadence variant. The stored source FPS remains an immutable
-    /// UI/patch base while routing supplies the effective value for this tick.
-    pub fn request_due_video_frames_at(
-        &mut self,
-        effective_fps: f32,
-        speed: f32,
-    ) -> Result<u32, String> {
-        let due = self.frames_due_at(effective_fps, speed);
-        self.request_video_frames(due)
-    }
-
     /// Stable video decoder health for state snapshots.
     pub fn video_health(&self) -> Option<DecoderHealth> {
         match &self.source {
             LayerSource::Video(decoder) => Some(decoder.health()),
             LayerSource::Still(_) => None,
             LayerSource::Spout(_) => None,
+        }
+    }
+
+    /// Allocation-free newest-only decoder timing/loss truth. Still and live
+    /// inputs have no threaded decoder and therefore report absence rather
+    /// than manufactured zeroes.
+    pub fn video_telemetry(&self) -> Option<DecoderTelemetry> {
+        match &self.source {
+            LayerSource::Video(decoder) => Some(decoder.telemetry()),
+            LayerSource::Still(_) | LayerSource::Spout(_) => None,
         }
     }
 
@@ -626,55 +1200,33 @@ impl Layer {
             }
             self.texture = texture;
             self.texture_view = texture_view;
+            self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
             self.width = frame.width;
             self.height = frame.height;
             self.effects.resolution = [frame.width as f32, frame.height as f32];
             self.source_frame_initialized = true;
+            self.codec_motion = None;
+            // Spout uses the same four-RGBA-buffer conservative planning
+            // multiplier as its admission plan. The frame length is already
+            // validated above, so this conversion is exact and bounded.
+            self.source_preload_bytes = u64::try_from(frame.pixels.len())
+                .unwrap_or(u64::MAX)
+                .saturating_mul(4);
             self.source_error.clear();
             return Ok(());
         }
         self.upload_frame(device, queue, &frame.pixels)
     }
 
-    /// Number of media frames currently due at the given (possibly modulated)
-    /// speed. Debt is retired only when the request-driven worker accepts it,
-    /// so a busy decoder does not lose transport time. The returned work is
-    /// capped per tick; excess debt remains queued.
-    pub fn frames_due_at(&mut self, effective_fps: f32, speed: f32) -> u32 {
-        let now = Instant::now();
-        if !self.source.has_transport() {
-            // A still is immutable and a live receiver is producer-paced.
-            // Clear any legacy/morphed timing debt rather than accumulating a
-            // counter that can never be retired.
-            self.frame_pacer.reset(now);
-            return 0;
-        }
-        self.frame_pacer
-            .advance(now, effective_fps.clamp(1.0, 240.0), speed.clamp(0.25, 4.0));
-        self.frame_pacer.due_frames.min(MAX_DECODE_FRAMES_PER_TICK)
-    }
-
-    /// Record that `count` due frames were drained (typically while keeping
-    /// only the newest decoded image for upload).
-    pub fn mark_frames_consumed(&mut self, count: u32) {
-        self.frame_pacer.due_frames = self.frame_pacer.due_frames.saturating_sub(count);
-        self.last_decode = Instant::now();
-    }
-
-    /// Clear pending transport debt and restart timing from now. Call this on
-    /// pause/resume transitions so intentional pauses are not interpreted as
-    /// renderer stalls that need to be caught up.
+    /// Compatibility seam retained for callers that reset legacy pacing on a
+    /// source discontinuity. Absolute `TransportTimeline` selection carries
+    /// no local pacing debt, so the operation is intentionally a no-op.
     pub fn reset_transport_timing(&mut self) {
         self.reset_transport_timing_at(Instant::now());
     }
 
-    /// Timestamped form used when a whole layer stack commits atomically.
-    /// Sharing one timestamp prevents earlier-opened layers from accumulating
-    /// artificial playback debt while later sources are still being rebuilt.
-    pub(crate) fn reset_transport_timing_at(&mut self, now: Instant) {
-        self.frame_pacer.reset(now);
-        self.last_decode = now;
-    }
+    /// Timestamped compatibility form; see [`Self::reset_transport_timing`].
+    pub(crate) fn reset_transport_timing_at(&mut self, _now: Instant) {}
 
     pub fn upload_frame(
         &mut self,
@@ -693,6 +1245,9 @@ impl Layer {
         ) {
             Ok(()) => {
                 self.source_frame_initialized = true;
+                // Generic RGBA uploads have no paired decoder product. The
+                // motion-aware sibling writes a matching product afterward.
+                self.codec_motion = None;
                 self.source_error.clear();
                 Ok(())
             }
@@ -893,67 +1448,90 @@ fn extension_in(extension: &str, allowed: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_layer_id, create_layer_texture, default_bypass_master_fx, is_still_image_file,
-        is_supported_visual_extension, is_supported_visual_file, is_video_file,
-        layer_texture_upload_error, source_reference_for_persistence,
-        spout_sender_from_source_path, validate_source_texture_dimensions,
-        write_layer_texture_checked, BlendMode, FramePacer, LayerSource,
-        MAX_DECODE_FRAMES_PER_TICK,
+        allocate_layer_id, content_identity_for_proxy_reference, create_layer_texture,
+        default_bypass_master_fx, default_layer_motion, default_layer_rack,
+        evaluate_transport_selection, is_still_image_file, is_supported_visual_extension,
+        is_supported_visual_file, is_video_file, layer_texture_upload_error, reset_layer_motion,
+        source_reference_for_persistence, spout_sender_from_source_path,
+        take_matching_codec_motion, validate_source_texture_dimensions,
+        write_layer_texture_checked, BlendMode,
     };
-    use std::time::{Duration, Instant};
-
+    use crate::transport::{
+        ClipTransportConfig, ClipTransportState, EndBehavior, NormalizedTime, PlaybackDirection,
+        ProgramTransportTick,
+    };
     #[test]
-    fn frame_pacer_preserves_fractional_time_and_catches_up() {
-        let start = Instant::now();
-        let mut pacer = FramePacer::new(start);
+    fn live_transport_seam_covers_freeze_reverse_seek_generation_and_terminal_transparency() {
+        let reverse = ClipTransportConfig {
+            direction: PlaybackDirection::Reverse,
+            rate: 1.0,
+            ..ClipTransportConfig::default()
+        };
+        let state =
+            ClipTransportState::at(NormalizedTime::clamped(0.5), PlaybackDirection::Reverse);
+        let frozen_tick = ProgramTransportTick {
+            delta_seconds: 1.0,
+            program_running: false,
+            media_running: true,
+            source_duration_seconds: 10.0,
+            source_frame_count: 100,
+            ..ProgramTransportTick::default()
+        };
+        let (state, frozen) = evaluate_transport_selection(&reverse, state, frozen_tick, Some(7));
+        assert_eq!(frozen.logical_time, NormalizedTime::clamped(0.5));
+        assert!(frozen.held);
+        assert!(frozen.generation >= 7);
 
-        pacer.advance(start + Duration::from_millis(20), 25.0, 1.0);
-        assert_eq!(pacer.due_frames, 0);
-        assert!((pacer.fractional_frames - 0.5).abs() < 1e-6);
+        let seek_tick = ProgramTransportTick {
+            source_duration_seconds: 10.0,
+            source_frame_count: 100,
+            seek_to: Some(NormalizedTime::clamped(0.8)),
+            ..ProgramTransportTick::default()
+        };
+        let (state, sought) = evaluate_transport_selection(&reverse, state, seek_tick, Some(9));
+        assert_eq!(sought.logical_time, NormalizedTime::clamped(0.8));
+        assert!(sought.discontinuity);
+        assert!(sought.generation > 9);
 
-        pacer.advance(start + Duration::from_millis(100), 25.0, 1.0);
-        assert_eq!(pacer.due_frames, 2);
-        assert!((pacer.fractional_frames - 0.5).abs() < 1e-6);
-    }
+        let reverse_tick = ProgramTransportTick {
+            delta_seconds: 1.0,
+            source_duration_seconds: 10.0,
+            source_frame_count: 100,
+            ..ProgramTransportTick::default()
+        };
+        let (_, reversed) = evaluate_transport_selection(&reverse, state, reverse_tick, None);
+        assert!((reversed.logical_time.get() - 0.7).abs() < 1e-9);
 
-    #[test]
-    fn frame_pacer_reset_discards_pause_debt() {
-        let start = Instant::now();
-        let mut pacer = FramePacer::new(start);
-        pacer.advance(start + Duration::from_secs(2), 30.0, 1.0);
-        assert_eq!(pacer.due_frames, 60);
-        assert_eq!(pacer.due_frames.min(MAX_DECODE_FRAMES_PER_TICK), 8);
-
-        let resumed = start + Duration::from_secs(5);
-        pacer.reset(resumed);
-        pacer.advance(resumed + Duration::from_millis(16), 30.0, 1.0);
-        assert_eq!(pacer.due_frames, 0);
-    }
-
-    #[test]
-    fn shared_commit_reset_eliminates_sequential_open_debt() {
-        let start = Instant::now();
-        let mut opened_first = FramePacer::new(start);
-        let mut opened_last = FramePacer::new(start + Duration::from_secs(2));
-        let commit = start + Duration::from_secs(3);
-
-        // Without a commit reset, construction time is indistinguishable from
-        // playback time and the earlier source immediately owes more frames.
-        opened_first.advance(commit, 30.0, 1.0);
-        opened_last.advance(commit, 30.0, 1.0);
-        assert!(opened_first.due_frames > opened_last.due_frames);
-
-        opened_first.reset(commit);
-        opened_last.reset(commit);
-        let first_tick = commit + Duration::from_millis(16);
-        opened_first.advance(first_tick, 30.0, 1.0);
-        opened_last.advance(first_tick, 30.0, 1.0);
-
-        assert_eq!(opened_first.due_frames, opened_last.due_frames);
-        assert_eq!(
-            opened_first.fractional_frames,
-            opened_last.fractional_frames
+        let one_shot = ClipTransportConfig {
+            end_behavior: EndBehavior::OneShot,
+            rate: 1.0,
+            ..ClipTransportConfig::default()
+        };
+        let state =
+            ClipTransportState::at(NormalizedTime::clamped(0.9), PlaybackDirection::Forward);
+        let crossing_tick = ProgramTransportTick {
+            delta_seconds: 2.0,
+            source_duration_seconds: 10.0,
+            source_frame_count: 100,
+            ..ProgramTransportTick::default()
+        };
+        let (state, terminal) = evaluate_transport_selection(&one_shot, state, crossing_tick, None);
+        assert!(terminal.completed);
+        assert!(
+            !terminal.transparent,
+            "terminal frame presents exactly once"
         );
+        let (_, after_terminal) = evaluate_transport_selection(
+            &one_shot,
+            state,
+            ProgramTransportTick {
+                source_duration_seconds: 10.0,
+                source_frame_count: 100,
+                ..ProgramTransportTick::default()
+            },
+            None,
+        );
+        assert!(after_terminal.transparent);
     }
 
     #[test]
@@ -979,11 +1557,51 @@ mod tests {
     }
 
     #[test]
+    fn proxy_identity_uses_only_a_valid_retained_content_reference() {
+        let digest = "a".repeat(64);
+        let reference = format!("cos-sha256://{digest}/1234");
+        let identity = content_identity_for_proxy_reference(&reference).unwrap();
+        assert_eq!(identity.sha256, digest);
+        assert_eq!(identity.byte_len, 1234);
+        assert_eq!(
+            content_identity_for_proxy_reference(r"D:\host\clip.mp4"),
+            None
+        );
+        assert_eq!(
+            content_identity_for_proxy_reference("cos-sha256://not-a-digest/1234"),
+            None
+        );
+    }
+
+    #[test]
     fn blend_mode_protocol_keys_match_web_option_values() {
-        assert_eq!(BlendMode::Normal.key(), "normal");
-        assert_eq!(BlendMode::Screen.key(), "screen");
-        assert_eq!(BlendMode::Multiply.key(), "multiply");
-        assert_eq!(BlendMode::Difference.key(), "difference");
+        let keys = [
+            "normal",
+            "screen",
+            "multiply",
+            "difference",
+            "add",
+            "subtract",
+            "darken",
+            "lighten",
+            "overlay",
+            "soft_light",
+            "hard_light",
+            "exclusion",
+            "dodge",
+            "burn",
+            "alpha_cut",
+        ];
+        for (code, (mode, key)) in BlendMode::ALL.into_iter().zip(keys).enumerate() {
+            assert_eq!(mode.as_u32(), code as u32);
+            assert_eq!(BlendMode::from_u32(code as u32), Some(mode));
+            assert_eq!(mode.key(), key);
+            assert_eq!(BlendMode::from_key(key), Some(mode));
+        }
+        assert_eq!(BlendMode::from_key("Soft Light"), None);
+        assert_eq!(BlendMode::from_key("unknown"), None);
+        assert_eq!(BlendMode::from_u32(15), None);
+        assert_eq!(BlendMode::from_u32(u32::MAX), None);
     }
 
     #[test]
@@ -1000,6 +1618,87 @@ mod tests {
         // Video, still, and Spout constructors all call this one default,
         // preventing one source kind from unexpectedly entering bypass mode.
         assert!(!default_bypass_master_fx());
+    }
+
+    #[test]
+    fn every_layer_constructor_starts_with_the_exact_frozen_legacy_rack() {
+        let rack = default_layer_rack();
+        assert!(rack.is_exact_legacy(crate::visual_rack::LegacyRackScope::Layer));
+        assert_eq!(
+            rack,
+            crate::visual_rack::RuntimeVisualRack::synthetic_legacy(
+                crate::visual_rack::LegacyRackScope::Layer
+            )
+        );
+    }
+
+    #[test]
+    fn every_layer_constructor_and_motion_reset_use_the_exact_no_op_contract() {
+        let defaults = default_layer_motion();
+        assert_eq!(defaults, crate::motion::MotionParams::default());
+        assert!(defaults.is_exact_zero());
+
+        let mut authored = crate::motion::MotionParams {
+            transplant: crate::motion::FaradayParams {
+                amount: 0.8,
+                ..crate::motion::FaradayParams::default()
+            },
+            shutter: crate::motion::CurvedShutterParams {
+                angle_degrees: 270.0,
+                ..crate::motion::CurvedShutterParams::default()
+            },
+            ..crate::motion::MotionParams::default()
+        };
+        reset_layer_motion(&mut authored);
+        assert_eq!(authored, defaults);
+    }
+
+    #[test]
+    fn codec_metadata_commits_only_for_matching_pixels_generation_and_dimensions() {
+        use crate::motion::MOTION_ALGORITHM_VERSION;
+        use crate::video::threaded::ReadyFrame;
+        use crate::video::{
+            CodecMotionFrame, CodecMotionFrameType, CodecMotionProvenance, CodecMotionStatus,
+        };
+
+        fn ready(source_generation: u64, motion_generation: u64) -> ReadyFrame {
+            ReadyFrame {
+                rgba: vec![0; 16 * 16 * 4],
+                codec_motion: Some(CodecMotionFrame {
+                    source_dimensions: [16, 16],
+                    frame_delta_seconds: 1.0 / 30.0,
+                    source_generation: motion_generation,
+                    frame_ordinal: 3,
+                    algorithm_version: MOTION_ALGORITHM_VERSION,
+                    provenance: CodecMotionProvenance::FfmpegExportMvs,
+                    frame_type: CodecMotionFrameType::Intra,
+                    status: CodecMotionStatus::Intra,
+                    vectors: Vec::new(),
+                }),
+                loops_advanced: 0,
+                source_generation,
+                pts: Some(3),
+                source_seconds: 0.1,
+                duration_seconds: 1.0,
+            }
+        }
+
+        let mut matching = ready(7, 7);
+        assert_eq!(
+            take_matching_codec_motion(&mut matching, [16, 16])
+                .expect("matching pixels and metadata")
+                .source_generation,
+            7
+        );
+        assert!(matching.codec_motion.is_none());
+
+        let mut stale = ready(8, 7);
+        assert!(take_matching_codec_motion(&mut stale, [16, 16]).is_none());
+        assert!(stale.codec_motion.is_none(), "stale metadata is discarded");
+
+        let mut wrong_dimensions = ready(7, 7);
+        assert!(take_matching_codec_motion(&mut wrong_dimensions, [8, 8]).is_none());
+        assert!(wrong_dimensions.codec_motion.is_none());
     }
 
     #[test]
@@ -1096,14 +1795,5 @@ mod tests {
         for filename in ["animation.gif", "sound.wav", "frame", "frame.png.exe"] {
             assert!(!is_supported_visual_file(std::path::Path::new(filename)));
         }
-    }
-
-    #[test]
-    fn still_source_has_no_transport_clock() {
-        let source = LayerSource::Still(crate::video::StillImage::from_decoded(
-            crate::video::DecodedStillImage::from_rgba(1, 1, vec![0, 0, 0, 0]).unwrap(),
-        ));
-        assert_eq!(source.kind(), "image");
-        assert!(!source.has_transport());
     }
 }

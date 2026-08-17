@@ -27,7 +27,12 @@ use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::error::RecvError;
 
-use super::state::{EnqueueOutcome, RerollScope, WebAction, WebState};
+use super::state::{
+    CaptureTargetSnapshot, CompositionRootSnapshot, CreativeImageSourceSnapshot,
+    CreativeImageTapSnapshot, CreativeScopeSnapshot, EnqueueOutcome, ImageInputSnapshot,
+    MotionScopeSnapshot, PresetTargetSnapshot, RerollScope, WebAction, WebState,
+    MAX_SCENE_NAME_BYTES,
+};
 use super::static_files;
 
 const AUTH_COOKIE: &str = "cos_key";
@@ -36,6 +41,7 @@ const MAX_LOGGED_MESSAGE_CHARS: usize = 256;
 const MAX_ACTION_VALUE_DEPTH: usize = 8;
 const MAX_ACTION_VALUE_NODES: usize = 512;
 const MAX_ACTION_VALUE_STRING_BYTES: usize = 2048;
+const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 /// Audio is decoded to at most ten minutes of canonical mono PCM. Bound the
 /// upload itself as well so a malformed or accidental multi-gigabyte file
 /// cannot consume library storage before FFmpeg gets a chance to reject it.
@@ -145,6 +151,12 @@ fn control_router(state: Arc<WebState>) -> Router {
         .route("/thumb/:filename", get(thumb_handler))
         .route("/preview/:filename/:index", get(preview_handler))
         .route("/qr.svg", get(qr_handler))
+        .route(
+            "/controller-profile",
+            post(controller_profile_handler).layer(DefaultBodyLimit::max(
+                crate::controller_profile::CONTROLLER_PROFILE_ACTION_MAX_BYTES,
+            )),
+        )
         .route(
             "/upload",
             post(upload_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024 * 1024)),
@@ -334,6 +346,56 @@ async fn qr_handler(State(state): State<Arc<WebState>>) -> impl IntoResponse {
             format!("QR generation failed: {e}"),
         )
             .into_response(),
+    }
+}
+
+async fn controller_profile_handler(
+    State(state): State<Arc<WebState>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request = match crate::controller_profile::ControllerProfileAction::from_json_bytes(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("controller profile request rejected: {error}"),
+            )
+                .into_response();
+        }
+    };
+    match request {
+        crate::controller_profile::ControllerProfileAction::Export {} => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"controller_profile.json\"",
+                ),
+            ],
+            state.controller_profile_export(),
+        )
+            .into_response(),
+        request @ crate::controller_profile::ControllerProfileAction::Import { .. } => {
+            let action = WebAction::ControllerProfile { request };
+            if !valid_action(&action, 0) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid controller profile document",
+                )
+                    .into_response();
+            }
+            match state.enqueue_action(action).await {
+                EnqueueOutcome::Added | EnqueueOutcome::Coalesced => {
+                    (StatusCode::ACCEPTED, "controller profile import queued").into_response()
+                }
+                EnqueueOutcome::Dropped => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "controller action queue is full",
+                )
+                    .into_response(),
+            }
+        }
     }
 }
 
@@ -707,6 +769,407 @@ fn valid_optional_stable_id(stable_id: &Option<String>) -> bool {
     })
 }
 
+fn valid_required_stable_id(stable_id: &str) -> bool {
+    !stable_id.is_empty()
+        && stable_id.bytes().all(|byte| byte.is_ascii_digit())
+        && stable_id.parse::<u64>().is_ok_and(|id| id != 0)
+}
+
+fn valid_capture_target(target: &CaptureTargetSnapshot) -> bool {
+    match target {
+        CaptureTargetSnapshot::Program => true,
+        CaptureTargetSnapshot::Layer { layer_id } => valid_required_stable_id(layer_id),
+        CaptureTargetSnapshot::Group { group_id } => valid_required_stable_id(group_id),
+    }
+}
+
+fn valid_output_endpoint_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_composition_revision(revision: u64) -> bool {
+    revision != 0
+}
+
+fn valid_creative_scope(scope: &CreativeScopeSnapshot) -> bool {
+    match scope {
+        CreativeScopeSnapshot::Master => true,
+        CreativeScopeSnapshot::Layer { layer_id } => valid_required_stable_id(layer_id),
+        CreativeScopeSnapshot::Group { group_id } => valid_required_stable_id(group_id),
+    }
+}
+
+fn valid_preset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= crate::preset::PRESET_MAX_NAME_BYTES
+        && name.trim() == name
+        && !name.chars().any(char::is_control)
+}
+
+fn valid_preset_target(target: &PresetTargetSnapshot) -> bool {
+    match target {
+        PresetTargetSnapshot::Master
+        | PresetTargetSnapshot::ControllerProfile
+        | PresetTargetSnapshot::StageMap => true,
+        PresetTargetSnapshot::Layer { layer_id } => valid_required_stable_id(layer_id),
+        PresetTargetSnapshot::Group { group_id } => valid_required_stable_id(group_id),
+    }
+}
+
+fn valid_preset_capture_target(
+    kind: crate::preset::PresetKind,
+    target: &PresetTargetSnapshot,
+) -> bool {
+    valid_preset_target(target)
+        && match kind {
+            crate::preset::PresetKind::Transform | crate::preset::PresetKind::Rack => matches!(
+                target,
+                PresetTargetSnapshot::Master
+                    | PresetTargetSnapshot::Layer { .. }
+                    | PresetTargetSnapshot::Group { .. }
+            ),
+            crate::preset::PresetKind::Matte => matches!(
+                target,
+                PresetTargetSnapshot::Layer { .. } | PresetTargetSnapshot::Group { .. }
+            ),
+            crate::preset::PresetKind::Group => {
+                matches!(target, PresetTargetSnapshot::Group { .. })
+            }
+            crate::preset::PresetKind::ControllerProfile => {
+                matches!(target, PresetTargetSnapshot::ControllerProfile)
+            }
+            crate::preset::PresetKind::StageMap => {
+                matches!(target, PresetTargetSnapshot::StageMap)
+            }
+        }
+}
+
+fn valid_node_kind(kind: &str, insertable: bool) -> Option<crate::visual_rack::NodeKindTag> {
+    let descriptor = crate::visual_rack::NODE_KIND_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.key == kind)?;
+    if insertable
+        && matches!(
+            descriptor.tag,
+            crate::visual_rack::NodeKindTag::LegacyCanonical
+                | crate::visual_rack::NodeKindTag::LegacyTemporal
+        )
+    {
+        return None;
+    }
+    Some(descriptor.tag)
+}
+
+fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) -> bool {
+    let Some(kind) = valid_node_kind(kind, false) else {
+        return false;
+    };
+    // Legacy markers are immutable execution boundaries. Their enabled/wet/
+    // blend values are fixed too, even though authored nodes expose those
+    // scalar fields for every ordinary kind.
+    if matches!(
+        kind,
+        crate::visual_rack::NodeKindTag::LegacyCanonical
+            | crate::visual_rack::NodeKindTag::LegacyTemporal
+    ) {
+        return false;
+    }
+    match param {
+        "enabled" => return value.is_boolean(),
+        "wet" => return number_in(value, 0.0, 1.0),
+        "blend" => {
+            return matches!(
+                value.as_str(),
+                Some(
+                    "normal"
+                        | "screen"
+                        | "multiply"
+                        | "difference"
+                        | "add"
+                        | "subtract"
+                        | "darken"
+                        | "lighten"
+                        | "overlay"
+                        | "soft_light"
+                        | "hard_light"
+                        | "exclusion"
+                        | "dodge"
+                        | "burn"
+                        | "alpha_cut"
+                )
+            );
+        }
+        // These are topology/routing fields and use barrier actions.
+        "variant" | "image_tap" | "image_channel" | "image_invert" => return false,
+        _ => {}
+    }
+    let Some(descriptor) = crate::visual_rack::NODE_PARAM_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.kind == kind && descriptor.key == param)
+    else {
+        return false;
+    };
+    use crate::visual_rack::NodeParamType;
+    match descriptor.value_type {
+        NodeParamType::Float => descriptor
+            .range
+            .is_some_and(|range| number_in(value, f64::from(range[0]), f64::from(range[1]))),
+        NodeParamType::Vec2 => descriptor.range.is_some_and(|range| {
+            value.as_array().is_some_and(|values| {
+                values.len() == 2
+                    && values
+                        .iter()
+                        .all(|value| number_in(value, f64::from(range[0]), f64::from(range[1])))
+            })
+        }),
+        NodeParamType::Color => value.as_array().is_some_and(|values| {
+            values.len() == 3 && values.iter().all(|value| number_in(value, 0.0, 1.0))
+        }),
+        NodeParamType::Bool => value.is_boolean(),
+        NodeParamType::Unsigned => value
+            .as_u64()
+            .is_some_and(|value| value <= u64::from(u32::MAX)),
+        NodeParamType::Enum => match param {
+            "fit_mode" => matches!(value.as_str(), Some("stretch" | "fit" | "fill" | "native")),
+            "edge_mode" => matches!(
+                value.as_str(),
+                Some("transparent" | "clamp" | "repeat" | "mirror")
+            ),
+            "sampling" => matches!(value.as_str(), Some("linear" | "nearest")),
+            "mode" => matches!(
+                value.as_str(),
+                Some("keep_bright" | "keep_dark" | "remove_color" | "keep_color")
+            ),
+            "algorithm" => matches!(
+                value.as_str(),
+                Some("gaussian" | "perlin" | "salt_pepper" | "blue")
+            ),
+            _ => false,
+        },
+        NodeParamType::ImageTap => false,
+    }
+}
+
+fn valid_creative_route(route: &CreativeImageTapSnapshot) -> bool {
+    match &route.input {
+        CreativeImageSourceSnapshot::SelectedLayer { layer_id, .. } => {
+            valid_required_stable_id(layer_id)
+        }
+        CreativeImageSourceSnapshot::MissingSelectedLayer { .. }
+        | CreativeImageSourceSnapshot::MissingGroupOutput { .. } => false,
+        CreativeImageSourceSnapshot::GroupOutput { group_id } => valid_required_stable_id(group_id),
+        CreativeImageSourceSnapshot::OneBelow | CreativeImageSourceSnapshot::AllBelow => true,
+        CreativeImageSourceSnapshot::CleanProgram => {
+            route.timing == crate::visual_rack::EdgeTiming::PreviousFrame
+        }
+    }
+}
+
+fn valid_member_ids(ids: &[String]) -> bool {
+    ids.len() <= crate::composition::MAX_COMPOSITION_LAYERS
+        && ids.iter().all(|id| valid_required_stable_id(id))
+        && ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len()
+}
+
+fn valid_root_item(item: &CompositionRootSnapshot) -> bool {
+    match item {
+        CompositionRootSnapshot::Layer { layer_id, bus } => {
+            valid_required_stable_id(layer_id) && matches!(bus.as_str(), "program" | "a" | "b")
+        }
+        CompositionRootSnapshot::Group { group_id } => valid_required_stable_id(group_id),
+    }
+}
+
+fn valid_group_param(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "name" => value.as_str().is_some_and(|name| {
+            name.len() <= crate::composition::MAX_GROUP_NAME_BYTES
+                && name.trim() == name
+                && !name.chars().any(char::is_control)
+        }),
+        "opacity" => number_in(value, 0.0, 1.0),
+        "solo" | "bypass" => value.is_boolean(),
+        "bus" => matches!(value.as_str(), Some("program" | "a" | "b")),
+        param => valid_transform_edit(param, value),
+    }
+}
+
+fn valid_group_matte_param(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "amount" | "threshold" => number_in(value, 0.0, 1.0),
+        "softness" => number_in(value, 0.0, 0.5),
+        _ => false,
+    }
+}
+
+fn valid_scene_name(name: &str) -> bool {
+    name.len() <= MAX_SCENE_NAME_BYTES && name.trim() == name && !name.chars().any(char::is_control)
+}
+
+fn number_in(value: &serde_json::Value, min: f64, max: f64) -> bool {
+    value
+        .as_f64()
+        .is_some_and(|number| number.is_finite() && (min..=max).contains(&number))
+}
+
+fn integer_in(value: &serde_json::Value, min: u64, max: u64) -> bool {
+    value
+        .as_u64()
+        .is_some_and(|number| (min..=max).contains(&number))
+}
+
+/// Closed M3/legacy temporal authoring vocabulary. Invalid enums, unknown
+/// fields, non-finite numbers, and out-of-range integers are rejected before
+/// they can occupy the bounded render queue.
+fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "feedback" => number_in(value, 0.0, 0.95),
+        "fb_zoom" => number_in(value, 0.9, 1.1),
+        "fb_rotate" => number_in(value, -5.0, 5.0),
+        "slitscan" | "slit_axis" => number_in(value, 0.0, 1.0),
+        "slit_angle" | "loom_angle" => number_in(value, -180.0, 180.0),
+        "key_mode" => integer_in(value, 0, 4),
+        "key_threshold" | "loom_amount" | "loom_depth" | "atlas_amount" | "atlas_collision"
+        | "garden_amount" | "garden_threshold" | "garden_decay" => number_in(value, 0.0, 1.0),
+        "key_softness" | "garden_softness" => number_in(value, 0.0, 0.5),
+        "key_history" => integer_in(value, 1, 23),
+        "loom_topology" => matches!(
+            value.as_str(),
+            Some("linear" | "radial" | "spiral" | "contour" | "folded" | "kaleidoscopic")
+        ),
+        "loom_interpolation" => matches!(value.as_str(), Some("floor" | "linear")),
+        "loom_phase" => number_in(value, -1_000.0, 1_000.0),
+        "loom_scale" => number_in(value, 0.01, 100.0),
+        "loom_folds" => integer_in(value, 1, 16),
+        "loom_quantization" => integer_in(value, 0, 24),
+        "atlas_seed" | "score_seed" | "garden_max_hold_ticks" => {
+            integer_in(value, 0, u64::from(u32::MAX))
+        }
+        "atlas_territories" => integer_in(value, 1, 64),
+        "garden_gate" => matches!(
+            value.as_str(),
+            Some(
+                "temporal_delta"
+                    | "luma"
+                    | "chroma"
+                    | "cellular_ridge"
+                    | "audio_energy"
+                    | "audio_onset"
+                    | "matte"
+            )
+        ),
+        "score_enabled" => value.is_boolean(),
+        "score_state_count" => integer_in(value, 2, 16),
+        "score_trigger" => matches!(
+            value.as_str(),
+            Some("boundary" | "downbeat" | "audio_onset" | "manual")
+        ),
+        "score_loop_driver" => value
+            .as_str()
+            .is_some_and(|driver| driver == "none" || valid_required_stable_id(driver)),
+        "reset_loop_boundary" | "reset_downbeat" => {
+            matches!(value.as_str(), Some("none" | "score" | "memory" | "all"))
+        }
+        _ => false,
+    }
+}
+
+fn valid_motion_scope(scope: &MotionScopeSnapshot) -> bool {
+    match scope {
+        MotionScopeSnapshot::Master => true,
+        MotionScopeSnapshot::Layer { layer_id } => valid_required_stable_id(layer_id),
+    }
+}
+
+/// Closed M4 vocabulary. Algorithm provenance and donor topology have no
+/// scalar ingress path; the latter uses its revision-protected barrier action.
+fn valid_motion_edit(scope: &MotionScopeSnapshot, param: &str, value: &serde_json::Value) -> bool {
+    if !valid_motion_scope(scope) {
+        return false;
+    }
+    let common = match param {
+        "field_source" => matches!(value.as_str(), Some("auto" | "codec_vectors" | "lattice")),
+        "lattice_quality" => matches!(value.as_str(), Some("draft" | "live" | "high")),
+        "shutter_angle" => number_in(value, 0.0, 360.0),
+        "shutter_phase" => number_in(value, -1.0, 1.0),
+        "shutter_curvature" => number_in(value, -2.0, 2.0),
+        "shutter_chromatic_lag" => number_in(value, 0.0, 1.0),
+        "shutter_quality" => {
+            matches!(value.as_str(), Some("sharp" | "draft" | "live" | "high"))
+        }
+        _ => false,
+    };
+    if common {
+        return true;
+    }
+    matches!(scope, MotionScopeSnapshot::Layer { .. })
+        && match param {
+            "transplant_amount" | "confidence_threshold" | "refresh" | "decay" | "occlusion" => {
+                number_in(value, 0.0, 1.0)
+            }
+            "confidence_softness" => number_in(value, 0.0, 0.5),
+            "carrier" => matches!(
+                value.as_str(),
+                Some("transparent" | "black" | "first_source_frame")
+            ),
+            _ => false,
+        }
+}
+
+/// Closed scalar-edit vocabulary for prepared clip transport. Structured
+/// config replacement is deliberately absent: each action has one semantic
+/// destination and therefore a safe queue coalescing key.
+fn valid_clip_transport_edit(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "direction" => matches!(value.as_str(), Some("forward" | "reverse")),
+        "end_behavior" => matches!(
+            value.as_str(),
+            Some("loop" | "ping_pong" | "one_shot" | "hold")
+        ),
+        "trigger_mode" => matches!(value.as_str(), Some("immediate" | "next_beat" | "next_bar")),
+        "in_point" | "out_point" => number_in(value, 0.0, 1.0),
+        "rate" => number_in(value, 0.0, 16.0),
+        "sample_fps" => value.is_null() || number_in(value, 0.25, 480.0),
+        "beat_grid_enabled" | "sync_to_program" | "beat_loop_enabled" => value.is_boolean(),
+        "clip_bpm" => number_in(value, 1.0, 999.0),
+        "length_beats" => value.is_null() || number_in(value, 1.0 / 64.0, 65_536.0),
+        "beats_per_bar" => integer_in(value, 1, 32),
+        "beat_loop_start" => number_in(value, 0.0, 65_536.0),
+        "beat_loop_length" => number_in(value, 1.0 / 64.0, 64.0),
+        _ => false,
+    }
+}
+
+fn valid_matte_edit(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "enabled" | "invert" => value.is_boolean(),
+        "channel" => matches!(
+            value.as_str(),
+            Some("alpha" | "luma" | "red" | "green" | "blue")
+        ),
+        "amount" | "threshold" | "softness" => number_in(value, 0.0, 1.0),
+        _ => false,
+    }
+}
+
+fn valid_image_input(input: &ImageInputSnapshot) -> bool {
+    match input {
+        ImageInputSnapshot::SelectedLayer { layer_id, .. } => valid_required_stable_id(layer_id),
+        ImageInputSnapshot::OneBelow
+        | ImageInputSnapshot::AllBelow
+        | ImageInputSnapshot::CleanProgram
+        | ImageInputSnapshot::ProgramHistory => true,
+        ImageInputSnapshot::GroupOutput { group_id } => valid_required_stable_id(group_id),
+        // Restore-only diagnostics.
+        ImageInputSnapshot::MissingSelectedLayer { .. }
+        | ImageInputSnapshot::MissingGroupOutput { .. } => false,
+    }
+}
+
 fn is_layer_routing_target(value: &serde_json::Value) -> bool {
     let Some(target) = value.as_str() else {
         return false;
@@ -720,6 +1183,26 @@ fn is_layer_routing_target(value: &serde_json::Value) -> bool {
     };
     number.parse::<usize>().is_ok_and(|layer| layer != 0)
         && crate::modulation::is_valid_target(target.as_ref())
+}
+
+fn valid_routing_edit(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "source" => value
+            .as_str()
+            .and_then(crate::modulation::ModSource::try_from_str)
+            .is_some(),
+        "target" => value
+            .as_str()
+            .is_some_and(crate::modulation::is_valid_target),
+        "depth" => number_in(value, -1.0, 1.0),
+        "curve" => matches!(
+            value.as_str(),
+            Some("linear" | "exp" | "log" | "s_curve" | "steps")
+        ),
+        "curve_amount" => number_in(value, -2.0, 2.0),
+        "attack" | "release" => number_in(value, 0.0, 10.0),
+        _ => false,
+    }
 }
 
 fn valid_json_value(value: &serde_json::Value) -> bool {
@@ -757,24 +1240,288 @@ fn valid_f64_for_f32(value: f64) -> bool {
     value.is_finite() && value.abs() <= f64::from(f32::MAX)
 }
 
+fn transform_number(value: &serde_json::Value) -> Option<f32> {
+    value
+        .as_f64()
+        .filter(|number| number.is_finite() && number.abs() <= f64::from(f32::MAX))
+        .map(|number| number as f32)
+        .filter(|number| number.is_finite())
+}
+
+/// Transform ingress is intentionally stricter than the older generic effect
+/// protocol: unknown fields and values outside the authored domain are
+/// rejected instead of entering the render queue as silent no-ops.
+fn valid_transform_edit(param: &str, value: &serde_json::Value) -> bool {
+    let bounded = |min: f32, max: f32| {
+        transform_number(value).is_some_and(|number| (min..=max).contains(&number))
+    };
+    match param {
+        "position_x" | "position_y" => {
+            bounded(crate::spatial::POSITION_MIN, crate::spatial::POSITION_MAX)
+        }
+        "scale_x" | "scale_y" => bounded(crate::spatial::SCALE_MIN, crate::spatial::SCALE_MAX),
+        "anchor_x" | "anchor_y" => bounded(crate::spatial::ANCHOR_MIN, crate::spatial::ANCHOR_MAX),
+        "rotation_deg" | "skew_axis_deg" => bounded(-180.0, 180.0),
+        "skew_deg" => bounded(
+            -crate::spatial::SKEW_LIMIT_DEGREES,
+            crate::spatial::SKEW_LIMIT_DEGREES,
+        ),
+        // The shared SpatialTransform sanitizer enforces the paired crop
+        // extent after this one-field edit is applied to current state.
+        "crop_left" | "crop_top" | "crop_right" | "crop_bottom" => {
+            bounded(0.0, crate::spatial::CROP_MAX)
+        }
+        "fit" => matches!(value.as_str(), Some("stretch" | "fit" | "fill" | "native")),
+        "edge" => matches!(
+            value.as_str(),
+            Some("transparent" | "clamp" | "repeat" | "mirror")
+        ),
+        "sampling" => matches!(value.as_str(), Some("linear" | "nearest")),
+        _ => false,
+    }
+}
+
+fn valid_complete_transform(transform: &crate::spatial::SpatialTransform) -> bool {
+    *transform == transform.sanitized()
+}
+
 fn valid_action(action: &WebAction, depth: usize) -> bool {
     if depth > 2 {
         return false;
     }
     match action {
         WebAction::Quantized { inner } => {
-            !matches!(inner.as_ref(), WebAction::SetMediaSafetyMode { .. })
-                && valid_action(inner, depth + 1)
+            !matches!(
+                inner.as_ref(),
+                WebAction::SetMediaSafetyMode { .. }
+                    | WebAction::SetNewLayerFit { .. }
+                    | WebAction::ClearTemporalMemory
+                    | WebAction::TriggerCollisionScore
+                    | WebAction::SetMotionDonor { .. }
+                    | WebAction::ClearMotionMemory
+                    | WebAction::BeginHistoryGesture { .. }
+                    | WebAction::EndHistoryGesture { .. }
+                    | WebAction::CancelHistoryGesture { .. }
+                    | WebAction::UndoManual
+                    | WebAction::RedoManual
+                    | WebAction::CaptureScopedPreset { .. }
+                    | WebAction::ApplyScopedPreset { .. }
+                    | WebAction::DeleteScopedPreset { .. }
+                    | WebAction::RestoreRecoveryJournal
+                    | WebAction::DiscardRecoveryJournal
+                    | WebAction::ControllerProfile { .. }
+            ) && valid_action(inner, depth + 1)
+        }
+        WebAction::ControllerProfile { request } => match request {
+            crate::controller_profile::ControllerProfileAction::Import { document } => {
+                document.to_json_bytes().is_ok()
+            }
+            crate::controller_profile::ControllerProfileAction::Export {} => true,
+        },
+        WebAction::SetVisualNodeParam {
+            scope,
+            node_id,
+            node_kind,
+            param,
+            value,
+            composition_revision,
+        } => {
+            valid_creative_scope(scope)
+                && valid_required_stable_id(node_id)
+                && valid_composition_revision(*composition_revision)
+                && valid_node_param_value(node_kind, param, value)
+        }
+        WebAction::InsertVisualNode {
+            scope,
+            index,
+            node_kind,
+            composition_revision,
+        } => {
+            valid_creative_scope(scope)
+                && *index < crate::visual_rack::MAX_NODES_PER_RACK
+                && valid_node_kind(node_kind, true).is_some()
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::RemoveVisualNode {
+            scope,
+            node_id,
+            composition_revision,
+        }
+        | WebAction::MoveVisualNode {
+            scope,
+            node_id,
+            composition_revision,
+            ..
+        } => {
+            valid_creative_scope(scope)
+                && valid_required_stable_id(node_id)
+                && valid_composition_revision(*composition_revision)
+                && match action {
+                    WebAction::MoveVisualNode { to, .. } => {
+                        *to < crate::visual_rack::MAX_NODES_PER_RACK
+                    }
+                    _ => true,
+                }
+        }
+        WebAction::SetVisualNodeMaskVariant {
+            scope,
+            node_id,
+            variant,
+            composition_revision,
+        } => {
+            valid_creative_scope(scope)
+                && valid_required_stable_id(node_id)
+                && matches!(variant.as_str(), "rectangle" | "ellipse" | "image")
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::SetVisualNodeRoute {
+            scope,
+            node_id,
+            route,
+            channel,
+            composition_revision,
+            ..
+        } => {
+            let self_group = match (scope, &route.input) {
+                (
+                    CreativeScopeSnapshot::Group { group_id },
+                    CreativeImageSourceSnapshot::GroupOutput { group_id: producer },
+                ) => {
+                    group_id == producer
+                        && route.timing == crate::visual_rack::EdgeTiming::CurrentFrame
+                }
+                _ => false,
+            };
+            valid_creative_scope(scope)
+                && valid_required_stable_id(node_id)
+                && !self_group
+                && valid_creative_route(route)
+                && matches!(
+                    channel.as_str(),
+                    "alpha" | "luma" | "red" | "green" | "blue"
+                )
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::SetCompositionGroupMatteRoute {
+            group_id,
+            route,
+            channel,
+            composition_revision,
+            ..
+        } => {
+            valid_required_stable_id(group_id)
+                && route.as_ref().is_none_or(valid_creative_route)
+                && matches!(
+                    channel.as_str(),
+                    "alpha" | "luma" | "red" | "green" | "blue"
+                )
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::SetCompositionGroupMatteParam {
+            group_id,
+            param,
+            value,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id)
+                && valid_group_matte_param(param, value)
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::SetCompositionGroupParam {
+            group_id,
+            param,
+            value,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id)
+                && valid_group_param(param, value)
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::CreateCompositionGroup {
+            name,
+            member_layer_ids,
+            composition_revision,
+            ..
+        } => {
+            name.len() <= crate::composition::MAX_GROUP_NAME_BYTES
+                && name.trim() == name
+                && !name.chars().any(char::is_control)
+                && valid_member_ids(member_layer_ids)
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::RemoveCompositionGroup {
+            group_id,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id) && valid_composition_revision(*composition_revision)
+        }
+        WebAction::SetCompositionGroupMembers {
+            group_id,
+            member_layer_ids,
+            composition_revision,
+        } => {
+            valid_required_stable_id(group_id)
+                && valid_member_ids(member_layer_ids)
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::MoveCompositionRootItem {
+            item,
+            composition_revision,
+            ..
+        } => valid_root_item(item) && valid_composition_revision(*composition_revision),
+        WebAction::SetCompositionBusCrossfade { value } => {
+            value.is_finite() && (0.0..=1.0).contains(value)
+        }
+        WebAction::SetCompositionLayerBus {
+            layer_id,
+            bus,
+            composition_revision,
+        } => {
+            valid_required_stable_id(layer_id)
+                && matches!(bus.as_str(), "program" | "a" | "b")
+                && valid_composition_revision(*composition_revision)
         }
         WebAction::AddLayer { filename } => valid_identifier(filename, 1024),
+        WebAction::LoadClipIntoSlot {
+            layer_id, filename, ..
+        } => valid_required_stable_id(layer_id) && valid_identifier(filename, 1024),
+        WebAction::RemoveClipSlot { layer_id, .. }
+        | WebAction::ActivateClipSlot { layer_id, .. }
+        | WebAction::SetClipCue { layer_id, .. }
+        | WebAction::RemoveClipCue { layer_id, .. }
+        | WebAction::TriggerClipCue { layer_id, .. }
+        | WebAction::SeekClipSlot { layer_id, .. } => valid_required_stable_id(layer_id),
+        WebAction::SetClipTransport {
+            layer_id,
+            param,
+            value,
+            ..
+        } => {
+            valid_required_stable_id(layer_id)
+                && valid_identifier(param, 64)
+                && valid_clip_transport_edit(param, value)
+        }
+        WebAction::CaptureScene { name, .. } => valid_scene_name(name),
+        WebAction::PrepareScene { .. }
+        | WebAction::RemoveScene { .. }
+        | WebAction::TriggerScene { .. } => true,
         WebAction::AddSpoutLayer { sender } => valid_identifier(sender, 255),
         WebAction::SetLayerParam {
             layer_id,
             param,
             value,
             ..
+        } => {
+            valid_optional_layer_id(layer_id)
+                && valid_identifier(param, 64)
+                && valid_json_value(value)
+                && (param != "blend_mode"
+                    || value
+                        .as_str()
+                        .and_then(crate::layers::BlendMode::from_key)
+                        .is_some())
         }
-        | WebAction::SetLayerEffect {
+        WebAction::SetLayerEffect {
             layer_id,
             param,
             value,
@@ -784,16 +1531,60 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && valid_identifier(param, 64)
                 && valid_json_value(value)
         }
+        WebAction::SetLayerTransform {
+            layer_id,
+            param,
+            value,
+            ..
+        } => {
+            layer_id.is_some()
+                && valid_optional_stable_id(layer_id)
+                && valid_identifier(param, 64)
+                && valid_transform_edit(param, value)
+        }
+        WebAction::ResetLayerTransform { layer_id, .. } => {
+            layer_id.is_some() && valid_optional_stable_id(layer_id)
+        }
+        WebAction::ApplyLayerTransform {
+            layer_id,
+            transform,
+            ..
+        } => {
+            layer_id.is_some()
+                && valid_optional_stable_id(layer_id)
+                && valid_complete_transform(transform)
+        }
         WebAction::RemoveLayer { layer_id, .. }
         | WebAction::ResetLayerFx { layer_id, .. }
         | WebAction::SetLayerVisibility { layer_id, .. }
         | WebAction::SetLayerPaused { layer_id, .. }
         | WebAction::MoveLayer { layer_id, .. } => valid_optional_layer_id(layer_id),
         WebAction::SetLayerRerollOnLoop { layer_id, .. } => valid_optional_stable_id(layer_id),
+        WebAction::SetLayerMatteParam {
+            layer_id,
+            param,
+            value,
+            composition_revision,
+        } => {
+            valid_required_stable_id(layer_id)
+                && valid_identifier(param, 64)
+                && valid_matte_edit(param, value)
+                && composition_revision.is_none_or(|revision| revision != 0)
+        }
+        WebAction::SetLayerMatteInput {
+            layer_id,
+            input,
+            composition_revision,
+        } => {
+            valid_required_stable_id(layer_id)
+                && valid_image_input(input)
+                && composition_revision.is_none_or(|revision| revision != 0)
+        }
         WebAction::Reroll {
             scope,
             index,
             layer_id,
+            group_id,
             stack_revision,
             amount,
             ..
@@ -802,17 +1593,28 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && (0.0..=2.0).contains(amount)
                 && match scope {
                     RerollScope::Master => {
-                        index.is_none() && layer_id.is_none() && stack_revision.is_none()
+                        index.is_none()
+                            && layer_id.is_none()
+                            && group_id.is_none()
+                            && stack_revision.is_none()
                     }
                     RerollScope::Layer => {
                         index.is_some()
                             && layer_id.is_some()
+                            && group_id.is_none()
                             && valid_optional_stable_id(layer_id)
+                            && stack_revision.is_none()
+                    }
+                    RerollScope::Group => {
+                        index.is_none()
+                            && layer_id.is_none()
+                            && group_id.as_deref().is_some_and(valid_required_stable_id)
                             && stack_revision.is_none()
                     }
                     RerollScope::All => {
                         index.is_none()
                             && layer_id.is_none()
+                            && group_id.is_none()
                             && stack_revision.is_some_and(|revision| revision != 0)
                     }
                 }
@@ -820,10 +1622,35 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         WebAction::SetParam { param, value }
         | WebAction::SetNtscParam { param, value }
         | WebAction::SetAudio { param, value }
-        | WebAction::SetMidi { param, value }
-        | WebAction::SetTemporal { param, value } => {
+        | WebAction::SetMidi { param, value } => {
             valid_identifier(param, 64) && valid_json_value(value)
         }
+        WebAction::SetTemporal { param, value } => {
+            valid_identifier(param, 64) && valid_temporal_edit(param, value)
+        }
+        WebAction::ClearTemporalMemory | WebAction::TriggerCollisionScore => true,
+        WebAction::SetMotion {
+            scope,
+            param,
+            value,
+        } => valid_identifier(param, 64) && valid_motion_edit(scope, param, value),
+        WebAction::SetMotionDonor {
+            layer_id,
+            donor_layer_id,
+            layer_stack_revision,
+        } => {
+            valid_required_stable_id(layer_id)
+                && donor_layer_id
+                    .as_deref()
+                    .is_none_or(valid_required_stable_id)
+                && donor_layer_id.as_deref() != Some(layer_id.as_str())
+                && *layer_stack_revision != 0
+        }
+        WebAction::ClearMotionMemory => true,
+        WebAction::SetMasterTransform { param, value } => {
+            valid_identifier(param, 64) && valid_transform_edit(param, value)
+        }
+        WebAction::ApplyMasterTransform { transform } => valid_complete_transform(transform),
         WebAction::SetLfo { param, value, .. } => {
             valid_identifier(param, 64) && valid_json_value(value)
         }
@@ -840,7 +1667,7 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && layer_stack_revision.is_none_or(|revision| revision != 0)
                 && match target_layer_id {
                     Some(_) => param == "target" && is_layer_routing_target(value),
-                    None => layer_stack_revision.is_none(),
+                    None => layer_stack_revision.is_none() && valid_routing_edit(param, value),
                 }
                 && valid_identifier(param, 64)
                 && valid_json_value(value)
@@ -864,12 +1691,87 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         WebAction::MorphCapture {
             slot,
             stack_revision,
+            composition_revision,
         } => {
             matches!(slot.as_str(), "a" | "b")
                 && stack_revision.is_none_or(|revision| revision != 0)
+                && composition_revision.is_none_or(|revision| revision != 0)
         }
         WebAction::SetMorphLaw { law } => matches!(law.as_str(), "linear" | "equal_power"),
         WebAction::ResetGroup { group } => valid_identifier(group, 32),
+        WebAction::StartProgramRecording { .. }
+        | WebAction::FinishProgramRecording
+        | WebAction::CancelProgramRecording
+        | WebAction::SetStageHealthHud { .. } => true,
+        WebAction::CaptureStill { target, .. } => valid_capture_target(target),
+        WebAction::StartResample {
+            target,
+            destination_layer_id,
+            ..
+        } => valid_capture_target(target) && valid_required_stable_id(destination_layer_id),
+        WebAction::SetStageTestCard {
+            mode,
+            output_endpoint_id,
+        } => match mode {
+            crate::stage_map::TestCardMode::Off => output_endpoint_id.is_none(),
+            crate::stage_map::TestCardMode::SmpteBars | crate::stage_map::TestCardMode::Grid => {
+                output_endpoint_id
+                    .as_deref()
+                    .is_some_and(valid_output_endpoint_id)
+            }
+        },
+        WebAction::SetOutputIdentification {
+            enabled,
+            output_endpoint_id,
+        } => {
+            if *enabled {
+                output_endpoint_id
+                    .as_deref()
+                    .is_some_and(valid_output_endpoint_id)
+            } else {
+                output_endpoint_id.is_none()
+            }
+        }
+        WebAction::BeginHistoryGesture { gesture_id }
+        | WebAction::EndHistoryGesture { gesture_id }
+        | WebAction::CancelHistoryGesture { gesture_id } => {
+            (1..=MAX_JS_SAFE_INTEGER).contains(gesture_id)
+        }
+        WebAction::UndoManual
+        | WebAction::RedoManual
+        | WebAction::RestoreRecoveryJournal
+        | WebAction::DiscardRecoveryJournal => true,
+        WebAction::CaptureScopedPreset {
+            name,
+            kind,
+            target,
+            preset_revision,
+            layer_stack_revision,
+            composition_revision,
+        } => {
+            valid_preset_name(name)
+                && valid_preset_capture_target(*kind, target)
+                && *preset_revision != 0
+                && *layer_stack_revision != 0
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::ApplyScopedPreset {
+            preset_id,
+            target,
+            preset_revision,
+            layer_stack_revision,
+            composition_revision,
+        } => {
+            valid_required_stable_id(preset_id)
+                && valid_preset_target(target)
+                && *preset_revision != 0
+                && *layer_stack_revision != 0
+                && valid_composition_revision(*composition_revision)
+        }
+        WebAction::DeleteScopedPreset {
+            preset_id,
+            preset_revision,
+        } => valid_required_stable_id(preset_id) && *preset_revision != 0,
         WebAction::StartExport {
             width,
             height,
@@ -946,6 +1848,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
 
     // Receive actions from this client
     let state_clone = state.clone();
+    // If a tab disappears mid-drag, publish an ordered End on disconnect so
+    // Main records the final authored value (or an exact no-op) instead of
+    // remaining permanently blocked by an orphaned gesture.
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Text(text) = msg {
@@ -961,7 +1866,48 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
                                 state_clone.note_gyro_sample(client_id);
                             }
                         }
+                        action @ WebAction::BeginHistoryGesture { gesture_id } => {
+                            if !state_clone
+                                .begin_browser_history_gesture(client_id, gesture_id)
+                                .await
+                            {
+                                log::warn!("Rejected nested browser history gesture");
+                                continue;
+                            }
+                            if state_clone.enqueue_action(action).await == EnqueueOutcome::Dropped {
+                                state_clone
+                                    .finish_browser_history_gesture(client_id, gesture_id)
+                                    .await;
+                            }
+                        }
+                        action @ (WebAction::EndHistoryGesture { gesture_id }
+                        | WebAction::CancelHistoryGesture { gesture_id }) => {
+                            let cancel = matches!(&action, WebAction::CancelHistoryGesture { .. });
+                            if !state_clone
+                                .may_finish_browser_history_gesture(client_id, gesture_id, cancel)
+                                .await
+                            {
+                                log::warn!(
+                                    "Rejected mismatched or dirty-cancel browser history boundary"
+                                );
+                                continue;
+                            }
+                            if state_clone.enqueue_action(action).await != EnqueueOutcome::Dropped {
+                                state_clone
+                                    .finish_browser_history_gesture(client_id, gesture_id)
+                                    .await;
+                            }
+                        }
                         action => {
+                            if !state_clone
+                                .admit_browser_action_during_gesture(client_id, &action)
+                                .await
+                            {
+                                log::warn!(
+                                    "Rejected cross-controller or cross-destination history action"
+                                );
+                                continue;
+                            }
                             let _ = state_clone.enqueue_action(action).await;
                         }
                     },
@@ -975,10 +1921,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
         }
     });
 
-    tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
+    let sender_finished_first = tokio::select! {
+        _ = &mut send_task => true,
+        _ = &mut recv_task => false,
+    };
+    if sender_finished_first {
+        recv_task.abort();
+        let _ = recv_task.await;
+    } else {
+        send_task.abort();
+        let _ = send_task.await;
     }
+    // WebState queues End(old) while it still owns the gesture lock. Only
+    // after that ordered barrier exists may another client acquire Begin(new).
+    let _ = state.disconnect_browser_history_gesture(client_id).await;
     state.disconnect_gyro_client(client_id);
 }
 
@@ -988,6 +1944,51 @@ mod tests {
     use axum::http::HeaderValue;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    #[tokio::test]
+    async fn controller_profile_endpoint_is_bounded_pathless_and_exports_latest_publication() {
+        let state = WebState::new().expect("test access token");
+        let published = crate::controller_profile::ControllerProfileDocument {
+            name: "Published browser profile".to_string(),
+            ..Default::default()
+        };
+        state.publish_controller_profile_export(&published).unwrap();
+        let export = crate::controller_profile::ControllerProfileAction::Export {}
+            .to_json_bytes()
+            .unwrap();
+        let response =
+            controller_profile_handler(State(state.clone()), axum::body::Bytes::from(export)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(
+            response.into_body(),
+            crate::controller_profile::CONTROLLER_PROFILE_MAX_BYTES,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::controller_profile::ControllerProfileDocument::from_json_bytes(&body).unwrap(),
+            published
+        );
+
+        let imported = crate::controller_profile::ControllerProfileDocument {
+            name: "Queued browser import".to_string(),
+            ..Default::default()
+        };
+        let request = crate::controller_profile::ControllerProfileAction::Import {
+            document: imported.clone(),
+        }
+        .to_json_bytes()
+        .unwrap();
+        let response = controller_profile_handler(State(state.clone()), request.into()).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let mut actions = state.actions.lock().await;
+        assert!(matches!(
+            actions.pop(),
+            Some(WebAction::ControllerProfile {
+                request: crate::controller_profile::ControllerProfileAction::Import { document }
+            }) if document == imported
+        ));
+    }
 
     #[tokio::test]
     async fn authenticated_websocket_round_trip_dispatches_and_returns_authoritative_state() {
@@ -1107,7 +2108,70 @@ mod tests {
             crate::media_safety::MediaSafetyMode::Expert
         );
 
+        socket
+            .send(ClientMessage::Text(
+                r#"{"action":"begin_history_gesture","gesture_id":77}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.actions.lock().await.len() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("history Begin did not cross WebSocket ingress");
+        socket
+            .send(ClientMessage::Text(
+                r#"{"action":"set_param","param":"brightness","value":0.625}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.actions.lock().await.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("history value did not cross WebSocket ingress");
+        // A hostile dirty Cancel is rejected before queueing and ownership is
+        // retained. Disconnect must therefore emit End, never strand Main's
+        // matching transaction.
+        socket
+            .send(ClientMessage::Text(
+                r#"{"action":"cancel_history_gesture","gesture_id":77}"#.to_string(),
+            ))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(state.actions.lock().await.len(), 2);
         socket.close(None).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.actions.lock().await.len() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect did not close the browser history gesture");
+        let queued = state.actions.lock().await;
+        assert!(matches!(
+            queued.as_slice(),
+            [
+                WebAction::BeginHistoryGesture { gesture_id: 77 },
+                WebAction::SetParam { param, value },
+                WebAction::EndHistoryGesture { gesture_id: 77 }
+            ] if param == "brightness" && value.as_f64() == Some(0.625)
+        ));
+        drop(queued);
         server.abort();
         let _ = server.await;
     }
@@ -1336,6 +2400,17 @@ mod tests {
             },
             0,
         ));
+
+        let direct_fit = WebAction::SetNewLayerFit {
+            fit: crate::spatial::FitMode::Native,
+        };
+        assert!(valid_action(&direct_fit, 0));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(direct_fit),
+            },
+            0,
+        ));
     }
 
     #[test]
@@ -1418,6 +2493,56 @@ mod tests {
             value: serde_json::json!("brightness"),
         };
         assert!(valid_action(&legacy_master, 0));
+
+        for target in [
+            "group/9/matte.amount",
+            "group/9/matte.threshold",
+            "group/9/matte.softness",
+            "composition/bus_crossfade",
+        ] {
+            let mut stable = legacy_master.clone();
+            if let WebAction::SetRouting { value, .. } = &mut stable {
+                *value = serde_json::json!(target);
+            }
+            assert!(valid_action(&stable, 0), "rejected stable target {target}");
+        }
+        for target in [
+            "group/0/matte.amount",
+            "group/9/matte.channel",
+            "group/9/matte.softness.extra",
+            "composition/bus",
+            "composition/9/bus_crossfade",
+        ] {
+            let mut invalid = legacy_master.clone();
+            if let WebAction::SetRouting { value, .. } = &mut invalid {
+                *value = serde_json::json!(target);
+            }
+            assert!(
+                !valid_action(&invalid, 0),
+                "accepted invalid target {target}"
+            );
+        }
+
+        for (param, value, expected) in [
+            ("depth", serde_json::json!(1.0), true),
+            ("depth", serde_json::json!(1.01), false),
+            ("curve", serde_json::json!("s_curve"), true),
+            ("curve", serde_json::json!("unknown"), false),
+            ("attack", serde_json::json!(10.0), true),
+            ("release", serde_json::json!(-0.01), false),
+        ] {
+            let mut edit = legacy_master.clone();
+            if let WebAction::SetRouting {
+                param: candidate,
+                value: candidate_value,
+                ..
+            } = &mut edit
+            {
+                *candidate = param.into();
+                *candidate_value = value;
+            }
+            assert_eq!(valid_action(&edit, 0), expected, "routing edit {param}");
+        }
     }
 
     #[test]
@@ -1433,11 +2558,15 @@ mod tests {
                 scope,
                 index,
                 layer_id: layer_id.map(str::to_owned),
+                group_id: None,
                 stack_revision,
                 seed: None,
                 mode: crate::web::state::RerollMode::Pattern,
                 amount,
                 include_grain_controls: false,
+                include_transform: false,
+                include_rack_controls: false,
+                include_group_controls: false,
             }
         }
 
@@ -1484,6 +2613,33 @@ mod tests {
             assert!(!valid_action(&invalid, 0));
         }
 
+        let group = WebAction::Reroll {
+            scope: RerollScope::Group,
+            index: None,
+            layer_id: None,
+            group_id: Some("77".into()),
+            stack_revision: None,
+            seed: Some(4),
+            mode: crate::web::state::RerollMode::Variation,
+            amount: 0.7,
+            include_grain_controls: false,
+            include_transform: false,
+            include_rack_controls: true,
+            include_group_controls: true,
+        };
+        assert!(valid_action(&group, 0));
+        for group_id in [None, Some("0"), Some("group-77")] {
+            let mut invalid = group.clone();
+            if let WebAction::Reroll {
+                group_id: candidate,
+                ..
+            } = &mut invalid
+            {
+                *candidate = group_id.map(str::to_owned);
+            }
+            assert!(!valid_action(&invalid, 0));
+        }
+
         for amount in [-0.001, 2.001, f32::NAN, f32::INFINITY] {
             assert!(!valid_action(
                 &reroll(RerollScope::Master, None, None, None, amount),
@@ -1511,6 +2667,163 @@ mod tests {
                 0
             ));
         }
+    }
+
+    #[test]
+    fn creative_ingress_keeps_markers_immutable_and_missing_routes_output_only() {
+        for kind in ["legacy_canonical", "legacy_temporal"] {
+            for (param, value) in [
+                ("enabled", serde_json::json!(false)),
+                ("wet", serde_json::json!(0.5)),
+                ("blend", serde_json::json!("screen")),
+            ] {
+                assert!(!valid_node_param_value(kind, param, &value));
+            }
+        }
+        assert!(valid_node_param_value(
+            "digital_color",
+            "wet",
+            &serde_json::json!(0.5)
+        ));
+
+        let missing_layer = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::MissingSelectedLayer {
+                saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            },
+            timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let missing_group = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::MissingGroupOutput {
+                group_id: "9".into(),
+            },
+            timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+        };
+        assert!(!valid_creative_route(&missing_layer));
+        assert!(!valid_creative_route(&missing_group));
+
+        let current_self = WebAction::SetVisualNodeRoute {
+            scope: CreativeScopeSnapshot::Group {
+                group_id: "9".into(),
+            },
+            node_id: "3".into(),
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::GroupOutput {
+                    group_id: "9".into(),
+                },
+                timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+            },
+            channel: "alpha".into(),
+            invert: false,
+            composition_revision: 7,
+        };
+        assert!(!valid_action(&current_self, 0));
+        let mut previous_self = current_self;
+        if let WebAction::SetVisualNodeRoute { route, .. } = &mut previous_self {
+            route.timing = crate::visual_rack::EdgeTiming::PreviousFrame;
+        }
+        assert!(valid_action(&previous_self, 0));
+
+        for variant in ["rectangle", "ellipse", "image"] {
+            assert!(valid_action(
+                &WebAction::SetVisualNodeMaskVariant {
+                    scope: CreativeScopeSnapshot::Master,
+                    node_id: "3".into(),
+                    variant: variant.into(),
+                    composition_revision: 7,
+                },
+                0
+            ));
+        }
+        assert!(!valid_action(
+            &WebAction::SetVisualNodeMaskVariant {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                variant: "missing".into(),
+                composition_revision: 7,
+            },
+            0
+        ));
+    }
+
+    #[test]
+    fn creative_matte_and_bus_actions_have_closed_validation() {
+        let route = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::OneBelow,
+            timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+        };
+        assert!(valid_action(
+            &WebAction::SetCompositionGroupMatteRoute {
+                group_id: "5".into(),
+                route: Some(route),
+                channel: "luma".into(),
+                invert: true,
+                composition_revision: 2,
+            },
+            0
+        ));
+        for (param, value, expected) in [
+            ("amount", serde_json::json!(0.75), true),
+            ("threshold", serde_json::json!(1.0), true),
+            ("softness", serde_json::json!(0.5), true),
+            ("softness", serde_json::json!(0.51), false),
+            ("enabled", serde_json::json!(true), false),
+        ] {
+            assert_eq!(
+                valid_action(
+                    &WebAction::SetCompositionGroupMatteParam {
+                        group_id: "5".into(),
+                        param: param.into(),
+                        value,
+                        composition_revision: 2,
+                    },
+                    0
+                ),
+                expected
+            );
+        }
+        for value in [0.0, 0.5, 1.0] {
+            assert!(valid_action(
+                &WebAction::SetCompositionBusCrossfade { value },
+                0
+            ));
+        }
+        assert!(!valid_action(
+            &WebAction::SetCompositionBusCrossfade { value: 1.001 },
+            0
+        ));
+        assert!(valid_action(
+            &WebAction::SetCompositionLayerBus {
+                layer_id: "44".into(),
+                bus: "b".into(),
+                composition_revision: 8,
+            },
+            0
+        ));
+
+        // Syntax ingress does not impose the advanced planner's group-member
+        // cap on the dynamic top-level root. Main validates against the actual
+        // staged root length without allocating from this index.
+        assert!(valid_action(
+            &WebAction::CreateCompositionGroup {
+                name: "late group".into(),
+                member_layer_ids: Vec::new(),
+                root_index: 273,
+                composition_revision: 8,
+            },
+            0
+        ));
+        assert!(valid_action(
+            &WebAction::MoveCompositionRootItem {
+                item: CompositionRootSnapshot::Layer {
+                    layer_id: "274".into(),
+                    bus: "program".into(),
+                },
+                to: 273,
+                composition_revision: 8,
+            },
+            0
+        ));
     }
 
     #[test]
@@ -1542,11 +2855,301 @@ mod tests {
     }
 
     #[test]
+    fn temporal_originals_ingress_has_a_closed_bounded_vocabulary() {
+        for (param, value) in [
+            ("feedback", serde_json::json!(0.95)),
+            ("fb_zoom", serde_json::json!(1.1)),
+            ("fb_rotate", serde_json::json!(-5.0)),
+            ("slitscan", serde_json::json!(1.0)),
+            ("slit_angle", serde_json::json!(-180.0)),
+            ("slit_axis", serde_json::json!(1.0)),
+            ("key_mode", serde_json::json!(4)),
+            ("key_threshold", serde_json::json!(1.0)),
+            ("key_softness", serde_json::json!(0.5)),
+            ("key_history", serde_json::json!(23)),
+            ("loom_amount", serde_json::json!(1.0)),
+            ("loom_topology", serde_json::json!("kaleidoscopic")),
+            ("loom_interpolation", serde_json::json!("linear")),
+            ("loom_depth", serde_json::json!(1.0)),
+            ("loom_phase", serde_json::json!(-1000.0)),
+            ("loom_scale", serde_json::json!(100.0)),
+            ("loom_angle", serde_json::json!(180.0)),
+            ("loom_folds", serde_json::json!(16)),
+            ("loom_quantization", serde_json::json!(24)),
+            ("atlas_amount", serde_json::json!(1.0)),
+            ("atlas_seed", serde_json::json!(u32::MAX)),
+            ("atlas_territories", serde_json::json!(64)),
+            ("atlas_collision", serde_json::json!(1.0)),
+            ("garden_amount", serde_json::json!(1.0)),
+            ("garden_gate", serde_json::json!("audio_onset")),
+            ("garden_threshold", serde_json::json!(1.0)),
+            ("garden_softness", serde_json::json!(0.5)),
+            ("garden_decay", serde_json::json!(1.0)),
+            ("garden_max_hold_ticks", serde_json::json!(u32::MAX)),
+            ("score_enabled", serde_json::json!(true)),
+            ("score_seed", serde_json::json!(u32::MAX)),
+            ("score_state_count", serde_json::json!(16)),
+            ("score_trigger", serde_json::json!("manual")),
+            ("score_loop_driver", serde_json::json!("91")),
+            ("score_loop_driver", serde_json::json!("none")),
+            ("reset_loop_boundary", serde_json::json!("memory")),
+            ("reset_downbeat", serde_json::json!("all")),
+        ] {
+            let action = WebAction::SetTemporal {
+                param: param.into(),
+                value,
+            };
+            assert!(valid_action(&action, 0), "rejected valid temporal {param}");
+        }
+
+        for (param, value) in [
+            ("feedback", serde_json::json!(0.951)),
+            ("fb_zoom", serde_json::json!(0.899)),
+            ("key_mode", serde_json::json!(4.5)),
+            ("key_history", serde_json::json!(0)),
+            ("loom_topology", serde_json::json!("hexagonal")),
+            ("loom_interpolation", serde_json::json!("cubic")),
+            ("loom_phase", serde_json::json!(1000.1)),
+            ("loom_scale", serde_json::json!(0.0)),
+            ("loom_folds", serde_json::json!(17)),
+            ("loom_quantization", serde_json::json!(25)),
+            ("atlas_seed", serde_json::json!(u64::from(u32::MAX) + 1)),
+            ("atlas_territories", serde_json::json!(0)),
+            ("garden_gate", serde_json::json!("motion")),
+            ("garden_softness", serde_json::json!(0.501)),
+            ("score_enabled", serde_json::json!(1)),
+            ("score_state_count", serde_json::json!(1)),
+            ("score_trigger", serde_json::json!("loop")),
+            ("score_loop_driver", serde_json::json!("0")),
+            ("score_loop_driver", serde_json::json!("missing:3")),
+            ("reset_downbeat", serde_json::json!("carrier")),
+            ("unknown_original", serde_json::json!(0.5)),
+        ] {
+            let action = WebAction::SetTemporal {
+                param: param.into(),
+                value,
+            };
+            assert!(
+                !valid_action(&action, 0),
+                "accepted invalid temporal {param}"
+            );
+        }
+
+        assert!(valid_action(&WebAction::ClearTemporalMemory, 0));
+        assert!(valid_action(&WebAction::TriggerCollisionScore, 0));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(WebAction::ClearTemporalMemory)
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(WebAction::TriggerCollisionScore)
+            },
+            0
+        ));
+    }
+
+    #[test]
+    fn motion_ingress_is_scope_aware_closed_bounded_and_revision_protected() {
+        let master = MotionScopeSnapshot::Master;
+        let layer = MotionScopeSnapshot::Layer {
+            layer_id: "91".into(),
+        };
+        for (scope, param, value) in [
+            (&master, "field_source", serde_json::json!("codec_vectors")),
+            (&master, "lattice_quality", serde_json::json!("high")),
+            (&master, "shutter_angle", serde_json::json!(360.0)),
+            (&master, "shutter_phase", serde_json::json!(-1.0)),
+            (&master, "shutter_curvature", serde_json::json!(2.0)),
+            (&master, "shutter_chromatic_lag", serde_json::json!(1.0)),
+            (&master, "shutter_quality", serde_json::json!("live")),
+            (&layer, "transplant_amount", serde_json::json!(1.0)),
+            (&layer, "confidence_threshold", serde_json::json!(1.0)),
+            (&layer, "confidence_softness", serde_json::json!(0.5)),
+            (&layer, "refresh", serde_json::json!(0.0)),
+            (&layer, "decay", serde_json::json!(1.0)),
+            (&layer, "occlusion", serde_json::json!(1.0)),
+            (&layer, "carrier", serde_json::json!("first_source_frame")),
+        ] {
+            assert!(
+                valid_action(
+                    &WebAction::SetMotion {
+                        scope: scope.clone(),
+                        param: param.into(),
+                        value,
+                    },
+                    0
+                ),
+                "rejected valid Motion edit {param}"
+            );
+        }
+        for (scope, param, value) in [
+            (&master, "transplant_amount", serde_json::json!(0.5)),
+            (&master, "carrier", serde_json::json!("black")),
+            (&master, "algorithm_version", serde_json::json!(1)),
+            (&layer, "donor", serde_json::json!("77")),
+            (&layer, "shutter_angle", serde_json::json!(360.1)),
+            (&layer, "shutter_phase", serde_json::json!(-1.1)),
+            (&layer, "confidence_softness", serde_json::json!(0.501)),
+            (&layer, "field_source", serde_json::json!("fallback")),
+            (&layer, "lattice_quality", serde_json::json!("adaptive")),
+            (&layer, "carrier", serde_json::json!("history")),
+            (&layer, "shutter_quality", serde_json::json!("auto")),
+        ] {
+            assert!(
+                !valid_action(
+                    &WebAction::SetMotion {
+                        scope: scope.clone(),
+                        param: param.into(),
+                        value,
+                    },
+                    0
+                ),
+                "accepted invalid Motion edit {param}"
+            );
+        }
+        assert!(!valid_action(
+            &WebAction::SetMotion {
+                scope: MotionScopeSnapshot::Layer {
+                    layer_id: "0".into()
+                },
+                param: "shutter_angle".into(),
+                value: serde_json::json!(20.0),
+            },
+            0
+        ));
+
+        let donor = WebAction::SetMotionDonor {
+            layer_id: "91".into(),
+            donor_layer_id: Some("77".into()),
+            layer_stack_revision: 4,
+        };
+        assert!(valid_action(&donor, 0));
+        for invalid in [
+            WebAction::SetMotionDonor {
+                layer_id: "91".into(),
+                donor_layer_id: Some("91".into()),
+                layer_stack_revision: 4,
+            },
+            WebAction::SetMotionDonor {
+                layer_id: "91".into(),
+                donor_layer_id: Some("0".into()),
+                layer_stack_revision: 4,
+            },
+            WebAction::SetMotionDonor {
+                layer_id: "91".into(),
+                donor_layer_id: None,
+                layer_stack_revision: 0,
+            },
+        ] {
+            assert!(!valid_action(&invalid, 0));
+        }
+        assert!(valid_action(&WebAction::ClearMotionMemory, 0));
+        for barrier in [donor, WebAction::ClearMotionMemory] {
+            assert!(!valid_action(
+                &WebAction::Quantized {
+                    inner: Box::new(barrier)
+                },
+                0
+            ));
+        }
+    }
+
+    #[test]
+    fn transform_actions_require_strict_identity_fields_and_bounded_complete_state() {
+        let layer = |layer_id: Option<&str>, param: &str, value: serde_json::Value| {
+            WebAction::SetLayerTransform {
+                index: 3,
+                layer_id: layer_id.map(str::to_owned),
+                param: param.into(),
+                value,
+            }
+        };
+        assert!(valid_action(
+            &layer(Some("22"), "position_x", serde_json::json!(0.25)),
+            0
+        ));
+        assert!(valid_action(
+            &layer(Some("22"), "edge", serde_json::json!("mirror")),
+            0
+        ));
+        for invalid in [
+            layer(None, "position_x", serde_json::json!(0.25)),
+            layer(Some("0"), "position_x", serde_json::json!(0.25)),
+            layer(Some("layer-22"), "position_x", serde_json::json!(0.25)),
+            layer(Some("22"), "position_x", serde_json::json!(4.01)),
+            layer(Some("22"), "skew_deg", serde_json::json!(89.1)),
+            layer(Some("22"), "edge", serde_json::json!("smear")),
+            layer(Some("22"), "unknown", serde_json::json!(0.0)),
+        ] {
+            assert!(
+                !valid_action(&invalid, 0),
+                "unexpectedly valid: {invalid:?}"
+            );
+        }
+
+        assert!(!valid_action(
+            &WebAction::ResetLayerTransform {
+                index: 0,
+                layer_id: None,
+            },
+            0,
+        ));
+        assert!(valid_action(
+            &WebAction::ResetLayerTransform {
+                index: 99,
+                layer_id: Some("22".into()),
+            },
+            0,
+        ));
+
+        let exact = crate::spatial::SpatialTransform::default();
+        assert!(valid_action(
+            &WebAction::ApplyMasterTransform { transform: exact },
+            0,
+        ));
+        assert!(valid_action(
+            &WebAction::ApplyLayerTransform {
+                index: 1,
+                layer_id: Some("22".into()),
+                transform: exact,
+            },
+            0,
+        ));
+        let hostile = crate::spatial::SpatialTransform {
+            scale: [17.0, 1.0],
+            ..Default::default()
+        };
+        assert!(!valid_action(
+            &WebAction::ApplyMasterTransform { transform: hostile },
+            0,
+        ));
+
+        assert!(valid_action(
+            &WebAction::SetMasterTransform {
+                param: "fit".into(),
+                value: serde_json::json!("fill"),
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::SetMasterTransform {
+                param: "fit".into(),
+                value: serde_json::json!(3),
+            },
+            0,
+        ));
+    }
+
+    #[test]
     fn morph_enums_and_capture_revision_are_strictly_validated() {
         assert!(valid_action(
             &WebAction::MorphCapture {
                 slot: "a".into(),
                 stack_revision: Some(9),
+                composition_revision: Some(12),
             },
             0,
         ));
@@ -1554,6 +3157,7 @@ mod tests {
             &WebAction::MorphCapture {
                 slot: "typo".into(),
                 stack_revision: Some(9),
+                composition_revision: Some(12),
             },
             0,
         ));
@@ -1561,6 +3165,15 @@ mod tests {
             &WebAction::MorphCapture {
                 slot: "b".into(),
                 stack_revision: Some(0),
+                composition_revision: Some(12),
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::MorphCapture {
+                slot: "b".into(),
+                stack_revision: Some(9),
+                composition_revision: Some(0),
             },
             0,
         ));
@@ -1575,6 +3188,359 @@ mod tests {
                 law: "equal".into()
             },
             0,
+        ));
+    }
+
+    #[test]
+    fn curated_blend_ingress_accepts_every_exact_key_and_rejects_aliases() {
+        for blend_mode in crate::layers::BlendMode::ALL {
+            let json = serde_json::json!({
+                "action": "set_layer_param",
+                "index": 0,
+                "layer_id": "17",
+                "param": "blend_mode",
+                "value": blend_mode.key(),
+            });
+            let action: WebAction = serde_json::from_value(json).unwrap();
+            assert!(
+                valid_action(&action, 0),
+                "server rejected exact blend key {}",
+                blend_mode.key()
+            );
+        }
+
+        for value in [
+            serde_json::json!("soft-light"),
+            serde_json::json!("Alpha Cut"),
+            serde_json::json!("future_blend"),
+            serde_json::json!(14),
+            serde_json::Value::Null,
+        ] {
+            let action = WebAction::SetLayerParam {
+                index: 0,
+                layer_id: Some("17".into()),
+                param: "blend_mode".into(),
+                value,
+            };
+            assert!(!valid_action(&action, 0));
+        }
+    }
+
+    #[test]
+    fn prepared_transport_ingress_is_stable_typed_and_finitely_bounded() {
+        let parse = |json: &str| serde_json::from_str::<WebAction>(json).unwrap();
+        for valid in [
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"direction","value":"reverse"}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"end_behavior","value":"ping_pong"}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"in_point","value":0.25}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"sample_fps","value":null}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"clip_bpm","value":128.5}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"beats_per_bar","value":7}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"beat_loop_length","value":0.015625}"#,
+            r#"{"action":"set_clip_cue","layer_id":"17","slot_id":2,"cue_id":4095,"at":1.0}"#,
+            r#"{"action":"trigger_scene","scene_id":1,"trigger_mode":"next_bar"}"#,
+        ] {
+            assert!(valid_action(&parse(valid), 0), "rejected {valid}");
+        }
+
+        for invalid in [
+            r#"{"action":"set_clip_transport","layer_id":"0","slot_id":2,"param":"rate","value":1}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17x","slot_id":2,"param":"rate","value":1}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"in_point","value":1.01}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"sample_fps","value":0.249}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"clip_bpm","value":1000}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"beats_per_bar","value":4.5}"#,
+            r#"{"action":"set_clip_transport","layer_id":"17","slot_id":2,"param":"whole_config","value":{}}"#,
+        ] {
+            assert!(!valid_action(&parse(invalid), 0), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn scene_authoring_ingress_has_bounded_clean_names_and_typed_ids() {
+        let parse = |json: &str| serde_json::from_str::<WebAction>(json).unwrap();
+        for valid in [
+            r#"{"action":"capture_scene","name":"","trigger_mode":"immediate"}"#,
+            r#"{"action":"capture_scene","name":"Act II — mirror study","trigger_mode":"next_bar"}"#,
+            r#"{"action":"capture_scene","scene_id":65535,"name":"Recapture","trigger_mode":"next_beat"}"#,
+            r#"{"action":"remove_scene","scene_id":65535}"#,
+        ] {
+            assert!(valid_action(&parse(valid), 0), "rejected {valid}");
+        }
+
+        let maximum = "a".repeat(MAX_SCENE_NAME_BYTES);
+        assert!(valid_action(
+            &WebAction::CaptureScene {
+                scene_id: None,
+                name: maximum,
+                trigger_mode: crate::transport::TriggerMode::Immediate,
+            },
+            0,
+        ));
+        for name in [
+            "a".repeat(MAX_SCENE_NAME_BYTES + 1),
+            "界".repeat((MAX_SCENE_NAME_BYTES / 3) + 1),
+            " leading".into(),
+            "trailing ".into(),
+            "line\nbreak".into(),
+        ] {
+            assert!(!valid_action(
+                &WebAction::CaptureScene {
+                    scene_id: None,
+                    name,
+                    trigger_mode: crate::transport::TriggerMode::Immediate,
+                },
+                0,
+            ));
+        }
+
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"capture_scene","scene_id":0,"name":"bad"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"capture_scene","scene_id":65536,"name":"bad"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"capture_scene","name":"bad","trigger_mode":"later"}"#
+        )
+        .is_err());
+        assert!(
+            serde_json::from_str::<WebAction>(r#"{"action":"remove_scene","scene_id":0}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_source_and_matte_ingress_never_falls_back_to_positions() {
+        let parse = |json: &str| serde_json::from_str::<WebAction>(json).unwrap();
+        for valid in [
+            r#"{"action":"load_clip_into_slot","layer_id":"12","filename":"study.mov","activate":true,"trigger_mode":"next_beat"}"#,
+            r#"{"action":"activate_clip_slot","layer_id":"12","slot_id":4}"#,
+            r#"{"action":"set_layer_matte_param","layer_id":"12","param":"amount","value":0.5}"#,
+            r#"{"action":"set_layer_matte_param","layer_id":"12","param":"channel","value":"luma"}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"selected_layer","layer_id":"88","stage":"pre_local_effects"}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"all_below"}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"group_output","group_id":"1"}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"all_below"},"composition_revision":9}"#,
+        ] {
+            assert!(valid_action(&parse(valid), 0), "rejected {valid}");
+        }
+
+        for invalid in [
+            r#"{"action":"activate_clip_slot","layer_id":"","slot_id":4}"#,
+            r#"{"action":"activate_clip_slot","layer_id":"legacy-index:2","slot_id":4}"#,
+            r#"{"action":"set_layer_matte_param","layer_id":"12","param":"softness","value":1.01}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"selected_layer","layer_id":"0"}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"missing_selected_layer","saved_position":2}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"group_output","group_id":"0"}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"missing_group_output","group_id":"1"}}"#,
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"all_below"},"composition_revision":0}"#,
+            r#"{"action":"set_layer_matte_param","layer_id":"12","param":"enabled","value":true,"composition_revision":0}"#,
+        ] {
+            assert!(!valid_action(&parse(invalid), 0), "accepted {invalid}");
+        }
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_layer_matte_input","layer_id":"12","input":{"source":"group_output","group_id":1}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recorder_and_stage_tool_ingress_has_no_paths_or_positional_fallbacks() {
+        let parse = |json: &str| serde_json::from_str::<WebAction>(json).unwrap();
+        for valid in [
+            r#"{"action":"start_program_recording","auto_import":true}"#,
+            r#"{"action":"finish_program_recording"}"#,
+            r#"{"action":"cancel_program_recording"}"#,
+            r#"{"action":"capture_still","target":"program","auto_import":false}"#,
+            r#"{"action":"capture_still","target":"layer","layer_id":"42"}"#,
+            r#"{"action":"start_resample","target":"group","group_id":"7","destination_layer_id":"42","activate":true}"#,
+            r#"{"action":"set_stage_health_hud","enabled":true}"#,
+            r#"{"action":"set_stage_test_card","mode":"smpte_bars","output_endpoint_id":"display-1"}"#,
+            r#"{"action":"set_stage_test_card","mode":"off"}"#,
+            r#"{"action":"set_output_identification","enabled":true,"output_endpoint_id":"projector_A"}"#,
+            r#"{"action":"set_output_identification","enabled":false}"#,
+        ] {
+            assert!(valid_action(&parse(valid), 0), "rejected {valid}");
+        }
+
+        for invalid in [
+            r#"{"action":"capture_still","target":"layer","layer_id":"0"}"#,
+            r#"{"action":"capture_still","target":"layer","layer_id":"legacy-index:2"}"#,
+            r#"{"action":"start_resample","target":"group","group_id":"7","destination_layer_id":"0"}"#,
+            r#"{"action":"set_stage_test_card","mode":"grid"}"#,
+            r#"{"action":"set_stage_test_card","mode":"off","output_endpoint_id":"display-1"}"#,
+            r#"{"action":"set_stage_test_card","mode":"grid","output_endpoint_id":"../display"}"#,
+            r#"{"action":"set_output_identification","enabled":true}"#,
+            r#"{"action":"set_output_identification","enabled":false,"output_endpoint_id":"display-1"}"#,
+        ] {
+            assert!(!valid_action(&parse(invalid), 0), "accepted {invalid}");
+        }
+
+        // The tagged action shape has no field through which a browser can
+        // nominate an arbitrary host path.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"start_program_recording","output_path":"C:\\\\escape.mp4"}"#
+        )
+        .is_ok());
+        let value = serde_json::to_value(parse(
+            r#"{"action":"start_program_recording","output_path":"ignored"}"#,
+        ))
+        .unwrap();
+        assert!(value.get("output_path").is_none());
+    }
+
+    #[test]
+    fn manual_history_preset_and_recovery_ingress_is_strict_and_unquantized() {
+        let layer = PresetTargetSnapshot::Layer {
+            layer_id: "41".into(),
+        };
+        let group = PresetTargetSnapshot::Group {
+            group_id: "7".into(),
+        };
+        for action in [
+            WebAction::BeginHistoryGesture { gesture_id: 1 },
+            WebAction::EndHistoryGesture {
+                gesture_id: MAX_JS_SAFE_INTEGER,
+            },
+            WebAction::CancelHistoryGesture { gesture_id: 9 },
+            WebAction::UndoManual,
+            WebAction::RedoManual,
+            WebAction::CaptureScopedPreset {
+                name: "Prismatic drift".into(),
+                kind: crate::preset::PresetKind::Transform,
+                target: PresetTargetSnapshot::Master,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "Silhouette".into(),
+                kind: crate::preset::PresetKind::Matte,
+                target: layer.clone(),
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "Bus study".into(),
+                kind: crate::preset::PresetKind::Group,
+                target: group.clone(),
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "Tour controller".into(),
+                kind: crate::preset::PresetKind::ControllerProfile,
+                target: PresetTargetSnapshot::ControllerProfile,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "Gallery map".into(),
+                kind: crate::preset::PresetKind::StageMap,
+                target: PresetTargetSnapshot::StageMap,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::ApplyScopedPreset {
+                preset_id: "18446744073709551615".into(),
+                target: layer.clone(),
+                preset_revision: 4,
+                layer_stack_revision: 5,
+                composition_revision: 6,
+            },
+            WebAction::DeleteScopedPreset {
+                preset_id: "9".into(),
+                preset_revision: 4,
+            },
+            WebAction::RestoreRecoveryJournal,
+            WebAction::DiscardRecoveryJournal,
+        ] {
+            assert!(valid_action(&action, 0), "rejected {action:?}");
+            assert!(!valid_action(
+                &WebAction::Quantized {
+                    inner: Box::new(action)
+                },
+                0
+            ));
+        }
+
+        for action in [
+            WebAction::BeginHistoryGesture { gesture_id: 0 },
+            WebAction::EndHistoryGesture {
+                gesture_id: MAX_JS_SAFE_INTEGER + 1,
+            },
+            WebAction::CaptureScopedPreset {
+                name: " leading".into(),
+                kind: crate::preset::PresetKind::Rack,
+                target: layer.clone(),
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "No master matte".into(),
+                kind: crate::preset::PresetKind::Matte,
+                target: PresetTargetSnapshot::Master,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "No layer group".into(),
+                kind: crate::preset::PresetKind::Group,
+                target: layer.clone(),
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "Wrong document".into(),
+                kind: crate::preset::PresetKind::ControllerProfile,
+                target: PresetTargetSnapshot::StageMap,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::CaptureScopedPreset {
+                name: "Stale".into(),
+                kind: crate::preset::PresetKind::Transform,
+                target: group,
+                preset_revision: 0,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::ApplyScopedPreset {
+                preset_id: "0".into(),
+                target: layer,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            WebAction::DeleteScopedPreset {
+                preset_id: "not-an-id".into(),
+                preset_revision: 1,
+            },
+        ] {
+            assert!(!valid_action(&action, 0), "accepted {action:?}");
+        }
+
+        let overlong = "x".repeat(crate::preset::PRESET_MAX_NAME_BYTES + 1);
+        assert!(!valid_action(
+            &WebAction::CaptureScopedPreset {
+                name: overlong,
+                kind: crate::preset::PresetKind::Rack,
+                target: PresetTargetSnapshot::Master,
+                preset_revision: 1,
+                layer_stack_revision: 2,
+                composition_revision: 3,
+            },
+            0
         ));
     }
 
