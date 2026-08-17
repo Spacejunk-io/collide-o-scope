@@ -2152,12 +2152,12 @@ mod tests {
     fn originals_shader_contract_is_additive_bounded_and_reuses_three_texture_resources() {
         use sha2::{Digest, Sha256};
 
-        let legacy = include_str!("shaders/temporal.wgsl");
+        let legacy = include_str!("shaders/temporal.wgsl").replace("\r\n", "\n");
         let originals = include_str!("shaders/temporal_originals.wgsl");
         assert_eq!(
             format!("{:x}", Sha256::digest(legacy.as_bytes())),
             "388fa95fc027c00078dc5d7d380370d335fc3fa332ec0e2dead9f7b202f269d6",
-            "the shared legacy/Advanced shader source is a frozen contract"
+            "the LF-canonical shared legacy/Advanced shader source is a frozen contract"
         );
         assert!(!legacy.contains("TemporalOriginalsUniforms"));
         assert!(legacy.contains("if u._pad0 < 0.5 { return legacy_temporal(uv); }"));

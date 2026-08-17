@@ -8670,6 +8670,7 @@ layers:
             })
         }
 
+        #[cfg(target_os = "windows")]
         fn render_export_full_stack(
             &self,
             layers: &mut [ExportLayer],
@@ -9823,6 +9824,7 @@ layers:
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn parity_second_layer_base() -> ExportFrameLayerBase {
         ExportFrameLayerBase {
             effects: EffectUniforms {
@@ -10207,6 +10209,7 @@ layers:
         )
     }
 
+    #[cfg(target_os = "windows")]
     fn configure_live_layer(layer: &mut crate::layers::Layer, base: ExportFrameLayerBase) {
         layer.effects = base.effects;
         layer.transform = base.transform;
@@ -10219,6 +10222,7 @@ layers:
         layer.bypass_master_fx = base.bypass_master_fx;
     }
 
+    #[cfg(target_os = "windows")]
     fn apply_export_morph_layer(
         layer: &mut ExportFrameLayerBase,
         sampled: crate::morph::LayerMorphSnapshot,
@@ -10253,6 +10257,7 @@ layers:
 
     /// Build the final two-layer live world through the runtime's mutable
     /// Morph materialization path, then freeze it through the shared planner.
+    #[cfg(target_os = "windows")]
     fn live_full_stack_world(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -10332,6 +10337,7 @@ layers:
 
     /// Independently reconstruct the same final world through export's
     /// detached Morph sampler. No live payload or mutable Layer is reused.
+    #[cfg(target_os = "windows")]
     fn export_full_stack_world(
         frame_index: u64,
         fps: u32,
@@ -10391,6 +10397,7 @@ layers:
         (plan, layers)
     }
 
+    #[cfg(target_os = "windows")]
     fn render_live_full_stack(
         renderer: &mut crate::renderer::state::Renderer,
         layers: &[crate::layers::Layer],
@@ -10434,6 +10441,7 @@ layers:
         )
     }
 
+    #[cfg(target_os = "windows")]
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(bytes);

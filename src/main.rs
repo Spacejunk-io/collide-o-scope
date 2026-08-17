@@ -18738,7 +18738,7 @@ mod app_state_tests {
         // Pin the production rejection arm itself: the rejected creative pass
         // must not encode Temporal, flatten opaque output, clear slot 2, or
         // publish/dispose the held audience snapshot.
-        let source = include_str!("main.rs");
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let exact_match = source
             .find("let legacy_render_result = renderer.render_evaluated_frame(")
             .expect("LegacyExact creative acceptance match");

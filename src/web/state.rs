@@ -5289,7 +5289,7 @@ mod protocol_tests {
         // Static coverage couples the table above to both the numerical
         // master controls and the data-driven layer-control generator.
         let html = include_str!("../../static/index.html");
-        let js = include_str!("../../static/app.js");
+        let js = include_str!("../../static/app.js").replace("\r\n", "\n");
         let range_specs = js
             .split_once("const TRANSFORM_RANGE_SPECS = [")
             .and_then(|(_, rest)| rest.split_once("];"))

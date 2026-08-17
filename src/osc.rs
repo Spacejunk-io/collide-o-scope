@@ -1508,9 +1508,12 @@ mod tests {
         assert_eq!(event.origin, AutomationOrigin::Osc(sender_address));
         assert_eq!(event.value, AutomationValue::Absolute(1.0));
 
-        sender
-            .send_to(&vec![0; OSC_MAX_DATAGRAM_BYTES + 1], bound)
-            .unwrap();
+        // The decoder unit law above proves the exact
+        // `OSC_MAX_DATAGRAM_BYTES + 1` rejection. Do not require the host OS to
+        // transmit that synthetic datagram here: some UDP stacks reject it
+        // with `EMSGSIZE` before the worker can observe it. A small malformed
+        // packet exercises the same worker counter/rejection path portably.
+        sender.send_to(&[0], bound).unwrap();
         let rejected = (0..100).any(|_| {
             let malformed = engine.runtime_snapshot().counters.malformed;
             if malformed == 0 {
@@ -1521,7 +1524,7 @@ mod tests {
         engine.stop();
         assert!(
             rejected,
-            "oversize UDP datagram should be counted and rejected"
+            "malformed UDP datagram should be counted and rejected"
         );
     }
 }

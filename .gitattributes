@@ -1,0 +1,11 @@
+# Keep source and contract assets byte-stable across Windows and Unix checkouts.
+*.rs text eol=lf
+*.wgsl text eol=lf
+*.js text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
