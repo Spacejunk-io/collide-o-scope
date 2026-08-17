@@ -453,7 +453,7 @@ impl AudioAnalyzer {
                 0.5 - 0.5 * (std::f32::consts::TAU * x).cos()
             })
             .collect();
-        let mut analyzer = Self {
+        let analyzer = Self {
             shared: Arc::new(SharedAudio {
                 samples: Mutex::new(VecDeque::with_capacity(MAX_BUFFERED)),
                 sample_rate: AtomicU32::new(48000),
@@ -482,7 +482,20 @@ impl AudioAnalyzer {
             devices: Vec::new(),
             system_playback_devices: Vec::new(),
         };
-        analyzer.refresh_devices();
+
+        // Unit-test construction must remain independent of the host audio
+        // stack. In particular, repeatedly enumerating WASAPI endpoints from
+        // short-lived `App` values can enter native COM/device code on hosted
+        // Windows runners even though those tests never start live capture.
+        // Production still populates the selector eagerly, and `start()`
+        // refreshes it again immediately before opening a stream.
+        #[cfg(not(test))]
+        let analyzer = {
+            let mut analyzer = analyzer;
+            analyzer.refresh_devices();
+            analyzer
+        };
+
         analyzer
     }
 

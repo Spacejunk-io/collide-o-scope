@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 pub const SENDER_NAME: &str = "collide-o-scope";
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
@@ -36,8 +37,11 @@ enum FrameKind {
 
 #[derive(Debug)]
 struct QueuedFrame {
+    #[cfg(any(windows, test))]
     pixels: Vec<u8>,
+    #[cfg(any(windows, test))]
     width: u32,
+    #[cfg(any(windows, test))]
     height: u32,
     epoch: u64,
     kind: FrameKind,
@@ -104,6 +108,8 @@ impl FrameMailbox {
         else {
             return false;
         };
+        #[cfg(not(any(windows, test)))]
+        let _ = byte_len;
 
         // This is deliberately the sole blocking submit path. Waiting for the
         // current send establishes a cut barrier; the worker revalidates its
@@ -129,8 +135,11 @@ impl FrameMailbox {
             blackout: true,
         };
         state.pending = Some(QueuedFrame {
+            #[cfg(any(windows, test))]
             pixels: vec![0; byte_len],
+            #[cfg(any(windows, test))]
             width,
+            #[cfg(any(windows, test))]
             height,
             epoch,
             kind: FrameKind::Black,
@@ -161,6 +170,7 @@ impl FrameMailbox {
         true
     }
 
+    #[cfg(any(windows, test))]
     fn recv(&self) -> Option<QueuedFrame> {
         let mut state = lock_unpoison(&self.state);
         loop {
@@ -180,6 +190,7 @@ impl FrameMailbox {
     /// Called by the worker while holding `send_barrier`, immediately before
     /// touching Spout. This invalidates a colour frame dequeued just before a
     /// blackout request replaced the mailbox contents.
+    #[cfg(any(windows, test))]
     fn is_current(&self, frame: &QueuedFrame) -> bool {
         let state = lock_unpoison(&self.state);
         if state.shutdown || frame.epoch != state.intent.epoch {
@@ -240,9 +251,14 @@ impl SpoutOut {
         let Some(worker) = &self.worker else {
             return false;
         };
+        #[cfg(not(any(windows, test)))]
+        let _ = (&pixels, width, height);
         worker.mailbox.try_queue_regular(QueuedFrame {
+            #[cfg(any(windows, test))]
             pixels,
+            #[cfg(any(windows, test))]
             width,
+            #[cfg(any(windows, test))]
             height,
             epoch,
             kind: FrameKind::Regular,
@@ -430,6 +446,7 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+#[cfg(any(windows, test))]
 fn update_status(
     status: &Mutex<SpoutStatus>,
     generation: u64,
@@ -467,6 +484,7 @@ mod tests {
         let frame = mailbox.recv().expect("black frame queued");
         assert_eq!(frame.kind, FrameKind::Black);
         assert_eq!(frame.epoch, 8);
+        assert_eq!((frame.width, frame.height), (1, 1));
         assert!(frame.pixels.iter().all(|byte| *byte == 0));
         assert!(mailbox.is_current(&frame));
     }

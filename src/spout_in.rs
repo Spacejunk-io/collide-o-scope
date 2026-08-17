@@ -9,22 +9,33 @@
 //! Windows-only; other platforms expose the same API and report Spout as
 //! unavailable when started.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(any(windows, test))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
 use std::sync::mpsc::{Receiver as StopReceiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, TryLockError};
+#[cfg(windows)]
 use std::thread::JoinHandle;
+#[cfg(any(windows, test))]
 use std::time::Duration;
 
-use crate::media_safety::{
-    MediaDeviceLimits, MediaReservation, MediaSafetyPolicy, MediaSourceKind,
-};
+#[cfg(windows)]
+use crate::media_safety::MediaReservation;
+#[cfg(any(windows, test))]
+use crate::media_safety::MediaSourceKind;
+use crate::media_safety::{MediaDeviceLimits, MediaSafetyPolicy};
 
+#[cfg(windows)]
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
+#[cfg(any(windows, test))]
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(any(windows, test))]
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const MAX_SENDER_NAME_BYTES: usize = 255;
 // Spout's default shared-texture format. `receive_image` returns the texture's
 // native four-byte channel order, while our wgpu layer texture is RGBA8.
+#[cfg(any(windows, test))]
 const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
 
 #[cfg(windows)]
@@ -64,14 +75,20 @@ pub struct SpoutStatus {
 
 /// Nonblocking bridge from a named Spout sender to the render loop.
 pub struct SpoutIn {
+    #[cfg(windows)]
     sender_name: String,
+    #[cfg(windows)]
     stop_tx: Option<SyncSender<()>>,
+    #[cfg(windows)]
     worker: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
+    #[cfg(windows)]
     next_sequence: Arc<AtomicU64>,
     latest: Arc<Mutex<Option<SpoutFrame>>>,
     status: Arc<Mutex<SpoutStatus>>,
+    #[cfg(windows)]
     media_policy: MediaSafetyPolicy,
+    #[cfg(windows)]
     device_limits: MediaDeviceLimits,
 }
 
@@ -91,6 +108,8 @@ impl SpoutIn {
         media_policy: MediaSafetyPolicy,
         device_limits: MediaDeviceLimits,
     ) -> Self {
+        #[cfg(not(windows))]
+        let _ = (media_policy, device_limits);
         let sender_name = sanitize_sender_name(name.as_ref());
         let error = if sender_name.is_empty() {
             "Spout sender name is empty after sanitization".to_string()
@@ -104,14 +123,20 @@ impl SpoutIn {
         };
 
         Self {
+            #[cfg(windows)]
             sender_name,
+            #[cfg(windows)]
             stop_tx: None,
+            #[cfg(windows)]
             worker: None,
             running: Arc::new(AtomicBool::new(false)),
+            #[cfg(windows)]
             next_sequence: Arc::new(AtomicU64::new(0)),
             latest: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(status)),
+            #[cfg(windows)]
             media_policy,
+            #[cfg(windows)]
             device_limits,
         }
     }
@@ -215,6 +240,9 @@ impl SpoutIn {
 
     #[cfg(not(windows))]
     pub fn start(&mut self) {
+        if self.is_running() {
+            return;
+        }
         update_status(&self.status, |status| {
             status.active = false;
             status.error = "Spout input is Windows-only".to_string();
@@ -226,9 +254,11 @@ impl SpoutIn {
     /// always performed through the nonblocking [`Self::try_recv`].
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
+        #[cfg(windows)]
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.try_send(());
         }
+        #[cfg(windows)]
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -389,6 +419,7 @@ fn set_worker_error(status: &Mutex<SpoutStatus>, error: String) {
     });
 }
 
+#[cfg(windows)]
 fn should_stop(stop_rx: &StopReceiver<()>, running: &AtomicBool) -> bool {
     if !running.load(Ordering::Acquire) {
         return true;
@@ -399,6 +430,7 @@ fn should_stop(stop_rx: &StopReceiver<()>, running: &AtomicBool) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn wait_or_stopped(stop_rx: &StopReceiver<()>, running: &AtomicBool, duration: Duration) -> bool {
     if !running.load(Ordering::Acquire) {
         return true;
@@ -409,6 +441,7 @@ fn wait_or_stopped(stop_rx: &StopReceiver<()>, running: &AtomicBool, duration: D
     }
 }
 
+#[cfg(any(windows, test))]
 fn next_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_RETRY_BACKOFF)
 }
@@ -450,6 +483,7 @@ fn frame_byte_len_with_media_policy(
         .map_err(|_| format!("Spout sender RGBA size does not fit memory: {width}x{height}"))
 }
 
+#[cfg(windows)]
 fn allocate_frame_with_media_policy(
     width: u32,
     height: u32,
@@ -492,6 +526,7 @@ fn publish_latest(
     .flatten()
 }
 
+#[cfg(any(windows, test))]
 fn publish_latest_approved(
     latest: &Mutex<Option<SpoutFrame>>,
     pixels: &[u8],
@@ -555,6 +590,7 @@ fn publish_latest_approved(
 /// legacy byte-for-byte behavior. Conversion happens during the mandatory
 /// copy into the one-frame slot, so it adds neither a second full-frame pass
 /// nor another allocation in steady state.
+#[cfg(any(windows, test))]
 fn copy_received_pixels_to_rgba(destination: &mut [u8], source: &[u8], sender_format: u32) {
     debug_assert_eq!(destination.len(), source.len());
     if sender_format != DXGI_FORMAT_B8G8R8A8_UNORM {
@@ -570,6 +606,7 @@ fn copy_received_pixels_to_rgba(destination: &mut [u8], source: &[u8], sender_fo
     }
 }
 
+#[cfg(any(windows, test))]
 fn increment_sequence(counter: &AtomicU64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
     loop {
