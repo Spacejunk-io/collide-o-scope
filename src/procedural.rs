@@ -2547,7 +2547,7 @@ pub fn generate_with_inventory(
     Ok(pieces)
 }
 
-fn sync_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if let Ok(directory) = fs::File::open(parent) {
             directory.sync_all()?;
@@ -2557,7 +2557,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
@@ -2578,7 +2578,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -2605,7 +2605,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_vendor = "apple")]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -2627,7 +2627,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     unix,
     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
-fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is not implemented on this Unix target",
@@ -2635,14 +2635,14 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is not implemented on this platform",
     ))
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3032,6 +3032,8 @@ mod tests {
             temporal: None,
             morph: None,
             scenes: crate::performance::Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         }
     }
 
@@ -4683,5 +4685,115 @@ scenes:
             wakes > 0,
             "at least one generated seed must wake the dormant edge"
         );
+    }
+
+    /// Generation and Dice mutate authored *values*. A recorded gesture is
+    /// neither: nothing here may invent one, mutate one, or shift the RNG
+    /// streams of the racks beside one.
+    #[test]
+    fn generation_never_invents_or_mutates_a_recorded_gesture_and_older_streams_stay_bit_identical()
+    {
+        use crate::gesture::{
+            normalize_gesture_input, GestureEvent, GestureMode, GestureOrigin, GesturePhase,
+            GestureTrack, GestureTrackDocument, RawGestureSample,
+        };
+        use crate::patch::GestureCanvasConfig;
+
+        let sample = |phase, tick| {
+            normalize_gesture_input(
+                GestureOrigin::NativePointer,
+                RawGestureSample::new(0, phase, GestureMode::Curl, [0.4, 0.6])
+                    .with_direction([0.0, 1.0]),
+                tick,
+            )
+            .expect("well-formed sample")
+        };
+        let mut track = GestureTrack::default();
+        for (phase, tick) in [
+            (GesturePhase::Begin, 40_u64),
+            (GesturePhase::Move, 42),
+            (GesturePhase::End, 47),
+        ] {
+            assert!(matches!(
+                track.record_accepted(tick, sample(phase, 0)),
+                Ok(true)
+            ));
+        }
+        let document = GestureTrackDocument::capture(&track);
+        let digest = track.checksum_hex();
+        let canvas = GestureCanvasConfig {
+            radius: 0.3,
+            strength: 0.6,
+            retention: 0.5,
+        };
+
+        // A gesture-free anchor never gains a gesture section.
+        let anchor = advanced_anchor();
+        assert_eq!(anchor.gesture_track, None);
+        assert_eq!(anchor.gesture_canvas, None);
+        let mut without = anchor.clone();
+        let mut without_fallbacks = Vec::new();
+        mutate_saved_creative_values(
+            &anchor,
+            &mut without,
+            1.0,
+            0x5EED,
+            5,
+            &mut without_fallbacks,
+        );
+        assert_eq!(
+            without.gesture_track, None,
+            "generation invents no recording"
+        );
+        assert_eq!(without.gesture_canvas, None);
+
+        // The same anchor and seed carrying a recorded gesture must produce a
+        // byte-identical creative mutation: gesture state is in no RNG domain,
+        // so appending it cannot perturb an older Dice stream.
+        let mut with_anchor = anchor.clone();
+        with_anchor.gesture_track = Some(document.clone());
+        with_anchor.gesture_canvas = Some(canvas);
+        let mut with = with_anchor.clone();
+        let mut with_fallbacks = Vec::new();
+        mutate_saved_creative_values(&with_anchor, &mut with, 1.0, 0x5EED, 5, &mut with_fallbacks);
+        assert_eq!(
+            with.master_rack, without.master_rack,
+            "a recorded gesture must not shift any older Dice stream"
+        );
+        assert_eq!(with.layers[0].rack, without.layers[0].rack);
+        assert_eq!(with.composition, without.composition);
+        assert_eq!(with_fallbacks.len(), without_fallbacks.len());
+
+        // The recording itself is carried whole and still verifies.
+        assert_eq!(with.gesture_track, Some(document.clone()));
+        assert_eq!(with.gesture_canvas, Some(canvas));
+        let restored = with.gesture_track.as_ref().unwrap().decode().unwrap();
+        assert_eq!(restored.checksum_hex(), digest);
+        assert_eq!(restored.events(), track.events());
+
+        // Temperature zero is an exact identity, including the gesture world.
+        let mut untouched = with_anchor.clone();
+        let mut none = Vec::new();
+        mutate_saved_creative_values(&with_anchor, &mut untouched, 0.0, 0x5EED, 5, &mut none);
+        assert_eq!(untouched.gesture_track, with_anchor.gesture_track);
+        assert_eq!(untouched.gesture_canvas, with_anchor.gesture_canvas);
+
+        // A gesture-free patch also keeps its canonical identity: nothing this
+        // tranche added is serialized, so the hash is the pre-gesture hash.
+        let hash_before = canonical_patch_sha256(&anchor).unwrap();
+        let mut still_free = anchor.clone();
+        still_free.gesture_track = None;
+        still_free.gesture_canvas = None;
+        assert_eq!(canonical_patch_sha256(&still_free).unwrap(), hash_before);
+        assert_ne!(canonical_patch_sha256(&with_anchor).unwrap(), hash_before);
+
+        // Live Dice never sees gesture state at all.
+        let live = include_str!("randomization.rs");
+        assert!(
+            !live.contains("gesture"),
+            "live Dice must have no gesture awareness whatsoever"
+        );
+        // Silence the otherwise-unused binding without weakening the claim.
+        let _: &[GestureEvent] = track.events();
     }
 }

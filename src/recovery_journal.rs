@@ -923,6 +923,105 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_recorded_gesture_track_round_trips_through_the_journal_and_still_validates() {
+        use crate::gesture::{
+            GestureEvent, GestureMode, GesturePhase, GestureTrack, GestureTrackDocument,
+        };
+
+        let mut track = GestureTrack::default();
+        for (tick, phase) in [
+            (700_u64, GesturePhase::Begin),
+            (701, GesturePhase::Move),
+            (703, GesturePhase::Move),
+            (709, GesturePhase::End),
+        ] {
+            assert!(track
+                .record_accepted(
+                    tick,
+                    GestureEvent::quantized(
+                        2,
+                        phase,
+                        GestureMode::Curl,
+                        [0.25, 0.75],
+                        0.5,
+                        [0.0, 1.0],
+                    ),
+                )
+                .unwrap());
+        }
+        let document = GestureTrackDocument::capture(&track);
+        let expected_checksum = track.checksum_hex();
+        assert_eq!(document.checksum, expected_checksum);
+
+        let mut carrier = patch(77);
+        carrier.gesture_track = Some(document.clone());
+
+        let path = TempJournal::new("gesture-track");
+        let mut journal = RecoveryJournal::open(&path.0).unwrap();
+        let receipt = journal.append_patch(&carrier).unwrap();
+        assert!(receipt.payload_bytes > 0);
+
+        // The record's own checksum still validates with the track present:
+        // a clean tail is exactly what `scan_bytes` reports when every
+        // `record_checksum` matched.
+        let reopened = RecoveryJournal::open(&path.0).unwrap();
+        assert_eq!(
+            reopened.latest_valid().tail_status,
+            RecoveryTailStatus::Clean
+        );
+        assert!(!reopened.latest_valid().has_bad_tail());
+        let latest = reopened.latest_valid().latest.as_ref().unwrap();
+        assert_eq!(seed(latest), 77);
+
+        // And the track itself round-tripped byte for byte, through the same
+        // acceptance path live ingest uses.
+        let restored = latest
+            .patch
+            .gesture_track
+            .as_ref()
+            .expect("the journal payload carries the recorded gesture track");
+        assert_eq!(restored, &document);
+        let decoded = restored.decode().unwrap();
+        assert_eq!(decoded, track);
+        assert_eq!(decoded.checksum_hex(), expected_checksum);
+        assert_eq!(decoded.events().len(), 4);
+        assert_eq!(decoded.origin_tick(), Some(700));
+        assert!(decoded.is_complete());
+
+        // Operational paths and filesystem metadata never enter the payload.
+        let payload = String::from_utf8(latest.payload.clone()).unwrap();
+        assert!(payload.contains(&expected_checksum));
+        assert!(!payload.contains("modified"));
+        assert!(!payload.contains(std::env::temp_dir().to_string_lossy().as_ref()));
+
+        // A payload whose declared digest no longer describes its events is
+        // refused by the patch boundary rather than accepted as a recording
+        // the operator never made.
+        let mut tampered = carrier.clone();
+        let mut broken = document.clone();
+        broken.events[1].x = broken.events[1].x.wrapping_add(1);
+        tampered.gesture_track = Some(broken);
+        let serialized = serde_yaml::to_string(&tampered).unwrap();
+        let error = match serde_yaml::from_str::<PatchState>(&serialized) {
+            Ok(_) => panic!("a rewritten event must fail the re-derived digest"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("checksum"),
+            "a rewritten event must fail the re-derived digest: {error}"
+        );
+
+        // An absent section is exactly the pre-gesture path.
+        let plain = serde_yaml::to_string(&patch(78)).unwrap();
+        assert!(!plain.contains("gesture_track"));
+        assert!(serde_yaml::from_str::<PatchState>(&plain)
+            .expect("a legacy patch with no gesture section still loads")
+            .gesture_track
+            .is_none());
+    }
+
+    #[test]
     fn checksum_corruption_preserves_the_valid_prefix_and_never_overwrites_patch() {
         let path = TempJournal::new("checksum");
         let mut journal = RecoveryJournal::open(&path.0).unwrap();

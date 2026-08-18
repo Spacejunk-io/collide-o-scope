@@ -230,6 +230,10 @@ pub enum CreativeImageSourceSnapshot {
         group_id: String,
     },
     CleanProgram,
+    /// The etched gesture field. A master-scope singleton: it carries no ID and
+    /// no saved position, and it is authorable from the browser at either
+    /// timing.
+    GestureCanvas,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +400,7 @@ impl CreativeImageTapSnapshot {
                 }
             }
             ResolvedImageSource::CleanProgram => CreativeImageSourceSnapshot::CleanProgram,
+            ResolvedImageSource::GestureCanvas => CreativeImageSourceSnapshot::GestureCanvas,
         };
         Self {
             input,
@@ -456,6 +461,10 @@ impl CreativeImageTapSnapshot {
                 }
                 ResolvedImageSource::CleanProgram
             }
+            // No ID to parse and no position to invent: the singleton resolves
+            // to itself, and its availability is a planner fact rather than an
+            // ingress one.
+            CreativeImageSourceSnapshot::GestureCanvas => ResolvedImageSource::GestureCanvas,
             CreativeImageSourceSnapshot::MissingSelectedLayer { .. }
             | CreativeImageSourceSnapshot::MissingGroupOutput { .. } => {
                 return Err("missing creative image sources are output-only diagnostics".into());
@@ -1091,6 +1100,10 @@ pub struct AppSnapshot {
     /// Temporal (feedback/slit-scan) effect state
     #[serde(default)]
     pub temporal: TemporalSnapshot,
+    /// Gesture-field recording truth. Additive: an older panel deserializes an
+    /// otherwise complete snapshot as a disarmed, empty recording.
+    #[serde(default)]
+    pub gesture: GestureStatusSnapshot,
     /// Program-wide Curved Shutter authoring and read-only execution truth.
     /// Faraday controls remain disabled for this master scope.
     #[serde(default)]
@@ -1187,6 +1200,7 @@ impl Default for AppSnapshot {
             controller_runtime: ControllerRuntimeSnapshot::default(),
             osc_runtime: OscRuntimeSnapshot::default(),
             temporal: TemporalSnapshot::default(),
+            gesture: GestureStatusSnapshot::default(),
             master_motion: MotionSnapshot::default(),
             spout: SpoutSnapshot::default(),
             recorder: ProgramRecorderSnapshot::default(),
@@ -2109,6 +2123,52 @@ pub struct TemporalOriginalsSnapshot {
     pub garden: RefreshGardenSnapshot,
     pub score: CollisionScoreSnapshot,
     pub reset: TemporalResetPolicySnapshot,
+}
+
+/// Operator-facing gesture recording truth.
+///
+/// The honesty law lives in these fields. `recording` is the armed flag;
+/// `recorded_events` counts only what actually entered the replayable track;
+/// `live_only_events` counts normalized samples that affected this session and
+/// were never recorded. A snapshot must never let the second be mistaken for
+/// the first, so they are separate counters and neither is derived from the
+/// other.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GestureStatusSnapshot {
+    /// True while recording is armed. While false, a live gesture is
+    /// session-local and is not replayable.
+    pub recording: bool,
+    /// Events in the replayable track.
+    pub recorded_events: u32,
+    /// The track reached its bounded cap and newer events stayed live-only.
+    pub truncated: bool,
+    /// Strokes still open in the recorded track. A track with open strokes is
+    /// valid but explicitly incomplete and is never auto-closed.
+    pub open_strokes: u32,
+    /// Normalized samples that reached this session without being recorded.
+    pub live_only_events: u64,
+    /// Canonical checksum of the recorded track, empty while it is empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub checksum: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Authored canvas controls. These are values, not a recording, and are
+    /// published beside the recording truth rather than inside it.
+    #[serde(default)]
+    pub canvas: GestureCanvasStatusSnapshot,
+}
+
+/// Authored gesture-canvas controls and the session-local field they drive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GestureCanvasStatusSnapshot {
+    pub radius: f32,
+    pub strength: f32,
+    pub retention: f32,
+    pub grid_width: u32,
+    pub grid_height: u32,
+    /// Committed canvas frames since the last reset. This is session state and
+    /// says nothing about whether any of it was recorded.
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3689,6 +3749,54 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// One phone/browser gesture-field sample.
+    ///
+    /// This is a stream event, not an absolute value, so it deliberately has no
+    /// `coalesce_key`: replacing an older pending sample would silently delete
+    /// path points and the recorded track would then differ from what the
+    /// operator actually drew. `phase` and `mode` cross the wire as the engine's
+    /// own closed vocabularies, so an unknown token is a deserialization error
+    /// rather than a silently defaulted value.
+    #[serde(rename = "gesture_sample")]
+    GestureSample {
+        stroke: u8,
+        phase: crate::gesture::GesturePhase,
+        mode: crate::gesture::GestureMode,
+        x: f32,
+        y: f32,
+        /// Absent means full contact, matching a surface with no pressure axis.
+        #[serde(default = "unit_pressure")]
+        pressure: f32,
+        /// Absent means an unset direction, which is inert rather than an
+        /// invented axis.
+        #[serde(default)]
+        direction_x: f32,
+        #[serde(default)]
+        direction_y: f32,
+    },
+    /// Arm or disarm gesture recording.
+    ///
+    /// The honesty law made explicit: while this is off a live gesture affects
+    /// the current session only and nothing is added to the replayable track.
+    /// It is an ordered barrier so a sample can never cross an arm/disarm edge
+    /// and land in the wrong recording, and it is protected by the current
+    /// layer-stack revision so an arm decision taken against one program can
+    /// never arrive after a patch load has replaced it.
+    #[serde(rename = "set_gesture_recording")]
+    SetGestureRecording {
+        enabled: bool,
+        layer_stack_revision: u64,
+    },
+    /// Coalescible bounded gesture-canvas value edit.
+    ///
+    /// Unlike the recording barrier this is an ordinary absolute scalar: the
+    /// newest value for one control is the only one worth applying. It reaches
+    /// authored canvas controls only and has no path to the recorded track.
+    #[serde(rename = "set_gesture_canvas")]
+    SetGestureCanvas {
+        param: String,
+        value: serde_json::Value,
+    },
     /// Set fullscreen audience output explicitly. Current clients use this
     /// idempotent command so a delayed/retried packet cannot invert the
     /// performer's requested state.
@@ -3928,6 +4036,11 @@ fn bool_true() -> bool {
     true
 }
 
+/// A surface with no pressure axis reports full contact.
+fn unit_pressure() -> f32 {
+    1.0
+}
+
 impl WebAction {
     fn creative_scope_key(scope: &CreativeScopeSnapshot) -> String {
         match scope {
@@ -4074,6 +4187,10 @@ impl WebAction {
             Self::SetMorph { .. } => Some("morph:position".into()),
             Self::SetMorphLaw { .. } => Some("morph:law".into()),
             Self::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
+            // An authored canvas scalar coalesces per control. The recording
+            // barrier deliberately gets no arm here: `_ => None` is what stops
+            // a later absolute value from jumping an arm/disarm edge.
+            Self::SetGestureCanvas { param, .. } => Some(format!("gesture:canvas:{param}")),
             Self::SetMotion { scope, param, .. } => Some(match scope {
                 MotionScopeSnapshot::Master => format!("motion:master:{param}"),
                 MotionScopeSnapshot::Layer { layer_id } => {
@@ -4107,6 +4224,8 @@ impl WebAction {
                 | Self::GyroStream { .. }
                 | Self::GyroCalibrate
                 | Self::Pad { .. }
+                | Self::GestureSample { .. }
+                | Self::SetGestureRecording { .. }
                 | Self::TriggerCollisionScore
                 | Self::TriggerRefreshGarden
                 | Self::ClearTemporalEventTrack
@@ -4171,6 +4290,7 @@ impl WebAction {
             | Self::SetRefreshGardenMatteRoute { .. }
             | Self::SetRefreshGardenMotionRoute { .. }
             | Self::ClearTemporalEventTrack
+            | Self::SetGestureRecording { .. }
             | Self::SetMotionDonor { .. }
             | Self::ClearMotionMemory
             | Self::SetLayerPaused { .. }
@@ -4213,6 +4333,14 @@ impl WebAction {
                 mode: crate::media_safety::MediaSafetyMode::Safe,
             } => true,
             Self::Pad { active, .. } => !active,
+            // A dropped `Begin` orphans every later point of that stroke and a
+            // dropped `End` leaves it permanently open, so both edges hold an
+            // admission reservation. An intermediate `Move` is ordinary: under
+            // saturation the queue sheds a path point, and the track then
+            // honestly records what the host accepted.
+            Self::GestureSample { phase, .. } => {
+                !matches!(phase, crate::gesture::GesturePhase::Move)
+            }
             Self::Quantized { inner } => inner.is_priority(),
             _ => false,
         }
@@ -6105,6 +6233,7 @@ mod protocol_tests {
             "class=\"fx-group\" data-group=\"motion\"",
             "id=\"motion-fields-group\"",
             "id=\"temporal-group\"",
+            "id=\"gesture-group\"",
             "id=\"audio-group\"",
         ];
         let mut previous = 0;
@@ -6113,7 +6242,7 @@ mod protocol_tests {
             assert!(position >= previous, "{marker} is out of column order");
             previous = position;
         }
-        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 6);
+        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 7);
         assert!(!second_column.contains("id=\"mod-group\""));
         assert!(!second_column.contains("id=\"pad-group\""));
         assert!(!second_column.contains("id=\"midi-group\""));
@@ -6280,7 +6409,7 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 94);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 97);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [
@@ -8809,5 +8938,413 @@ mod protocol_tests {
         assert!(!quantizable.contains("set_visual_node_residual_route"));
         assert!(!quantizable.contains("set_visual_node_displace_route"));
         assert!(!quantizable.contains("set_visual_node_route"));
+    }
+    #[test]
+    fn gesture_samples_are_uncoalesced_stream_events_whose_stroke_edges_hold_priority() {
+        use crate::gesture::{GestureMode, GesturePhase};
+
+        let begin = WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::Begin,
+            mode: GestureMode::Push,
+            x: 0.25,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 0.0,
+            direction_y: 0.0,
+        };
+        let motion = WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::Move,
+            mode: GestureMode::Push,
+            x: 0.5,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 1.0,
+            direction_y: 0.0,
+        };
+        let end = WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::End,
+            mode: GestureMode::Push,
+            x: 0.75,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 1.0,
+            direction_y: 0.0,
+        };
+
+        // A sample is a stream event, never an absolute value: coalescing one
+        // would silently delete a path point the operator actually drew.
+        for action in [&begin, &motion, &end] {
+            assert!(
+                action.coalesce_key().is_none(),
+                "a gesture sample must never coalesce"
+            );
+            assert!(action.is_performance_only_for_history());
+        }
+        // A dropped Begin orphans the stroke and a dropped End leaves it open,
+        // so both edges hold an admission reservation while ordinary motion
+        // may shed under saturation.
+        assert!(begin.is_priority());
+        assert!(end.is_priority());
+        assert!(!motion.is_priority());
+
+        // Because a sample carries no coalesce key it is also an ordering
+        // barrier, so a later absolute value can never jump ahead of a stroke.
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.1),
+                }
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut queue, motion.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.9),
+                }
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(queue.len(), 3, "the sample separates the two scalars");
+
+        // Wire shape: a well-formed sample decodes, an absent pressure means
+        // full contact, an absent direction is the inert zero, and both
+        // vocabularies are closed rather than defaulted.
+        let value = serde_json::to_value(&begin).unwrap();
+        assert_eq!(value["action"], "gesture_sample");
+        assert_eq!(value["phase"], "begin");
+        assert_eq!(value["mode"], "push");
+
+        let defaulted = serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"curl","x":0.5,"y":0.5}"#,
+        )
+        .unwrap();
+        let WebAction::GestureSample {
+            mode,
+            pressure,
+            direction_x,
+            direction_y,
+            ..
+        } = defaulted
+        else {
+            panic!("a gesture sample must decode to its own variant");
+        };
+        assert_eq!(mode, GestureMode::Curl);
+        assert_eq!(pressure, 1.0);
+        assert_eq!(direction_x, 0.0);
+        assert_eq!(direction_y, 0.0);
+
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"scrub","mode":"push","x":0.5,"y":0.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"smear","x":0.5,"y":0.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"push","y":0.5}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gesture_recording_control_is_an_uncoalesced_priority_barrier() {
+        let arm = WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: 9,
+        };
+        assert!(arm.is_priority());
+        assert!(
+            arm.coalesce_key().is_none(),
+            "a sample must never cross an arm/disarm edge into the wrong recording"
+        );
+        assert!(arm.is_performance_only_for_history());
+        assert_eq!(
+            serde_json::to_value(&arm).unwrap(),
+            serde_json::json!({
+                "action": "set_gesture_recording",
+                "enabled": true,
+                "layer_stack_revision": 9
+            })
+        );
+        let decoded = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_recording","enabled":false,"layer_stack_revision":9}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            decoded,
+            WebAction::SetGestureRecording {
+                enabled: false,
+                layer_stack_revision: 9,
+            }
+        ));
+        // Both fields are mandatory: the revision is the barrier that keeps an
+        // arm decision attached to the program it was taken against.
+        for hostile in [
+            r#"{"action":"set_gesture_recording"}"#,
+            r#"{"action":"set_gesture_recording","enabled":true}"#,
+            r#"{"action":"set_gesture_recording","layer_stack_revision":9}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WebAction>(hostile).is_err(),
+                "accepted an incomplete recording barrier: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_snapshot_reports_live_only_samples_separately_from_the_recorded_track() {
+        // The honesty law on the wire: an unrecorded gesture is counted in its
+        // own field and never merged into the recorded total, and an empty
+        // track publishes no checksum because it has nothing to verify.
+        let disarmed = GestureStatusSnapshot {
+            recording: false,
+            recorded_events: 0,
+            truncated: false,
+            open_strokes: 0,
+            live_only_events: 512,
+            checksum: String::new(),
+            status: String::new(),
+            canvas: GestureCanvasStatusSnapshot::default(),
+        };
+        let value = serde_json::to_value(&disarmed).unwrap();
+        assert_eq!(value["recording"], false);
+        assert_eq!(value["recorded_events"], 0);
+        assert_eq!(value["live_only_events"], 512);
+        assert!(
+            value.get("checksum").is_none(),
+            "an empty track must not offer a digest that implies it is replayable"
+        );
+
+        let recorded = GestureStatusSnapshot {
+            recording: true,
+            recorded_events: 3,
+            truncated: true,
+            open_strokes: 1,
+            live_only_events: 4,
+            checksum: "abc".into(),
+            status: "held".into(),
+            canvas: GestureCanvasStatusSnapshot::default(),
+        };
+        let value = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["open_strokes"], 1);
+        assert_eq!(value["checksum"], "abc");
+        assert_eq!(value["status"], "held");
+
+        // The section is additive: an older snapshot with no gesture block
+        // deserializes as a disarmed, empty, unrecorded one.
+        let legacy = serde_json::to_value(AppSnapshot::default()).unwrap();
+        let mut trimmed = legacy.clone();
+        trimmed.as_object_mut().unwrap().remove("gesture");
+        let restored = serde_json::from_value::<AppSnapshot>(trimmed).unwrap();
+        assert_eq!(restored.gesture, GestureStatusSnapshot::default());
+        assert!(!restored.gesture.recording);
+        assert_eq!(restored.gesture.recorded_events, 0);
+        assert_eq!(restored.gesture.live_only_events, 0);
+    }
+
+    /// The canvas scalar is an ordinary absolute value that coalesces per
+    /// control - and it can never jump the recording barrier, because the
+    /// barrier has no coalesce key at all.
+    #[test]
+    fn gesture_canvas_scalars_coalesce_per_control_and_never_cross_the_recording_barrier() {
+        let radius = WebAction::SetGestureCanvas {
+            param: "radius".into(),
+            value: serde_json::json!(0.2),
+        };
+        let strength = WebAction::SetGestureCanvas {
+            param: "strength".into(),
+            value: serde_json::json!(0.4),
+        };
+        assert_eq!(
+            radius.coalesce_key().as_deref(),
+            Some("gesture:canvas:radius")
+        );
+        assert_eq!(
+            strength.coalesce_key().as_deref(),
+            Some("gesture:canvas:strength")
+        );
+        assert!(!radius.is_priority());
+        assert!(
+            !radius.is_performance_only_for_history(),
+            "a canvas value is an authored edit and belongs in manual history"
+        );
+        assert_eq!(
+            serde_json::to_value(&radius).unwrap(),
+            serde_json::json!({"action": "set_gesture_canvas", "param": "radius", "value": 0.2})
+        );
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_canvas","param":"retention","value":0.5}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_canvas","param":"retention"}"#
+        )
+        .is_err());
+
+        // Two edits to one control coalesce; the arm/disarm barrier between
+        // two edits stops the later one from replacing the earlier.
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut queue, radius.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetGestureCanvas {
+                    param: "radius".into(),
+                    value: serde_json::json!(0.3),
+                }
+            ),
+            EnqueueOutcome::Coalesced
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetGestureRecording {
+                    enabled: true,
+                    layer_stack_revision: 4,
+                }
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetGestureCanvas {
+                    param: "radius".into(),
+                    value: serde_json::json!(0.9),
+                }
+            ),
+            EnqueueOutcome::Added,
+            "an absolute value must never jump an arm/disarm edge"
+        );
+        assert_eq!(queue.len(), 3);
+        assert!(matches!(queue[1], WebAction::SetGestureRecording { .. }));
+    }
+
+    /// The panel must state which of the two counts is replayable. The armed
+    /// state is the only thing announced; the per-frame counters live outside
+    /// the live region so a stream of samples cannot flood a screen reader.
+    #[test]
+    fn gesture_browser_surface_is_accessible_truthful_and_stays_out_of_a_quantized_batch() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "id=\"gesture-group\"",
+            "role=\"region\" aria-label=\"Gesture field etching\"",
+            "data-gesture-canvas=\"radius\" data-min=\"0\" data-max=\"1\" data-step=\"0.001\"",
+            "data-gesture-canvas=\"strength\"",
+            "data-gesture-canvas=\"retention\"",
+            "id=\"gesture-record-toggle\" aria-pressed=\"false\"",
+            "id=\"gesture-recording-state\" role=\"status\" aria-live=\"polite\"",
+            "id=\"gesture-telemetry\" aria-live=\"off\"",
+            "id=\"gesture-checksum\" aria-live=\"off\"",
+            "etches this session only and is never added to the replayable track",
+        ] {
+            assert!(html.contains(contract), "missing gesture HTML: {contract}");
+        }
+        // The fast counters must not sit inside a live announcement region.
+        let telemetry = html
+            .find("id=\"gesture-telemetry\"")
+            .expect("gesture telemetry element");
+        let telemetry_tag = &html[telemetry..telemetry + html[telemetry..].find('>').unwrap()];
+        assert!(!telemetry_tag.contains("role=\"status\""));
+        assert!(!telemetry_tag.contains("aria-live=\"polite\""));
+
+        for contract in [
+            "syncGesture(msg.gesture)",
+            "action: 'set_gesture_canvas', param, value",
+            "action: 'set_gesture_recording',",
+            "layer_stack_revision: layerStackRevision,",
+            "recorded event(s)",
+            "live-only sample(s)",
+            "'No recorded track'",
+            "['gesture_radius', 'Gesture Radius']",
+            "['gesture_strength', 'Gesture Strength']",
+            "['gesture_retention', 'Gesture Retention']",
+        ] {
+            assert!(js.contains(contract), "missing gesture JS: {contract}");
+        }
+
+        // Neither gesture action may ever be wrapped in a quantized batch.
+        let start = js.find("const QUANTIZABLE_ACTIONS").expect("allowlist");
+        let tail = &js[start..];
+        let end = tail.find("]);").expect("allowlist end") + 3;
+        let allowlist = &tail[..end];
+        for forbidden in [
+            "set_gesture_recording",
+            "set_gesture_canvas",
+            "gesture_sample",
+        ] {
+            assert!(
+                !allowlist.contains(forbidden),
+                "{forbidden} must never be latchable"
+            );
+        }
+    }
+
+    /// The published canvas block is session state and sits beside the
+    /// recording truth rather than inside it.
+    #[test]
+    fn the_gesture_snapshot_separates_authored_canvas_state_from_recording_truth() {
+        let mut snapshot = GestureStatusSnapshot {
+            recording: false,
+            recorded_events: 0,
+            truncated: false,
+            open_strokes: 2,
+            live_only_events: 90,
+            checksum: String::new(),
+            status: String::new(),
+            canvas: GestureCanvasStatusSnapshot {
+                radius: 0.2,
+                strength: 0.4,
+                retention: 0.6,
+                grid_width: 320,
+                grid_height: 180,
+                generation: 77,
+            },
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["canvas"]["generation"], 77);
+        assert_eq!(value["canvas"]["grid_width"], 320);
+        assert_eq!(value["recorded_events"], 0);
+        assert_eq!(value["live_only_events"], 90);
+        assert!(
+            value.get("checksum").is_none(),
+            "a busy canvas with nothing recorded must not publish a digest"
+        );
+
+        // An older panel that never learned about the canvas keeps working.
+        let mut trimmed = value.clone();
+        trimmed.as_object_mut().unwrap().remove("canvas");
+        let restored = serde_json::from_value::<GestureStatusSnapshot>(trimmed).unwrap();
+        assert_eq!(restored.canvas, GestureCanvasStatusSnapshot::default());
+        assert_eq!(restored.live_only_events, 90);
+
+        snapshot.recording = true;
+        snapshot.recorded_events = 5;
+        snapshot.checksum = "d".repeat(64);
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["recording"], true);
+        assert_eq!(value["recorded_events"], 5);
+        assert_eq!(value["live_only_events"], 90);
+        assert_eq!(value["checksum"], snapshot.checksum);
     }
 }

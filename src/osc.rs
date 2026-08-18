@@ -1527,4 +1527,46 @@ mod tests {
             "malformed UDP datagram should be counted and rejected"
         );
     }
+    #[test]
+    fn gesture_scalars_are_addressable_over_osc_without_a_new_wire_surface() {
+        // The gesture surface adds four entries to the one closed
+        // cross-protocol vocabulary, so both the OSC path grammar and the MIDI
+        // profile document address them with no protocol-specific code.
+        let parameters = [
+            (ControlParameter::GestureX, "gesture_x"),
+            (ControlParameter::GestureY, "gesture_y"),
+            (ControlParameter::GesturePressure, "gesture_pressure"),
+            (ControlParameter::GestureContact, "gesture_contact"),
+        ];
+        for (parameter, key) in parameters {
+            assert_eq!(parameter.key(), key);
+            assert_eq!(ControlParameter::parse(key), Some(parameter));
+            // The saved profile document uses the same token, so a MIDI
+            // binding reaches the identical adapter.
+            assert_eq!(
+                serde_json::to_value(parameter).unwrap(),
+                serde_json::Value::String(key.to_string())
+            );
+
+            let address = RuntimeControlAddress::Master(parameter);
+            let encoded = format_control_address(address).unwrap();
+            assert_eq!(encoded, format!("/collide/v1/master/{key}"));
+            assert_eq!(parse_control_address(&encoded), Ok(address));
+
+            let bytes = encode_feedback(address, 0.5).unwrap();
+            let decoded = decode_packet(&bytes, peer()).unwrap();
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].address, address);
+            assert_eq!(decoded[0].value, AutomationValue::Absolute(0.5));
+        }
+
+        // A neighbouring token stays outside the vocabulary rather than
+        // resolving to one of the four.
+        assert_eq!(ControlParameter::parse("gesture"), None);
+        assert_eq!(ControlParameter::parse("gesture_z"), None);
+        assert_eq!(
+            parse_control_address("/collide/v1/master/gesture_stroke"),
+            Err(OscError::Parameter)
+        );
+    }
 }
