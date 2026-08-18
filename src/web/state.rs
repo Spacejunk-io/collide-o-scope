@@ -242,6 +242,36 @@ pub struct CreativeImageTapSnapshot {
     pub timing: EdgeTiming,
 }
 
+/// One addressed Symmetry Field route. The closed `slot` tag names the route
+/// class and `index` names the fixed slot inside that class, because slot index
+/// is route identity: clearing slot 0 must never slide slot 1's donor down.
+///
+/// An image slot carries a full image tap. A motion slot carries a stable layer
+/// ID or `None` to clear it; a motion route never enters the image dependency
+/// graph, so it has no timing, stage, channel, or inversion of its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "slot", rename_all = "snake_case")]
+pub enum SymmetryRouteSnapshot {
+    Image {
+        index: u8,
+        route: CreativeImageTapSnapshot,
+    },
+    Motion {
+        index: u8,
+        #[serde(default)]
+        layer_id: Option<String>,
+    },
+}
+
+impl SymmetryRouteSnapshot {
+    /// The addressed slot index, whichever class it belongs to.
+    pub const fn index(&self) -> u8 {
+        match self {
+            Self::Image { index, .. } | Self::Motion { index, .. } => *index,
+        }
+    }
+}
+
 /// Which of a Residual node's two authored routes an ordered reroute names.
 /// The vocabulary is closed and tagged so an out-of-range slot is a
 /// deserialization error rather than a positional fallback onto the other
@@ -559,6 +589,43 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "boundary": value.boundary,
             "diagnostic": creative_route_diagnostic(value.tap.source),
         }),
+        // Both image slots and both motion slots are published by slot index,
+        // each with its own diagnostic, so a controller can tell which of the
+        // four routes lost its donor without inferring it from an ordering.
+        RuntimeVisualNodeKind::Symmetry(value) => serde_json::json!({
+            "symmetry_mode": value.mode,
+            "symmetry_boundary": value.boundary,
+            "symmetry_seed": value.seed,
+            "symmetry_base_folds": value.base_folds,
+            "symmetry_fold_offset": value.fold_offset,
+            "symmetry_effective_folds": value.values().effective_folds(),
+            "symmetry_radial_phase_deg": value.radial_phase_deg,
+            "symmetry_orbit_phase": value.orbit_phase,
+            "symmetry_planar_axis_deg": value.planar_axis_deg,
+            "symmetry_planar_phase": value.planar_phase,
+            "symmetry_cell_skew": value.cell_skew,
+            "symmetry_spiral_scale": value.spiral_scale,
+            "symmetry_orbit_radius": value.orbit_radius,
+            "symmetry_orbit_spin_deg": value.orbit_spin_deg,
+            "symmetry_motion_gain": value.motion_gain,
+            "symmetry_hue_span": value.hue_span,
+            "symmetry_center": value.center,
+            "symmetry_source_carrier": value.source_mask.carrier,
+            "symmetry_source_donor0": value.source_mask.donor0,
+            "symmetry_source_donor1": value.source_mask.donor1,
+            "symmetry_source_history": value.source_mask.clean_history,
+            "symmetry_motion_slot0": value.motion_mask.slot0,
+            "symmetry_motion_slot1": value.motion_mask.slot1,
+            "symmetry_donor0_tap": CreativeImageTapSnapshot::from_runtime(value.donors[0]),
+            "symmetry_donor1_tap": CreativeImageTapSnapshot::from_runtime(value.donors[1]),
+            "symmetry_motion0_donor": creative_motion_donor(value.motion[0]),
+            "symmetry_motion1_donor": creative_motion_donor(value.motion[1]),
+            "symmetry_exact_bypass": value.is_exact_bypass(),
+            "donor0_diagnostic": creative_route_diagnostic(value.donors[0].source),
+            "donor1_diagnostic": creative_route_diagnostic(value.donors[1].source),
+            "motion0_diagnostic": creative_motion_diagnostic(value.motion[0]),
+            "motion1_diagnostic": creative_motion_diagnostic(value.motion[1]),
+        }),
         RuntimeVisualNodeKind::Residual(value) => serde_json::json!({
             "structure_tap": CreativeImageTapSnapshot::from_runtime(value.structure),
             "detail_tap": CreativeImageTapSnapshot::from_runtime(value.detail),
@@ -569,6 +636,40 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "seed": value.seed,
             "diagnostic": creative_two_slot_route_diagnostic(value.structure.source, value.detail.source),
         }),
+    }
+}
+
+/// Publish one motion route by slot in the established [`MotionDonorSnapshot`]
+/// shape: a stable decimal layer ID for a live donor, a saved position only for
+/// a retained tombstone. The stable ID is the panel's addressing key — the same
+/// one `CreativeImageSourceSnapshot::SelectedLayer` already publishes for an
+/// image slot — and a tombstone never carries one, so it can never rebind.
+fn creative_motion_donor(donor: crate::motion::MotionDonor) -> serde_json::Value {
+    let snapshot = match donor {
+        crate::motion::MotionDonor::None => MotionDonorSnapshot::None,
+        crate::motion::MotionDonor::Selected {
+            layer_id,
+            saved_position,
+        } => MotionDonorSnapshot::Selected {
+            layer_id: layer_id.get().to_string(),
+            saved_position: saved_position.get(),
+        },
+        crate::motion::MotionDonor::Missing { saved_position } => MotionDonorSnapshot::Missing {
+            saved_position: saved_position.get(),
+        },
+    };
+    serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null)
+}
+
+/// Operator-facing text for a motion route that resolves to nothing.
+fn creative_motion_diagnostic(donor: crate::motion::MotionDonor) -> String {
+    match donor {
+        crate::motion::MotionDonor::Missing { saved_position } => {
+            format!("missing saved layer {}", saved_position.get())
+        }
+        crate::motion::MotionDonor::None | crate::motion::MotionDonor::Selected { .. } => {
+            String::new()
+        }
     }
 }
 
@@ -3264,6 +3365,20 @@ pub enum WebAction {
         route: CreativeImageTapSnapshot,
         composition_revision: u64,
     },
+    /// Reroute one of a Symmetry Field's four fixed slots. Slot index is route
+    /// identity, so the addressed slot travels inside the payload and an edit
+    /// to slot 1 can never be mistaken for an edit to slot 0. Rewiring either
+    /// class rewrites the image dependency graph or the motion field request,
+    /// so this is an ordered, revision-protected, uncoalesced barrier. Every
+    /// other Symmetry field — geometry, masks, seed, mode, boundary — travels
+    /// on the ordinary coalescible parameter action.
+    #[serde(rename = "set_visual_node_symmetry_route")]
+    SetVisualNodeSymmetryRoute {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        route: SymmetryRouteSnapshot,
+        composition_revision: u64,
+    },
     /// Reroute one slot of a Residual node. Both routes rewrite the image
     /// dependency graph, so the action is an ordered, revision-protected,
     /// uncoalesced barrier and carries a closed slot token rather than an
@@ -4313,6 +4428,7 @@ impl WebAction {
             | Self::SetVisualNodeMaskVariant { .. }
             | Self::SetVisualNodeRoute { .. }
             | Self::SetVisualNodeDisplaceRoute { .. }
+            | Self::SetVisualNodeSymmetryRoute { .. }
             | Self::SetVisualNodeResidualRoute { .. }
             | Self::SetCompositionGroupMatteRoute { .. }
             | Self::CreateCompositionGroup { .. }
@@ -6903,6 +7019,44 @@ mod protocol_tests {
         assert_eq!(layer_bus.coalesce_key(), None);
         assert!(layer_bus.is_priority());
 
+        // Every Symmetry Field slot is its own ordered barrier, while its
+        // geometry, masks, and seed ride the one coalescible value action.
+        for route in [
+            SymmetryRouteSnapshot::Image {
+                index: 0,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+            },
+            SymmetryRouteSnapshot::Motion {
+                index: 1,
+                layer_id: Some("31".into()),
+            },
+        ] {
+            let action = WebAction::SetVisualNodeSymmetryRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "7".into(),
+                route,
+                composition_revision: 9,
+            };
+            assert_eq!(action.coalesce_key(), None);
+            assert!(action.is_priority());
+        }
+        let seed = WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "7".into(),
+            node_kind: "symmetry".into(),
+            param: "symmetry_seed".into(),
+            value: serde_json::json!(9_001),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            seed.coalesce_key().as_deref(),
+            Some("creative:master:node:7:symmetry_seed")
+        );
+        assert!(!seed.is_priority());
+
         // A Residual value rides the one coalescible node action and keys on
         // its own parameter, while both of its routes stay ordered barriers.
         let residual_value = WebAction::SetVisualNodeParam {
@@ -8064,6 +8218,8 @@ mod protocol_tests {
             "action: 'set_visual_node_mask_variant'",
             "action: 'set_visual_node_route'",
             "action: 'set_visual_node_displace_route'",
+            "action: 'set_visual_node_symmetry_route'",
+            "action: 'set_visual_node_displace_route'",
             "action: 'set_visual_node_residual_route'",
             "action: 'set_composition_group_param'",
             "action: 'set_composition_group_matte_route'",
@@ -8615,6 +8771,287 @@ mod protocol_tests {
             missing["donor_tap"]["input"]["source"],
             "missing_selected_layer"
         );
+    }
+
+    /// The snapshot publishes both image slots and both motion slots by slot
+    /// index, each with its own diagnostic, so a controller can tell which of
+    /// the four routes lost its donor without inferring it from an ordering.
+    /// A retained tombstone names its saved provenance and never rebinds, and
+    /// no process identity is ever published.
+    #[test]
+    fn symmetry_snapshot_publishes_both_image_slots_both_motion_slots_and_its_masks() {
+        use crate::motion::MotionDonor;
+        use crate::symmetry::{
+            RuntimeSymmetryParams, SymmetryBoundary, SymmetryMode, SymmetryMotionMask,
+            SymmetrySourceMask,
+        };
+        use crate::visual_rack::{ResolvedImageSource, ResolvedImageTap, RuntimeVisualNodeKind};
+
+        let position = |value: u32| crate::performance::SavedLayerPosition::new(value).unwrap();
+        let live = creative_node_params(RuntimeVisualNodeKind::Symmetry(RuntimeSymmetryParams {
+            mode: SymmetryMode::PlanarPm,
+            boundary: SymmetryBoundary::CellularReentry,
+            base_folds: 6.0,
+            fold_offset: 0.4,
+            hue_span: 0.5,
+            motion_gain: -0.25,
+            seed: 77,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: false,
+                donor1: true,
+                clean_history: true,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: true,
+                slot1: false,
+            },
+            donors: [
+                ResolvedImageTap {
+                    source: ResolvedImageSource::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ResolvedImageTap {
+                    source: ResolvedImageSource::MissingSelectedLayer {
+                        saved_position: position(4),
+                        stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::PreviousFrame,
+                },
+            ],
+            motion: [
+                MotionDonor::Selected {
+                    layer_id: crate::image_routing::StableLayerId::new(910).unwrap(),
+                    saved_position: position(2),
+                },
+                MotionDonor::Missing {
+                    saved_position: position(6),
+                },
+            ],
+            ..RuntimeSymmetryParams::default()
+        }));
+
+        assert_eq!(live["symmetry_mode"], "planar_pm");
+        assert_eq!(live["symmetry_boundary"], "cellular_reentry");
+        assert_eq!(live["symmetry_seed"], 77);
+        assert_eq!(live["symmetry_base_folds"], 6.0);
+        assert_eq!(live["symmetry_fold_offset"], f64::from(0.4_f32));
+        assert_eq!(
+            live["symmetry_effective_folds"], 6,
+            "the published fold count is rounded exactly once"
+        );
+        assert_eq!(live["symmetry_hue_span"], 0.5);
+        assert_eq!(live["symmetry_motion_gain"], -0.25);
+        assert_eq!(live["symmetry_exact_bypass"], false);
+
+        assert_eq!(live["symmetry_source_carrier"], true);
+        assert_eq!(live["symmetry_source_donor0"], false);
+        assert_eq!(live["symmetry_source_donor1"], true);
+        assert_eq!(live["symmetry_source_history"], true);
+        assert_eq!(live["symmetry_motion_slot0"], true);
+        assert_eq!(live["symmetry_motion_slot1"], false);
+
+        assert_eq!(live["symmetry_donor0_tap"]["input"]["source"], "one_below");
+        assert_eq!(live["symmetry_donor0_tap"]["timing"], "current_frame");
+        assert_eq!(live["donor0_diagnostic"], "");
+        assert_eq!(
+            live["symmetry_donor1_tap"]["input"]["source"],
+            "missing_selected_layer"
+        );
+        assert_eq!(live["symmetry_donor1_tap"]["timing"], "previous_frame");
+        assert_eq!(live["donor1_diagnostic"], "missing saved layer 4");
+
+        // A live motion slot publishes the same stable decimal layer ID the
+        // image slots already publish, because that ID is how the panel
+        // addresses a layer. A tombstone publishes only its saved provenance
+        // and never a layer ID, so it can never rebind.
+        assert_eq!(live["symmetry_motion0_donor"]["kind"], "selected");
+        assert_eq!(live["symmetry_motion0_donor"]["layer_id"], "910");
+        assert_eq!(live["symmetry_motion0_donor"]["saved_position"], 2);
+        assert_eq!(live["motion0_diagnostic"], "");
+        assert_eq!(live["symmetry_motion1_donor"]["kind"], "missing");
+        assert_eq!(live["symmetry_motion1_donor"]["saved_position"], 6);
+        assert!(
+            live["symmetry_motion1_donor"]["layer_id"].is_null(),
+            "a retained motion tombstone never publishes a layer identity"
+        );
+        assert_eq!(live["motion1_diagnostic"], "missing saved layer 6");
+
+        let neutral = creative_node_params(RuntimeVisualNodeKind::Symmetry(
+            RuntimeSymmetryParams::default(),
+        ));
+        assert_eq!(neutral["symmetry_exact_bypass"], true);
+        assert_eq!(neutral["symmetry_motion0_donor"]["kind"], "none");
+        assert_eq!(neutral["symmetry_effective_folds"], 1);
+    }
+
+    /// Closes `is_priority` and `coalesce_key` for the Symmetry route action.
+    /// A missing `is_priority` arm silently loses the admission reservation and
+    /// the barrier semantics under queue pressure; an accidental `coalesce_key`
+    /// arm would let a later absolute value jump ahead of a reroute.
+    #[test]
+    fn symmetry_route_action_is_an_uncoalesced_ordered_slot_addressed_barrier() {
+        let image = SymmetryRouteSnapshot::Image {
+            index: 1,
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+        };
+        let action = WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "7".into(),
+            route: image.clone(),
+            composition_revision: 12,
+        };
+        assert!(action.is_priority());
+        assert!(action.coalesce_key().is_none());
+
+        // The wire name is explicit, the slot travels inside the payload, and
+        // the whole message round trips exactly.
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["action"], "set_visual_node_symmetry_route");
+        assert_eq!(value["composition_revision"], 12);
+        assert_eq!(value["route"]["slot"], "image");
+        assert_eq!(value["route"]["index"], 1);
+        let WebAction::SetVisualNodeSymmetryRoute {
+            scope: decoded_scope,
+            node_id: decoded_node,
+            route: decoded_route,
+            composition_revision: decoded_revision,
+        } = serde_json::from_value::<WebAction>(value).unwrap()
+        else {
+            panic!("the symmetry route action must decode to its own variant");
+        };
+        assert_eq!(decoded_scope, CreativeScopeSnapshot::Master);
+        assert_eq!(decoded_node, "7");
+        assert_eq!(decoded_route, image);
+        assert_eq!(decoded_revision, 12);
+
+        // A motion slot clears with an absent layer and names one otherwise.
+        let cleared = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_symmetry_route","scope":{"scope":"master"},"node_id":"7","route":{"slot":"motion","index":0},"composition_revision":3}"#,
+        )
+        .unwrap();
+        let WebAction::SetVisualNodeSymmetryRoute { route, .. } = cleared else {
+            panic!("motion slot")
+        };
+        assert_eq!(
+            route,
+            SymmetryRouteSnapshot::Motion {
+                index: 0,
+                layer_id: None
+            }
+        );
+        assert_eq!(route.index(), 0);
+
+        // The revision is mandatory, so a reroute can never arrive unbarriered.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_symmetry_route","scope":{"scope":"master"},"node_id":"7","route":{"slot":"motion","index":0}}"#
+        )
+        .is_err());
+        // The slot vocabulary is closed: an unknown class is a deserialization
+        // error, not a defaulted image slot.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_symmetry_route","scope":{"scope":"master"},"node_id":"7","route":{"slot":"aux","index":0},"composition_revision":3}"#
+        )
+        .is_err());
+        // So is an unknown donor token inside an image slot.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_symmetry_route","scope":{"scope":"master"},"node_id":"7","route":{"slot":"image","index":0,"route":{"input":{"source":"teleport"},"timing":"current_frame"}},"composition_revision":3}"#
+        )
+        .is_err());
+    }
+
+    /// The four hand-maintained browser registries have no cross-check of their
+    /// own, so this asserts the Symmetry Field reaches all of them: the kind
+    /// picker option, `CREATIVE_NODE_INFO`, `CREATIVE_NODE_PARAMS`, and the
+    /// slot-aware route editors. It also asserts the ordered actions stay out
+    /// of the quantized allowlist.
+    #[test]
+    fn symmetry_browser_surface_is_registered_slot_aware_and_never_quantized() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+
+        assert!(
+            html.contains(r#"<option value="symmetry">Symmetry Field</option>"#),
+            "the kind picker is a hand-maintained registry and must list the node"
+        );
+        assert!(js.contains("symmetry: { label: 'Symmetry Field' }"));
+
+        // Every browser-editable descriptor appears in CREATIVE_NODE_PARAMS,
+        // and no route key does — routes own the ordered action instead.
+        let params = js
+            .split_once("  symmetry: [")
+            .expect("CREATIVE_NODE_PARAMS declares a symmetry block")
+            .1
+            .split_once("\n  ],")
+            .expect("the symmetry block terminates")
+            .0;
+        for descriptor in crate::visual_rack::NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == crate::visual_rack::NodeKindTag::Symmetry)
+        {
+            let is_route = matches!(
+                descriptor.value_type,
+                crate::visual_rack::NodeParamType::ImageTap
+                    | crate::visual_rack::NodeParamType::MotionDonor
+            );
+            assert_eq!(
+                params.contains(&format!("'{}'", descriptor.key)),
+                !is_route,
+                "browser registry disagrees with the descriptor registry for {}",
+                descriptor.key
+            );
+        }
+
+        // Both discrete vocabularies are published in full.
+        for token in [
+            "'cyclic'",
+            "'dihedral'",
+            "'planar_p1'",
+            "'planar_pm'",
+            "'planar_p2'",
+            "'planar_pmm'",
+            "'log_spiral'",
+            "'orbit'",
+            "'cellular_reentry'",
+        ] {
+            assert!(
+                params.contains(token),
+                "missing symmetry enum token {token}"
+            );
+        }
+
+        // The route editors are slot addressed, and all four slots are folded
+        // into the structural fingerprint so a reroute rebuilds the card.
+        for marker in [
+            "'image:0'",
+            "'image:1'",
+            "'motion:0'",
+            "'motion:1'",
+            "data-route-slot",
+            "card.querySelectorAll('.creative-route-editor')",
+            "slot: 'image', index: slotIndex(editor)",
+            "slot: 'motion', index: slotIndex(editor)",
+            "symmetryRoutes:",
+        ] {
+            assert!(
+                js.contains(marker),
+                "missing slot-aware route marker {marker}"
+            );
+        }
+
+        // Ordered topology actions are never beat latched.
+        let quantizable = js
+            .split_once("const QUANTIZABLE_ACTIONS")
+            .unwrap()
+            .1
+            .split_once("]);")
+            .unwrap()
+            .0;
+        assert!(!quantizable.contains("set_visual_node_symmetry_route"));
+        assert!(!quantizable.contains("set_visual_node_displace_route"));
     }
 
     #[test]

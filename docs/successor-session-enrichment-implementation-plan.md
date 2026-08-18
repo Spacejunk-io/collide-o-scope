@@ -281,12 +281,24 @@ arena; no full-frame persistent surface:
 | Item | Exact initial contract |
 |---|---:|
 | Sampled textures/pass | 8 |
-| Bind groups | 2 |
+| Bind groups | 2 — **shipped as 3**, see below |
 | Render passes/node | 1 |
 | Worst-case texture operations/pixel | 10 |
 | Uniform arena/node | 1,024 bytes |
 | Neutral textures | 3 tiny textures / 4 views |
 | Full-frame persistent surfaces | 0 |
+
+**Deviation as shipped: three bind groups, not two.** A `MotionGpuField` owns a
+committed ping/pong parity of its own (`MotionMemoryStage::render_field_index`),
+a third parity dimension above the carrier parity and the composition's N-1 tap
+parity. Held in one input group the three multiply to 16 prebuilt groups per
+node; splitting the motion vector/gate pair into its own group makes them add —
+4 image groups (carrier × N-1) plus 4 motion groups (the two slots' committed
+parities) = 8 per node, with three groups bound per pass. Honouring "2" would
+have left an authored motion route binding the neutral pair and decoding to
+exactly zero. Every other row of this table is unchanged, including the
+eight-texture count: a fragment stage's sampled-texture budget is counted across
+every bound group. See the Symmetry Field section of `CLAUDE.md`.
 
 The frozen successor ABI should use two named image-donor slots, two named
 motion-donor slots, and the already committed 24-layer clean-history array.

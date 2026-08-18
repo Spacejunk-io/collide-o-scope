@@ -12,8 +12,8 @@ use crate::composition::{BusAssignment, RuntimeRootItem};
 use crate::evaluated_frame::evaluated_composition::{
     AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
     EvaluatedRefreshGardenSignalPlan, EvaluatedScopeExecution, EvaluatedScopeStep,
-    ImageTapConsumer, LegacyCanonicalApplication, MotionFieldAttachment, PlannedImageSource,
-    PlannedImageTap,
+    EvaluatedSymmetryFieldPlan, ImageTapConsumer, LegacyCanonicalApplication,
+    MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
 };
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::layers::BlendMode;
@@ -26,8 +26,9 @@ use crate::renderer::composition_host::{
 };
 use crate::renderer::compositor::{MatteChannelCode, MatteCompositeUniforms, ResolvedMatteParams};
 use crate::renderer::motion::{
-    MotionFrameInput, MotionGpuError, MotionGpuFieldSource, MotionGpuFieldSpec, MotionGpuResources,
-    MotionGpuScopeSpec, MotionRuntimeDiagnostic, MotionRuntimeMetrics,
+    MotionFieldReadParity, MotionFrameInput, MotionGpuError, MotionGpuFieldSource,
+    MotionGpuFieldSpec, MotionGpuResources, MotionGpuScopeSpec, MotionRuntimeDiagnostic,
+    MotionRuntimeMetrics,
 };
 use crate::renderer::rack::{
     CollisionRackExecutor, RackGpuError, RackImageBindings, RackImageInput, RackResidualMeans,
@@ -39,6 +40,16 @@ use crate::renderer::readback::{
     RecorderReadbackReadiness, RecorderReadbackRequest, RecorderReadbackReservation,
     RecorderReadbackTag,
 };
+use crate::renderer::symmetry_field::{
+    SymmetryFieldBindings, SymmetryFieldExecutor, SymmetryFieldGpuError, SymmetryFieldInput,
+    SymmetryFieldMotionBindings, SymmetryFieldMotionInput, SymmetryHistoryCursor,
+    SymmetryMotionViews,
+};
+#[cfg(test)]
+use crate::renderer::symmetry_field::{
+    SYMMETRY_FIELD_CARRIER_PARITIES, SYMMETRY_FIELD_MOTION_GROUPS,
+};
+use crate::symmetry::{SYMMETRY_IMAGE_SLOTS, SYMMETRY_MOTION_SLOTS};
 use crate::temporal::{TemporalFrameInput, TemporalResetCause, TemporalStateMetrics};
 use crate::visual_rack::{
     EdgeTiming, GroupId, MatteChannel, NodeId, VisualScopeId, RACK_PRIMARY_ROUTE_SLOT,
@@ -273,6 +284,15 @@ impl From<RackGpuError> for CompositionGpuError {
     }
 }
 
+/// The dedicated Symmetry Field executor reports through the same channel the
+/// fixed rack executor does: both are creative-pass executors, and an operator
+/// reading the message needs the failure, not the module that raised it.
+impl From<SymmetryFieldGpuError> for CompositionGpuError {
+    fn from(value: SymmetryFieldGpuError) -> Self {
+        Self::Rack(value.to_string())
+    }
+}
+
 impl From<MotionGpuError> for CompositionGpuError {
     fn from(value: MotionGpuError) -> Self {
         Self::Motion(value.to_string())
@@ -399,6 +419,32 @@ struct PreparedRackSegment {
     tap_indices: Box<[(NodeId, u8, crate::visual_rack::ResolvedImageTap, usize)]>,
 }
 
+/// One prepared dedicated Symmetry Field step.
+///
+/// The node owns its own eight-texture bind groups rather than sharing a
+/// segment's, because slot index is route identity here: `tap_indices` records
+/// which image slot each admitted route occupies, and a readiness flip on one
+/// slot can never move the other slot's donor.
+struct PreparedSymmetryField {
+    scope: VisualScopeId,
+    node_id: NodeId,
+    uniform_slot: usize,
+    /// Both committed N-1 read parities, exactly like a rack segment. Each
+    /// holds one image bind group per carrier parity, so four per node.
+    bindings: [SymmetryFieldBindings; 2],
+    /// Every combination of the two motion slots' committed ping/pong parities,
+    /// prepared once per node. The motion group holds no image view, so it is
+    /// independent of the N-1 read parity and is deliberately NOT rebuilt per
+    /// read index; four per node, not eight.
+    motion_bindings: SymmetryFieldMotionBindings,
+    /// The admitted motion field slot each motion route resolved to, carried so
+    /// encode can ask the motion resources for that field's committed parity
+    /// without re-walking the evaluated plan.
+    motion_field_slots: [Option<u8>; SYMMETRY_MOTION_SLOTS],
+    /// `(image slot, tap index)` for each admitted image route.
+    tap_indices: Box<[(usize, usize)]>,
+}
+
 struct PreparedAdvanced {
     topology_signature: u64,
     source_keys: Box<[(StableLayerId, [u32; 2], u64)]>,
@@ -411,6 +457,10 @@ struct PreparedAdvanced {
     gesture_canvas_bound: bool,
     host: CompositionHost,
     rack: CollisionRackExecutor,
+    /// Present only when the plan emits at least one dedicated step. It owns no
+    /// output-sized surface, so an absent executor costs nothing.
+    symmetry: Option<SymmetryFieldExecutor>,
+    symmetry_fields: Vec<PreparedSymmetryField>,
     motion: Option<MotionGpuResources>,
     taps: Box<[PreparedTap]>,
     /// Current-frame PreLocal donors are independently materialized and
@@ -833,7 +883,7 @@ impl CompositionGpuExecutor {
             .unwrap_or_default();
         CompositionAllocationSnapshot {
             host_objects: prepared.host.allocation_snapshot().total(),
-            rack_objects: prepared.rack.allocation_snapshot().total(),
+            rack_objects: prepared.rack.allocation_snapshot().total() + prepared.symmetry_objects(),
             retained_textures: prepared.retained_textures,
             retained_views: prepared.retained_views,
             executor_bindings: prepared.executor_bindings,
@@ -1517,6 +1567,32 @@ impl PreparedAdvanced {
                 &prelocal_surfaces,
                 gesture_canvas.view.as_ref(),
             )?;
+            let symmetry_slot_count = symmetry_field_step_count(plan);
+            let symmetry = if symmetry_slot_count == 0 {
+                None
+            } else {
+                Some(SymmetryFieldExecutor::new(
+                    device,
+                    queue,
+                    dimensions,
+                    symmetry_slot_count,
+                )?)
+            };
+            let symmetry_fields = match &symmetry {
+                Some(executor) => prepare_symmetry_fields(
+                    device,
+                    plan,
+                    &host,
+                    executor,
+                    motion.as_ref(),
+                    &taps,
+                    &prelocal_surfaces,
+                    rack_zero.view,
+                    gesture_canvas.view.as_ref(),
+                    [ping.view, pong.view],
+                )?,
+                None => Vec::new(),
+            };
             let retained_scope_sources = retained_scope_sources(plan, &taps);
             let (root_schedule, member_schedules) =
                 build_block_schedules(plan, &retained_scope_sources)?;
@@ -1620,6 +1696,8 @@ impl PreparedAdvanced {
                 gesture_canvas_bound: gesture_canvas.is_bound(),
                 host,
                 rack,
+                symmetry,
+                symmetry_fields,
                 motion,
                 taps: taps.into_boxed_slice(),
                 prelocal_surfaces,
@@ -1824,10 +1902,21 @@ impl PreparedAdvanced {
         Ok(())
     }
 
+    /// Objects owned by the dedicated Symmetry Field executor. They are folded
+    /// into the rack object count because both are creative-pass executors; the
+    /// dedicated one contributes no bytes to the surface ledger, so
+    /// `creative_bytes` is unchanged by its presence.
+    fn symmetry_objects(&self) -> u64 {
+        self.symmetry.as_ref().map_or(0, |executor| {
+            let snapshot = executor.allocation_snapshot();
+            snapshot.textures + snapshot.buffers + snapshot.bind_groups + snapshot.pipelines
+        })
+    }
+
     fn allocation_snapshot(&self) -> CompositionAllocationSnapshot {
         CompositionAllocationSnapshot {
             host_objects: self.host.allocation_snapshot().total(),
-            rack_objects: self.rack.allocation_snapshot().total(),
+            rack_objects: self.rack.allocation_snapshot().total() + self.symmetry_objects(),
             retained_textures: self.retained_textures,
             retained_views: self.retained_views,
             executor_bindings: self.executor_bindings,
@@ -1986,6 +2075,7 @@ impl PreparedAdvanced {
                 | EvaluatedScopeStep::LegacyCanonical { pass, .. } => pass,
                 EvaluatedScopeStep::CollisionRack { .. }
                 | EvaluatedScopeStep::LegacyTemporal { .. }
+                | EvaluatedScopeStep::SymmetryField { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => continue,
             };
             self.host
@@ -2278,6 +2368,9 @@ impl PreparedAdvanced {
                     *segment_index,
                     rack_plan,
                 )?,
+                EvaluatedScopeStep::SymmetryField { plan: field } => {
+                    self.execute_symmetry_field(queue, encoder, plan, scope, field)?;
+                }
                 EvaluatedScopeStep::LegacyTemporal { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(format!(
@@ -2288,6 +2381,114 @@ impl PreparedAdvanced {
             }
         }
         self.execute_motion_scope(encoder, plan, scope)?;
+        Ok(())
+    }
+
+    /// Encode one dedicated Symmetry Field step.
+    ///
+    /// The step's contract is the same as every other ordered step's: read the
+    /// scope's carrier out of Ping and leave the result in Ping. The dedicated
+    /// executor owns no surface of its own, so the pass renders into the
+    /// existing Pong scratch and is copied back, exactly as
+    /// `encode_effect_from_ping` does.
+    fn execute_symmetry_field(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        scope: VisualScopeId,
+        field: &EvaluatedSymmetryFieldPlan,
+    ) -> Result<(), CompositionGpuError> {
+        // A dormant or exactly-bypassed node is a real delegation: Ping already
+        // holds the carrier, so nothing is encoded and nothing is copied.
+        if SymmetryFieldExecutor::is_inert(field) {
+            return Ok(());
+        }
+        let prepared_index = self
+            .symmetry_fields
+            .iter()
+            .position(|prepared| prepared.scope == scope && prepared.node_id == field.node_id)
+            .ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "Symmetry Field node {} in {scope:?} was not prepared",
+                    field.node_id.get()
+                ))
+            })?;
+        let prelocal = self.symmetry_fields[prepared_index]
+            .tap_indices
+            .iter()
+            .find_map(|(_, tap_index)| {
+                matches!(
+                    self.taps[*tap_index].backing,
+                    TapBacking::CurrentPreLocal { .. }
+                )
+                .then_some(*tap_index)
+            });
+        if let Some(tap_index) = prelocal {
+            self.ensure_current_prelocal(encoder, tap_index)?;
+        }
+        let read_index = self.tap_history_read_index;
+        for binding_index in 0..self.symmetry_fields[prepared_index].tap_indices.len() {
+            let (slot, tap_index) = self.symmetry_fields[prepared_index].tap_indices[binding_index];
+            let ready = self.tap_ready(tap_index);
+            let updated = self.symmetry_fields[prepared_index].bindings[read_index]
+                .set_donor_ready(field.node_id, slot, ready);
+            debug_assert!(updated);
+        }
+        // Each motion slot reads the parity its own field committed THIS frame,
+        // the same `render_field_index` motion rendering wrote through, so a
+        // routed consumer can never observe the stale half of a ping/pong pair.
+        // A slot whose field has no staged frame, or whose committed parity is
+        // not materialized yet, reports not-ready: the packed record's validity
+        // lane closes and the shader decodes exactly zero displacement while the
+        // prebuilt group stays untouched.
+        let committed: [Option<MotionFieldReadParity>; SYMMETRY_MOTION_SLOTS] =
+            std::array::from_fn(|slot| {
+                let field_slot = self.symmetry_fields[prepared_index].motion_field_slots[slot]?;
+                self.motion.as_ref()?.field_read_parity(field_slot)
+            });
+        let motion_parity: [usize; SYMMETRY_MOTION_SLOTS] =
+            std::array::from_fn(|slot| committed[slot].map_or(0, |parity| parity.index));
+        for (slot, parity) in committed.into_iter().enumerate() {
+            let updated = self.symmetry_fields[prepared_index]
+                .motion_bindings
+                .set_motion_ready(
+                    field.node_id,
+                    slot,
+                    parity.is_some_and(|parity| parity.valid),
+                );
+            debug_assert!(updated);
+        }
+        let executor = self.symmetry.as_ref().ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(
+                "a Symmetry Field step was planned without its dedicated executor".into(),
+            )
+        })?;
+        let (history_write, history_valid) = self.host.temporal_history_read_cursor();
+        let _report = executor.encode_at(
+            queue,
+            encoder,
+            field,
+            &self.symmetry_fields[prepared_index].bindings[read_index],
+            &self.symmetry_fields[prepared_index].motion_bindings,
+            // Parity 0 is Ping, which is where every ordered step leaves its
+            // result and therefore where this step finds its carrier.
+            0,
+            motion_parity,
+            self.host.surface(HostSurface::Pong).view,
+            self.symmetry_fields[prepared_index].uniform_slot,
+            SymmetryHistoryCursor {
+                write_index: history_write,
+                valid: history_valid,
+            },
+            plan.base().context().time_seconds,
+        )?;
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Pong).texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
         Ok(())
     }
 
@@ -2456,6 +2657,9 @@ impl PreparedAdvanced {
                         *segment_index,
                         rack_plan,
                     )?,
+                    EvaluatedScopeStep::SymmetryField { plan: field } => {
+                        self.execute_symmetry_field(queue, encoder, plan, scope, field)?;
+                    }
                     EvaluatedScopeStep::GroupMatte { .. } => {
                         self.execute_group_matte(encoder, plan, group_id)?;
                     }
@@ -2737,6 +2941,15 @@ impl PreparedAdvanced {
                     if !wrote_ping {
                         copy_texture(encoder, pong.texture, ping.texture, self.host.dimensions());
                     }
+                }
+                EvaluatedScopeStep::SymmetryField { plan: field } => {
+                    self.execute_symmetry_field(
+                        queue,
+                        encoder,
+                        plan,
+                        VisualScopeId::Master,
+                        field,
+                    )?;
                 }
                 EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(
@@ -3173,6 +3386,181 @@ const fn bus_surface(bus: BusAssignment) -> HostSurface {
     }
 }
 
+/// One dynamic-offset uniform slot per dedicated step the frame can encode
+/// before a single queue submit. Counted from the EMITTED steps, exactly as the
+/// planner's own dedicated ledger is, so the arena can never be short.
+fn symmetry_field_step_count(plan: &AdvancedCompositionPlan) -> usize {
+    let mut count = 0;
+    let mut tally = |execution: &EvaluatedScopeExecution| {
+        count += execution
+            .steps()
+            .iter()
+            .filter(|step| matches!(step, EvaluatedScopeStep::SymmetryField { .. }))
+            .count();
+    };
+    for layer in plan.layers() {
+        tally(&layer.execution);
+    }
+    for group in plan.groups() {
+        tally(&group.execution);
+    }
+    tally(&plan.master().execution);
+    count
+}
+
+/// Prepare every dedicated step's input bind groups, for both committed N-1
+/// read parities and both carrier parities, once.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "preparation binds every borrowed GPU input explicitly"
+)]
+fn prepare_symmetry_fields(
+    device: &wgpu::Device,
+    plan: &AdvancedCompositionPlan,
+    host: &CompositionHost,
+    executor: &SymmetryFieldExecutor,
+    motion: Option<&MotionGpuResources>,
+    taps: &[PreparedTap],
+    prelocal_surfaces: &BTreeMap<StableLayerId, RetainedSurface>,
+    zero: &wgpu::TextureView,
+    gesture_canvas: Option<&wgpu::TextureView>,
+    carriers: [&wgpu::TextureView; 2],
+) -> Result<Vec<PreparedSymmetryField>, CompositionGpuError> {
+    let mut prepared = Vec::new();
+    let mut next_uniform_slot = 0_usize;
+    let mut visit = |scope: VisualScopeId,
+                     execution: &EvaluatedScopeExecution|
+     -> Result<(), CompositionGpuError> {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::SymmetryField { plan: field } = step else {
+                continue;
+            };
+            // Slot index is route identity: each slot is looked up by its own
+            // consumer key, so an unarmed or missing slot 0 never slides slot
+            // 1's donor down into its place.
+            let mut indices = Vec::new();
+            for slot in 0..SYMMETRY_IMAGE_SLOTS {
+                let consumer = ImageTapConsumer::RackNode {
+                    scope,
+                    node_id: field.node_id,
+                    slot: slot as u8,
+                };
+                let Some(tap_index) = tap_index_for_consumer(plan, consumer) else {
+                    continue;
+                };
+                indices.push((slot, tap_index));
+            }
+            let prelocal_donors = indices
+                .iter()
+                .filter_map(|(_, tap_index)| match taps[*tap_index].backing {
+                    TapBacking::CurrentPreLocal { layer_id } => Some(layer_id),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if prelocal_donors.len() > 1 {
+                return Err(CompositionGpuError::InvalidSchedule(
+                    "a Symmetry Field contains more than one current PreLocal donor".into(),
+                ));
+            }
+            let bindings = std::array::from_fn(|read_index| {
+                let mut donors: [Option<&wgpu::TextureView>; SYMMETRY_IMAGE_SLOTS] = [None, None];
+                for (slot, tap_index) in &indices {
+                    donors[*slot] = match taps[*tap_index].backing {
+                        TapBacking::Transparent => None,
+                        _ => Some(prepared_tap_view(
+                            host,
+                            prelocal_surfaces,
+                            zero,
+                            gesture_canvas,
+                            &taps[*tap_index],
+                            read_index,
+                        )),
+                    };
+                }
+                executor.prepare_bindings(
+                    device,
+                    carriers,
+                    &[SymmetryFieldInput {
+                        node_id: field.node_id,
+                        donors,
+                        // The clean-history ring is borrowed from the host,
+                        // never duplicated.
+                        history: Some(host.temporal_history_view()),
+                    }],
+                )
+            });
+            let [first, second] = bindings;
+            // The motion group is prepared ONCE per node, outside the N-1
+            // parity loop: it holds no image view, so rebuilding it per read
+            // index would double its cost for nothing. Each admitted slot hands
+            // over BOTH committed parities of its field's vector/gate pair, and
+            // the executor prebuilds every `[slot 0][slot 1]` combination — the
+            // two slots are independent fields and are never required to agree.
+            //
+            // An UNADMITTED slot stays `None` and binds the executor's
+            // defined-zero neutral pair; the planner has already published the
+            // diagnostic that names it. An ADMITTED slot whose field the
+            // prepared resources do not own is a renderer/planner disagreement
+            // rather than a lost donor, so it is refused by name instead of
+            // being silently degraded to neutral — a neutral fallback there
+            // would hide exactly the wiring failure this hand-off exists to fix.
+            let mut motion_views: [Option<SymmetryMotionViews<'_>>; SYMMETRY_MOTION_SLOTS] =
+                [None, None];
+            for (slot, admitted) in field.motion_field_slots.iter().enumerate() {
+                let Some(field_slot) = *admitted else {
+                    continue;
+                };
+                let views = motion
+                    .and_then(|motion| motion.field_primitive_views(field_slot))
+                    .ok_or_else(|| {
+                        CompositionGpuError::InvalidSchedule(format!(
+                            "Symmetry Field node {} motion slot {slot} was admitted against \
+                             motion field {field_slot}, which the prepared motion resources do \
+                             not own",
+                            field.node_id.get()
+                        ))
+                    })?;
+                motion_views[slot] = Some(SymmetryMotionViews {
+                    vectors: views.vectors,
+                    gates: views.gates,
+                    grid: views.grid,
+                });
+            }
+            let motion_bindings = executor.prepare_motion_bindings(
+                device,
+                &[SymmetryFieldMotionInput {
+                    node_id: field.node_id,
+                    motion: motion_views,
+                }],
+            )?;
+            let uniform_slot = next_uniform_slot;
+            next_uniform_slot = next_uniform_slot.checked_add(1).ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(
+                    "Symmetry Field uniform slot count overflowed during preparation".into(),
+                )
+            })?;
+            prepared.push(PreparedSymmetryField {
+                scope,
+                node_id: field.node_id,
+                uniform_slot,
+                bindings: [first?, second?],
+                motion_bindings,
+                motion_field_slots: field.motion_field_slots,
+                tap_indices: indices.into_boxed_slice(),
+            });
+        }
+        Ok(())
+    };
+    for layer in plan.layers() {
+        visit(VisualScopeId::Layer(layer.stable_id), &layer.execution)?;
+    }
+    for group in plan.groups() {
+        visit(VisualScopeId::Group(group.id), &group.execution)?;
+    }
+    visit(VisualScopeId::Master, &plan.master().execution)?;
+    Ok(prepared)
+}
+
 /// Resolve one planned tap by its complete consumer identity. `RackNode`
 /// carries its route slot, so the first positional match is the exact route
 /// rather than whichever slot of a multi-route node happened to be collected
@@ -3213,9 +3601,12 @@ fn prepare_rack_segments(
             };
             let mut indices = Vec::new();
             for pass in rack_plan.passes() {
-                // Every authored slot is bound independently. A single-route
-                // kind fills only the primary slot; a two-route kind reaches
-                // this loop twice and its donors can never alias.
+                // Every authored slot of an ordinary rack pass is bound
+                // independently. A single-route kind fills only the primary
+                // slot; a two-route kind reaches this loop twice and its
+                // donors can never alias. The Symmetry Field is lifted into
+                // its own dedicated step and never reaches this segment
+                // builder at all.
                 for (index, tap) in pass.kind.image_taps().into_iter().enumerate() {
                     let Some(tap) = tap else {
                         continue;
@@ -5372,6 +5763,874 @@ mod tests {
             );
         }
         plan
+    }
+
+    /// One layer rack whose only authored node is a Symmetry Field, so the
+    /// plan must lift it out of segmentation into a dedicated step.
+    ///
+    /// The device ceiling is raised explicitly: every planner fixture runs on
+    /// `CreativeResourceLimits::default()`, whose
+    /// `max_sampled_textures_per_shader_stage` is the fixed rack layout's three,
+    /// while production reads the real device. Without this the dedicated pass
+    /// is correctly refused before a GPU is ever reached.
+    fn symmetry_field_layer_fixture(
+        dimensions: [u32; 2],
+        dedicated: bool,
+    ) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::A,
+            }],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::empty();
+        if dedicated {
+            layer_rack
+                .push(RuntimeVisualNodeKind::Symmetry(
+                    crate::symmetry::RuntimeSymmetryParams {
+                        mode: crate::symmetry::SymmetryMode::Dihedral,
+                        base_folds: 4.0,
+                        radial_phase_deg: 13.0,
+                        center: [0.4137, 0.5279],
+                        boundary: crate::symmetry::SymmetryBoundary::Mirror,
+                        ..Default::default()
+                    },
+                ))
+                .unwrap();
+        } else {
+            // The control: one ordinary rack node in the same authored place.
+            layer_rack
+                .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                    invert: 1.0,
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        let racks = vec![(stable_layer(1), layer_rack)];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        let plan = EvaluatedCompositionPlan::evaluate(&base, input).unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("a dedicated step forces an Advanced plan");
+        };
+        assert_eq!(
+            symmetry_field_step_count(advanced),
+            usize::from(dedicated),
+            "the planner must emit exactly one dedicated step, and none for the control"
+        );
+        plan
+    }
+
+    /// Three layers; the topmost carries one Symmetry Field whose two image
+    /// slots each select a DIFFERENT layer at the current frame's PreLocal
+    /// stage.
+    ///
+    /// Both routes are armed in the source mask, so both are really admitted as
+    /// taps rather than silently dropped. This is the schedule the renderer
+    /// cannot honour: a current-frame PreLocal donor is materialized into a
+    /// dedicated surface just before the node runs, and two of them on one node
+    /// would need two such materializations interleaved with one pass.
+    fn two_prelocal_symmetry_donors_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[3, 2, 1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::A,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::A,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(3),
+                    bus: BusAssignment::A,
+                },
+            ],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let prelocal = |id: u64, position: u32| ResolvedImageTap {
+            source: crate::visual_rack::ResolvedImageSource::SelectedLayer {
+                layer_id: stable_layer(id),
+                saved_position: SavedLayerPosition::new(position).unwrap(),
+                stage: LayerImageStage::PreLocalEffects,
+            },
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let mut layer_rack = RuntimeVisualRack::empty();
+        layer_rack
+            .push(RuntimeVisualNodeKind::Symmetry(
+                crate::symmetry::RuntimeSymmetryParams {
+                    mode: crate::symmetry::SymmetryMode::Dihedral,
+                    base_folds: 5.0,
+                    radial_phase_deg: 21.0,
+                    center: [0.4137, 0.5279],
+                    boundary: crate::symmetry::SymmetryBoundary::Mirror,
+                    source_mask: crate::symmetry::SymmetrySourceMask {
+                        carrier: true,
+                        donor0: true,
+                        donor1: true,
+                        clean_history: false,
+                    },
+                    donors: [prelocal(1, 3), prelocal(2, 2)],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        // Front to back, exactly as the evaluated base lists them.
+        let racks = vec![
+            (stable_layer(3), layer_rack),
+            (
+                stable_layer(2),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        EvaluatedCompositionPlan::evaluate(&base, input).unwrap()
+    }
+
+    /// Two layers; the upper carries a Symmetry Field whose motion slot 0
+    /// selects the lower layer, whose OWN Motion is exactly zero.
+    ///
+    /// The donor's primitive vector/gate field therefore exists only because
+    /// the planner set `required_as_donor`. That is the exact configuration the
+    /// live hand-off has to serve: an authored route, an admitted field, and a
+    /// donor with nothing visible of its own.
+    fn symmetry_motion_donor_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[2, 1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::empty();
+        layer_rack
+            .push(RuntimeVisualNodeKind::Symmetry(
+                crate::symmetry::RuntimeSymmetryParams {
+                    mode: crate::symmetry::SymmetryMode::Dihedral,
+                    base_folds: 6.0,
+                    radial_phase_deg: 17.0,
+                    center: [0.4137, 0.5279],
+                    boundary: crate::symmetry::SymmetryBoundary::Mirror,
+                    motion_gain: 0.75,
+                    motion_mask: crate::symmetry::SymmetryMotionMask {
+                        slot0: true,
+                        slot1: false,
+                    },
+                    motion: [
+                        MotionDonor::Selected {
+                            layer_id: stable_layer(1),
+                            saved_position: SavedLayerPosition::new(2).unwrap(),
+                        },
+                        MotionDonor::None,
+                    ],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        let racks = vec![
+            (stable_layer(2), layer_rack),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let motion = [
+            LayerMotionPlanInput {
+                stable_id: stable_layer(2),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(1),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        )
+        .with_motion(
+            MotionParams::default(),
+            &motion,
+            MotionDeviceLimits::new(8_192, u64::MAX),
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        EvaluatedCompositionPlan::evaluate(&base, input).unwrap()
+    }
+
+    /// The planner really admits the donor field, without an adapter.
+    #[test]
+    fn a_symmetry_motion_slot_resolves_to_an_admitted_donor_field_slot() {
+        let plan = symmetry_motion_donor_fixture([8, 8]);
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("a dedicated step forces an Advanced plan");
+        };
+        let field = advanced
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.execution.steps())
+            .find_map(|step| match step {
+                EvaluatedScopeStep::SymmetryField { plan } => Some(plan),
+                _ => None,
+            })
+            .expect("the dedicated step");
+        assert!(
+            field.motion_field_slots[0].is_some(),
+            "an armed motion slot naming a live donor must resolve to an admitted field"
+        );
+        assert_eq!(field.motion_field_slots[1], None);
+        let motion = advanced
+            .motion()
+            .advanced()
+            .expect("an advanced motion plan");
+        let donor = motion
+            .scope(VisualScopeId::Layer(stable_layer(1)))
+            .expect("the donor scope");
+        assert_eq!(donor.admitted_field_slot(), field.motion_field_slots[0]);
+        assert!(
+            donor.params.is_exact_zero(),
+            "the donor's own Motion must be exactly zero, so only required_as_donor \
+             can have pulled its primitive field into the plan"
+        );
+    }
+
+    /// The live hand-off, end to end on a real device: an authored motion route
+    /// reaches a prepared motion bind group, the encode selects the donor's
+    /// committed parity, and a warmed frame still allocates nothing.
+    ///
+    /// Offline export drives this same `CompositionGpuExecutor` over this same
+    /// evaluated plan and the same `symmetry_field.wgsl`, so there is no
+    /// export-only motion path to prove separately.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_symmetry_field_binds_its_authored_motion_donor_field() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let plan = symmetry_motion_donor_fixture(dimensions);
+        let donor = gpu.source(dimensions, [255, 0, 0, 255], "Symmetry motion donor");
+        let carrier = gpu.source(dimensions, [0, 200, 255, 255], "Symmetry motion carrier");
+        let sources = [
+            CompositionSourceDescriptor::new(stable_layer(1), &donor.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(2), &carrier.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .expect("an authored motion route must prepare");
+        let warmed = executor.allocation_snapshot();
+        let first = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert_eq!(
+            executor.allocation_snapshot(),
+            warmed,
+            "selecting a committed motion parity must not allocate"
+        );
+        let second = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        assert!(first.iter().flatten().all(|value| value.is_finite()));
+        assert!(second.iter().flatten().all(|value| value.is_finite()));
+    }
+
+    /// One authored composition, expressed under whichever layer-identity
+    /// scheme the caller names and with the motion route either armed or not.
+    ///
+    /// The donor's OWN Motion is exactly zero — `MotionParams::is_exact_zero()`
+    /// reads only `transplant.amount` and `shutter.angle_degrees`, and both stay
+    /// at their defaults — while it still publishes a codec field. So the
+    /// primitive vector/gate pair exists for exactly one reason: an armed motion
+    /// slot on the layer above set `required_as_donor`. Unarm the slot and the
+    /// field is never admitted at all, which is the honest control.
+    ///
+    /// Everything else is held identical between the two arms: carrier-only
+    /// source mask, zero hue span, same geometry, same seed. The armed arm
+    /// therefore differs from the unarmed one only in each sector record's
+    /// motion lane, and with a stationary field even that difference is
+    /// invisible — `raw + vec2f(0.0)` is bit-identical to `raw`.
+    fn symmetry_motion_payoff_fixture(
+        dimensions: [u32; 2],
+        carrier_id: u64,
+        donor_id: u64,
+        armed: bool,
+    ) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[carrier_id, donor_id], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(donor_id),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(carrier_id),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::empty();
+        layer_rack
+            .push(RuntimeVisualNodeKind::Symmetry(
+                crate::symmetry::RuntimeSymmetryParams {
+                    mode: crate::symmetry::SymmetryMode::Dihedral,
+                    // Twelve reachable sector records. With one motion slot
+                    // armed the motion lane is a two-way draw, so the odds that
+                    // no reachable record names the slot are 1 in 4,096 — and
+                    // the fixture asserts it outright rather than trusting them.
+                    base_folds: 12.0,
+                    radial_phase_deg: 17.0,
+                    center: [0.4137, 0.5279],
+                    boundary: crate::symmetry::SymmetryBoundary::Mirror,
+                    motion_gain: 1.0,
+                    motion_mask: crate::symmetry::SymmetryMotionMask {
+                        slot0: armed,
+                        slot1: false,
+                    },
+                    motion: [
+                        if armed {
+                            MotionDonor::Selected {
+                                layer_id: stable_layer(donor_id),
+                                saved_position: SavedLayerPosition::new(2).unwrap(),
+                            }
+                        } else {
+                            MotionDonor::None
+                        },
+                        MotionDonor::None,
+                    ],
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        let racks = vec![
+            (stable_layer(carrier_id), layer_rack),
+            (
+                stable_layer(donor_id),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let motion = [
+            LayerMotionPlanInput {
+                stable_id: stable_layer(carrier_id),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(donor_id),
+                params: MotionParams {
+                    field_source: MotionFieldSource::CodecVectors,
+                    ..MotionParams::default()
+                },
+                codec: MotionCodecFrameFacts {
+                    available: true,
+                    source_generation: 7,
+                    frame_ordinal: 9,
+                },
+            },
+        ];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        )
+        .with_motion(
+            MotionParams::default(),
+            &motion,
+            MotionDeviceLimits::new(8_192, u64::MAX),
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        EvaluatedCompositionPlan::evaluate(&base, input).unwrap()
+    }
+
+    /// A spatially uniform codec field, so a moved pixel can only be the
+    /// authored route and never an accident of one grid cell.
+    fn uniform_motion_field(
+        dimensions: [u32; 2],
+        grid: MotionGrid,
+        velocity_uv_per_second: [f32; 2],
+    ) -> MotionField {
+        MotionField::from_samples(
+            dimensions,
+            grid,
+            MotionFieldOrigin::CodecVectors,
+            std::iter::repeat_n(
+                MotionVectorSample {
+                    velocity_uv_per_second,
+                    confidence: 1.0,
+                    visibility: 1.0,
+                },
+                grid.vector_count as usize,
+            ),
+        )
+        .expect("a uniform codec field")
+    }
+
+    /// The fixture's codec attachment. The generation and ordinal match the
+    /// donor's `MotionCodecFrameFacts` exactly, because
+    /// `EvaluatedMotionFieldPlan::accepts` compares every one of them.
+    fn payoff_attachment<'a>(
+        scope: VisualScopeId,
+        dimensions: [u32; 2],
+        grid: MotionGrid,
+        field: &'a MotionField,
+    ) -> MotionFieldAttachment<'a> {
+        MotionFieldAttachment {
+            scope,
+            source_generation: 7,
+            frame_ordinal: 9,
+            product_content_sha256: [11; 32],
+            algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
+            source_dimensions: dimensions,
+            grid,
+            field,
+        }
+    }
+
+    /// A carrier a displacement cannot land on unnoticed: a two-pixel checker
+    /// under a per-column ramp, so no translation of a few pixels reproduces
+    /// the original frame.
+    fn checkered_source(gpu: &GpuHarness, dimensions: [u32; 2], label: &'static str) -> TestSource {
+        let source = gpu.source(dimensions, [0, 0, 0, 255], label);
+        let mut bytes = vec![0_u8; dimensions[0] as usize * dimensions[1] as usize * 4];
+        for row in 0..dimensions[1] as usize {
+            for column in 0..dimensions[0] as usize {
+                let offset = (row * dimensions[0] as usize + column) * 4;
+                let ramp = (column * 255 / dimensions[0].max(1) as usize) as u8;
+                let texel = if (column / 2 + row / 2) % 2 == 0 {
+                    [255, ramp, 16, 255]
+                } else {
+                    [16, ramp, 255, 255]
+                };
+                bytes[offset..offset + 4].copy_from_slice(&texel);
+            }
+        }
+        gpu.queue.write_texture(
+            source.texture.as_image_copy(),
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(dimensions[0] * 4),
+                rows_per_image: Some(dimensions[1]),
+            },
+            wgpu::Extent3d {
+                width: dimensions[0],
+                height: dimensions[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        source
+    }
+
+    /// **The payoff.** An authored Symmetry Field motion route reaches the
+    /// pixels — which is precisely what binding `motion: [None, None]` broke,
+    /// and what the three-bind-group split exists to fix.
+    ///
+    /// The donor's own visible Motion is exactly zero, so its primitive
+    /// vector/gate pair is in the plan only because `required_as_donor` put it
+    /// there. A known uniform field is driven through it and four things are
+    /// proven at once:
+    ///
+    /// - **(a)** the frame differs both from the same node fed a stationary
+    ///   field and from the same node with the slot unarmed;
+    /// - **(b)** the live layer-identity scheme (process-lifetime ids) and
+    ///   export's `position + 1` scheme render byte-identical frames from the
+    ///   same authored patch at the same frame index;
+    /// - **(c)** an unarmed slot, and an armed slot whose field never
+    ///   materialized, are byte-identical to the stationary neutral pair;
+    /// - **(d)** the warm-allocation snapshot still holds with eight prebuilt
+    ///   bind groups per node.
+    ///
+    /// Every render is one frame from a pristine executor with `commit: false`,
+    /// so no temporal ring or motion memory advance can leak between the
+    /// comparisons.
+    ///
+    /// The fixture was confirmed discriminating rather than incidentally true:
+    /// restoring `motion: [None, None]` in `prepare_symmetry_fields` — the exact
+    /// gap this stage closed — fails it at (a) on this adapter.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_symmetry_field_authored_motion_route_reaches_the_pixels() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let grid = MotionGrid::for_source(dimensions, Default::default()).unwrap();
+        // 6 UV/s through one reference tick is 0.2 UV — better than three pixels
+        // here, far outside binary16 noise, and well inside the ±64 clamp.
+        let moving = uniform_motion_field(dimensions, grid, [6.0, -6.0]);
+        let stationary = uniform_motion_field(dimensions, grid, [0.0, 0.0]);
+
+        // Live process-lifetime identities and export's position + 1 identities,
+        // for the same authored composition.
+        const LIVE_CARRIER: u64 = 908;
+        const LIVE_DONOR: u64 = 907;
+        let live = symmetry_motion_payoff_fixture(dimensions, LIVE_CARRIER, LIVE_DONOR, true);
+        let offline = symmetry_motion_payoff_fixture(dimensions, 2, 1, true);
+        let unarmed = symmetry_motion_payoff_fixture(dimensions, LIVE_CARRIER, LIVE_DONOR, false);
+
+        // The route really is armed on a donor with nothing visible of its own,
+        // and the reachable part of the sector table really names it.
+        let EvaluatedCompositionPlan::Advanced(advanced) = &live else {
+            panic!("a dedicated step forces an Advanced plan");
+        };
+        let field_plan = advanced
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.execution.steps())
+            .find_map(|step| match step {
+                EvaluatedScopeStep::SymmetryField { plan } => Some(plan),
+                _ => None,
+            })
+            .expect("the dedicated step");
+        assert!(
+            field_plan.motion_field_slots[0].is_some(),
+            "the armed slot must resolve to an admitted primitive field"
+        );
+        let donor_scope = VisualScopeId::Layer(stable_layer(LIVE_DONOR));
+        let donor = advanced
+            .motion()
+            .advanced()
+            .expect("an advanced motion plan")
+            .scope(donor_scope)
+            .expect("the donor scope");
+        assert!(
+            donor.params.is_exact_zero(),
+            "only required_as_donor can have pulled this field into the plan"
+        );
+        let folds = usize::from(field_plan.params.values().effective_folds());
+        let table = field_plan.params.sector_table(field_plan.domain);
+        assert!(
+            table.records()[..folds]
+                .iter()
+                .any(|record| record.motion == Some(0)),
+            "no reachable sector names the armed motion slot"
+        );
+
+        let carrier_source = checkered_source(&gpu, dimensions, "Symmetry payoff carrier");
+        let donor_source = gpu.source(dimensions, [255, 0, 0, 255], "Symmetry payoff donor");
+        let live_sources = [
+            CompositionSourceDescriptor::new(
+                stable_layer(LIVE_DONOR),
+                &donor_source.view,
+                dimensions,
+            ),
+            CompositionSourceDescriptor::new(
+                stable_layer(LIVE_CARRIER),
+                &carrier_source.view,
+                dimensions,
+            ),
+        ];
+        let offline_sources = [
+            CompositionSourceDescriptor::new(stable_layer(1), &donor_source.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(2), &carrier_source.view, dimensions),
+        ];
+        let attachment = |scope, field| payoff_attachment(scope, dimensions, grid, field);
+
+        // (a) and (d): the armed route with a real field, twice, from one warm
+        // executor.
+        let mut armed = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        armed
+            .prepare(&gpu.device, &gpu.queue, &live, &live_sources)
+            .expect("an authored motion route must prepare");
+        let warmed = armed.allocation_snapshot();
+        let moved = gpu.render_with_motion(
+            &mut armed,
+            &live,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[attachment(donor_scope, &moving)],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(
+            armed.allocation_snapshot(),
+            warmed,
+            "selecting a committed motion parity must allocate nothing"
+        );
+        let repeated = gpu.render_with_motion(
+            &mut armed,
+            &live,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[attachment(donor_scope, &moving)],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(armed.allocation_snapshot(), warmed);
+        assert_eq!(moved, repeated, "the routed pass is deterministic");
+
+        // The same authored node, the same admitted field, a stationary vector.
+        let mut held = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        held.prepare(&gpu.device, &gpu.queue, &live, &live_sources)
+            .unwrap();
+        let still = gpu.render_with_motion(
+            &mut held,
+            &live,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[attachment(donor_scope, &stationary)],
+                held_scopes: &[],
+            },
+        );
+        assert_ne!(
+            moved, still,
+            "an authored motion route must reach the image"
+        );
+
+        // (c) The armed slot whose field never materialized: no attachment at
+        // all, so the committed parity holds nothing and the readiness bit
+        // closes the record's validity lane.
+        let mut unmaterialized =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        unmaterialized
+            .prepare(&gpu.device, &gpu.queue, &live, &live_sources)
+            .unwrap();
+        let missing = gpu.render_with_motion(
+            &mut unmaterialized,
+            &live,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput::default(),
+        );
+        assert_eq!(
+            missing, still,
+            "a missing motion field must be byte-identical to the neutral pair"
+        );
+
+        // (c) The unarmed slot, offered the moving field it never asked for.
+        let mut control = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        control
+            .prepare(&gpu.device, &gpu.queue, &unarmed, &live_sources)
+            .unwrap();
+        let unarmed_pixels = gpu.render_with_motion(
+            &mut control,
+            &unarmed,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[attachment(donor_scope, &moving)],
+                held_scopes: &[],
+            },
+        );
+        assert_ne!(
+            moved, unarmed_pixels,
+            "arming the slot must be visible against the unarmed control"
+        );
+        assert_eq!(
+            unarmed_pixels, still,
+            "an unarmed slot must be byte-identical to the neutral pair"
+        );
+
+        // (b) Export's layer-identity scheme, same authored patch, same frame.
+        let mut export = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        export
+            .prepare(&gpu.device, &gpu.queue, &offline, &offline_sources)
+            .unwrap();
+        let offline_pixels = gpu.render_with_motion(
+            &mut export,
+            &offline,
+            1.0 / 30.0,
+            false,
+            CompositionMotionFrameInput {
+                attachments: &[attachment(VisualScopeId::Layer(stable_layer(1)), &moving)],
+                held_scopes: &[],
+            },
+        );
+        assert_eq!(
+            moved, offline_pixels,
+            "live and offline must render the same authored patch identically"
+        );
+        assert!(moved.iter().flatten().all(|value| value.is_finite()));
+    }
+
+    /// The precondition of the refusal, proven without an adapter: the planner
+    /// really admits BOTH image slots as separate current-frame PreLocal taps
+    /// naming two different layers. Without this the GPU fixture below could
+    /// pass for the wrong reason.
+    #[test]
+    fn two_symmetry_image_slots_can_plan_two_distinct_current_prelocal_donors() {
+        let plan = two_prelocal_symmetry_donors_fixture([8, 8]);
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("a dedicated step forces an Advanced plan");
+        };
+        assert_eq!(symmetry_field_step_count(advanced), 1);
+        let mut donors = Vec::new();
+        for slot in 0..SYMMETRY_IMAGE_SLOTS {
+            let tap = advanced
+                .image_taps()
+                .iter()
+                .find(|tap| {
+                    matches!(
+                        tap.consumer,
+                        ImageTapConsumer::RackNode {
+                            scope: VisualScopeId::Layer(layer_id),
+                            slot: tap_slot,
+                            ..
+                        } if layer_id == stable_layer(3) && usize::from(tap_slot) == slot
+                    )
+                })
+                .unwrap_or_else(|| panic!("image slot {slot} must be admitted as its own tap"));
+            let PlannedImageSource::SelectedLayer {
+                layer_id,
+                stage: LayerImageStage::PreLocalEffects,
+            } = tap.resolved
+            else {
+                panic!("slot {slot} must resolve to a current-frame PreLocal donor");
+            };
+            assert_eq!(tap.origin.timing(), EdgeTiming::CurrentFrame);
+            donors.push(layer_id);
+        }
+        assert_eq!(donors, vec![stable_layer(1), stable_layer(2)]);
+    }
+
+    /// The renderer refuses that schedule by name rather than silently binding
+    /// one donor twice or dropping the second.
+    ///
+    /// This is the fixture the renderer stage deferred. It drives the real
+    /// evaluated plan through the real `prepare`, so the refusal is proven at
+    /// the seam that owns it, not by calling a predicate directly.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_symmetry_field_refuses_two_current_prelocal_donors() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let plan = two_prelocal_symmetry_donors_fixture(dimensions);
+        let first = gpu.source(dimensions, [255, 0, 0, 255], "PreLocal donor one");
+        let second = gpu.source(dimensions, [0, 255, 0, 255], "PreLocal donor two");
+        let carrier = gpu.source(dimensions, [0, 0, 255, 255], "Symmetry Field carrier");
+        let sources = [
+            CompositionSourceDescriptor::new(stable_layer(1), &first.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(2), &second.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(3), &carrier.view, dimensions),
+        ];
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        let error = executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .expect_err("two current PreLocal donors on one node must be refused");
+        let CompositionGpuError::InvalidSchedule(message) = &error else {
+            panic!("the refusal must be the typed InvalidSchedule, not {error:?}");
+        };
+        assert!(
+            message.contains("a Symmetry Field contains more than one current PreLocal donor"),
+            "the refusal must name the dedicated step: {message}"
+        );
+    }
+
+    /// The dedicated executor is real end to end: the composition builds it,
+    /// executes the authored step in place, and a warmed frame allocates
+    /// nothing. Two frames of the same plan are byte identical.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_symmetry_field_executes_in_place_and_warm_frames_allocate_nothing() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let plan = symmetry_field_layer_fixture(dimensions, true);
+        let control_plan = symmetry_field_layer_fixture(dimensions, false);
+        let source = gpu.source(
+            dimensions,
+            [0, 200, 255, 255],
+            "Symmetry Field layer source",
+        );
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let mut control = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        control
+            .prepare(&gpu.device, &gpu.queue, &control_plan, &sources)
+            .unwrap();
+        let control_warm = control.allocation_snapshot();
+        let mut executor =
+            CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        executor
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let warmed = executor.allocation_snapshot();
+        assert!(warmed.total() > 0);
+        // The exact frozen resource delta of one dedicated step, measured on a
+        // real device against the identical composition carrying an ordinary
+        // rack node instead: three tiny neutral textures, one uniform arena,
+        // one uniform bind group, one pipeline, TWO image bind groups per
+        // prepared N-1 parity — the composition prepares both committed read
+        // parities, exactly as it does for a rack segment, and each holds one
+        // group per carrier parity — plus FOUR motion bind groups, one per
+        // combination of the two motion slots' committed field parities. The
+        // motion groups are prepared once per node rather than per read
+        // parity, which is the whole point of splitting them out: the three
+        // parity dimensions add to eight groups instead of multiplying to
+        // sixteen. Zero full-frame surfaces either way.
+        const N_MINUS_ONE_PARITIES: u64 = 2;
+        assert_eq!(
+            warmed.rack_objects - control_warm.rack_objects,
+            3 + 1
+                + 1
+                + 1
+                + SYMMETRY_FIELD_CARRIER_PARITIES as u64 * N_MINUS_ONE_PARITIES
+                + SYMMETRY_FIELD_MOTION_GROUPS as u64,
+            "one dedicated step costs exactly its declared objects"
+        );
+        assert_eq!(warmed.retained_textures, control_warm.retained_textures);
+        assert_eq!(warmed.retained_views, control_warm.retained_views);
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("fixture must be Advanced");
+        };
+        // The dedicated pass owns no full-frame surface, so the admitted
+        // creative byte ledger is untouched by its presence.
+        assert_eq!(warmed.creative_bytes, advanced.resources().creative_bytes);
+
+        let first = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert_eq!(
+            executor.allocation_snapshot(),
+            warmed,
+            "a warmed frame carrying a dedicated pass must allocate nothing"
+        );
+        executor.reset_history();
+        let second = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+        assert_eq!(executor.allocation_snapshot(), warmed);
+        assert_eq!(first, second, "the dedicated pass is deterministic");
+        assert!(first.iter().flatten().all(|value| value.is_finite()));
     }
 
     #[test]

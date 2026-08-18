@@ -1,0 +1,49 @@
+{
+  "receipt": "gpu_eight_sampled_textures_in_one_pass_are_portable_under_the_device_floor",
+  "question": "Is one pass that simultaneously samples eight textures portable under the collide-o-scope device floor?",
+  "verdict": "PASS",
+  "commit": "4866d34",
+  "branch": "probe/s2-eight-texture-floor",
+  "adapter": {
+    "name": "AMD Radeon RX 6950 XT",
+    "backend": "vulkan",
+    "device_type": "DiscreteGpu",
+    "driver": "AMD proprietary driver",
+    "driver_info": "26.7.1 (AMD proprietary shader compiler)",
+    "vendor": 4098,
+    "device": 29605
+  },
+  "floor": {
+    "source": "src/renderer/state.rs:2892",
+    "required_features": "wgpu::Features::empty()",
+    "required_limits": "wgpu::Limits::default()",
+    "wgpu_version": "29.0.3",
+    "max_sampled_textures_per_shader_stage": 16,
+    "enforced_on_device": 16,
+    "adapter_raw_capability": 429391871
+  },
+  "evidence": {
+    "textures_sampled_in_one_pass": 8,
+    "bind_groups_used": 1,
+    "shader_sha256": "1d778553eab7791a66efa161ed4a4cea7a259468bfb49d4a0890c86e804ac418",
+    "naga_validation": "passed",
+    "pipeline_creation": "passed",
+    "expected_fingerprint": 1793,
+    "observed_fingerprint": 1793,
+    "fingerprint_exact_in_binary16": true,
+    "floor_maximum_16_layout": "accepted",
+    "over_floor_17_layout": "refused",
+    "refusal_detail": "Validation Error | Caused by: | In Device::create_bind_group_layout, label = 'seventeen-texture layout' | Too many bindings of type SampledTextures in Stage ShaderStages(FRAGMENT), limit is 16, count was 17. Check the limit `max_sampled_textures_per_shader_stage` passed to `Adapter::request_device`"
+  },
+  "interpretation": [
+    "The device was created with exactly the production required_limits, so wgpu validated every operation against the floor's 16-texture budget rather than this adapter's raw capability.",
+    "The 17-texture refusal on the same device demonstrates the cap was actively enforced, which is what makes the 8-texture success generalize.",
+    "request_device refuses any adapter below the floor, so no adapter that runs collide-o-scope can offer fewer than 16 sampled textures per fragment stage.",
+    "Eight is therefore portable with eight textures of headroom. The blocking constant is MAX_SAMPLED_TEXTURES_PER_PASS = 3 in src/visual_rack.rs:43, which is self-imposed policy, not a device capability."
+  ],
+  "scope_limits": [
+    "This receipt proves capability under the floor. It does not measure performance, bandwidth, or cache behaviour of an eight-tap pass.",
+    "One adapter and one backend were exercised; the portability claim rests on the enforced-cap argument, not on backend coverage.",
+    "No product module, shader, or admission constant was modified."
+  ]
+}

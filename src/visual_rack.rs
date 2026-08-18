@@ -17,6 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::performance::SavedLayerPosition;
 use crate::spatial::SpatialTransform;
+use crate::symmetry::{RuntimeSymmetryParams, SymmetryParams};
 
 pub const MAX_NODES_PER_RACK: usize = 8;
 pub const MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK: u32 = 32;
@@ -41,6 +42,16 @@ pub const MAX_GRAPH_SCOPES: usize = 274;
 /// textures. Dedicated creative passes are split by the composition planner
 /// and preflight against their own declared ceiling.
 pub const MAX_SAMPLED_TEXTURES_PER_PASS: u32 = 3;
+/// A dedicated creative pass owns its own bind layout and therefore its own,
+/// separate ceiling. Eight simultaneously sampled textures in one pass was
+/// proven portable under the production device floor
+/// (`Limits::default()`, `src/renderer/state.rs`) by the S2 probe, whose
+/// receipt `s2-eight-texture-floor-receipt.json` records the enforced-cap
+/// argument: the floor guarantees sixteen, and a seventeen-texture layout was
+/// refused on the same device. This ceiling is independent of
+/// [`MAX_SAMPLED_TEXTURES_PER_PASS`]; raising either one never raises the
+/// other, and the fixed Collision Rack layout stays capped at three.
+pub const MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS: u32 = 8;
 pub const MAX_CREATIVE_GPU_BYTES: u64 = 512 * 1024 * 1024;
 /// Rack ping/pong, A lane, B lane, Program lane, and one shared group-local
 /// scratch surface. Image taps/history are charged in addition to this base.
@@ -1565,6 +1576,11 @@ pub enum VisualNodeKind {
     Grain(GrainParams),
     Mask(MaskParams),
     Displace(DisplaceParams),
+    /// The dedicated eight-texture Symmetry Field. Unlike every kind above it,
+    /// this one is not encodable as an ordinary Collision Rack pass: the rack's
+    /// fixed bind layout carries two sampled textures, so the composition
+    /// planner splits it into its own dedicated step.
+    Symmetry(SymmetryParams),
     Residual(ResidualParams),
 }
 
@@ -1581,6 +1597,7 @@ impl VisualNodeKind {
             Self::Grain(_) => NodeKindTag::Grain,
             Self::Mask(_) => NodeKindTag::Mask,
             Self::Displace(_) => NodeKindTag::Displace,
+            Self::Symmetry(_) => NodeKindTag::Symmetry,
             Self::Residual(_) => NodeKindTag::Residual,
         }
     }
@@ -1595,6 +1612,7 @@ impl VisualNodeKind {
             Self::Grain(value) => Self::Grain(value.sanitized()),
             Self::Mask(value) => Self::Mask(value.sanitized()),
             Self::Displace(value) => Self::Displace(value.sanitized()),
+            Self::Symmetry(value) => Self::Symmetry(value.sanitized()),
             Self::Residual(value) => Self::Residual(value.sanitized()),
             marker => marker,
         }
@@ -1688,6 +1706,7 @@ pub enum NodeKindTag {
     Grain,
     Mask,
     Displace,
+    Symmetry,
     Residual,
 }
 
@@ -1708,6 +1727,32 @@ impl NodeKindTag {
             Self::Mask => 9,
             Self::Displace => 10,
             Self::Residual => 11,
+            Self::Symmetry => 12,
+        }
+    }
+
+    /// Kinds the composition planner lifts out of ordinary rack segmentation
+    /// into their own dedicated pass. Their `sampled_textures_in_pass` is
+    /// charged against [`MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS`] instead of
+    /// the fixed rack layout's [`MAX_SAMPLED_TEXTURES_PER_PASS`]; the two
+    /// ceilings are independent and neither may be raised to admit the other.
+    pub const fn occupies_dedicated_pass(self) -> bool {
+        match self {
+            Self::Symmetry => true,
+            Self::LegacyCanonical
+            | Self::LegacyTemporal
+            | Self::Transform
+            | Self::DigitalColor
+            | Self::Key
+            | Self::Cellular
+            | Self::Shift
+            | Self::Grain
+            | Self::Mask
+            // Residual reads two donors alongside its carrier, which still
+            // fits the fixed rack layout's three sampled textures, so it stays
+            // an ordinary segmented rack pass.
+            | Self::Residual
+            | Self::Displace => false,
         }
     }
 }
@@ -1742,7 +1787,7 @@ pub struct NodeKindDescriptor {
     pub budget: NodeResourceBudget,
 }
 
-pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 11] = [
+pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 12] = [
     NodeKindDescriptor {
         tag: NodeKindTag::LegacyCanonical,
         key: "legacy_canonical",
@@ -1923,6 +1968,32 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 11] = [
             reduced_resolution_surfaces: 2,
         },
     },
+    NodeKindDescriptor {
+        tag: NodeKindTag::Symmetry,
+        key: "symmetry",
+        title: "Symmetry Field",
+        budget: NodeResourceBudget {
+            full_frame_passes: 1,
+            // Dry carrier, the folded source, and one motion vector/gate pair.
+            logical_texture_lookups_per_pixel: 4,
+            // Ten explicit operations: four loads for the dry carrier, four for
+            // the folded source, and one each for the vector and gate lanes,
+            // which are read at their own grid resolution without filtering.
+            texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 2 + 2,
+            // Carrier, donor 0, donor 1, the clean-history D2 array, and a
+            // vector/gate pair per motion slot: eight simultaneous bindings in
+            // one dedicated pass.
+            sampled_textures_in_pass: 8,
+            // The two fixed image slots. Motion slots are admitted through the
+            // motion planner's donor flags, not as cross-scope image taps.
+            cross_input_taps: 2,
+            // The Symmetry Field is one full-output dedicated pass. It owns no
+            // reduced block grid and no persistent sub-frame surface, so both
+            // reduced-resolution ledgers stay at zero.
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
 ];
 
 pub fn node_kind_descriptor(tag: NodeKindTag) -> &'static NodeKindDescriptor {
@@ -1941,6 +2012,11 @@ pub enum NodeParamType {
     Vec2,
     Color,
     ImageTap,
+    /// A motion-field route. Like [`NodeParamType::ImageTap`] it is stable
+    /// authored topology rather than a value, and it is deliberately a distinct
+    /// type: a motion route resolves against the motion planner's donor flags,
+    /// not against the image dependency graph.
+    MotionDonor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2305,6 +2381,153 @@ pub const NODE_PARAM_DESCRIPTORS: &[NodeParamDescriptor] = &[
         dice_eligible: false,
         modulatable: false,
     },
+    // Symmetry Field. Every wire key is prefixed so none of them can
+    // cross-resolve against another kind through the deliberate shared-key path
+    // in `StableNodeParameter::same_wire_parameter`: this node owns several
+    // values whose bare names ("scale", "phase", "seed", "center") are already
+    // in use elsewhere in the registry.
+    //
+    // The four routes, the two discrete laws, the seed, and the six mask bits
+    // are stable authored topology: enumerable so every consumer can see them,
+    // but neither modulatable nor Dice-eligible.
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_mode",
+        value_type: NodeParamType::Enum,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_boundary",
+        value_type: NodeParamType::Enum,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_seed",
+        value_type: NodeParamType::Unsigned,
+        range: None,
+        default: Some(0.0),
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_donor0_tap",
+        value_type: NodeParamType::ImageTap,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_donor1_tap",
+        value_type: NodeParamType::ImageTap,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_motion0_donor",
+        value_type: NodeParamType::MotionDonor,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_motion1_donor",
+        value_type: NodeParamType::MotionDonor,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_source_carrier",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_source_donor0",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_source_donor1",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_source_history",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_motion_slot0",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_motion_slot1",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    float_param!(Symmetry, "symmetry_base_folds", 1.0, 32.0, 1.0),
+    float_param!(Symmetry, "symmetry_fold_offset", -32.0, 32.0, 0.0),
+    float_param!(Symmetry, "symmetry_radial_phase_deg", -180.0, 180.0, 0.0),
+    float_param!(Symmetry, "symmetry_orbit_phase", -1.0, 1.0, 0.0),
+    float_param!(Symmetry, "symmetry_planar_axis_deg", -180.0, 180.0, 0.0),
+    float_param!(Symmetry, "symmetry_planar_phase", -4.0, 4.0, 0.0),
+    float_param!(Symmetry, "symmetry_cell_skew", -1.0, 1.0, 0.0),
+    float_param!(Symmetry, "symmetry_spiral_scale", -1.0, 1.0, 0.0),
+    float_param!(Symmetry, "symmetry_orbit_radius", 0.0, 1.0, 0.0),
+    float_param!(Symmetry, "symmetry_orbit_spin_deg", -180.0, 180.0, 0.0),
+    float_param!(Symmetry, "symmetry_motion_gain", -1.0, 1.0, 0.0),
+    float_param!(Symmetry, "symmetry_hue_span", 0.0, 1.0, 0.0),
+    NodeParamDescriptor {
+        kind: NodeKindTag::Symmetry,
+        key: "symmetry_center",
+        value_type: NodeParamType::Vec2,
+        range: Some([-1.0, 2.0]),
+        default: Some(0.5),
+        dice_eligible: true,
+        modulatable: true,
+    },
     // Residual exposes exactly two continuous values, under wire keys that are
     // unique across every kind so a modulation route authored for another node
     // can never cross-resolve onto this one. Both routes, both discrete laws,
@@ -2411,6 +2634,7 @@ pub enum RackError {
     RackLogicalLookupBudget { lookups: u32, limit: u32 },
     RackSampleBudget { samples: u32, limit: u32 },
     PassTextureBudget { textures: u32, limit: u32 },
+    DedicatedPassTextureBudget { textures: u32, limit: u32 },
 }
 
 impl fmt::Display for RackError {
@@ -2469,6 +2693,10 @@ impl fmt::Display for RackError {
                 formatter,
                 "rack pass requests {textures} sampled textures; limit is {limit}"
             ),
+            Self::DedicatedPassTextureBudget { textures, limit } => write!(
+                formatter,
+                "dedicated pass requests {textures} sampled textures; limit is {limit}"
+            ),
         }
     }
 }
@@ -2480,7 +2708,13 @@ pub struct RackResourceBudget {
     pub full_frame_passes: u32,
     pub logical_texture_lookups_per_pixel: u32,
     pub texture_samples_per_pixel: u32,
+    /// Simultaneous bindings of the widest *ordinary* rack pass. Dedicated
+    /// kinds are deliberately excluded so the fixed rack bind layout keeps its
+    /// own three-texture ceiling.
     pub max_sampled_textures_in_pass: u32,
+    /// Simultaneous bindings of the widest *dedicated* pass, charged against
+    /// [`MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS`].
+    pub max_sampled_textures_in_dedicated_pass: u32,
     pub cross_input_taps: u32,
     /// Summed reduced-grid passes. These are additional to
     /// `full_frame_passes`; a node that declares one of each encodes both.
@@ -2766,9 +3000,11 @@ impl VisualRack {
                 .texture_samples_per_pixel
                 .checked_add(u32::from(budget.texture_samples_per_pixel))
                 .ok_or(RackError::ResourceOverflow)?;
-            result.max_sampled_textures_in_pass = result
-                .max_sampled_textures_in_pass
-                .max(u32::from(budget.sampled_textures_in_pass));
+            charge_sampled_textures(
+                &mut result,
+                node.kind.tag(),
+                budget.sampled_textures_in_pass,
+            );
             result.cross_input_taps = result
                 .cross_input_taps
                 .checked_add(u32::from(budget.cross_input_taps))
@@ -2800,37 +3036,52 @@ impl VisualRack {
                 limit: MAX_SAMPLED_TEXTURES_PER_PASS,
             });
         }
+        validate_dedicated_pass_textures(result.max_sampled_textures_in_dedicated_pass)?;
         Ok(result)
     }
 
     /// Every group named by every route slot, in node then slot order. The
-    /// walk yields a fixed slot-width array per node so a two-route kind can
+    /// walk yields a fixed slot-width array per node so a multi-route kind can
     /// never have its second route silently dropped by a one-value closure.
     pub fn referenced_group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
         self.nodes
             .iter()
-            .flat_map(|node| match node.kind {
-                VisualNodeKind::Mask(mask) => [
-                    mask.image_tap().and_then(SavedImageTap::referenced_group),
-                    None,
-                ],
-                VisualNodeKind::Displace(displace) => [displace.referenced_group(), None],
-                VisualNodeKind::Residual(residual) => residual.referenced_groups(),
-                _ => [None, None],
+            .flat_map(|node| -> [Option<GroupId>; 2] {
+                match node.kind {
+                    VisualNodeKind::Mask(mask) => [
+                        mask.image_tap().and_then(SavedImageTap::referenced_group),
+                        None,
+                    ],
+                    VisualNodeKind::Displace(displace) => [displace.referenced_group(), None],
+                    VisualNodeKind::Residual(residual) => residual.referenced_groups(),
+                    VisualNodeKind::Symmetry(symmetry) => symmetry.referenced_groups(),
+                    _ => [None; 2],
+                }
             })
             .flatten()
     }
 
     pub fn selected_layer_positions(&self) -> impl Iterator<Item = SavedLayerPosition> + '_ {
+        // Slot width is the widest authored route count in the tree: Symmetry
+        // names two image donors plus two motion donors. A narrower kind pads
+        // rather than shrinking the array, so no route is ever truncated away.
         self.nodes
             .iter()
-            .flat_map(|node| match node.kind {
-                VisualNodeKind::Mask(MaskParams::Image(matte)) => {
-                    [matte.selected_layer_position(), None]
+            .flat_map(|node| -> [Option<SavedLayerPosition>; 4] {
+                match node.kind {
+                    VisualNodeKind::Mask(MaskParams::Image(matte)) => {
+                        [matte.selected_layer_position(), None, None, None]
+                    }
+                    VisualNodeKind::Displace(displace) => {
+                        [displace.selected_layer_position(), None, None, None]
+                    }
+                    VisualNodeKind::Residual(residual) => {
+                        let [structure, detail] = residual.selected_layer_positions();
+                        [structure, detail, None, None]
+                    }
+                    VisualNodeKind::Symmetry(symmetry) => symmetry.selected_layer_positions(),
+                    _ => [None; 4],
                 }
-                VisualNodeKind::Displace(displace) => [displace.selected_layer_position(), None],
-                VisualNodeKind::Residual(residual) => residual.selected_layer_positions(),
-                _ => [None, None],
             })
             .flatten()
     }
@@ -2850,6 +3101,9 @@ impl VisualRack {
                 }
                 VisualNodeKind::Displace(displace) => {
                     displace.mark_group_output_missing(removed);
+                }
+                VisualNodeKind::Symmetry(symmetry) => {
+                    symmetry.mark_group_output_missing(removed);
                 }
                 VisualNodeKind::Residual(residual) => {
                     residual.mark_group_output_missing(removed);
@@ -3365,6 +3619,7 @@ pub enum RuntimeVisualNodeKind {
     Grain(GrainParams),
     Mask(RuntimeMaskParams),
     Displace(RuntimeDisplaceParams),
+    Symmetry(RuntimeSymmetryParams),
     Residual(RuntimeResidualParams),
 }
 
@@ -3381,6 +3636,7 @@ impl RuntimeVisualNodeKind {
             Self::Grain(_) => NodeKindTag::Grain,
             Self::Mask(_) => NodeKindTag::Mask,
             Self::Displace(_) => NodeKindTag::Displace,
+            Self::Symmetry(_) => NodeKindTag::Symmetry,
             Self::Residual(_) => NodeKindTag::Residual,
         }
     }
@@ -3407,6 +3663,9 @@ impl RuntimeVisualNodeKind {
             VisualNodeKind::Displace(value) => Self::Displace(
                 RuntimeDisplaceParams::resolve_routes(value, layer_at_position, group_exists),
             ),
+            VisualNodeKind::Symmetry(value) => Self::Symmetry(
+                RuntimeSymmetryParams::resolve_routes(value, layer_at_position, group_exists),
+            ),
             VisualNodeKind::Residual(value) => Self::Residual(
                 RuntimeResidualParams::resolve_routes(value, layer_at_position, group_exists),
             ),
@@ -3430,6 +3689,9 @@ impl RuntimeVisualNodeKind {
             Self::Displace(value) => {
                 VisualNodeKind::Displace(value.capture_routes(position_of_layer))
             }
+            Self::Symmetry(value) => {
+                VisualNodeKind::Symmetry(value.capture_routes(position_of_layer))
+            }
             Self::Residual(value) => {
                 VisualNodeKind::Residual(value.capture_routes(position_of_layer))
             }
@@ -3446,6 +3708,7 @@ impl RuntimeVisualNodeKind {
             Self::Grain(value) => Self::Grain(value.sanitized()),
             Self::Mask(value) => Self::Mask(value.sanitized()),
             Self::Displace(value) => Self::Displace(value.sanitized()),
+            Self::Symmetry(value) => Self::Symmetry(value.sanitized()),
             Self::Residual(value) => Self::Residual(value.sanitized()),
             marker => marker,
         }
@@ -3866,9 +4129,11 @@ impl RuntimeVisualRack {
                 .texture_samples_per_pixel
                 .checked_add(u32::from(budget.texture_samples_per_pixel))
                 .ok_or(RackError::ResourceOverflow)?;
-            result.max_sampled_textures_in_pass = result
-                .max_sampled_textures_in_pass
-                .max(u32::from(budget.sampled_textures_in_pass));
+            charge_sampled_textures(
+                &mut result,
+                node.kind.tag(),
+                budget.sampled_textures_in_pass,
+            );
             result.cross_input_taps = result
                 .cross_input_taps
                 .checked_add(u32::from(budget.cross_input_taps))
@@ -3903,6 +4168,7 @@ impl RuntimeVisualRack {
             }
             .into());
         }
+        validate_dedicated_pass_textures(result.max_sampled_textures_in_dedicated_pass)?;
         Ok(result)
     }
 
@@ -3911,29 +4177,44 @@ impl RuntimeVisualRack {
     pub fn referenced_group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
         self.nodes
             .iter()
-            .flat_map(|node| match node.kind {
-                RuntimeVisualNodeKind::Mask(mask) => [
-                    mask.image_tap()
-                        .and_then(ResolvedImageTap::referenced_group),
-                    None,
-                ],
-                RuntimeVisualNodeKind::Displace(displace) => [displace.referenced_group(), None],
-                RuntimeVisualNodeKind::Residual(residual) => residual.referenced_groups(),
-                _ => [None, None],
+            .flat_map(|node| -> [Option<GroupId>; 2] {
+                match node.kind {
+                    RuntimeVisualNodeKind::Mask(mask) => [
+                        mask.image_tap()
+                            .and_then(ResolvedImageTap::referenced_group),
+                        None,
+                    ],
+                    RuntimeVisualNodeKind::Displace(displace) => {
+                        [displace.referenced_group(), None]
+                    }
+                    RuntimeVisualNodeKind::Residual(residual) => residual.referenced_groups(),
+                    RuntimeVisualNodeKind::Symmetry(symmetry) => symmetry.referenced_groups(),
+                    _ => [None; 2],
+                }
             })
             .flatten()
     }
 
     pub fn selected_layer_ids(&self) -> impl Iterator<Item = StableLayerId> + '_ {
+        // Same widest-slot law as the saved walk: Symmetry's four donors set
+        // the width and every narrower kind pads into it.
         self.nodes
             .iter()
-            .flat_map(|node| match node.kind {
-                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
-                    [matte.selected_layer_id(), None]
+            .flat_map(|node| -> [Option<StableLayerId>; 4] {
+                match node.kind {
+                    RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
+                        [matte.selected_layer_id(), None, None, None]
+                    }
+                    RuntimeVisualNodeKind::Displace(displace) => {
+                        [displace.selected_layer_id(), None, None, None]
+                    }
+                    RuntimeVisualNodeKind::Residual(residual) => {
+                        let [structure, detail] = residual.selected_layer_ids();
+                        [structure, detail, None, None]
+                    }
+                    RuntimeVisualNodeKind::Symmetry(symmetry) => symmetry.selected_layer_ids(),
+                    _ => [None; 4],
                 }
-                RuntimeVisualNodeKind::Displace(displace) => [displace.selected_layer_id(), None],
-                RuntimeVisualNodeKind::Residual(residual) => residual.selected_layer_ids(),
-                _ => [None, None],
             })
             .flatten()
     }
@@ -3946,6 +4227,9 @@ impl RuntimeVisualRack {
                 }
                 RuntimeVisualNodeKind::Displace(displace) => {
                     displace.mark_layer_output_missing(removed);
+                }
+                RuntimeVisualNodeKind::Symmetry(symmetry) => {
+                    symmetry.mark_layer_output_missing(removed);
                 }
                 RuntimeVisualNodeKind::Residual(residual) => {
                     residual.mark_layer_output_missing(removed);
@@ -3963,6 +4247,9 @@ impl RuntimeVisualRack {
                 }
                 RuntimeVisualNodeKind::Displace(displace) => {
                     displace.mark_group_output_missing(removed);
+                }
+                RuntimeVisualNodeKind::Symmetry(symmetry) => {
+                    symmetry.mark_group_output_missing(removed);
                 }
                 RuntimeVisualNodeKind::Residual(residual) => {
                     residual.mark_group_output_missing(removed);
@@ -4486,6 +4773,7 @@ impl CreativeResourcePlan {
         let mut logical_lookups = 0_u32;
         let mut samples = 0_u32;
         let mut max_textures = 0_u32;
+        let mut max_dedicated_textures = 0_u32;
         for (index, rack) in racks.iter().enumerate() {
             let budget = rack
                 .resource_budget()
@@ -4500,6 +4788,8 @@ impl CreativeResourcePlan {
                 .checked_add(budget.texture_samples_per_pixel)
                 .ok_or(ResourcePreflightError::ArithmeticOverflow)?;
             max_textures = max_textures.max(budget.max_sampled_textures_in_pass);
+            max_dedicated_textures =
+                max_dedicated_textures.max(budget.max_sampled_textures_in_dedicated_pass);
         }
         validate_frame_texture_budgets(logical_lookups, samples)?;
         let texture_limit = limits
@@ -4509,6 +4799,16 @@ impl CreativeResourcePlan {
             return Err(ResourcePreflightError::SampledTextureLimit {
                 requested: max_textures,
                 limit: texture_limit,
+            });
+        }
+        // A dedicated creative pass owns its own bind layout, so it is checked
+        // against the device's reported ceiling directly. The fixed rack
+        // layout's `.min(MAX_SAMPLED_TEXTURES_PER_PASS)` clamp above must never
+        // be applied here, and this check must never relax the clamp above.
+        if max_dedicated_textures > limits.max_sampled_textures_per_shader_stage {
+            return Err(ResourcePreflightError::SampledTextureLimit {
+                requested: max_dedicated_textures,
+                limit: limits.max_sampled_textures_per_shader_stage,
             });
         }
 
@@ -4562,6 +4862,33 @@ impl CreativeResourcePlan {
             creative_bytes,
         })
     }
+}
+
+/// Charge one node's simultaneous-binding count to the ceiling that governs
+/// the pass it is actually encoded in. Ordinary kinds share the fixed rack
+/// bind layout; dedicated kinds own their own layout and their own ceiling.
+fn charge_sampled_textures(budget: &mut RackResourceBudget, tag: NodeKindTag, textures: u8) {
+    let textures = u32::from(textures);
+    if tag.occupies_dedicated_pass() {
+        budget.max_sampled_textures_in_dedicated_pass =
+            budget.max_sampled_textures_in_dedicated_pass.max(textures);
+    } else {
+        budget.max_sampled_textures_in_pass = budget.max_sampled_textures_in_pass.max(textures);
+    }
+}
+
+/// The dedicated-pass simultaneous-binding ceiling, shared by the saved and
+/// runtime racks. It is a constant-only check: the device's own reported limit
+/// is applied separately by [`CreativeResourcePlan`], without the ordinary
+/// rack's `.min(MAX_SAMPLED_TEXTURES_PER_PASS)` clamp.
+pub(crate) fn validate_dedicated_pass_textures(textures: u32) -> Result<(), RackError> {
+    if textures > MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS {
+        return Err(RackError::DedicatedPassTextureBudget {
+            textures,
+            limit: MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS,
+        });
+    }
+    Ok(())
 }
 
 fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
@@ -4796,7 +5123,10 @@ mod tests {
             .collect();
         assert_eq!(tags.len(), NODE_KIND_DESCRIPTORS.len());
         assert_eq!(keys.len(), NODE_KIND_DESCRIPTORS.len());
-        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 11);
+        // Ten historical kinds through Displace (code 10), plus Residual
+        // Counterpoint (11) and the Symmetry Field (12). Kind codes are
+        // append-only, so this count only ever grows.
+        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 12);
         for descriptor in NODE_KIND_DESCRIPTORS {
             assert!(descriptor.budget.full_frame_passes > 0);
             assert!(descriptor.budget.logical_texture_lookups_per_pixel > 0);
@@ -4856,6 +5186,7 @@ mod tests {
             (NodeKindTag::Shift, 8),
             (NodeKindTag::Grain, 4),
             (NodeKindTag::Mask, 5),
+            (NodeKindTag::Symmetry, 10),
             (NodeKindTag::Residual, 12),
         ];
         for (kind, expected) in advanced_texture_ops {
@@ -6040,6 +6371,588 @@ mod tests {
         assert!(budget.logical_texture_lookups_per_pixel <= MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK);
         assert!(budget.texture_samples_per_pixel <= MAX_TEXTURE_SAMPLES_PER_RACK);
         assert!(budget.max_sampled_textures_in_pass <= MAX_SAMPLED_TEXTURES_PER_PASS);
+    }
+
+    /// The Symmetry Field takes append-only kind code 12. Code 11 belongs to
+    /// Residual Counterpoint, which was authored in parallel from the same
+    /// published SHA and landed first; a kind code enters every persisted
+    /// topology signature, so the two can never share one. Every
+    /// historical code keeps its value and both frozen legacy rack signatures
+    /// stay bit-identical, because `topology_signature` hashes only
+    /// `(stable_id, kind code)` pairs.
+    #[test]
+    fn symmetry_kind_code_is_twelve_and_append_only() {
+        assert_eq!(NodeKindTag::Symmetry.signature_code(), 12);
+        for (tag, code) in [
+            (NodeKindTag::LegacyCanonical, 1_u8),
+            (NodeKindTag::LegacyTemporal, 2),
+            (NodeKindTag::Transform, 3),
+            (NodeKindTag::DigitalColor, 4),
+            (NodeKindTag::Key, 5),
+            (NodeKindTag::Cellular, 6),
+            (NodeKindTag::Shift, 7),
+            (NodeKindTag::Grain, 8),
+            (NodeKindTag::Mask, 9),
+            (NodeKindTag::Displace, 10),
+            (NodeKindTag::Symmetry, 12),
+        ] {
+            assert_eq!(tag.signature_code(), code);
+        }
+        let codes: BTreeSet<_> = NODE_KIND_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.tag.signature_code())
+            .collect();
+        assert_eq!(codes.len(), NODE_KIND_DESCRIPTORS.len());
+        assert_eq!(node_kind_descriptor(NodeKindTag::Symmetry).key, "symmetry");
+        assert_eq!(
+            node_kind_descriptor(NodeKindTag::Symmetry).title,
+            "Symmetry Field"
+        );
+
+        // Exactly one kind is lifted into a dedicated pass today.
+        let dedicated: Vec<_> = NODE_KIND_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.tag.occupies_dedicated_pass())
+            .map(|descriptor| descriptor.tag)
+            .collect();
+        assert_eq!(dedicated, vec![NodeKindTag::Symmetry]);
+
+        assert_eq!(
+            VisualRack::synthetic_legacy(LegacyRackScope::Layer).topology_signature(),
+            LEGACY_LAYER_RACK_SIGNATURE
+        );
+        assert_eq!(
+            VisualRack::synthetic_legacy(LegacyRackScope::Master).topology_signature(),
+            LEGACY_MASTER_RACK_SIGNATURE
+        );
+    }
+
+    /// The exact default is cyclic at one fold, carrier only, with no motion,
+    /// no history, no hue and a neutral phase/axis/center — and it is an exact
+    /// bypass. Hostile non-finite input takes the neutral fallback, so it
+    /// collapses to a bypass rather than to a full-scale fold.
+    #[test]
+    fn symmetry_defaults_sanitize_and_declare_exact_bypass() {
+        let default = SymmetryParams::default();
+        assert_eq!(default.mode, crate::symmetry::SymmetryMode::Cyclic);
+        assert_eq!(default.effective_folds(), 1);
+        assert_eq!(default.radial_phase_deg, 0.0);
+        assert_eq!(default.orbit_phase, 0.0);
+        assert_eq!(default.planar_axis_deg, 0.0);
+        assert_eq!(default.planar_phase, 0.0);
+        assert_eq!(default.center, [0.5, 0.5]);
+        assert_eq!(default.motion_gain, 0.0);
+        assert_eq!(default.hue_span, 0.0);
+        assert_eq!(default.seed, 0);
+        assert!(default.source_mask.is_carrier_only());
+        assert!(default.motion_mask.is_empty());
+        for slot in 0..2_u8 {
+            assert_eq!(
+                default.donor_tap(slot).unwrap().source,
+                SavedImageSource::OneBelow
+            );
+            assert_eq!(
+                default.donor_tap(slot).unwrap().timing,
+                EdgeTiming::CurrentFrame
+            );
+            assert_eq!(
+                default.motion_donor(slot).unwrap(),
+                crate::symmetry::SavedMotionDonor::None
+            );
+        }
+        assert!(default.table_is_neutral());
+        assert!(default.is_exact_bypass());
+
+        // Hostile values fall back to neutral, never to a clamped extreme.
+        let hostile = SymmetryParams {
+            base_folds: f32::NAN,
+            fold_offset: f32::INFINITY,
+            radial_phase_deg: f32::NEG_INFINITY,
+            orbit_phase: f32::NAN,
+            motion_gain: f32::INFINITY,
+            hue_span: f32::NAN,
+            ..SymmetryParams::default()
+        };
+        let clean = hostile.sanitized();
+        assert_eq!(clean.base_folds, 1.0);
+        assert_eq!(clean.fold_offset, 0.0);
+        assert_eq!(clean.radial_phase_deg, 0.0);
+        assert_eq!(clean.orbit_phase, 0.0);
+        assert_eq!(clean.motion_gain, 0.0);
+        assert_eq!(clean.hue_span, 0.0);
+        assert!(hostile.is_exact_bypass());
+
+        // Finite overshoot clamps and stays live.
+        let overshoot = SymmetryParams {
+            motion_gain: 12.0,
+            hue_span: 12.0,
+            ..SymmetryParams::default()
+        }
+        .sanitized();
+        assert_eq!(overshoot.motion_gain, 1.0);
+        assert_eq!(overshoot.hue_span, 1.0);
+        assert!(!overshoot.is_exact_bypass());
+
+        // Both halves of the bypass predicate are load bearing: an identity
+        // fold whose table can still reach a donor, the history ring, a motion
+        // donor, or a hue rotation is not a bypass.
+        for armed in [
+            SymmetryParams {
+                base_folds: 4.0,
+                ..SymmetryParams::default()
+            },
+            SymmetryParams {
+                source_mask: crate::symmetry::SymmetrySourceMask {
+                    donor0: true,
+                    ..crate::symmetry::SymmetrySourceMask::CARRIER_ONLY
+                },
+                ..SymmetryParams::default()
+            },
+            SymmetryParams {
+                source_mask: crate::symmetry::SymmetrySourceMask {
+                    clean_history: true,
+                    ..crate::symmetry::SymmetrySourceMask::CARRIER_ONLY
+                },
+                ..SymmetryParams::default()
+            },
+            SymmetryParams {
+                motion_mask: crate::symmetry::SymmetryMotionMask {
+                    slot0: true,
+                    slot1: false,
+                },
+                ..SymmetryParams::default()
+            },
+            SymmetryParams {
+                hue_span: 0.25,
+                ..SymmetryParams::default()
+            },
+        ] {
+            assert!(!armed.is_exact_bypass());
+        }
+
+        // The runtime twin follows the identical law through the same values.
+        let runtime = RuntimeSymmetryParams::default();
+        assert!(runtime.is_exact_bypass());
+        assert_eq!(runtime.donors[0].source, ResolvedImageSource::OneBelow);
+        assert_eq!(runtime.donors[1].source, ResolvedImageSource::OneBelow);
+        assert_eq!(runtime.motion, [crate::motion::MotionDonor::None; 2]);
+        assert_eq!(
+            RuntimeSymmetryParams {
+                hue_span: 9.0,
+                ..RuntimeSymmetryParams::default()
+            }
+            .sanitized()
+            .hue_span,
+            1.0
+        );
+        assert!(!RuntimeSymmetryParams {
+            hue_span: 0.5,
+            ..RuntimeSymmetryParams::default()
+        }
+        .is_exact_bypass());
+    }
+
+    /// The node serializes through the bounded rack deserializer with its kind
+    /// key, defaults every absent field, sanitizes hostile values during
+    /// deserialization, and rejects an unknown discrete token rather than
+    /// defaulting it.
+    #[test]
+    fn symmetry_serde_round_trips_and_defaults_every_absent_field() {
+        let params = SymmetryParams {
+            mode: crate::symmetry::SymmetryMode::Dihedral,
+            base_folds: 6.0,
+            hue_span: 0.5,
+            seed: 99,
+            ..SymmetryParams::default()
+        };
+        let encoded = serde_json::to_string(&params).expect("params serialize");
+        let decoded: SymmetryParams = serde_json::from_str(&encoded).expect("params deserialize");
+        assert_eq!(decoded, params);
+
+        let empty: SymmetryParams = serde_json::from_str("{}").expect("an empty map deserializes");
+        assert_eq!(empty, SymmetryParams::default());
+
+        let node: VisualNode = serde_json::from_str(
+            r#"{"stable_id":3,"kind":{"kind":"symmetry","params":{"base_folds":900.0,"hue_span":-5.0,"motion_gain":50.0}}}"#,
+        )
+        .expect("a symmetry node deserializes through the bounded rack model");
+        let VisualNodeKind::Symmetry(value) = node.kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(value.base_folds, 32.0, "finite overshoot clamps");
+        assert_eq!(
+            value.hue_span, 0.0,
+            "an out of range span clamps to its floor"
+        );
+        assert_eq!(value.motion_gain, 1.0);
+        assert_eq!(value.seed, 0, "an absent seed is the historical default");
+        assert!(value.source_mask.is_carrier_only());
+
+        // Closed vocabularies stay closed.
+        assert!(serde_json::from_str::<SymmetryParams>(r#"{"mode":"hyperbolic"}"#).is_err());
+        assert!(serde_json::from_str::<SymmetryParams>(r#"{"boundary":"teleport"}"#).is_err());
+    }
+
+    /// Both image slots and both motion slots are visible to every saved and
+    /// runtime rack accessor, addressed by slot index. A tombstoned slot keeps
+    /// naming its saved identity and never rebinds against a replacement.
+    #[test]
+    fn symmetry_routes_are_visible_to_every_saved_and_runtime_accessor() {
+        let group = GroupId::new(31).unwrap();
+        let mut saved = VisualRack::empty();
+        let node = saved
+            .push(VisualNodeKind::Symmetry(SymmetryParams {
+                base_folds: 6.0,
+                donors: [
+                    SavedImageTap {
+                        source: SavedImageSource::SelectedLayer {
+                            layer_position: saved_position(4),
+                            stage: LayerImageStage::PostLocalEffects,
+                        },
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    SavedImageTap {
+                        source: SavedImageSource::GroupOutput { group_id: group },
+                        timing: EdgeTiming::PreviousFrame,
+                    },
+                ],
+                motion: [
+                    crate::symmetry::SavedMotionDonor::Selected {
+                        saved_position: saved_position(5),
+                    },
+                    crate::symmetry::SavedMotionDonor::Selected {
+                        saved_position: saved_position(6),
+                    },
+                ],
+                ..SymmetryParams::default()
+            }))
+            .unwrap();
+
+        // A `filter_map` walker could only ever surface one route per node.
+        assert_eq!(
+            saved.selected_layer_positions().collect::<Vec<_>>(),
+            vec![saved_position(4), saved_position(5), saved_position(6)]
+        );
+        assert_eq!(
+            saved.referenced_group_ids().collect::<Vec<_>>(),
+            vec![group]
+        );
+
+        saved.mark_group_output_missing(group);
+        let VisualNodeKind::Symmetry(params) = saved.get(node).unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(
+            params.donor_tap(1).unwrap().source,
+            SavedImageSource::MissingGroupOutput { group_id: group }
+        );
+        assert_eq!(
+            params.donor_tap(0).unwrap().source,
+            SavedImageSource::SelectedLayer {
+                layer_position: saved_position(4),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            "slot zero is untouched by slot one losing its group"
+        );
+        assert!(params.donor_tap(2).is_none());
+        assert!(params.motion_donor(2).is_none());
+
+        // Resolution binds each slot independently; a position that cannot be
+        // resolved becomes an explicit tombstone at its own slot.
+        let image_donor = live_id(41);
+        let motion_donor = live_id(42);
+        let mut runtime = saved.resolve_routes(
+            |position| match position.get() {
+                4 => Some(image_donor),
+                5 => Some(motion_donor),
+                _ => None,
+            },
+            |_| false,
+        );
+        assert_eq!(
+            runtime.selected_layer_ids().collect::<Vec<_>>(),
+            vec![image_donor, motion_donor]
+        );
+        let RuntimeVisualNodeKind::Symmetry(params) = runtime.iter().next().unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(
+            params.motion_donor(1).unwrap(),
+            crate::motion::MotionDonor::Missing {
+                saved_position: saved_position(6)
+            }
+        );
+
+        runtime.mark_layer_output_missing(image_donor);
+        let RuntimeVisualNodeKind::Symmetry(params) = runtime.iter().next().unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(
+            params.donor_tap(0).unwrap().source,
+            ResolvedImageSource::MissingSelectedLayer {
+                saved_position: saved_position(4),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            params.motion_donor(0).unwrap(),
+            crate::motion::MotionDonor::Selected {
+                layer_id: motion_donor,
+                saved_position: saved_position(5),
+            },
+            "an image slot losing its donor never disturbs a motion slot"
+        );
+        runtime.mark_layer_output_missing(motion_donor);
+        assert!(runtime.selected_layer_ids().next().is_none());
+
+        // Capture preserves every missing identity rather than inventing one,
+        // and re-resolving against a replacement at the vacated position must
+        // not rebind it.
+        let recaptured = runtime.capture_routes(|_| None).unwrap();
+        let VisualNodeKind::Symmetry(params) = recaptured.iter().next().unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(
+            params.donor_tap(0).unwrap().source,
+            SavedImageSource::MissingSelectedLayer {
+                saved_position: saved_position(4),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            params.motion_donor(0).unwrap(),
+            crate::symmetry::SavedMotionDonor::Missing {
+                saved_position: saved_position(5)
+            }
+        );
+        assert_eq!(params.base_folds, 6.0, "route capture preserves the values");
+
+        let rebound = recaptured.resolve_routes(|_| Some(live_id(99)), |_| true);
+        let RuntimeVisualNodeKind::Symmetry(params) = rebound.iter().next().unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert!(
+            params.selected_layer_ids().iter().all(Option::is_none),
+            "a tombstoned slot never rebinds against a replacement"
+        );
+    }
+
+    /// Every Symmetry wire key is prefixed and unique across the whole
+    /// registry, so none of them can cross-resolve through the deliberate
+    /// shared-key path. Only the declared continuous controls are modulatable
+    /// and Dice-eligible; the four routes, two discrete laws, seed, and six
+    /// mask bits are enumerable topology.
+    #[test]
+    fn symmetry_exposes_only_its_declared_continuous_controls_as_modulatable() {
+        let descriptors: Vec<_> = NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == NodeKindTag::Symmetry)
+            .collect();
+        assert_eq!(descriptors.len(), 26);
+
+        let continuous: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.modulatable)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(
+            continuous,
+            vec![
+                "symmetry_base_folds",
+                "symmetry_fold_offset",
+                "symmetry_radial_phase_deg",
+                "symmetry_orbit_phase",
+                "symmetry_planar_axis_deg",
+                "symmetry_planar_phase",
+                "symmetry_cell_skew",
+                "symmetry_spiral_scale",
+                "symmetry_orbit_radius",
+                "symmetry_orbit_spin_deg",
+                "symmetry_motion_gain",
+                "symmetry_hue_span",
+                "symmetry_center",
+            ]
+        );
+        let diceable: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.dice_eligible)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(diceable, continuous);
+
+        for descriptor in &descriptors {
+            assert!(
+                descriptor.key.starts_with("symmetry_"),
+                "{} must be prefixed so it cannot alias another kind",
+                descriptor.key
+            );
+            if descriptor.modulatable {
+                assert!(descriptor.range.is_some(), "{}", descriptor.key);
+            } else {
+                assert!(descriptor.range.is_none(), "{}", descriptor.key);
+                assert!(!descriptor.dice_eligible, "{}", descriptor.key);
+                assert!(
+                    matches!(
+                        descriptor.value_type,
+                        NodeParamType::Enum
+                            | NodeParamType::Bool
+                            | NodeParamType::Unsigned
+                            | NodeParamType::ImageTap
+                            | NodeParamType::MotionDonor
+                    ),
+                    "{}",
+                    descriptor.key
+                );
+            }
+            // No other kind may already own this wire key.
+            assert!(
+                NODE_PARAM_DESCRIPTORS
+                    .iter()
+                    .filter(|other| other.key == descriptor.key)
+                    .all(|other| other.kind == NodeKindTag::Symmetry),
+                "{} is not unique across the registry",
+                descriptor.key
+            );
+        }
+
+        let routes: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| {
+                matches!(
+                    descriptor.value_type,
+                    NodeParamType::ImageTap | NodeParamType::MotionDonor
+                )
+            })
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(
+            routes,
+            vec![
+                "symmetry_donor0_tap",
+                "symmetry_donor1_tap",
+                "symmetry_motion0_donor",
+                "symmetry_motion1_donor"
+            ],
+            "exactly two image slots and two motion slots, addressed by slot"
+        );
+    }
+
+    /// The dedicated pass declares eight simultaneously sampled textures and is
+    /// charged against its own ceiling. The fixed Collision Rack layout keeps
+    /// its separate three-texture cap, and neither ceiling admits the other.
+    #[test]
+    fn symmetry_declares_eight_textures_in_a_dedicated_pass_that_admits_eight_and_refuses_nine() {
+        assert_eq!(MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS, 8);
+        assert_eq!(MAX_SAMPLED_TEXTURES_PER_PASS, 3);
+
+        let budget = node_kind_descriptor(NodeKindTag::Symmetry).budget;
+        assert_eq!(budget.full_frame_passes, 1);
+        assert_eq!(budget.logical_texture_lookups_per_pixel, 4);
+        assert_eq!(budget.texture_samples_per_pixel, 10);
+        assert_eq!(budget.sampled_textures_in_pass, 8);
+        assert_eq!(budget.cross_input_taps, 2);
+
+        assert!(validate_dedicated_pass_textures(8).is_ok());
+        assert_eq!(
+            validate_dedicated_pass_textures(9),
+            Err(RackError::DedicatedPassTextureBudget {
+                textures: 9,
+                limit: 8,
+            })
+        );
+
+        // A rack holding the dedicated node still reports zero ordinary-pass
+        // textures for it, so the three-texture rack layout is untouched.
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Symmetry(SymmetryParams::default()))
+            .unwrap();
+        let budget = rack.resource_budget().unwrap();
+        assert_eq!(budget.max_sampled_textures_in_pass, 0);
+        assert_eq!(budget.max_sampled_textures_in_dedicated_pass, 8);
+
+        // An ordinary node beside it charges the ordinary accumulator only.
+        rack.push(VisualNodeKind::Displace(DisplaceParams::default()))
+            .unwrap();
+        let budget = rack.resource_budget().unwrap();
+        assert_eq!(budget.max_sampled_textures_in_pass, 2);
+        assert_eq!(budget.max_sampled_textures_in_dedicated_pass, 8);
+
+        // Preflight checks the dedicated ceiling against the device's own
+        // reported limit, without the fixed rack layout's `.min(3)` clamp. The
+        // stub default limit is that same 3, so a fixture must raise it
+        // explicitly the way production reads the device floor of 16.
+        let graph = ImageGraphPlan {
+            current_topological_order: Vec::new(),
+            current_taps: 0,
+            previous_taps: 0,
+            diagnostics: Vec::new(),
+        };
+        let stub = CreativeResourceLimits::default();
+        assert_eq!(stub.max_sampled_textures_per_shader_stage, 3);
+        assert_eq!(
+            CreativeResourcePlan::preflight_with_surface_formats(
+                [640, 360],
+                std::slice::from_ref(&rack),
+                &graph,
+                0,
+                0,
+                stub,
+            ),
+            Err(ResourcePreflightError::SampledTextureLimit {
+                requested: 8,
+                limit: 3,
+            })
+        );
+        let floor = CreativeResourceLimits {
+            max_sampled_textures_per_shader_stage: 16,
+            ..CreativeResourceLimits::default()
+        };
+        assert!(CreativeResourcePlan::preflight_with_surface_formats(
+            [640, 360],
+            std::slice::from_ref(&rack),
+            &graph,
+            0,
+            0,
+            floor,
+        )
+        .is_ok());
+    }
+
+    /// A node declaring four logical lookups admits a full rack of eight, and
+    /// the dedicated accumulator never inflates the ordinary rack ceiling.
+    #[test]
+    fn symmetry_nodes_stay_inside_the_rack_lookup_and_pass_ceilings() {
+        let mut rack = VisualRack::empty();
+        for _ in 0..MAX_NODES_PER_RACK {
+            rack.push(VisualNodeKind::Symmetry(SymmetryParams {
+                base_folds: 6.0,
+                ..SymmetryParams::default()
+            }))
+            .unwrap();
+        }
+        let budget = rack.resource_budget().unwrap();
+        assert_eq!(budget.full_frame_passes, MAX_NODES_PER_RACK as u32);
+        assert_eq!(
+            budget.logical_texture_lookups_per_pixel,
+            4 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(
+            budget.texture_samples_per_pixel,
+            10 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(budget.max_sampled_textures_in_pass, 0);
+        assert_eq!(budget.max_sampled_textures_in_dedicated_pass, 8);
+        assert_eq!(budget.cross_input_taps, 2 * MAX_NODES_PER_RACK as u32);
+        assert_eq!(
+            budget.logical_texture_lookups_per_pixel,
+            MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK
+        );
+        assert!(budget.texture_samples_per_pixel <= MAX_TEXTURE_SAMPLES_PER_RACK);
+        assert!(budget.max_sampled_textures_in_pass <= MAX_SAMPLED_TEXTURES_PER_PASS);
+        assert!(
+            budget.max_sampled_textures_in_dedicated_pass
+                <= MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS
+        );
     }
 
     #[test]

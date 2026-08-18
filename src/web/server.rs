@@ -30,8 +30,8 @@ use tokio::sync::broadcast::error::RecvError;
 use super::state::{
     CaptureTargetSnapshot, CompositionRootSnapshot, CreativeImageSourceSnapshot,
     CreativeImageTapSnapshot, CreativeScopeSnapshot, EnqueueOutcome, ImageInputSnapshot,
-    MotionScopeSnapshot, PresetTargetSnapshot, RerollScope, WebAction, WebState,
-    MAX_SCENE_NAME_BYTES,
+    MotionScopeSnapshot, PresetTargetSnapshot, RerollScope, SymmetryRouteSnapshot, WebAction,
+    WebState, MAX_SCENE_NAME_BYTES,
 };
 use super::static_files;
 
@@ -904,8 +904,17 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
             );
         }
         // These are topology/routing fields and use barrier actions.
-        "variant" | "image_tap" | "image_channel" | "image_invert" | "donor_tap"
-        | "structure_tap" | "detail_tap" => {
+        "variant"
+        | "image_tap"
+        | "image_channel"
+        | "image_invert"
+        | "donor_tap"
+        | "structure_tap"
+        | "detail_tap"
+        | "symmetry_donor0_tap"
+        | "symmetry_donor1_tap"
+        | "symmetry_motion0_donor"
+        | "symmetry_motion1_donor" => {
             return false;
         }
         _ => {}
@@ -951,6 +960,9 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
                 value.as_str(),
                 Some("gaussian" | "perlin" | "salt_pepper" | "blue")
             ),
+            // Displace's boundary law. Without this arm the shipped panel's
+            // Boundary select is dropped here, before dispatch ever sees it.
+            //
             // A discrete law that is declared `NodeParamType::Enum` but absent
             // from this allowlist is silently dropped at ingress while the
             // panel control still renders, so every closed vocabulary must
@@ -961,6 +973,26 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
                 value.as_str(),
                 Some("transparent" | "mirror" | "wrap" | "hold")
             ),
+            // The Symmetry Field's two discrete authored laws. Both vocabularies
+            // are closed and append-only; a neighbouring token from the other
+            // one must be refused.
+            "symmetry_mode" => matches!(
+                value.as_str(),
+                Some(
+                    "cyclic"
+                        | "dihedral"
+                        | "planar_p1"
+                        | "planar_pm"
+                        | "planar_p2"
+                        | "planar_pmm"
+                        | "log_spiral"
+                        | "orbit"
+                )
+            ),
+            "symmetry_boundary" => matches!(
+                value.as_str(),
+                Some("transparent" | "mirror" | "wrap" | "hold" | "cellular_reentry")
+            ),
             "block" => matches!(
                 value.as_str(),
                 Some("four" | "eight" | "sixteen" | "thirty_two" | "sixty_four")
@@ -968,7 +1000,25 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
             "quantization" => matches!(value.as_str(), Some("off" | "coarse" | "medium" | "fine")),
             _ => false,
         },
-        NodeParamType::ImageTap => false,
+        // Routes are stable authored topology and are never edited through the
+        // ordinary coalescible parameter action.
+        NodeParamType::ImageTap | NodeParamType::MotionDonor => false,
+    }
+}
+
+/// A group rack node may never read its own group's output on the current
+/// frame. Shared by every ordered route action so the three call sites cannot
+/// drift apart.
+fn creative_self_group_current_frame(
+    scope: &CreativeScopeSnapshot,
+    route: &CreativeImageTapSnapshot,
+) -> bool {
+    match (scope, &route.input) {
+        (
+            CreativeScopeSnapshot::Group { group_id },
+            CreativeImageSourceSnapshot::GroupOutput { group_id: producer },
+        ) => group_id == producer && route.timing == crate::visual_rack::EdgeTiming::CurrentFrame,
+        _ => false,
     }
 }
 
@@ -1371,6 +1421,20 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     | WebAction::SetGestureRecording { .. }
                     | WebAction::SetMotionDonor { .. }
                     | WebAction::ClearMotionMemory
+                    | WebAction::SetVisualNodeDisplaceRoute { .. }
+                    | WebAction::SetVisualNodeSymmetryRoute { .. }
+                    // Every ordered, revision-protected route action belongs
+                    // here as a class, not one kind at a time. Residual's is
+                    // the same barrier and is documented as never latched, but
+                    // neither branch could list it: the rule was authored where
+                    // Residual did not exist, and Residual was authored where
+                    // the rule did not. Today `quantized_action_key` answers
+                    // None for all three, so an admitted wrapper would execute
+                    // immediately rather than defer — which is exactly why the
+                    // refusal has to live here, at the gate, instead of resting
+                    // on a downstream lookup that a later latching change could
+                    // extend without noticing this omission.
+                    | WebAction::SetVisualNodeResidualRoute { .. }
                     | WebAction::BeginHistoryGesture { .. }
                     | WebAction::EndHistoryGesture { .. }
                     | WebAction::CancelHistoryGesture { .. }
@@ -1454,19 +1518,9 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             composition_revision,
             ..
         } => {
-            let self_group = match (scope, &route.input) {
-                (
-                    CreativeScopeSnapshot::Group { group_id },
-                    CreativeImageSourceSnapshot::GroupOutput { group_id: producer },
-                ) => {
-                    group_id == producer
-                        && route.timing == crate::visual_rack::EdgeTiming::CurrentFrame
-                }
-                _ => false,
-            };
             valid_creative_scope(scope)
                 && valid_required_stable_id(node_id)
-                && !self_group
+                && !creative_self_group_current_frame(scope, route)
                 && valid_creative_route(route)
                 && matches!(
                     channel.as_str(),
@@ -1474,11 +1528,46 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 )
                 && valid_composition_revision(*composition_revision)
         }
-        // Both named two-input node routes are ordered topology barriers with
-        // no channel or invert of their own. They still need every prefilter
-        // `SetVisualNodeRoute` applies, including the group's-own-output
-        // current-frame rejection, so a hostile message never reaches the
-        // bounded queue in the first place.
+        // Displace, Residual, and Symmetry all rewrite the image dependency
+        // graph, so they take the same decimal-ID, non-zero-revision,
+        // tombstone, and self-group current-frame prefilters as
+        // `SetVisualNodeRoute` instead of falling through to the permissive
+        // tail.
+        WebAction::SetVisualNodeSymmetryRoute {
+            scope,
+            node_id,
+            route,
+            composition_revision,
+        } => {
+            let slot_valid = match route {
+                SymmetryRouteSnapshot::Image { index, .. } => {
+                    usize::from(*index) < crate::symmetry::SYMMETRY_IMAGE_SLOTS
+                }
+                SymmetryRouteSnapshot::Motion { index, .. } => {
+                    usize::from(*index) < crate::symmetry::SYMMETRY_MOTION_SLOTS
+                }
+            };
+            let payload_valid = match route {
+                SymmetryRouteSnapshot::Image { route, .. } => {
+                    !creative_self_group_current_frame(scope, route) && valid_creative_route(route)
+                }
+                // A motion route names a stable layer or clears the slot. It
+                // never carries a tombstone, a stage, or a timing.
+                SymmetryRouteSnapshot::Motion { layer_id, .. } => {
+                    layer_id.as_deref().is_none_or(valid_required_stable_id)
+                }
+            };
+            valid_creative_scope(scope)
+                && valid_required_stable_id(node_id)
+                && slot_valid
+                && payload_valid
+                && valid_composition_revision(*composition_revision)
+        }
+        // The named single- and two-input node routes are ordered topology
+        // barriers with no channel or invert of their own. They still need
+        // every prefilter `SetVisualNodeRoute` applies, including the
+        // group's-own-output current-frame rejection, so a hostile message
+        // never reaches the bounded queue in the first place.
         WebAction::SetVisualNodeDisplaceRoute {
             scope,
             node_id,
@@ -2887,6 +2976,277 @@ mod tests {
             },
             0
         ));
+    }
+
+    /// Closes the `NodeParamType::Enum` allowlist and the ordered route arm of
+    /// `valid_action`. A missing enum arm silently drops the panel's select at
+    /// ingress with the control still rendering normally; a missing route arm
+    /// lets an unvalidated reroute into the bounded queue.
+    #[test]
+    fn symmetry_ingress_validates_every_slot_and_closes_both_discrete_vocabularies() {
+        // Both discrete vocabularies are closed and complete, and neither
+        // accepts a token belonging to the other.
+        for mode in [
+            "cyclic",
+            "dihedral",
+            "planar_p1",
+            "planar_pm",
+            "planar_p2",
+            "planar_pmm",
+            "log_spiral",
+            "orbit",
+        ] {
+            assert!(
+                valid_node_param_value("symmetry", "symmetry_mode", &serde_json::json!(mode)),
+                "symmetry_mode must accept {mode}"
+            );
+        }
+        for boundary in ["transparent", "mirror", "wrap", "hold", "cellular_reentry"] {
+            assert!(
+                valid_node_param_value(
+                    "symmetry",
+                    "symmetry_boundary",
+                    &serde_json::json!(boundary)
+                ),
+                "symmetry_boundary must accept {boundary}"
+            );
+        }
+        assert!(!valid_node_param_value(
+            "symmetry",
+            "symmetry_mode",
+            &serde_json::json!("cellular_reentry")
+        ));
+        assert!(!valid_node_param_value(
+            "symmetry",
+            "symmetry_boundary",
+            &serde_json::json!("orbit")
+        ));
+        // The shipped Displace boundary select reaches dispatch too.
+        assert!(valid_node_param_value(
+            "displace",
+            "boundary",
+            &serde_json::json!("mirror")
+        ));
+        assert!(!valid_node_param_value(
+            "displace",
+            "boundary",
+            &serde_json::json!("cellular_reentry")
+        ));
+
+        // Continuous controls are bounded by the descriptor registry, the seed
+        // is an ordinary u32 value, and every route key is refused outright.
+        assert!(valid_node_param_value(
+            "symmetry",
+            "symmetry_base_folds",
+            &serde_json::json!(32.0)
+        ));
+        assert!(!valid_node_param_value(
+            "symmetry",
+            "symmetry_base_folds",
+            &serde_json::json!(33.0)
+        ));
+        assert!(valid_node_param_value(
+            "symmetry",
+            "symmetry_seed",
+            &serde_json::json!(4_294_967_295_u64)
+        ));
+        assert!(valid_node_param_value(
+            "symmetry",
+            "symmetry_source_donor0",
+            &serde_json::json!(true)
+        ));
+        for key in [
+            "symmetry_donor0_tap",
+            "symmetry_donor1_tap",
+            "symmetry_motion0_donor",
+            "symmetry_motion1_donor",
+        ] {
+            assert!(
+                !valid_node_param_value("symmetry", key, &serde_json::json!("one_below")),
+                "{key} must never be editable on the coalescible value path"
+            );
+        }
+
+        let image_route =
+            |index: u8, input: CreativeImageSourceSnapshot, timing| SymmetryRouteSnapshot::Image {
+                index,
+                route: CreativeImageTapSnapshot { input, timing },
+            };
+        let action = |scope: CreativeScopeSnapshot, node_id: &str, route, revision| {
+            WebAction::SetVisualNodeSymmetryRoute {
+                scope,
+                node_id: node_id.into(),
+                route,
+                composition_revision: revision,
+            }
+        };
+        let current = crate::visual_rack::EdgeTiming::CurrentFrame;
+        let previous = crate::visual_rack::EdgeTiming::PreviousFrame;
+
+        assert!(valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                image_route(1, CreativeImageSourceSnapshot::OneBelow, current),
+                7
+            ),
+            0
+        ));
+        // Slot index is route identity, and there are exactly two of each.
+        assert!(!valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                image_route(2, CreativeImageSourceSnapshot::OneBelow, current),
+                7
+            ),
+            0
+        ));
+        assert!(!valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                SymmetryRouteSnapshot::Motion {
+                    index: 2,
+                    layer_id: None
+                },
+                7
+            ),
+            0
+        ));
+        // Zero or non-decimal identifiers and a zero revision are refused.
+        assert!(!valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "0",
+                image_route(0, CreativeImageSourceSnapshot::OneBelow, current),
+                7
+            ),
+            0
+        ));
+        assert!(!valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                image_route(0, CreativeImageSourceSnapshot::OneBelow, current),
+                0
+            ),
+            0
+        ));
+        assert!(!valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                SymmetryRouteSnapshot::Motion {
+                    index: 0,
+                    layer_id: Some("0".into())
+                },
+                7
+            ),
+            0
+        ));
+        // Clearing a motion slot is legal.
+        assert!(valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                SymmetryRouteSnapshot::Motion {
+                    index: 1,
+                    layer_id: None
+                },
+                7
+            ),
+            0
+        ));
+        // Both output-only tombstones are refused on ingress.
+        for tombstone in [
+            CreativeImageSourceSnapshot::MissingSelectedLayer {
+                saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            },
+            CreativeImageSourceSnapshot::MissingGroupOutput {
+                group_id: "9".into(),
+            },
+        ] {
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    image_route(0, tombstone, previous),
+                    7
+                ),
+                0
+            ));
+        }
+        // A group rack node cannot read its own group's output on this frame,
+        // and Clean Program is previous-frame only.
+        let group = CreativeScopeSnapshot::Group {
+            group_id: "9".into(),
+        };
+        let own_output = CreativeImageSourceSnapshot::GroupOutput {
+            group_id: "9".into(),
+        };
+        assert!(!valid_action(
+            &action(
+                group.clone(),
+                "3",
+                image_route(0, own_output.clone(), current),
+                7
+            ),
+            0
+        ));
+        assert!(valid_action(
+            &action(group, "3", image_route(0, own_output, previous), 7),
+            0
+        ));
+        assert!(!valid_action(
+            &action(
+                CreativeScopeSnapshot::Master,
+                "3",
+                image_route(0, CreativeImageSourceSnapshot::CleanProgram, current),
+                7
+            ),
+            0
+        ));
+
+        // No ordered route action may be wrapped in a quantized batch. This is
+        // a class rule over every revision-protected route barrier in the
+        // registry, so all three are asserted together rather than only the
+        // two that existed when the rule was first written.
+        for inner in [
+            WebAction::SetVisualNodeSymmetryRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                route: image_route(0, CreativeImageSourceSnapshot::OneBelow, current),
+                composition_revision: 7,
+            },
+            WebAction::SetVisualNodeDisplaceRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: current,
+                },
+                composition_revision: 7,
+            },
+            WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                slot: crate::web::state::ResidualRouteSlotSnapshot::Detail,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: current,
+                },
+                composition_revision: 7,
+            },
+        ] {
+            assert!(!valid_action(
+                &WebAction::Quantized {
+                    inner: Box::new(inner)
+                },
+                0
+            ));
+        }
     }
 
     /// Every `NodeParamType::Enum` needs an explicit token list in

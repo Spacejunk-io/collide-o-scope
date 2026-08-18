@@ -29,16 +29,17 @@ use crate::performance::SavedLayerPosition;
 use crate::renderer::compositor::{MatteChannelCode, ResolvedMatteParams};
 use crate::renderer::rack::{CollisionRackPlan, RackCompileError};
 use crate::spatial::{EffectPassUniforms, SpatialGpuUniforms, SpatialTransform};
+use crate::symmetry::{RuntimeSymmetryParams, SymmetryNodeDomain, SYMMETRY_MOTION_SLOTS};
 use crate::temporal::{RefreshGardenMatteRoute, RefreshGardenMotionRoute};
 use crate::visual_rack::{
     CreativeResourceLimits, CreativeResourcePlan, EdgeTiming, GroupId, ImageDependency,
-    ImageDependencyGraph, ImageGraphError, ImageGraphMode, ImageGraphPlan, LegacyRackScope, NodeId,
-    NodeKindTag, ResidualResourceError, ResidualResourceLimits, ResidualResourcePlan,
-    ResidualResourceRequest, ResolvedImageSource, ResolvedImageTap, ResourcePreflightError,
-    RouteCaptureError, RuntimeImageMatte, RuntimeMaskParams, RuntimeRackError, RuntimeVisualNode,
-    RuntimeVisualNodeKind, RuntimeVisualRack, VisualNodeKind, VisualRack, VisualScopeId,
-    ADVANCED_PROGRAM_HISTORY_STAGING_LAYERS, ADVANCED_RACK_SURFACE_LAYERS,
-    ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS, MAX_IMAGE_DEPENDENCIES,
+    ImageDependencyGraph, ImageGraphError, ImageGraphMode, ImageGraphPlan, LegacyRackScope,
+    NodeBlend, NodeId, NodeKindTag, ResidualResourceError, ResidualResourceLimits,
+    ResidualResourcePlan, ResidualResourceRequest, ResolvedImageSource, ResolvedImageTap,
+    ResourcePreflightError, RouteCaptureError, RuntimeImageMatte, RuntimeMaskParams,
+    RuntimeRackError, RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack, VisualNodeKind,
+    VisualRack, VisualScopeId, ADVANCED_PROGRAM_HISTORY_STAGING_LAYERS,
+    ADVANCED_RACK_SURFACE_LAYERS, ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS, MAX_IMAGE_DEPENDENCIES,
     MAX_LOGICAL_TEXTURE_LOOKUPS_PER_FRAME, MAX_TEXTURE_SAMPLES_PER_FRAME, RACK_PRIMARY_ROUTE_SLOT,
     RESIDUAL_DETAIL_SLOT, RESIDUAL_ROUTE_SLOTS, RESIDUAL_STRUCTURE_SLOT,
 };
@@ -290,6 +291,11 @@ pub enum EvaluatedScopeStep {
         segment_index: u8,
         plan: CollisionRackPlan,
     },
+    /// One dedicated eight-texture Symmetry Field pass, at its exact authored
+    /// rack position. It owns its own bind layout, so it can never share an
+    /// ordinary rack segment: the segmenter flushes what came before, emits
+    /// this step, and resumes segmentation behind it.
+    SymmetryField { plan: EvaluatedSymmetryFieldPlan },
     /// Stateful master-only boundary in its exact authored position.
     LegacyTemporal { params: TemporalParams },
     /// Group matte is post-transform/rack and pre-opacity/admission.
@@ -311,11 +317,41 @@ impl EvaluatedScopeStep {
         match self {
             Self::LegacyCanonical { .. } => Some(NodeKindTag::LegacyCanonical),
             Self::LegacyTemporal { .. } => Some(NodeKindTag::LegacyTemporal),
+            // A dedicated step is still one authored node, so it reports its
+            // own kind rather than hiding behind a segment.
+            Self::SymmetryField { .. } => Some(NodeKindTag::Symmetry),
             Self::MaterializeSpatial { .. }
             | Self::CollisionRack { .. }
             | Self::GroupMatte { .. } => None,
         }
     }
+}
+
+/// The evaluated payload of one dedicated Symmetry Field pass.
+///
+/// It carries the authored node controls an ordinary rack pass would observe,
+/// the route-resolved parameters, and the motion field each armed motion slot
+/// actually resolved to. Nothing here is frame-local readiness: a donor that
+/// fails to bind changes the executor's neutral-view choice, never this plan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvaluatedSymmetryFieldPlan {
+    pub node_id: NodeId,
+    /// The authored node's stable sector-table domain, resolved once here from
+    /// its owning scope and its stable node id. The dedicated executor reads
+    /// the table through this rather than re-deriving an owner it cannot see.
+    pub domain: SymmetryNodeDomain,
+    pub enabled: bool,
+    pub wet: f32,
+    pub blend: NodeBlend,
+    pub params: RuntimeSymmetryParams,
+    /// The admitted motion field per motion slot. `None` is an incomplete
+    /// pair — an unarmed slot, an unselected or tombstoned donor, or a donor
+    /// whose field was never admitted — and the executor binds the neutral
+    /// vector/gate views for it. The planner has already published a
+    /// `MotionPlanDiagnostic` naming the slot in every case but "unarmed".
+    pub motion_field_slots: [Option<u8>; SYMMETRY_MOTION_SLOTS],
+    /// This one pass's declared constant resource table.
+    pub resources: SymmetryFieldResourcePlan,
 }
 
 /// The inherited canonical block historically observes each layer's
@@ -434,6 +470,12 @@ pub enum ImageTapConsumer {
     RackNode {
         scope: VisualScopeId,
         node_id: NodeId,
+        /// Which of the node's fixed image routes this tap is. Slot index is
+        /// route identity: a single-route node always uses slot 0, while a
+        /// multi-route node addresses each route by its own permanent slot.
+        /// Without it two taps from one node compare equal, `tap_index_for_-
+        /// consumer` binds the first route twice, and a slot-1 route change
+        /// leaves the topology signature unmoved.
         slot: u8,
     },
     GroupMatte {
@@ -582,6 +624,29 @@ pub enum MotionPlanDiagnostic {
         saved_position: SavedLayerPosition,
     },
     RefreshGardenMotionUnavailable,
+    /// An armed Symmetry Field motion slot names no donor at all.
+    SymmetryMotionNotSelected {
+        scope: VisualScopeId,
+        node_id: NodeId,
+        slot: u8,
+    },
+    /// An armed Symmetry Field motion slot holds a tombstoned donor. The saved
+    /// position is retained for the operator, never to rebind: whatever layer
+    /// later occupies that position does not inherit the route.
+    MissingSymmetryMotion {
+        scope: VisualScopeId,
+        node_id: NodeId,
+        slot: u8,
+        saved_position: SavedLayerPosition,
+    },
+    /// An armed Symmetry Field motion slot selected a live donor, but this
+    /// frame carries no motion input at all, so no primitive field exists to
+    /// request. The slot binds neutral vector/gate views.
+    SymmetryMotionUnavailable {
+        scope: VisualScopeId,
+        node_id: NodeId,
+        slot: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,6 +750,124 @@ fn refresh_garden_resource_plan(
         texture_operations_per_pixel: 6,
         max_sampled_textures_in_pass: 3,
     }
+}
+
+/// The constant resource table of the dedicated Symmetry Field pass.
+///
+/// Modelled on [`RefreshGardenResourcePlan`]: a step that is not a rack node
+/// pass declares its own table rather than widening `NodeResourceBudget`. The
+/// per-pixel terms are informational here — the authored node is still charged
+/// once through the ordinary rack ledger by `capture_budget_rack`, so adding
+/// them again in `resource_preflight` would double count. The simultaneous
+/// binding count is the term this plan actually gates on, and it is checked
+/// against the device's own reported ceiling without the fixed rack layout's
+/// `.min(MAX_SAMPLED_TEXTURES_PER_PASS)` clamp.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SymmetryFieldResourcePlan {
+    pub full_frame_passes: u32,
+    pub logical_texture_lookups_per_pixel: u32,
+    pub texture_operations_per_pixel: u32,
+    pub max_sampled_textures_in_pass: u32,
+    /// One dynamic-offset uniform record per encoded pass.
+    pub uniform_bytes: u32,
+}
+
+/// The table for `passes` dedicated Symmetry Field steps. Dormant with none.
+///
+/// Every term is read from the frozen node descriptor rather than restated, so
+/// the step's table and the rack ledger can never disagree about one node's
+/// cost. Passes and per-pixel work accumulate; simultaneous bindings do not —
+/// each pass owns its own bind group, so the frame's requirement is the widest
+/// single pass, exactly as `MotionFrameBudget` and `RefreshGardenResourcePlan`
+/// treat theirs.
+fn symmetry_field_resource_plan(
+    passes: u32,
+) -> Result<SymmetryFieldResourcePlan, CompositionPlanError> {
+    if passes == 0 {
+        return Ok(SymmetryFieldResourcePlan::default());
+    }
+    let descriptor = crate::visual_rack::node_kind_descriptor(NodeKindTag::Symmetry).budget;
+    let scale = |per_pass: u8| {
+        u32::from(per_pass)
+            .checked_mul(passes)
+            .ok_or(CompositionPlanError::Resource(
+                ResourcePreflightError::ArithmeticOverflow,
+            ))
+    };
+    Ok(SymmetryFieldResourcePlan {
+        full_frame_passes: scale(descriptor.full_frame_passes)?,
+        logical_texture_lookups_per_pixel: scale(descriptor.logical_texture_lookups_per_pixel)?,
+        texture_operations_per_pixel: scale(descriptor.texture_samples_per_pixel)?,
+        max_sampled_textures_in_pass: u32::from(descriptor.sampled_textures_in_pass),
+        uniform_bytes: SYMMETRY_UNIFORM_BYTES.checked_mul(passes).ok_or(
+            CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow),
+        )?,
+    })
+}
+
+/// The frozen dynamic-offset uniform record size, restated from
+/// `SymmetryGpuUniforms`' compile-time size assertion.
+const SYMMETRY_UNIFORM_BYTES: u32 = 1_024;
+
+/// Admit the dedicated pass's simultaneous-binding count.
+///
+/// Two independent ceilings, both required. The first is this project's own
+/// dedicated-pass policy, `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS`. The second
+/// is the device's reported capability, read **raw**: a dedicated pass owns its
+/// own bind-group layout, so the fixed Collision Rack layout's
+/// `.min(MAX_SAMPLED_TEXTURES_PER_PASS)` clamp — which governs three-texture
+/// rack passes and appears twice in `resource_preflight` — must never be
+/// applied here. Equally, nothing here may relax that clamp: the two ceilings
+/// are independent and neither was raised to admit the other.
+fn validate_symmetry_field_textures(
+    symmetry_field: SymmetryFieldResourcePlan,
+    limits: CreativeResourceLimits,
+) -> Result<(), CompositionPlanError> {
+    let requested = symmetry_field.max_sampled_textures_in_pass;
+    if requested > crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS {
+        return Err(CompositionPlanError::Resource(
+            ResourcePreflightError::SampledTextureLimit {
+                requested,
+                limit: crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS,
+            },
+        ));
+    }
+    if requested > limits.max_sampled_textures_per_shader_stage {
+        return Err(CompositionPlanError::Resource(
+            ResourcePreflightError::SampledTextureLimit {
+                requested,
+                limit: limits.max_sampled_textures_per_shader_stage,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Count the dedicated Symmetry Field steps the segmenter actually emitted.
+fn count_symmetry_field_steps(
+    layers: &[EvaluatedLayerScopePlan],
+    groups: &[EvaluatedGroupScopePlan],
+    master: &EvaluatedMasterScopePlan,
+) -> Result<u32, CompositionPlanError> {
+    let mut count = 0_u32;
+    let mut tally = |execution: &EvaluatedScopeExecution| -> Result<(), CompositionPlanError> {
+        for step in execution.steps() {
+            if matches!(step, EvaluatedScopeStep::SymmetryField { .. }) {
+                count = count.checked_add(1).ok_or(CompositionPlanError::Resource(
+                    ResourcePreflightError::ArithmeticOverflow,
+                ))?;
+            }
+        }
+        Ok(())
+    };
+    for layer in layers {
+        tally(&layer.execution)?;
+    }
+    for group in groups {
+        tally(&group.execution)?;
+    }
+    tally(&master.execution)?;
+    Ok(count)
 }
 
 #[derive(Debug, Clone)]
@@ -853,6 +1036,14 @@ pub struct AdvancedCompositionPlan {
     motion: EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
     refresh_garden_resources: RefreshGardenResourcePlan,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated Symmetry Field ledger precedes its executor"
+        )
+    )]
+    symmetry_field_resources: SymmetryFieldResourcePlan,
     topology_signature: u64,
 }
 
@@ -953,6 +1144,19 @@ impl AdvancedCompositionPlan {
 
     pub const fn refresh_garden_resources(&self) -> RefreshGardenResourcePlan {
         self.refresh_garden_resources
+    }
+
+    /// The combined constant table of every dedicated Symmetry Field pass this
+    /// frame encodes. Default when the frame encodes none.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated Symmetry Field ledger precedes its executor"
+        )
+    )]
+    pub const fn symmetry_field_resources(&self) -> SymmetryFieldResourcePlan {
+        self.symmetry_field_resources
     }
 
     pub const fn topology_signature(&self) -> u64 {
@@ -1286,6 +1490,46 @@ impl fmt::Display for CompositionPlanError {
 
 impl std::error::Error for CompositionPlanError {}
 
+/// One armed Symmetry Field motion slot, addressed by its permanent slot index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SymmetryMotionRequest {
+    scope: VisualScopeId,
+    node_id: NodeId,
+    slot: u8,
+    donor: MotionDonor,
+}
+
+impl SymmetryMotionRequest {
+    fn unselected_diagnostic(self) -> MotionPlanDiagnostic {
+        MotionPlanDiagnostic::SymmetryMotionNotSelected {
+            scope: self.scope,
+            node_id: self.node_id,
+            slot: self.slot,
+        }
+    }
+
+    fn missing_diagnostic(self, saved_position: SavedLayerPosition) -> MotionPlanDiagnostic {
+        MotionPlanDiagnostic::MissingSymmetryMotion {
+            scope: self.scope,
+            node_id: self.node_id,
+            slot: self.slot,
+            saved_position,
+        }
+    }
+
+    fn unserved_diagnostic(self) -> MotionPlanDiagnostic {
+        match self.donor {
+            MotionDonor::None => self.unselected_diagnostic(),
+            MotionDonor::Missing { saved_position } => self.missing_diagnostic(saved_position),
+            MotionDonor::Selected { .. } => MotionPlanDiagnostic::SymmetryMotionUnavailable {
+                scope: self.scope,
+                node_id: self.node_id,
+                slot: self.slot,
+            },
+        }
+    }
+}
+
 struct Planner<'a> {
     base: &'a EvaluatedFramePlan,
     input: CompositionPlanInput<'a>,
@@ -1438,6 +1682,7 @@ impl<'a> Planner<'a> {
                     allow_exact_scope: true,
                 },
                 output,
+                &motion,
             )?;
             let legacy_matte = legacy_mattes
                 .get(base_layer_index)
@@ -1481,6 +1726,7 @@ impl<'a> Planner<'a> {
                     allow_exact_scope: false,
                 },
                 output,
+                &motion,
             )?;
             if let Some(matte) = group.matte {
                 let EvaluatedScopeExecution::Ordered { steps } = &mut execution else {
@@ -1598,6 +1844,7 @@ impl<'a> Planner<'a> {
                     allow_exact_scope: false,
                 },
                 output,
+                &motion,
             )?,
             canonical_layers: canonical_layers.into_boxed_slice(),
             canonical_bypass_layers: canonical_bypass_layers.into_boxed_slice(),
@@ -1811,6 +2058,14 @@ impl<'a> Planner<'a> {
             &route_edges,
             &prefix_constraints,
         )?;
+        // Re-derive the dedicated-pass table from the emitted steps rather than
+        // from the authored racks, so the segmenter and the ledger cannot
+        // disagree about how many dedicated passes the frame actually encodes.
+        let symmetry_field_resources = symmetry_field_resource_plan(count_symmetry_field_steps(
+            &layer_plans,
+            &group_plans,
+            &master,
+        )?)?;
         let (resources, residual_resources) = resource_preflight(
             output,
             self.input,
@@ -1821,6 +2076,7 @@ impl<'a> Planner<'a> {
             &taps,
             &motion,
             refresh_garden_signal,
+            symmetry_field_resources,
         )?;
         let topology_signature = advanced_topology_signature(
             self.input.composition,
@@ -1831,6 +2087,7 @@ impl<'a> Planner<'a> {
             &taps,
             &motion,
             refresh_garden_signal,
+            symmetry_field_resources,
             residual_resources,
         );
 
@@ -1852,9 +2109,55 @@ impl<'a> Planner<'a> {
                 motion,
                 refresh_garden_signal,
                 refresh_garden_resources,
+                symmetry_field_resources,
                 topology_signature,
             },
         )))
+    }
+
+    /// Every armed Symmetry Field motion slot in the composition, in the same
+    /// layers-then-groups-then-master order tap collection uses.
+    ///
+    /// This is authored topology only. It never inspects a donor layer's own
+    /// `MotionParams`, and it never inspects whether a field happens to exist,
+    /// so the requests it produces are stable across frames.
+    fn symmetry_motion_requests(&self) -> Vec<SymmetryMotionRequest> {
+        let mut requests = Vec::new();
+        let mut collect = |scope: VisualScopeId, rack: &RuntimeVisualRack| {
+            for node in rack.iter() {
+                if !node.enabled || node.wet <= 0.0 {
+                    continue;
+                }
+                let RuntimeVisualNodeKind::Symmetry(symmetry) = node.kind else {
+                    continue;
+                };
+                if symmetry.is_exact_bypass() {
+                    continue;
+                }
+                for (slot, donor) in symmetry.admitted_motion_donors().into_iter().enumerate() {
+                    let Some(donor) = donor else {
+                        continue;
+                    };
+                    let Ok(slot) = u8::try_from(slot) else {
+                        continue;
+                    };
+                    requests.push(SymmetryMotionRequest {
+                        scope,
+                        node_id: node.stable_id,
+                        slot,
+                        donor,
+                    });
+                }
+            }
+        };
+        for (id, rack) in &self.racks {
+            collect(VisualScopeId::Layer(*id), rack);
+        }
+        for group in self.input.composition.groups() {
+            collect(VisualScopeId::Group(group.id), &group.rack);
+        }
+        collect(VisualScopeId::Master, self.input.master_rack);
+        requests
     }
 
     fn evaluate_motion(
@@ -1871,35 +2174,45 @@ impl<'a> Planner<'a> {
             && garden.amount.is_finite()
             && garden.amount > 0.0
             && garden.gate == RefreshGardenGate::Motion;
+        let symmetry_motion = self.symmetry_motion_requests();
         let Some(input) = self.input.motion else {
+            let mut diagnostics = Vec::new();
             if garden_motion_active {
-                let diagnostics = match garden.motion_route {
+                diagnostics.push(match garden.motion_route {
                     RefreshGardenMotionRoute::None => {
-                        vec![MotionPlanDiagnostic::RefreshGardenMotionNotSelected]
+                        MotionPlanDiagnostic::RefreshGardenMotionNotSelected
                     }
                     RefreshGardenMotionRoute::SelectedLayer { .. } => {
-                        vec![MotionPlanDiagnostic::RefreshGardenMotionUnavailable]
+                        MotionPlanDiagnostic::RefreshGardenMotionUnavailable
                     }
                     RefreshGardenMotionRoute::MissingSelectedLayer { saved_position } => {
-                        vec![MotionPlanDiagnostic::MissingRefreshGardenMotion { saved_position }]
+                        MotionPlanDiagnostic::MissingRefreshGardenMotion { saved_position }
                     }
-                };
-                return Ok(EvaluatedMotionPlan::Advanced(Box::new(
-                    AdvancedMotionPlan {
-                        scopes: Box::new([]),
-                        fields: Box::new([]),
-                        resources: MotionResourcePlan::default(),
-                        diagnostics: diagnostics.into_boxed_slice(),
-                        budget: MotionFrameBudget::default(),
-                        topology_signature: motion_topology_signature(
-                            &[],
-                            &[],
-                            MotionResourcePlan::default(),
-                        ),
-                    },
-                )));
+                });
             }
-            return Ok(EvaluatedMotionPlan::LegacyExact);
+            // A frame with no motion input at all can serve no primitive
+            // vector/gate pair, so every armed Symmetry slot is an incomplete
+            // pair that binds neutral views and says so by name.
+            for request in &symmetry_motion {
+                diagnostics.push(request.unserved_diagnostic());
+            }
+            if diagnostics.is_empty() {
+                return Ok(EvaluatedMotionPlan::LegacyExact);
+            }
+            return Ok(EvaluatedMotionPlan::Advanced(Box::new(
+                AdvancedMotionPlan {
+                    scopes: Box::new([]),
+                    fields: Box::new([]),
+                    resources: MotionResourcePlan::default(),
+                    diagnostics: diagnostics.into_boxed_slice(),
+                    budget: MotionFrameBudget::default(),
+                    topology_signature: motion_topology_signature(
+                        &[],
+                        &[],
+                        MotionResourcePlan::default(),
+                    ),
+                },
+            )));
         };
         let mut supplied = BTreeMap::new();
         for layer in input.layers {
@@ -2049,6 +2362,45 @@ impl<'a> Planner<'a> {
             scopes[donor_index].required_as_donor = true;
         }
 
+        // A Symmetry Field motion slot demands its donor's primitive
+        // vector/gate field through the established flag, exactly as an
+        // admitted Faraday transplant does. The donor's own Motion parameters
+        // are never consulted: a donor whose visible Motion is exactly zero
+        // still yields a field once `required_as_donor` is set, because
+        // `field_required` below reads the flag before the shutter.
+        for request in &symmetry_motion {
+            let donor_id = match request.donor {
+                MotionDonor::None => {
+                    diagnostics.push(request.unselected_diagnostic());
+                    continue;
+                }
+                MotionDonor::Missing { saved_position } => {
+                    diagnostics.push(request.missing_diagnostic(saved_position));
+                    continue;
+                }
+                MotionDonor::Selected {
+                    layer_id,
+                    saved_position,
+                } => {
+                    if !self.base_index.contains_key(&layer_id) {
+                        // A donor that has left the stack is a tombstone, not a
+                        // rebinding opportunity.
+                        diagnostics.push(request.missing_diagnostic(saved_position));
+                        continue;
+                    }
+                    layer_id
+                }
+            };
+            let Some(donor_index) = scopes
+                .iter()
+                .position(|scope| scope.scope == VisualScopeId::Layer(donor_id))
+            else {
+                diagnostics.push(request.unserved_diagnostic());
+                continue;
+            };
+            scopes[donor_index].required_as_donor = true;
+        }
+
         if let Some(recipient_index) = garden_recipient_index {
             let signal_scope = if scopes[recipient_index].transplant_admitted {
                 scopes[recipient_index]
@@ -2064,6 +2416,7 @@ impl<'a> Planner<'a> {
         }
 
         if !garden_motion_active
+            && symmetry_motion.is_empty()
             && scopes.iter().all(|scope| {
                 scope.params.is_exact_zero()
                     && !scope.required_as_donor
@@ -2195,6 +2548,7 @@ fn compile_scope_execution(
     scope: VisualScopeId,
     host: ScopeHostPayload,
     output: [u32; 2],
+    motion: &EvaluatedMotionPlan,
 ) -> Result<EvaluatedScopeExecution, CompositionPlanError> {
     rack.validate_for_scope(legacy_scope)
         .map_err(|error| CompositionPlanError::Rack { scope, error })?;
@@ -2217,7 +2571,14 @@ fn compile_scope_execution(
     for node in rack.iter().copied() {
         match node.kind {
             RuntimeVisualNodeKind::LegacyCanonical => {
-                flush_segment(&mut pending, &mut steps, &mut segment_index, scope, output)?;
+                flush_segment(
+                    &mut pending,
+                    &mut steps,
+                    &mut segment_index,
+                    scope,
+                    output,
+                    motion,
+                )?;
                 let application =
                     if legacy_scope == LegacyRackScope::Master && first_global_node.is_some() {
                         LegacyCanonicalApplication::ScopeLocal
@@ -2233,7 +2594,14 @@ fn compile_scope_execution(
             }
             RuntimeVisualNodeKind::LegacyTemporal => {
                 first_global_node.get_or_insert(node.stable_id);
-                flush_segment(&mut pending, &mut steps, &mut segment_index, scope, output)?;
+                flush_segment(
+                    &mut pending,
+                    &mut steps,
+                    &mut segment_index,
+                    scope,
+                    output,
+                    motion,
+                )?;
                 steps.push(EvaluatedScopeStep::LegacyTemporal {
                     params: host.temporal.ok_or(CompositionPlanError::Internal(
                         "legacy temporal marker has no master payload",
@@ -2246,7 +2614,14 @@ fn compile_scope_execution(
             }
         }
     }
-    flush_segment(&mut pending, &mut steps, &mut segment_index, scope, output)?;
+    flush_segment(
+        &mut pending,
+        &mut steps,
+        &mut segment_index,
+        scope,
+        output,
+        motion,
+    )?;
     Ok(EvaluatedScopeExecution::Ordered {
         steps: steps.into_boxed_slice(),
     })
@@ -2258,12 +2633,35 @@ fn flush_segment(
     segment_index: &mut u8,
     scope: VisualScopeId,
     output: [u32; 2],
+    motion: &EvaluatedMotionPlan,
 ) -> Result<(), CompositionPlanError> {
     if pending.is_empty() {
         return Ok(());
     }
     let mut ordinary = Vec::new();
     for node in std::mem::take(pending) {
+        // Kind-only, deliberately not value-gated: segment indices and the
+        // executor's uniform-slot reservation must not move when a gain
+        // crosses zero. The value-gated predicate lives in `collect_rack_taps`
+        // and its saved-patch twin, never here.
+        if let RuntimeVisualNodeKind::Symmetry(params) = node.kind {
+            // A dedicated eight-texture pass owns its own bind layout, so it is
+            // lifted out of segmentation entirely rather than isolated into a
+            // one-node rack segment: flush the ordinary work that precedes it,
+            // emit exactly one step at the authored position, and let the loop
+            // resume accumulating behind it.
+            compile_segment_nodes(
+                std::mem::take(&mut ordinary),
+                steps,
+                segment_index,
+                scope,
+                output,
+            )?;
+            steps.push(EvaluatedScopeStep::SymmetryField {
+                plan: symmetry_field_plan(scope, node, params, motion)?,
+            });
+            continue;
+        }
         // Deliberately kind-only, unlike the value-gated admission predicate in
         // `collect_rack_taps`: segment indices must never depend on frame-local
         // gains, or the uniform-slot reservation renumbers whenever one crosses
@@ -2288,6 +2686,48 @@ fn flush_segment(
         }
     }
     compile_segment_nodes(ordinary, steps, segment_index, scope, output)
+}
+
+/// Build one dedicated step's evaluated payload.
+///
+/// Motion slots are resolved through `admitted_field_slot`, never through
+/// `field_slot`: an admitted Faraday transplant replaces a scope's own field
+/// with its donor's, and a routed consumer that read the raw slot would sample
+/// a different field than motion rendering wrote.
+fn symmetry_field_plan(
+    scope: VisualScopeId,
+    node: RuntimeVisualNode,
+    params: RuntimeSymmetryParams,
+    motion: &EvaluatedMotionPlan,
+) -> Result<EvaluatedSymmetryFieldPlan, CompositionPlanError> {
+    let params = params.sanitized();
+    let admitted = params.admitted_motion_donors();
+    // The same value-gated predicate `symmetry_motion_requests` used to ask for
+    // these fields. A dormant node asked for nothing, so it must observe
+    // nothing rather than inheriting a field some other consumer admitted.
+    let admitted_node = node.enabled && node.wet > 0.0 && !params.is_exact_bypass();
+    let motion_field_slots = std::array::from_fn(|slot| {
+        if !admitted_node {
+            return None;
+        }
+        let MotionDonor::Selected { layer_id, .. } = admitted[slot]? else {
+            return None;
+        };
+        motion
+            .advanced()?
+            .scope(VisualScopeId::Layer(layer_id))
+            .and_then(|scope| scope.admitted_field_slot())
+    });
+    Ok(EvaluatedSymmetryFieldPlan {
+        node_id: node.stable_id,
+        domain: SymmetryNodeDomain::for_scope(scope, node.stable_id.get()),
+        enabled: node.enabled,
+        wet: node.wet,
+        blend: node.blend,
+        params,
+        motion_field_slots,
+        resources: symmetry_field_resource_plan(1)?,
+    })
 }
 
 fn compile_segment_nodes(
@@ -2386,9 +2826,12 @@ fn collect_rack_taps(
         if !node.enabled || node.wet <= 0.0 {
             continue;
         }
-        // Slot-ordered authored routes for this node. A single-route kind fills
-        // slot 0 only; Residual names both of its slots so its two donors are
-        // separate consumer identities that can never alias.
+        // Routes are collected by slot, so a node carrying several fixed
+        // routes yields one tap per admitted slot and slot index stays route
+        // identity all the way into the consumer key. A single-route kind fills
+        // slot 0 only; Residual names both of its slots and Symmetry both of
+        // its image slots, so those donors are separate consumer identities
+        // that can never alias.
         let mut routes: [Option<ResolvedImageTap>; RESIDUAL_ROUTE_SLOTS] =
             [None; RESIDUAL_ROUTE_SLOTS];
         match node.kind {
@@ -2407,6 +2850,15 @@ fn collect_rack_taps(
                 let [structure, detail] = residual.routes();
                 routes[usize::from(RESIDUAL_STRUCTURE_SLOT)] = Some(structure);
                 routes[usize::from(RESIDUAL_DETAIL_SLOT)] = Some(detail);
+            }
+            // A Symmetry Field answers admission per image slot: a donor no
+            // sector record can name claims nothing, exactly as a whole
+            // bypassed node claims nothing. The destructure is the
+            // compile-time proof that both frozen image slots are carried.
+            RuntimeVisualNodeKind::Symmetry(symmetry) if !symmetry.is_exact_bypass() => {
+                let [donor0, donor1] = symmetry.admitted_donor_taps();
+                routes[0] = donor0;
+                routes[1] = donor1;
             }
             _ => continue,
         }
@@ -2970,6 +3422,7 @@ fn resource_preflight(
     taps: &[PlannedImageTap],
     motion: &EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
+    symmetry_field: SymmetryFieldResourcePlan,
 ) -> Result<(CreativeResourcePlan, ResidualResourcePlan), CompositionPlanError> {
     let mut racks = Vec::with_capacity(
         input
@@ -3077,6 +3530,11 @@ fn resource_preflight(
         input.resource_limits,
     )
     .map_err(CompositionPlanError::Resource)?;
+    // The dedicated pass's per-pixel terms are deliberately absent from the
+    // combined arithmetic below: the authored node is already charged exactly
+    // once through `capture_budget_rack` above, and charging it again here
+    // would double count the same pass.
+    validate_symmetry_field_textures(symmetry_field, input.resource_limits)?;
     // Reduced block-mean surfaces are sub-full-frame and byte-exact, so they
     // are budgeted entirely outside the full-frame layer ledger. Charging them
     // as `additional_rgba16_layers` would over-count by orders of magnitude.
@@ -3323,6 +3781,7 @@ fn advanced_topology_signature(
     taps: &[PlannedImageTap],
     motion: &EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
+    symmetry_field: SymmetryFieldResourcePlan,
     residual: ResidualResourcePlan,
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4144_5641_4e43_4544);
@@ -3410,6 +3869,13 @@ fn advanced_topology_signature(
             }
         },
     );
+    if symmetry_field.full_frame_passes > 0 {
+        // Append-only domain tag, in the style of the motion tag above.
+        hash = hash_value(hash, 0x5359_4d4d_4554_5259);
+        hash = hash_value(hash, u64::from(symmetry_field.full_frame_passes));
+        hash = hash_value(hash, u64::from(symmetry_field.max_sampled_textures_in_pass));
+        hash = hash_value(hash, u64::from(symmetry_field.uniform_bytes));
+    }
     // The reduced block-mean grid is plan-visible resource topology: its
     // dimensions come from the authored block vocabulary, which the rack
     // signature deliberately does not hash. Without this a block change would
@@ -3534,10 +4000,12 @@ fn hash_consumer(mut hash: u64, consumer: ImageTapConsumer) -> u64 {
         } => {
             hash = hash_value(hash, 1);
             hash = hash_scope(hash, scope);
-            // The slot is part of the identity, not decoration: a route change
-            // on a second slot must move the signature, or `is_prepared_for`
-            // reuses the previous frame's bindings for a rewritten graph.
             hash = hash_value(hash, node_id.get());
+            // The slot is part of the identity, not decoration, and it must
+            // enter the hash. Without it a change confined to a node's second
+            // route leaves the topology signature unchanged and
+            // `CompositionGpuExecutor::is_prepared_for` silently reuses the
+            // stale bindings built for the previous route.
             hash_value(hash, u64::from(slot))
         }
         ImageTapConsumer::GroupMatte { group_id } => {
@@ -6479,5 +6947,887 @@ mod tests {
             advanced.resources().compat8_surface_layers,
             ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS
         );
+    }
+
+    // --- S4 Symmetry Field: the evaluator and admission ---
+
+    /// A woken Symmetry Field. Six-fold dihedral geometry keeps it out of the
+    /// exact-bypass domain, and each image slot is armed only when a route is
+    /// supplied, because the source mask is what admits a slot.
+    fn symmetry_params(
+        donor0: Option<(ResolvedImageSource, EdgeTiming)>,
+        donor1: Option<(ResolvedImageSource, EdgeTiming)>,
+    ) -> RuntimeSymmetryParams {
+        let mut params = RuntimeSymmetryParams {
+            mode: crate::symmetry::SymmetryMode::Dihedral,
+            base_folds: 6.0,
+            ..RuntimeSymmetryParams::default()
+        };
+        if let Some((source, timing)) = donor0 {
+            params.donors[0] = ResolvedImageTap { source, timing };
+            params.source_mask.donor0 = true;
+        }
+        if let Some((source, timing)) = donor1 {
+            params.donors[1] = ResolvedImageTap { source, timing };
+            params.source_mask.donor1 = true;
+        }
+        params
+    }
+
+    fn push_symmetry(rack: &mut RuntimeVisualRack, params: RuntimeSymmetryParams) -> NodeId {
+        rack.push(RuntimeVisualNodeKind::Symmetry(params)).unwrap()
+    }
+
+    fn layer_source(id: u64, position: u32) -> ResolvedImageSource {
+        ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(id),
+            saved_position: saved_position(position),
+            stage: LayerImageStage::PostLocalEffects,
+        }
+    }
+
+    /// Every tap one node collected, ordered by slot. A first-match lookup
+    /// would silently hide the second route, so this deliberately collects all
+    /// of them and keys them by slot.
+    fn symmetry_taps(plan: &AdvancedCompositionPlan, node: NodeId) -> Vec<(u8, &PlannedImageTap)> {
+        let mut found: Vec<_> = plan
+            .image_taps()
+            .iter()
+            .filter_map(|tap| match tap.consumer {
+                ImageTapConsumer::RackNode { node_id, slot, .. } if node_id == node => {
+                    Some((slot, tap))
+                }
+                _ => None,
+            })
+            .collect();
+        found.sort_by_key(|(slot, _)| *slot);
+        found
+    }
+
+    /// Planned layers are in flattened root order, which is the reverse of the
+    /// front-to-back fixture order, so a fixture must address a layer by its
+    /// stable ID rather than by position.
+    fn layer_plan(plan: &AdvancedCompositionPlan, id: u64) -> &EvaluatedLayerScopePlan {
+        plan.layers()
+            .iter()
+            .find(|layer| layer.stable_id == layer_id(id))
+            .expect("the planned layer exists")
+    }
+
+    fn symmetry_steps(execution: &EvaluatedScopeExecution) -> Vec<&EvaluatedSymmetryFieldPlan> {
+        execution
+            .steps()
+            .iter()
+            .filter_map(|step| match step {
+                EvaluatedScopeStep::SymmetryField { plan } => Some(plan),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every planner fixture otherwise runs at `CreativeResourceLimits::-
+    /// default()`, whose sampled-texture stub is the *ordinary rack* ceiling of
+    /// three. Production reads the device, whose enforced floor is sixteen, so
+    /// an eight-texture dedicated pass has to raise this explicitly.
+    fn plan_at_device_floor(
+        base: &EvaluatedFramePlan,
+        composition: &RuntimeComposition,
+        master: &RuntimeVisualRack,
+        racks: &[(StableLayerId, RuntimeVisualRack)],
+    ) -> Result<EvaluatedCompositionPlan, CompositionPlanError> {
+        let mut input = CompositionPlanInput::new(composition, master, racks);
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        EvaluatedCompositionPlan::evaluate(base, input)
+    }
+
+    fn plan_with_motion_at_device_floor(
+        base: &EvaluatedFramePlan,
+        composition: &RuntimeComposition,
+        master: &RuntimeVisualRack,
+        racks: &[(StableLayerId, RuntimeVisualRack)],
+        layers: &[LayerMotionPlanInput],
+    ) -> Result<EvaluatedCompositionPlan, CompositionPlanError> {
+        let mut input = CompositionPlanInput::new(composition, master, racks).with_motion(
+            MotionParams::default(),
+            layers,
+            MotionDeviceLimits::new(8_192, u64::MAX),
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        EvaluatedCompositionPlan::evaluate(base, input)
+    }
+
+    fn zero_motion_layers(ids: &[u64]) -> Vec<LayerMotionPlanInput> {
+        ids.iter()
+            .map(|id| LayerMotionPlanInput {
+                stable_id: layer_id(*id),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_symmetry_field_flushes_its_ordinary_segment_emits_one_dedicated_step_and_resumes() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let node = push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None),
+        );
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        let steps = layer_plan(&compiled, 2).execution.steps();
+        assert!(matches!(
+            steps[0],
+            EvaluatedScopeStep::MaterializeSpatial { .. }
+        ));
+        assert!(matches!(
+            steps[1],
+            EvaluatedScopeStep::LegacyCanonical { .. }
+        ));
+        // The ordinary work before the node is flushed into segment 0 ...
+        assert!(matches!(
+            steps[2],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 0,
+                ..
+            }
+        ));
+        // ... the dedicated pass sits at its exact authored position ...
+        let EvaluatedScopeStep::SymmetryField { plan: field } = &steps[3] else {
+            panic!("a Symmetry Field must own a dedicated step, not a rack segment");
+        };
+        assert_eq!(field.node_id, node);
+        assert!(field.enabled);
+        // ... and segmentation resumes behind it with the next segment index.
+        assert!(matches!(
+            steps[4],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 1,
+                ..
+            }
+        ));
+        assert_eq!(steps.len(), 5);
+        assert_eq!(
+            steps[3].node_kind_tag(),
+            Some(NodeKindTag::Symmetry),
+            "a dedicated step still reports the authored node kind it came from"
+        );
+
+        // Segmentation is kind-only: a disabled, zero-wet, exact-default node
+        // still owns its dedicated position, so segment indices and the
+        // executor's uniform-slot reservation never move with a value.
+        let mut dormant = legacy_racks(&[1, 2]);
+        dormant[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let dormant_node = push_symmetry(&mut dormant[1].1, RuntimeSymmetryParams::default());
+        dormant[1].1.get_mut(dormant_node).unwrap().enabled = false;
+        dormant[1].1.get_mut(dormant_node).unwrap().wet = 0.0;
+        dormant[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &dormant).unwrap());
+        let steps = layer_plan(&compiled, 2).execution.steps();
+        assert_eq!(steps.len(), 5);
+        assert!(matches!(steps[3], EvaluatedScopeStep::SymmetryField { .. }));
+        assert!(matches!(
+            steps[4],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 1,
+                ..
+            }
+        ));
+        assert!(
+            symmetry_taps(&compiled, dormant_node).is_empty(),
+            "a dormant node owns its position but collects no route"
+        );
+    }
+
+    #[test]
+    fn the_dedicated_pass_is_admitted_at_eight_and_refused_at_nine_against_the_raw_device_ceiling()
+    {
+        let plan_for = |textures| SymmetryFieldResourcePlan {
+            max_sampled_textures_in_pass: textures,
+            ..symmetry_field_resource_plan(1).unwrap()
+        };
+        let limits_for = |textures| CreativeResourceLimits {
+            max_sampled_textures_per_shader_stage: textures,
+            ..CreativeResourceLimits::default()
+        };
+
+        // The frozen declaration is eight, and eight is admitted at the device
+        // floor of sixteen. This case cannot pass if the ordinary rack's
+        // `.min(MAX_SAMPLED_TEXTURES_PER_PASS)` clamp is ever applied here,
+        // because that clamp would reduce sixteen to three.
+        assert_eq!(
+            symmetry_field_resource_plan(1)
+                .unwrap()
+                .max_sampled_textures_in_pass,
+            8
+        );
+        assert!(validate_symmetry_field_textures(plan_for(8), limits_for(16)).is_ok());
+        assert!(validate_symmetry_field_textures(plan_for(8), limits_for(8)).is_ok());
+
+        // Nine exceeds this project's dedicated-pass policy even on a device
+        // that could serve it.
+        assert!(matches!(
+            validate_symmetry_field_textures(plan_for(9), limits_for(16)),
+            Err(CompositionPlanError::Resource(
+                ResourcePreflightError::SampledTextureLimit {
+                    requested: 9,
+                    limit: 8
+                }
+            ))
+        ));
+
+        // A device that reports fewer than eight refuses the pass by its own
+        // number, not by the policy constant.
+        assert!(matches!(
+            validate_symmetry_field_textures(plan_for(8), limits_for(7)),
+            Err(CompositionPlanError::Resource(
+                ResourcePreflightError::SampledTextureLimit {
+                    requested: 8,
+                    limit: 7
+                }
+            ))
+        ));
+
+        // End to end: the default limits stub is the ordinary rack ceiling of
+        // three, so an authored Symmetry Field is refused there and admitted
+        // once the fixture reports the real device floor.
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None),
+        );
+        assert!(matches!(
+            plan(&base, &composition, &master, &racks),
+            Err(CompositionPlanError::Resource(
+                ResourcePreflightError::SampledTextureLimit {
+                    requested: 8,
+                    limit: 3
+                }
+            ))
+        ));
+        assert!(plan_at_device_floor(&base, &composition, &master, &racks).is_ok());
+    }
+
+    #[test]
+    fn ordinary_rack_segments_stay_capped_at_three_while_the_dedicated_pass_owns_eight() {
+        // The two ceilings are separate constants and neither was raised to
+        // admit the other.
+        assert_eq!(crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_PASS, 3);
+        assert_eq!(
+            crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS,
+            8
+        );
+
+        // The ordinary clamp survives verbatim at both of its sites in this
+        // module, and the dedicated check contains no clamp at all.
+        let source = include_str!("evaluated_composition.rs");
+        let implementation = source
+            .split_once("\nmod tests {")
+            .expect("the test module follows the implementation")
+            .0;
+        assert_eq!(
+            implementation
+                .matches(".min(crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_PASS)")
+                .count(),
+            2,
+            "the ordinary rack clamp must stay at exactly its two established sites"
+        );
+        let dedicated = implementation
+            .split_once("fn validate_symmetry_field_textures(")
+            .expect("the dedicated admission check exists")
+            .1;
+        let dedicated = &dedicated[..dedicated.find("\n}\n").expect("its body is bounded")];
+        assert!(
+            !dedicated.contains(".min("),
+            "the dedicated ceiling must never be clamped by the ordinary rack ceiling"
+        );
+        assert!(dedicated.contains("MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS"));
+        assert!(dedicated.contains("limits.max_sampled_textures_per_shader_stage"));
+
+        // The two hardcoded LegacyExact matte threes are independent of both
+        // ceilings and did not move with either.
+        assert!(include_str!("renderer/compositor.rs")
+            .contains("if limits.max_sampled_textures_per_shader_stage < 3 {"));
+        assert!(include_str!("evaluated_frame.rs")
+            .contains("max_sampled_textures_per_shader_stage: 3,"));
+
+        // An ordinary rack alongside a dedicated pass still charges its own
+        // widest pass to the three-texture accumulator.
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        push_displace(
+            &mut racks[1].1,
+            layer_source(1, 0),
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None),
+        );
+        let budget = racks[1].1.resource_budget().unwrap();
+        assert_eq!(
+            budget.max_sampled_textures_in_pass, 2,
+            "Displace's two bindings, not the dedicated pass's eight"
+        );
+        assert_eq!(budget.max_sampled_textures_in_dedicated_pass, 8);
+        assert!(plan_at_device_floor(&base, &composition, &master, &racks).is_ok());
+    }
+
+    #[test]
+    fn symmetry_collects_one_tap_per_armed_image_slot_and_slot_index_is_route_identity() {
+        let base = base(&[1, 2, 3], &[]);
+        let composition = legacy_composition(&[1, 2, 3]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+
+        // Both slots armed: two taps, one per slot, each resolving its own
+        // donor. A first-match consumer lookup could not tell them apart.
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        let node = push_symmetry(
+            &mut racks[2].1,
+            symmetry_params(
+                Some((layer_source(1, 0), EdgeTiming::CurrentFrame)),
+                Some((layer_source(2, 1), EdgeTiming::CurrentFrame)),
+            ),
+        );
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        let taps = symmetry_taps(&compiled, node);
+        assert_eq!(taps.len(), 2);
+        assert_eq!(taps[0].0, 0);
+        assert_eq!(
+            taps[0].1.resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(1),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(taps[1].0, 1);
+        assert_eq!(
+            taps[1].1.resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(2),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+
+        // Disarming slot 0 leaves slot 1 addressed as slot 1. The surviving
+        // route must not slide down into the vacated slot.
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        let mut params = symmetry_params(
+            Some((layer_source(1, 0), EdgeTiming::CurrentFrame)),
+            Some((layer_source(2, 1), EdgeTiming::CurrentFrame)),
+        );
+        params.source_mask.donor0 = false;
+        let node = push_symmetry(&mut racks[2].1, params);
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        let taps = symmetry_taps(&compiled, node);
+        assert_eq!(taps.len(), 1);
+        assert_eq!(taps[0].0, 1);
+        assert_eq!(
+            taps[0].1.resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(2),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+
+        // An exact-default node is a real delegation: no tap at either slot.
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        let node = push_symmetry(&mut racks[2].1, RuntimeSymmetryParams::default());
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        assert!(symmetry_taps(&compiled, node).is_empty());
+    }
+
+    #[test]
+    fn the_topology_signature_moves_when_the_same_route_moves_to_the_other_image_slot() {
+        // The consumer key must carry the slot: two identical routes differing
+        // only in which slot holds them are otherwise indistinguishable.
+        let scope = VisualScopeId::Layer(layer_id(2));
+        let node_id = NodeId::new(7).unwrap();
+        assert_ne!(
+            hash_consumer(
+                FNV_OFFSET,
+                ImageTapConsumer::RackNode {
+                    scope,
+                    node_id,
+                    slot: 0
+                }
+            ),
+            hash_consumer(
+                FNV_OFFSET,
+                ImageTapConsumer::RackNode {
+                    scope,
+                    node_id,
+                    slot: 1
+                }
+            )
+        );
+
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let route = (layer_source(1, 0), EdgeTiming::CurrentFrame);
+        let compile = |params| {
+            let mut racks = legacy_racks(&[1, 2]);
+            let node = push_symmetry(&mut racks[1].1, params);
+            let compiled =
+                advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+            (compiled, node)
+        };
+
+        let (at_slot_zero, first) = compile(symmetry_params(Some(route), None));
+        let (at_slot_one, second) = compile(symmetry_params(None, Some(route)));
+        let first = symmetry_taps(&at_slot_zero, first);
+        let second = symmetry_taps(&at_slot_one, second);
+
+        // Everything except the slot is identical: one tap, same origin, same
+        // resolved source, same timing.
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].1.origin, second[0].1.origin);
+        assert_eq!(first[0].1.resolved, second[0].1.resolved);
+        assert_eq!(first[0].0, 0);
+        assert_eq!(second[0].0, 1);
+        assert_ne!(
+            at_slot_zero.topology_signature(),
+            at_slot_one.topology_signature(),
+            "moving a route between slots must invalidate the prepared bindings"
+        );
+    }
+
+    #[test]
+    fn the_three_symmetry_admission_sites_agree_route_for_route() {
+        // All three sites share one predicate and one per-slot helper. The
+        // segmentation site is deliberately kind-only.
+        let planner = include_str!("evaluated_composition.rs");
+        let saved = include_str!("patch/mod.rs");
+        for source in [planner, saved] {
+            assert!(source.contains("Symmetry(symmetry) if !symmetry.is_exact_bypass()"));
+            assert!(source.contains("symmetry.admitted_donor_taps()"));
+        }
+
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let route = (layer_source(1, 0), EdgeTiming::CurrentFrame);
+        let cases = [
+            (true, 1.0_f32, symmetry_params(Some(route), Some(route))),
+            (true, 1.0, symmetry_params(Some(route), None)),
+            (true, 1.0, symmetry_params(None, Some(route))),
+            (true, 1.0, RuntimeSymmetryParams::default()),
+            (false, 1.0, symmetry_params(Some(route), Some(route))),
+            (true, 0.0, symmetry_params(Some(route), Some(route))),
+        ];
+        for (enabled, wet, params) in cases {
+            let mut racks = legacy_racks(&[1, 2]);
+            let node = push_symmetry(&mut racks[1].1, params);
+            let live = racks[1].1.get_mut(node).unwrap();
+            live.enabled = enabled;
+            live.wet = wet;
+            let compiled =
+                advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+
+            // The saved-patch walk's own predicate, evaluated on the captured
+            // twin of the same node.
+            let captured = params.capture_routes(&mut |_| Some(saved_position(0)));
+            let expected: Vec<u8> = if enabled && wet > 0.0 && !captured.is_exact_bypass() {
+                captured
+                    .admitted_donor_taps()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, tap)| tap.map(|_| slot as u8))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let collected: Vec<u8> = symmetry_taps(&compiled, node)
+                .into_iter()
+                .map(|(slot, _)| slot)
+                .collect();
+            assert_eq!(
+                collected, expected,
+                "the live planner and the saved walk must admit the same slots"
+            );
+
+            // The segmentation site never consults a value.
+            assert_eq!(symmetry_steps(&layer_plan(&compiled, 2).execution).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_symmetry_motion_donor_yields_a_field_even_when_its_own_motion_is_exactly_zero() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = zero_motion_layers(&[1, 2]);
+        assert!(
+            layers.iter().all(|layer| layer.params.is_exact_zero()),
+            "the donor's own Motion must be exactly zero for this proof to mean anything"
+        );
+
+        // Without the route the frame has no motion work at all, so the whole
+        // composition stays on the literal pre-M4 exact path.
+        let racks = legacy_racks(&[1, 2]);
+        let quiet = plan_with_motion_at_device_floor(&base, &composition, &master, &racks, &layers)
+            .unwrap();
+        assert!(matches!(quiet, EvaluatedCompositionPlan::LegacyExact(_)));
+
+        // Arming a Symmetry motion slot pulls the donor's primitive
+        // vector/gate field into the plan through `required_as_donor`.
+        let mut racks = legacy_racks(&[1, 2]);
+        let mut params =
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None);
+        params.motion_mask.slot0 = true;
+        params.motion[0] = MotionDonor::Selected {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+        };
+        let node = push_symmetry(&mut racks[1].1, params);
+        let compiled = advanced(
+            plan_with_motion_at_device_floor(&base, &composition, &master, &racks, &layers)
+                .unwrap(),
+        );
+        let motion = compiled
+            .motion()
+            .advanced()
+            .expect("an admitted field plan");
+        assert_eq!(motion.fields().len(), 1);
+        assert_eq!(motion.fields()[0].scope, VisualScopeId::Layer(layer_id(1)));
+        assert!(motion.fields()[0].required_as_donor);
+        assert_eq!(motion.resources().active_field_slots, 1);
+        let donor = motion.scope(VisualScopeId::Layer(layer_id(1))).unwrap();
+        assert!(donor.params.is_exact_zero());
+        assert!(donor.required_as_donor);
+
+        // The dedicated step observes the same admitted slot motion rendering
+        // wrote, and the unarmed slot stays empty.
+        let field = symmetry_steps(&layer_plan(&compiled, 2).execution);
+        assert_eq!(field.len(), 1);
+        assert_eq!(field[0].node_id, node);
+        assert_eq!(
+            field[0].motion_field_slots,
+            [donor.admitted_field_slot(), None]
+        );
+        assert_eq!(field[0].motion_field_slots[0], Some(0));
+    }
+
+    #[test]
+    fn an_incomplete_symmetry_motion_pair_binds_neutral_and_names_its_own_slot() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = zero_motion_layers(&[1, 2]);
+
+        let mut racks = legacy_racks(&[1, 2]);
+        let tombstoned = saved_position(3);
+        let mut params =
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None);
+        params.motion_mask.slot0 = true;
+        params.motion_mask.slot1 = true;
+        // Slot 0 is a tombstone, slot 1 names a live donor.
+        params.motion[0] = MotionDonor::Missing {
+            saved_position: tombstoned,
+        };
+        params.motion[1] = MotionDonor::Selected {
+            layer_id: layer_id(1),
+            saved_position: saved_position(0),
+        };
+        let node = push_symmetry(&mut racks[1].1, params);
+        let compiled = advanced(
+            plan_with_motion_at_device_floor(&base, &composition, &master, &racks, &layers)
+                .unwrap(),
+        );
+        let motion = compiled.motion().advanced().unwrap();
+        assert!(
+            motion.diagnostics().iter().any(|diagnostic| matches!(
+                diagnostic,
+                MotionPlanDiagnostic::MissingSymmetryMotion {
+                    scope: VisualScopeId::Layer(owner),
+                    node_id,
+                    slot: 0,
+                    saved_position,
+                } if *owner == layer_id(2)
+                    && *node_id == node
+                    && *saved_position == tombstoned
+            )),
+            "a tombstoned motion slot must name itself: {:?}",
+            motion.diagnostics()
+        );
+        let field = symmetry_steps(&layer_plan(&compiled, 2).execution);
+        assert_eq!(field[0].motion_field_slots[0], None);
+        assert_eq!(field[0].motion_field_slots[1], Some(0));
+
+        // An armed slot with no donor at all is equally visible, and the
+        // tombstone never rebinds onto the layer that now occupies its saved
+        // position.
+        let mut racks = legacy_racks(&[1, 2]);
+        let mut params =
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None);
+        params.motion_mask.slot1 = true;
+        let node = push_symmetry(&mut racks[1].1, params);
+        let compiled = advanced(
+            plan_with_motion_at_device_floor(&base, &composition, &master, &racks, &layers)
+                .unwrap(),
+        );
+        let motion = compiled.motion().advanced().unwrap();
+        assert!(motion.fields().is_empty());
+        assert!(motion.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            MotionPlanDiagnostic::SymmetryMotionNotSelected {
+                node_id, slot: 1, ..
+            } if *node_id == node
+        )));
+        let field = symmetry_steps(&layer_plan(&compiled, 2).execution);
+        assert_eq!(field[0].motion_field_slots, [None, None]);
+    }
+
+    #[test]
+    fn a_symmetry_slot_self_route_cycles_on_the_current_frame_but_n_minus_one_is_admitted() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let own_output = layer_source(2, 1);
+
+        // Slot 1 alone reads its own scope this frame.
+        let mut racks = legacy_racks(&[1, 2]);
+        push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(
+                Some((layer_source(1, 0), EdgeTiming::CurrentFrame)),
+                Some((own_output, EdgeTiming::CurrentFrame)),
+            ),
+        );
+        let Err(error) = plan_at_device_floor(&base, &composition, &master, &racks) else {
+            panic!("a current-frame self route must be rejected before allocation");
+        };
+        assert!(
+            matches!(
+                error,
+                CompositionPlanError::ImageGraph(ImageGraphError::CurrentCycle { ref scopes })
+                    if scopes.as_slice() == [VisualScopeId::Layer(layer_id(2))]
+            ),
+            "the offending scope must be named: {error:?}"
+        );
+
+        // The identical route at N-1 is a legitimate feedback edge, and slot 0
+        // keeps its own current-frame edge alongside it.
+        let mut racks = legacy_racks(&[1, 2]);
+        push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(
+                Some((layer_source(1, 0), EdgeTiming::CurrentFrame)),
+                Some((own_output, EdgeTiming::PreviousFrame)),
+            ),
+        );
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        assert_eq!(compiled.graph().previous_taps, 1);
+        assert_eq!(compiled.graph().current_taps, 1);
+
+        // Disarming the offending slot removes the edge entirely: an
+        // unreadable route cannot cycle.
+        let mut racks = legacy_racks(&[1, 2]);
+        let mut params = symmetry_params(
+            Some((layer_source(1, 0), EdgeTiming::CurrentFrame)),
+            Some((own_output, EdgeTiming::CurrentFrame)),
+        );
+        params.source_mask.donor1 = false;
+        push_symmetry(&mut racks[1].1, params);
+        assert!(plan_at_device_floor(&base, &composition, &master, &racks).is_ok());
+    }
+
+    #[test]
+    fn a_missing_symmetry_donor_tombstones_only_its_own_slot_and_never_rebinds() {
+        let frame = base(&[1, 2], &[]);
+        let replaced_frame = base(&[3, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let saved = saved_position(0);
+
+        let mut racks = legacy_racks(&[1, 2]);
+        let node = push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(
+                Some((layer_source(2, 1), EdgeTiming::PreviousFrame)),
+                Some((layer_source(1, 0), EdgeTiming::CurrentFrame)),
+            ),
+        );
+        let compiled =
+            advanced(plan_at_device_floor(&frame, &composition, &master, &racks).unwrap());
+        assert!(matches!(
+            symmetry_taps(&compiled, node)[1].1.resolved,
+            PlannedImageSource::SelectedLayer { .. }
+        ));
+
+        // Deleting slot 1's donor tombstones that slot only.
+        racks[1].1.mark_layer_output_missing(layer_id(1));
+        let replaced_composition = legacy_composition(&[3, 2]);
+        let mut replaced_racks = legacy_racks(&[3, 2]);
+        let slot = replaced_racks
+            .iter_mut()
+            .find(|(id, _)| *id == layer_id(2))
+            .expect("layer 2 survives the replacement");
+        slot.1 = racks[1].1.clone();
+        let compiled = advanced(
+            plan_at_device_floor(
+                &replaced_frame,
+                &replaced_composition,
+                &master,
+                &replaced_racks,
+            )
+            .unwrap(),
+        );
+        let taps = symmetry_taps(&compiled, node);
+        assert_eq!(taps.len(), 2);
+        assert!(
+            matches!(
+                taps[0].1.resolved,
+                PlannedImageSource::SelectedLayer {
+                    layer_id: id,
+                    ..
+                } if id == layer_id(2)
+            ),
+            "slot 0 is untouched by slot 1's loss"
+        );
+        assert_eq!(taps[1].1.resolved, PlannedImageSource::Transparent);
+        assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::MissingSelectedLayer {
+                consumer: ImageTapConsumer::RackNode {
+                    node_id,
+                    slot: 1,
+                    ..
+                },
+                saved_position,
+            } if *node_id == node && *saved_position == saved
+        )));
+    }
+
+    #[test]
+    fn the_dedicated_symmetry_ledger_is_charged_exactly_once_beside_the_rack_ledger() {
+        let descriptor = crate::visual_rack::node_kind_descriptor(NodeKindTag::Symmetry).budget;
+        assert_eq!(
+            symmetry_field_resource_plan(0).unwrap(),
+            SymmetryFieldResourcePlan::default()
+        );
+        assert_eq!(
+            symmetry_field_resource_plan(1).unwrap(),
+            SymmetryFieldResourcePlan {
+                full_frame_passes: 1,
+                logical_texture_lookups_per_pixel: 4,
+                texture_operations_per_pixel: 10,
+                max_sampled_textures_in_pass: 8,
+                uniform_bytes: 1_024,
+            }
+        );
+        // Two dedicated passes accumulate work but not simultaneous bindings:
+        // each pass owns its own bind group.
+        assert_eq!(
+            symmetry_field_resource_plan(2).unwrap(),
+            SymmetryFieldResourcePlan {
+                full_frame_passes: 2,
+                logical_texture_lookups_per_pixel: 8,
+                texture_operations_per_pixel: 20,
+                max_sampled_textures_in_pass: 8,
+                uniform_bytes: 2_048,
+            }
+        );
+        assert_eq!(
+            u32::from(descriptor.logical_texture_lookups_per_pixel),
+            symmetry_field_resource_plan(1)
+                .unwrap()
+                .logical_texture_lookups_per_pixel,
+            "the step table is read from the frozen descriptor, never restated"
+        );
+
+        // The authored node is charged once, through the ordinary rack ledger.
+        // The step table beside it must not add a second charge. The baseline
+        // carries an ordinary custom node so both plans are Advanced and differ
+        // only by the dedicated pass.
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let baseline_rack = |racks: &mut Vec<(StableLayerId, RuntimeVisualRack)>| {
+            racks[1]
+                .1
+                .push(RuntimeVisualNodeKind::DigitalColor(
+                    DigitalColorParams::default(),
+                ))
+                .unwrap();
+        };
+        let mut racks = legacy_racks(&[1, 2]);
+        baseline_rack(&mut racks);
+        let without = advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        assert_eq!(
+            without.symmetry_field_resources(),
+            SymmetryFieldResourcePlan::default()
+        );
+
+        let mut racks = legacy_racks(&[1, 2]);
+        baseline_rack(&mut racks);
+        push_symmetry(
+            &mut racks[1].1,
+            symmetry_params(Some((layer_source(1, 0), EdgeTiming::CurrentFrame)), None),
+        );
+        let with = advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        assert_eq!(with.symmetry_field_resources(), {
+            symmetry_field_resource_plan(1).unwrap()
+        });
+        assert_eq!(
+            with.resources().logical_texture_lookups_per_pixel
+                - without.resources().logical_texture_lookups_per_pixel,
+            u32::from(descriptor.logical_texture_lookups_per_pixel),
+        );
+        assert_eq!(
+            with.resources().texture_samples_per_pixel
+                - without.resources().texture_samples_per_pixel,
+            u32::from(descriptor.texture_samples_per_pixel),
+        );
+        assert_eq!(
+            with.resources().full_frame_passes - without.resources().full_frame_passes,
+            u32::from(descriptor.full_frame_passes),
+        );
+        // The Compat8 clean-history ring is reused, never rebuilt: a dedicated
+        // pass adds no history layer.
+        assert_eq!(
+            with.resources().compat8_surface_layers,
+            without.resources().compat8_surface_layers
+        );
+        assert_ne!(with.topology_signature(), without.topology_signature());
     }
 }

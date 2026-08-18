@@ -32,11 +32,13 @@ src/
 ├── media_source.rs      shared resolution, bounded SHA-256 fingerprinting, content references
 ├── spatial.rs           canonical authored transforms and packed GPU pass uniforms
 ├── motion.rs            canonical codec/lattice fields, Motion authoring, resource preflight
+├── symmetry.rs          closed symmetry groups, 32-sector table, 1,024-byte uniform
 ├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
+├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
@@ -70,6 +72,7 @@ src/
     ├── fullscreen.wgsl  fullscreen triangle vertex shader
     ├── effects.wgsl     LegacyExact and Advanced layer/master effects
     ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
+    ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
     ├── gesture_etch.wgsl one ordered etch sample per pass plus the donor present
@@ -602,6 +605,283 @@ route, composition_revision }`. Snapshot params are
 same evaluated plan and the same rack shader; there is no export-only
 displacement path.
 
+### The dedicated Symmetry Field
+
+`Symmetry` folds its carrier through a finite symmetry group and recolours the
+result from a frozen 32-record sector table. It is the first node that is not
+encoded inside an ordinary rack segment: `NodeKindTag::occupies_dedicated_pass`
+is true only for it, and `flush_segment` closes the accumulated segment, emits
+one `EvaluatedScopeStep::SymmetryField` at the exact authored position, then
+resumes segmentation behind it. `NodeKindTag::Symmetry` holds append-only
+signature code 11; kind codes are never renumbered or reused.
+
+**Two closed vocabularies.** `SymmetryMode` has permanent codes 0…7: cyclic
+`Cn` 0, dihedral `Dn` 1, planar `p1` 2, `pm` 3, `p2` 4, `pmm` 5, bounded log
+spiral 6, orbit 7. Every mode is a genuine finite group — the composition table
+closes, the generator returns to the identity after the full point-group order,
+the action agrees with the table, and classification recovers each sample
+through its own element. The log spiral closes only on its log-polar **quotient
+torus**: `folds` steps climb exactly one log-radius period, the period is hard
+clamped to 6.0 with the per-step climb derived back out of the clamped value so
+closure stays exact, and below a 0.25 period the mode degenerates to pure cyclic
+geometry instead of collapsing every radius onto one circle. Orbit is a
+presentation of `Cn`, not a distinct group: its satellite radius and spin are a
+uniform post-fold frame applied deliberately outside the group action.
+`SymmetryBoundary` is `Transparent | Mirror | Wrap | Hold | CellularReentry`
+with shader codes 0…4. Codes 0…3 stay byte-compatible with the Displace
+boundary vocabulary; `Transparent` is the default and the only law that removes
+coverage. CellularReentry is **one deterministic D4 cell transform, never
+recursive sampling**: floor to a cell index, select one of eight D4 elements
+from two cell parity bits plus one supercell parity bit, apply it about the cell
+centre. Non-recursion is proven structurally — no self-call, no loop, no
+iterator in any of its three functions — plus by totality and cell-index
+periodicity, not by comment.
+
+**The four phase semantics.** Radial phase rotates the sector **origin** and
+carries the folded coordinate with it. Orbit phase rotates sector
+**classification** only and never moves the folded coordinate; it is named for
+the orbit of the group action and applies in every mode, not only
+`SymmetryMode::Orbit`. Planar axis rotates the **lattice basis**. Planar phase
+translates the **primary lattice coordinate** by whole cell periods. Reuse
+`spatial.rs`'s `output_aspect_basis` / `conjugate_through_output_aspect` and its
+wrap/mirror helpers rather than re-deriving them: physical angles must stay
+correct on non-square outputs. `mirrored_walls()` is a per-axis `[bool; 2]`
+declaration — `pm` is `[true, false]`, continuous across its mirror and seamed
+across the other — and the identity-seam continuity law is measured against it
+rather than against a single per-mode boolean.
+
+`effective_folds()` is the **sole rounding point**. It sums the already-modulated
+`base_folds + fold_offset`, guards the sum for overflow, rounds exactly once,
+then clamps `1..=32`. Nothing else rounds a fold count, and a source-text audit
+asserts `.round()` appears exactly once in `symmetry.rs`.
+
+**The 32-sector table.** `SYMMETRY_SECTOR_RECORDS = 32`, and history ages run
+`0..=SYMMETRY_MAX_HISTORY_AGE`, derived from the committed ring as
+`TEMPORAL_HISTORY_LEN - 1 = 23` rather than restated as a literal. Each record
+chooses a source (`Carrier | Donor0 | Donor1 | CleanHistory`, codes 0…3), an
+optional motion slot (`0 | 1 | none`, stored as slot+1 so neutral is also the
+zero word), one history age, and one hue offset. Four independently keyed lanes
+are drawn by a pure SplitMix64 counter hash over `(stable node domain, authored
+seed, sector index, lane-domain constant)` — no sequential state, so any record
+recomputes alone and one lane can never perturb another. **Runtime donor
+availability must never enter that hash.** Losing a selected donor binds the
+neutral view for that sector and rerolls nothing; the fold clamp guarantees a
+sector index is always a legal record index at any fold count. An exact-default
+node short circuits to the frozen neutral table and therefore does not depend on
+its seed at all.
+
+The domain comes from the single derivation `SymmetryNodeDomain::for_scope`, and
+**only authored identity may enter it**. The node's persisted `stable_id` and
+its authored `seed` do; a `GroupId` does, because it is serialized in the
+composition. A live `StableLayerId` does **not**: it is process lifetime and
+deliberately never serialized, an export job numbers layers `position + 1`, and
+a fresh process or a replaced clip mints a different value for the same authored
+layer, so consuming it would reroll all 32 records on every reload and make an
+exported file disagree with the program it was rendered from. The layer arm of
+`symmetry_scope_owner` therefore contributes only its scope kind. The stated
+consequence is that two Symmetry Fields carrying the same node id in two
+different layer racks share a table until they are given different seeds — a
+bounded correlation between two authored nodes, which is not comparable to a
+table that changes under the operator's feet. Reordering the stack never touches
+the table, and moving a node to master or into a group is a different authored
+identity that legitimately owns a different one.
+
+**Slot index is route identity.** Exactly two fixed image slots and two fixed
+motion slots, never a variable count — a variable count would make an authored
+route depend on how many other routes happen to exist. Selected donors capture
+saved positions and resolve once; `Missing` donors retain their saved positions
+and never rebind. Admission is answered **per slot**: a donor whose source-mask
+bit is clear can never be chosen by any sector record, so it claims no
+dependency edge, no tombstone diagnostic and no binding, and clearing slot 0
+never slides slot 1's route down. `ImageTapConsumer::RackNode` therefore carries
+`slot: u8`, which enters both the consumer key and the topology signature;
+without it two taps from one node compare equal and the first-match binding
+lookup aliases them. Motion slots request their primitive vector/gate fields
+through the established `required_as_donor` flag, so an armed donor yields a
+field even when its own Motion is exactly zero; there is no second path.
+
+**Exact default and bypass.** Cyclic, fold 1, carrier-only, no motion, no
+history, no hue, neutral phase/axis/centre, OneBelow/current-frame routes.
+`is_exact_bypass()` ANDs geometric identity with table neutrality (carrier-only
+mask, empty motion mask, zero hue span): an identity fold whose table can still
+read a donor or the ring is emphatically not a bypass. Only cyclic geometry can
+claim a bypass at all — over-claiming is a pixel bug, under-claiming only costs
+a pass. The delegation is real but sits one level up: because a dedicated step
+writes a surface that is *not* its carrier, omitting the pass would leave that
+target holding stale content, so `encode_at` always encodes exactly one pass and
+`SymmetryFieldExecutor::is_inert` makes the composition skip the step and the
+copy entirely. The shader's identity and wet-zero branches `textureLoad` the
+carrier texel directly, textually before any filter, so a default readback is
+byte-for-byte its carrier.
+
+**Eight sampled textures in one pass — and why the ordinary ceiling did not
+move.** `MAX_SAMPLED_TEXTURES_PER_PASS = 3` governs ordinary rack segments and
+is unchanged; the two hardcoded LegacyExact matte `3`s (`renderer/compositor.rs`,
+`evaluated_frame.rs`) are independent of both ceilings and did not move either.
+A **separate** `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS = 8` sits beside it,
+`RackResourceBudget` carries a second accumulator so a dedicated kind never
+inflates the fixed rack layout's ceiling, and the dedicated step is checked
+against `limits.max_sampled_textures_per_shader_stage` **raw** — the ordinary
+path's `.min(MAX_SAMPLED_TEXTURES_PER_PASS)` clamp must never be applied there
+and that check must never relax the clamp. Eight bindings: carrier, donor 0,
+donor 1, the clean-history **D2 array**, and a vector/gate pair per motion slot.
+There is **no texture sampler**: every lookup is an explicit `textureLoad` and
+the covered premultiplied bilinear is transplanted from
+`rack_node.wgsl`'s `source_premultiplied_linear`. Every planner unit test builds
+`CreativeResourceLimits::default()`, whose `max_sampled_textures_per_shader_stage`
+*is* the ordinary constant 3, so a Symmetry fixture must raise
+`input.resource_limits` explicitly; the admission fixtures refuse at 3 and admit
+at the enforced device floor of 16, and that discrimination is exactly what
+fails if the clamp ever creeps back in.
+
+Uniforms are the exact 1,024-byte `SymmetryGpuUniforms` with a compile-time
+`const _: () = assert!(size_of::<SymmetryGpuUniforms>() == 1_024)`: `meta` 64 B
+at offset 0, `params` 64 B at 64, `motion_rows` 128 B at 128, the 32 sector
+records at 256 (512 B), the renderer-owned `frame` and `frame_modes` lanes at
+768 and 784, then a 224-byte reserved tail. The tail exists so renderer-owned
+fields can be added without moving the stride or any existing offset. The arena
+strides by `align_up(1_024, min_uniform_buffer_offset_alignment)` with
+`has_dynamic_offset: true` and `min_binding_size` 1,024; 1,024 is never written
+as a stride literal.
+
+**Three bind groups, not two — a deliberate, documented deviation.** The frozen
+contract said "Bind groups: 2". Honouring it would have left the motion pair
+permanently neutral, because a `MotionGpuField` owns a **third** committed
+ping/pong parity (`MotionMemoryStage::render_field_index`, chosen per field per
+frame) above the carrier parity and the composition's N-1 tap parity. All three
+in one input group multiply: 4 × 4 = 16 prebuilt groups per node. Splitting the
+vector/gate pair into its own group makes them add instead:
+
+- **group 0, image** — carrier, donor 0, donor 1, the clean-history D2 array;
+  prebuilt per carrier parity (`std::array::from_fn(|parity| …)`), and the
+  composition prepares both committed N-1 read parities above that, so **4 image
+  groups per node** in a live frame, exactly as a rack segment does;
+- **group 1, uniform** — the 1,024-byte dynamic-offset record;
+- **group 2, motion** — the two slots' vector/gate pairs, prebuilt for every
+  `[slot 0 parity][slot 1 parity]` combination, so **4 motion groups per node**.
+  The two slots are two independent fields and are deliberately **not** required
+  to share a parity. The motion group holds no image view, so it is prepared
+  **once per node**, not once per N-1 read parity — that is what keeps the count
+  at four rather than eight.
+
+**8 prebuilt groups per node, 3 bound per pass.** Do not undercount either. The
+sampled-texture count, the pass count and the per-pixel operation ledger are
+unchanged: a fragment stage's sampled-texture budget is counted across every
+bound group, so the split moved bindings between groups without touching the
+eight-texture claim.
+
+`MotionGpuResources::field_primitive_views` hands over *both* parities of a
+field's vector/gate pair at prepare time, and `field_read_parity` returns the
+committed index — the same `render_field_index` motion rendering wrote through —
+at encode. An admitted slot whose field the resources do not own is a
+renderer/planner disagreement and is refused by name; an *unadmitted* slot, and a
+slot whose committed parity is not materialized yet, bind the defined-zero
+neutral pair and close the record's validity lane, which decodes to exactly zero
+displacement. Live and offline share one `CompositionGpuExecutor`, so there is no
+export-only motion path.
+
+**Reuse the committed Compat8 ring.** The clean-history binding is
+`CompositionHost::temporal_history_view()`, the existing D2Array **read** view of
+the committed 24-layer ring, with the cursor taken through
+`temporal_history_read_cursor()` → `temporal::temporal_read_snapshot`, never raw
+`TemporalState` fields, so an age names the same layer here and in the temporal
+pass. The 24 single-layer views stay unexposed: a second writer would corrupt
+the ring the temporal pass is mid-frame reading. Guard every age against the
+valid count exactly as `temporal_originals.wgsl` does. **A new RGBA16F
+full-frame history ring is prohibited** (~398 MiB at 1080p) absent an explicit
+product decision. An unbound source — a lost donor, an unmaterialized age, a
+missing binding — falls back to the **carrier**, not to transparent, so a
+missing donor changes nothing and the cost stays donor-state independent.
+
+Resource delta per active node, charged through the existing descriptor ledger:
+
+| Item | Exact charge |
+|---|---:|
+| Render passes | 1 |
+| Logical lookups/pixel | 4 |
+| Explicit texture operations/pixel | 10 |
+| Simultaneously sampled textures | 8 |
+| Bind groups bound per pass | 3 (image, uniform, motion) |
+| Prebuilt bind groups per node | 8 (4 image + 4 motion) |
+| Cross-scope image taps | 2 |
+| Uniform bytes | 1,024 |
+| Neutral textures / views | 3 / 4 |
+| New full-frame persistent surfaces | 0 |
+
+Three bound and eight prebuilt is the whole reason for the deviation: giving the
+motion pair its own group makes the three parity dimensions — carrier, N-1 tap,
+and each `MotionGpuField`'s own committed ping/pong index — **add** as
+4 image + 4 motion instead of **multiplying** as 4 × 4 = 16 groups per node, and
+a fragment stage's sampled-texture budget is counted across every bound group,
+so nothing else in this table moved.
+
+The dedicated step re-derives `SymmetryFieldResourcePlan` from the **emitted**
+steps, modelled on `RefreshGardenResourcePlan` rather than extending
+`NodeResourceBudget`, so the segmenter and the ledger cannot disagree about how
+many passes a frame encodes. Only its simultaneous-binding ceiling is gated;
+adding its per-pixel terms in `resource_preflight` would double count the pass
+the rack ledger already charges.
+
+Motion displacement is scaled by exactly **one reference tick**
+(`1.0 / TEMPORAL_REFERENCE_FPS`), never by program or wall time, which bounds
+the ±64 UV/second vector to ±2.13 UV at full gain. Both gate lanes survive:
+`clamp(gate.x) * clamp(gate.y)`, confidence times validity/occlusion, so a field
+is never applied at full confidence through a closed gate. The Symmetry hue
+rotation is byte-identical to `rack_node.wgsl`'s, asserted by source text so an
+edit to one without the other fails.
+
+Modulation exposes exactly thirteen continuous controls — `base_folds`,
+`fold_offset`, `radial_phase_deg`, `orbit_phase`, `planar_axis_deg`,
+`planar_phase`, `cell_skew`, `spiral_scale`, `orbit_radius`, `orbit_spin_deg`,
+`motion_gain`, `hue_span`, and `center` — with the three angular keys on the
+degree-wrap allowlist. Mode, boundary, seed, the four routes and the six mask
+bits are enumerable authored topology and get no modulatable address. Dice and
+procedural generation mutate the same thirteen values and nothing else, so
+neither can reroll the sector table. Morph interpolates the values only on an
+exact four-slot route match that also compares both masks — a differently armed
+field describes a different dependency graph, not two ends of a blend — switches
+mode and boundary at the midpoint, and recalls the seed as an endpoint rather
+than interpolating an RNG. The browser edits the thirteen values, both discrete
+vocabularies, the six mask bits and the seed through the ordinary coalescible
+parameter action; the seed selects a table but routes nothing, so it rides
+`SetVisualNodeParam` like the Cellular, Shift and Grain pattern seeds. Only the
+four fields that rewrite the dependency graph use the ordered,
+revision-protected `SetVisualNodeSymmetryRoute { scope, node_id, route,
+composition_revision }`, whose `route` is the closed slot-tagged vocabulary
+`Image { index, route } | Motion { index, layer_id }`. It is never coalesced and
+never quantized, and an out-of-range slot is a typed refusal, never a fallback
+onto slot 0. `NodeParamType::MotionDonor` exists so a motion route is not
+mislabelled as an image tap.
+
+Export consumes the same evaluated plan, the same `SymmetryFieldExecutor` and
+the same `symmetry_field.wgsl`; there is no export-only symmetry path, and the
+pass's only time input is the shared frame-plan context, which offline derives
+from `frame_num` and the export FPS. The `.motion.json` sidecar records, at
+schema version 4, the resolved-or-missing identity of **every** image and motion
+slot **by slot index** for every authored Symmetry Field — armed or not, and
+never compacted.
+
+What is proven and what is not: group closure, identity seams, the analytic
+sector and boundary fixtures, CellularReentry's structural non-recursion, the
+sector-table hash law under donor loss, the single rounding point, the
+1,024-byte assertion, the 8-admits/9-refuses ledger with ordinary segments still
+capped at 3, and the full patch/Morph/modulation/Dice/generator/preset/browser/
+native/export closure are covered by ordinary CPU tests. Default-readback
+carrier bit-identity, CPU-reference agreement per mode, missing-donor and
+incomplete-motion neutrality, live/export byte equality across the two layer
+identity schemes, warm-allocation invariance, and the labeled export render are
+covered only by opt-in `#[ignore]` fixtures on one adapter
+(AMD Radeon RX 6950 XT / Vulkan 26.7.1). The eight-texture portability claim
+rests on the S2 receipt's enforced-cap argument — every device in this tranche
+is requested with `Features::empty()` + `Limits::default()`, byte for byte the
+production request — and not on backend coverage. The motion hand-off is
+likewise proven only on that adapter: independent committed-parity selection per
+slot, the two-current-PreLocal-donor refusal, and — the payoff — a known uniform
+codec field driven through a donor whose own Motion is exactly zero, moving the
+frame against both a stationary field and an unarmed slot while the live and
+export layer-identity schemes stay byte-identical and warm frames still allocate
+nothing.
+
 ### Named two-input Residual Counterpoint
 
 `Residual` is a Collision Rack node that recombines one route's large-scale
@@ -1047,6 +1327,18 @@ FFmpeg maps raw video and audio explicitly, strips metadata, and fixes the
 program duration. Do not change this policy silently; it is part of the output
 contract.
 
+The `.motion.json` sidecar is written once, atomically, after FFmpeg succeeds
+and is removed with the video by `remove_started_output`. Schema version 4
+appended a `symmetry_fields` section carrying, per authored Symmetry Field, the
+owning scope and the resolved-or-missing identity of every image and motion slot
+**by slot index** — armed or not, never compacted, and a retained tombstone is
+recorded as a tombstone rather than re-resolved against whatever now occupies
+the vacated position. Routes are resolved exactly once per job by
+`resolve_export_creative_graph` and Morph carries values only, so the section is
+recorded beside the authored motion scopes rather than per accepted frame and
+cannot inflate the distinct-state list. Operational paths and filesystem
+metadata stay out of it.
+
 Cancellation closes FFmpeg and removes the partial output. Export validation
 must include paired `framemd5` runs, not just successful process exit.
 
@@ -1167,6 +1459,38 @@ mislead browser tests.
   addresses, the uncoalesced revision-barriered browser route action, and a
   labeled export case. The two `renderer::rack::tests::gpu_displace_` fixtures
   carry the physical-GPU claim.
+- Symmetry Field tests must cover group closure and the identity seam for every
+  one of the eight modes, analytic sector fixtures for the radial and planar
+  families, all five boundary laws with CellularReentry's non-recursion proven
+  structurally, `effective_folds` as the only rounding point under fractional
+  modulation, the 32-record table's stability by owner/node/seed with every
+  record bit-identical after a donor is lost, a table domain that carries no
+  process-lifetime layer ID so live and offline agree for the same authored
+  patch, history ages accepted at 23 and
+  rejected at 24, the exact-default bypass, the 1,024-byte compile-time size
+  assertion, the dedicated ledger admitted at eight and refused at nine while
+  ordinary rack segments stay capped at three, per-slot planner admission and
+  tombstones that never rebind, a motion donor yielding a field at exactly zero
+  Motion, an armed motion slot resolving to that donor's `admitted_field_slot`,
+  two image slots planning two distinct current-frame PreLocal donors, the full
+  patch/Morph/modulation/Dice/generator/preset/browser/native closure, per-slot
+  export provenance, and a labeled export case. Fixtures must
+  raise `input.resource_limits` explicitly, because
+  `CreativeResourceLimits::default()` reports the ordinary three-texture
+  constant. The six `renderer::symmetry_field::tests::gpu_symmetry_field_`
+  fixtures — including the one proving each motion slot's committed parity is
+  selected independently and that an unmaterialized parity displaces by exactly
+  nothing — plus the four `renderer::composition::tests::`
+  `production_symmetry_field_` fixtures — in-place execution with warm-frame
+  allocation invariance, the authored motion donor reaching a prepared motion
+  bind group, the typed refusal of two current PreLocal donors on one node, and
+  `production_symmetry_field_authored_motion_route_reaches_the_pixels`, which
+  drives a known uniform codec field through a donor whose own Motion is exactly
+  zero and proves in one fixture that the frame moves against both a stationary
+  field and an unarmed slot, that live and export layer identities render the
+  frame byte-identically, that an unarmed or unmaterialized slot is
+  byte-identical to the neutral pair, and that the warm-allocation snapshot
+  survives eight prebuilt groups — carry the physical-GPU claim.
 - Residual Counterpoint tests must cover the append-only kind code 11 and the
   two closed vocabularies, sanitize/exact-bypass laws including hostile
   non-finite `mix`, the 1/2/3/12/3/2/2 descriptor ledger, the independent CPU
@@ -1237,6 +1561,17 @@ a passing claim.
 - Procedural generation emits patches/manifests/preflight receipts only; MP4
   batch rendering, clip-statistics curation, and visual-driven audio DSP remain
   explicit deferred/research boundaries.
+- The Symmetry Field's eight-texture single pass is a *floor* claim resting on
+  the S2 receipt's enforced-cap argument, measured on one adapter and one
+  backend. It is a capability claim only, not performance, bandwidth, or cache
+  behaviour.
+- The Symmetry Field pipeline layout is **three** bind groups, not the frozen
+  table's two. See the dedicated section: the motion pair owns its own group so
+  a `MotionGpuField`'s committed parity adds to the carrier and N-1 parities
+  instead of multiplying with them.
+- A master-scope Symmetry Field counts as a global step for the canonical
+  reordering law, so it disables selective-VHS bypass authoring
+  (`AmbiguousMasterBypass`) exactly as any other non-marker master node does.
 - Physical MIDI, phone, audio-interface, Spout-host, and multi-monitor proof is
   separate from software tests. Gesture ingress is proven through the one
   normalized adapter and its four origins in software; a real tablet, phone

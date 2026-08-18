@@ -1296,6 +1296,27 @@ fn apply_stable_node_offset(
             "amount_y" => Some(&mut value.amount_y),
             _ => None,
         },
+        // Symmetry exposes its declared continuous controls and nothing else.
+        // The two image routes, the two motion routes, the mode, the boundary,
+        // the authored seed, and the six mask bits are stable authored topology
+        // with no modulatable address, so modulation can never rewrite the
+        // sector table.
+        RuntimeVisualNodeKind::Symmetry(value) => match descriptor.key {
+            "symmetry_base_folds" => Some(&mut value.base_folds),
+            "symmetry_fold_offset" => Some(&mut value.fold_offset),
+            "symmetry_radial_phase_deg" => Some(&mut value.radial_phase_deg),
+            "symmetry_orbit_phase" => Some(&mut value.orbit_phase),
+            "symmetry_planar_axis_deg" => Some(&mut value.planar_axis_deg),
+            "symmetry_planar_phase" => Some(&mut value.planar_phase),
+            "symmetry_cell_skew" => Some(&mut value.cell_skew),
+            "symmetry_spiral_scale" => Some(&mut value.spiral_scale),
+            "symmetry_orbit_radius" => Some(&mut value.orbit_radius),
+            "symmetry_orbit_spin_deg" => Some(&mut value.orbit_spin_deg),
+            "symmetry_motion_gain" => Some(&mut value.motion_gain),
+            "symmetry_hue_span" => Some(&mut value.hue_span),
+            "symmetry_center" => stable_component_slot(component, None, Some(&mut value.center)),
+            _ => None,
+        },
         // Residual exposes its wet authority and its detail gain and nothing
         // else: both routes, both discrete laws, and the quantization seed are
         // topology and have no modulatable address.
@@ -1308,7 +1329,13 @@ fn apply_stable_node_offset(
     if let Some(slot) = slot {
         if matches!(
             descriptor.key,
-            "rotation_deg" | "skew_axis_deg" | "rectangle_rotation_deg" | "ellipse_rotation_deg"
+            "rotation_deg"
+                | "skew_axis_deg"
+                | "rectangle_rotation_deg"
+                | "ellipse_rotation_deg"
+                | "symmetry_radial_phase_deg"
+                | "symmetry_planar_axis_deg"
+                | "symmetry_orbit_spin_deg"
         ) {
             *slot = wrap_stable_degrees(finite_or(*slot, 0.0) + finite_or(offset, 0.0));
         } else {
@@ -4863,6 +4890,177 @@ mod tests {
                 component: StableModComponent::Scalar,
             };
             assert!(!parameter.is_valid_for_kind(NodeKindTag::Displace));
+        }
+    }
+
+    /// Symmetry publishes one stable address per declared continuous control
+    /// (plus the shared structural wet) and nothing else. Angular controls wrap
+    /// instead of clamping, and neither the routes, the discrete laws, the
+    /// authored seed, nor the six mask bits can be reached by modulation — so
+    /// no route can rewrite the sector table.
+    #[test]
+    fn symmetry_exposes_stable_addresses_for_its_declared_continuous_controls_only() {
+        use crate::symmetry::{
+            RuntimeSymmetryParams, SymmetryBoundary, SymmetryMode, SymmetryMotionMask,
+            SymmetrySourceMask,
+        };
+        use crate::visual_rack::{RuntimeVisualNodeKind, RuntimeVisualRack};
+
+        let authored = RuntimeSymmetryParams {
+            mode: SymmetryMode::PlanarPmm,
+            base_folds: 6.0,
+            radial_phase_deg: 170.0,
+            boundary: SymmetryBoundary::CellularReentry,
+            seed: 4_242,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: false,
+                clean_history: true,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: true,
+                slot1: false,
+            },
+            ..RuntimeSymmetryParams::default()
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::Symmetry(authored))
+            .unwrap();
+
+        let mut book = StableModAddressBook::default();
+        book.add_rack(StableModScope::Master, &rack).unwrap();
+
+        let keys: Vec<_> = book
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                StableModTarget::Node { parameter, .. } => match parameter {
+                    StableNodeParameter::Wet => Some("wet".to_string()),
+                    StableNodeParameter::Descriptor {
+                        descriptor_index,
+                        component,
+                    } => NODE_PARAM_DESCRIPTORS
+                        .get(usize::from(*descriptor_index))
+                        .map(|descriptor| {
+                            let suffix = match component {
+                                StableModComponent::Scalar => "",
+                                StableModComponent::X => ".x",
+                                StableModComponent::Y => ".y",
+                                StableModComponent::Red => ".r",
+                                StableModComponent::Green => ".g",
+                                StableModComponent::Blue => ".b",
+                            };
+                            format!("{}{suffix}", descriptor.key)
+                        }),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "wet",
+                "symmetry_base_folds",
+                "symmetry_fold_offset",
+                "symmetry_radial_phase_deg",
+                "symmetry_orbit_phase",
+                "symmetry_planar_axis_deg",
+                "symmetry_planar_phase",
+                "symmetry_cell_skew",
+                "symmetry_spiral_scale",
+                "symmetry_orbit_radius",
+                "symmetry_orbit_spin_deg",
+                "symmetry_motion_gain",
+                "symmetry_hue_span",
+                "symmetry_center.x",
+                "symmetry_center.y",
+            ]
+        );
+
+        let address_of = |key: &str, component: StableModComponent| {
+            book.targets
+                .iter()
+                .position(|target| {
+                    matches!(
+                        target,
+                        StableModTarget::Node {
+                            parameter: StableNodeParameter::Descriptor { descriptor_index, component: found },
+                            ..
+                        } if NODE_PARAM_DESCRIPTORS[usize::from(*descriptor_index)].key == key
+                            && *found == component
+                    )
+                })
+                .map(|index| StableModAddress(index as u16))
+                .unwrap()
+        };
+        let mut offsets = vec![0.0_f32; book.targets.len()];
+        offsets[address_of("symmetry_fold_offset", StableModComponent::Scalar).index()] = 4.0;
+        offsets[address_of("symmetry_hue_span", StableModComponent::Scalar).index()] = 9.0;
+        offsets[address_of("symmetry_radial_phase_deg", StableModComponent::Scalar).index()] = 20.0;
+        offsets[address_of("symmetry_center", StableModComponent::Y).index()] = 0.25;
+        let frame = StableModulationFrame { offsets };
+
+        let mut modulated = rack.clone();
+        apply_stable_rack_modulation(&book, &frame, StableModScope::Master, &mut modulated);
+        let RuntimeVisualNodeKind::Symmetry(params) = modulated.get(node_id).unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert!((params.fold_offset - 4.0).abs() < 1e-5);
+        assert_eq!(
+            params.hue_span, 1.0,
+            "offsets clamp into the declared range"
+        );
+        assert!(
+            (params.radial_phase_deg - (-170.0)).abs() < 1e-3,
+            "an angular control wraps rather than clamping: got {}",
+            params.radial_phase_deg
+        );
+        assert!((params.center[1] - 0.75).abs() < 1e-5);
+        assert_eq!(params.center[0], authored.center[0]);
+        // The rounded fold count observes the modulated sum exactly once.
+        assert_eq!(params.values().effective_folds(), 10);
+
+        assert_eq!(params.donors, authored.donors, "routes are never modulated");
+        assert_eq!(params.motion, authored.motion, "routes are never modulated");
+        assert_eq!(params.mode, authored.mode);
+        assert_eq!(params.boundary, authored.boundary);
+        assert_eq!(params.seed, authored.seed);
+        assert_eq!(params.source_mask, authored.source_mask);
+        assert_eq!(params.motion_mask, authored.motion_mask);
+        assert_eq!(
+            params.sector_table(crate::symmetry::SymmetryNodeDomain::new(1, 3)),
+            authored.sector_table(crate::symmetry::SymmetryNodeDomain::new(1, 3)),
+            "modulation can never reroll the sector table"
+        );
+
+        for key in [
+            "symmetry_mode",
+            "symmetry_boundary",
+            "symmetry_seed",
+            "symmetry_donor0_tap",
+            "symmetry_donor1_tap",
+            "symmetry_motion0_donor",
+            "symmetry_motion1_donor",
+            "symmetry_source_carrier",
+            "symmetry_source_donor0",
+            "symmetry_source_donor1",
+            "symmetry_source_history",
+            "symmetry_motion_slot0",
+            "symmetry_motion_slot1",
+        ] {
+            let index = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .position(|descriptor| {
+                    descriptor.kind == NodeKindTag::Symmetry && descriptor.key == key
+                })
+                .unwrap();
+            let parameter = StableNodeParameter::Descriptor {
+                descriptor_index: index as u16,
+                component: StableModComponent::Scalar,
+            };
+            assert!(!parameter.is_valid_for_kind(NodeKindTag::Symmetry), "{key}");
         }
     }
 

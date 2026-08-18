@@ -192,6 +192,9 @@ impl CollisionRackPlan {
             });
         }
         let declared = rack.resource_budget().map_err(RackCompileError::Rack)?;
+        // Dedicated-pass kinds are charged to their own accumulator by
+        // `RackResourceBudget`, so `max_sampled_textures_in_pass` here is
+        // still the fixed rack layout's own ceiling.
         if declared.logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK
             || declared.texture_samples_per_pixel > MAX_TEXTURE_SAMPLES_PER_RACK
             || declared.max_sampled_textures_in_pass > MAX_SAMPLED_TEXTURES_PER_PASS
@@ -226,8 +229,10 @@ impl CollisionRackPlan {
                 independently_counted_samples = independently_counted_samples
                     .checked_add(u32::from(descriptor.texture_samples_per_pixel))
                     .ok_or(RackCompileError::BudgetOverflow)?;
-                independently_counted_textures = independently_counted_textures
-                    .max(u32::from(descriptor.sampled_textures_in_pass));
+                if !node.kind.tag().occupies_dedicated_pass() {
+                    independently_counted_textures = independently_counted_textures
+                        .max(u32::from(descriptor.sampled_textures_in_pass));
+                }
                 independently_counted_inputs = independently_counted_inputs
                     .checked_add(u32::from(descriptor.cross_input_taps))
                     .ok_or(RackCompileError::BudgetOverflow)?;
@@ -395,6 +400,18 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
         RuntimeVisualNodeKind::Displace(value) => {
             RackPassKind::Displace(sanitize_runtime_displace(value))
         }
+        // The Symmetry Field samples eight textures in one pass. The fixed
+        // Collision Rack texture bind-group layout carries exactly two, so this
+        // node is never encodable here: the composition planner lifts it out of
+        // rack segmentation into its own dedicated step before compilation.
+        // Reaching this arm is a planner error, and it is reported rather than
+        // silently degraded into a passthrough.
+        RuntimeVisualNodeKind::Symmetry(_) => {
+            return Err(RackCompileError::DedicatedPassNode {
+                node_id: node.stable_id,
+                tag: node.kind.tag(),
+            });
+        }
         RuntimeVisualNodeKind::Residual(value) => {
             RackPassKind::Residual(sanitize_runtime_residual(value))
         }
@@ -411,11 +428,30 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RackCompileError {
     Rack(RuntimeRackError),
-    ZeroDimensions { source: [u32; 2], output: [u32; 2] },
-    TooManyPasses { requested: usize, limit: usize },
+    ZeroDimensions {
+        source: [u32; 2],
+        output: [u32; 2],
+    },
+    TooManyPasses {
+        requested: usize,
+        limit: usize,
+    },
     DuplicateNodeId(NodeId),
-    LegacyNode { node_id: NodeId, tag: NodeKindTag },
-    DeclaredBudgetExceeded { samples: u32, textures: u32 },
+    LegacyNode {
+        node_id: NodeId,
+        tag: NodeKindTag,
+    },
+    /// A node the composition planner owes its own dedicated pass. The fixed
+    /// Collision Rack bind layout carries two sampled textures, so a
+    /// dedicated-pass kind is never encodable as an ordinary rack pass.
+    DedicatedPassNode {
+        node_id: NodeId,
+        tag: NodeKindTag,
+    },
+    DeclaredBudgetExceeded {
+        samples: u32,
+        textures: u32,
+    },
     BudgetOverflow,
     BudgetContractMismatch,
 }
@@ -435,6 +471,11 @@ impl fmt::Display for RackCompileError {
             Self::DuplicateNodeId(id) => {
                 write!(formatter, "rack contains duplicate node id {}", id.get())
             }
+            Self::DedicatedPassNode { node_id, tag } => write!(
+                formatter,
+                "node {} is {tag:?}, which owns a dedicated pass and cannot be compiled into a rack segment",
+                node_id.get()
+            ),
             Self::LegacyNode { node_id, tag } => write!(
                 formatter,
                 "{tag:?} node {} belongs to the frozen legacy renderer and cannot run in the advanced rack executor",
@@ -4059,6 +4100,185 @@ mod tests {
         );
         assert_eq!(missing_report.missing_image_count, 1);
         assert_eq!(missing_bytes, neutral_bytes);
+    }
+
+    /// Closes `RackPassKind::image_taps`'s routeless row for the Symmetry Field.
+    ///
+    /// The field owns four routes and samples eight textures; the fixed rack
+    /// texture layout carries three across two authored slots. It therefore has
+    /// no `RackPassKind` at all, and `compile_pass` refuses it by name. If a
+    /// future change ever admitted it into a rack pass, `image_taps` would
+    /// silently hand back a two-slot array — short by half, or all `None` — and
+    /// the node would bind the rack-owned 1x1 zero texture forever with no
+    /// error anywhere, so the refusal is what closes the row. The shader half
+    /// is closed too: `rack_node.wgsl` must never gain a Symmetry case, or its
+    /// `default: {}` would leave `processed = dry` while the Rust ledger still
+    /// charged a pass.
+    #[test]
+    fn a_symmetry_node_is_refused_by_name_and_never_reaches_the_rack_image_tap() {
+        use crate::symmetry::RuntimeSymmetryParams;
+
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack
+            .push(RuntimeVisualNodeKind::Symmetry(
+                RuntimeSymmetryParams::default(),
+            ))
+            .unwrap();
+        let error = CollisionRackPlan::compile(&rack, [8, 8], [8, 8])
+            .expect_err("a dedicated-pass kind is never compiled into a rack segment");
+        assert_eq!(
+            error,
+            RackCompileError::DedicatedPassNode {
+                node_id: id,
+                tag: NodeKindTag::Symmetry,
+            },
+            "the refusal must name the node rather than degrade it to a passthrough"
+        );
+        assert!(
+            NodeKindTag::Symmetry.occupies_dedicated_pass(),
+            "the planner's split predicate and this refusal must agree"
+        );
+
+        // Every kind that IS encodable here still answers `image_taps` exactly,
+        // slot for slot, so the routeless row remains a statement about kinds
+        // that own no route at all.
+        let tap = route(ResolvedImageSource::OneBelow);
+        assert_eq!(
+            RackPassKind::Displace(displace(0.5, 0.0, DisplaceBoundary::Wrap)).image_taps(),
+            [Some(route(ResolvedImageSource::OneBelow)), None]
+        );
+        assert_eq!(
+            RackPassKind::ImageMask(RuntimeImageMatte {
+                tap,
+                channel: crate::visual_rack::MatteChannel::Alpha,
+                invert: false,
+                amount: 1.0,
+                threshold: 0.5,
+                softness: 0.1,
+            })
+            .image_taps(),
+            [Some(tap), None]
+        );
+        assert_eq!(
+            RackPassKind::Grain(crate::visual_rack::GrainParams::default()).image_taps(),
+            [None; MAX_NODE_ROUTE_SLOTS]
+        );
+
+        // The rack shader carries exactly the kinds the rack can encode, and
+        // the Symmetry Field is deliberately not one of them.
+        let rack_shader = include_str!("../shaders/rack_node.wgsl");
+        assert!(
+            !rack_shader.contains("SYMMETRY") && !rack_shader.contains("symmetry"),
+            "the Symmetry Field must never gain a case in the shared rack shader"
+        );
+        assert_eq!(
+            rack_shader.matches("\n        case RACK_").count(),
+            11,
+            "the rack switch covers exactly the eleven rack-encodable kinds"
+        );
+    }
+
+    /// The dedicated shader has no `switch`, so its mode and boundary laws are
+    /// if/else chains. Every code must reach an explicitly named branch: a
+    /// missing branch would silently fall into the trailing `else`, which is the
+    /// Transparent/radial neutral, while the Rust ledger still charged the pass.
+    #[test]
+    fn every_symmetry_mode_and_boundary_code_reaches_an_explicit_shader_branch() {
+        use crate::symmetry::{SymmetryBoundary, SymmetryMode, SymmetrySource};
+
+        let shader = include_str!("../shaders/symmetry_field.wgsl");
+        // Boundary and source laws each compare against their named constant.
+        for boundary in SymmetryBoundary::ALL {
+            let name = match boundary {
+                SymmetryBoundary::Transparent => "SYM_BOUNDARY_TRANSPARENT",
+                SymmetryBoundary::Mirror => "SYM_BOUNDARY_MIRROR",
+                SymmetryBoundary::Wrap => "SYM_BOUNDARY_WRAP",
+                SymmetryBoundary::Hold => "SYM_BOUNDARY_HOLD",
+                SymmetryBoundary::CellularReentry => "SYM_BOUNDARY_CELLULAR_REENTRY",
+            };
+            let declaration = format!("const {name}: u32 = {}u;", boundary.code());
+            assert!(shader.contains(&declaration), "{name} must be declared");
+            // Transparent is the documented trailing `else`; every other law
+            // must be selected by an explicit comparison against its constant.
+            if boundary != SymmetryBoundary::Transparent {
+                assert!(
+                    shader.contains(&format!("law == {name}")),
+                    "{name} must reach an explicit branch, not the neutral else"
+                );
+            }
+        }
+        for source in SymmetrySource::ALL {
+            let name = match source {
+                SymmetrySource::Carrier => "SYM_SOURCE_CARRIER",
+                SymmetrySource::Donor0 => "SYM_SOURCE_DONOR0",
+                SymmetrySource::Donor1 => "SYM_SOURCE_DONOR1",
+                SymmetrySource::CleanHistory => "SYM_SOURCE_CLEAN_HISTORY",
+            };
+            assert!(
+                shader.contains(&format!("const {name}: u32 = {}u;", source.code())),
+                "{name} must be declared with its append-only code"
+            );
+            // Carrier is the documented trailing fallback — an unbound donor
+            // and an unmaterialized history age both resolve to it — so only
+            // the other three need an explicit comparison.
+            if source != SymmetrySource::Carrier {
+                assert!(
+                    shader.contains(&format!("source == {name}")),
+                    "{name} must reach an explicit branch"
+                );
+            }
+            assert!(
+                shader.contains("SYM_SOURCE_CARRIER, source,"),
+                "an unbound source must fall back to the carrier, not to a hole"
+            );
+        }
+        // Modes are not dispatched by a switch: the shader characterizes them
+        // through the same lattice/reflection predicates the CPU reference uses.
+        // Cyclic Cn is precisely the mode both predicates exclude, so it is the
+        // one code with no explicit branch — every other must be named, and the
+        // two predicates must name exactly the modes the CPU reference says.
+        let lattice = shader
+            .split_once("fn sym_has_lattice")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(body, _)| body.to_string())
+            .expect("the shader declares a lattice predicate");
+        let reflection = shader
+            .split_once("fn sym_has_reflection")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(body, _)| body.to_string())
+            .expect("the shader declares a reflection predicate");
+        for mode in SymmetryMode::ALL {
+            let name = match mode {
+                SymmetryMode::Cyclic => "SYM_CYCLIC",
+                SymmetryMode::Dihedral => "SYM_DIHEDRAL",
+                SymmetryMode::PlanarP1 => "SYM_PLANAR_P1",
+                SymmetryMode::PlanarPm => "SYM_PLANAR_PM",
+                SymmetryMode::PlanarP2 => "SYM_PLANAR_P2",
+                SymmetryMode::PlanarPmm => "SYM_PLANAR_PMM",
+                SymmetryMode::LogSpiral => "SYM_LOG_SPIRAL",
+                SymmetryMode::Orbit => "SYM_ORBIT",
+            };
+            assert!(
+                shader.contains(&format!("const {name}: u32 = {}u;", mode.code())),
+                "{name} must be declared with its append-only code"
+            );
+            assert_eq!(
+                lattice.contains(name),
+                mode.has_lattice(),
+                "the shader lattice predicate must agree with the CPU reference for {name}"
+            );
+            assert_eq!(
+                reflection.contains(name),
+                mode.has_reflection(),
+                "the shader reflection predicate must agree with the CPU reference for {name}"
+            );
+            if mode != SymmetryMode::Cyclic {
+                assert!(
+                    shader.matches(name).count() >= 2,
+                    "{name} must be used by at least one branch, not merely declared"
+                );
+            }
+        }
     }
 
     #[test]
