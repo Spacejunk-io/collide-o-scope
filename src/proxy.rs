@@ -4,6 +4,10 @@
 //! path, or mutate a cache. It turns an already verified content identity,
 //! fixed proxy settings, measured playback facts, and a bounded cache index
 //! into deterministic decisions that a later worker may execute atomically.
+//! It also owns the bounded decode/audio input contract: [`plan_proxy_input`]
+//! is the one function that answers what a proxy encode may consume, and the
+//! future worker, its artifact validator, and any receipt writer must all
+//! answer from it rather than restating the laws beside it.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -14,6 +18,12 @@ use sha2::{Digest, Sha256};
 use crate::media_source::ContentIdentity;
 
 pub const PROXY_SCHEMA_VERSION: u16 = 1;
+/// The version that owns proxy semantics. Version 1 *means* the bounded
+/// decode/audio input contract declared by [`plan_proxy_input`] and its law
+/// types; changing any of those laws requires bumping this constant, which
+/// provably changes every cache key because [`ProxySettings::update_cache_key`]
+/// hashes it. No artifact may ever be produced under settings whose semantics
+/// were not defined first — that is the plan's ordering clause, in code.
 pub const PROXY_ALGORITHM_VERSION: u16 = 1;
 pub const PROXY_CACHE_KEY_DOMAIN: &[u8] = b"collide-o-scope.proxy-cache-key.v1\0";
 pub const PROXY_MAX_FIXED_FPS_NUMERATOR: u32 = 240_000;
@@ -187,6 +197,293 @@ impl<'de> Deserialize<'de> for ProxySettings {
         .validate()
         .map_err(de::Error::custom)
     }
+}
+
+// --- The bounded decode/audio input contract -------------------------------
+//
+// Everything below defines what a proxy encode is allowed to consume and what
+// the fixed settings *mean*. The laws are owned by `PROXY_ALGORITHM_VERSION`;
+// they are declared ahead of the worker that will execute them, because the
+// moment a worker gives `include_audio: true` a meaning, that meaning is what
+// algorithm version 1 means permanently for every artifact anyone has keyed.
+
+/// At most one proxy encode helper process-wide, matching the Expert-mode
+/// serialization precedent for heavy media helpers. A proxy encode is far
+/// heavier than a thumbnail; two concurrent encodes are a disk and CPU storm.
+#[allow(
+    dead_code,
+    reason = "frozen bound for the explicitly deferred cache worker"
+)]
+pub const PROXY_ENCODE_MAX_CONCURRENT: usize = 1;
+/// A source longer than one hour is refused for proxying. This bounds the
+/// worst-case encode time and, together with the per-entry byte cap, the
+/// artifact size. It is a proxy-admission bound, not a playback bound.
+#[allow(
+    dead_code,
+    reason = "frozen bound for the explicitly deferred cache worker"
+)]
+pub const PROXY_ENCODE_MAX_SOURCE_SECONDS: u64 = 3_600;
+/// Fixed setup allowance of the encode deadline, independent of duration.
+#[allow(
+    dead_code,
+    reason = "frozen bound for the explicitly deferred cache worker"
+)]
+pub const PROXY_ENCODE_DEADLINE_BASE_SECONDS: u64 = 120;
+/// The deadline grants this multiple of the source duration on top of the
+/// base. FFV1 encodes faster than realtime on production hosts; twice
+/// realtime plus the base is generous without being unbounded.
+#[allow(
+    dead_code,
+    reason = "frozen bound for the explicitly deferred cache worker"
+)]
+pub const PROXY_ENCODE_DEADLINE_REALTIME_FACTOR: u64 = 2;
+/// A container reporting more streams than this is refused before any
+/// per-stream work, so a hostile stream table cannot buy unbounded probing.
+#[allow(
+    dead_code,
+    reason = "frozen bound for the explicitly deferred cache worker"
+)]
+pub const PROXY_MAX_PROBED_STREAMS: u32 = 64;
+
+/// How the proxy selects its video stream. One variant: byte-for-byte the
+/// `streams().best(Type::Video)` selection every live decode path performs
+/// (open, reopen, dimension probe, and keyframe index). A proxy is a decode
+/// substitute, so it must carry exactly the stream live decode would read.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyVideoStreamLaw {
+    FfmpegBestVideoStream,
+}
+
+/// What happens to frame timing. `Source` settings preserve every frame and
+/// its timestamps — the request decoder is timestamp-driven, so variable
+/// frame rate passes through as a faithful substitute. A fixed rate resamples
+/// to exactly `numerator/denominator` constant frame rate by duplicate/drop.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyFrameTimingLaw {
+    PreserveSourceTiming,
+    ResampleToConstantRate { numerator: u32, denominator: u32 },
+}
+
+/// Why a planned artifact carries no audio track. The two causes are kept
+/// distinct so a worker receipt can never conflate "the operator excluded
+/// audio" with "the source had none to carry".
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyAudioAbsenceCause {
+    ExcludedBySettings,
+    SourceCarriesNoAudioStream,
+}
+
+/// The meaning of `include_audio` — the proxy's own audio policy, deliberately
+/// a third policy beside the two the program already carries. Export selects
+/// the first ordered audio stream (`-map 1:a:0`), starts it at zero at 1x,
+/// and pads/trims to program duration; analysis audio decodes once under
+/// bounded limits and samples a circular window. A proxy is a decode
+/// *substitute*, so it does neither: with `include_audio: true` it carries the
+/// source's first ordered audio stream — exactly the `a:0` stream export
+/// would select from the original — as a bit-exact stream copy with no
+/// re-encode, no resample, no gain, and no timing edit, and it carries that
+/// stream whole. A stream longer or shorter than the video is *not* padded or
+/// trimmed, because those are consumption-time policies and baking them into
+/// the artifact would change what downstream consumers decode. Streams beyond
+/// the first are not carried. A source with no audio stream yields an
+/// artifact with no audio track, and that is the defined result rather than
+/// an error, so one default settings value serves silent and audible sources
+/// under one key law. There is deliberately no audio-duration field anywhere
+/// in [`ProxySourceProbe`]: carried-whole means no law consumes one.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyAudioInputLaw {
+    NoAudioTrack { cause: ProxyAudioAbsenceCause },
+    FirstOrderedStreamBitExactCopy,
+}
+
+/// Bounded facts from a metadata-only probe of the source container. All
+/// fields are integers, so no non-finite value is representable, and no path,
+/// mtime, or filesystem metadata can enter the contract through this type.
+/// `duration_micros` is the container duration; zero means unknown, and an
+/// unknown duration is refused because the encode deadline derives from it.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxySourceProbe {
+    pub container_streams: u32,
+    pub video_streams: u32,
+    pub audio_streams: u32,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub duration_micros: u64,
+}
+
+/// The complete answer to "what may this proxy encode consume, and what will
+/// the artifact mean". Everything a worker does must be derivable from this
+/// plan plus the cache plan; nothing here is advisory.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyInputPlan {
+    pub video_stream: ProxyVideoStreamLaw,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub frame_timing: ProxyFrameTimingLaw,
+    pub audio: ProxyAudioInputLaw,
+    /// Absolute helper deadline, computed once at admission from the probed
+    /// duration and never suspended — the thumbnail-helper law. Derived as
+    /// `base + factor * ceil(duration)`, so its maximum is
+    /// `PROXY_ENCODE_DEADLINE_BASE_SECONDS +
+    /// PROXY_ENCODE_DEADLINE_REALTIME_FACTOR * PROXY_ENCODE_MAX_SOURCE_SECONDS`
+    /// by construction rather than by a second literal.
+    pub deadline_seconds: u64,
+}
+
+impl ProxyScale {
+    /// The scale law: `Original` preserves exact source dimensions — the
+    /// source already decodes at them. `Half` and `Quarter` floor-divide and
+    /// round down to even with a floor of 2, so every scaled artifact is
+    /// legal in chroma-subsampled pixel formats. The proxy preserves the
+    /// source's decoded pixel format rather than forcing a conversion, so the
+    /// even law is uniform rather than format-conditional.
+    #[allow(
+        dead_code,
+        reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+    )]
+    pub const fn output_dimension(self, source: u32) -> u32 {
+        match self {
+            Self::Original => source,
+            Self::Half => even_floor_with_minimum(source / 2),
+            Self::Quarter => even_floor_with_minimum(source / 4),
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+const fn even_floor_with_minimum(value: u32) -> u32 {
+    let even = value & !1;
+    if even < 2 {
+        2
+    } else {
+        even
+    }
+}
+
+/// Absolute encode deadline for an admitted source. Callers must have
+/// validated the duration against `PROXY_ENCODE_MAX_SOURCE_SECONDS` first;
+/// this function saturates rather than guessing about an unvalidated input.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+pub const fn proxy_encode_deadline_seconds(duration_micros: u64) -> u64 {
+    let ceil_seconds = duration_micros.div_ceil(1_000_000);
+    PROXY_ENCODE_DEADLINE_BASE_SECONDS
+        .saturating_add(PROXY_ENCODE_DEADLINE_REALTIME_FACTOR.saturating_mul(ceil_seconds))
+}
+
+/// The one function that decides what a proxy encode may consume. Refusals
+/// are typed and evaluated in a fixed order: probe consistency, stream-count
+/// cap, video-stream presence, dimension sanity, duration known, duration
+/// cap. Source admission itself — Safe/Expert pixel, byte, and device bounds
+/// plus any Expert reservation — is deliberately *not* re-derived here: it is
+/// answered by `MediaSafetyPolicy::plan`, the single existing predicate, and
+/// the worker must hold that plan for the encode's lifetime exactly as every
+/// other media helper does. Restating those numbers here would be a second
+/// predicate waiting to drift.
+#[allow(
+    dead_code,
+    reason = "the input contract is defined ahead of the worker that executes it, per the plan's ordering clause"
+)]
+pub fn plan_proxy_input(
+    probe: ProxySourceProbe,
+    settings: ProxySettings,
+) -> Result<ProxyInputPlan, ProxyError> {
+    let settings = settings.validate()?;
+    let stream_sum = probe
+        .video_streams
+        .checked_add(probe.audio_streams)
+        .ok_or(ProxyError::ArithmeticOverflow)?;
+    if stream_sum > probe.container_streams {
+        return Err(ProxyError::InvalidProbe("stream counts"));
+    }
+    if probe.container_streams > PROXY_MAX_PROBED_STREAMS {
+        return Err(ProxyError::TooManyStreams {
+            count: probe.container_streams,
+            limit: PROXY_MAX_PROBED_STREAMS,
+        });
+    }
+    if probe.video_streams == 0 {
+        return Err(ProxyError::NoVideoStream);
+    }
+    if probe.video_width == 0
+        || probe.video_height == 0
+        || probe.video_width > crate::media_safety::ABSOLUTE_MEDIA_MAX_EDGE
+        || probe.video_height > crate::media_safety::ABSOLUTE_MEDIA_MAX_EDGE
+    {
+        return Err(ProxyError::InvalidProbe("video dimensions"));
+    }
+    if probe.duration_micros == 0 {
+        return Err(ProxyError::SourceDurationUnknown);
+    }
+    let limit_micros = PROXY_ENCODE_MAX_SOURCE_SECONDS
+        .checked_mul(1_000_000)
+        .ok_or(ProxyError::ArithmeticOverflow)?;
+    if probe.duration_micros > limit_micros {
+        return Err(ProxyError::SourceTooLong {
+            micros: probe.duration_micros,
+            limit_micros,
+        });
+    }
+
+    let frame_timing = match settings.frame_rate {
+        ProxyFrameRate::Source => ProxyFrameTimingLaw::PreserveSourceTiming,
+        ProxyFrameRate::Fixed {
+            numerator,
+            denominator,
+        } => ProxyFrameTimingLaw::ResampleToConstantRate {
+            numerator,
+            denominator,
+        },
+    };
+    let audio = if !settings.include_audio {
+        ProxyAudioInputLaw::NoAudioTrack {
+            cause: ProxyAudioAbsenceCause::ExcludedBySettings,
+        }
+    } else if probe.audio_streams == 0 {
+        ProxyAudioInputLaw::NoAudioTrack {
+            cause: ProxyAudioAbsenceCause::SourceCarriesNoAudioStream,
+        }
+    } else {
+        ProxyAudioInputLaw::FirstOrderedStreamBitExactCopy
+    };
+
+    Ok(ProxyInputPlan {
+        video_stream: ProxyVideoStreamLaw::FfmpegBestVideoStream,
+        output_width: settings.scale.output_dimension(probe.video_width),
+        output_height: settings.scale.output_dimension(probe.video_height),
+        frame_timing,
+        audio,
+        deadline_seconds: proxy_encode_deadline_seconds(probe.duration_micros),
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -665,6 +962,17 @@ pub enum ProxyError {
     InvalidContentIdentity,
     InvalidCacheKey,
     InvalidObservation(&'static str),
+    InvalidProbe(&'static str),
+    NoVideoStream,
+    TooManyStreams {
+        count: u32,
+        limit: u32,
+    },
+    SourceDurationUnknown,
+    SourceTooLong {
+        micros: u64,
+        limit_micros: u64,
+    },
     InvalidCacheLimits(&'static str),
     CacheIndexEntries {
         count: usize,
@@ -708,6 +1016,26 @@ impl fmt::Display for ProxyError {
             Self::InvalidObservation(field) => {
                 write!(formatter, "invalid proxy playback observation: {field}")
             }
+            Self::InvalidProbe(field) => {
+                write!(formatter, "invalid proxy source probe: {field}")
+            }
+            Self::NoVideoStream => {
+                formatter.write_str("proxy source carries no video stream")
+            }
+            Self::TooManyStreams { count, limit } => write!(
+                formatter,
+                "proxy source container reports {count} streams; limit is {limit}"
+            ),
+            Self::SourceDurationUnknown => formatter.write_str(
+                "proxy source duration is unknown; the encode deadline cannot be derived",
+            ),
+            Self::SourceTooLong {
+                micros,
+                limit_micros,
+            } => write!(
+                formatter,
+                "proxy source is {micros} microseconds; limit is {limit_micros}"
+            ),
             Self::InvalidCacheLimits(field) => {
                 write!(formatter, "invalid proxy cache limits: {field}")
             }
@@ -899,6 +1227,273 @@ mod tests {
         assert_eq!(replacement.peak_bytes_during_stage, 160);
         assert_eq!(replacement.committed_bytes, 100);
         assert_eq!(replacement.committed_entries, 1);
+    }
+
+    fn valid_probe() -> ProxySourceProbe {
+        ProxySourceProbe {
+            container_streams: 2,
+            video_streams: 1,
+            audio_streams: 1,
+            video_width: 1_920,
+            video_height: 1_080,
+            duration_micros: 10_000_000,
+        }
+    }
+
+    #[test]
+    fn the_audio_and_frame_rate_policies_and_the_versions_are_hashed_into_the_key() {
+        let source = identity('a', 12_345);
+        let baseline = ProxyCacheKey::derive(&source, ProxySettings::default()).unwrap();
+
+        let silent = ProxySettings {
+            include_audio: false,
+            ..ProxySettings::default()
+        };
+        assert_ne!(baseline, ProxyCacheKey::derive(&source, silent).unwrap());
+
+        let resampled = ProxySettings {
+            frame_rate: ProxyFrameRate::Fixed {
+                numerator: 30_000,
+                denominator: 1_001,
+            },
+            ..ProxySettings::default()
+        };
+        assert_ne!(baseline, ProxyCacheKey::derive(&source, resampled).unwrap());
+
+        // A future semantic change to the input contract must bump the
+        // algorithm version, and that bump must change every key. `validate`
+        // rightly refuses to construct such settings, so hash the raw stream
+        // through the same private method the key derivation uses.
+        let mut current = Sha256::new();
+        ProxySettings::default().update_cache_key(&mut current);
+        let mut bumped_algorithm = Sha256::new();
+        ProxySettings {
+            algorithm_version: PROXY_ALGORITHM_VERSION + 1,
+            ..ProxySettings::default()
+        }
+        .update_cache_key(&mut bumped_algorithm);
+        let mut bumped_schema = Sha256::new();
+        ProxySettings {
+            schema_version: PROXY_SCHEMA_VERSION + 1,
+            ..ProxySettings::default()
+        }
+        .update_cache_key(&mut bumped_schema);
+        let current: [u8; 32] = current.finalize().into();
+        assert_ne!(current, <[u8; 32]>::from(bumped_algorithm.finalize()));
+        assert_ne!(current, <[u8; 32]>::from(bumped_schema.finalize()));
+    }
+
+    #[test]
+    fn the_input_contract_gives_include_audio_its_meaning() {
+        let plan = plan_proxy_input(valid_probe(), ProxySettings::default()).unwrap();
+        assert_eq!(
+            plan.video_stream,
+            ProxyVideoStreamLaw::FfmpegBestVideoStream
+        );
+        assert_eq!(plan.frame_timing, ProxyFrameTimingLaw::PreserveSourceTiming);
+        assert_eq!(
+            plan.audio,
+            ProxyAudioInputLaw::FirstOrderedStreamBitExactCopy
+        );
+
+        let several_streams = ProxySourceProbe {
+            container_streams: 6,
+            audio_streams: 5,
+            ..valid_probe()
+        };
+        assert_eq!(
+            plan_proxy_input(several_streams, ProxySettings::default())
+                .unwrap()
+                .audio,
+            ProxyAudioInputLaw::FirstOrderedStreamBitExactCopy
+        );
+
+        let silent_source = ProxySourceProbe {
+            container_streams: 1,
+            audio_streams: 0,
+            ..valid_probe()
+        };
+        assert_eq!(
+            plan_proxy_input(silent_source, ProxySettings::default())
+                .unwrap()
+                .audio,
+            ProxyAudioInputLaw::NoAudioTrack {
+                cause: ProxyAudioAbsenceCause::SourceCarriesNoAudioStream,
+            }
+        );
+
+        let excluded = ProxySettings {
+            include_audio: false,
+            ..ProxySettings::default()
+        };
+        assert_eq!(
+            plan_proxy_input(valid_probe(), excluded).unwrap().audio,
+            ProxyAudioInputLaw::NoAudioTrack {
+                cause: ProxyAudioAbsenceCause::ExcludedBySettings,
+            }
+        );
+
+        let resampled = ProxySettings {
+            frame_rate: ProxyFrameRate::Fixed {
+                numerator: 30_000,
+                denominator: 1_001,
+            },
+            ..ProxySettings::default()
+        };
+        assert_eq!(
+            plan_proxy_input(valid_probe(), resampled)
+                .unwrap()
+                .frame_timing,
+            ProxyFrameTimingLaw::ResampleToConstantRate {
+                numerator: 30_000,
+                denominator: 1_001,
+            }
+        );
+    }
+
+    #[test]
+    fn the_scale_law_is_even_floored_with_a_floor_of_two_and_original_is_exact() {
+        assert_eq!(ProxyScale::Original.output_dimension(1_919), 1_919);
+        assert_eq!(ProxyScale::Original.output_dimension(1_079), 1_079);
+        assert_eq!(ProxyScale::Half.output_dimension(1_920), 960);
+        assert_eq!(ProxyScale::Half.output_dimension(1_919), 958);
+        assert_eq!(ProxyScale::Half.output_dimension(3), 2);
+        assert_eq!(ProxyScale::Half.output_dimension(2), 2);
+        assert_eq!(ProxyScale::Quarter.output_dimension(1_920), 480);
+        assert_eq!(ProxyScale::Quarter.output_dimension(1_079), 268);
+        assert_eq!(ProxyScale::Quarter.output_dimension(1), 2);
+
+        let odd = ProxySourceProbe {
+            video_width: 1_919,
+            video_height: 1_079,
+            ..valid_probe()
+        };
+        let plan = plan_proxy_input(
+            odd,
+            ProxySettings {
+                scale: ProxyScale::Half,
+                ..ProxySettings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((plan.output_width, plan.output_height), (958, 538));
+    }
+
+    #[test]
+    fn the_deadline_law_is_duration_derived_with_no_second_literal() {
+        assert_eq!(proxy_encode_deadline_seconds(1), 122);
+        assert_eq!(proxy_encode_deadline_seconds(1_000_001), 124);
+        let limit_micros = PROXY_ENCODE_MAX_SOURCE_SECONDS * 1_000_000;
+        assert_eq!(
+            proxy_encode_deadline_seconds(limit_micros),
+            PROXY_ENCODE_DEADLINE_BASE_SECONDS
+                + PROXY_ENCODE_DEADLINE_REALTIME_FACTOR * PROXY_ENCODE_MAX_SOURCE_SECONDS
+        );
+
+        let at_limit = ProxySourceProbe {
+            duration_micros: limit_micros,
+            ..valid_probe()
+        };
+        assert!(plan_proxy_input(at_limit, ProxySettings::default()).is_ok());
+        let one_over = ProxySourceProbe {
+            duration_micros: limit_micros + 1,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(one_over, ProxySettings::default()),
+            Err(ProxyError::SourceTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn the_input_contract_refuses_hostile_probes_with_typed_errors() {
+        let crowded_but_legal = ProxySourceProbe {
+            container_streams: PROXY_MAX_PROBED_STREAMS,
+            audio_streams: PROXY_MAX_PROBED_STREAMS - 1,
+            ..valid_probe()
+        };
+        assert!(plan_proxy_input(crowded_but_legal, ProxySettings::default()).is_ok());
+        let one_stream_over = ProxySourceProbe {
+            container_streams: PROXY_MAX_PROBED_STREAMS + 1,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(one_stream_over, ProxySettings::default()),
+            Err(ProxyError::TooManyStreams { count, limit })
+                if count == PROXY_MAX_PROBED_STREAMS + 1 && limit == PROXY_MAX_PROBED_STREAMS
+        ));
+
+        let no_video = ProxySourceProbe {
+            video_streams: 0,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(no_video, ProxySettings::default()),
+            Err(ProxyError::NoVideoStream)
+        ));
+
+        let inconsistent = ProxySourceProbe {
+            container_streams: 1,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(inconsistent, ProxySettings::default()),
+            Err(ProxyError::InvalidProbe("stream counts"))
+        ));
+        let overflowing = ProxySourceProbe {
+            video_streams: u32::MAX,
+            audio_streams: u32::MAX,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(overflowing, ProxySettings::default()),
+            Err(ProxyError::ArithmeticOverflow)
+        ));
+
+        let zero_dimension = ProxySourceProbe {
+            video_width: 0,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(zero_dimension, ProxySettings::default()),
+            Err(ProxyError::InvalidProbe("video dimensions"))
+        ));
+        let at_edge = ProxySourceProbe {
+            video_width: crate::media_safety::ABSOLUTE_MEDIA_MAX_EDGE,
+            ..valid_probe()
+        };
+        assert!(plan_proxy_input(at_edge, ProxySettings::default()).is_ok());
+        let one_pixel_over = ProxySourceProbe {
+            video_width: crate::media_safety::ABSOLUTE_MEDIA_MAX_EDGE + 1,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(one_pixel_over, ProxySettings::default()),
+            Err(ProxyError::InvalidProbe("video dimensions"))
+        ));
+
+        let unknown_duration = ProxySourceProbe {
+            duration_micros: 0,
+            ..valid_probe()
+        };
+        assert!(matches!(
+            plan_proxy_input(unknown_duration, ProxySettings::default()),
+            Err(ProxyError::SourceDurationUnknown)
+        ));
+
+        // Settings validation precedes every probe check, so hostile settings
+        // and a hostile probe together report the settings refusal.
+        let hostile_settings = ProxySettings {
+            frame_rate: ProxyFrameRate::Fixed {
+                numerator: 0,
+                denominator: 1,
+            },
+            ..ProxySettings::default()
+        };
+        assert!(matches!(
+            plan_proxy_input(no_video, hostile_settings),
+            Err(ProxyError::InvalidFrameRate { .. })
+        ));
     }
 
     #[test]
