@@ -62,6 +62,7 @@ src/
 ├── stage_map.rs         venue endpoints/slices, monitor bindings, calibration tools
 ├── stage_health.rs      preview-only timing/resource/source health HUD
 ├── proxy.rs             measured proxy recommendation, bounded decode/audio input contract, content-addressed cache plan
+├── proxy_worker.rs      bounded FFV1/Matroska encode worker, sealed atomic cache, consumption
 ├── precision.rs         objective color metrics and precision/capability accounting
 ├── study.rs             closed data-only SSA Study schema and authority validation
 ├── patch/               YAML model, capture/apply, editor and file dialogs
@@ -385,6 +386,18 @@ editor-only transform: S6 proves that closure rather than adding to it.
   coalesces older absolute values for the same semantic control, reserves
   admission for safety/release actions, and broadcasts a complete
   `AppSnapshot`. Do not replace it with an unbounded collection.
+- The **proxy encode worker** owns one thread and a one-slot job queue that
+  refuses new work while busy instead of queueing a backlog. A job
+  re-fingerprints its source, probes and plans through `plan_proxy_input`,
+  holds a `MediaSafetyPolicy` reservation for the encode's life, and babysits
+  one ffmpeg child with an absolute plan-derived deadline, a staging-size
+  kill at the per-artifact cap, bounded captured output, and a caller-owned
+  cancel flag (deliberately not the library generation — a proxy is
+  content-keyed and survives library changes). Validation decodes the staged
+  artifact's identity before publication; publication renames the artifact
+  and then its SHA-256 seal, so recovery can remove unsealed residue without
+  serving it. Events return to the render thread through a nonblocking
+  channel drained once per frame.
 - **Thumbnail/preview helpers** invoke FFmpeg outside the render path only after
   a metadata probe and `MediaSafetyPolicy` plan. Keep candidates, elapsed time,
   captured stdout/stderr, and concurrency bounded; Safe admits at most four
@@ -1805,6 +1818,8 @@ mislead browser tests.
 - `F` — main-window fullscreen
 - `O` — fullscreen output window
 - `B` — blackout
+- `Y` — encode a proxy for the selected layer's verified content identity;
+  every refusal and completion reports through that layer's HUD status line
 - `Ctrl+E` — patch parameter editor
 - `Ctrl+S` / `Ctrl+O` — save/load patch
 - `Ctrl+Shift+I` / `Ctrl+Shift+X` — import/export the bounded controller profile
@@ -2001,6 +2016,26 @@ mislead browser tests.
   identical while both differ from the third. The gizmo introduces no export
   path, so the six pre-existing labeled cases must additionally be proven
   `framemd5`-identical across the tranche by a same-branch A/B.
+- Proxy-worker tests split along the CLI boundary. Hosted (all three CI
+  platforms, no ffmpeg CLI): the crash test written reproduction-first — a
+  staging leftover removed and never published or counted, an unsealed
+  artifact and an orphan seal both removed as interrupted publications; the
+  atomic publish law with the prior artifact readable until replacement and
+  the seal following the artifact; mid-file corruption refused by the seal
+  and discarded; eviction following the pure plan with a path-free receipt;
+  foreign files counted but never touched; the contract-derived argv; garbage
+  bytes failing decoded-identity validation; mutated/unreadable sources
+  refused before any encode; and the Y-key mapping. Opt-in (`--ignored`,
+  ffmpeg CLI required, like `effects_audit`):
+  `proxy_worker_end_to_end_encode_publish_rename_and_corruption_survival` —
+  encode, validate, publish, cache hit, identical bytes at a renamed path
+  hitting the same key and adopting, corruption refused at consultation and
+  at the job's own cache-hit path, crash recovery beside a live cache, and
+  both audio laws — plus
+  `proxy_encode_kill_bounds_are_typed_and_publish_nothing` for the deadline
+  and size-cap kills. Windows fsync law: `FlushFileBuffers` demands writable
+  handles for both the staging file and the parent directory; do not "fix" a
+  publish failure by dropping either sync.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
@@ -2032,16 +2067,24 @@ a passing claim.
 - Procedural generation emits patches/manifests/preflight receipts only; MP4
   batch rendering, clip-statistics curation, and visual-driven audio DSP remain
   explicit deferred/research boundaries.
-- The proxy loop is still open. `proxy.rs` now carries the complete bounded
-  decode/audio input contract — `plan_proxy_input` is the one function that
-  decides what a proxy encode may consume, and its laws are owned by
-  `PROXY_ALGORITHM_VERSION`, so changing any of them must bump that version
-  and thereby change every cache key. But no encoder is integrated, no
-  artifact is produced, no decoder consults a cache, and the operator-facing
-  "proxy recommended" status remains unactionable until a worker tranche
-  lands behind this contract. The worker must answer from `plan_proxy_input`
-  and hold a `MediaSafetyPolicy` plan for the encode's lifetime; assessment
-  plus this contract is still not a proxy implementation.
+- The proxy loop is closed for content-referenced video, with three honest
+  edges. `proxy_worker.rs` executes the `plan_proxy_input` contract: the Y
+  key requests a bounded FFV1/Matroska encode (single helper, absolute
+  deadline, staging-size kill, `MediaSafetyPolicy` reservation held for the
+  encode, source re-fingerprinted first), publication follows the atomic
+  commit law with a SHA-256 seal published after the artifact, recovery
+  removes staging and unsealed residue without ever serving it, and patch
+  load consults the cache — a validated artifact backs the decoder while the
+  layer keeps the original identity, so a proxy can never enter a patch, an
+  export, or Dice. The edges: adoption happens at patch (re)apply, not by
+  hot-swapping a live decoder; only sources with a verified `cos-sha256`
+  identity can be proxied, because the key is content-addressed; and the
+  browser panel has no proxy surface — request and status are native
+  (Y key + stage-health HUD). A host killed mid-encode may orphan one ffmpeg
+  process bounded by its own completion; the staged file it writes is
+  recovery residue, never an artifact. The Unix CI FFmpeg build carries
+  `--disable-programs`, so end-to-end encode fixtures are opt-in like
+  `effects_audit` and hosted CI proves the CLI-free cache half only.
 - The Symmetry Field's eight-texture single pass is a *floor* claim resting on
   the S2 receipt's enforced-cap argument, measured on one adapter and one
   backend. It is a capability claim only, not performance, bandwidth, or cache

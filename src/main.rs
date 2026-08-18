@@ -27,6 +27,7 @@ mod preset;
 mod procedural;
 mod program_recorder;
 mod proxy;
+mod proxy_worker;
 mod randomization;
 mod recovery_journal;
 mod render_export;
@@ -3419,6 +3420,20 @@ struct App {
     accepted_motion_resource_bytes: Option<u64>,
     layers: Vec<Layer>,
     selected_layer: Option<usize>,
+    /// The proxy cache, opened lazily on first use (a Y-key encode request or
+    /// a patch-load consultation). Opening performs the crash-recovery scan.
+    /// `None` means not yet opened; an open failure is remembered separately
+    /// so it is reported once instead of retried every frame.
+    proxy_store: Option<std::sync::Arc<std::sync::Mutex<proxy_worker::ProxyCacheStore>>>,
+    proxy_store_error: Option<String>,
+    /// The single encode worker, spawned beside the store on first request.
+    proxy_encode_worker: Option<proxy_worker::ProxyEncodeWorker>,
+    /// Session-local, bounded per-identity notes: encode progress, readiness,
+    /// refusals. Keyed by source SHA-256 so they survive patch reloads.
+    proxy_feedback: std::collections::HashMap<String, String>,
+    /// Decode p95 observed when an encode was requested, keyed by source
+    /// SHA-256 — the "before" half of the decoder A/B once a proxy is live.
+    proxy_ab_baseline_micros: std::collections::HashMap<String, u32>,
     /// Monotonic generation for the live layer stack. Browser actions carry
     /// this (plus a stable layer ID) so stale multi-controller edits cannot
     /// land on a different clip after a topology change.
@@ -3916,6 +3931,11 @@ impl App {
             accepted_motion_resource_bytes: None,
             layers: Vec::new(),
             selected_layer: None,
+            proxy_store: None,
+            proxy_store_error: None,
+            proxy_encode_worker: None,
+            proxy_feedback: std::collections::HashMap::new(),
+            proxy_ab_baseline_micros: std::collections::HashMap::new(),
             layer_stack_revision: 1,
             composition: legacy_runtime_composition(&[])
                 .expect("the empty legacy composition is valid"),
@@ -6842,6 +6862,10 @@ impl App {
             media_source::FingerprintSession::new(media_source::FingerprintLimits::default())
                 .map_err(|error| error.to_string())?;
         let mut rebuilt = Vec::with_capacity(patch.layers.len());
+        // Opened once before the loop so consultation cannot conflict with
+        // the per-layer renderer borrow; refusal notes are applied after it.
+        let proxy_store = self.ensure_proxy_store();
+        let mut proxy_refusal_notes: Vec<(String, String)> = Vec::new();
 
         for config in &patch.layers {
             let persisted_source_reference =
@@ -6875,7 +6899,43 @@ impl App {
                 unreachable!("Spout sources returned above")
             };
             let path = resolved.path;
-            let path_text = path.to_string_lossy();
+            // A content-referenced video source consults the proxy cache:
+            // a validated artifact backs the decoder while the layer keeps
+            // the original identity for persistence and export. A refused
+            // artifact is discarded and the original is used.
+            let mut proxy_backing: Option<String> = None;
+            let mut open_path = path.clone();
+            if let (Some(store), Some(reference)) =
+                (proxy_store.as_ref(), persisted_source_reference.as_deref())
+            {
+                if layers::is_video_file(&path) {
+                    if let Ok(Some(identity)) = media_source::parse_content_reference(reference) {
+                        match proxy_worker::consult_proxy_cache(
+                            store,
+                            &identity,
+                            proxy::ProxySettings::default(),
+                            &path,
+                        ) {
+                            proxy_worker::ProxyConsultation::Adopted { key, artifact_path } => {
+                                open_path = artifact_path;
+                                proxy_backing = Some(key.to_hex());
+                            }
+                            proxy_worker::ProxyConsultation::NoArtifact => {}
+                            proxy_worker::ProxyConsultation::RefusedInvalid { key, error } => {
+                                log::warn!(
+                                    "proxy artifact {} refused at patch load: {error}",
+                                    key.to_hex()
+                                );
+                                proxy_refusal_notes.push((
+                                    identity.sha256,
+                                    format!("proxy artifact refused and discarded: {error}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            let path_text = open_path.to_string_lossy();
             let mut layer = Layer::new_with_media_policy(
                 &path_text,
                 &renderer.device,
@@ -6884,7 +6944,16 @@ impl App {
             .map_err(|e| format!("{}: {e}", config.filename))?;
             config.apply_to_layer(&mut layer);
             layer.set_persisted_source_reference(persisted_source_reference);
+            if let Some(backing) = proxy_backing {
+                layer.set_proxy_backing(Some(backing));
+                // The layer presents the authored clip, not the artifact's
+                // hex name; the runtime open path is the only proxy fact.
+                layer.filename = config.filename.clone();
+            }
             rebuilt.push(layer);
+        }
+        for (key, note) in proxy_refusal_notes {
+            self.note_proxy_feedback(key, note);
         }
 
         if let Some(restored_layer_ids) = restored_layer_ids {
@@ -16260,6 +16329,220 @@ impl App {
         }
     }
 
+    /// Open the proxy cache on first use; the open performs the
+    /// crash-recovery scan. A failed open is remembered and reported through
+    /// layer feedback rather than retried every frame.
+    fn ensure_proxy_store(
+        &mut self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<proxy_worker::ProxyCacheStore>>> {
+        if let Some(store) = &self.proxy_store {
+            return Some(std::sync::Arc::clone(store));
+        }
+        if self.proxy_store_error.is_some() {
+            return None;
+        }
+        match proxy_worker::ProxyCacheStore::open(proxy_worker::default_proxy_cache_root()) {
+            Ok((store, recovery)) => {
+                if recovery.staging_removed > 0 {
+                    log::warn!(
+                        "proxy cache recovery removed {} interrupted staging file(s); none were published",
+                        recovery.staging_removed
+                    );
+                }
+                let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+                self.proxy_store = Some(std::sync::Arc::clone(&store));
+                Some(store)
+            }
+            Err(error) => {
+                log::warn!("proxy cache unavailable: {error}");
+                self.proxy_store_error = Some(error.to_string());
+                None
+            }
+        }
+    }
+
+    /// Bounded per-identity feedback; at capacity the lexicographically
+    /// first key is dropped so growth is impossible and eviction is
+    /// deterministic.
+    fn note_proxy_feedback(&mut self, key: String, note: String) {
+        const PROXY_FEEDBACK_CAP: usize = 64;
+        if self.proxy_feedback.len() >= PROXY_FEEDBACK_CAP
+            && !self.proxy_feedback.contains_key(&key)
+        {
+            if let Some(first) = self.proxy_feedback.keys().min().cloned() {
+                self.proxy_feedback.remove(&first);
+            }
+        }
+        self.proxy_feedback.insert(key, note);
+    }
+
+    fn proxy_feedback_key_for_layer(layer: &Layer) -> String {
+        layer
+            .content_identity_for_proxy()
+            .map(|identity| identity.sha256)
+            .unwrap_or_else(|| format!("layer:{:?}", layer.stable_layer_id()))
+    }
+
+    /// The Y key: ask the worker to encode a proxy for the selected layer's
+    /// verified content identity. Every refusal lands in the layer's HUD
+    /// status line; nothing here blocks the render thread.
+    fn request_selected_layer_proxy(&mut self) {
+        let Some(index) = self.selected_layer else {
+            log::info!("proxy encode request ignored: no layer is selected");
+            return;
+        };
+        let Some(layer) = self.layers.get(index) else {
+            return;
+        };
+        let feedback_key = Self::proxy_feedback_key_for_layer(layer);
+        if !layer.is_video() {
+            self.note_proxy_feedback(
+                feedback_key,
+                "proxy encode refused: only video layers can be proxied".to_owned(),
+            );
+            return;
+        }
+        if let Some(backing) = layer.proxy_backing() {
+            let note = format!(
+                "already proxy-backed ({}…)",
+                &backing[..8.min(backing.len())]
+            );
+            self.note_proxy_feedback(feedback_key, note);
+            return;
+        }
+        let Some(identity) = layer.content_identity_for_proxy() else {
+            self.note_proxy_feedback(
+                feedback_key,
+                "proxy encode refused: this layer has no verified content identity; load it \
+                 through a content-referenced (cos-sha256) patch first"
+                    .to_owned(),
+            );
+            return;
+        };
+        let source_path = std::path::PathBuf::from(&layer.source_path);
+        if let Some(telemetry) = layer.video_telemetry() {
+            self.proxy_ab_baseline_micros.insert(
+                identity.sha256.clone(),
+                duration_micros_u32(telemetry.decode_p95_duration),
+            );
+            if self.proxy_ab_baseline_micros.len() > 64 {
+                if let Some(first) = self.proxy_ab_baseline_micros.keys().min().cloned() {
+                    self.proxy_ab_baseline_micros.remove(&first);
+                }
+            }
+        }
+        let Some(store) = self.ensure_proxy_store() else {
+            let error = self
+                .proxy_store_error
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            self.note_proxy_feedback(
+                identity.sha256.clone(),
+                format!("proxy cache unavailable: {error}"),
+            );
+            return;
+        };
+        if self.proxy_encode_worker.is_none() {
+            self.proxy_encode_worker = Some(proxy_worker::ProxyEncodeWorker::spawn(
+                store,
+                proxy::ProxyCacheLimits::default(),
+                self.media_safety_policy.clone(),
+            ));
+        }
+        let job = proxy_worker::ProxyEncodeJob {
+            source_path,
+            identity: identity.clone(),
+            settings: proxy::ProxySettings::default(),
+        };
+        let submitted = self
+            .proxy_encode_worker
+            .as_ref()
+            .expect("worker was just ensured")
+            .submit(job);
+        let note = match submitted {
+            Ok(()) => "proxy encode requested".to_owned(),
+            Err(refusal) => format!("proxy encode refused: {refusal}"),
+        };
+        self.note_proxy_feedback(identity.sha256, note);
+    }
+
+    /// Drain worker completions nonblockingly, once per frame.
+    fn drain_proxy_worker_events(&mut self) {
+        let events = match &self.proxy_encode_worker {
+            Some(worker) => worker.drain_events(),
+            None => return,
+        };
+        for event in events {
+            match event {
+                proxy_worker::ProxyWorkerEvent::Started { identity, key } => {
+                    let key = key.to_hex();
+                    let note = format!("proxy encode running ({}…)", &key[..8]);
+                    self.note_proxy_feedback(identity.sha256, note);
+                }
+                proxy_worker::ProxyWorkerEvent::Finished { identity, outcome } => {
+                    let note = if outcome.already_cached {
+                        "proxy already cached — reapply the patch to adopt it".to_owned()
+                    } else {
+                        let evicted = outcome
+                            .eviction
+                            .as_ref()
+                            .map(|receipt| receipt.evicted.len())
+                            .unwrap_or(0);
+                        if evicted > 0 {
+                            format!(
+                                "proxy ready ({} bytes, {} evicted, {}s) — reapply the patch to adopt it",
+                                outcome.artifact_bytes, evicted, outcome.encode_seconds
+                            )
+                        } else {
+                            format!(
+                                "proxy ready ({} bytes, {}s) — reapply the patch to adopt it",
+                                outcome.artifact_bytes, outcome.encode_seconds
+                            )
+                        }
+                    };
+                    self.note_proxy_feedback(identity.sha256, note);
+                }
+                proxy_worker::ProxyWorkerEvent::Failed { identity, error } => {
+                    self.note_proxy_feedback(
+                        identity.sha256,
+                        format!("proxy encode failed: {error}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Compose the operator-facing proxy line for one layer: an active
+    /// backing reports itself (with the A/B baseline when one was measured),
+    /// otherwise the measured assessment plus any session feedback.
+    fn proxy_layer_status(
+        &self,
+        layer: &Layer,
+        telemetry: &video::threaded::DecoderTelemetry,
+        visible_layers: usize,
+    ) -> String {
+        if let Some(backing) = layer.proxy_backing() {
+            let decode_p95 = duration_micros_u32(telemetry.decode_p95_duration);
+            let short = &backing[..8.min(backing.len())];
+            let baseline = layer
+                .content_identity_for_proxy()
+                .and_then(|identity| self.proxy_ab_baseline_micros.get(&identity.sha256).copied());
+            return match baseline {
+                Some(before) => format!(
+                    "proxy active ({short}…): decode p95 {decode_p95} us vs {before} us before"
+                ),
+                None => format!("proxy active ({short}…): decode p95 {decode_p95} us"),
+            };
+        }
+        let mut status = proxy_assessment_status(layer, telemetry, visible_layers);
+        let feedback_key = Self::proxy_feedback_key_for_layer(layer);
+        if let Some(note) = self.proxy_feedback.get(&feedback_key) {
+            status.push_str("; ");
+            status.push_str(note);
+        }
+        status
+    }
+
     fn stage_health_snapshot(&self) -> stage_health::StageHealthSnapshot {
         let decoder_telemetry: Vec<_> = self.layers.iter().map(Layer::video_telemetry).collect();
         let visible_layers = self
@@ -16289,7 +16572,7 @@ impl App {
                     let decode_p95_us = duration_micros_u32(telemetry.decode_p95_duration);
                     let upload_p95_us = duration_micros_u32(telemetry.upload_p95_duration);
                     let frame_age_p95_us = duration_micros_u32(telemetry.frame_age_p95_duration);
-                    let proxy_status = proxy_assessment_status(layer, telemetry, visible_layers);
+                    let proxy_status = self.proxy_layer_status(layer, telemetry, visible_layers);
                     format!(
                         "{base}; decoded {}/{} frames, command queue {}, command drops {}, upload {} us ({} samples), p95 decode/upload/age {decode_p95_us}/{upload_p95_us}/{frame_age_p95_us} us; {proxy_status}",
                         telemetry.consumed_frames,
@@ -18039,7 +18322,12 @@ impl ApplicationHandler for App {
                             apply_action(action, &mut layer.effects)
                         };
                         match flow {
-                            ControlFlow::Quit => event_loop.exit(),
+                            ControlFlow::Quit => {
+                                if let Some(worker) = &self.proxy_encode_worker {
+                                    worker.cancel_all();
+                                }
+                                event_loop.exit();
+                            }
                             ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
                                 self.apply_native_transport_flow(flow, Some(idx));
                             }
@@ -18049,6 +18337,9 @@ impl ApplicationHandler for App {
                                 OutputWindowCommand::Toggle,
                             ),
                             ControlFlow::ToggleBlackout => self.toggle_blackout(),
+                            ControlFlow::CreateSelectedLayerProxy => {
+                                self.request_selected_layer_proxy();
+                            }
                             ControlFlow::Continue => {}
                         }
                     }
@@ -18056,11 +18347,19 @@ impl ApplicationHandler for App {
                     let mut dummy = effects::EffectUniforms::default();
                     let flow = apply_action(action, &mut dummy);
                     match flow {
-                        ControlFlow::Quit => event_loop.exit(),
+                        ControlFlow::Quit => {
+                            if let Some(worker) = &self.proxy_encode_worker {
+                                worker.cancel_all();
+                            }
+                            event_loop.exit();
+                        }
                         ControlFlow::ToggleFullscreen => self.toggle_preview_fullscreen(),
                         ControlFlow::ToggleOutputWindow => self
                             .apply_output_window_command(event_loop, OutputWindowCommand::Toggle),
                         ControlFlow::ToggleBlackout => self.toggle_blackout(),
+                        ControlFlow::CreateSelectedLayerProxy => {
+                            self.request_selected_layer_proxy();
+                        }
                         ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
                             self.apply_native_transport_flow(flow, None);
                         }
@@ -18086,6 +18385,7 @@ impl ApplicationHandler for App {
                     // publish its library/ClipSlot intent here; a new Start in
                     // this same browser batch then sees the transaction idle.
                     self.poll_live_capture();
+                    self.drain_proxy_worker_events();
 
                     // Process actions from web UI
                     let mut pending_actions: VecDeque<_> = self
