@@ -35,6 +35,17 @@ mod spout_out;
 mod stage_health;
 mod stage_map;
 mod study;
+// The S4 symmetry domain is the frozen CPU reference that the pending dedicated
+// Symmetry Field pass reproduces. Until that pass lands, the module is reached
+// only from its own tests.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the frozen symmetry group-closure reference precedes its dedicated pass"
+    )
+)]
+mod symmetry;
 mod temporal;
 mod transport;
 mod video;
@@ -1266,6 +1277,12 @@ fn json_vec_f32<const N: usize>(value: &serde_json::Value) -> Result<[f32; N], S
     Ok(result)
 }
 
+fn json_bool(value: &serde_json::Value, label: &str) -> Result<bool, String> {
+    value
+        .as_bool()
+        .ok_or_else(|| format!("{label} must be boolean"))
+}
+
 fn json_enum<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, String> {
     serde_json::from_value(value.clone()).map_err(|error| format!("invalid enum value: {error}"))
 }
@@ -1285,6 +1302,10 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         // Deterministic OneBelow/current-frame donor at zero gain, matching the
         // image-mask variant law. The node is an exact bypass until authored.
         "displace" => Kind::Displace(visual_rack::RuntimeDisplaceParams::default()),
+        // Cyclic at one fold with a carrier-only table: the exact default is an
+        // exact bypass, so an inserted Symmetry Field collects no tap, requests
+        // no motion field, and encodes no dedicated pass until it is authored.
+        "symmetry" => Kind::Symmetry(symmetry::RuntimeSymmetryParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -1455,9 +1476,76 @@ fn set_runtime_node_param(
                 }
                 _ => return Err(format!("unsupported displace parameter {param}")),
             },
+            Kind::Symmetry(params) => match param {
+                "symmetry_base_folds" => params.base_folds = finite_json_f32(value)?,
+                "symmetry_fold_offset" => params.fold_offset = finite_json_f32(value)?,
+                "symmetry_radial_phase_deg" => {
+                    params.radial_phase_deg = finite_json_f32(value)?;
+                }
+                "symmetry_orbit_phase" => params.orbit_phase = finite_json_f32(value)?,
+                "symmetry_planar_axis_deg" => {
+                    params.planar_axis_deg = finite_json_f32(value)?;
+                }
+                "symmetry_planar_phase" => params.planar_phase = finite_json_f32(value)?,
+                "symmetry_cell_skew" => params.cell_skew = finite_json_f32(value)?,
+                "symmetry_spiral_scale" => params.spiral_scale = finite_json_f32(value)?,
+                "symmetry_orbit_radius" => params.orbit_radius = finite_json_f32(value)?,
+                "symmetry_orbit_spin_deg" => {
+                    params.orbit_spin_deg = finite_json_f32(value)?;
+                }
+                "symmetry_motion_gain" => params.motion_gain = finite_json_f32(value)?,
+                "symmetry_hue_span" => params.hue_span = finite_json_f32(value)?,
+                "symmetry_center" => params.center = json_vec_f32(value)?,
+                "symmetry_mode" => params.mode = json_enum(value)?,
+                "symmetry_boundary" => params.boundary = json_enum(value)?,
+                "symmetry_source_carrier" => {
+                    params.source_mask.carrier = json_bool(value, "symmetry source carrier")?;
+                }
+                "symmetry_source_donor0" => {
+                    params.source_mask.donor0 = json_bool(value, "symmetry source donor 0")?;
+                }
+                "symmetry_source_donor1" => {
+                    params.source_mask.donor1 = json_bool(value, "symmetry source donor 1")?;
+                }
+                "symmetry_source_history" => {
+                    params.source_mask.clean_history =
+                        json_bool(value, "symmetry source clean history")?;
+                }
+                "symmetry_motion_slot0" => {
+                    params.motion_mask.slot0 = json_bool(value, "symmetry motion slot 0")?;
+                }
+                "symmetry_motion_slot1" => {
+                    params.motion_mask.slot1 = json_bool(value, "symmetry motion slot 1")?;
+                }
+                // The authored seed selects a sector table; it never routes
+                // one. It claims no image edge, requests no motion field, and
+                // reserves no binding, so it is an ordinary absolute value
+                // exactly like the Cellular, Shift, and Grain pattern seeds.
+                "symmetry_seed" => params.seed = json_u32(value)?,
+                // The four routes are the only Symmetry fields that rewrite the
+                // image dependency graph or the motion field request, so each
+                // owns the ordered, revision-protected, slot-addressed topology
+                // action rather than this coalescible value path.
+                "symmetry_donor0_tap"
+                | "symmetry_donor1_tap"
+                | "symmetry_motion0_donor"
+                | "symmetry_motion1_donor" => {
+                    return Err(format!("{param} requires its ordered topology action"));
+                }
+                _ => return Err(format!("unsupported symmetry parameter {param}")),
+            },
         },
     }
     normalize_runtime_rack(rack)
+}
+
+/// One resolved Symmetry Field route edit, already typed by class. The slot
+/// index travels beside it; this only carries the resolved payload so the
+/// dispatch arm can assign it without re-deciding which class it belongs to.
+#[derive(Debug, Clone, Copy)]
+enum SymmetryRouteEdit {
+    Image(visual_rack::ResolvedImageTap),
+    Motion(motion::MotionDonor),
 }
 
 #[derive(Clone)]
@@ -3836,6 +3924,16 @@ impl App {
             input.resource_limits.max_texture_array_layers = limits.max_texture_array_layers;
             input.resource_limits.max_sampled_textures_per_shader_stage =
                 limits.max_sampled_textures_per_shader_stage;
+        } else {
+            // `CreativeResourceLimits::default()` carries the ordinary rack
+            // constant in the sampled-texture slot, which is bind-layout policy
+            // rather than a device fact. Production creates its device with
+            // `wgpu::Limits::default()`, and `request_device` refuses any
+            // adapter below that, so the floor is the honest ceiling before a
+            // renderer exists. Without this a dedicated eight-texture pass
+            // would be refused against a three-texture rack constant.
+            input.resource_limits.max_sampled_textures_per_shader_stage =
+                wgpu::Limits::default().max_sampled_textures_per_shader_stage;
         }
         base.plan_composition(input)
             .map_err(|error| format!("creative graph preflight failed: {error}"))?;
@@ -3995,6 +4093,7 @@ impl App {
                 | WebAction::SetVisualNodeMaskVariant { .. }
                 | WebAction::SetVisualNodeRoute { .. }
                 | WebAction::SetVisualNodeDisplaceRoute { .. }
+                | WebAction::SetVisualNodeSymmetryRoute { .. }
                 | WebAction::SetCompositionGroupMatteRoute { .. }
                 | WebAction::SetCompositionGroupMatteParam { .. }
                 | WebAction::SetCompositionGroupParam { .. }
@@ -4266,6 +4365,84 @@ impl App {
                         true,
                         format!("Routed displace node {}", node_id.get()),
                     )?;
+                }
+                WebAction::SetVisualNodeSymmetryRoute {
+                    scope,
+                    node_id,
+                    route,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let slot = usize::from(route.index());
+                    let mut staged = self.staged_creative_graph();
+                    // Slot index is route identity: an out-of-range slot is a
+                    // typed refusal rather than a fallback onto slot 0.
+                    let resolved = match route {
+                        web::state::SymmetryRouteSnapshot::Image { route, .. } => {
+                            if slot >= symmetry::SYMMETRY_IMAGE_SLOTS {
+                                return Err(format!("symmetry image slot {slot} does not exist"));
+                            }
+                            SymmetryRouteEdit::Image(
+                                self.creative_route_from_snapshot(route, &staged.composition)?,
+                            )
+                        }
+                        web::state::SymmetryRouteSnapshot::Motion { layer_id, .. } => {
+                            if slot >= symmetry::SYMMETRY_MOTION_SLOTS {
+                                return Err(format!("symmetry motion slot {slot} does not exist"));
+                            }
+                            SymmetryRouteEdit::Motion(match layer_id.as_deref() {
+                                None => motion::MotionDonor::None,
+                                Some(value) => {
+                                    let donor_id = parse_nonzero_decimal(value)
+                                        .and_then(image_routing::StableLayerId::new)
+                                        .ok_or_else(|| {
+                                            "symmetry motion donor layer ID is malformed"
+                                                .to_string()
+                                        })?;
+                                    let saved_position = self
+                                        .creative_saved_position(donor_id)
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "symmetry motion donor layer {} is absent",
+                                                donor_id.get()
+                                            )
+                                        })?;
+                                    motion::MotionDonor::Selected {
+                                        layer_id: donor_id,
+                                        saved_position,
+                                    }
+                                }
+                            })
+                        }
+                    };
+                    let node = staged
+                        .rack_mut(scope)
+                        .and_then(|rack| rack.get_mut(node_id))
+                        .ok_or_else(|| format!("symmetry node {} is absent", node_id.get()))?;
+                    let visual_rack::RuntimeVisualNodeKind::Symmetry(params) = &mut node.kind
+                    else {
+                        return Err(format!("node {} is not a symmetry field", node_id.get()));
+                    };
+                    // Only the addressed slot moves. Every other slot, both
+                    // masks, the seed, and the whole geometry keep their
+                    // authored values across a reroute.
+                    let label = match resolved {
+                        SymmetryRouteEdit::Image(tap) => {
+                            params.donors[slot] = tap;
+                            format!("Routed symmetry node {} image slot {slot}", node_id.get())
+                        }
+                        SymmetryRouteEdit::Motion(donor) => {
+                            params.motion[slot] = donor;
+                            format!("Routed symmetry node {} motion slot {slot}", node_id.get())
+                        }
+                    };
+                    normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(staged, true, label)?;
                 }
                 WebAction::SetCompositionGroupMatteRoute {
                     group_id,
@@ -6870,7 +7047,8 @@ impl App {
             | WebAction::MoveVisualNode { scope, .. }
             | WebAction::SetVisualNodeMaskVariant { scope, .. }
             | WebAction::SetVisualNodeRoute { scope, .. }
-            | WebAction::SetVisualNodeDisplaceRoute { scope, .. } => {
+            | WebAction::SetVisualNodeDisplaceRoute { scope, .. }
+            | WebAction::SetVisualNodeSymmetryRoute { scope, .. } => {
                 matches!(scope, CreativeScopeSnapshot::Master)
             }
             WebAction::Reroll {
@@ -14387,6 +14565,7 @@ impl App {
             | WebAction::SetVisualNodeMaskVariant { .. }
             | WebAction::SetVisualNodeRoute { .. }
             | WebAction::SetVisualNodeDisplaceRoute { .. }
+            | WebAction::SetVisualNodeSymmetryRoute { .. }
             | WebAction::SetCompositionGroupMatteRoute { .. }
             | WebAction::SetCompositionGroupMatteParam { .. }
             | WebAction::SetCompositionGroupParam { .. }
@@ -20268,6 +20447,220 @@ mod app_state_tests {
             app.master_rack.get(grain_id).unwrap().kind,
             visual_rack::RuntimeVisualNodeKind::Grain(_)
         ));
+    }
+
+    /// Closes the four main.rs sites for the Symmetry route action: the
+    /// creative admission `matches!`, the dispatch arm, `action_targets_master_
+    /// rack`, and the legacy-dispatch list. Omitting the admission guard
+    /// silently falls through to the legacy `unreachable!`, and omitting the
+    /// master-rack predicate lets a latched reroute survive a visual reset.
+    #[test]
+    fn symmetry_browser_protocol_edits_values_and_barriers_each_slot_by_revision() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot,
+            SymmetryRouteSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "symmetry".into(),
+            composition_revision: app.composition_revision,
+        });
+        let node_id = app
+            .master_rack
+            .iter()
+            .next()
+            .expect("the browser can insert a Symmetry Field")
+            .stable_id;
+        let params = |app: &App| match app.master_rack.get(node_id).unwrap().kind {
+            visual_rack::RuntimeVisualNodeKind::Symmetry(params) => params,
+            _ => panic!("inserted node must be a symmetry field"),
+        };
+        // A newly inserted node is the deterministic exact-bypass default.
+        assert!(params(&app).is_exact_bypass());
+        assert_eq!(params(&app).mode, symmetry::SymmetryMode::Cyclic);
+        assert_eq!(
+            params(&app).boundary,
+            symmetry::SymmetryBoundary::Transparent
+        );
+        assert!(params(&app).source_mask.is_carrier_only());
+
+        // Geometry, masks, discrete laws, and the seed all travel on the one
+        // coalescible value action.
+        let revision = app.composition_revision;
+        let set = |app: &mut App, param: &str, value: serde_json::Value| {
+            app.handle_web_action(WebAction::SetVisualNodeParam {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                node_kind: "symmetry".into(),
+                param: param.into(),
+                value,
+                composition_revision: revision,
+            });
+        };
+        set(&mut app, "symmetry_base_folds", serde_json::json!(6.0));
+        set(&mut app, "symmetry_mode", serde_json::json!("planar_pmm"));
+        set(
+            &mut app,
+            "symmetry_boundary",
+            serde_json::json!("cellular_reentry"),
+        );
+        set(&mut app, "symmetry_hue_span", serde_json::json!(0.5));
+        set(&mut app, "symmetry_seed", serde_json::json!(4_242));
+        set(&mut app, "symmetry_source_donor1", serde_json::json!(true));
+        set(&mut app, "symmetry_motion_slot0", serde_json::json!(true));
+        assert_eq!(params(&app).base_folds, 6.0);
+        assert_eq!(params(&app).mode, symmetry::SymmetryMode::PlanarPmm);
+        assert_eq!(
+            params(&app).boundary,
+            symmetry::SymmetryBoundary::CellularReentry
+        );
+        assert_eq!(params(&app).hue_span, 0.5);
+        assert_eq!(params(&app).seed, 4_242);
+        assert!(params(&app).source_mask.donor1);
+        assert!(params(&app).motion_mask.slot0);
+        assert!(!params(&app).is_exact_bypass());
+
+        // Hostile values clamp into the declared range, and every route key is
+        // refused on the value path.
+        set(&mut app, "symmetry_base_folds", serde_json::json!(9_000.0));
+        assert_eq!(params(&app).base_folds, 32.0);
+        set(&mut app, "symmetry_hue_span", serde_json::json!(f64::NAN));
+        assert_eq!(params(&app).hue_span, 0.5, "a non-finite edit is refused");
+        for key in [
+            "symmetry_donor0_tap",
+            "symmetry_donor1_tap",
+            "symmetry_motion0_donor",
+            "symmetry_motion1_donor",
+        ] {
+            set(&mut app, key, serde_json::json!("one_below"));
+        }
+        let default_tap = visual_rack::ResolvedImageTap {
+            source: visual_rack::ResolvedImageSource::OneBelow,
+            timing: visual_rack::EdgeTiming::CurrentFrame,
+        };
+        assert_eq!(
+            params(&app).donors,
+            [default_tap; symmetry::SYMMETRY_IMAGE_SLOTS],
+            "the four routes must reject the coalescible value path"
+        );
+
+        // The dedicated ordered action reroutes exactly one slot and leaves the
+        // other three plus every value untouched.
+        let clean_program = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::CleanProgram,
+            timing: visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let route_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: SymmetryRouteSnapshot::Image {
+                index: 1,
+                route: clean_program.clone(),
+            },
+            composition_revision: route_revision,
+        });
+        assert_eq!(
+            params(&app).donors[1].source,
+            visual_rack::ResolvedImageSource::CleanProgram
+        );
+        assert_eq!(
+            params(&app).donors[0],
+            default_tap,
+            "slot index is route identity: slot 1 never writes slot 0"
+        );
+        assert_eq!(params(&app).base_folds, 32.0, "a reroute preserves values");
+        assert_eq!(params(&app).seed, 4_242);
+        assert_ne!(
+            app.composition_revision, route_revision,
+            "a route change is a topology barrier and advances the revision"
+        );
+
+        // A stale revision is rejected outright; the live route is untouched.
+        app.handle_web_action(WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: SymmetryRouteSnapshot::Image {
+                index: 1,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+            },
+            composition_revision: route_revision,
+        });
+        assert_eq!(
+            params(&app).donors[1].source,
+            visual_rack::ResolvedImageSource::CleanProgram,
+            "a stale revision must never apply a reroute"
+        );
+
+        // An out-of-range slot is a typed refusal, never a fallback onto slot 0.
+        app.handle_web_action(WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: SymmetryRouteSnapshot::Image {
+                index: 7,
+                route: clean_program.clone(),
+            },
+            composition_revision: app.composition_revision,
+        });
+        assert_eq!(params(&app).donors[0], default_tap);
+        assert!(app.composition_status.contains("slot 7 does not exist"));
+
+        // A motion slot clears with an absent layer.
+        app.handle_web_action(WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: SymmetryRouteSnapshot::Motion {
+                index: 1,
+                layer_id: None,
+            },
+            composition_revision: app.composition_revision,
+        });
+        assert_eq!(params(&app).motion[1], motion::MotionDonor::None);
+
+        // The route action is an ordered barrier, is never latched, and is
+        // recognized as master-rack work so a visual reset purges it.
+        let route_action = WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: SymmetryRouteSnapshot::Image {
+                index: 0,
+                route: clean_program,
+            },
+            composition_revision: app.composition_revision,
+        };
+        assert!(App::quantized_action_key(&route_action).is_none());
+        assert!(App::action_targets_master_rack(&route_action));
+
+        // Addressing a node of another kind is a typed refusal.
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 1,
+            node_kind: "grain".into(),
+            composition_revision: app.composition_revision,
+        });
+        let grain_id = app.master_rack.iter().nth(1).unwrap().stable_id;
+        app.handle_web_action(WebAction::SetVisualNodeSymmetryRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: grain_id.get().to_string(),
+            route: SymmetryRouteSnapshot::Motion {
+                index: 0,
+                layer_id: None,
+            },
+            composition_revision: app.composition_revision,
+        });
+        assert!(matches!(
+            app.master_rack.get(grain_id).unwrap().kind,
+            visual_rack::RuntimeVisualNodeKind::Grain(_)
+        ));
+        assert!(app.composition_status.contains("is not a symmetry field"));
     }
 
     #[test]

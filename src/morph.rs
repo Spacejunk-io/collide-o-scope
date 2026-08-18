@@ -25,12 +25,15 @@ use crate::patch::{
     TemporalResetPolicyConfig,
 };
 use crate::spatial::SpatialTransform;
+use crate::symmetry::{
+    SavedMotionDonor, SymmetryParams, SYMMETRY_IMAGE_SLOTS, SYMMETRY_MOTION_SLOTS,
+};
 use crate::temporal::CollisionScoreLoopDriver;
 use crate::visual_rack::{
     CellularParams, DigitalColorParams, DisplaceParams, EllipseMask, GrainParams, ImageMatte,
     KeyParams, MaskParams, RectangleMask, RuntimeImageMatte, RuntimeMaskParams,
-    RuntimeVisualNodeKind, RuntimeVisualRack, SavedImageSource, ShiftParams, VisualNodeKind,
-    VisualRack,
+    RuntimeVisualNodeKind, RuntimeVisualRack, SavedImageSource, SavedImageTap, ShiftParams,
+    VisualNodeKind, VisualRack,
 };
 
 // Morph's positional layer world follows the existing saved stack bound, not
@@ -1128,26 +1131,153 @@ fn remapped_saved_position_after_move(
         .unwrap_or(position)
 }
 
+/// Every saved image route one node owns, addressed by slot.
+///
+/// Slot index is route identity, so a node owning two routes hands back two
+/// independent borrows and a positional layer edit can never slide one slot's
+/// donor into the other. The match is exhaustive on purpose: a future kind that
+/// carries a route must be listed here, not silently skipped.
+fn saved_node_image_taps_mut(
+    kind: &mut VisualNodeKind,
+) -> [Option<&mut SavedImageTap>; SYMMETRY_IMAGE_SLOTS] {
+    match kind {
+        VisualNodeKind::Mask(MaskParams::Image(matte)) => [Some(&mut matte.tap), None],
+        VisualNodeKind::Displace(params) => [Some(&mut params.tap), None],
+        VisualNodeKind::Symmetry(params) => {
+            let [first, second] = &mut params.donors;
+            [Some(first), Some(second)]
+        }
+        VisualNodeKind::LegacyCanonical
+        | VisualNodeKind::LegacyTemporal
+        | VisualNodeKind::Transform(_)
+        | VisualNodeKind::DigitalColor(_)
+        | VisualNodeKind::Key(_)
+        | VisualNodeKind::Cellular(_)
+        | VisualNodeKind::Shift(_)
+        | VisualNodeKind::Grain(_)
+        | VisualNodeKind::Mask(MaskParams::Rectangle(_) | MaskParams::Ellipse(_)) => [None, None],
+    }
+}
+
+/// Every saved motion route one node owns, addressed by slot. A motion route
+/// never enters the image dependency graph, but it names the same saved layer
+/// positions and must survive a reorder identically.
+fn saved_node_motion_donors_mut(
+    kind: &mut VisualNodeKind,
+) -> [Option<&mut SavedMotionDonor>; SYMMETRY_MOTION_SLOTS] {
+    match kind {
+        VisualNodeKind::Symmetry(params) => {
+            let [first, second] = &mut params.motion;
+            [Some(first), Some(second)]
+        }
+        VisualNodeKind::LegacyCanonical
+        | VisualNodeKind::LegacyTemporal
+        | VisualNodeKind::Transform(_)
+        | VisualNodeKind::DigitalColor(_)
+        | VisualNodeKind::Key(_)
+        | VisualNodeKind::Cellular(_)
+        | VisualNodeKind::Shift(_)
+        | VisualNodeKind::Grain(_)
+        | VisualNodeKind::Mask(_)
+        | VisualNodeKind::Displace(_) => [None, None],
+    }
+}
+
+fn remap_saved_tap_after_move(tap: &mut SavedImageTap, from: usize, to: usize) {
+    let SavedImageSource::SelectedLayer {
+        layer_position,
+        stage,
+    } = tap.source
+    else {
+        return;
+    };
+    tap.source = SavedImageSource::SelectedLayer {
+        layer_position: remapped_saved_position_after_move(layer_position, from, to),
+        stage,
+    };
+}
+
+fn remap_saved_tap_after_remove(tap: &mut SavedImageTap, removed: usize) {
+    let SavedImageSource::SelectedLayer {
+        layer_position,
+        stage,
+    } = tap.source
+    else {
+        return;
+    };
+    let position_index = layer_position.get() as usize;
+    tap.source = if position_index == removed {
+        // The vacated position becomes a tombstone that never rebinds to a
+        // later occupant of the same index.
+        SavedImageSource::MissingSelectedLayer {
+            saved_position: layer_position,
+            stage,
+        }
+    } else if position_index > removed {
+        SavedImageSource::SelectedLayer {
+            layer_position: crate::performance::SavedLayerPosition::new(
+                layer_position
+                    .get()
+                    .checked_sub(1)
+                    .expect("a position greater than the removed index is nonzero"),
+            )
+            .expect("decrementing a valid saved position remains valid"),
+            stage,
+        }
+    } else {
+        tap.source
+    };
+}
+
+fn remap_saved_motion_donor_after_move(donor: &mut SavedMotionDonor, from: usize, to: usize) {
+    let SavedMotionDonor::Selected { saved_position } = *donor else {
+        return;
+    };
+    *donor = SavedMotionDonor::Selected {
+        saved_position: remapped_saved_position_after_move(saved_position, from, to),
+    };
+}
+
+fn remap_saved_motion_donor_after_remove(donor: &mut SavedMotionDonor, removed: usize) {
+    let SavedMotionDonor::Selected { saved_position } = *donor else {
+        return;
+    };
+    let position_index = saved_position.get() as usize;
+    *donor = if position_index == removed {
+        SavedMotionDonor::Missing { saved_position }
+    } else if position_index > removed {
+        SavedMotionDonor::Selected {
+            saved_position: crate::performance::SavedLayerPosition::new(
+                saved_position
+                    .get()
+                    .checked_sub(1)
+                    .expect("a position greater than the removed index is nonzero"),
+            )
+            .expect("decrementing a valid saved position remains valid"),
+        }
+    } else {
+        *donor
+    };
+}
+
 fn remap_saved_rack_routes_after_move(rack: &mut VisualRack, from: usize, to: usize) {
     let node_ids = rack.iter().map(|node| node.stable_id).collect::<Vec<_>>();
     for node_id in node_ids {
         let Some(node) = rack.get_mut(node_id) else {
             continue;
         };
-        let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
-            continue;
-        };
-        let SavedImageSource::SelectedLayer {
-            layer_position,
-            stage,
-        } = matte.tap.source
-        else {
-            continue;
-        };
-        matte.tap.source = SavedImageSource::SelectedLayer {
-            layer_position: remapped_saved_position_after_move(layer_position, from, to),
-            stage,
-        };
+        for tap in saved_node_image_taps_mut(&mut node.kind)
+            .into_iter()
+            .flatten()
+        {
+            remap_saved_tap_after_move(tap, from, to);
+        }
+        for donor in saved_node_motion_donors_mut(&mut node.kind)
+            .into_iter()
+            .flatten()
+        {
+            remap_saved_motion_donor_after_move(donor, from, to);
+        }
     }
 }
 
@@ -1157,36 +1287,18 @@ fn remap_saved_rack_routes_after_remove(rack: &mut VisualRack, removed: usize) {
         let Some(node) = rack.get_mut(node_id) else {
             continue;
         };
-        let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
-            continue;
-        };
-        let SavedImageSource::SelectedLayer {
-            layer_position,
-            stage,
-        } = matte.tap.source
-        else {
-            continue;
-        };
-        let position_index = layer_position.get() as usize;
-        matte.tap.source = if position_index == removed {
-            SavedImageSource::MissingSelectedLayer {
-                saved_position: layer_position,
-                stage,
-            }
-        } else if position_index > removed {
-            SavedImageSource::SelectedLayer {
-                layer_position: crate::performance::SavedLayerPosition::new(
-                    layer_position
-                        .get()
-                        .checked_sub(1)
-                        .expect("a position greater than the removed index is nonzero"),
-                )
-                .expect("decrementing a valid saved position remains valid"),
-                stage,
-            }
-        } else {
-            matte.tap.source
-        };
+        for tap in saved_node_image_taps_mut(&mut node.kind)
+            .into_iter()
+            .flatten()
+        {
+            remap_saved_tap_after_remove(tap, removed);
+        }
+        for donor in saved_node_motion_donors_mut(&mut node.kind)
+            .into_iter()
+            .flatten()
+        {
+            remap_saved_motion_donor_after_remove(donor, removed);
+        }
     }
 }
 
@@ -2241,6 +2353,7 @@ fn saved_node_topology_matches(a: VisualNodeKind, b: VisualNodeKind) -> bool {
         ) => image_matte_route_matches(a, b),
         (VisualNodeKind::Mask(_), VisualNodeKind::Mask(_)) => false,
         (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => displace_route_matches(a, b),
+        (VisualNodeKind::Symmetry(a), VisualNodeKind::Symmetry(b)) => symmetry_route_matches(a, b),
         _ => true,
     }
 }
@@ -2253,6 +2366,21 @@ fn image_matte_route_matches(a: ImageMatte, b: ImageMatte) -> bool {
 /// Two different routes are different topology, not two ends of a blend.
 fn displace_route_matches(a: DisplaceParams, b: DisplaceParams) -> bool {
     a.tap == b.tap
+}
+
+/// A Symmetry Field's geometry interpolates only when both slots describe the
+/// exact same routing graph, AND-ed across all four fixed slots.
+///
+/// The two masks join the routes because they decide admission: a slot whose
+/// source or motion bit is clear claims no dependency edge and reserves no
+/// binding, so two slots with different masks describe two different graphs
+/// rather than two ends of a blend. Slot index is route identity, so the
+/// comparison is positional and a swapped pair is a mismatch, not a match.
+fn symmetry_route_matches(a: SymmetryParams, b: SymmetryParams) -> bool {
+    a.donors == b.donors
+        && a.motion == b.motion
+        && a.source_mask.sanitized() == b.source_mask.sanitized()
+        && a.motion_mask == b.motion_mask
 }
 
 fn interpolate_rack(
@@ -2314,6 +2442,9 @@ fn interpolate_node_kind(
         (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => {
             VisualNodeKind::Displace(interpolate_displace(a, b, weights, choose_b)?)
         }
+        (VisualNodeKind::Symmetry(a), VisualNodeKind::Symmetry(b)) => {
+            VisualNodeKind::Symmetry(interpolate_symmetry(a, b, weights, choose_b)?)
+        }
         _ => return None,
     })
 }
@@ -2335,6 +2466,50 @@ fn interpolate_displace(
         amount_x: blend_finite(a.amount_x, b.amount_x, weights),
         amount_y: blend_finite(a.amount_y, b.amount_y, weights),
         boundary: pick(a.boundary, b.boundary, choose_b),
+    })
+}
+
+/// The Symmetry Field's declared continuous controls blend; every angular one
+/// blends along its shortest wrapped arc. Mode and boundary are discrete
+/// authored laws and switch at the midpoint like every other enum. The four
+/// routes and the two masks are topology: A/B compatibility already proved them
+/// equal, so they are carried, never interpolated.
+fn interpolate_symmetry(
+    a: SymmetryParams,
+    b: SymmetryParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<SymmetryParams> {
+    if !symmetry_route_matches(a, b) {
+        return None;
+    }
+    Some(SymmetryParams {
+        mode: pick(a.mode, b.mode, choose_b),
+        base_folds: blend_finite(a.base_folds, b.base_folds, weights),
+        fold_offset: blend_finite(a.fold_offset, b.fold_offset, weights),
+        radial_phase_deg: blend_wrapped_degrees(a.radial_phase_deg, b.radial_phase_deg, weights),
+        orbit_phase: blend_finite(a.orbit_phase, b.orbit_phase, weights),
+        planar_axis_deg: blend_wrapped_degrees(a.planar_axis_deg, b.planar_axis_deg, weights),
+        planar_phase: blend_finite(a.planar_phase, b.planar_phase, weights),
+        cell_skew: blend_finite(a.cell_skew, b.cell_skew, weights),
+        spiral_scale: blend_finite(a.spiral_scale, b.spiral_scale, weights),
+        orbit_radius: blend_finite(a.orbit_radius, b.orbit_radius, weights),
+        orbit_spin_deg: blend_wrapped_degrees(a.orbit_spin_deg, b.orbit_spin_deg, weights),
+        center: [
+            blend_finite(a.center[0], b.center[0], weights),
+            blend_finite(a.center[1], b.center[1], weights),
+        ],
+        boundary: pick(a.boundary, b.boundary, choose_b),
+        motion_gain: blend_finite(a.motion_gain, b.motion_gain, weights),
+        hue_span: blend_finite(a.hue_span, b.hue_span, weights),
+        // Seed identity is an endpoint recall, never an interpolated RNG.
+        // Blending it would synthesize a third 32-record sector table that
+        // neither slot ever captured.
+        seed: pick(a.seed, b.seed, choose_b),
+        source_mask: a.source_mask,
+        motion_mask: a.motion_mask,
+        donors: a.donors,
+        motion: a.motion,
     })
 }
 
@@ -2621,6 +2796,10 @@ fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKi
             apply_saved_displace_values(value, live);
             true
         }
+        (VisualNodeKind::Symmetry(value), VisualNodeKind::Symmetry(live)) => {
+            apply_saved_symmetry_values(value, live);
+            true
+        }
         _ => false,
     }
 }
@@ -2635,6 +2814,34 @@ fn apply_saved_displace_values(sampled: DisplaceParams, live: &mut DisplaceParam
     live.amount_x = sampled.amount_x;
     live.amount_y = sampled.amount_y;
     live.boundary = sampled.boundary;
+}
+
+/// Values only. The four live routes and the two live masks are preserved, so
+/// applying a Look or a preset can never silently retarget a Symmetry Field at
+/// another image or arm a source the operator never armed. The seed travels
+/// with the values because it is a value: it selects a table, it does not route
+/// one.
+#[allow(
+    dead_code,
+    reason = "implementation detail of retained saved value application"
+)]
+fn apply_saved_symmetry_values(sampled: SymmetryParams, live: &mut SymmetryParams) {
+    live.mode = sampled.mode;
+    live.base_folds = sampled.base_folds;
+    live.fold_offset = sampled.fold_offset;
+    live.radial_phase_deg = sampled.radial_phase_deg;
+    live.orbit_phase = sampled.orbit_phase;
+    live.planar_axis_deg = sampled.planar_axis_deg;
+    live.planar_phase = sampled.planar_phase;
+    live.cell_skew = sampled.cell_skew;
+    live.spiral_scale = sampled.spiral_scale;
+    live.orbit_radius = sampled.orbit_radius;
+    live.orbit_spin_deg = sampled.orbit_spin_deg;
+    live.center = sampled.center;
+    live.boundary = sampled.boundary;
+    live.motion_gain = sampled.motion_gain;
+    live.hue_span = sampled.hue_span;
+    live.seed = sampled.seed;
 }
 
 #[allow(
@@ -2828,6 +3035,27 @@ fn apply_saved_node_kind_values_to_runtime(
             live.boundary = value.boundary;
             true
         }
+        (VisualNodeKind::Symmetry(value), RuntimeVisualNodeKind::Symmetry(live)) => {
+            // Values only; the four live routes and the two live masks stay
+            // under topology control so a preset never rewires the field.
+            live.mode = value.mode;
+            live.base_folds = value.base_folds;
+            live.fold_offset = value.fold_offset;
+            live.radial_phase_deg = value.radial_phase_deg;
+            live.orbit_phase = value.orbit_phase;
+            live.planar_axis_deg = value.planar_axis_deg;
+            live.planar_phase = value.planar_phase;
+            live.cell_skew = value.cell_skew;
+            live.spiral_scale = value.spiral_scale;
+            live.orbit_radius = value.orbit_radius;
+            live.orbit_spin_deg = value.orbit_spin_deg;
+            live.center = value.center;
+            live.boundary = value.boundary;
+            live.motion_gain = value.motion_gain;
+            live.hue_span = value.hue_span;
+            live.seed = value.seed;
+            true
+        }
         _ => false,
     }
 }
@@ -2859,6 +3087,15 @@ fn runtime_racks_share_strict_topology(a: &RuntimeVisualRack, b: &RuntimeVisualR
             ) => a.tap == b.tap && a.channel == b.channel && a.invert == b.invert,
             (RuntimeVisualNodeKind::Displace(a), RuntimeVisualNodeKind::Displace(b)) => {
                 a.tap == b.tap
+            }
+            // All four slots plus both masks, exactly as the saved gate. A Look
+            // that lands on a differently routed or differently armed Symmetry
+            // Field must refuse the whole rack rather than rewire it.
+            (RuntimeVisualNodeKind::Symmetry(a), RuntimeVisualNodeKind::Symmetry(b)) => {
+                a.donors == b.donors
+                    && a.motion == b.motion
+                    && a.source_mask.sanitized() == b.source_mask.sanitized()
+                    && a.motion_mask == b.motion_mask
             }
             _ => true,
         })
@@ -2928,6 +3165,27 @@ fn apply_runtime_node_kind_values(
             live.amount_x = value.amount_x;
             live.amount_y = value.amount_y;
             live.boundary = value.boundary;
+            true
+        }
+        (RuntimeVisualNodeKind::Symmetry(value), RuntimeVisualNodeKind::Symmetry(live)) => {
+            // Values only; the four live routes and both live masks stay under
+            // topology control.
+            live.mode = value.mode;
+            live.base_folds = value.base_folds;
+            live.fold_offset = value.fold_offset;
+            live.radial_phase_deg = value.radial_phase_deg;
+            live.orbit_phase = value.orbit_phase;
+            live.planar_axis_deg = value.planar_axis_deg;
+            live.planar_phase = value.planar_phase;
+            live.cell_skew = value.cell_skew;
+            live.spiral_scale = value.spiral_scale;
+            live.orbit_radius = value.orbit_radius;
+            live.orbit_spin_deg = value.orbit_spin_deg;
+            live.center = value.center;
+            live.boundary = value.boundary;
+            live.motion_gain = value.motion_gain;
+            live.hue_span = value.hue_span;
+            live.seed = value.seed;
             true
         }
         _ => false,
@@ -4911,5 +5169,440 @@ glide:
             "strict apply must reject a Displace whose donor differs"
         );
         assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
+    }
+
+    fn symmetry_rack(params: SymmetryParams) -> VisualRack {
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Symmetry(params)).unwrap();
+        rack
+    }
+
+    fn symmetry_donor(position: u32) -> SavedImageTap {
+        SavedImageTap {
+            source: SavedImageSource::SelectedLayer {
+                layer_position: crate::performance::SavedLayerPosition::new(position).unwrap(),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            },
+            timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+        }
+    }
+
+    /// A fully routed, fully armed field so every one of the four slots and both
+    /// masks is load bearing in the topology predicate.
+    fn routed_symmetry() -> SymmetryParams {
+        use crate::symmetry::{SymmetryMotionMask, SymmetrySourceMask};
+
+        SymmetryParams {
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: true,
+                clean_history: true,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: true,
+                slot1: true,
+            },
+            donors: [symmetry_donor(1), symmetry_donor(2)],
+            motion: [
+                SavedMotionDonor::Selected {
+                    saved_position: crate::performance::SavedLayerPosition::new(3).unwrap(),
+                },
+                SavedMotionDonor::Selected {
+                    saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                },
+            ],
+            ..SymmetryParams::default()
+        }
+    }
+
+    /// Closes `saved_node_topology_matches` and `interpolate_node_kind`. Without
+    /// the topology arm two slots naming different donors would be declared
+    /// compatible and their geometry blended across mismatched routes; without
+    /// the interpolate arm even a matching pair would fall into `_ => None` and
+    /// silently stop the whole rack from morphing.
+    #[test]
+    fn morph_interpolates_symmetry_geometry_only_on_an_exact_four_slot_route_match() {
+        use crate::symmetry::{SymmetryBoundary, SymmetryMode, SymmetryMotionMask};
+
+        let base = routed_symmetry();
+        let a = symmetry_rack(SymmetryParams {
+            mode: SymmetryMode::Cyclic,
+            boundary: SymmetryBoundary::Wrap,
+            base_folds: 2.0,
+            radial_phase_deg: 170.0,
+            hue_span: 0.0,
+            seed: 11,
+            ..base
+        });
+        let b = symmetry_rack(SymmetryParams {
+            mode: SymmetryMode::PlanarPmm,
+            boundary: SymmetryBoundary::CellularReentry,
+            base_folds: 8.0,
+            radial_phase_deg: -170.0,
+            hue_span: 1.0,
+            seed: 22,
+            ..base
+        });
+
+        // Midpoint: continuous controls blend, angles take the shortest wrapped
+        // arc, discrete laws switch, and every route plus both masks is carried.
+        let sampled = interpolate_rack(&a, &b, [0.5, 0.5], true).expect("routes match");
+        let VisualNodeKind::Symmetry(params) = sampled.iter().next().unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert!((params.base_folds - 5.0).abs() <= 1.0e-6);
+        assert!((params.hue_span - 0.5).abs() <= 1.0e-6);
+        assert!(
+            params.radial_phase_deg.abs() >= 179.0,
+            "170 deg to -170 deg is a 20 deg arc through 180, not a 340 deg sweep: {}",
+            params.radial_phase_deg
+        );
+        assert_eq!(params.mode, SymmetryMode::PlanarPmm);
+        assert_eq!(params.boundary, SymmetryBoundary::CellularReentry);
+        assert_eq!(params.donors, base.donors);
+        assert_eq!(params.motion, base.motion);
+        assert_eq!(params.source_mask, base.source_mask);
+        assert_eq!(params.motion_mask, base.motion_mask);
+        assert!(
+            params.seed == 11 || params.seed == 22,
+            "the seed is an endpoint recall, never a mixture: {}",
+            params.seed
+        );
+
+        // Endpoints are exact on the continuous, discrete, and seed fields.
+        for (weights, choose_b, folds, mode, seed) in [
+            (
+                [1.0_f32, 0.0_f32],
+                false,
+                2.0_f32,
+                SymmetryMode::Cyclic,
+                11_u32,
+            ),
+            ([0.0, 1.0], true, 8.0, SymmetryMode::PlanarPmm, 22),
+        ] {
+            let sampled = interpolate_rack(&a, &b, weights, choose_b).unwrap();
+            let VisualNodeKind::Symmetry(params) = sampled.iter().next().unwrap().kind else {
+                panic!("symmetry node")
+            };
+            assert_eq!(params.base_folds, folds);
+            assert_eq!(params.mode, mode);
+            assert_eq!(params.seed, seed);
+        }
+
+        // Each of the four slots independently makes the pair incompatible, and
+        // slot index is route identity, so swapping the two donors is a
+        // mismatch rather than a match.
+        let mismatches = [
+            SymmetryParams {
+                donors: [symmetry_donor(9), base.donors[1]],
+                ..base
+            },
+            SymmetryParams {
+                donors: [base.donors[0], symmetry_donor(9)],
+                ..base
+            },
+            SymmetryParams {
+                donors: [base.donors[1], base.donors[0]],
+                ..base
+            },
+            SymmetryParams {
+                motion: [
+                    SavedMotionDonor::None,
+                    SavedMotionDonor::Selected {
+                        saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                    },
+                ],
+                ..base
+            },
+            SymmetryParams {
+                motion: [base.motion[0], SavedMotionDonor::None],
+                ..base
+            },
+            // A retimed edge on the same layer is different topology too.
+            SymmetryParams {
+                donors: [
+                    SavedImageTap {
+                        timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+                        ..base.donors[0]
+                    },
+                    base.donors[1],
+                ],
+                ..base
+            },
+            // A mask decides admission, so a differently armed field describes a
+            // different graph.
+            SymmetryParams {
+                source_mask: crate::symmetry::SymmetrySourceMask {
+                    donor1: false,
+                    ..base.source_mask
+                },
+                ..base
+            },
+            SymmetryParams {
+                motion_mask: SymmetryMotionMask {
+                    slot0: true,
+                    slot1: false,
+                },
+                ..base
+            },
+        ];
+        for (index, mismatch) in mismatches.into_iter().enumerate() {
+            let rack = symmetry_rack(mismatch);
+            assert!(
+                interpolate_rack(&a, &rack, [0.5, 0.5], false).is_none(),
+                "mismatch {index} must stop the rack from morphing"
+            );
+        }
+    }
+
+    /// Closes `apply_saved_node_kind_values`, its saved-to-runtime twin, and
+    /// `apply_runtime_node_kind_values`. A missing arm returns `false` there,
+    /// which silently refuses the entire Look or preset for the whole rack.
+    #[test]
+    fn applying_symmetry_values_never_retargets_a_slot_or_rearms_a_mask() {
+        use crate::symmetry::{
+            RuntimeSymmetryParams, SymmetryBoundary, SymmetryMode, SymmetryMotionMask,
+            SymmetrySourceMask,
+        };
+
+        let sampled = symmetry_rack(SymmetryParams {
+            mode: SymmetryMode::Dihedral,
+            boundary: SymmetryBoundary::Hold,
+            base_folds: 7.0,
+            fold_offset: -2.0,
+            radial_phase_deg: 45.0,
+            orbit_phase: 0.25,
+            planar_axis_deg: -30.0,
+            planar_phase: 1.5,
+            cell_skew: 0.5,
+            spiral_scale: -0.25,
+            orbit_radius: 0.75,
+            orbit_spin_deg: 90.0,
+            center: [0.25, 0.75],
+            motion_gain: -0.5,
+            hue_span: 0.5,
+            seed: 4_242,
+            ..routed_symmetry()
+        });
+
+        // Saved-to-runtime apply (Look, preset) copies values only.
+        let mut live = sampled.resolve_routes(|_| None, |_| false);
+        let node_id = live.iter().next().unwrap().stable_id;
+        let live_donor = crate::visual_rack::ResolvedImageTap {
+            source: crate::visual_rack::ResolvedImageSource::OneBelow,
+            timing: crate::visual_rack::EdgeTiming::CurrentFrame,
+        };
+        let live_mask = SymmetrySourceMask {
+            carrier: true,
+            donor0: false,
+            donor1: false,
+            clean_history: false,
+        };
+        let RuntimeVisualNodeKind::Symmetry(params) = &mut live.get_mut(node_id).unwrap().kind
+        else {
+            panic!("symmetry node")
+        };
+        *params = RuntimeSymmetryParams {
+            donors: [live_donor, live_donor],
+            source_mask: live_mask,
+            motion_mask: SymmetryMotionMask {
+                slot0: false,
+                slot1: false,
+            },
+            ..RuntimeSymmetryParams::default()
+        };
+
+        assert!(apply_saved_rack_values_to_runtime(&sampled, &mut live));
+        let RuntimeVisualNodeKind::Symmetry(params) = live.get(node_id).unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(params.mode, SymmetryMode::Dihedral);
+        assert_eq!(params.boundary, SymmetryBoundary::Hold);
+        assert_eq!(params.base_folds, 7.0);
+        assert_eq!(params.fold_offset, -2.0);
+        assert_eq!(params.radial_phase_deg, 45.0);
+        assert_eq!(params.orbit_phase, 0.25);
+        assert_eq!(params.planar_axis_deg, -30.0);
+        assert_eq!(params.planar_phase, 1.5);
+        assert_eq!(params.cell_skew, 0.5);
+        assert_eq!(params.spiral_scale, -0.25);
+        assert_eq!(params.orbit_radius, 0.75);
+        assert_eq!(params.orbit_spin_deg, 90.0);
+        assert_eq!(params.center, [0.25, 0.75]);
+        assert_eq!(params.motion_gain, -0.5);
+        assert_eq!(params.hue_span, 0.5);
+        assert_eq!(params.seed, 4_242);
+        assert_eq!(
+            params.donors,
+            [live_donor, live_donor],
+            "value transfer must never rewrite a live route slot"
+        );
+        assert_eq!(
+            params.motion,
+            [crate::motion::MotionDonor::None; SYMMETRY_MOTION_SLOTS]
+        );
+        assert_eq!(
+            params.source_mask, live_mask,
+            "value transfer must never arm a source the operator never armed"
+        );
+
+        // The strict runtime path refuses a route or mask mismatch outright.
+        let mut rerouted = live.clone();
+        let RuntimeVisualNodeKind::Symmetry(params) = &mut rerouted.get_mut(node_id).unwrap().kind
+        else {
+            panic!("symmetry node")
+        };
+        params.donors[1] = crate::visual_rack::ResolvedImageTap {
+            source: crate::visual_rack::ResolvedImageSource::CleanProgram,
+            timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let mut target = live.clone();
+        assert!(
+            !apply_runtime_rack_values_strict(&rerouted, &mut target),
+            "strict apply must reject a Symmetry Field whose second slot differs"
+        );
+
+        let mut rearmed = live.clone();
+        let RuntimeVisualNodeKind::Symmetry(params) = &mut rearmed.get_mut(node_id).unwrap().kind
+        else {
+            panic!("symmetry node")
+        };
+        params.source_mask.donor1 = true;
+        assert!(
+            !apply_runtime_rack_values_strict(&rearmed, &mut target),
+            "strict apply must reject a differently armed Symmetry Field"
+        );
+        assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
+
+        // The saved-to-saved path is gated by the strict saved topology, so a
+        // route-equal target transfers values while the routes stay put, and a
+        // route-differing target is refused before any field is written.
+        let mut saved_live = symmetry_rack(routed_symmetry());
+        assert!(apply_rack_values(&sampled, &mut saved_live));
+        let VisualNodeKind::Symmetry(params) = saved_live.iter().next().unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(params.base_folds, 7.0);
+        assert_eq!(params.seed, 4_242);
+        assert_eq!(params.donors, routed_symmetry().donors);
+        assert_eq!(params.motion, routed_symmetry().motion);
+
+        let mut saved_rerouted = symmetry_rack(SymmetryParams {
+            donors: [symmetry_donor(7), symmetry_donor(8)],
+            ..routed_symmetry()
+        });
+        assert!(
+            !apply_rack_values(&sampled, &mut saved_rerouted),
+            "the saved values-only path refuses a differently routed field"
+        );
+    }
+
+    /// Closes `remap_saved_rack_routes_after_move`/`_after_remove` for every
+    /// slot a Symmetry Field owns. Without them a stored slot diverges from its
+    /// A/B twin after a stack edit, `symmetry_route_matches` then reports false,
+    /// and the whole rack silently stops morphing.
+    #[test]
+    fn layer_stack_remaps_carry_every_symmetry_slot_and_tombstone_the_removed_one() {
+        use crate::performance::SavedLayerPosition;
+
+        let position = |value: u32| SavedLayerPosition::new(value).unwrap();
+        let params = SymmetryParams {
+            donors: [symmetry_donor(0), symmetry_donor(2)],
+            motion: [
+                SavedMotionDonor::Selected {
+                    saved_position: position(1),
+                },
+                SavedMotionDonor::Selected {
+                    saved_position: position(2),
+                },
+            ],
+            ..routed_symmetry()
+        };
+        let mut slot = MorphSlot {
+            master_rack: Some(symmetry_rack(params)),
+            ..MorphSlot::default()
+        };
+        let read = |slot: &MorphSlot| {
+            let VisualNodeKind::Symmetry(params) = slot
+                .master_rack
+                .as_ref()
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .kind
+            else {
+                panic!("symmetry node")
+            };
+            params
+        };
+
+        slot.remap_layers_after_move(0, 2);
+        let moved = read(&slot);
+        assert_eq!(moved.donors[0], symmetry_donor(2));
+        assert_eq!(moved.donors[1], symmetry_donor(1));
+        assert_eq!(
+            moved.motion,
+            [
+                SavedMotionDonor::Selected {
+                    saved_position: position(0)
+                },
+                SavedMotionDonor::Selected {
+                    saved_position: position(1)
+                },
+            ]
+        );
+
+        slot.remap_layers_after_remove(1);
+        let removed = read(&slot);
+        assert_eq!(
+            removed.donors[0],
+            symmetry_donor(1),
+            "a position above the removed index decrements"
+        );
+        assert_eq!(
+            removed.donors[1].source,
+            SavedImageSource::MissingSelectedLayer {
+                saved_position: position(1),
+                stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+            },
+            "the vacated position becomes a tombstone that never rebinds"
+        );
+        assert_eq!(
+            removed.motion,
+            [
+                SavedMotionDonor::Selected {
+                    saved_position: position(0)
+                },
+                SavedMotionDonor::Missing {
+                    saved_position: position(1)
+                },
+            ]
+        );
+
+        // A tombstone stays a tombstone through every later stack edit.
+        slot.remap_layers_after_move(0, 1);
+        let later = read(&slot);
+        assert_eq!(later.donors[1].source, removed.donors[1].source);
+        assert_eq!(later.motion[1], removed.motion[1]);
+
+        // Group identities are stable and never rewritten by a layer edit.
+        let group_tap = SavedImageTap {
+            source: SavedImageSource::GroupOutput {
+                group_id: crate::visual_rack::GroupId::new(91).unwrap(),
+            },
+            timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let mut group_slot = MorphSlot {
+            master_rack: Some(symmetry_rack(SymmetryParams {
+                donors: [group_tap, group_tap],
+                ..routed_symmetry()
+            })),
+            ..MorphSlot::default()
+        };
+        group_slot.remap_layers_after_move(0, 2);
+        group_slot.remap_layers_after_remove(0);
+        assert_eq!(read(&group_slot).donors, [group_tap, group_tap]);
     }
 }

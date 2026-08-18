@@ -1290,6 +1290,59 @@ pub(crate) fn mutate_runtime_rack_values(
                 value.amount_y =
                     mutate_linear(0.0, value.amount_y, -1.0, 1.0, amount * 0.2, &mut rng);
             }
+            RuntimeVisualNodeKind::Symmetry(value) => {
+                // The two image routes, the two motion routes, the mode, the
+                // boundary, the authored seed, and the six mask bits are stable
+                // authored topology; Dice moves only the declared continuous
+                // controls and therefore can never reroll the sector table.
+                // Each node draws from its own stable domain, so appending this
+                // arm cannot perturb any previously authored node's stream.
+                value.base_folds =
+                    mutate_linear(1.0, value.base_folds, 1.0, 32.0, amount * 2.0, &mut rng);
+                value.fold_offset =
+                    mutate_linear(0.0, value.fold_offset, -32.0, 32.0, amount * 2.0, &mut rng);
+                value.radial_phase_deg = mutate_circular(
+                    0.0,
+                    value.radial_phase_deg,
+                    -180.0,
+                    180.0,
+                    amount * 30.0,
+                    &mut rng,
+                );
+                value.orbit_phase =
+                    mutate_linear(0.0, value.orbit_phase, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.planar_axis_deg = mutate_circular(
+                    0.0,
+                    value.planar_axis_deg,
+                    -180.0,
+                    180.0,
+                    amount * 30.0,
+                    &mut rng,
+                );
+                value.planar_phase =
+                    mutate_linear(0.0, value.planar_phase, -4.0, 4.0, amount * 0.4, &mut rng);
+                value.cell_skew =
+                    mutate_linear(0.0, value.cell_skew, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.spiral_scale =
+                    mutate_linear(0.0, value.spiral_scale, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.orbit_radius =
+                    mutate_linear(0.0, value.orbit_radius, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.orbit_spin_deg = mutate_circular(
+                    0.0,
+                    value.orbit_spin_deg,
+                    -180.0,
+                    180.0,
+                    amount * 30.0,
+                    &mut rng,
+                );
+                value.motion_gain =
+                    mutate_linear(0.0, value.motion_gain, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.hue_span =
+                    mutate_linear(0.0, value.hue_span, 0.0, 1.0, amount * 0.2, &mut rng);
+                for slot in &mut value.center {
+                    *slot = mutate_linear(0.5, *slot, -1.0, 2.0, amount * 0.1, &mut rng);
+                }
+            }
         }
     }
 }
@@ -2117,5 +2170,120 @@ mod tests {
         assert_eq!(solo_grain, grain_id);
         mutate_runtime_rack_values(&mut without_displace, 1.0, 7, 11, DiceRackScope::Master);
         assert_eq!(grain_of(&without_displace), grain_of(&diced));
+    }
+
+    /// Dice moves only the Symmetry Field's declared continuous controls. The
+    /// two image routes, the two motion routes, the mode, the boundary, the
+    /// authored seed, and the six mask bits are stable authored topology, so
+    /// the 32-record sector table is bit-identical before and after.
+    #[test]
+    fn dice_moves_symmetry_continuous_values_only_and_never_its_routes_masks_or_seed() {
+        use crate::motion::MotionDonor;
+        use crate::symmetry::{
+            RuntimeSymmetryParams, SymmetryBoundary, SymmetryMode, SymmetryMotionMask,
+            SymmetryNodeDomain, SymmetrySourceMask,
+        };
+        use crate::visual_rack::{
+            EdgeTiming, ResolvedImageSource, ResolvedImageTap, RuntimeVisualNodeKind,
+            RuntimeVisualRack,
+        };
+
+        let saved_position = crate::performance::SavedLayerPosition::new(3).unwrap();
+        let authored = RuntimeSymmetryParams {
+            mode: SymmetryMode::LogSpiral,
+            base_folds: 5.0,
+            boundary: SymmetryBoundary::Mirror,
+            seed: 909,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: true,
+                clean_history: false,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: false,
+                slot1: true,
+            },
+            donors: [
+                ResolvedImageTap {
+                    source: ResolvedImageSource::CleanProgram,
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                ResolvedImageTap {
+                    source: ResolvedImageSource::AllBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+            ],
+            motion: [MotionDonor::None, MotionDonor::Missing { saved_position }],
+            ..RuntimeSymmetryParams::default()
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::Symmetry(authored))
+            .unwrap();
+        let domain = SymmetryNodeDomain::new(0x4d41_5354_4552, node_id.get());
+        let table = authored.sector_table(domain);
+
+        let scope = DiceRackScope::Master;
+        let mut diced = rack.clone();
+        mutate_runtime_rack_values(&mut diced, 1.0, 4_242, 11, scope);
+        let RuntimeVisualNodeKind::Symmetry(params) = diced.get(node_id).unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert!(
+            params.base_folds != authored.base_folds
+                || params.radial_phase_deg != authored.radial_phase_deg
+                || params.hue_span != authored.hue_span,
+            "at least one continuous control must move at amount 1.0"
+        );
+        assert!(params.base_folds >= 1.0 && params.base_folds <= 32.0);
+        assert!(params.hue_span >= 0.0 && params.hue_span <= 1.0);
+        assert!(params.motion_gain >= -1.0 && params.motion_gain <= 1.0);
+        assert!(params.center[0] >= -1.0 && params.center[0] <= 2.0);
+
+        assert_eq!(params.donors, authored.donors);
+        assert_eq!(params.motion, authored.motion);
+        assert_eq!(params.mode, authored.mode);
+        assert_eq!(params.boundary, authored.boundary);
+        assert_eq!(params.seed, authored.seed);
+        assert_eq!(params.source_mask, authored.source_mask);
+        assert_eq!(params.motion_mask, authored.motion_mask);
+        assert_eq!(params.sector_table(domain), table);
+
+        // The same seed and stream reproduce exactly, and amount zero is an
+        // exact whole-rack no-op.
+        let mut repeat = rack.clone();
+        mutate_runtime_rack_values(&mut repeat, 1.0, 4_242, 11, scope);
+        assert_eq!(repeat, diced);
+        let mut untouched = rack.clone();
+        mutate_runtime_rack_values(&mut untouched, 0.0, 4_242, 11, scope);
+        assert_eq!(untouched, rack);
+
+        // A neighbouring node is byte-identical with and without this kind
+        // present, because every node draws from its own stable domain.
+        let grain = crate::visual_rack::GrainParams::default();
+        let mut with_symmetry = RuntimeVisualRack::empty();
+        with_symmetry
+            .push(RuntimeVisualNodeKind::Symmetry(authored))
+            .unwrap();
+        let neighbour = with_symmetry
+            .push(RuntimeVisualNodeKind::Grain(grain))
+            .unwrap();
+        let mut without_symmetry = RuntimeVisualRack::empty();
+        without_symmetry
+            .push(RuntimeVisualNodeKind::Displace(
+                crate::visual_rack::RuntimeDisplaceParams::default(),
+            ))
+            .unwrap();
+        let same_slot = without_symmetry
+            .push(RuntimeVisualNodeKind::Grain(grain))
+            .unwrap();
+        assert_eq!(same_slot, neighbour, "the neighbour keeps its stable id");
+        mutate_runtime_rack_values(&mut with_symmetry, 1.0, 4_242, 11, scope);
+        mutate_runtime_rack_values(&mut without_symmetry, 1.0, 4_242, 11, scope);
+        assert_eq!(
+            with_symmetry.get(neighbour).unwrap().kind,
+            without_symmetry.get(neighbour).unwrap().kind
+        );
     }
 }

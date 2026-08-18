@@ -2060,6 +2060,35 @@ impl CompositionHost {
         self.temporal_state.borrow().history_valid
     }
 
+    /// The single D2Array **read** view of the committed Compat8 clean-history
+    /// ring.
+    ///
+    /// This is a borrow, never a copy: a second consumer binds this same view
+    /// and the ring stays exactly 24 `Rgba8UnormSrgb` layers charged once as
+    /// `ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS`. Reading it alongside the
+    /// temporal pass is safe because both are reads; the 24 single-layer views
+    /// are render targets and are deliberately not exposed, because a second
+    /// writer would corrupt the ring the temporal pass is mid-frame reading.
+    pub fn temporal_history_view(&self) -> &wgpu::TextureView {
+        &self.temporal_history_view
+    }
+
+    /// The clean-history read cursor a consumer must use to turn an age into a
+    /// layer, derived through `temporal::temporal_read_snapshot` exactly as the
+    /// temporal pass derives its own uniform.
+    ///
+    /// Age 0 is the virtual current image and never addresses a stored layer;
+    /// an age is materialized only while it is strictly below `valid`.
+    pub fn temporal_history_read_cursor(&self) -> (u32, u32) {
+        let state = self.temporal_state.borrow();
+        let snapshot =
+            crate::temporal::temporal_read_snapshot(state.history_write, state.history_valid, 1.0);
+        (
+            u32::try_from(snapshot.virtual_write).unwrap_or(0),
+            snapshot.virtual_valid,
+        )
+    }
+
     #[allow(
         dead_code,
         reason = "native telemetry reaches this through the active Advanced executor only"

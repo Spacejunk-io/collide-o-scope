@@ -1149,6 +1149,137 @@ mod tests {
         ));
     }
 
+    /// Presets are node-kind agnostic: both entry points delegate to
+    /// `morph::apply_*`, so registering the Symmetry Field there is what closes
+    /// this row. A missing morph arm would make every preset apply return
+    /// `IncompatibleTarget` for any rack containing the node.
+    #[test]
+    fn rack_preset_copies_symmetry_values_but_preserves_its_four_routes_and_masks() {
+        use crate::symmetry::{
+            RuntimeSymmetryParams, SavedMotionDonor, SymmetryBoundary, SymmetryMode,
+            SymmetryMotionMask, SymmetrySourceMask,
+        };
+
+        let donor = layer_id(44);
+        let other_donor = layer_id(99);
+        let authored = RuntimeSymmetryParams {
+            mode: SymmetryMode::Dihedral,
+            boundary: SymmetryBoundary::Wrap,
+            base_folds: 9.0,
+            hue_span: 0.6,
+            seed: 5_150,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: false,
+                clean_history: true,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: true,
+                slot1: false,
+            },
+            donors: [
+                ResolvedImageTap {
+                    source: ResolvedImageSource::SelectedLayer {
+                        layer_id: donor,
+                        saved_position: saved_position(3),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ResolvedImageTap {
+                    source: ResolvedImageSource::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+            ],
+            motion: [
+                crate::motion::MotionDonor::Selected {
+                    layer_id: donor,
+                    saved_position: saved_position(3),
+                },
+                crate::motion::MotionDonor::None,
+            ],
+            ..RuntimeSymmetryParams::default()
+        };
+        let mut source = RuntimeVisualRack::empty();
+        let node_id = source
+            .push(RuntimeVisualNodeKind::Symmetry(authored))
+            .unwrap();
+        let preset =
+            RackPreset::capture_runtime(&source, |id| (id == donor).then(|| saved_position(3)))
+                .unwrap();
+
+        // The target is differently routed, differently armed, and carries
+        // different values.
+        let live_donor = ResolvedImageTap {
+            source: ResolvedImageSource::SelectedLayer {
+                layer_id: other_donor,
+                saved_position: saved_position(8),
+                stage: LayerImageStage::PreLocalEffects,
+            },
+            timing: EdgeTiming::PreviousFrame,
+        };
+        let live_mask = SymmetrySourceMask {
+            carrier: true,
+            donor0: false,
+            donor1: true,
+            clean_history: false,
+        };
+        let mut target = source.clone();
+        let node = target.get_mut(node_id).unwrap();
+        let RuntimeVisualNodeKind::Symmetry(params) = &mut node.kind else {
+            panic!("symmetry node")
+        };
+        params.donors = [live_donor, live_donor];
+        params.source_mask = live_mask;
+        params.motion = [crate::motion::MotionDonor::None; 2];
+        params.motion_mask = SymmetryMotionMask {
+            slot0: false,
+            slot1: true,
+        };
+        params.base_folds = 1.0;
+        params.hue_span = 0.0;
+        params.seed = 1;
+
+        preset.apply_to_runtime(&mut target).unwrap();
+        let RuntimeVisualNodeKind::Symmetry(params) = target.get(node_id).unwrap().kind else {
+            panic!("symmetry node")
+        };
+        assert_eq!(params.base_folds, 9.0);
+        assert_eq!(params.hue_span, 0.6);
+        assert_eq!(params.mode, SymmetryMode::Dihedral);
+        assert_eq!(params.boundary, SymmetryBoundary::Wrap);
+        assert_eq!(params.seed, 5_150);
+        assert_eq!(
+            params.donors,
+            [live_donor, live_donor],
+            "a preset must never retarget a live route slot"
+        );
+        assert_eq!(
+            params.source_mask, live_mask,
+            "a preset must never arm a source the operator never armed"
+        );
+        assert_eq!(
+            params.motion_mask,
+            SymmetryMotionMask {
+                slot0: false,
+                slot1: true
+            }
+        );
+
+        // The saved twin of a motion route persists only its saved position, so
+        // a captured preset can never carry a process identity.
+        let captured = SavedMotionDonor::from_runtime(authored.motion[0], &mut |id| {
+            (id == donor).then(|| saved_position(3))
+        });
+        assert_eq!(
+            captured,
+            SavedMotionDonor::Selected {
+                saved_position: saved_position(3)
+            }
+        );
+    }
+
     #[test]
     fn topology_mismatch_rejects_without_partial_apply() {
         let mut saved = VisualRack::synthetic_legacy(LegacyRackScope::Layer);

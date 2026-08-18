@@ -259,9 +259,7 @@ impl SpatialTransform {
         // UV X and Y are not equal physical distances on a non-square output.
         // Conjugate the authored rotation/shear through pixel-aspect space so
         // 90 degrees remains 90 degrees on screen.
-        let to_physical = [[output_aspect, 0.0], [0.0, 1.0]];
-        let from_physical = [[1.0 / output_aspect, 0.0], [0.0, 1.0]];
-        let authored = multiply_2x2(from_physical, multiply_2x2(authored_physical, to_physical));
+        let authored = conjugate_through_output_aspect(authored_physical, output_aspect);
         let forward = multiply_2x2(authored, [[scale[0], 0.0], [0.0, scale[1]]]);
         let determinant = forward[0][0] * forward[1][1] - forward[0][1] * forward[1][0];
         // Authored near-zero scale was rejected above. Fit/Native may
@@ -376,7 +374,7 @@ impl EffectPassUniforms {
     }
 }
 
-fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
+pub(crate) fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
     if value.is_finite() {
         value.clamp(min, max)
     } else {
@@ -384,7 +382,7 @@ fn finite_clamp(value: f32, fallback: f32, min: f32, max: f32) -> f32 {
     }
 }
 
-fn wrap_degrees(value: f32) -> f32 {
+pub(crate) fn wrap_degrees(value: f32) -> f32 {
     if value.is_finite() {
         let wrapped = (value + 180.0).rem_euclid(360.0) - 180.0;
         if wrapped == -180.0 && value.is_sign_positive() {
@@ -428,12 +426,41 @@ fn blend_degrees(a: f32, b: f32, weights: [f32; 2]) -> f32 {
     wrap_degrees(a + delta * t)
 }
 
-fn rotation_matrix(angle: f32) -> [[f32; 2]; 2] {
+pub(crate) fn rotation_matrix(angle: f32) -> [[f32; 2]; 2] {
     let (sin, cos) = angle.sin_cos();
     [[cos, -sin], [sin, cos]]
 }
 
-fn multiply_2x2(a: [[f32; 2]; 2], b: [[f32; 2]; 2]) -> [[f32; 2]; 2] {
+/// Basis change between output UV space and physical (square-pixel) space.
+/// Returns `(to_physical, from_physical)`.
+///
+/// UV X and Y are not equal physical distances on a non-square output. Any
+/// authored angle must be expressed in physical space and conjugated back, or a
+/// 90 degree turn stops looking like 90 degrees on screen.
+pub(crate) fn output_aspect_basis(output_aspect: f32) -> ([[f32; 2]; 2], [[f32; 2]; 2]) {
+    (
+        [[output_aspect, 0.0], [0.0, 1.0]],
+        [[1.0 / output_aspect, 0.0], [0.0, 1.0]],
+    )
+}
+
+/// Conjugate a linear map authored in physical space into output UV space.
+pub(crate) fn conjugate_through_output_aspect(
+    authored_physical: [[f32; 2]; 2],
+    output_aspect: f32,
+) -> [[f32; 2]; 2] {
+    let (to_physical, from_physical) = output_aspect_basis(output_aspect);
+    multiply_2x2(from_physical, multiply_2x2(authored_physical, to_physical))
+}
+
+pub(crate) fn apply_2x2(matrix: [[f32; 2]; 2], vector: [f32; 2]) -> [f32; 2] {
+    [
+        matrix[0][0] * vector[0] + matrix[0][1] * vector[1],
+        matrix[1][0] * vector[0] + matrix[1][1] * vector[1],
+    ]
+}
+
+pub(crate) fn multiply_2x2(a: [[f32; 2]; 2], b: [[f32; 2]; 2]) -> [[f32; 2]; 2] {
     [
         [
             a[0][0] * b[0][0] + a[0][1] * b[1][0],

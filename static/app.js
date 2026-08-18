@@ -401,6 +401,7 @@ const CREATIVE_NODE_INFO = Object.freeze({
   grain: { label: 'Grain' },
   mask: { label: 'Mask' },
   displace: { label: 'Displace' },
+  symmetry: { label: 'Symmetry Field' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -489,6 +490,33 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     floatDef('amount_x', 'Amount X', -1, 1, 0.001),
     floatDef('amount_y', 'Amount Y', -1, 1, 0.001),
     enumDef('boundary', 'Boundary', [['transparent', 'Transparent'], ['mirror', 'Mirror'], ['wrap', 'Wrap'], ['hold', 'Hold']]),
+  ],
+  // Ranges here must equal the NODE_PARAM_DESCRIPTORS ranges the server
+  // validates against. The four routes are absent on purpose: they own the
+  // ordered slot-addressed topology action, not this value path.
+  symmetry: [
+    enumDef('symmetry_mode', 'Mode', [['cyclic', 'Cyclic Cn'], ['dihedral', 'Dihedral Dn'], ['planar_p1', 'Planar p1'], ['planar_pm', 'Planar pm'], ['planar_p2', 'Planar p2'], ['planar_pmm', 'Planar pmm'], ['log_spiral', 'Log spiral'], ['orbit', 'Orbit']]),
+    enumDef('symmetry_boundary', 'Boundary', [['transparent', 'Transparent'], ['mirror', 'Mirror'], ['wrap', 'Wrap'], ['hold', 'Hold'], ['cellular_reentry', 'Cellular re-entry']]),
+    floatDef('symmetry_base_folds', 'Folds', 1, 32, 0.01),
+    floatDef('symmetry_fold_offset', 'Fold offset', -32, 32, 0.01),
+    floatDef('symmetry_radial_phase_deg', 'Radial phase', -180, 180, 0.1),
+    floatDef('symmetry_orbit_phase', 'Orbit phase', -1, 1, 0.001),
+    floatDef('symmetry_planar_axis_deg', 'Lattice axis', -180, 180, 0.1),
+    floatDef('symmetry_planar_phase', 'Lattice phase', -4, 4, 0.001),
+    floatDef('symmetry_cell_skew', 'Cell skew', -1, 1, 0.001),
+    floatDef('symmetry_spiral_scale', 'Spiral scale', -1, 1, 0.001),
+    floatDef('symmetry_orbit_radius', 'Orbit radius', 0, 1, 0.001),
+    floatDef('symmetry_orbit_spin_deg', 'Orbit spin', -180, 180, 0.1),
+    floatDef('symmetry_motion_gain', 'Motion gain', -1, 1, 0.001),
+    floatDef('symmetry_hue_span', 'Hue span', 0, 1, 0.001),
+    vecDef('symmetry_center', 'Center', -1, 2, 0.001),
+    boolDef('symmetry_source_carrier', 'Source · carrier'),
+    boolDef('symmetry_source_donor0', 'Source · donor 0'),
+    boolDef('symmetry_source_donor1', 'Source · donor 1'),
+    boolDef('symmetry_source_history', 'Source · clean history'),
+    boolDef('symmetry_motion_slot0', 'Motion · slot 0'),
+    boolDef('symmetry_motion_slot1', 'Motion · slot 1'),
+    uintDef('symmetry_seed', 'Seed'),
   ],
 });
 
@@ -622,14 +650,17 @@ function creativeRouteFromToken(token, timing) {
   return { input, timing: normalizedTiming };
 }
 
-function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, fieldOnly = false) {
+// `slot` tags the editor so a node owning more than one route binds each editor
+// to its own submit closure. Slot index is route identity, so it also travels
+// on the wire; an untagged editor is a single-route node.
+function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, fieldOnly = false, slot = '', label = 'Donor') {
   const token = creativeRouteToken(route);
   const timing = route?.timing || 'current_frame';
   const channelControls = fieldOnly ? '' : `<label>Channel <select class="creative-route-channel">${creativeOptionHtml([['alpha', 'Alpha'], ['luma', 'Luma'], ['red', 'Red'], ['green', 'Green'], ['blue', 'Blue']], channel)}</select></label>
       <label><input class="creative-route-invert" type="checkbox" ${invert ? 'checked' : ''}> Invert</label>`;
-  return `<div class="creative-route-editor">
+  return `<div class="creative-route-editor"${slot ? ` data-route-slot="${escapeHtml(slot)}"` : ''}>
     <div class="creative-route-row">
-      <label>Donor <select class="creative-route-source">${creativeOptionHtml(creativeRouteOptions(route), token)}</select></label>
+      <label>${escapeHtml(label)} <select class="creative-route-source">${creativeOptionHtml(creativeRouteOptions(route), token)}</select></label>
       <label>Timing <select class="creative-route-timing">
         <option value="current_frame" ${timing === 'current_frame' ? 'selected' : ''}>Current frame</option>
         <option value="previous_frame" ${timing === 'previous_frame' ? 'selected' : ''}>Previous frame N−1</option>
@@ -638,6 +669,33 @@ function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, field
     </div>
     <div class="creative-node-diagnostic">Current-frame routes participate in cycle rejection. Clean Program is deliberately previous-frame only.</div>
   </div>`;
+}
+
+// A Symmetry motion slot names a whole layer, so it carries no timing, stage,
+// channel, or inversion — a motion route never enters the image dependency
+// graph. A retained tombstone is listed for provenance only and is refused on
+// submit, exactly as the layer Faraday donor select does.
+function creativeMotionRouteEditorHtml(donor, slot, label, diagnostic) {
+  const kind = donor?.kind || 'none';
+  const selected = kind === 'selected'
+    ? String(donor.layer_id || '')
+    : kind === 'missing' ? `missing:${Number(donor.saved_position || 0)}` : 'none';
+  const options = [['none', 'None']];
+  latestLayers.forEach((candidate, index) => options.push([String(candidate.layer_id), `Layer ${index + 1} · ${candidate.filename || 'Untitled'}`]));
+  if (kind === 'missing') options.push([selected, `Missing saved layer ${Number(donor.saved_position || 0) + 1}`]);
+  const note = diagnostic
+    ? `<div class="creative-node-diagnostic">${escapeHtml(diagnostic)}</div>`
+    : '';
+  return `<div class="creative-motion-route-editor" data-route-slot="${escapeHtml(slot)}">
+    <div class="creative-route-row">
+      <label>${escapeHtml(label)} <select class="creative-motion-route-source">${creativeOptionHtml(options, selected)}</select></label>
+    </div>
+    ${note}
+  </div>`;
+}
+
+function creativeRouteDiagnosticHtml(diagnostic) {
+  return diagnostic ? `<div class="creative-node-diagnostic">${escapeHtml(diagnostic)}</div>` : '';
 }
 
 function wireCreativeRouteEditor(editor, onChange, selfGroupId = '') {
@@ -731,11 +789,24 @@ function renderCreativeRack() {
     const maskVariant = node.kind === 'mask' ? `<label class="creative-control creative-control-wide"><span>Mask kind</span><select class="creative-mask-variant">${creativeOptionHtml([['rectangle', 'Rectangle'], ['ellipse', 'Ellipse'], ['image', 'Image donor']], node.params?.variant || 'rectangle')}</select><output></output></label>` : '';
     // Displace routes a donor vector field, not a matte, so it reuses the
     // shared editor in field-only mode: no channel and no invert.
+    // The Symmetry Field owns four fixed routes. Each editor carries its own
+    // slot so the two image editors and the two motion editors bind to four
+    // distinct submit closures instead of the first one found.
+    const symmetryRoutes = node.kind === 'symmetry'
+      ? [
+        creativeRouteEditorHtml(node.params?.symmetry_donor0_tap, 'alpha', false, true, 'image:0', 'Donor 0'),
+        creativeRouteDiagnosticHtml(node.params?.donor0_diagnostic),
+        creativeRouteEditorHtml(node.params?.symmetry_donor1_tap, 'alpha', false, true, 'image:1', 'Donor 1'),
+        creativeRouteDiagnosticHtml(node.params?.donor1_diagnostic),
+        creativeMotionRouteEditorHtml(node.params?.symmetry_motion0_donor, 'motion:0', 'Motion 0', node.params?.motion0_diagnostic),
+        creativeMotionRouteEditorHtml(node.params?.symmetry_motion1_donor, 'motion:1', 'Motion 1', node.params?.motion1_diagnostic),
+      ].join('')
+      : '';
     const imageRoute = node.kind === 'mask' && node.params?.variant === 'image'
       ? creativeRouteEditorHtml(node.params.image_tap, node.params.image_channel, node.params.image_invert)
       : node.kind === 'displace'
         ? creativeRouteEditorHtml(node.params?.donor_tap, 'alpha', false, true)
-        : '';
+        : symmetryRoutes;
     const nodeDiagnostic = node.params?.diagnostic
       ? `<div class="creative-node-diagnostic">${escapeHtml(node.params.diagnostic)}</div>`
       : '';
@@ -757,14 +828,33 @@ function renderCreativeRack() {
     card.querySelector('.creative-mask-variant')?.addEventListener('change', (event) => creativeSend({
       action: 'set_visual_node_mask_variant', scope: creativeScopeWire(), node_id: String(node.node_id), variant: event.currentTarget.value, composition_revision: compositionRevision,
     }, 'Changing mask kind…'));
-    const routeEditor = card.querySelector('.creative-route-editor');
+    const routeEditors = [...card.querySelectorAll('.creative-route-editor')];
     const selfGroupId = creativeScopeWire().scope === 'group' ? creativeScopeWire().group_id : '';
-    if (routeEditor && node.kind === 'displace') {
-      wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
+    const slotIndex = (editor) => Number(String(editor.dataset.routeSlot || '').split(':')[1] || 0);
+    if (node.kind === 'symmetry') {
+      routeEditors.forEach((editor) => wireCreativeRouteEditor(editor, (route) => creativeSend({
+        action: 'set_visual_node_symmetry_route', scope: creativeScopeWire(), node_id: String(node.node_id),
+        route: { slot: 'image', index: slotIndex(editor), route }, composition_revision: compositionRevision,
+      }, 'Preflighting symmetry donor…'), selfGroupId));
+      card.querySelectorAll('.creative-motion-route-editor').forEach((editor) => {
+        const select = editor.querySelector('.creative-motion-route-source');
+        select?.addEventListener('change', () => {
+          const value = select.value;
+          if (value.startsWith('missing:')) return;
+          const layerId = value === 'none' ? null : value;
+          if (layerId !== null && !/^(?:[1-9][0-9]*)$/.test(layerId)) return;
+          creativeSend({
+            action: 'set_visual_node_symmetry_route', scope: creativeScopeWire(), node_id: String(node.node_id),
+            route: { slot: 'motion', index: slotIndex(editor), layer_id: layerId }, composition_revision: compositionRevision,
+          }, 'Preflighting symmetry motion donor…');
+        });
+      });
+    } else if (routeEditors[0] && node.kind === 'displace') {
+      wireCreativeRouteEditor(routeEditors[0], (route) => creativeSend({
         action: 'set_visual_node_displace_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, composition_revision: compositionRevision,
       }, 'Preflighting displace donor…'), selfGroupId);
-    } else if (routeEditor) {
-      wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
+    } else if (routeEditors[0]) {
+      wireCreativeRouteEditor(routeEditors[0], (route, channel, invert) => creativeSend({
         action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
       }, 'Preflighting image route…'), selfGroupId);
     }
@@ -957,6 +1047,16 @@ function creativeRackStructure(rack) {
     route: node.kind === 'displace'
       ? node.params?.donor_tap || null
       : (node.params?.variant === 'image' ? node.params.image_tap : null),
+    // All four Symmetry slots are structural, by slot index. Folding only the
+    // first one in would leave a stale editor that then resubmits the old token.
+    symmetryRoutes: node.kind === 'symmetry'
+      ? [
+        node.params?.symmetry_donor0_tap || null,
+        node.params?.symmetry_donor1_tap || null,
+        node.params?.symmetry_motion0_donor || null,
+        node.params?.symmetry_motion1_donor || null,
+      ]
+      : null,
     channel: node.params?.image_channel || '', invert: !!node.params?.image_invert,
   }));
 }

@@ -71,10 +71,16 @@ const OUTCOME_CANCELLED: u8 = 4;
 /// contains an excessive number of unavailable layers.
 const MAX_EXPORT_WARNINGS: usize = 128;
 const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 3;
+/// Bumped from 3 when the sidecar began recording per-slot Symmetry Field
+/// route identity. Every schema-3 key keeps its name and meaning.
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 4;
 const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
 const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
+/// Authored Symmetry Field nodes whose route identity is recorded. Racks are
+/// bounded per scope, but the number of scopes is not, so the section carries
+/// its own cap and truncation flag like every other sidecar list.
+const MAX_EXPORT_SYMMETRY_SIDECAR_NODES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
 
 const fn transparent_accumulation_clear() -> wgpu::Color {
@@ -355,6 +361,70 @@ struct MotionSidecarLastFrame {
     scopes_truncated: bool,
 }
 
+/// The rack scope that owns one Symmetry Field. Unlike the motion scope
+/// identity this carries a group arm, because a rack — and therefore a
+/// dedicated pass — can be authored at master, layer, or group scope.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SymmetrySidecarScope {
+    Master,
+    Layer { saved_position: u32, stable_id: u64 },
+    Group { group_id: u64 },
+}
+
+/// One image slot of one Symmetry Field, recorded by slot index.
+///
+/// Slot index is route identity, so the record is emitted for both slots
+/// always — including an unarmed one — and never compacted. `resolved` is the
+/// single fact an operator needs: false means the authored donor did not
+/// resolve for this job and the slot bound the neutral view, with
+/// `saved_position` retained so the tombstone is legible and can never rebind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct SymmetrySidecarImageRoute {
+    slot: u8,
+    /// The source-mask bit. An unarmed slot claims no dependency edge and
+    /// reserves no binding, so it is recorded but never counted as missing.
+    armed: bool,
+    source: &'static str,
+    timing: &'static str,
+    resolved: bool,
+    stable_id: Option<u64>,
+    saved_position: Option<u32>,
+    group_id: Option<u64>,
+    stage: Option<&'static str>,
+}
+
+/// One motion slot of one Symmetry Field, recorded by slot index.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct SymmetrySidecarMotionRoute {
+    slot: u8,
+    /// The motion-mask bit. An unarmed slot requests no primitive
+    /// vector/gate field at all.
+    armed: bool,
+    donor: &'static str,
+    resolved: bool,
+    stable_id: Option<u64>,
+    saved_position: Option<u32>,
+}
+
+/// Authored provenance for one Symmetry Field node, resolved once per job by
+/// [`resolve_export_creative_graph`]. Morph may only carry values, never
+/// routes, so this record is complete for the whole render and is not
+/// re-observed per frame.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct SymmetrySidecarNode {
+    scope: SymmetrySidecarScope,
+    node_id: u64,
+    enabled: bool,
+    wet: f32,
+    mode: crate::symmetry::SymmetryMode,
+    boundary: crate::symmetry::SymmetryBoundary,
+    seed: u32,
+    exact_bypass: bool,
+    image_routes: Vec<SymmetrySidecarImageRoute>,
+    motion_routes: Vec<SymmetrySidecarMotionRoute>,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct ExportMotionSidecar {
     schema_version: u16,
@@ -367,6 +437,8 @@ struct ExportMotionSidecar {
     authored_scopes_truncated: bool,
     distinct_dynamic_states: Vec<MotionSidecarDistinctState>,
     distinct_dynamic_states_truncated: bool,
+    symmetry_fields: Vec<SymmetrySidecarNode>,
+    symmetry_fields_truncated: bool,
     last_accepted_frame: Option<MotionSidecarLastFrame>,
     warnings: Vec<String>,
 }
@@ -379,6 +451,8 @@ struct ExportMotionSidecarAccumulator {
     authored_scopes_truncated: bool,
     distinct: Vec<MotionSidecarDistinctState>,
     distinct_truncated: bool,
+    symmetry_fields: Vec<SymmetrySidecarNode>,
+    symmetry_fields_truncated: bool,
     last: Option<MotionSidecarLastFrame>,
 }
 
@@ -1565,6 +1639,209 @@ fn sidecar_scope_state(value: &ExportMotionScopeMetadata) -> MotionSidecarScopeS
     }
 }
 
+/// Per-slot provenance for one resolved Symmetry Field image route.
+///
+/// The slot index is supplied by the caller rather than searched for, because
+/// slot index *is* route identity: compacting an unarmed or tombstoned slot out
+/// of the list would silently renumber the surviving one.
+fn symmetry_sidecar_image_route(
+    slot: u8,
+    armed: bool,
+    tap: crate::visual_rack::ResolvedImageTap,
+) -> SymmetrySidecarImageRoute {
+    use crate::image_routing::LayerImageStage;
+    use crate::visual_rack::{EdgeTiming, ResolvedImageSource};
+
+    let timing = match tap.timing {
+        EdgeTiming::CurrentFrame => "current_frame",
+        EdgeTiming::PreviousFrame => "previous_frame",
+    };
+    let stage_key = |stage: LayerImageStage| match stage {
+        LayerImageStage::PreLocalEffects => "pre_local_effects",
+        LayerImageStage::PostLocalEffects => "post_local_effects",
+    };
+    let mut record = SymmetrySidecarImageRoute {
+        slot,
+        armed,
+        source: "one_below",
+        timing,
+        resolved: true,
+        stable_id: None,
+        saved_position: None,
+        group_id: None,
+        stage: None,
+    };
+    match tap.source {
+        ResolvedImageSource::SelectedLayer {
+            layer_id,
+            saved_position,
+            stage,
+        } => {
+            record.source = "selected_layer";
+            record.stable_id = Some(layer_id.get());
+            record.saved_position = Some(saved_position.get());
+            record.stage = Some(stage_key(stage));
+        }
+        ResolvedImageSource::MissingSelectedLayer {
+            saved_position,
+            stage,
+        } => {
+            record.source = "missing_selected_layer";
+            record.resolved = false;
+            record.saved_position = Some(saved_position.get());
+            record.stage = Some(stage_key(stage));
+        }
+        ResolvedImageSource::OneBelow => record.source = "one_below",
+        ResolvedImageSource::AllBelow => record.source = "all_below",
+        ResolvedImageSource::GroupOutput(group_id) => {
+            record.source = "group_output";
+            record.group_id = Some(group_id.get());
+        }
+        ResolvedImageSource::MissingGroupOutput(group_id) => {
+            record.source = "missing_group_output";
+            record.resolved = false;
+            record.group_id = Some(group_id.get());
+        }
+        ResolvedImageSource::CleanProgram => record.source = "clean_program",
+    }
+    record
+}
+
+/// Per-slot provenance for one resolved Symmetry Field motion route.
+fn symmetry_sidecar_motion_route(
+    slot: u8,
+    armed: bool,
+    donor: crate::motion::MotionDonor,
+) -> SymmetrySidecarMotionRoute {
+    use crate::motion::MotionDonor;
+
+    match donor {
+        MotionDonor::None => SymmetrySidecarMotionRoute {
+            slot,
+            armed,
+            donor: "none",
+            resolved: true,
+            stable_id: None,
+            saved_position: None,
+        },
+        MotionDonor::Selected {
+            layer_id,
+            saved_position,
+        } => SymmetrySidecarMotionRoute {
+            slot,
+            armed,
+            donor: "selected",
+            resolved: true,
+            stable_id: Some(layer_id.get()),
+            saved_position: Some(saved_position.get()),
+        },
+        MotionDonor::Missing { saved_position } => SymmetrySidecarMotionRoute {
+            slot,
+            armed,
+            donor: "missing",
+            resolved: false,
+            stable_id: None,
+            saved_position: Some(saved_position.get()),
+        },
+    }
+}
+
+fn symmetry_sidecar_node(
+    scope: SymmetrySidecarScope,
+    node: &crate::visual_rack::RuntimeVisualNode,
+    symmetry: crate::symmetry::RuntimeSymmetryParams,
+) -> SymmetrySidecarNode {
+    let clean = symmetry.sanitized();
+    let source_mask = clean.source_mask.sanitized();
+    let armed_image = [source_mask.donor0, source_mask.donor1];
+    let armed_motion = [clean.motion_mask.slot0, clean.motion_mask.slot1];
+    SymmetrySidecarNode {
+        scope,
+        node_id: node.stable_id.get(),
+        enabled: node.enabled,
+        wet: node.wet,
+        mode: clean.mode,
+        boundary: clean.boundary,
+        seed: clean.seed,
+        exact_bypass: clean.is_exact_bypass(),
+        image_routes: clean
+            .donors
+            .iter()
+            .enumerate()
+            .map(|(slot, tap)| {
+                let slot = u8::try_from(slot).unwrap_or(u8::MAX);
+                symmetry_sidecar_image_route(
+                    slot,
+                    armed_image.get(usize::from(slot)).copied().unwrap_or(false),
+                    *tap,
+                )
+            })
+            .collect(),
+        motion_routes: clean
+            .motion
+            .iter()
+            .enumerate()
+            .map(|(slot, donor)| {
+                let slot = u8::try_from(slot).unwrap_or(u8::MAX);
+                symmetry_sidecar_motion_route(
+                    slot,
+                    armed_motion
+                        .get(usize::from(slot))
+                        .copied()
+                        .unwrap_or(false),
+                    *donor,
+                )
+            })
+            .collect(),
+    }
+}
+
+/// Walk every rack the export job actually renders and record the resolved or
+/// missing identity of each Symmetry Field route, by slot.
+///
+/// The walk order matches the planner's own — layer racks, then group racks,
+/// then master — so the sidecar reads in the order the frame is planned. Routes
+/// were resolved exactly once by [`resolve_export_creative_graph`]; nothing
+/// here re-resolves, and a tombstone is recorded as a tombstone rather than
+/// being retargeted onto whatever now occupies the vacated position.
+fn export_symmetry_sidecar_nodes(graph: &ExportCreativeGraph) -> (Vec<SymmetrySidecarNode>, bool) {
+    use crate::visual_rack::{RuntimeVisualNodeKind, RuntimeVisualRack};
+
+    let mut nodes = Vec::new();
+    let mut truncated = false;
+    let mut collect = |scope: SymmetrySidecarScope, rack: &RuntimeVisualRack| {
+        for node in rack.iter() {
+            let RuntimeVisualNodeKind::Symmetry(symmetry) = node.kind else {
+                continue;
+            };
+            if nodes.len() == MAX_EXPORT_SYMMETRY_SIDECAR_NODES {
+                truncated = true;
+                return;
+            }
+            nodes.push(symmetry_sidecar_node(scope.clone(), node, symmetry));
+        }
+    };
+    for (position, (stable_id, rack)) in graph.layer_racks.iter().enumerate() {
+        collect(
+            SymmetrySidecarScope::Layer {
+                saved_position: u32::try_from(position).unwrap_or(u32::MAX),
+                stable_id: stable_id.get(),
+            },
+            rack,
+        );
+    }
+    for group in graph.composition.groups() {
+        collect(
+            SymmetrySidecarScope::Group {
+                group_id: group.id.get(),
+            },
+            &group.rack,
+        );
+    }
+    collect(SymmetrySidecarScope::Master, &graph.master_rack);
+    (nodes, truncated)
+}
+
 fn same_distinct_motion_state(
     left: &MotionSidecarScopeState,
     right: &MotionSidecarScopeState,
@@ -1637,6 +1914,11 @@ impl ExportMotionSidecarAccumulator {
                 *params,
             ));
         }
+        // Symmetry Field routes are authored topology resolved exactly once
+        // per job. Morph carries values only, so recording them here — beside
+        // the authored motion scopes rather than per accepted frame — is
+        // complete and cannot inflate the distinct-state list.
+        let (symmetry_fields, symmetry_fields_truncated) = export_symmetry_sidecar_nodes(graph);
         Self {
             artifact: MotionSidecarArtifact::from_config(config),
             sources,
@@ -1645,6 +1927,8 @@ impl ExportMotionSidecarAccumulator {
             authored_scopes_truncated,
             distinct: Vec::new(),
             distinct_truncated: false,
+            symmetry_fields,
+            symmetry_fields_truncated,
             last: None,
         }
     }
@@ -1697,6 +1981,8 @@ impl ExportMotionSidecarAccumulator {
             authored_scopes_truncated: self.authored_scopes_truncated,
             distinct_dynamic_states: self.distinct,
             distinct_dynamic_states_truncated: self.distinct_truncated,
+            symmetry_fields: self.symmetry_fields,
+            symmetry_fields_truncated: self.symmetry_fields_truncated,
             last_accepted_frame: self.last,
             warnings: warnings
                 .into_iter()
@@ -3341,6 +3627,19 @@ fn export_motion_plan_warnings(plan: &EvaluatedCompositionPlan) -> Vec<String> {
             MotionPlanDiagnostic::RefreshGardenMotionUnavailable =>
                 "Refresh Garden's selected motion route is unavailable; its motion gate resolves to zero."
                     .to_owned(),
+            MotionPlanDiagnostic::SymmetryMotionNotSelected { scope, node_id, slot } => format!(
+                "Symmetry Field node {} in {scope:?} arms motion slot {slot} with no selected donor; that slot binds neutral vector/gate views.",
+                node_id.get()
+            ),
+            MotionPlanDiagnostic::MissingSymmetryMotion { scope, node_id, slot, saved_position } => format!(
+                "Symmetry Field node {} in {scope:?} is missing saved motion position {} at slot {slot}; that slot binds neutral vector/gate views and never rebinds.",
+                node_id.get(),
+                saved_position.get()
+            ),
+            MotionPlanDiagnostic::SymmetryMotionUnavailable { scope, node_id, slot } => format!(
+                "Symmetry Field node {} in {scope:?} selected a motion donor at slot {slot}, but no motion field was admitted; that slot binds neutral vector/gate views.",
+                node_id.get()
+            ),
         }));
     warnings
 }
@@ -9030,6 +9329,8 @@ layers:
             authored_scopes_truncated: false,
             distinct: Vec::new(),
             distinct_truncated: false,
+            symmetry_fields: Vec::new(),
+            symmetry_fields_truncated: false,
             last: None,
         };
         let scope = ExportMotionScopeMetadata {
@@ -9120,7 +9421,11 @@ layers:
         let bytes = std::fs::read(&sidecar_path).unwrap();
         assert!(bytes.len() <= MAX_EXPORT_MOTION_SIDECAR_BYTES);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        // Schema 4 appended the per-slot Symmetry Field route section. Every
+        // schema-3 key below is re-asserted unchanged.
+        assert_eq!(json["schema_version"], 4);
+        assert!(json["symmetry_fields"].as_array().unwrap().is_empty());
+        assert_eq!(json["symmetry_fields_truncated"], false);
         assert_eq!(json["cross_gpu_pixel_identity_guaranteed"], false);
         assert_eq!(
             json["artifact"]["requested_shutter_sample_policy"],
@@ -9164,6 +9469,573 @@ layers:
         assert!(!output.exists());
         assert!(!sidecar_path.exists());
         std::fs::remove_dir(&directory).unwrap();
+    }
+
+    /// Export provenance records both image slots and both motion slots of
+    /// every Symmetry Field by slot index, and keeps a resolved route
+    /// distinguishable from a retained tombstone.
+    ///
+    /// Each pair below names the *same* saved position twice: slot 0 selects
+    /// it and slot 1 is a retained tombstone at it. A walker that compacted
+    /// slots, or that re-resolved a tombstone against whatever now occupies
+    /// the vacated position, would make the two records identical.
+    #[test]
+    fn symmetry_export_provenance_records_both_image_and_motion_slots_by_index_with_missing_identity(
+    ) {
+        use crate::symmetry::{
+            SavedMotionDonor, SymmetryMotionMask, SymmetryParams, SymmetrySourceMask,
+        };
+        use crate::visual_rack::{
+            EdgeTiming, LegacyRackScope, SavedImageSource, SavedImageTap, VisualNodeKind,
+            VisualRack,
+        };
+
+        let one = SavedLayerPosition::new(1).unwrap();
+        let two = SavedLayerPosition::new(2).unwrap();
+        let mut patch = three_layer_legacy_patch();
+
+        let mut layer_rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        layer_rack
+            .push(VisualNodeKind::Symmetry(SymmetryParams {
+                base_folds: 6.0,
+                source_mask: SymmetrySourceMask {
+                    carrier: true,
+                    donor0: true,
+                    donor1: true,
+                    clean_history: false,
+                },
+                motion_mask: SymmetryMotionMask {
+                    slot0: true,
+                    slot1: true,
+                },
+                donors: [
+                    SavedImageTap {
+                        source: SavedImageSource::SelectedLayer {
+                            layer_position: two,
+                            stage: crate::image_routing::LayerImageStage::PreLocalEffects,
+                        },
+                        timing: EdgeTiming::PreviousFrame,
+                    },
+                    SavedImageTap {
+                        source: SavedImageSource::MissingSelectedLayer {
+                            saved_position: two,
+                            stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                        },
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                ],
+                motion: [
+                    SavedMotionDonor::Selected {
+                        saved_position: one,
+                    },
+                    SavedMotionDonor::Missing {
+                        saved_position: one,
+                    },
+                ],
+                ..SymmetryParams::default()
+            }))
+            .unwrap();
+        patch.layers[0].rack = Some(layer_rack);
+
+        // A second, entirely default node proves an unarmed slot is still
+        // recorded at its own index and is never reported as missing.
+        let mut master_rack = VisualRack::synthetic_legacy(LegacyRackScope::Master);
+        master_rack
+            .push(VisualNodeKind::Symmetry(SymmetryParams::default()))
+            .unwrap();
+        patch.master_rack = Some(master_rack);
+
+        let graph = resolve_export_creative_graph(&patch).unwrap();
+        let (nodes, truncated) = export_symmetry_sidecar_nodes(&graph);
+        assert!(!truncated);
+        assert_eq!(nodes.len(), 2, "one layer-scope node and one master node");
+
+        let value = serde_json::to_value(&nodes).unwrap();
+        let layer = &value[0];
+        assert_eq!(layer["scope"]["kind"], "layer");
+        assert_eq!(layer["scope"]["saved_position"], 0);
+        assert_eq!(layer["scope"]["stable_id"], 1);
+        assert_eq!(layer["exact_bypass"], false);
+
+        let images = layer["image_routes"].as_array().unwrap();
+        assert_eq!(images.len(), crate::symmetry::SYMMETRY_IMAGE_SLOTS);
+        assert_eq!(images[0]["slot"], 0);
+        assert_eq!(images[0]["armed"], true);
+        assert_eq!(images[0]["source"], "selected_layer");
+        assert_eq!(images[0]["resolved"], true);
+        // Export identity is position + 1, so saved position 2 is stable ID 3.
+        assert_eq!(images[0]["stable_id"], 3);
+        assert_eq!(images[0]["saved_position"], 2);
+        assert_eq!(images[0]["timing"], "previous_frame");
+        assert_eq!(images[0]["stage"], "pre_local_effects");
+        assert_eq!(images[1]["slot"], 1);
+        assert_eq!(images[1]["armed"], true);
+        assert_eq!(images[1]["source"], "missing_selected_layer");
+        assert_eq!(images[1]["resolved"], false);
+        assert_eq!(images[1]["stable_id"], serde_json::Value::Null);
+        assert_eq!(images[1]["saved_position"], 2);
+        assert_eq!(images[1]["stage"], "post_local_effects");
+
+        let motions = layer["motion_routes"].as_array().unwrap();
+        assert_eq!(motions.len(), crate::symmetry::SYMMETRY_MOTION_SLOTS);
+        assert_eq!(motions[0]["slot"], 0);
+        assert_eq!(motions[0]["armed"], true);
+        assert_eq!(motions[0]["donor"], "selected");
+        assert_eq!(motions[0]["resolved"], true);
+        assert_eq!(motions[0]["stable_id"], 2);
+        assert_eq!(motions[0]["saved_position"], 1);
+        assert_eq!(motions[1]["slot"], 1);
+        assert_eq!(motions[1]["armed"], true);
+        assert_eq!(motions[1]["donor"], "missing");
+        assert_eq!(motions[1]["resolved"], false);
+        assert_eq!(motions[1]["stable_id"], serde_json::Value::Null);
+        assert_eq!(motions[1]["saved_position"], 1);
+
+        let master = &value[1];
+        assert_eq!(master["scope"]["kind"], "master");
+        assert_eq!(master["exact_bypass"], true);
+        assert_eq!(master["mode"], "cyclic");
+        assert_eq!(master["boundary"], "transparent");
+        for slot in 0..crate::symmetry::SYMMETRY_IMAGE_SLOTS {
+            assert_eq!(master["image_routes"][slot]["slot"], slot);
+            assert_eq!(master["image_routes"][slot]["armed"], false);
+            assert_eq!(master["image_routes"][slot]["source"], "one_below");
+            assert_eq!(master["image_routes"][slot]["resolved"], true);
+        }
+        for slot in 0..crate::symmetry::SYMMETRY_MOTION_SLOTS {
+            assert_eq!(master["motion_routes"][slot]["slot"], slot);
+            assert_eq!(master["motion_routes"][slot]["armed"], false);
+            assert_eq!(master["motion_routes"][slot]["donor"], "none");
+            assert_eq!(master["motion_routes"][slot]["resolved"], true);
+        }
+
+        // Provenance is shareable: no operational path or filesystem metadata.
+        let text = serde_json::to_string(&nodes).unwrap();
+        assert!(!text.contains("top.mp4"));
+        assert!(!text.contains("middle.mp4"));
+        assert!(!text.contains(".mp4"));
+    }
+
+    /// Export reaches the dedicated eight-texture Symmetry Field step through
+    /// the one shared planner entry, at every export rate, and is refused when
+    /// the reported device ceiling cannot bind eight textures.
+    ///
+    /// This is the "no export-only symmetry path" proof at the planner seam:
+    /// the offline job builds the same `EvaluatedCompositionPlan::Advanced`
+    /// carrying the same `EvaluatedScopeStep::SymmetryField` that the live
+    /// executor consumes, and its topology does not move with the frame rate.
+    #[test]
+    fn export_planning_emits_the_dedicated_symmetry_step_and_refuses_it_below_the_device_floor() {
+        use crate::evaluated_frame::evaluated_composition::EvaluatedScopeStep;
+        use crate::symmetry::{SymmetryMode, SymmetryParams, SymmetrySourceMask};
+        use crate::visual_rack::{
+            EdgeTiming, LegacyRackScope, SavedImageSource, SavedImageTap, VisualNodeKind,
+            VisualRack,
+        };
+
+        let mut patch = three_layer_legacy_patch();
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        let node_id = rack
+            .push(VisualNodeKind::Symmetry(SymmetryParams {
+                mode: SymmetryMode::Dihedral,
+                base_folds: 6.0,
+                source_mask: SymmetrySourceMask {
+                    carrier: true,
+                    donor0: true,
+                    donor1: false,
+                    clean_history: true,
+                },
+                donors: [
+                    SavedImageTap {
+                        source: SavedImageSource::OneBelow,
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    SavedImageTap::default(),
+                ],
+                ..SymmetryParams::default()
+            }))
+            .unwrap();
+        patch.layers[0].rack = Some(rack);
+
+        let graph = resolve_export_creative_graph(&patch).unwrap();
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let evaluate = |fps: u32| {
+            let modulation = crate::modulation::ModMatrix::new().frame(3);
+            EvaluatedFramePlan::evaluate(
+                &modulation,
+                FramePlanContext::new(64, 36, fps as f32 / fps as f32),
+                MasterFrameInput {
+                    effects: &effects,
+                    transform: &transform,
+                    ntsc: &ntsc,
+                    temporal: &temporal,
+                },
+                graph
+                    .layer_ids
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(slot, id)| LayerFrameInput {
+                        source: SourceTap::new(id.get(), slot, 64, 36),
+                        effects: &effects,
+                        transform: &transform,
+                        opacity: 1.0,
+                        speed: 1.0,
+                        fps: fps as f32,
+                        blend_mode: BlendMode::Normal,
+                        visible: true,
+                        paused: false,
+                        bypass_master_fx: false,
+                    }),
+            )
+        };
+        // The enforced device floor, exactly as `creative_resource_limits`
+        // reads it from the real adapter in `run_export`.
+        let floor_limits = CreativeResourceLimits {
+            max_sampled_textures_per_shader_stage: wgpu::Limits::default()
+                .max_sampled_textures_per_shader_stage,
+            ..CreativeResourceLimits::default()
+        };
+
+        let mut signature = None;
+        for fps in [24_u32, 30, 60] {
+            let evaluated = evaluate(fps);
+            let planned = plan_export_composition(
+                &evaluated,
+                &graph,
+                &[LayerMatte::default(); 3],
+                false,
+                floor_limits,
+            )
+            .unwrap();
+            let EvaluatedCompositionPlan::Advanced(advanced) = planned else {
+                panic!("a dedicated Symmetry Field must enter the unified advanced plan");
+            };
+            let layer = advanced
+                .layers()
+                .iter()
+                .find(|layer| layer.stable_id == StableLayerId::new(1).unwrap())
+                .expect("layer 0 is planned");
+            let field = layer
+                .execution
+                .steps()
+                .iter()
+                .find_map(|step| match step {
+                    EvaluatedScopeStep::SymmetryField { plan } => Some(plan),
+                    _ => None,
+                })
+                .expect("the offline plan carries the dedicated step");
+            assert_eq!(field.node_id, node_id);
+            assert!(field.enabled);
+
+            let resources = advanced.symmetry_field_resources();
+            assert_eq!(resources.full_frame_passes, 1);
+            assert_eq!(resources.max_sampled_textures_in_pass, 8);
+            assert_eq!(resources.uniform_bytes, 1_024);
+
+            if let Some(expected) = signature {
+                assert_eq!(
+                    advanced.topology_signature(),
+                    expected,
+                    "the dedicated step's topology cannot depend on the export rate"
+                );
+            } else {
+                signature = Some(advanced.topology_signature());
+            }
+        }
+
+        // The same authored patch is refused where the reported ceiling is the
+        // ordinary rack constant, so the dedicated admission is genuinely live
+        // at the export entry and is not clamped down to three.
+        let evaluated = evaluate(30);
+        assert_eq!(
+            CreativeResourceLimits::default().max_sampled_textures_per_shader_stage,
+            crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_PASS
+        );
+        let refused = plan_export_composition(
+            &evaluated,
+            &graph,
+            &[LayerMatte::default(); 3],
+            false,
+            CreativeResourceLimits::default(),
+        );
+        assert!(
+            refused.is_err(),
+            "eight simultaneous bindings cannot be admitted against a three-texture ceiling"
+        );
+    }
+
+    /// The 32-record sector table of the same authored patch is identical in
+    /// the live program and in its offline render.
+    ///
+    /// A live `StableLayerId` is process lifetime: it is deliberately not
+    /// serialized, an export job numbers layers `position + 1`, and a fresh
+    /// process or a replaced clip mints different values for the same authored
+    /// layer. Anything that feeds one of those values into the table domain
+    /// makes the exported file disagree with the program it was rendered from
+    /// and rerolls a saved node's records on every reload. This fixture drives
+    /// export's own resolution against the shared planner's live-style
+    /// resolution and compares the tables the two dedicated steps carry.
+    #[test]
+    fn the_symmetry_sector_table_is_identical_live_and_offline_for_the_same_authored_patch() {
+        use crate::evaluated_frame::evaluated_composition::{
+            CompositionPlanInput, EvaluatedScopeStep,
+        };
+        use crate::symmetry::{SymmetryMode, SymmetryParams, SymmetrySourceMask};
+        use crate::visual_rack::{
+            EdgeTiming, LegacyRackScope, SavedImageSource, SavedImageTap, VisualNodeKind,
+            VisualRack,
+        };
+
+        let mut patch = three_layer_legacy_patch();
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        let node_id = rack
+            .push(VisualNodeKind::Symmetry(SymmetryParams {
+                mode: SymmetryMode::Dihedral,
+                base_folds: 5.0,
+                seed: 0x0BAD_5EED,
+                hue_span: 0.4,
+                source_mask: SymmetrySourceMask {
+                    carrier: true,
+                    donor0: true,
+                    donor1: false,
+                    clean_history: true,
+                },
+                donors: [
+                    SavedImageTap {
+                        source: SavedImageSource::OneBelow,
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    SavedImageTap::default(),
+                ],
+                ..SymmetryParams::default()
+            }))
+            .unwrap();
+        patch.layers[0].rack = Some(rack);
+
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let evaluate = |ids: &[StableLayerId]| {
+            let modulation = crate::modulation::ModMatrix::new().frame(3);
+            EvaluatedFramePlan::evaluate(
+                &modulation,
+                FramePlanContext::new(64, 36, 1.0),
+                MasterFrameInput {
+                    effects: &effects,
+                    transform: &transform,
+                    ntsc: &ntsc,
+                    temporal: &temporal,
+                },
+                ids.iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(slot, id)| LayerFrameInput {
+                        source: SourceTap::new(id.get(), slot, 64, 36),
+                        effects: &effects,
+                        transform: &transform,
+                        opacity: 1.0,
+                        speed: 1.0,
+                        fps: 30.0,
+                        blend_mode: BlendMode::Normal,
+                        visible: true,
+                        paused: false,
+                        bypass_master_fx: false,
+                    }),
+            )
+        };
+        let floor_limits = CreativeResourceLimits {
+            max_sampled_textures_per_shader_stage: wgpu::Limits::default()
+                .max_sampled_textures_per_shader_stage,
+            ..CreativeResourceLimits::default()
+        };
+
+        let table_of = |plan: &EvaluatedCompositionPlan, id: StableLayerId| {
+            let EvaluatedCompositionPlan::Advanced(advanced) = plan else {
+                panic!("a dedicated Symmetry Field must enter the unified advanced plan");
+            };
+            let layer = advanced
+                .layers()
+                .iter()
+                .find(|layer| layer.stable_id == id)
+                .expect("the authoring layer is planned");
+            let field = layer
+                .execution
+                .steps()
+                .iter()
+                .find_map(|step| match step {
+                    EvaluatedScopeStep::SymmetryField { plan } => Some(plan),
+                    _ => None,
+                })
+                .expect("the dedicated step exists");
+            assert_eq!(field.node_id, node_id);
+            field.params.sector_table(field.domain)
+        };
+
+        // Export's own resolution: layer identity is position + 1.
+        let export_graph = resolve_export_creative_graph(&patch).unwrap();
+        assert_eq!(export_graph.layer_ids[0], StableLayerId::new(1).unwrap());
+        let export_plan = plan_export_composition(
+            &evaluate(&export_graph.layer_ids),
+            &export_graph,
+            &[LayerMatte::default(); 3],
+            false,
+            floor_limits,
+        )
+        .unwrap();
+        let export_table = table_of(&export_plan, StableLayerId::new(1).unwrap());
+
+        // A live host resolving the same patch after ordinary layer churn. The
+        // process-global counter has already handed out 909 identities, so the
+        // same authored layer is a completely different live ID.
+        let live_ids = [910_u64, 911, 912].map(|id| StableLayerId::new(id).unwrap());
+        let live_composition = patch
+            .composition
+            .clone()
+            .unwrap_or_else(|| {
+                let back_to_front = (0..patch.layers.len())
+                    .rev()
+                    .map(|position| SavedLayerPosition::new(position as u32).unwrap())
+                    .collect::<Vec<_>>();
+                crate::composition::CompositionTree::legacy_for_layers(&back_to_front).unwrap()
+            })
+            .resolve(|position| live_ids.get(position.get() as usize).copied())
+            .unwrap();
+        let group_exists = |group_id| live_composition.contains_group(group_id);
+        let live_master = patch.effective_master_rack().resolve_routes(
+            |position| live_ids.get(position.get() as usize).copied(),
+            group_exists,
+        );
+        let live_racks = (0..patch.layers.len())
+            .map(|position| {
+                (
+                    live_ids[position],
+                    patch
+                        .effective_layer_rack(position)
+                        .unwrap()
+                        .resolve_routes(
+                            |saved| live_ids.get(saved.get() as usize).copied(),
+                            group_exists,
+                        ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut live_input =
+            CompositionPlanInput::new(&live_composition, &live_master, &live_racks);
+        live_input.resource_limits = floor_limits;
+        let live_plan =
+            EvaluatedCompositionPlan::evaluate(&evaluate(&live_ids), live_input).unwrap();
+        let live_table = table_of(&live_plan, live_ids[0]);
+
+        assert_eq!(
+            live_table, export_table,
+            "the sector table is authored identity; it cannot depend on a \
+             process-lifetime layer ID"
+        );
+
+        // The same node after a stack reorder. Its saved position moves from 0
+        // to 2, so export now numbers it 3 rather than 1 — and the table it
+        // carries is still the same table.
+        let mut reordered = patch.clone();
+        let moved = reordered.layers.remove(0);
+        reordered.layers.push(moved);
+        let reordered_graph = resolve_export_creative_graph(&reordered).unwrap();
+        let reordered_plan = plan_export_composition(
+            &evaluate(&reordered_graph.layer_ids),
+            &reordered_graph,
+            &[LayerMatte::default(); 3],
+            false,
+            floor_limits,
+        )
+        .unwrap();
+        assert_eq!(
+            table_of(&reordered_plan, StableLayerId::new(3).unwrap()),
+            export_table,
+            "reordering the stack must never reroll a sector table"
+        );
+    }
+
+    /// The Symmetry Field's only time input is the shared frame-plan context,
+    /// which export derives from `frame_num` and the export FPS. The same
+    /// instant therefore packs a byte-identical 1,024-byte record at 24, 30 and
+    /// 60 fps — the dedicated pass reads no wall clock and no per-rate counter.
+    #[test]
+    fn symmetry_field_uniforms_are_frame_index_derived_and_exact_at_equal_24_30_and_60_fps_times() {
+        use crate::symmetry::{
+            SymmetryFrameUniforms, SymmetryGpuBindings, SymmetryGpuUniforms, SymmetryMode,
+            SymmetryNodeDomain, SymmetryParams, SymmetrySourceMask,
+        };
+        use crate::visual_rack::VisualScopeId;
+
+        let params = SymmetryParams {
+            mode: SymmetryMode::LogSpiral,
+            base_folds: 7.0,
+            radial_phase_deg: 41.0,
+            orbit_phase: 0.375,
+            spiral_scale: 0.6,
+            hue_span: 0.5,
+            motion_gain: 0.25,
+            seed: 0x5359_4d4d,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: true,
+                clean_history: true,
+            },
+            ..SymmetryParams::default()
+        };
+        let domain = SymmetryNodeDomain::for_scope(VisualScopeId::Master, 9_001);
+        let table = params.sector_table(domain);
+        let mut canonical: Option<Vec<u8>> = None;
+        for fps in [24_u32, 30, 60] {
+            // One second in, expressed the way `run_export` expresses it.
+            let frame_interval = 1.0 / fps as f32;
+            let (time, _) = export_program_transport(u64::from(fps), frame_interval, false);
+            assert_eq!(
+                time, 1.0,
+                "the frame-index derivation must land on the same instant at {fps} fps"
+            );
+            let packed = SymmetryGpuUniforms::pack(
+                params,
+                (1920, 1080),
+                &table,
+                SymmetryGpuBindings::default(),
+                SymmetryFrameUniforms {
+                    wet: 0.75,
+                    blend_code: 2,
+                    time_seconds: time,
+                },
+            );
+            let evidence = bytemuck::bytes_of(&packed).to_vec();
+            assert_eq!(evidence.len(), 1_024);
+            if let Some(expected) = &canonical {
+                assert_eq!(&evidence, expected);
+            } else {
+                canonical = Some(evidence);
+            }
+        }
+
+        // A different instant must actually move the record, so the equality
+        // above is not vacuous.
+        let moved = SymmetryGpuUniforms::pack(
+            params,
+            (1920, 1080),
+            &table,
+            SymmetryGpuBindings::default(),
+            SymmetryFrameUniforms {
+                wet: 0.75,
+                blend_code: 2,
+                time_seconds: 2.0,
+            },
+        );
+        assert_ne!(
+            bytemuck::bytes_of(&moved).to_vec(),
+            canonical.expect("canonical bytes")
+        );
     }
 
     fn map_spatial_uv(uniforms: SpatialGpuUniforms, uv: [f32; 2]) -> [f32; 2] {
@@ -14013,6 +14885,81 @@ mod effects_audit {
         patch.layers[0].rack = Some(rack);
         patch.layers[0].effects.hue_shift = 90.0;
         render("displace_two_input", patch);
+    }
+
+    /// One layer whose rack carries a dedicated eight-texture Symmetry Field
+    /// reading its own carrier, the layer below through image slot 0, the
+    /// committed Compat8 clean-history ring, and the layer below's primitive
+    /// motion vector/gate pair through motion slot 0 — whose own visible Motion
+    /// effect is exactly zero, so the donor field exists only because the
+    /// planner set `required_as_donor`. Image slot 1 and motion slot 1 stay
+    /// unarmed, so one armed and one unarmed slot of each class travel through
+    /// the same render.
+    ///
+    /// This is the labeled export case for the dedicated pass: the offline
+    /// renderer builds the same evaluated plan, constructs the same
+    /// `SymmetryFieldExecutor`, and runs the same `symmetry_field.wgsl`. There
+    /// is no export-only symmetry path. Its `.motion.json` sidecar carries the
+    /// schema-4 per-slot route records.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_symmetry_field_dedicated_pass() {
+        use crate::symmetry::{
+            SavedMotionDonor, SymmetryBoundary, SymmetryMode, SymmetryMotionMask, SymmetryParams,
+            SymmetrySourceMask,
+        };
+        use crate::visual_rack::{
+            EdgeTiming, LegacyRackScope, SavedImageSource, SavedImageTap, VisualNodeKind,
+            VisualRack,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        let donor = patch.layers[0].clone();
+        patch.layers.push(donor);
+
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Symmetry(SymmetryParams {
+            mode: SymmetryMode::Dihedral,
+            base_folds: 6.0,
+            radial_phase_deg: 17.0,
+            center: [0.4137, 0.5279],
+            boundary: SymmetryBoundary::Mirror,
+            hue_span: 0.25,
+            motion_gain: 0.4,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: false,
+                clean_history: true,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: true,
+                slot1: false,
+            },
+            donors: [
+                SavedImageTap {
+                    source: SavedImageSource::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                SavedImageTap::default(),
+            ],
+            motion: [
+                SavedMotionDonor::Selected {
+                    saved_position: SavedLayerPosition::new(1).expect("layer 1 exists"),
+                },
+                SavedMotionDonor::None,
+            ],
+            ..SymmetryParams::default()
+        }))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+        render("symmetry_field", patch);
     }
 
     #[test]

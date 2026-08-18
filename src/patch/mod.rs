@@ -33,6 +33,7 @@ use crate::performance::{
     SceneReferenceIssue, Scenes,
 };
 use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
+use crate::symmetry::SYMMETRY_IMAGE_SLOTS;
 use crate::temporal::{
     CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
     TemporalEventResetMode, TemporalResetPolicy,
@@ -3289,6 +3290,18 @@ fn runtime_group_visual_topology_matches(sampled: &RuntimeGroup, live: &RuntimeG
                             crate::visual_rack::RuntimeVisualNodeKind::Displace(sampled),
                             crate::visual_rack::RuntimeVisualNodeKind::Displace(live),
                         ) => sampled.tap == live.tap,
+                        // All four Symmetry slots plus both masks. A group-scope
+                        // Look must refuse a differently routed or differently
+                        // armed field rather than retarget it.
+                        (
+                            crate::visual_rack::RuntimeVisualNodeKind::Symmetry(sampled),
+                            crate::visual_rack::RuntimeVisualNodeKind::Symmetry(live),
+                        ) => {
+                            sampled.donors == live.donors
+                                && sampled.motion == live.motion
+                                && sampled.source_mask.sanitized() == live.source_mask.sanitized()
+                                && sampled.motion_mask == live.motion_mask
+                        }
                         _ => true,
                     }
             })
@@ -3442,14 +3455,25 @@ fn collect_rack_dependencies(
     ordering_edges: &mut Vec<ImageOrderingEdge>,
 ) -> Result<(), String> {
     for node in rack.iter().filter(|node| node.enabled && node.wet > 0.0) {
-        // Mirror the live planner's admission predicate exactly: a node that
-        // cannot collect a tap at frame time must not claim a saved edge here.
-        let tap = match node.kind {
-            VisualNodeKind::Mask(MaskParams::Image(matte)) if matte.amount > 0.0 => matte.tap,
-            VisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => displace.tap,
+        // Mirror the live planner's admission predicate exactly, slot for
+        // slot: a node that cannot collect a tap at frame time must not claim a
+        // saved edge here, and a slot that cannot be sampled must not claim one
+        // either.
+        let slots: [Option<SavedImageTap>; SYMMETRY_IMAGE_SLOTS] = match node.kind {
+            VisualNodeKind::Mask(MaskParams::Image(matte)) if matte.amount > 0.0 => {
+                [Some(matte.tap), None]
+            }
+            VisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => {
+                [Some(displace.tap), None]
+            }
+            VisualNodeKind::Symmetry(symmetry) if !symmetry.is_exact_bypass() => {
+                symmetry.admitted_donor_taps()
+            }
             _ => continue,
         };
-        collect_saved_tap_dependency(tap, consumer, below, dependencies, ordering_edges)?;
+        for tap in slots.into_iter().flatten() {
+            collect_saved_tap_dependency(tap, consumer, below, dependencies, ordering_edges)?;
+        }
     }
     Ok(())
 }
@@ -7187,6 +7211,117 @@ routings:
         patch_with(previous_frame)
             .validate_creative_persistence()
             .unwrap();
+    }
+
+    #[test]
+    fn saved_symmetry_edges_are_dormant_per_slot_and_cycle_only_when_that_slot_is_armed() {
+        use crate::symmetry::{SymmetryMode, SymmetryParams};
+
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let self_tap = SavedImageTap {
+            source: SavedImageSource::GroupOutput { group_id },
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let symmetry_rack = |params: SymmetryParams| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Symmetry(params)).unwrap();
+            rack
+        };
+        // Slot 1 holds the self route; slot 0 stays on its neutral default.
+        let woken = SymmetryParams {
+            mode: SymmetryMode::Dihedral,
+            base_folds: 6.0,
+            donors: [SymmetryParams::default().donors[0], self_tap],
+            ..SymmetryParams::default()
+        };
+        let patch_with = |rack: VisualRack| {
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            patch
+        };
+
+        // Dormant forms claim no saved edge at either slot: an exact-default
+        // node, a disabled or zero-wet node, and — the per-slot case — a woken
+        // node whose slot 1 source-mask bit is clear.
+        let mut disabled = symmetry_rack(SymmetryParams {
+            source_mask: crate::symmetry::SymmetrySourceMask {
+                donor1: true,
+                ..crate::symmetry::SymmetrySourceMask::CARRIER_ONLY
+            },
+            ..woken
+        });
+        let disabled_id = disabled.iter().next().unwrap().stable_id;
+        disabled.get_mut(disabled_id).unwrap().enabled = false;
+        let mut zero_wet = symmetry_rack(SymmetryParams {
+            source_mask: crate::symmetry::SymmetrySourceMask {
+                donor1: true,
+                ..crate::symmetry::SymmetrySourceMask::CARRIER_ONLY
+            },
+            ..woken
+        });
+        let zero_wet_id = zero_wet.iter().next().unwrap().stable_id;
+        zero_wet.get_mut(zero_wet_id).unwrap().wet = 0.0;
+        let exact_default = symmetry_rack(SymmetryParams {
+            donors: [SymmetryParams::default().donors[0], self_tap],
+            ..SymmetryParams::default()
+        });
+        let unarmed_slot = symmetry_rack(woken);
+
+        for dormant in [disabled, zero_wet, exact_default, unarmed_slot] {
+            let mut patch = patch_with(dormant);
+            patch.validate_creative_persistence().unwrap();
+            let yaml = serde_yaml::to_string(&patch).unwrap();
+            let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+            let composition = restored.composition.unwrap();
+            let rack = &composition.group(group_id).unwrap().rack;
+            assert!(matches!(
+                rack.iter().next().unwrap().kind,
+                VisualNodeKind::Symmetry(_)
+            ));
+        }
+
+        // Arming slot 1 wakes that slot's saved edge, and the same-frame self
+        // route is then rejected at load rather than reaching the planner.
+        let error = patch_with(symmetry_rack(SymmetryParams {
+            source_mask: crate::symmetry::SymmetrySourceMask {
+                donor1: true,
+                ..crate::symmetry::SymmetrySourceMask::CARRIER_ONLY
+            },
+            ..woken
+        }))
+        .validate_creative_persistence()
+        .expect_err("a woken same-frame Symmetry self route must be rejected");
+        assert!(
+            error.contains("cycle") || error.contains("graph"),
+            "unexpected saved-edge rejection: {error}"
+        );
+
+        // The identical route at N-1 is a legitimate saved feedback edge.
+        patch_with(symmetry_rack(SymmetryParams {
+            source_mask: crate::symmetry::SymmetrySourceMask {
+                donor1: true,
+                ..crate::symmetry::SymmetrySourceMask::CARRIER_ONLY
+            },
+            donors: [
+                SymmetryParams::default().donors[0],
+                SavedImageTap {
+                    timing: EdgeTiming::PreviousFrame,
+                    ..self_tap
+                },
+            ],
+            ..woken
+        }))
+        .validate_creative_persistence()
+        .unwrap();
     }
 
     #[test]

@@ -31,6 +31,7 @@ use crate::spatial::{
     SpatialTransform, ANCHOR_MAX, ANCHOR_MIN, CROP_MAX, POSITION_MAX, POSITION_MIN, SCALE_MAX,
     SCALE_MIN, SKEW_LIMIT_DEGREES,
 };
+use crate::symmetry::SymmetryParams;
 use crate::visual_rack::{DisplaceParams, GroupId, MaskParams, NodeId, VisualNodeKind, VisualRack};
 
 /// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
@@ -789,10 +790,32 @@ enum CreativeEdgeFallback {
         prior_x: f32,
         prior_y: f32,
     },
+    /// A Symmetry Field claims a saved image edge only while an armed source
+    /// slot survives its own exact-bypass test, so a generated geometry value
+    /// that leaves the bypass is the same class of wake as a mask amount. The
+    /// whole continuous geometry travels in one variant: reverting half of it
+    /// could leave a partially woken graph.
+    SymmetryGeometry {
+        owner: ProceduralRackOwner,
+        node_id: NodeId,
+        prior: SymmetryParams,
+    },
     GroupMatteAmount {
         group_id: GroupId,
         prior: f32,
     },
+}
+
+/// The exact predicate `patch::collect_rack_dependencies` uses for a saved
+/// Symmetry Field edge, factored out so generation's wake analysis and the
+/// validator can never drift apart. A node whose armed slots are all clear
+/// claims nothing however active its geometry becomes.
+fn symmetry_claims_saved_image_edge(params: SymmetryParams) -> bool {
+    !params.is_exact_bypass()
+        && params
+            .admitted_donor_taps()
+            .iter()
+            .any(std::option::Option::is_some)
 }
 
 fn saved_rack_mut(patch: &mut PatchState, owner: ProceduralRackOwner) -> Option<&mut VisualRack> {
@@ -849,6 +872,35 @@ impl CreativeEdgeFallback {
                     params.amount_y = prior_y;
                 }
             }
+            Self::SymmetryGeometry {
+                owner,
+                node_id,
+                prior,
+            } => {
+                let Some(node) =
+                    saved_rack_mut(patch, owner).and_then(|rack| rack.get_mut(node_id))
+                else {
+                    return;
+                };
+                if let VisualNodeKind::Symmetry(params) = &mut node.kind {
+                    // Restore exactly what generation mutated. Routes, masks,
+                    // seed, mode, and boundary were never touched, so they are
+                    // deliberately left as they stand.
+                    params.base_folds = prior.base_folds;
+                    params.fold_offset = prior.fold_offset;
+                    params.radial_phase_deg = prior.radial_phase_deg;
+                    params.orbit_phase = prior.orbit_phase;
+                    params.planar_axis_deg = prior.planar_axis_deg;
+                    params.planar_phase = prior.planar_phase;
+                    params.cell_skew = prior.cell_skew;
+                    params.spiral_scale = prior.spiral_scale;
+                    params.orbit_radius = prior.orbit_radius;
+                    params.orbit_spin_deg = prior.orbit_spin_deg;
+                    params.center = prior.center;
+                    params.motion_gain = prior.motion_gain;
+                    params.hue_span = prior.hue_span;
+                }
+            }
             Self::GroupMatteAmount { group_id, prior } => {
                 let Some(matte) = patch
                     .composition
@@ -898,6 +950,10 @@ fn mutate_saved_rack_values(
         };
         let prior_displace = match node.kind {
             VisualNodeKind::Displace(params) => Some(params),
+            _ => None,
+        };
+        let prior_symmetry = match node.kind {
+            VisualNodeKind::Symmetry(params) => Some(params),
             _ => None,
         };
         let mut rng = procedural_node_rng(seed, index, owner, node_id);
@@ -1284,6 +1340,125 @@ fn mutate_saved_rack_values(
                     &mut rng,
                 );
             }
+            (VisualNodeKind::Symmetry(anchor), VisualNodeKind::Symmetry(value)) => {
+                // Declared continuous controls only. The four routes, both
+                // masks, the authored seed, the mode, and the boundary law are
+                // stable authored topology, so generation can never rewrite the
+                // 32-record sector table. Each node draws from its own domain,
+                // so this arm cannot perturb any older generated stream.
+                value.base_folds = mutate_linear(
+                    anchor.base_folds,
+                    value.base_folds,
+                    1.0,
+                    32.0,
+                    temperature * 2.0,
+                    &mut rng,
+                );
+                value.fold_offset = mutate_linear(
+                    anchor.fold_offset,
+                    value.fold_offset,
+                    -32.0,
+                    32.0,
+                    temperature * 1.5,
+                    &mut rng,
+                );
+                value.radial_phase_deg = mutate_circular(
+                    anchor.radial_phase_deg,
+                    value.radial_phase_deg,
+                    -180.0,
+                    180.0,
+                    temperature * 40.0,
+                    &mut rng,
+                );
+                value.orbit_phase = mutate_linear(
+                    anchor.orbit_phase,
+                    value.orbit_phase,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.planar_axis_deg = mutate_circular(
+                    anchor.planar_axis_deg,
+                    value.planar_axis_deg,
+                    -180.0,
+                    180.0,
+                    temperature * 40.0,
+                    &mut rng,
+                );
+                value.planar_phase = mutate_linear(
+                    anchor.planar_phase,
+                    value.planar_phase,
+                    -4.0,
+                    4.0,
+                    temperature * 0.4,
+                    &mut rng,
+                );
+                value.cell_skew = mutate_linear(
+                    anchor.cell_skew,
+                    value.cell_skew,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.spiral_scale = mutate_linear(
+                    anchor.spiral_scale,
+                    value.spiral_scale,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.orbit_radius = mutate_linear(
+                    anchor.orbit_radius,
+                    value.orbit_radius,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.orbit_spin_deg = mutate_circular(
+                    anchor.orbit_spin_deg,
+                    value.orbit_spin_deg,
+                    -180.0,
+                    180.0,
+                    temperature * 40.0,
+                    &mut rng,
+                );
+                value.motion_gain = mutate_linear(
+                    anchor.motion_gain,
+                    value.motion_gain,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.hue_span = mutate_linear(
+                    anchor.hue_span,
+                    value.hue_span,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.center[0] = mutate_linear(
+                    anchor.center[0],
+                    value.center[0],
+                    -1.0,
+                    2.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.center[1] = mutate_linear(
+                    anchor.center[1],
+                    value.center[1],
+                    -1.0,
+                    2.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+            }
             (VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal, _)
             | (_, VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal) => {}
             // A generated patch never changes rack topology. Be defensive if
@@ -1302,8 +1477,13 @@ fn mutate_saved_rack_values(
             VisualNodeKind::Displace(params) => Some(params),
             _ => None,
         };
+        let current_symmetry = match node.kind {
+            VisualNodeKind::Symmetry(params) => Some(params),
+            _ => None,
+        };
         let route_effect_active = current_image_amount.is_some_and(|value| value > 0.0)
-            || current_displace.is_some_and(|params| !params.is_exact_bypass());
+            || current_displace.is_some_and(|params| !params.is_exact_bypass())
+            || current_symmetry.is_some_and(symmetry_claims_saved_image_edge);
         if prior_wet <= 0.0 && node.wet > 0.0 && route_effect_active {
             edge_fallbacks.push(CreativeEdgeFallback::NodeWet {
                 owner,
@@ -1331,6 +1511,18 @@ fn mutate_saved_rack_values(
                 node_id,
                 prior_x: prior.amount_x,
                 prior_y: prior.amount_y,
+            });
+        }
+        // A Symmetry Field wake is recorded only when the claim answer itself
+        // changes, so a piece is never reverted further than the graph needs.
+        if node.wet > 0.0
+            && prior_symmetry.is_some_and(|params| !symmetry_claims_saved_image_edge(params))
+            && current_symmetry.is_some_and(symmetry_claims_saved_image_edge)
+        {
+            edge_fallbacks.push(CreativeEdgeFallback::SymmetryGeometry {
+                owner,
+                node_id,
+                prior: prior_symmetry.unwrap_or_default(),
             });
         }
     }
@@ -3280,6 +3472,19 @@ mod tests {
                     assert_eq!(actual.channel, expected.channel);
                     assert_eq!(actual.invert, expected.invert);
                 }
+                (VisualNodeKind::Displace(expected), VisualNodeKind::Displace(actual)) => {
+                    assert_eq!(actual.tap, expected.tap);
+                    assert_eq!(actual.boundary, expected.boundary);
+                }
+                (VisualNodeKind::Symmetry(expected), VisualNodeKind::Symmetry(actual)) => {
+                    assert_eq!(actual.donors, expected.donors);
+                    assert_eq!(actual.motion, expected.motion);
+                    assert_eq!(actual.source_mask, expected.source_mask);
+                    assert_eq!(actual.motion_mask, expected.motion_mask);
+                    assert_eq!(actual.seed, expected.seed);
+                    assert_eq!(actual.mode, expected.mode);
+                    assert_eq!(actual.boundary, expected.boundary);
+                }
                 _ => {}
             }
         }
@@ -4394,5 +4599,309 @@ scenes:
                 "waking a dormant Displace edge must be transactionally restorable"
             );
         }
+    }
+
+    /// Closes the saved (silent) half of Dice. Without the `prior_symmetry`
+    /// capture and the paired mutation arm, generation falls into `_ => {}` and
+    /// a Symmetry Field is never varied at all; with the arm, it must still
+    /// leave every route, mask, seed, mode, and boundary — and therefore the
+    /// whole 32-record sector table — bit-identical.
+    #[test]
+    fn generated_symmetry_moves_geometry_only_and_never_its_routes_masks_or_seed() {
+        use crate::symmetry::{
+            SavedMotionDonor, SymmetryBoundary, SymmetryMode, SymmetryMotionMask,
+            SymmetryNodeDomain, SymmetryParams, SymmetrySourceMask,
+        };
+        use crate::visual_rack::{EdgeTiming, SavedImageSource, SavedImageTap};
+
+        let authored = SymmetryParams {
+            mode: SymmetryMode::PlanarP2,
+            boundary: SymmetryBoundary::CellularReentry,
+            base_folds: 6.0,
+            radial_phase_deg: 30.0,
+            hue_span: 0.4,
+            motion_gain: 0.3,
+            seed: 8_675,
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: false,
+                clean_history: true,
+            },
+            motion_mask: SymmetryMotionMask {
+                slot0: true,
+                slot1: false,
+            },
+            donors: [
+                SavedImageTap {
+                    source: SavedImageSource::CleanProgram,
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                SavedImageTap {
+                    source: SavedImageSource::AllBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+            ],
+            motion: [
+                SavedMotionDonor::Selected {
+                    saved_position: crate::performance::SavedLayerPosition::new(2).unwrap(),
+                },
+                SavedMotionDonor::None,
+            ],
+            ..SymmetryParams::default()
+        };
+        let mut anchor = VisualRack::empty();
+        let node_id = anchor.push(VisualNodeKind::Symmetry(authored)).unwrap();
+        let params_of = |rack: &VisualRack| match rack.get(node_id).unwrap().kind {
+            VisualNodeKind::Symmetry(params) => params,
+            _ => panic!("symmetry node"),
+        };
+        let domain = SymmetryNodeDomain::new(0x4d41_5354_4552, node_id.get());
+        let table = authored.sector_table(domain);
+
+        let mut generated = anchor.clone();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut generated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        let after = params_of(&generated);
+        assert!(
+            after.base_folds != authored.base_folds
+                || after.radial_phase_deg != authored.radial_phase_deg
+                || after.hue_span != authored.hue_span,
+            "at least one declared continuous control must move at temperature 1.0"
+        );
+        assert!((1.0..=32.0).contains(&after.base_folds));
+        assert!((-180.0..=180.0).contains(&after.radial_phase_deg));
+        assert!((0.0..=1.0).contains(&after.hue_span));
+        assert!((-1.0..=1.0).contains(&after.motion_gain));
+        assert!((-1.0..=2.0).contains(&after.center[0]));
+
+        assert_eq!(after.donors, authored.donors, "generation never reroutes");
+        assert_eq!(after.motion, authored.motion);
+        assert_eq!(after.source_mask, authored.source_mask);
+        assert_eq!(after.motion_mask, authored.motion_mask);
+        assert_eq!(after.seed, authored.seed);
+        assert_eq!(after.mode, authored.mode);
+        assert_eq!(after.boundary, authored.boundary);
+        assert_eq!(
+            after.sector_table(domain),
+            table,
+            "generation can never rewrite one sector record"
+        );
+
+        // Deterministic repeat and an exact zero-temperature no-op.
+        let mut repeated = anchor.clone();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut repeated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(params_of(&repeated), after);
+        let mut untouched = anchor.clone();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut untouched,
+            0.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(params_of(&untouched), authored);
+
+        // A neighbouring node is byte-identical with and without this kind
+        // present, because every node draws from its own stable domain.
+        let grain = crate::visual_rack::GrainParams::default();
+        let mut with_symmetry = VisualRack::empty();
+        with_symmetry
+            .push(VisualNodeKind::Symmetry(authored))
+            .unwrap();
+        let neighbour = with_symmetry.push(VisualNodeKind::Grain(grain)).unwrap();
+        let mut without_symmetry = VisualRack::empty();
+        without_symmetry
+            .push(VisualNodeKind::Displace(DisplaceParams::default()))
+            .unwrap();
+        let same_slot = without_symmetry.push(VisualNodeKind::Grain(grain)).unwrap();
+        assert_eq!(same_slot, neighbour, "the neighbour keeps its stable id");
+        let with_anchor = with_symmetry.clone();
+        let without_anchor = without_symmetry.clone();
+        mutate_saved_rack_values(
+            &with_anchor,
+            &mut with_symmetry,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        mutate_saved_rack_values(
+            &without_anchor,
+            &mut without_symmetry,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            with_symmetry.get(neighbour).unwrap().kind,
+            without_symmetry.get(neighbour).unwrap().kind,
+            "an older generated stream stays bit-identical beside a new kind"
+        );
+    }
+
+    /// Closes `route_effect_active` and the `CreativeEdgeFallback` row. A
+    /// Symmetry Field claims a saved edge exactly when the validator says it
+    /// does, so waking one by lifting `wet` off zero must be transactionally
+    /// restorable, and a carrier-only field must never record a spurious
+    /// fallback for geometry that claims nothing.
+    #[test]
+    fn a_generated_symmetry_wake_is_transactional_and_matches_the_validator_predicate() {
+        use crate::symmetry::{SymmetryParams, SymmetrySourceMask};
+        use crate::visual_rack::{EdgeTiming, SavedImageSource, SavedImageTap};
+
+        let armed_route = SavedImageTap {
+            source: SavedImageSource::OneBelow,
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let armed = SymmetryParams {
+            source_mask: SymmetrySourceMask {
+                carrier: true,
+                donor0: true,
+                donor1: false,
+                clean_history: false,
+            },
+            donors: [armed_route, SavedImageTap::default()],
+            ..SymmetryParams::default()
+        };
+
+        // The claim predicate must agree with `collect_rack_dependencies` for
+        // every combination of arming and geometry.
+        assert!(
+            symmetry_claims_saved_image_edge(armed),
+            "an armed slot claims its edge"
+        );
+        assert!(
+            !symmetry_claims_saved_image_edge(SymmetryParams {
+                source_mask: SymmetrySourceMask::CARRIER_ONLY,
+                ..armed
+            }),
+            "a carrier-only field claims nothing however it is routed"
+        );
+        assert!(
+            !symmetry_claims_saved_image_edge(SymmetryParams {
+                source_mask: SymmetrySourceMask::CARRIER_ONLY,
+                hue_span: 1.0,
+                base_folds: 9.0,
+                ..armed
+            }),
+            "leaving the exact bypass does not by itself claim an edge"
+        );
+
+        // A dormant (zero-wet) node whose wet is lifted wakes a real edge, so a
+        // transactional fallback must be recorded.
+        let mut dormant = VisualRack::empty();
+        let dormant_id = dormant.push(VisualNodeKind::Symmetry(armed)).unwrap();
+        dormant.get_mut(dormant_id).unwrap().wet = 0.0;
+        let anchor = dormant.clone();
+        let mut woken = dormant.clone();
+        let mut fallbacks = Vec::new();
+        mutate_saved_rack_values(
+            &anchor,
+            &mut woken,
+            1.0,
+            0xC0FFEE,
+            5,
+            ProceduralRackOwner::Master,
+            &mut fallbacks,
+        );
+        assert!(
+            woken.get(dormant_id).unwrap().wet > 0.0,
+            "this fixture's seed must actually lift wet off zero"
+        );
+        assert!(
+            fallbacks.iter().any(|fallback| matches!(
+                fallback,
+                CreativeEdgeFallback::NodeWet { node_id, prior, .. }
+                    if *node_id == dormant_id && *prior == 0.0
+            )),
+            "waking a Symmetry Field edge must be transactionally restorable"
+        );
+
+        // A carrier-only field is not a route consumer, so lifting its wet must
+        // never record a fallback: reverting it would revert more than the
+        // graph needs.
+        let mut carrier_only = VisualRack::empty();
+        let carrier_id = carrier_only
+            .push(VisualNodeKind::Symmetry(SymmetryParams {
+                source_mask: SymmetrySourceMask::CARRIER_ONLY,
+                ..armed
+            }))
+            .unwrap();
+        carrier_only.get_mut(carrier_id).unwrap().wet = 0.0;
+        let carrier_anchor = carrier_only.clone();
+        let mut carrier_woken = carrier_only.clone();
+        let mut carrier_fallbacks = Vec::new();
+        mutate_saved_rack_values(
+            &carrier_anchor,
+            &mut carrier_woken,
+            1.0,
+            0xC0FFEE,
+            5,
+            ProceduralRackOwner::Master,
+            &mut carrier_fallbacks,
+        );
+        assert!(
+            carrier_fallbacks.is_empty(),
+            "a carrier-only Symmetry Field must never record a spurious fallback"
+        );
+
+        // The restore itself is exact: it puts back every mutated continuous
+        // value and touches nothing else.
+        let mut patch = advanced_anchor();
+        let mut restored_rack = VisualRack::empty();
+        let restore_id = restored_rack
+            .push(VisualNodeKind::Symmetry(SymmetryParams {
+                base_folds: 12.0,
+                hue_span: 0.9,
+                center: [0.1, 0.2],
+                ..armed
+            }))
+            .unwrap();
+        patch.master_rack = Some(restored_rack);
+        CreativeEdgeFallback::SymmetryGeometry {
+            owner: ProceduralRackOwner::Master,
+            node_id: restore_id,
+            prior: armed,
+        }
+        .restore(&mut patch);
+        let VisualNodeKind::Symmetry(params) = patch
+            .master_rack
+            .as_ref()
+            .unwrap()
+            .get(restore_id)
+            .unwrap()
+            .kind
+        else {
+            panic!("symmetry node")
+        };
+        assert_eq!(params.base_folds, armed.base_folds);
+        assert_eq!(params.hue_span, armed.hue_span);
+        assert_eq!(params.center, armed.center);
+        assert_eq!(
+            params.donors, armed.donors,
+            "a restore never rewrites a route"
+        );
+        assert_eq!(params.source_mask, armed.source_mask);
     }
 }

@@ -39,6 +39,24 @@ pub(crate) struct MotionGpuFieldSource<'a> {
     pub view: &'a wgpu::TextureView,
 }
 
+/// One admitted motion field's primitive vector/gate ping-pong pair, both
+/// parities, for a routed consumer that prebuilds bind groups.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MotionPrimitiveFieldViews<'a> {
+    pub vectors: [&'a wgpu::TextureView; 2],
+    pub gates: [&'a wgpu::TextureView; 2],
+    /// `[width, height]` of the field's own `MotionGrid`, not the output size.
+    pub grid: [u32; 2],
+}
+
+/// Which committed parity a routed consumer must read this frame, and whether
+/// that parity holds a materialized field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MotionFieldReadParity {
+    pub index: usize,
+    pub valid: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MotionGpuScopeSpec {
     pub scope: VisualScopeId,
@@ -846,6 +864,46 @@ impl MotionGpuResources {
 
     pub(crate) fn garden_signal_view(&self) -> Option<&wgpu::TextureView> {
         self.garden_signal.as_ref().map(|signal| &signal.view)
+    }
+
+    /// Both committed ping/pong parities of one admitted field's primitive
+    /// vector/gate pair, plus the field's own `MotionGrid` extent.
+    ///
+    /// A routed consumer outside motion rendering — the dedicated Symmetry
+    /// Field is the first — prebuilds a bind group for *every* parity here and
+    /// selects the committed one at encode through
+    /// [`MotionGpuResources::field_read_parity`]. Handing out only the
+    /// currently committed view would force a rebuild on every ping/pong swap,
+    /// which the warm-encode contract forbids.
+    ///
+    /// `slot` is an admitted field slot, which routed consumers must obtain
+    /// through `EvaluatedMotionScopePlan::admitted_field_slot` so an admitted
+    /// Faraday transplant cannot desync them from motion rendering.
+    pub(crate) fn field_primitive_views(&self, slot: u8) -> Option<MotionPrimitiveFieldViews<'_>> {
+        let field = self.fields.get(usize::from(slot))?;
+        Some(MotionPrimitiveFieldViews {
+            vectors: std::array::from_fn(|parity| &field.vectors[parity].view),
+            gates: std::array::from_fn(|parity| &field.gates[parity].view),
+            grid: [field.spec.grid.width, field.spec.grid.height],
+        })
+    }
+
+    /// The committed parity a routed consumer must read for one field slot this
+    /// frame, and whether that parity actually holds a materialized field.
+    ///
+    /// This is `MotionMemoryStage::render_field_index` — the exact index
+    /// `encode_garden_signal` and `encode_scope` render from — so a routed
+    /// consumer observes the same field motion rendering wrote. `None` means
+    /// the slot does not exist or no frame is staged; `valid == false` means the
+    /// parity exists but nothing has been written into it yet, which is an
+    /// honest zero rather than a stale or unrelated field.
+    pub(crate) fn field_read_parity(&self, slot: u8) -> Option<MotionFieldReadParity> {
+        let field = self.fields.get(usize::from(slot))?;
+        let stage = field.frame_stage?;
+        Some(MotionFieldReadParity {
+            index: usize::from(stage.render_field_index),
+            valid: stage.render_field_valid,
+        })
     }
 
     /// Materialize the routed scalar from the same staged field parity used by
