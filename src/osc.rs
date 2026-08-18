@@ -1425,14 +1425,11 @@ mod tests {
         })
         .unwrap();
         engine.start().unwrap();
-        let bound = (0..100)
-            .find_map(|_| {
-                let address = engine.runtime_snapshot().bound_address;
-                if address.is_none() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                address
-            })
+        // Binding is setup, not the claim under test, so it waits on the same
+        // deadline as the loopback fixture rather than a 500 ms budget the host
+        // scheduler owns. The stop bound asserted below is deliberately left
+        // exact: that latency IS this test's subject.
+        let bound = poll_until(|| engine.runtime_snapshot().bound_address)
             .expect("OSC worker should bind its flood-test socket");
 
         let packet = encode_feedback(
