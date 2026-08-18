@@ -24,8 +24,9 @@ use crate::modulation::{
     StableModAddressBook, MAX_ROUTINGS, NUM_LFOS,
 };
 use crate::motion::{
-    CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier, MotionDonor,
-    MotionFieldSource, MotionLatticeQuality, MotionParams, MOTION_ALGORITHM_VERSION,
+    CurvedShutterParams, CurvedShutterQuality, FaradayParams, FieldColliderMode,
+    FieldColliderParams, MotionBoundaryMode, MotionCarrier, MotionDonor, MotionFieldSource,
+    MotionLatticeQuality, MotionParams, FIELD_COLLIDER_ALGORITHM_VERSION, MOTION_ALGORITHM_VERSION,
 };
 use crate::ntsc::NtscParams;
 use crate::performance::{
@@ -1555,6 +1556,171 @@ impl CurvedShutterConfig {
     }
 }
 
+/// Serializable Field Collider v1 recombination law.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldColliderModeConfig {
+    #[default]
+    Sum,
+    Difference,
+    Curl,
+    Projection,
+    CollisionBoundary,
+}
+
+impl FieldColliderModeConfig {
+    fn from_runtime(value: FieldColliderMode) -> Self {
+        match value {
+            FieldColliderMode::Sum => Self::Sum,
+            FieldColliderMode::Difference => Self::Difference,
+            FieldColliderMode::Curl => Self::Curl,
+            FieldColliderMode::Projection => Self::Projection,
+            FieldColliderMode::CollisionBoundary => Self::CollisionBoundary,
+        }
+    }
+
+    fn to_runtime(self) -> FieldColliderMode {
+        match self {
+            Self::Sum => FieldColliderMode::Sum,
+            Self::Difference => FieldColliderMode::Difference,
+            Self::Curl => FieldColliderMode::Curl,
+            Self::Projection => FieldColliderMode::Projection,
+            Self::CollisionBoundary => FieldColliderMode::CollisionBoundary,
+        }
+    }
+}
+
+/// Serializable motion-field boundary law.
+///
+/// The token order here is the frozen shader-code order shared with the two
+/// image boundaries, not the prose order of the enrichment plan; see
+/// [`MotionBoundaryMode`] for why motion deliberately does not mint its own
+/// numbering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionBoundaryModeConfig {
+    #[default]
+    Transparent,
+    Mirror,
+    Wrap,
+    Hold,
+}
+
+impl MotionBoundaryModeConfig {
+    fn from_runtime(value: MotionBoundaryMode) -> Self {
+        match value {
+            MotionBoundaryMode::Transparent => Self::Transparent,
+            MotionBoundaryMode::Mirror => Self::Mirror,
+            MotionBoundaryMode::Wrap => Self::Wrap,
+            MotionBoundaryMode::Hold => Self::Hold,
+        }
+    }
+
+    fn to_runtime(self) -> MotionBoundaryMode {
+        match self {
+            Self::Transparent => MotionBoundaryMode::Transparent,
+            Self::Mirror => MotionBoundaryMode::Mirror,
+            Self::Wrap => MotionBoundaryMode::Wrap,
+            Self::Hold => MotionBoundaryMode::Hold,
+        }
+    }
+}
+
+/// Serializable S5 Field Collider authoring.
+///
+/// This carries the strict version, the two discrete laws, and the two saved
+/// donor identities — and nothing else. Derived vectors, the transient mapped
+/// pair, gate parities, admitted field slots, runtime diagnostics, and
+/// process-local stable IDs are all deliberately absent: they are frame-local
+/// executor state, not authored topology. Version 1 adds no collider-only
+/// continuous control, so there is no scalar here to interpolate or dice.
+///
+/// Both inputs are independent NAMED fields rather than a list, because slot
+/// identity is route identity: a positional container would make input B's
+/// meaning depend on whether input A happened to be authored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FieldColliderConfig {
+    #[serde(
+        default = "default_field_collider_algorithm_version",
+        deserialize_with = "deserialize_field_collider_algorithm_version"
+    )]
+    pub algorithm_version: u16,
+    pub enabled: bool,
+    pub mode: FieldColliderModeConfig,
+    pub boundary: MotionBoundaryModeConfig,
+    #[serde(default, skip_serializing_if = "MotionDonorConfig::is_none")]
+    pub input_a: MotionDonorConfig,
+    #[serde(default, skip_serializing_if = "MotionDonorConfig::is_none")]
+    pub input_b: MotionDonorConfig,
+}
+
+const fn default_field_collider_algorithm_version() -> u16 {
+    FIELD_COLLIDER_ALGORITHM_VERSION
+}
+
+/// A patch declaring any other collider version is rejected at deserialize
+/// time rather than migrated, exactly as the motion algorithm version is.
+fn deserialize_field_collider_algorithm_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u16::deserialize(deserializer)?;
+    if value == FIELD_COLLIDER_ALGORITHM_VERSION {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported field collider algorithm version {value}; expected \
+             {FIELD_COLLIDER_ALGORITHM_VERSION}"
+        )))
+    }
+}
+
+impl Default for FieldColliderConfig {
+    fn default() -> Self {
+        Self::from_params(FieldColliderParams::default())
+    }
+}
+
+impl FieldColliderConfig {
+    pub fn from_params(value: FieldColliderParams) -> Self {
+        Self {
+            algorithm_version: value.algorithm_version,
+            enabled: value.enabled,
+            mode: FieldColliderModeConfig::from_runtime(value.mode),
+            boundary: MotionBoundaryModeConfig::from_runtime(value.boundary),
+            input_a: MotionDonorConfig::from_runtime_cached(value.input_a),
+            input_b: MotionDonorConfig::from_runtime_cached(value.input_b),
+        }
+    }
+
+    /// Both donors collapse to `Missing`, exactly as the transplant's does:
+    /// resolution is a separate, later step through `resolve_runtime` once a
+    /// complete live layer stack exists.
+    pub fn to_params(self) -> FieldColliderParams {
+        let donor = |config: MotionDonorConfig| match config {
+            MotionDonorConfig::None => MotionDonor::None,
+            MotionDonorConfig::Selected { saved_position }
+            | MotionDonorConfig::Missing { saved_position } => {
+                MotionDonor::Missing { saved_position }
+            }
+        };
+        FieldColliderParams {
+            algorithm_version: FIELD_COLLIDER_ALGORITHM_VERSION,
+            enabled: self.enabled,
+            mode: self.mode.to_runtime(),
+            boundary: self.boundary.to_runtime(),
+            input_a: donor(self.input_a),
+            input_b: donor(self.input_b),
+        }
+        .sanitized()
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Serializable M4 authoring. Runtime fields, carrier pixels, codec records,
 /// telemetry, and process-local stable IDs are deliberately absent.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1569,6 +1735,11 @@ pub struct MotionConfig {
     pub lattice_quality: MotionLatticeQualityConfig,
     pub transplant: FaradayConfig,
     pub shutter: CurvedShutterConfig,
+    /// Field Collider v1. An omitted section is exactly the pre-collider path,
+    /// so every patch written before S5 keeps its original bytes and its
+    /// original canonical hash.
+    #[serde(default, skip_serializing_if = "FieldColliderConfig::is_default")]
+    pub collider: FieldColliderConfig,
 }
 
 impl Default for MotionConfig {
@@ -1585,6 +1756,7 @@ impl MotionConfig {
             lattice_quality: MotionLatticeQualityConfig::from_runtime(value.lattice_quality),
             transplant: FaradayConfig::from_params(value.transplant),
             shutter: CurvedShutterConfig::from_params(value.shutter),
+            collider: FieldColliderConfig::from_params(value.collider),
         }
     }
 
@@ -1592,6 +1764,13 @@ impl MotionConfig {
         let mut config = Self::from_params(value);
         config.transplant.donor =
             MotionDonorConfig::from_runtime_for_capture(value.transplant.donor, layer_ids);
+        // Each collider slot recomputes its own saved position independently.
+        // Slot identity is a named field, so clearing input A can never slide
+        // input B's donor down into A's place.
+        config.collider.input_a =
+            MotionDonorConfig::from_runtime_for_capture(value.collider.input_a, layer_ids);
+        config.collider.input_b =
+            MotionDonorConfig::from_runtime_for_capture(value.collider.input_b, layer_ids);
         config
     }
 
@@ -1606,12 +1785,15 @@ impl MotionConfig {
             lattice_quality: self.lattice_quality.to_runtime(),
             transplant: self.transplant.to_params(),
             shutter: self.shutter.to_params(),
+            collider: self.collider.to_params(),
         }
     }
 
     pub(crate) fn resolve_runtime(self, layer_ids: &[StableLayerId]) -> MotionParams {
         let mut params = self.to_params().sanitized();
         params.transplant.donor = self.transplant.donor.resolve_runtime(layer_ids);
+        params.collider.input_a = self.collider.input_a.resolve_runtime(layer_ids);
+        params.collider.input_b = self.collider.input_b.resolve_runtime(layer_ids);
         params
     }
 
@@ -1619,8 +1801,14 @@ impl MotionConfig {
     /// intent until a complete live layer stack is available.
     pub fn sanitized(self) -> Self {
         let donor = self.transplant.donor;
+        let (input_a, input_b) = (self.collider.input_a, self.collider.input_b);
         let mut sanitized = Self::from_params(self.to_params().sanitized());
         sanitized.transplant.donor = donor;
+        // Both collider tombstones survive the sanitize for the same reason the
+        // transplant's does: flattening Missing to None here would silently
+        // rebind a dead slot the next time a layer occupied that position.
+        sanitized.collider.input_a = input_a;
+        sanitized.collider.input_b = input_b;
         sanitized
     }
 
@@ -1631,9 +1819,14 @@ impl MotionConfig {
 
 fn apply_motion_look(config: MotionConfig, live: &mut MotionParams) {
     let donor = live.transplant.donor;
+    let (input_a, input_b) = (live.collider.input_a, live.collider.input_b);
     *live = config.to_params().sanitized();
-    // A Look transfers bounded values and recipe laws, never donor-route topology.
+    // A Look transfers bounded values and recipe laws, never donor-route
+    // topology. The collider's enabled flag, mode, and boundary are recipe and
+    // do travel; both of its inputs are topology and stay live.
     live.transplant.donor = donor;
+    live.collider.input_a = input_a;
+    live.collider.input_b = input_b;
 }
 
 /// Serializable S3b gesture-canvas authoring.
@@ -6072,6 +6265,7 @@ scenes:
                 chromatic_lag: 0.25,
                 quality: CurvedShutterQuality::High,
             },
+            collider: FieldColliderParams::default(),
         };
         let config = MotionConfig::from_params_for_capture(params, &[other, wanted]);
         assert_eq!(
@@ -6111,6 +6305,222 @@ scenes:
             }
         );
         assert_eq!(runtime.shutter.quality.sample_count(), 16);
+    }
+
+    #[test]
+    fn field_collider_round_trips_as_authored_only_topology_with_two_independent_slots() {
+        let first = StableLayerId::new(41).unwrap();
+        let second = StableLayerId::new(52).unwrap();
+        let stale = SavedLayerPosition::new(9).unwrap();
+        let params = MotionParams {
+            transplant: FaradayParams {
+                amount: 0.5,
+                ..FaradayParams::default()
+            },
+            collider: FieldColliderParams {
+                enabled: true,
+                mode: FieldColliderMode::CollisionBoundary,
+                boundary: MotionBoundaryMode::Mirror,
+                input_a: MotionDonor::Selected {
+                    layer_id: first,
+                    saved_position: stale,
+                },
+                input_b: MotionDonor::Selected {
+                    layer_id: second,
+                    saved_position: stale,
+                },
+                ..FieldColliderParams::default()
+            },
+            ..MotionParams::default()
+        };
+
+        // Capture recomputes EACH slot's saved position independently against
+        // the live stack. Both started from the same stale 9 and must land on
+        // their own real positions, not on one shared value.
+        let config = MotionConfig::from_params_for_capture(params, &[second, first]);
+        assert_eq!(
+            config.collider.input_a,
+            MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            }
+        );
+        assert_eq!(
+            config.collider.input_b,
+            MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(0).unwrap()
+            }
+        );
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("mode: collision_boundary"));
+        assert!(yaml.contains("boundary: mirror"));
+        assert!(yaml.contains("enabled: true"));
+        // Authored topology only. A process-lifetime stable ID, a derived
+        // vector, the transient pair, and gate parities are all absent.
+        assert!(!yaml.contains("layer_id"));
+        assert!(!yaml.contains("velocity"));
+        assert!(!yaml.contains("derived"));
+        assert!(!yaml.contains("pair"));
+        assert!(!yaml.contains("gate"));
+
+        let restored: MotionConfig = serde_yaml::from_str(&yaml).unwrap();
+        let runtime = restored.to_params();
+        // `to_params` never resolves: both slots collapse to Missing until a
+        // complete live layer stack exists.
+        assert_eq!(
+            runtime.collider.input_a,
+            MotionDonor::Missing {
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            }
+        );
+        assert_eq!(
+            runtime.collider.input_b,
+            MotionDonor::Missing {
+                saved_position: SavedLayerPosition::new(0).unwrap()
+            }
+        );
+        assert!(!runtime.collider.is_admitted());
+
+        let resolved = restored.resolve_runtime(&[second, first]);
+        assert_eq!(
+            resolved.collider.admission(),
+            crate::motion::FieldColliderAdmission::Admitted {
+                input_a: first,
+                input_b: second,
+            }
+        );
+        assert_eq!(resolved.collider.mode, FieldColliderMode::CollisionBoundary);
+        assert_eq!(resolved.collider.boundary, MotionBoundaryMode::Mirror);
+
+        // A hostile version is a hard deserialization error, never migrated.
+        let hostile = yaml.replace("algorithm_version: 1", "algorithm_version: 2");
+        assert!(serde_yaml::from_str::<MotionConfig>(&hostile).is_err());
+        // And an unknown key inside the block is rejected outright.
+        assert!(serde_yaml::from_str::<FieldColliderConfig>(
+            "enabled: true\ninput_c:\n  kind: none\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_collider_tombstone_survives_sanitization_and_never_rebinds() {
+        let occupant = StableLayerId::new(88).unwrap();
+        let position = SavedLayerPosition::new(0).unwrap();
+        let config = MotionConfig {
+            collider: FieldColliderConfig {
+                enabled: true,
+                input_a: MotionDonorConfig::Missing {
+                    saved_position: position,
+                },
+                input_b: MotionDonorConfig::Selected {
+                    saved_position: position,
+                },
+                ..FieldColliderConfig::default()
+            },
+            ..MotionConfig::default()
+        };
+        // Sanitizing must not flatten Missing into None: doing so would let the
+        // dead slot rebind the next time that position was occupied.
+        let sanitized = config.sanitized();
+        assert_eq!(
+            sanitized.collider.input_a,
+            MotionDonorConfig::Missing {
+                saved_position: position
+            }
+        );
+        assert_eq!(
+            sanitized.collider.input_b,
+            MotionDonorConfig::Selected {
+                saved_position: position
+            }
+        );
+
+        let resolved = sanitized.resolve_runtime(&[occupant]);
+        assert_eq!(
+            resolved.collider.input_a,
+            MotionDonor::Missing {
+                saved_position: position
+            },
+            "a tombstone rebound onto whatever now occupies its position"
+        );
+        assert_eq!(
+            resolved.collider.input_b,
+            MotionDonor::Selected {
+                layer_id: occupant,
+                saved_position: position
+            }
+        );
+    }
+
+    #[test]
+    fn a_look_carries_the_collider_recipe_and_preserves_live_input_topology() {
+        let live_a = MotionDonor::Selected {
+            layer_id: StableLayerId::new(5).unwrap(),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+        };
+        let live_b = MotionDonor::Selected {
+            layer_id: StableLayerId::new(6).unwrap(),
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+        };
+        let mut live = MotionParams {
+            collider: FieldColliderParams {
+                input_a: live_a,
+                input_b: live_b,
+                ..FieldColliderParams::default()
+            },
+            ..MotionParams::default()
+        };
+        apply_motion_look(
+            MotionConfig {
+                collider: FieldColliderConfig {
+                    enabled: true,
+                    mode: FieldColliderModeConfig::Curl,
+                    boundary: MotionBoundaryModeConfig::Wrap,
+                    input_a: MotionDonorConfig::Selected {
+                        saved_position: SavedLayerPosition::new(4).unwrap(),
+                    },
+                    input_b: MotionDonorConfig::None,
+                    ..FieldColliderConfig::default()
+                },
+                ..MotionConfig::default()
+            },
+            &mut live,
+        );
+        // Recipe travels...
+        assert!(live.collider.enabled);
+        assert_eq!(live.collider.mode, FieldColliderMode::Curl);
+        assert_eq!(live.collider.boundary, MotionBoundaryMode::Wrap);
+        // ...but both inputs are topology and stay exactly as authored live.
+        assert_eq!(live.collider.input_a, live_a);
+        assert_eq!(live.collider.input_b, live_b);
+    }
+
+    #[test]
+    fn a_pre_collider_patch_loads_unchanged_and_a_default_block_is_omitted() {
+        // An omitted section is exactly the pre-collider path.
+        let legacy: MotionConfig =
+            serde_yaml::from_str("algorithm_version: 1\ntransplant:\n  amount: 0.25\n").unwrap();
+        assert_eq!(legacy.collider, FieldColliderConfig::default());
+        assert!(legacy.collider.is_default());
+        assert!(legacy.to_params().collider.is_exact_m4());
+
+        // A default block emits no key at all, so a pre-collider patch keeps
+        // its original bytes and its original canonical hash.
+        let yaml = serde_yaml::to_string(&MotionConfig::default()).unwrap();
+        assert!(!yaml.contains("collider"));
+
+        // An enabled block does emit one.
+        let enabled = MotionConfig {
+            collider: FieldColliderConfig {
+                enabled: true,
+                ..FieldColliderConfig::default()
+            },
+            ..MotionConfig::default()
+        };
+        assert!(!enabled.collider.is_default());
+        assert!(serde_yaml::to_string(&enabled)
+            .unwrap()
+            .contains("collider"));
     }
 
     #[test]

@@ -21,9 +21,11 @@ use crate::image_routing::{
     MissingImageInput, StableLayerId,
 };
 use crate::motion::{
-    resolve_motion_source, MotionDeviceLimits, MotionDonor, MotionField, MotionFieldOrigin,
-    MotionGrid, MotionParams, MotionPlanError, MotionResourcePlan, MotionScopeResourceRequest,
-    MotionSourceDecision, MotionSourceDiagnostic, MOTION_ALGORITHM_VERSION,
+    resolve_motion_source, FieldColliderAdmission, FieldColliderDiagnostic, FieldColliderInput,
+    FieldColliderMode, FieldColliderResourcePlan, MotionBoundaryMode, MotionDeviceLimits,
+    MotionDonor, MotionField, MotionFieldOrigin, MotionGrid, MotionParams, MotionPlanError,
+    MotionResourcePlan, MotionScopeResourceRequest, MotionSourceDecision, MotionSourceDiagnostic,
+    MOTION_ALGORITHM_VERSION,
 };
 use crate::performance::SavedLayerPosition;
 use crate::renderer::compositor::{MatteChannelCode, ResolvedMatteParams};
@@ -647,6 +649,13 @@ pub enum MotionPlanDiagnostic {
         node_id: NodeId,
         slot: u8,
     },
+    /// An enabled Field Collider did not survive admission. The block delegates
+    /// to the exact M4 recipe; the typed cause travels so the operator can see
+    /// which slot, or which law, refused it.
+    FieldCollider {
+        recipient: StableLayerId,
+        diagnostic: FieldColliderDiagnostic,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,6 +688,11 @@ pub struct EvaluatedMotionScopePlan {
     pub donor_scope: Option<VisualScopeId>,
     pub donor_field_slot: Option<u8>,
     pub transplant_admitted: bool,
+    /// An admitted Field Collider owns this scope's advection field. The
+    /// single-donor recipe is *parked*, not erased: `params.transplant` still
+    /// carries its authored donor, amount, carrier, confidence, refresh, decay,
+    /// and occlusion verbatim, and disabling the collider resumes it exactly.
+    pub collider_admitted: bool,
     pub codec: MotionCodecFrameFacts,
 }
 
@@ -687,12 +701,42 @@ impl EvaluatedMotionScopePlan {
     /// Faraday transplant replaces the recipient's own field with its donor;
     /// routed consumers must observe the same choice as motion rendering.
     pub const fn admitted_field_slot(self) -> Option<u8> {
-        if self.transplant_admitted {
+        if self.transplant_admitted && !self.collider_admitted {
             self.donor_field_slot
         } else {
+            // A collider recipient has no single donor to substitute, so a
+            // routed *primitive* consumer observes this scope's own field. The
+            // derived collided field is not a primitive field and deliberately
+            // has no primitive slot: it is reached through
+            // `AdvancedMotionPlan::collider`, never through this accessor.
             self.field_slot
         }
     }
+}
+
+/// The immutable evaluated plan of the one admitted Field Collider.
+///
+/// Live and offline rendering consume this exact value; there is no
+/// export-only collider path. `output_slot` appends *after* every primitive
+/// field slot, and the derived attachment it names is an internal executor
+/// value: it is never added to `CodecMotionProduct`, the live codec field
+/// cache, or export codec acquisition, all three of which describe primitive
+/// acquisition only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvaluatedFieldColliderPlan {
+    pub output_slot: u8,
+    pub recipient_scope: VisualScopeId,
+    pub input_a_scope: VisualScopeId,
+    pub input_a_slot: u8,
+    pub input_b_scope: VisualScopeId,
+    pub input_b_slot: u8,
+    /// The recipient's own grid. The derived field is indexed in composition
+    /// output UV and carries recipient-local vectors, so the Faraday apply pass
+    /// consumes it under identity transforms.
+    pub output_grid: MotionGrid,
+    pub algorithm_version: u16,
+    pub mode: FieldColliderMode,
+    pub boundary: MotionBoundaryMode,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -875,6 +919,8 @@ pub struct AdvancedMotionPlan {
     scopes: Box<[EvaluatedMotionScopePlan]>,
     fields: Box<[EvaluatedMotionFieldPlan]>,
     resources: MotionResourcePlan,
+    collider: Option<EvaluatedFieldColliderPlan>,
+    collider_resources: FieldColliderResourcePlan,
     diagnostics: Box<[MotionPlanDiagnostic]>,
     budget: MotionFrameBudget,
     topology_signature: u64,
@@ -918,6 +964,17 @@ impl AdvancedMotionPlan {
 
     pub const fn resources(&self) -> MotionResourcePlan {
         self.resources
+    }
+
+    /// The one admitted Field Collider, or `None` for the exact M4 plan.
+    pub const fn collider(&self) -> Option<EvaluatedFieldColliderPlan> {
+        self.collider
+    }
+
+    /// The byte-exact collider-specific resource delta. All zeros with no
+    /// admitted collider, so the exact M4 plan charges nothing.
+    pub const fn collider_resources(&self) -> FieldColliderResourcePlan {
+        self.collider_resources
     }
 
     pub fn diagnostics(&self) -> &[MotionPlanDiagnostic] {
@@ -2204,12 +2261,15 @@ impl<'a> Planner<'a> {
                     scopes: Box::new([]),
                     fields: Box::new([]),
                     resources: MotionResourcePlan::default(),
+                    collider: None,
+                    collider_resources: FieldColliderResourcePlan::default(),
                     diagnostics: diagnostics.into_boxed_slice(),
                     budget: MotionFrameBudget::default(),
                     topology_signature: motion_topology_signature(
                         &[],
                         &[],
                         MotionResourcePlan::default(),
+                        None,
                     ),
                 },
             )));
@@ -2251,6 +2311,7 @@ impl<'a> Planner<'a> {
             donor_scope: None,
             donor_field_slot: None,
             transplant_admitted: false,
+            collider_admitted: false,
             codec: MotionCodecFrameFacts::default(),
         });
         for id in flat_ids {
@@ -2270,6 +2331,7 @@ impl<'a> Planner<'a> {
                 donor_scope: None,
                 donor_field_slot: None,
                 transplant_admitted: false,
+                collider_admitted: false,
                 codec: authored.codec,
             });
         }
@@ -2305,6 +2367,7 @@ impl<'a> Planner<'a> {
             diagnostics.push(MotionPlanDiagnostic::MasterTransplantRejected);
         }
         let mut admitted_recipient = None;
+        let mut admitted_collider: Option<(usize, usize, usize)> = None;
         for id in flat_ids {
             let recipient_index = scopes
                 .iter()
@@ -2313,7 +2376,88 @@ impl<'a> Planner<'a> {
                     "motion recipient disappeared from compact scope plan",
                 ))?;
             if scopes[recipient_index].params.transplant.amount <= 0.0 {
+                // `collider_admission` answers this identically, so a collider
+                // authored on a zero-amount scope is reported there rather than
+                // silently skipped here.
+                if scopes[recipient_index].params.collider.enabled {
+                    diagnostics.push(MotionPlanDiagnostic::FieldCollider {
+                        recipient: *id,
+                        diagnostic: FieldColliderDiagnostic::NoActiveTransplant,
+                    });
+                }
                 continue;
+            }
+            // The Field Collider is resolved BEFORE the single-donor recipe,
+            // because an admitted collider parks that recipe rather than
+            // ambiguously running both. `collider_admission` is the one shared
+            // predicate — the same call the executor and the dependency walk
+            // make — and everything below it is ordinary environmental
+            // resolution against the live stack, exactly as the transplant
+            // donor's own `base_index` check is.
+            match scopes[recipient_index].params.collider_admission(false) {
+                FieldColliderAdmission::Admitted { input_a, input_b } => {
+                    let mut resolved = [None, None];
+                    let mut refused = false;
+                    for (slot, candidate) in [
+                        (FieldColliderInput::A, input_a),
+                        (FieldColliderInput::B, input_b),
+                    ] {
+                        // A donor that has left the stack is a tombstone, not a
+                        // rebinding opportunity.
+                        let index = self
+                            .base_index
+                            .contains_key(&candidate)
+                            .then(|| {
+                                scopes.iter().position(|scope| {
+                                    scope.scope == VisualScopeId::Layer(candidate)
+                                })
+                            })
+                            .flatten();
+                        match index {
+                            Some(index) => resolved[usize::from(slot.index())] = Some(index),
+                            None => {
+                                diagnostics.push(MotionPlanDiagnostic::FieldCollider {
+                                    recipient: *id,
+                                    diagnostic: FieldColliderDiagnostic::InputMissing {
+                                        input: slot,
+                                    },
+                                });
+                                refused = true;
+                            }
+                        }
+                    }
+                    if let ([Some(a_index), Some(b_index)], false) = (resolved, refused) {
+                        if admitted_recipient.is_some() {
+                            diagnostics.push(MotionPlanDiagnostic::ExcessTransplantRejected {
+                                recipient: *id,
+                                admitted_recipient: admitted_recipient.unwrap_or(*id),
+                            });
+                            continue;
+                        }
+                        admitted_recipient = Some(*id);
+                        scopes[recipient_index].transplant_admitted = true;
+                        scopes[recipient_index].collider_admitted = true;
+                        // Both inputs demand an honest primitive field even
+                        // when their own Motion is exactly zero. This is the
+                        // established `required_as_donor` flag and the only
+                        // path: `field_required` below reads it before the
+                        // shutter, so a stationary donor still yields a field.
+                        scopes[a_index].required_as_donor = true;
+                        scopes[b_index].required_as_donor = true;
+                        admitted_collider = Some((recipient_index, a_index, b_index));
+                        continue;
+                    }
+                    // A refused collider delegates to exact M4 and falls
+                    // through to the single-donor recipe it parked.
+                }
+                FieldColliderAdmission::Delegated { diagnostic } => {
+                    if diagnostic.is_fault() {
+                        diagnostics.push(MotionPlanDiagnostic::FieldCollider {
+                            recipient: *id,
+                            diagnostic,
+                        });
+                    }
+                }
             }
             let donor = scopes[recipient_index].params.transplant.donor;
             let donor_id = match donor {
@@ -2402,7 +2546,9 @@ impl<'a> Planner<'a> {
         }
 
         if let Some(recipient_index) = garden_recipient_index {
-            let signal_scope = if scopes[recipient_index].transplant_admitted {
+            let signal_scope = if scopes[recipient_index].transplant_admitted
+                && !scopes[recipient_index].collider_admitted
+            {
                 scopes[recipient_index]
                     .donor_scope
                     .and_then(|donor| scopes.iter().position(|scope| scope.scope == donor))
@@ -2410,6 +2556,9 @@ impl<'a> Planner<'a> {
                         "admitted Garden motion recipient lost its donor scope",
                     ))?
             } else {
+                // A collider recipient substitutes no single donor, so the
+                // routed Garden signal honestly observes the recipient's own
+                // primitive motion rather than one of the two collided inputs.
                 recipient_index
             };
             scopes[signal_scope].required_as_garden_signal = true;
@@ -2421,6 +2570,10 @@ impl<'a> Planner<'a> {
                 scope.params.is_exact_zero()
                     && !scope.required_as_donor
                     && !scope.required_as_garden_signal
+                    // A disabled collider is exact M4 and must not hold the
+                    // plan out of LegacyExact. An enabled one always produces
+                    // at least a diagnostic, so it always has something to say.
+                    && scope.params.collider.is_exact_m4()
             })
         {
             return Ok(EvaluatedMotionPlan::LegacyExact);
@@ -2465,6 +2618,50 @@ impl<'a> Planner<'a> {
                 .map(|field| field.slot);
         }
 
+        // Derived slots append AFTER every primitive field, own no decoder
+        // attachment and no luma source, and are never confused with a
+        // codec/lattice acquisition slot.
+        let collider = match admitted_collider {
+            Some((recipient_index, a_index, b_index)) => {
+                let output_grid = MotionGrid::for_source(
+                    scopes[recipient_index].source_dimensions,
+                    scopes[recipient_index].params.lattice_quality,
+                )
+                .map_err(CompositionPlanError::Motion)?;
+                let slot_for = |index: usize| {
+                    scopes[index]
+                        .field_slot
+                        .ok_or(CompositionPlanError::Internal(
+                            "an admitted Field Collider input was denied its primitive field",
+                        ))
+                };
+                let output_slot = u8::try_from(fields.len()).map_err(|_| {
+                    CompositionPlanError::Internal("derived motion field slot exceeds u8")
+                })?;
+                Some(EvaluatedFieldColliderPlan {
+                    output_slot,
+                    recipient_scope: scopes[recipient_index].scope,
+                    input_a_scope: scopes[a_index].scope,
+                    input_a_slot: slot_for(a_index)?,
+                    input_b_scope: scopes[b_index].scope,
+                    input_b_slot: slot_for(b_index)?,
+                    output_grid,
+                    algorithm_version: scopes[recipient_index].params.collider.algorithm_version,
+                    mode: scopes[recipient_index].params.collider.mode,
+                    boundary: scopes[recipient_index].params.collider.boundary,
+                })
+            }
+            None => None,
+        };
+        let collider_resources = FieldColliderResourcePlan::preflight(
+            collider
+                .map(|plan| [plan.output_grid])
+                .as_ref()
+                .map_or(&[][..], |grids| &grids[..]),
+            input.limits,
+        )
+        .map_err(CompositionPlanError::Motion)?;
+
         let requests = scopes
             .iter()
             .map(|scope| {
@@ -2486,12 +2683,14 @@ impl<'a> Planner<'a> {
         let resources = MotionResourcePlan::preflight(&requests, input.limits)
             .map_err(CompositionPlanError::Motion)?;
         let budget = motion_frame_budget(&scopes)?;
-        let topology_signature = motion_topology_signature(&scopes, &fields, resources);
+        let topology_signature = motion_topology_signature(&scopes, &fields, resources, collider);
         Ok(EvaluatedMotionPlan::Advanced(Box::new(
             AdvancedMotionPlan {
                 scopes: scopes.into_boxed_slice(),
                 fields: fields.into_boxed_slice(),
                 resources,
+                collider,
+                collider_resources,
                 diagnostics: diagnostics.into_boxed_slice(),
                 budget,
                 topology_signature,
@@ -3948,8 +4147,26 @@ fn motion_topology_signature(
     scopes: &[EvaluatedMotionScopePlan],
     fields: &[EvaluatedMotionFieldPlan],
     resources: MotionResourcePlan,
+    collider: Option<EvaluatedFieldColliderPlan>,
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4d4f_5449_4f4e_0001);
+    // The derived collider plan is prepared-binding topology in its own right.
+    // Swapping the two inputs leaves every scope and field identical while
+    // changing what each of the eight prebuilt parity bind groups means, so the
+    // slot pair must enter the signature in order.
+    if let Some(plan) = collider {
+        hash = hash_value(hash, u64::from(plan.output_slot));
+        hash = hash_scope(hash, plan.recipient_scope);
+        hash = hash_scope(hash, plan.input_a_scope);
+        hash = hash_value(hash, u64::from(plan.input_a_slot));
+        hash = hash_scope(hash, plan.input_b_scope);
+        hash = hash_value(hash, u64::from(plan.input_b_slot));
+        hash = hash_value(hash, u64::from(plan.output_grid.width));
+        hash = hash_value(hash, u64::from(plan.output_grid.height));
+        hash = hash_value(hash, u64::from(plan.mode.code()));
+        hash = hash_value(hash, u64::from(plan.boundary.code()));
+        hash = hash_value(hash, u64::from(plan.algorithm_version));
+    }
     hash = hash_value(hash, u64::from(resources.active_field_slots));
     hash = hash_value(hash, u64::from(resources.persistent_carriers));
     hash = hash_value(hash, u64::from(resources.active_garden_signals));
@@ -3967,6 +4184,10 @@ fn motion_topology_signature(
             u64::from(scope.donor_field_slot.map_or(u8::MAX, |slot| slot)),
         );
         hash = hash_value(hash, u64::from(scope.transplant_admitted));
+        hash = hash_value(hash, u64::from(scope.collider_admitted));
+        hash = hash_value(hash, u64::from(scope.params.collider.enabled));
+        hash = hash_value(hash, u64::from(scope.params.collider.mode.code()));
+        hash = hash_value(hash, u64::from(scope.params.collider.boundary.code()));
         hash = hash_value(hash, u64::from(!scope.params.shutter.is_exact_zero()));
         hash = hash_value(hash, u64::from(scope.params.shutter.quality.sample_count()));
     }
@@ -4120,6 +4341,7 @@ mod tests {
     use crate::image_routing::{LayerMatte, MatteChannel as LegacyMatteChannel};
     use crate::layers::BlendMode;
     use crate::modulation::{ModMatrix, ModSource, Routing};
+    use crate::motion::{FaradayParams, FieldColliderParams, FIELD_COLLIDER_ALGORITHM_VERSION};
     use crate::ntsc::NtscParams;
     use crate::spatial::SpatialTransform;
     use crate::visual_rack::{
@@ -4379,6 +4601,403 @@ mod tests {
                 MotionDeviceLimits::new(8_192, u64::MAX),
             ),
         )
+    }
+
+    fn collider_recipient(
+        mode: FieldColliderMode,
+        boundary: MotionBoundaryMode,
+        a: u64,
+        b: u64,
+    ) -> MotionParams {
+        MotionParams {
+            transplant: FaradayParams {
+                amount: 0.75,
+                ..Default::default()
+            },
+            collider: FieldColliderParams {
+                enabled: true,
+                mode,
+                boundary,
+                input_a: MotionDonor::Selected {
+                    layer_id: layer_id(a),
+                    saved_position: saved_position(1),
+                },
+                input_b: MotionDonor::Selected {
+                    layer_id: layer_id(b),
+                    saved_position: saved_position(2),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Plan a three-layer stack where layer 10 collides layers 20 and 30.
+    fn plan_collider(recipient: MotionParams) -> AdvancedCompositionPlan {
+        let base = base(&[10, 20, 30], &[]);
+        let composition = legacy_composition(&[10, 20, 30]);
+        let racks = legacy_racks(&[10, 20, 30]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = [
+            LayerMotionPlanInput {
+                stable_id: layer_id(10),
+                params: recipient,
+                codec: MotionCodecFrameFacts::default(),
+            },
+            // Both donors are authored EXACTLY zero: their fields must still be
+            // admitted, which is the whole point of `required_as_donor`.
+            LayerMotionPlanInput {
+                stable_id: layer_id(20),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: layer_id(30),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        advanced(
+            plan_with_motion(
+                &base,
+                &composition,
+                &master,
+                &racks,
+                MotionParams::default(),
+                &layers,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_collider_admits_both_inputs_as_honest_primitive_fields_at_exactly_zero_motion() {
+        let advanced = plan_collider(collider_recipient(
+            FieldColliderMode::Curl,
+            MotionBoundaryMode::Wrap,
+            20,
+            30,
+        ));
+        let motion = advanced.motion().advanced().expect("collider motion plan");
+
+        // Two primitive fields, one per input, both admitted purely because a
+        // collider named them — their own Motion is exactly zero.
+        assert_eq!(motion.fields().len(), 2);
+        for field in motion.fields() {
+            assert!(field.required_as_donor, "{:?}", field.scope);
+            assert!(!field.required_as_garden_signal);
+        }
+        let scopes: Vec<_> = motion.fields().iter().map(|field| field.scope).collect();
+        assert!(scopes.contains(&VisualScopeId::Layer(layer_id(20))));
+        assert!(scopes.contains(&VisualScopeId::Layer(layer_id(30))));
+        assert!(
+            !scopes.contains(&VisualScopeId::Layer(layer_id(10))),
+            "a collider recipient needs no primitive field of its own"
+        );
+
+        let plan = motion.collider().expect("an admitted collider plan");
+        assert_eq!(plan.recipient_scope, VisualScopeId::Layer(layer_id(10)));
+        assert_eq!(plan.input_a_scope, VisualScopeId::Layer(layer_id(20)));
+        assert_eq!(plan.input_b_scope, VisualScopeId::Layer(layer_id(30)));
+        assert_ne!(plan.input_a_slot, plan.input_b_slot);
+        assert_eq!(plan.mode, FieldColliderMode::Curl);
+        assert_eq!(plan.boundary, MotionBoundaryMode::Wrap);
+        assert_eq!(plan.algorithm_version, FIELD_COLLIDER_ALGORITHM_VERSION);
+        // Each input's slot is resolved through `admitted_field_slot`, so the
+        // collider observes exactly the field motion rendering publishes.
+        for (scope, slot) in [
+            (plan.input_a_scope, plan.input_a_slot),
+            (plan.input_b_scope, plan.input_b_slot),
+        ] {
+            assert_eq!(
+                motion.scope(scope).unwrap().admitted_field_slot(),
+                Some(slot)
+            );
+        }
+        // Derived slots append AFTER every primitive field slot.
+        assert_eq!(plan.output_slot, 2);
+        assert!(plan.output_slot as usize >= motion.fields().len());
+        assert!(!motion
+            .diagnostics()
+            .iter()
+            .any(|entry| matches!(entry, MotionPlanDiagnostic::FieldCollider { .. })));
+
+        // The recipient's transplant is admitted and owned by the collider.
+        let recipient = motion.scope(plan.recipient_scope).unwrap();
+        assert!(recipient.transplant_admitted);
+        assert!(recipient.collider_admitted);
+        assert_eq!(recipient.donor_scope, None);
+        assert_eq!(recipient.donor_field_slot, None);
+
+        // The byte-exact ledger: 20 bytes per output-grid cell, two low
+        // resolution passes, three sampled textures.
+        let resources = motion.collider_resources();
+        let cells = plan.output_grid.vector_count;
+        assert_eq!(resources.active_colliders, 1);
+        assert_eq!(resources.total_bytes, cells * 20);
+        assert_eq!(resources.bytes_per_cell(), 20);
+        assert_eq!(resources.low_resolution_passes, 2);
+        assert_eq!(resources.nearest_lookups, 5);
+        assert_eq!(resources.max_sampled_textures_in_pass, 3);
+    }
+
+    #[test]
+    fn a_disabled_collider_is_exact_m4_and_costs_nothing() {
+        let mut recipient = collider_recipient(
+            FieldColliderMode::Sum,
+            MotionBoundaryMode::Transparent,
+            20,
+            30,
+        );
+        recipient.collider.enabled = false;
+        // With the collider off, the parked single-donor recipe runs. Its
+        // authored inputs are retained verbatim and simply do nothing.
+        recipient.transplant.donor = MotionDonor::Selected {
+            layer_id: layer_id(20),
+            saved_position: saved_position(1),
+        };
+        let advanced = plan_collider(recipient);
+        let motion = advanced.motion().advanced().unwrap();
+
+        assert_eq!(motion.collider(), None);
+        assert_eq!(
+            motion.collider_resources(),
+            FieldColliderResourcePlan::default()
+        );
+        assert_eq!(motion.collider_resources().total_bytes, 0);
+        assert_eq!(motion.collider_resources().low_resolution_passes, 0);
+        // Exactly the M4 shape: ONE donor field, the recipient substituting it.
+        assert_eq!(motion.fields().len(), 1);
+        assert_eq!(motion.fields()[0].scope, VisualScopeId::Layer(layer_id(20)));
+        let recipient_scope = motion.scope(VisualScopeId::Layer(layer_id(10))).unwrap();
+        assert!(recipient_scope.transplant_admitted);
+        assert!(!recipient_scope.collider_admitted);
+        assert_eq!(
+            recipient_scope.donor_scope,
+            Some(VisualScopeId::Layer(layer_id(20)))
+        );
+        assert_eq!(recipient_scope.admitted_field_slot(), Some(0));
+        // A disabled block is not a fault and publishes no diagnostic.
+        assert!(!motion
+            .diagnostics()
+            .iter()
+            .any(|entry| matches!(entry, MotionPlanDiagnostic::FieldCollider { .. })));
+
+        // And the authored collider inputs survived, unerased, ready to resume.
+        assert!(matches!(
+            recipient_scope.params.collider.input_a,
+            MotionDonor::Selected { layer_id: id, .. } if id == layer_id(20)
+        ));
+        assert!(matches!(
+            recipient_scope.params.collider.input_b,
+            MotionDonor::Selected { layer_id: id, .. } if id == layer_id(30)
+        ));
+    }
+
+    #[test]
+    fn an_aliased_missing_or_removed_collider_input_delegates_with_a_typed_diagnostic() {
+        let diagnostic_of = |recipient: MotionParams| {
+            let advanced = plan_collider(recipient);
+            let motion = advanced.motion().advanced().unwrap();
+            let found = motion.diagnostics().iter().find_map(|entry| match entry {
+                MotionPlanDiagnostic::FieldCollider { diagnostic, .. } => Some(*diagnostic),
+                _ => None,
+            });
+            (motion.collider().is_some(), found)
+        };
+
+        let base = collider_recipient(
+            FieldColliderMode::Sum,
+            MotionBoundaryMode::Transparent,
+            20,
+            30,
+        );
+
+        // A and B may never alias each other.
+        let mut aliased = base;
+        aliased.collider.input_b = aliased.collider.input_a;
+        assert_eq!(
+            diagnostic_of(aliased),
+            (false, Some(FieldColliderDiagnostic::AliasedInputs))
+        );
+
+        // A tombstone refuses by name and by slot, and never rebinds.
+        let mut tombstoned = base;
+        tombstoned.collider.input_b = MotionDonor::Missing {
+            saved_position: saved_position(2),
+        };
+        assert_eq!(
+            diagnostic_of(tombstoned),
+            (
+                false,
+                Some(FieldColliderDiagnostic::InputMissing {
+                    input: FieldColliderInput::B
+                })
+            )
+        );
+
+        // An unselected slot.
+        let mut unselected = base;
+        unselected.collider.input_a = MotionDonor::None;
+        assert_eq!(
+            diagnostic_of(unselected),
+            (
+                false,
+                Some(FieldColliderDiagnostic::InputUnselected {
+                    input: FieldColliderInput::A
+                })
+            )
+        );
+
+        // A donor that has left the stack is a tombstone, not a rebinding
+        // opportunity: it resolves to no scope and refuses by slot.
+        let mut removed = base;
+        removed.collider.input_b = MotionDonor::Selected {
+            layer_id: layer_id(9_999),
+            saved_position: saved_position(2),
+        };
+        assert_eq!(
+            diagnostic_of(removed),
+            (
+                false,
+                Some(FieldColliderDiagnostic::InputMissing {
+                    input: FieldColliderInput::B
+                })
+            )
+        );
+
+        // No active transplant: there is no carrier to advect.
+        let mut inert = base;
+        inert.transplant.amount = 0.0;
+        assert_eq!(
+            diagnostic_of(inert),
+            (false, Some(FieldColliderDiagnostic::NoActiveTransplant))
+        );
+    }
+
+    #[test]
+    fn a_collider_input_may_name_its_own_recipient_and_still_be_admitted() {
+        // A layer colliding its own field against another layer's is authored
+        // topology, not a cycle. Only A-aliases-B is refused.
+        let recipient = collider_recipient(
+            FieldColliderMode::Difference,
+            MotionBoundaryMode::Hold,
+            10,
+            30,
+        );
+        let advanced = plan_collider(recipient);
+        let motion = advanced.motion().advanced().unwrap();
+        let plan = motion.collider().expect("a self-naming input is admitted");
+        assert_eq!(plan.recipient_scope, VisualScopeId::Layer(layer_id(10)));
+        assert_eq!(plan.input_a_scope, VisualScopeId::Layer(layer_id(10)));
+        assert_eq!(plan.input_b_scope, VisualScopeId::Layer(layer_id(30)));
+        // The recipient now carries its OWN primitive field, because it is
+        // also a donor, and that field is what a routed primitive consumer
+        // observes.
+        let recipient_scope = motion.scope(plan.recipient_scope).unwrap();
+        assert!(recipient_scope.required_as_donor);
+        assert_eq!(
+            recipient_scope.admitted_field_slot(),
+            Some(plan.input_a_slot)
+        );
+        // Only a Source diagnostic (the deterministic lattice fallback these
+        // fixtures always take) may be present; no collider fault.
+        assert!(!motion
+            .diagnostics()
+            .iter()
+            .any(|entry| matches!(entry, MotionPlanDiagnostic::FieldCollider { .. })));
+    }
+
+    #[test]
+    fn the_collider_topology_signature_tracks_every_discrete_authored_choice() {
+        let signature = |mode, boundary, a, b| {
+            plan_collider(collider_recipient(mode, boundary, a, b))
+                .motion()
+                .topology_signature()
+        };
+        let reference = signature(
+            FieldColliderMode::Sum,
+            MotionBoundaryMode::Transparent,
+            20,
+            30,
+        );
+        assert_ne!(
+            reference,
+            signature(
+                FieldColliderMode::Curl,
+                MotionBoundaryMode::Transparent,
+                20,
+                30
+            ),
+            "a mode change must invalidate prepared bindings"
+        );
+        assert_ne!(
+            reference,
+            signature(FieldColliderMode::Sum, MotionBoundaryMode::Mirror, 20, 30),
+            "a boundary change must invalidate prepared bindings"
+        );
+        assert_ne!(
+            reference,
+            signature(
+                FieldColliderMode::Sum,
+                MotionBoundaryMode::Transparent,
+                30,
+                20
+            ),
+            "swapping the two inputs is a different dependency graph"
+        );
+
+        let mut disabled = collider_recipient(
+            FieldColliderMode::Sum,
+            MotionBoundaryMode::Transparent,
+            20,
+            30,
+        );
+        disabled.collider.enabled = false;
+        disabled.transplant.donor = MotionDonor::Selected {
+            layer_id: layer_id(20),
+            saved_position: saved_position(1),
+        };
+        assert_ne!(
+            reference,
+            plan_collider(disabled).motion().topology_signature(),
+            "enabling the collider is a topology change"
+        );
+    }
+
+    #[test]
+    fn a_default_collider_never_holds_the_plan_out_of_legacy_exact() {
+        // The exact pre-collider path: no motion effect anywhere, so the plan
+        // must still collapse to LegacyExact and allocate nothing.
+        let base = base(&[10, 20], &[]);
+        let composition = legacy_composition(&[10, 20]);
+        let racks = legacy_racks(&[10, 20]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = [
+            LayerMotionPlanInput {
+                stable_id: layer_id(10),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: layer_id(20),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        let evaluated = plan_with_motion(
+            &base,
+            &composition,
+            &master,
+            &racks,
+            MotionParams::default(),
+            &layers,
+        )
+        .unwrap();
+        assert!(
+            matches!(evaluated, EvaluatedCompositionPlan::LegacyExact(_)),
+            "a default collider must not hold the composition out of LegacyExact"
+        );
     }
 
     fn advanced(result: EvaluatedCompositionPlan) -> AdvancedCompositionPlan {

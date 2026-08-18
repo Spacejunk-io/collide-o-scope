@@ -1417,6 +1417,7 @@ impl PreparedAdvanced {
                     motion_plan.resources(),
                     &field_specs,
                     dimensions,
+                    motion_plan.collider(),
                 )?;
                 if let Some(mut resources) = prepared_resources {
                     let field_sources = motion_plan
@@ -1459,11 +1460,19 @@ impl PreparedAdvanced {
                             if !effect_active {
                                 return None;
                             }
-                            let render_field_slot = scope.admitted_field_slot()?;
+                            // A collider recipient advects from the derived
+                            // field and therefore needs no primitive slot of
+                            // its own; every other scope still requires one.
+                            let render_field_slot = if scope.collider_admitted {
+                                scope.admitted_field_slot().unwrap_or_default()
+                            } else {
+                                scope.admitted_field_slot()?
+                            };
                             Some(MotionGpuScopeSpec {
                                 scope: scope.scope,
                                 render_field_slot,
                                 uses_carrier: scope.transplant_admitted,
+                                derived_collider: scope.collider_admitted,
                             })
                         })
                         .collect::<Vec<_>>();
@@ -1785,6 +1794,11 @@ impl PreparedAdvanced {
             {
                 resources.encode_field_scope(encoder, motion_plan, field.scope)?;
             }
+            // Primitive fields are staged and encoded first, the derived
+            // collided field second, and the carrier is advected third. The
+            // collider therefore reads this frame's primitive vectors, and
+            // every advection below reads this frame's derived field.
+            resources.encode_collider(encoder)?;
             resources.encode_garden_signal(encoder)?;
         }
 
@@ -3920,16 +3934,17 @@ mod tests {
     };
     use crate::effects::EffectUniforms;
     use crate::evaluated_frame::evaluated_composition::{
-        LayerMotionPlanInput, MotionCodecFrameFacts,
+        CompositionPlanInput, LayerMotionPlanInput, MotionCodecFrameFacts,
     };
     use crate::evaluated_frame::{
         EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, SourceTap,
     };
     use crate::modulation::ModMatrix;
     use crate::motion::{
-        CurvedShutterParams, CurvedShutterQuality, FaradayParams, MotionCarrier,
-        MotionDeviceLimits, MotionDonor, MotionField, MotionFieldOrigin, MotionFieldSource,
-        MotionGrid, MotionParams, MotionVectorSample,
+        CurvedShutterParams, CurvedShutterQuality, FaradayParams, FieldColliderMode,
+        FieldColliderParams, MotionBoundaryMode, MotionCarrier, MotionDeviceLimits, MotionDonor,
+        MotionField, MotionFieldOrigin, MotionFieldSource, MotionGrid, MotionParams,
+        MotionVectorSample,
     };
     use crate::ntsc::NtscParams;
     use crate::performance::SavedLayerPosition;
@@ -6084,6 +6099,325 @@ mod tests {
     /// therefore differs from the unarmed one only in each sector record's
     /// motion lane, and with a stationary field even that difference is
     /// invisible — `raw + vec2f(0.0)` is bit-identical to `raw`.
+    /// A two-layer composition whose top layer's Faraday carrier is advected
+    /// from a Field Collider.
+    ///
+    /// Input A names the recipient itself and input B names the layer beneath
+    /// it. That is deliberate and legal: section 5 allows either input to equal
+    /// the recipient and forbids only A aliasing B, so this fixture exercises
+    /// the permissive half of that law while keeping the composition topology
+    /// identical to the proven Symmetry payoff fixture beside it.
+    fn field_collider_payoff_fixture(
+        dimensions: [u32; 2],
+        recipient_id: u64,
+        donor_id: u64,
+        collider: FieldColliderParams,
+    ) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[recipient_id, donor_id], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(donor_id),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(recipient_id),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![
+            (
+                stable_layer(recipient_id),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(donor_id),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        // The recipient owns the shared carrier/advection controls. Both
+        // collider inputs take codec fields so a known uniform observation can
+        // be attached to each; neither input has any authored Motion *effect*
+        // of its own, so only `required_as_donor` can pull its field in.
+        let codec = MotionCodecFrameFacts {
+            available: true,
+            source_generation: 7,
+            frame_ordinal: 9,
+        };
+        let motion = [
+            LayerMotionPlanInput {
+                stable_id: stable_layer(recipient_id),
+                params: MotionParams {
+                    field_source: MotionFieldSource::CodecVectors,
+                    transplant: FaradayParams {
+                        amount: 1.0,
+                        carrier: MotionCarrier::FirstSourceFrame,
+                        confidence_threshold: 0.0,
+                        confidence_softness: 0.0,
+                        refresh: 0.0,
+                        decay: 1.0,
+                        occlusion: 0.0,
+                        ..Default::default()
+                    },
+                    collider,
+                    ..MotionParams::default()
+                },
+                codec,
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(donor_id),
+                params: MotionParams {
+                    field_source: MotionFieldSource::CodecVectors,
+                    ..MotionParams::default()
+                },
+                codec,
+            },
+        ];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            CompositionPlanInput::new(&composition, &master, &racks).with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap()
+    }
+
+    /// THE delivery gate.
+    ///
+    /// A pure type, an isolated shader, or a hidden test is not delivery. This
+    /// fixture drives a known A/B pair through both low-resolution collider
+    /// passes and proves, in one place, that:
+    ///
+    /// - the derived collided field actually advects the carrier and reaches
+    ///   the audience image — the frame MOVES, and moves differently from what
+    ///   either input alone would have produced;
+    /// - a disabled collider is BYTE-IDENTICAL to the exact M4 path, which is
+    ///   the compatibility claim;
+    /// - the live process-lifetime layer identities and export's
+    ///   `position + 1` identities render the same authored patch identically,
+    ///   so there is no export-only collider path;
+    /// - a warm frame allocates nothing across the eight prebuilt parity bind
+    ///   groups.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_field_collider_derived_field_reaches_the_pixels() {
+        let gpu = GpuHarness::new();
+        let dimensions = [16, 16];
+        let grid = MotionGrid::for_source(dimensions, Default::default()).unwrap();
+        // 6 UV/s through one reference tick is 0.2 UV — several pixels here,
+        // far outside binary16 noise and well inside the clamp.
+        let a_field = uniform_motion_field(dimensions, grid, [6.0, -6.0]);
+        let b_field = uniform_motion_field(dimensions, grid, [-6.0, 6.0]);
+        let stationary = uniform_motion_field(dimensions, grid, [0.0, 0.0]);
+
+        // The recipient is the upper layer, so it carries the higher live
+        // identity exactly as the Symmetry payoff fixture beside it does.
+        const LIVE_RECIPIENT: u64 = 812;
+        const LIVE_DONOR: u64 = 811;
+
+        let armed = |recipient: u64, donor: u64| FieldColliderParams {
+            enabled: true,
+            mode: FieldColliderMode::Difference,
+            boundary: MotionBoundaryMode::Hold,
+            input_a: MotionDonor::Selected {
+                layer_id: stable_layer(recipient),
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            },
+            input_b: MotionDonor::Selected {
+                layer_id: stable_layer(donor),
+                saved_position: SavedLayerPosition::new(2).unwrap(),
+            },
+            ..Default::default()
+        };
+
+        let live = field_collider_payoff_fixture(
+            dimensions,
+            LIVE_RECIPIENT,
+            LIVE_DONOR,
+            armed(LIVE_RECIPIENT, LIVE_DONOR),
+        );
+        // Export numbers the same authored layers `position + 1`.
+        let offline = field_collider_payoff_fixture(dimensions, 2, 1, armed(2, 1));
+        // The identical patch with the block disabled: the parked single-donor
+        // recipe, retained verbatim and simply not running.
+        let mut parked = armed(LIVE_RECIPIENT, LIVE_DONOR);
+        parked.enabled = false;
+        let disabled =
+            field_collider_payoff_fixture(dimensions, LIVE_RECIPIENT, LIVE_DONOR, parked);
+
+        // The collider really is admitted, and both inputs really were pulled
+        // in as honest primitive fields by `required_as_donor` alone.
+        let EvaluatedCompositionPlan::Advanced(advanced) = &live else {
+            panic!("an admitted collider forces an Advanced plan");
+        };
+        let motion = advanced
+            .motion()
+            .advanced()
+            .expect("an advanced motion plan");
+        let plan = motion.collider().expect("an admitted collider plan");
+        assert_ne!(plan.input_a_slot, plan.input_b_slot);
+        for scope in [plan.input_a_scope, plan.input_b_scope] {
+            let input = motion.scope(scope).expect("an admitted collider input");
+            assert!(input.required_as_donor);
+        }
+        let recipient_scope = motion.scope(plan.recipient_scope).expect("the recipient");
+        assert!(recipient_scope.collider_admitted);
+        assert!(recipient_scope.transplant_admitted);
+        // Twenty bytes a cell, two low-resolution passes, three sampled
+        // textures — the published ledger, on the plan that actually renders.
+        let resources = motion.collider_resources();
+        assert_eq!(resources.total_bytes, plan.output_grid.vector_count * 20);
+        assert_eq!(resources.low_resolution_passes, 2);
+        assert_eq!(resources.max_sampled_textures_in_pass, 3);
+
+        let carrier_source = checkered_source(&gpu, dimensions, "Collider payoff carrier");
+        let donor_source = gpu.source(dimensions, [255, 0, 0, 255], "Collider payoff donor");
+        let live_sources = [
+            CompositionSourceDescriptor::new(
+                stable_layer(LIVE_DONOR),
+                &donor_source.view,
+                dimensions,
+            ),
+            CompositionSourceDescriptor::new(
+                stable_layer(LIVE_RECIPIENT),
+                &carrier_source.view,
+                dimensions,
+            ),
+        ];
+        let offline_sources = [
+            CompositionSourceDescriptor::new(stable_layer(1), &donor_source.view, dimensions),
+            CompositionSourceDescriptor::new(stable_layer(2), &carrier_source.view, dimensions),
+        ];
+        let attachment = |scope, field| payoff_attachment(scope, dimensions, grid, field);
+        let a_scope = plan.input_a_scope;
+        let b_scope = plan.input_b_scope;
+
+        let render = |plan: &EvaluatedCompositionPlan,
+                      sources: &[CompositionSourceDescriptor],
+                      attachments: &[_]| {
+            let mut executor =
+                CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+            executor
+                .prepare(&gpu.device, &gpu.queue, plan, sources)
+                .expect("an admitted collider must prepare");
+            let warmed = executor.allocation_snapshot();
+            let pixels = gpu.render_with_motion(
+                &mut executor,
+                plan,
+                1.0 / 30.0,
+                false,
+                CompositionMotionFrameInput {
+                    attachments,
+                    held_scopes: &[],
+                },
+            );
+            // A warm frame binds one of the eight prebuilt parity groups per
+            // pass and creates nothing.
+            assert_eq!(
+                executor.allocation_snapshot(),
+                warmed,
+                "a warm collider frame allocated"
+            );
+            pixels
+        };
+
+        // (1) The collided field MOVES the frame.
+        let collided = render(
+            &live,
+            &live_sources,
+            &[attachment(a_scope, &a_field), attachment(b_scope, &b_field)],
+        );
+        let both_still = render(
+            &live,
+            &live_sources,
+            &[
+                attachment(a_scope, &stationary),
+                attachment(b_scope, &stationary),
+            ],
+        );
+        assert_ne!(
+            collided, both_still,
+            "the derived collided field must reach the audience image"
+        );
+
+        // (2) It is genuinely the COLLISION, not either input alone. The
+        // difference of (6,-6) and (-6,6) is (12,-12); of (6,-6) and (0,0) it
+        // is (6,-6). Both inputs demonstrably contribute.
+        let a_only = render(
+            &live,
+            &live_sources,
+            &[
+                attachment(a_scope, &a_field),
+                attachment(b_scope, &stationary),
+            ],
+        );
+        assert_ne!(
+            collided, a_only,
+            "input B must contribute to the derived field"
+        );
+        let b_only = render(
+            &live,
+            &live_sources,
+            &[
+                attachment(a_scope, &stationary),
+                attachment(b_scope, &b_field),
+            ],
+        );
+        assert_ne!(
+            collided, b_only,
+            "input A must contribute to the derived field"
+        );
+
+        // (3) An unmaterialized input yields the exact invalid/zero sample and
+        // never reuses its surviving partner.
+        let one_missing = render(&live, &live_sources, &[attachment(a_scope, &a_field)]);
+        assert_eq!(
+            one_missing, both_still,
+            "a missing input must yield the exact zero sample, not its partner's field"
+        );
+
+        // (4) Live and export identities render the same authored patch
+        // identically: there is no export-only collider path.
+        let exported = render(
+            &offline,
+            &offline_sources,
+            &[
+                attachment(VisualScopeId::Layer(stable_layer(2)), &a_field),
+                attachment(VisualScopeId::Layer(stable_layer(1)), &b_field),
+            ],
+        );
+        assert_eq!(
+            collided, exported,
+            "live and export layer identities must render the same authored collider"
+        );
+
+        // (5) Disabled is BYTE-IDENTICAL to exact M4: the parked single-donor
+        // recipe names no transplant donor, so offering the collider's fields
+        // changes nothing at all.
+        let parked_pixels = render(
+            &disabled,
+            &live_sources,
+            &[attachment(a_scope, &a_field), attachment(b_scope, &b_field)],
+        );
+        let parked_control = render(&disabled, &live_sources, &[]);
+        assert_eq!(
+            parked_pixels, parked_control,
+            "a disabled collider must be byte-identical to exact M4"
+        );
+        assert_ne!(
+            collided, parked_pixels,
+            "enabling the collider must change the image it produces"
+        );
+    }
+
     fn symmetry_motion_payoff_fixture(
         dimensions: [u32; 2],
         carrier_id: u64,

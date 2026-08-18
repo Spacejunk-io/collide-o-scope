@@ -2344,11 +2344,13 @@ const MOTION_PARAM_DEFAULTS = Object.freeze({
   carrier: 'transparent', confidence_threshold: 0.1, confidence_softness: 0.05,
   refresh: 1, decay: 1, occlusion: 0, shutter_angle: 0, shutter_phase: 0,
   shutter_curvature: 0, shutter_chromatic_lag: 0, shutter_quality: 'sharp',
+  collider_enabled: false, collider_mode: 'sum', collider_boundary: 'transparent',
 });
 
 function motionParamValue(motion = {}, param) {
   const transplant = motion.transplant || {};
   const shutter = motion.shutter || {};
+  const collider = motion.collider || {};
   const values = {
     field_source: motion.field_source,
     lattice_quality: motion.lattice_quality,
@@ -2364,8 +2366,18 @@ function motionParamValue(motion = {}, param) {
     shutter_curvature: shutter.curvature,
     shutter_chromatic_lag: shutter.chromatic_lag,
     shutter_quality: shutter.quality,
+    collider_enabled: collider.enabled,
+    collider_mode: collider.mode,
+    collider_boundary: collider.boundary,
   };
   return values[param] ?? MOTION_PARAM_DEFAULTS[param];
+}
+
+function motionColliderText(motion = {}) {
+  const collider = motion.collider || {};
+  if (!collider.enabled) return 'Collider off - single-donor Faraday transplant is live.';
+  if (collider.diagnostic) return String(collider.diagnostic);
+  return collider.admitted ? 'Collider admitted - the derived field advects the carrier.' : 'Collider inert.';
 }
 
 function motionTelemetryText(motion = {}) {
@@ -2396,7 +2408,9 @@ function wireMotionPanel(panel, scopeProvider) {
     control.addEventListener(eventName, () => {
       const scope = scopeProvider();
       if (!scope) return;
-      const value = control.type === 'range' ? Number(control.value) : control.value;
+      const value = control.type === 'range'
+        ? Number(control.value)
+        : control.type === 'checkbox' ? control.checked : control.value;
       if (control.type === 'range') {
         const valueEl = row.querySelector('.value');
         if (valueEl) valueEl.textContent = formatValue(value, Number(control.min), Number(control.max), Number(control.step));
@@ -2414,6 +2428,10 @@ function syncMotionPanel(panel, motion = {}) {
     const control = row.querySelector('input,select');
     if (!control || !canSync(control)) return;
     const value = motionParamValue(motion, param);
+    if (control.type === 'checkbox') {
+      control.checked = Boolean(value);
+      return;
+    }
     control.value = String(value);
     if (control.type === 'range') {
       const valueEl = row.querySelector('.value');
@@ -3329,6 +3347,10 @@ function motionRangeHtml(param, label, min, max, step, value) {
   return `<div class="param-row" data-motion-param="${param}"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-label="${label}"><span class="value">${value}</span></div>`;
 }
 
+function motionCheckboxHtml(param, label) {
+  return `<div class="param-row select-row" data-motion-param="${param}"><label>${label}</label><input type="checkbox" aria-label="${label}"></div>`;
+}
+
 function motionSelectHtml(param, label, options) {
   return `<div class="param-row select-row" data-motion-param="${param}"><label>${label}</label><select aria-label="${label}">${options.map(([value, text]) => `<option value="${value}">${text}</option>`).join('')}</select></div>`;
 }
@@ -3351,8 +3373,14 @@ function layerMotionControlsHtml(layer, index) {
     ${motionRangeHtml('shutter_curvature', 'Curvature', -2, 2, 0.01, Number(motion.shutter?.curvature ?? 0))}
     ${motionRangeHtml('shutter_chromatic_lag', 'Chroma lag', 0, 1, 0.01, Number(motion.shutter?.chromatic_lag ?? 0))}
     ${motionSelectHtml('shutter_quality', 'Shutter quality', [['sharp', 'Sharp · 1'], ['draft', 'Draft · 4'], ['live', 'Live · 8'], ['high', 'High · 16']])}
+    ${motionCheckboxHtml('collider_enabled', 'Field Collider')}
+    ${motionSelectHtml('collider_mode', 'Collide mode', [['sum', 'Sum'], ['difference', 'Difference'], ['curl', 'Curl'], ['projection', 'Projection'], ['collision_boundary', 'Collision boundary']])}
+    ${motionSelectHtml('collider_boundary', 'Collide edge', [['transparent', 'Transparent'], ['mirror', 'Mirror'], ['wrap', 'Wrap'], ['hold', 'Hold']])}
+    <div class="param-row select-row motion-collider-row"><label for="layer-motion-collider-a-${index}">Collider A</label><select id="layer-motion-collider-a-${index}" class="motion-collider-select" data-collider-input="a" aria-label="Layer ${index + 1} Field Collider input A"><option value="none">None</option></select></div>
+    <div class="param-row select-row motion-collider-row"><label for="layer-motion-collider-b-${index}">Collider B</label><select id="layer-motion-collider-b-${index}" class="motion-collider-select" data-collider-input="b" aria-label="Layer ${index + 1} Field Collider input B"><option value="none">None</option></select></div>
+    <div class="audio-status motion-collider-status" role="status" aria-live="polite">${escapeHtml(motionColliderText(motion))}</div>
     <div class="audio-status motion-telemetry" role="status" aria-live="polite">${escapeHtml(motionTelemetryText(motion))}</div>
-    <div class="audio-status">One active transplant is admitted composition-wide. A missing donor stays inert and never retargets.</div>`;
+    <div class="audio-status">One active transplant is admitted composition-wide. A missing donor stays inert and never retargets. Enabling the collider parks the single-donor recipe; disabling resumes it.</div>`;
 }
 
 function syncLayerMotion(card, layer) {
@@ -3381,6 +3409,48 @@ function syncLayerMotion(card, layer) {
     donorSelect.replaceChildren(...options);
   }
   donorSelect.value = currentValue;
+  syncLayerMotionCollider(panel, layer);
+}
+
+// Both collider slots are populated independently and keyed by their own slot
+// token, so clearing input A never slides input B's selection into A's place.
+// A collider input may legally name its own recipient layer, unlike the Faraday
+// donor above, so the recipient is NOT filtered out here. The partner slot's
+// current layer is filtered out because A and B may never alias; the engine
+// refuses that edit anyway, and offering it would invite a rejection.
+function syncLayerMotionCollider(panel, layer) {
+  const collider = layer.motion?.collider || {};
+  const status = panel.querySelector('.motion-collider-status');
+  if (status) {
+    status.textContent = motionColliderText(layer.motion || {});
+    status.classList.toggle('error', Boolean(collider.enabled && collider.diagnostic));
+  }
+  panel.querySelectorAll('.motion-collider-select').forEach((select) => {
+    if (!canSync(select)) return;
+    const slot = select.dataset.colliderInput === 'b' ? 'input_b' : 'input_a';
+    const partner = slot === 'input_a' ? collider.input_b : collider.input_a;
+    const donor = collider[slot] || { kind: 'none' };
+    const currentValue = donor.kind === 'selected'
+      ? String(donor.layer_id || '')
+      : donor.kind === 'missing' ? `missing:${Number(donor.saved_position || 0)}` : 'none';
+    const excluded = partner?.kind === 'selected' ? String(partner.layer_id || '') : '';
+    const optionKey = JSON.stringify([slot, currentValue, excluded, latestLayers.map((candidate) => [candidate.layer_id, candidate.filename])]);
+    if (select.dataset.optionKey !== optionKey) {
+      select.dataset.optionKey = optionKey;
+      const options = [new Option('None', 'none')];
+      latestLayers.forEach((candidate, candidateIndex) => {
+        if (excluded && String(candidate.layer_id) === excluded) return;
+        options.push(new Option(`Layer ${candidateIndex + 1} · ${candidate.filename || 'Untitled'}`, String(candidate.layer_id)));
+      });
+      if (donor.kind === 'missing') {
+        const missing = new Option(`Missing saved layer ${Number(donor.saved_position || 0) + 1}`, currentValue);
+        missing.disabled = true;
+        options.push(missing);
+      }
+      select.replaceChildren(...options);
+    }
+    select.value = currentValue;
+  });
 }
 
 function wireLayerMotion(card, layer, index) {
@@ -3398,6 +3468,25 @@ function wireLayerMotion(card, layer, index) {
     const donorLayerId = selected === 'none' ? null : selected;
     if (donorLayerId !== null && !/^(?:[1-9][0-9]*)$/.test(donorLayerId)) return;
     sendAction({ action: 'set_motion_donor', layer_id: layerId, donor_layer_id: donorLayerId, layer_stack_revision: layerStackRevision });
+  });
+  panel.querySelectorAll('.motion-collider-select').forEach((select) => {
+    select.addEventListener('change', (event) => {
+      const current = currentLayerContext(card, layer, index).layer;
+      const layerId = String(current?.layer_id || '');
+      const selected = event.currentTarget.value;
+      if (!/^(?:[1-9][0-9]*)$/.test(layerId) || selected.startsWith('missing:')) return;
+      const donorLayerId = selected === 'none' ? null : selected;
+      if (donorLayerId !== null && !/^(?:[1-9][0-9]*)$/.test(donorLayerId)) return;
+      // Deliberately never wrapped as a Quantized inner action: rewiring an
+      // input rewrites the motion-field request, so it is an ordered barrier.
+      sendAction({
+        action: 'set_motion_collider_input',
+        layer_id: layerId,
+        input: event.currentTarget.dataset.colliderInput === 'b' ? 'b' : 'a',
+        donor_layer_id: donorLayerId,
+        layer_stack_revision: layerStackRevision,
+      });
+    });
   });
 }
 

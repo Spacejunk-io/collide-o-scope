@@ -252,6 +252,14 @@ pub struct MotionParams {
     pub lattice_quality: MotionLatticeQuality,
     pub transplant: FaradayParams,
     pub shutter: CurvedShutterParams,
+    /// Field Collider v1. Disabled is exact M4: the block delegates before any
+    /// admission or allocation and the single-donor transplant recipe below
+    /// runs untouched. Enabling it *parks* that recipe — the authored donor,
+    /// amount, carrier, confidence, refresh, decay, and occlusion are all
+    /// retained verbatim — and substitutes the derived collided field as the
+    /// thing the carrier is advected from. Disabling resumes the parked recipe
+    /// exactly, because nothing about it was ever erased.
+    pub collider: FieldColliderParams,
 }
 
 impl Default for MotionParams {
@@ -262,6 +270,7 @@ impl Default for MotionParams {
             lattice_quality: MotionLatticeQuality::Live,
             transplant: FaradayParams::default(),
             shutter: CurvedShutterParams::default(),
+            collider: FieldColliderParams::default(),
         }
     }
 }
@@ -278,11 +287,41 @@ impl MotionParams {
             lattice_quality: self.lattice_quality,
             transplant: self.transplant.sanitized(),
             shutter: self.shutter.sanitized(),
+            collider: self.collider.sanitized(),
         }
     }
 
     pub fn is_exact_zero(self) -> bool {
         self.transplant.amount == 0.0 && self.shutter.angle_degrees == 0.0
+    }
+
+    /// The admitted Field Collider for this scope, if any.
+    ///
+    /// A collider derives the field the Faraday transplant advects from, so it
+    /// is meaningless without an active transplant: with `amount == 0.0` there
+    /// is no carrier to advect and no pass to feed. It is likewise refused at
+    /// master scope, where a transplant is already refused. Both conditions
+    /// are answered here, so every call site asks the identical question.
+    pub fn collider_admission(self, is_master: bool) -> FieldColliderAdmission {
+        let collider = self.collider.sanitized();
+        // Authored inertness is reported before any environmental fault, so a
+        // disabled block never accuses the scope of a problem it does not have.
+        if !collider.enabled {
+            return FieldColliderAdmission::Delegated {
+                diagnostic: FieldColliderDiagnostic::Disabled,
+            };
+        }
+        if is_master {
+            return FieldColliderAdmission::Delegated {
+                diagnostic: FieldColliderDiagnostic::MasterRecipient,
+            };
+        }
+        if self.transplant.sanitized().amount <= 0.0 {
+            return FieldColliderAdmission::Delegated {
+                diagnostic: FieldColliderDiagnostic::NoActiveTransplant,
+            };
+        }
+        collider.admission()
     }
 }
 
@@ -636,6 +675,7 @@ pub enum MotionPlanError {
     TooManyActiveFields { count: u32, limit: u32 },
     TooManyTransplants { count: u32, limit: u32 },
     TooManyGardenSignals { count: u32, limit: u32 },
+    TooManyColliders { count: u32, limit: u32 },
     MasterTransplant,
     ArithmeticOverflow,
 }
@@ -682,6 +722,10 @@ impl fmt::Display for MotionPlanError {
             Self::TooManyGardenSignals { count, limit } => write!(
                 f,
                 "motion plan requests {count} routed Garden signals; limit is {limit}"
+            ),
+            Self::TooManyColliders { count, limit } => write!(
+                f,
+                "motion plan requests {count} field colliders; limit is {limit}"
             ),
             Self::MasterTransplant => write!(f, "Faraday transplant requires a layer recipient"),
             Self::ArithmeticOverflow => write!(f, "motion resource arithmetic overflow"),
@@ -1337,12 +1381,1239 @@ fn validate_codec_vector(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Field Collider v1
+// ---------------------------------------------------------------------------
+//
+// The Field Collider is a Motion-subsystem block, not a Collision Rack node: it
+// takes no `NodeKindTag` code, occupies no rack segment, and never appears in
+// the image dependency graph. It consumes two admitted *primitive* motion
+// fields, recombines their recipient-local vectors under a closed mode law, and
+// publishes one derived vector/gate field. The existing Faraday transplant then
+// advects its carrier from that derived field instead of from a single donor.
+//
+// Everything here is pure: no `wgpu`, no clock, no filesystem, no UI. The CPU
+// laws below are the independent reference the GPU pass is measured against,
+// not a description of the shader.
+
+/// Persisted provenance for the first Field Collider algorithm family.
+pub const FIELD_COLLIDER_ALGORITHM_VERSION: u16 = 1;
+
+/// M4 admitted one expensive transplant; v1 likewise admits one collider and
+/// therefore one derived field on top of that single carrier.
+pub const MOTION_MAX_ACTIVE_COLLIDERS: u32 = 1;
+
+// The collider's own per-cell working set. Both primitive inputs and the sole
+// carrier stay separately and honestly accounted through the M4 ledger; only
+// these three surfaces are new.
+const DERIVED_VECTOR_BYTES_PER_CELL: u64 = 8; // two RG16Float parities
+const DERIVED_GATE_BYTES_PER_CELL: u64 = 4; // two RG8Unorm parities
+const TRANSIENT_PAIR_BYTES_PER_CELL: u64 = 8; // one RGBA16Float mapped pair
+/// The complete published collider-specific delta, in bytes per grid cell.
+pub const FIELD_COLLIDER_BYTES_PER_CELL: u64 =
+    DERIVED_VECTOR_BYTES_PER_CELL + DERIVED_GATE_BYTES_PER_CELL + TRANSIENT_PAIR_BYTES_PER_CELL;
+
+const _: () = assert!(FIELD_COLLIDER_BYTES_PER_CELL == 20);
+
+/// Which of the two fixed collider inputs a value or diagnostic addresses.
+///
+/// Slot identity is authored topology, exactly as it is for a Symmetry Field's
+/// image slots: an unarmed or missing input A can never slide input B's donor
+/// down into its place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FieldColliderInput {
+    A,
+    B,
+}
+
+impl FieldColliderInput {
+    /// Permanent append-only wire/persistence index. Never renumber.
+    pub const fn index(self) -> u8 {
+        match self {
+            Self::A => 0,
+            Self::B => 1,
+        }
+    }
+
+    pub const fn from_index(index: u8) -> Option<Self> {
+        match index {
+            0 => Some(Self::A),
+            1 => Some(Self::B),
+            _ => None,
+        }
+    }
+
+    pub const ALL: [Self; 2] = [Self::A, Self::B];
+}
+
+impl fmt::Display for FieldColliderInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::A => write!(f, "A"),
+            Self::B => write!(f, "B"),
+        }
+    }
+}
+
+/// The closed v1 recombination vocabulary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FieldColliderMode {
+    #[default]
+    Sum,
+    Difference,
+    Curl,
+    Projection,
+    CollisionBoundary,
+}
+
+impl FieldColliderMode {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Sum => 0,
+            Self::Difference => 1,
+            Self::Curl => 2,
+            Self::Projection => 3,
+            Self::CollisionBoundary => 4,
+        }
+    }
+
+    /// Every mode in the closed vocabulary, in code order.
+    pub const ALL: [Self; 5] = [
+        Self::Sum,
+        Self::Difference,
+        Self::Curl,
+        Self::Projection,
+        Self::CollisionBoundary,
+    ];
+}
+
+/// Boundary law for a motion-field lookup outside its source extent.
+///
+/// The variants are declared in **shader-code order**, which is the frozen
+/// `Transparent = 0, Mirror = 1, Wrap = 2, Hold = 3` numbering already carried
+/// by [`crate::visual_rack::DisplaceBoundary`] and
+/// [`crate::symmetry::SymmetryBoundary`]. Section 5 of the enrichment plan
+/// lists the four names in the order "transparent, hold, mirror, wrap"; that
+/// listing is prose enumerating the vocabulary, not a code assignment, and
+/// minting a fourth incompatible boundary table so that motion disagreed with
+/// the two image boundaries about the numeric meaning of `1` would be a
+/// persistence and shader hazard for no authored benefit. Motion therefore
+/// deliberately does **not** differ: one boundary numbering serves the whole
+/// program.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MotionBoundaryMode {
+    /// Inclusive `[0, 1]` acceptance. The only law that removes a sample.
+    #[default]
+    Transparent,
+    /// Period-two triangular reflection.
+    Mirror,
+    /// `x - floor(x)`.
+    Wrap,
+    /// Clamp to the closed unit interval.
+    Hold,
+}
+
+impl MotionBoundaryMode {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Transparent => 0,
+            Self::Mirror => 1,
+            Self::Wrap => 2,
+            Self::Hold => 3,
+        }
+    }
+
+    /// Every boundary in the closed vocabulary, in code order.
+    pub const ALL: [Self; 4] = [Self::Transparent, Self::Mirror, Self::Wrap, Self::Hold];
+
+    /// Resolve one lookup coordinate, or `None` when this law removes it.
+    ///
+    /// A non-finite coordinate is removed by every law, including the three
+    /// that otherwise always produce a sample: `clamp`, `fract`, and the
+    /// triangular map are all meaningless on NaN, and inventing a coordinate
+    /// there would fabricate a reading the field never took.
+    pub fn resolve(self, uv: [f32; 2]) -> Option<[f32; 2]> {
+        if !uv[0].is_finite() || !uv[1].is_finite() {
+            return None;
+        }
+        match self {
+            Self::Transparent => {
+                (uv[0] >= 0.0 && uv[0] <= 1.0 && uv[1] >= 0.0 && uv[1] <= 1.0).then_some(uv)
+            }
+            Self::Hold => Some([uv[0].clamp(0.0, 1.0), uv[1].clamp(0.0, 1.0)]),
+            Self::Wrap => Some([wrap_unit(uv[0]), wrap_unit(uv[1])]),
+            Self::Mirror => Some([mirror_unit(uv[0]), mirror_unit(uv[1])]),
+        }
+    }
+}
+
+fn wrap_unit(value: f32) -> f32 {
+    // `value - floor(value)` on a large negative magnitude can round to exactly
+    // 1.0; the closed unit interval is still the honest answer, so clamp rather
+    // than letting a lookup escape by one ulp.
+    (value - value.floor()).clamp(0.0, 1.0)
+}
+
+fn mirror_unit(value: f32) -> f32 {
+    let half = value / 2.0;
+    let period = (half - half.floor()) * 2.0;
+    let folded = if period > 1.0 { 2.0 - period } else { period };
+    folded.clamp(0.0, 1.0)
+}
+
+/// Clamp one derived velocity component into the canonical Motion range.
+///
+/// This is exactly the interval [`pack_velocity`] encodes and
+/// [`unpack_velocity`] recovers, so no mode can emit a velocity the frozen M4
+/// field contract cannot represent. It clamps without quantizing: the GPU
+/// derived field is `Rg16Float`, so applying the 16-bit *lattice* here would
+/// make the CPU reference disagree with the shader by construction.
+pub fn clamp_motion_velocity(value: f32) -> f32 {
+    finite_or(value, 0.0).clamp(-MOTION_MAX_UV_PER_SECOND, MOTION_MAX_UV_PER_SECOND)
+}
+
+/// Bounded authored Field Collider controls.
+///
+/// Version 1 adds no collider-only continuous control: the shared Faraday
+/// `amount`, carrier, confidence threshold/softness, refresh, decay, and
+/// occlusion remain the one carrier/advection law. Dice and modulation
+/// therefore preserve this block exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldColliderParams {
+    pub algorithm_version: u16,
+    /// `false` is exact M4: the block delegates before any admission or
+    /// allocation, and the single-donor transplant recipe resumes untouched.
+    pub enabled: bool,
+    pub mode: FieldColliderMode,
+    pub boundary: MotionBoundaryMode,
+    pub input_a: MotionDonor,
+    pub input_b: MotionDonor,
+}
+
+impl Default for FieldColliderParams {
+    fn default() -> Self {
+        Self {
+            algorithm_version: FIELD_COLLIDER_ALGORITHM_VERSION,
+            enabled: false,
+            mode: FieldColliderMode::Sum,
+            boundary: MotionBoundaryMode::Transparent,
+            input_a: MotionDonor::None,
+            input_b: MotionDonor::None,
+        }
+    }
+}
+
+impl FieldColliderParams {
+    pub fn sanitized(self) -> Self {
+        Self {
+            algorithm_version: FIELD_COLLIDER_ALGORITHM_VERSION,
+            ..self
+        }
+    }
+
+    /// The authored donor occupying one fixed input slot.
+    pub const fn input(self, input: FieldColliderInput) -> MotionDonor {
+        match input {
+            FieldColliderInput::A => self.input_a,
+            FieldColliderInput::B => self.input_b,
+        }
+    }
+
+    pub const fn input_mut(&mut self, input: FieldColliderInput) -> &mut MotionDonor {
+        match input {
+            FieldColliderInput::A => &mut self.input_a,
+            FieldColliderInput::B => &mut self.input_b,
+        }
+    }
+
+    /// True when this block is exactly the frozen M4 recipe.
+    ///
+    /// This is the *delegation* predicate, and it is deliberately narrower than
+    /// [`Self::admission`]: a disabled collider is inert authored state that
+    /// carries no fault, whereas an enabled collider with a bad input also
+    /// delegates but must stay visible.
+    pub const fn is_exact_m4(self) -> bool {
+        !self.enabled
+    }
+
+    /// Resolve the complete admission decision for this authored block.
+    ///
+    /// This single function is the whole admission law. The planner-collect,
+    /// executor-encode, and dependency-walk sites all call *this* — the S1–S4
+    /// three-site discipline is satisfied by construction rather than by three
+    /// hand-copied predicates that can drift apart.
+    pub fn admission(self) -> FieldColliderAdmission {
+        if !self.enabled {
+            return FieldColliderAdmission::Delegated {
+                diagnostic: FieldColliderDiagnostic::Disabled,
+            };
+        }
+        let mut resolved = [None, None];
+        for input in FieldColliderInput::ALL {
+            match self.input(input) {
+                MotionDonor::Selected { layer_id, .. } => {
+                    resolved[usize::from(input.index())] = Some(layer_id);
+                }
+                MotionDonor::Missing { .. } => {
+                    return FieldColliderAdmission::Delegated {
+                        diagnostic: FieldColliderDiagnostic::InputMissing { input },
+                    };
+                }
+                MotionDonor::None => {
+                    return FieldColliderAdmission::Delegated {
+                        diagnostic: FieldColliderDiagnostic::InputUnselected { input },
+                    };
+                }
+            }
+        }
+        let [Some(a), Some(b)] = resolved else {
+            // Unreachable: both slots were just proven `Selected`.
+            return FieldColliderAdmission::Delegated {
+                diagnostic: FieldColliderDiagnostic::InputUnselected {
+                    input: FieldColliderInput::A,
+                },
+            };
+        };
+        // A may equal the recipient and B may equal the recipient, but A and B
+        // may never alias each other: colliding a field with itself is not a
+        // second observation, and every mode would degenerate.
+        if a == b {
+            return FieldColliderAdmission::Delegated {
+                diagnostic: FieldColliderDiagnostic::AliasedInputs,
+            };
+        }
+        FieldColliderAdmission::Admitted {
+            input_a: a,
+            input_b: b,
+        }
+    }
+
+    /// True exactly when the collider owns the recipient's motion field.
+    pub fn is_admitted(self) -> bool {
+        matches!(self.admission(), FieldColliderAdmission::Admitted { .. })
+    }
+}
+
+/// The outcome of [`FieldColliderParams::admission`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldColliderAdmission {
+    /// The block runs and owns the recipient's derived motion field.
+    Admitted {
+        input_a: StableLayerId,
+        input_b: StableLayerId,
+    },
+    /// The block delegates to exact M4 before any admission or allocation.
+    /// `Disabled` is authored inertness; every other diagnostic is a fault the
+    /// operator must be able to see.
+    Delegated { diagnostic: FieldColliderDiagnostic },
+}
+
+impl FieldColliderAdmission {
+    pub const fn diagnostic(self) -> FieldColliderDiagnostic {
+        match self {
+            Self::Admitted { .. } => FieldColliderDiagnostic::None,
+            Self::Delegated { diagnostic } => diagnostic,
+        }
+    }
+}
+
+/// Typed, telemetry-safe collider faults. These name authored identity only:
+/// no host path, no filesystem metadata, and no pixel content.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FieldColliderDiagnostic {
+    #[default]
+    None,
+    /// Authored `enabled = false`. Not a fault: the exact M4 recipe is live.
+    Disabled,
+    /// The slot's saved donor did not survive reorder, removal, or replacement.
+    /// A tombstone never rebinds; it stays visible until reauthored.
+    InputMissing { input: FieldColliderInput },
+    /// The slot names no donor at all.
+    InputUnselected { input: FieldColliderInput },
+    /// Both slots resolved to the same layer.
+    AliasedInputs,
+    /// The recipient is the master scope, which owns no Faraday carrier.
+    MasterRecipient,
+    /// The block is enabled, but its recipient has no active transplant, so
+    /// there is no carrier to advect and nothing for a derived field to feed.
+    NoActiveTransplant,
+    /// The slot resolved, but its scope was not admitted a primitive field.
+    InputFieldUnavailable { input: FieldColliderInput },
+    /// The donor-local to recipient-local affine was non-finite or singular.
+    SingularTransform { input: FieldColliderInput },
+}
+
+impl FieldColliderDiagnostic {
+    /// True when this diagnostic describes a fault the operator should see.
+    /// `None` and `Disabled` are ordinary states, not faults.
+    pub const fn is_fault(self) -> bool {
+        !matches!(self, Self::None | Self::Disabled)
+    }
+}
+
+impl fmt::Display for FieldColliderDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "field collider admitted"),
+            Self::Disabled => write!(f, "field collider disabled; exact M4 transplant is live"),
+            Self::InputMissing { input } => write!(
+                f,
+                "field collider input {input} names a layer that is no longer present"
+            ),
+            Self::InputUnselected { input } => {
+                write!(f, "field collider input {input} names no donor")
+            }
+            Self::AliasedInputs => write!(f, "field collider inputs A and B name the same layer"),
+            Self::MasterRecipient => write!(f, "field collider requires a layer recipient"),
+            Self::NoActiveTransplant => write!(
+                f,
+                "field collider requires an active Faraday transplant to advect"
+            ),
+            Self::InputFieldUnavailable { input } => write!(
+                f,
+                "field collider input {input} was not admitted a primitive motion field"
+            ),
+            Self::SingularTransform { input } => write!(
+                f,
+                "field collider input {input} has a singular or non-finite field transform"
+            ),
+        }
+    }
+}
+
+/// One validated recipient-local observation entering the recombination law.
+///
+/// `velocity_uv_per_second` has already been mapped by
+/// `linear(inverse(R) * D)`; translation never reaches a vector.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ColliderInputSample {
+    pub velocity_uv_per_second: [f32; 2],
+    pub confidence: f32,
+    pub visibility: f32,
+}
+
+impl ColliderInputSample {
+    /// Validate one mapped observation. Any non-finite or out-of-range
+    /// component removes the whole sample; a partially trusted reading would
+    /// let one hostile component steer a mode that mixes both.
+    pub fn validated(self) -> Option<Self> {
+        let [x, y] = self.velocity_uv_per_second;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        if x.abs() > MOTION_MAX_UV_PER_SECOND || y.abs() > MOTION_MAX_UV_PER_SECOND {
+            return None;
+        }
+        if !self.confidence.is_finite() || !self.visibility.is_finite() {
+            return None;
+        }
+        if !(0.0..=1.0).contains(&self.confidence) || !(0.0..=1.0).contains(&self.visibility) {
+            return None;
+        }
+        Some(self)
+    }
+}
+
+/// Squared-magnitude floor below which a direction is not a direction.
+const COLLIDER_EPSILON: f32 = 1e-12;
+
+/// The complete v1 recombination law over two validated recipient-local
+/// vectors. This is the independent CPU reference `motion_collide.wgsl` is
+/// measured against, expression for expression.
+pub fn collide_vectors(mode: FieldColliderMode, a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    let d = [a[0] - b[0], a[1] - b[1]];
+    let m = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
+    let raw = match mode {
+        FieldColliderMode::Sum => [a[0] + b[0], a[1] + b[1]],
+        FieldColliderMode::Difference => d,
+        FieldColliderMode::Curl => [-d[1], d[0]],
+        FieldColliderMode::Projection => {
+            let bb = b[0].mul_add(b[0], b[1] * b[1]);
+            if bb <= COLLIDER_EPSILON {
+                [0.0, 0.0]
+            } else {
+                let ab = a[0].mul_add(b[0], a[1] * b[1]);
+                let scale = ab / bb;
+                [b[0] * scale, b[1] * scale]
+            }
+        }
+        FieldColliderMode::CollisionBoundary => {
+            let dd = d[0].mul_add(d[0], d[1] * d[1]);
+            if dd <= COLLIDER_EPSILON {
+                m
+            } else {
+                // Remove the mean flow normal to disagreement.
+                let md = m[0].mul_add(d[0], m[1] * d[1]);
+                let scale = md / dd;
+                [m[0] - d[0] * scale, m[1] - d[1] * scale]
+            }
+        }
+    };
+    [clamp_motion_velocity(raw[0]), clamp_motion_velocity(raw[1])]
+}
+
+/// The complete derived sample for one cell.
+///
+/// Both inputs must be present and validated. A missing or invalid input yields
+/// the exact invalid/zero sample — it never reuses the surviving input and
+/// never reuses a prior derived field, because either would present an
+/// observation the collider did not make.
+///
+/// Confidence and visibility are componentwise minima. The Faraday gate then
+/// applies threshold/softness/occlusion exactly once, downstream, in
+/// `motion_apply.wgsl` and `motion_refresh.wgsl` — this function never
+/// pre-applies it.
+pub fn collide_motion_samples(
+    mode: FieldColliderMode,
+    a: Option<ColliderInputSample>,
+    b: Option<ColliderInputSample>,
+) -> MotionVectorSample {
+    let (Some(a), Some(b)) = (
+        a.and_then(ColliderInputSample::validated),
+        b.and_then(ColliderInputSample::validated),
+    ) else {
+        return MotionVectorSample::default();
+    };
+    MotionVectorSample {
+        velocity_uv_per_second: collide_vectors(
+            mode,
+            a.velocity_uv_per_second,
+            b.velocity_uv_per_second,
+        ),
+        confidence: a.confidence.min(b.confidence),
+        visibility: a.visibility.min(b.visibility),
+    }
+}
+
+/// Byte-exact collider-specific resource delta for one admitted collider.
+///
+/// The two primitive input fields and the sole persistent carrier are already
+/// charged by [`MotionResourcePlan::preflight`]; this plan carries only the
+/// three surfaces the collider itself adds, so nothing is double counted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldColliderResourcePlan {
+    pub active_colliders: u32,
+    pub grid: Option<MotionGrid>,
+    pub derived_vector_bytes: u64,
+    pub derived_gate_bytes: u64,
+    pub transient_pair_bytes: u64,
+    pub total_bytes: u64,
+    /// Two low-resolution passes per admitted collider.
+    pub low_resolution_passes: u32,
+    /// Five nearest lookups per admitted collider: two in pass 1, three in
+    /// pass 2.
+    pub nearest_lookups: u32,
+    /// The ordinary three-sampled-texture ceiling is unchanged by this block.
+    pub max_sampled_textures_in_pass: u32,
+}
+
+impl FieldColliderResourcePlan {
+    /// Preflight one composition's collider requests.
+    ///
+    /// `grids` carries the output grid of every admitted collider. An empty
+    /// slice is the exact-M4 plan: all zeros, no pass, no surface.
+    pub fn preflight(
+        grids: &[MotionGrid],
+        limits: MotionDeviceLimits,
+    ) -> Result<Self, MotionPlanError> {
+        let mut plan = Self::default();
+        for grid in grids {
+            plan.active_colliders = plan
+                .active_colliders
+                .checked_add(1)
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            if plan.active_colliders > MOTION_MAX_ACTIVE_COLLIDERS {
+                return Err(MotionPlanError::TooManyColliders {
+                    count: plan.active_colliders,
+                    limit: MOTION_MAX_ACTIVE_COLLIDERS,
+                });
+            }
+            if grid.width == 0
+                || grid.height == 0
+                || grid.width > MOTION_FIELD_MAX_EDGE
+                || grid.height > MOTION_FIELD_MAX_EDGE
+            {
+                return Err(MotionPlanError::FieldEdge {
+                    dimensions: [grid.width, grid.height],
+                    limit: MOTION_FIELD_MAX_EDGE,
+                });
+            }
+            if grid.width > limits.max_texture_dimension_2d
+                || grid.height > limits.max_texture_dimension_2d
+            {
+                return Err(MotionPlanError::DeviceTextureDimension {
+                    dimensions: [grid.width, grid.height],
+                    limit: limits.max_texture_dimension_2d,
+                });
+            }
+            let cells = u64::from(grid.width)
+                .checked_mul(u64::from(grid.height))
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            if cells != grid.vector_count || cells > MOTION_FIELD_MAX_VECTORS {
+                return Err(MotionPlanError::VectorCount {
+                    count: cells,
+                    limit: MOTION_FIELD_MAX_VECTORS,
+                });
+            }
+            let derived_vector_bytes = checked_bytes(cells, DERIVED_VECTOR_BYTES_PER_CELL)?;
+            let derived_gate_bytes = checked_bytes(cells, DERIVED_GATE_BYTES_PER_CELL)?;
+            let transient_pair_bytes = checked_bytes(cells, TRANSIENT_PAIR_BYTES_PER_CELL)?;
+            let field_bytes = derived_vector_bytes
+                .checked_add(derived_gate_bytes)
+                .and_then(|value| value.checked_add(transient_pair_bytes))
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            // One collider's complete working set is one field's worth of
+            // resource and is bounded by the same per-field ceiling.
+            if field_bytes > MOTION_FIELD_MAX_BYTES {
+                return Err(MotionPlanError::FieldBytes {
+                    bytes: field_bytes,
+                    limit: MOTION_FIELD_MAX_BYTES,
+                });
+            }
+            plan.grid = Some(*grid);
+            plan.derived_vector_bytes = plan
+                .derived_vector_bytes
+                .checked_add(derived_vector_bytes)
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            plan.derived_gate_bytes = plan
+                .derived_gate_bytes
+                .checked_add(derived_gate_bytes)
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            plan.transient_pair_bytes = plan
+                .transient_pair_bytes
+                .checked_add(transient_pair_bytes)
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            plan.low_resolution_passes = plan
+                .low_resolution_passes
+                .checked_add(2)
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            plan.nearest_lookups = plan
+                .nearest_lookups
+                .checked_add(5)
+                .ok_or(MotionPlanError::ArithmeticOverflow)?;
+            plan.max_sampled_textures_in_pass = plan.max_sampled_textures_in_pass.max(3);
+        }
+        plan.total_bytes = plan
+            .derived_vector_bytes
+            .checked_add(plan.derived_gate_bytes)
+            .and_then(|value| value.checked_add(plan.transient_pair_bytes))
+            .ok_or(MotionPlanError::ArithmeticOverflow)?;
+        if plan.total_bytes > limits.max_motion_bytes {
+            return Err(MotionPlanError::AggregateBytes {
+                bytes: plan.total_bytes,
+                limit: limits.max_motion_bytes,
+            });
+        }
+        Ok(plan)
+    }
+
+    /// The exact per-cell charge this plan represents. Zero with no collider.
+    pub const fn bytes_per_cell(self) -> u64 {
+        if self.active_colliders == 0 {
+            0
+        } else {
+            FIELD_COLLIDER_BYTES_PER_CELL
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn generous_limits() -> MotionDeviceLimits {
         MotionDeviceLimits::new(8_192, 256 * 1024 * 1024)
+    }
+
+    // -----------------------------------------------------------------
+    // Field Collider v1
+    // -----------------------------------------------------------------
+
+    fn collider_donor(id: u64, position: u32) -> MotionDonor {
+        MotionDonor::Selected {
+            layer_id: StableLayerId::new(id).unwrap(),
+            saved_position: SavedLayerPosition::new(position).unwrap(),
+        }
+    }
+
+    fn armed_collider(mode: FieldColliderMode) -> FieldColliderParams {
+        FieldColliderParams {
+            enabled: true,
+            mode,
+            input_a: collider_donor(11, 0),
+            input_b: collider_donor(22, 1),
+            ..FieldColliderParams::default()
+        }
+    }
+
+    fn collider_sample(
+        velocity: [f32; 2],
+        confidence: f32,
+        visibility: f32,
+    ) -> ColliderInputSample {
+        ColliderInputSample {
+            velocity_uv_per_second: velocity,
+            confidence,
+            visibility,
+        }
+    }
+
+    #[test]
+    fn field_collider_vocabularies_are_closed_and_their_codes_are_append_only() {
+        assert_eq!(FIELD_COLLIDER_ALGORITHM_VERSION, 1);
+        let codes: Vec<u32> = FieldColliderMode::ALL
+            .iter()
+            .map(|mode| mode.code())
+            .collect();
+        assert_eq!(codes, vec![0, 1, 2, 3, 4]);
+        assert_eq!(FieldColliderMode::default(), FieldColliderMode::Sum);
+
+        // The motion boundary deliberately does NOT mint a fourth table: its
+        // codes are the frozen image-boundary numbering, so `1` means Mirror
+        // everywhere in the program.
+        let boundary_codes: Vec<u32> = MotionBoundaryMode::ALL
+            .iter()
+            .map(|boundary| boundary.code())
+            .collect();
+        assert_eq!(boundary_codes, vec![0, 1, 2, 3]);
+        assert_eq!(
+            MotionBoundaryMode::default(),
+            MotionBoundaryMode::Transparent
+        );
+        assert_eq!(
+            MotionBoundaryMode::Transparent.code(),
+            crate::visual_rack::DisplaceBoundary::Transparent.code()
+        );
+        assert_eq!(
+            MotionBoundaryMode::Mirror.code(),
+            crate::visual_rack::DisplaceBoundary::Mirror.code()
+        );
+        assert_eq!(
+            MotionBoundaryMode::Wrap.code(),
+            crate::visual_rack::DisplaceBoundary::Wrap.code()
+        );
+        assert_eq!(
+            MotionBoundaryMode::Hold.code(),
+            crate::visual_rack::DisplaceBoundary::Hold.code()
+        );
+        assert_eq!(
+            MotionBoundaryMode::Hold.code(),
+            crate::symmetry::SymmetryBoundary::Hold.code()
+        );
+
+        assert_eq!(FieldColliderInput::A.index(), 0);
+        assert_eq!(FieldColliderInput::B.index(), 1);
+        assert_eq!(
+            FieldColliderInput::from_index(0),
+            Some(FieldColliderInput::A)
+        );
+        assert_eq!(
+            FieldColliderInput::from_index(1),
+            Some(FieldColliderInput::B)
+        );
+        assert_eq!(FieldColliderInput::from_index(2), None);
+    }
+
+    #[test]
+    fn field_collider_modes_match_their_analytic_definitions() {
+        let a = [3.0, 1.0];
+        let b = [1.0, -1.0];
+        // d = a - b = (2, 2); m = (a + b) / 2 = (2, 0).
+        assert_eq!(collide_vectors(FieldColliderMode::Sum, a, b), [4.0, 0.0]);
+        assert_eq!(
+            collide_vectors(FieldColliderMode::Difference, a, b),
+            [2.0, 2.0]
+        );
+        // Curl is d rotated a quarter turn: (-d.y, d.x).
+        assert_eq!(collide_vectors(FieldColliderMode::Curl, a, b), [-2.0, 2.0]);
+        // Projection: b * dot(a,b)/dot(b,b) = (1,-1) * 2/2 = (1,-1).
+        assert_eq!(
+            collide_vectors(FieldColliderMode::Projection, a, b),
+            [1.0, -1.0]
+        );
+        // Collision boundary: m - d * dot(m,d)/dot(d,d) = (2,0) - (2,2)*4/8.
+        assert_eq!(
+            collide_vectors(FieldColliderMode::CollisionBoundary, a, b),
+            [1.0, -1.0]
+        );
+
+        // Every mode is exactly zero on two zero inputs, and the two degenerate
+        // guards return their documented value rather than a division by zero.
+        for mode in FieldColliderMode::ALL {
+            assert_eq!(collide_vectors(mode, [0.0, 0.0], [0.0, 0.0]), [0.0, 0.0]);
+        }
+        assert_eq!(
+            collide_vectors(FieldColliderMode::Projection, [5.0, 7.0], [0.0, 0.0]),
+            [0.0, 0.0],
+            "a zero b has no direction to project onto"
+        );
+        assert_eq!(
+            collide_vectors(FieldColliderMode::CollisionBoundary, [4.0, 6.0], [4.0, 6.0]),
+            [4.0, 6.0],
+            "two agreeing inputs have no disagreement normal to remove, so the mean survives"
+        );
+    }
+
+    #[test]
+    fn every_mode_clamps_into_the_canonical_velocity_range() {
+        let extreme = MOTION_MAX_UV_PER_SECOND;
+        // Sum is the mode that can overflow from two in-range inputs.
+        assert_eq!(
+            collide_vectors(
+                FieldColliderMode::Sum,
+                [extreme, extreme],
+                [extreme, extreme]
+            ),
+            [extreme, extreme]
+        );
+        assert_eq!(
+            collide_vectors(
+                FieldColliderMode::Difference,
+                [-extreme, -extreme],
+                [extreme, extreme]
+            ),
+            [-extreme, -extreme]
+        );
+        assert_eq!(
+            collide_vectors(
+                FieldColliderMode::Curl,
+                [extreme, -extreme],
+                [-extreme, extreme]
+            ),
+            [extreme, extreme]
+        );
+        // The clamped value survives the canonical pack/unpack round trip,
+        // which is the whole point of clamping to exactly that interval.
+        for value in [extreme, -extreme, 0.0, 1.5] {
+            let clamped = clamp_motion_velocity(value);
+            let round_tripped = unpack_velocity(pack_velocity(clamped));
+            assert!(
+                (round_tripped - clamped).abs() <= extreme / f32::from(i16::MAX) + 1e-6,
+                "{clamped} did not survive the canonical lattice"
+            );
+        }
+        // A non-finite input lands on the DEFAULT, never on a clamped extreme.
+        // That is the established `finite_or` idiom throughout this module: an
+        // infinity is a broken observation, not a very fast one, and clamping
+        // it to the maximum velocity would invent the strongest possible motion
+        // out of a fault.
+        assert_eq!(clamp_motion_velocity(f32::NAN), 0.0);
+        assert_eq!(clamp_motion_velocity(f32::INFINITY), 0.0);
+        assert_eq!(clamp_motion_velocity(f32::NEG_INFINITY), 0.0);
+        // A finite over-range value IS clamped, because it is a real reading
+        // that merely exceeds what the field contract can carry.
+        assert_eq!(clamp_motion_velocity(extreme * 3.0), extreme);
+        assert_eq!(clamp_motion_velocity(-extreme * 3.0), -extreme);
+    }
+
+    #[test]
+    fn confidence_and_visibility_are_componentwise_minima_and_are_never_pre_gated() {
+        let derived = collide_motion_samples(
+            FieldColliderMode::Sum,
+            Some(collider_sample([1.0, 2.0], 0.25, 0.9)),
+            Some(collider_sample([3.0, 4.0], 0.75, 0.1)),
+        );
+        assert_eq!(derived.velocity_uv_per_second, [4.0, 6.0]);
+        assert_eq!(derived.confidence, 0.25);
+        assert_eq!(derived.visibility, 0.1);
+        // The velocity is emphatically NOT scaled by either gate here: the
+        // Faraday gate applies threshold/softness/occlusion exactly once,
+        // downstream.
+        assert_eq!(derived.velocity_uv_per_second, [4.0, 6.0]);
+    }
+
+    #[test]
+    fn an_invalid_input_yields_the_exact_zero_sample_and_never_reuses_its_partner() {
+        let good = collider_sample([7.0, -7.0], 1.0, 1.0);
+        let zero = MotionVectorSample::default();
+        for mode in FieldColliderMode::ALL {
+            assert_eq!(collide_motion_samples(mode, Some(good), None), zero);
+            assert_eq!(collide_motion_samples(mode, None, Some(good)), zero);
+            assert_eq!(collide_motion_samples(mode, None, None), zero);
+            for hostile in [
+                collider_sample([f32::NAN, 0.0], 1.0, 1.0),
+                collider_sample([0.0, f32::INFINITY], 1.0, 1.0),
+                collider_sample([MOTION_MAX_UV_PER_SECOND * 2.0, 0.0], 1.0, 1.0),
+                collider_sample([0.0, 0.0], f32::NAN, 1.0),
+                collider_sample([0.0, 0.0], 1.0, 2.0),
+                collider_sample([0.0, 0.0], -0.5, 1.0),
+            ] {
+                assert_eq!(
+                    collide_motion_samples(mode, Some(good), Some(hostile)),
+                    zero,
+                    "{mode:?} reused a surviving input"
+                );
+                assert_eq!(
+                    collide_motion_samples(mode, Some(hostile), Some(good)),
+                    zero,
+                    "{mode:?} reused a surviving input"
+                );
+            }
+        }
+        assert_eq!(
+            ColliderInputSample::default().validated(),
+            Some(ColliderInputSample::default()),
+            "an all-zero observation is valid; it is simply stationary"
+        );
+    }
+
+    #[test]
+    fn every_boundary_law_resolves_or_removes_its_lookup() {
+        // Transparent is inclusive on both edges and is the only removing law.
+        assert_eq!(
+            MotionBoundaryMode::Transparent.resolve([0.0, 1.0]),
+            Some([0.0, 1.0])
+        );
+        assert_eq!(MotionBoundaryMode::Transparent.resolve([-0.001, 0.5]), None);
+        assert_eq!(MotionBoundaryMode::Transparent.resolve([0.5, 1.001]), None);
+
+        assert_eq!(
+            MotionBoundaryMode::Hold.resolve([-3.0, 4.0]),
+            Some([0.0, 1.0])
+        );
+        assert_eq!(
+            MotionBoundaryMode::Wrap.resolve([1.25, -0.25]),
+            Some([0.25, 0.75])
+        );
+        // Mirror is the period-two triangular map: 1.25 folds to 0.75.
+        assert_eq!(
+            MotionBoundaryMode::Mirror.resolve([1.25, -0.25]),
+            Some([0.75, 0.25])
+        );
+        assert_eq!(
+            MotionBoundaryMode::Mirror.resolve([2.0, 3.0]),
+            Some([0.0, 1.0])
+        );
+
+        // A non-finite coordinate is removed by EVERY law, including the three
+        // that otherwise always produce a sample.
+        for boundary in MotionBoundaryMode::ALL {
+            assert_eq!(boundary.resolve([f32::NAN, 0.5]), None, "{boundary:?}");
+            assert_eq!(boundary.resolve([0.5, f32::INFINITY]), None, "{boundary:?}");
+            // Whatever survives is inside the closed unit interval.
+            if let Some([x, y]) = boundary.resolve([7.3, -4.1]) {
+                assert!((0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y));
+            }
+        }
+    }
+
+    #[test]
+    fn collider_admission_refuses_alias_missing_unselected_master_and_zero_transplant() {
+        let admitted = armed_collider(FieldColliderMode::Curl);
+        assert_eq!(
+            admitted.admission(),
+            FieldColliderAdmission::Admitted {
+                input_a: StableLayerId::new(11).unwrap(),
+                input_b: StableLayerId::new(22).unwrap(),
+            }
+        );
+        assert!(admitted.is_admitted());
+        assert_eq!(
+            admitted.admission().diagnostic(),
+            FieldColliderDiagnostic::None
+        );
+
+        // Disabled is exact M4 and carries no fault.
+        let disabled = FieldColliderParams::default();
+        assert!(disabled.is_exact_m4());
+        assert!(!disabled.is_admitted());
+        assert_eq!(
+            disabled.admission().diagnostic(),
+            FieldColliderDiagnostic::Disabled
+        );
+        assert!(!FieldColliderDiagnostic::Disabled.is_fault());
+        assert!(!FieldColliderDiagnostic::None.is_fault());
+
+        // A and B may never alias each other.
+        let mut aliased = admitted;
+        aliased.input_b = aliased.input_a;
+        assert_eq!(
+            aliased.admission().diagnostic(),
+            FieldColliderDiagnostic::AliasedInputs
+        );
+        assert!(FieldColliderDiagnostic::AliasedInputs.is_fault());
+
+        // Aliasing by layer id alone, even at a different saved position.
+        let mut aliased_position = admitted;
+        aliased_position.input_b = collider_donor(11, 5);
+        assert_eq!(
+            aliased_position.admission().diagnostic(),
+            FieldColliderDiagnostic::AliasedInputs
+        );
+
+        // A tombstone never rebinds; it refuses by name and by slot.
+        let mut missing_b = admitted;
+        missing_b.input_b = MotionDonor::Missing {
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+        };
+        assert_eq!(
+            missing_b.admission().diagnostic(),
+            FieldColliderDiagnostic::InputMissing {
+                input: FieldColliderInput::B
+            }
+        );
+        let mut unselected_a = admitted;
+        unselected_a.input_a = MotionDonor::None;
+        assert_eq!(
+            unselected_a.admission().diagnostic(),
+            FieldColliderDiagnostic::InputUnselected {
+                input: FieldColliderInput::A
+            }
+        );
+
+        // Scope-level refusals, answered by the one shared predicate.
+        let mut params = MotionParams {
+            collider: admitted,
+            ..MotionParams::default()
+        };
+        params.transplant.amount = 0.5;
+        assert!(matches!(
+            params.collider_admission(false),
+            FieldColliderAdmission::Admitted { .. }
+        ));
+        assert_eq!(
+            params.collider_admission(true).diagnostic(),
+            FieldColliderDiagnostic::MasterRecipient
+        );
+        params.transplant.amount = 0.0;
+        assert_eq!(
+            params.collider_admission(false).diagnostic(),
+            FieldColliderDiagnostic::NoActiveTransplant
+        );
+        // Authored inertness outranks every environmental fault, so a disabled
+        // block never accuses its scope of a problem it does not have.
+        params.collider.enabled = false;
+        assert_eq!(
+            params.collider_admission(true).diagnostic(),
+            FieldColliderDiagnostic::Disabled
+        );
+    }
+
+    #[test]
+    fn a_collider_input_may_name_its_own_recipient() {
+        // Only A-aliases-B is refused. A layer colliding its own field against
+        // another layer's is authored, not a cycle.
+        let recipient = StableLayerId::new(11).unwrap();
+        let params = FieldColliderParams {
+            enabled: true,
+            input_a: collider_donor(recipient.get(), 0),
+            input_b: collider_donor(22, 1),
+            ..FieldColliderParams::default()
+        };
+        assert_eq!(
+            params.admission(),
+            FieldColliderAdmission::Admitted {
+                input_a: recipient,
+                input_b: StableLayerId::new(22).unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_collider_block_sanitizes_and_survives_motion_sanitization() {
+        let hostile = FieldColliderParams {
+            algorithm_version: 99,
+            ..armed_collider(FieldColliderMode::Projection)
+        };
+        assert_eq!(
+            hostile.sanitized().algorithm_version,
+            FIELD_COLLIDER_ALGORITHM_VERSION
+        );
+        // Sanitizing preserves every authored field except the pinned version.
+        assert_eq!(hostile.sanitized().mode, FieldColliderMode::Projection);
+        assert_eq!(hostile.sanitized().input_a, hostile.input_a);
+        assert_eq!(hostile.sanitized().input_b, hostile.input_b);
+
+        let params = MotionParams {
+            collider: hostile,
+            ..MotionParams::default()
+        };
+        assert_eq!(
+            params.sanitized().collider.algorithm_version,
+            FIELD_COLLIDER_ALGORITHM_VERSION
+        );
+        assert_eq!(params.sanitized().collider.input_b, hostile.input_b);
+
+        // The default block is exactly M4 and does not disturb is_exact_zero.
+        assert!(MotionParams::default().is_exact_zero());
+        assert!(MotionParams::default().collider.is_exact_m4());
+        assert_eq!(
+            FieldColliderParams::default().input(FieldColliderInput::A),
+            MotionDonor::None
+        );
+
+        // Slot identity is a named field: writing A never disturbs B.
+        let mut slots = FieldColliderParams::default();
+        *slots.input_mut(FieldColliderInput::B) = collider_donor(7, 3);
+        assert_eq!(slots.input(FieldColliderInput::A), MotionDonor::None);
+        assert_eq!(slots.input(FieldColliderInput::B), collider_donor(7, 3));
+        *slots.input_mut(FieldColliderInput::A) = collider_donor(8, 4);
+        assert_eq!(slots.input(FieldColliderInput::B), collider_donor(7, 3));
+    }
+
+    #[test]
+    fn the_collider_ledger_is_exactly_twenty_bytes_per_cell_and_admits_one_collider() {
+        let limits = generous_limits();
+        let grid = MotionGrid::for_source([640, 480], MotionLatticeQuality::Live).unwrap();
+        let cells = grid.vector_count;
+
+        let empty = FieldColliderResourcePlan::preflight(&[], limits).unwrap();
+        assert_eq!(empty, FieldColliderResourcePlan::default());
+        assert_eq!(empty.total_bytes, 0);
+        assert_eq!(empty.bytes_per_cell(), 0);
+        assert_eq!(empty.low_resolution_passes, 0);
+
+        let plan = FieldColliderResourcePlan::preflight(&[grid], limits).unwrap();
+        assert_eq!(plan.active_colliders, 1);
+        assert_eq!(plan.grid, Some(grid));
+        // 8 derived-vector + 4 derived-gate + 8 transient-pair = 20.
+        assert_eq!(plan.derived_vector_bytes, cells * 8);
+        assert_eq!(plan.derived_gate_bytes, cells * 4);
+        assert_eq!(plan.transient_pair_bytes, cells * 8);
+        assert_eq!(plan.total_bytes, cells * 20);
+        assert_eq!(plan.bytes_per_cell(), FIELD_COLLIDER_BYTES_PER_CELL);
+        assert_eq!(FIELD_COLLIDER_BYTES_PER_CELL, 20);
+        // Two low-resolution passes and five nearest lookups per collider, with
+        // the ordinary three-sampled-texture ceiling unchanged.
+        assert_eq!(plan.low_resolution_passes, 2);
+        assert_eq!(plan.nearest_lookups, 5);
+        assert_eq!(plan.max_sampled_textures_in_pass, 3);
+
+        // The one-collider cap.
+        assert_eq!(
+            FieldColliderResourcePlan::preflight(&[grid, grid], limits),
+            Err(MotionPlanError::TooManyColliders {
+                count: 2,
+                limit: MOTION_MAX_ACTIVE_COLLIDERS,
+            })
+        );
+        assert_eq!(MOTION_MAX_ACTIVE_COLLIDERS, 1);
+    }
+
+    #[test]
+    fn the_collider_ledger_rejects_one_byte_over_every_independent_bound() {
+        let limits = generous_limits();
+        // Exactly at the per-field byte ceiling, then one cell over it.
+        let admitted_cells = MOTION_FIELD_MAX_BYTES / FIELD_COLLIDER_BYTES_PER_CELL;
+        let width = 1_024_u32;
+        let height = u32::try_from(admitted_cells / u64::from(width)).unwrap();
+        let at_cap = MotionGrid {
+            width,
+            height,
+            block_pixels: 8,
+            vector_count: u64::from(width) * u64::from(height),
+        };
+        let plan = FieldColliderResourcePlan::preflight(&[at_cap], limits).unwrap();
+        assert!(plan.total_bytes <= MOTION_FIELD_MAX_BYTES);
+
+        let one_row_over = MotionGrid {
+            height: height + 1,
+            vector_count: u64::from(width) * u64::from(height + 1),
+            ..at_cap
+        };
+        assert!(matches!(
+            FieldColliderResourcePlan::preflight(&[one_row_over], limits),
+            Err(MotionPlanError::FieldBytes { .. })
+        ));
+
+        // One over the absolute edge bound.
+        let over_edge = MotionGrid {
+            width: MOTION_FIELD_MAX_EDGE + 1,
+            height: 1,
+            block_pixels: 8,
+            vector_count: u64::from(MOTION_FIELD_MAX_EDGE) + 1,
+        };
+        assert!(matches!(
+            FieldColliderResourcePlan::preflight(&[over_edge], limits),
+            Err(MotionPlanError::FieldEdge { .. })
+        ));
+
+        // A zero extent is refused rather than silently producing no surface.
+        let empty_grid = MotionGrid {
+            width: 0,
+            height: 4,
+            block_pixels: 8,
+            vector_count: 0,
+        };
+        assert!(matches!(
+            FieldColliderResourcePlan::preflight(&[empty_grid], limits),
+            Err(MotionPlanError::FieldEdge { .. })
+        ));
+
+        // A grid whose declared count disagrees with its extent is refused,
+        // never trusted.
+        let inconsistent = MotionGrid {
+            width: 8,
+            height: 8,
+            block_pixels: 8,
+            vector_count: 63,
+        };
+        assert!(matches!(
+            FieldColliderResourcePlan::preflight(&[inconsistent], limits),
+            Err(MotionPlanError::VectorCount { .. })
+        ));
+
+        // The device texture-edge bound binds independently of the motion cap.
+        let small_device = MotionDeviceLimits::new(64, 256 * 1024 * 1024);
+        let grid = MotionGrid::for_source([1_920, 1_080], MotionLatticeQuality::Live).unwrap();
+        assert!(matches!(
+            FieldColliderResourcePlan::preflight(&[grid], small_device),
+            Err(MotionPlanError::DeviceTextureDimension { .. })
+        ));
+
+        // And so does the aggregate motion byte budget.
+        let tight = MotionDeviceLimits {
+            max_motion_bytes: 1,
+            ..generous_limits()
+        };
+        assert!(matches!(
+            FieldColliderResourcePlan::preflight(&[grid], tight),
+            Err(MotionPlanError::AggregateBytes { .. })
+        ));
+    }
+
+    #[test]
+    fn a_collider_diagnostic_names_its_slot_and_carries_no_host_detail() {
+        for diagnostic in [
+            FieldColliderDiagnostic::Disabled,
+            FieldColliderDiagnostic::AliasedInputs,
+            FieldColliderDiagnostic::MasterRecipient,
+            FieldColliderDiagnostic::NoActiveTransplant,
+            FieldColliderDiagnostic::InputMissing {
+                input: FieldColliderInput::A,
+            },
+            FieldColliderDiagnostic::InputUnselected {
+                input: FieldColliderInput::B,
+            },
+            FieldColliderDiagnostic::InputFieldUnavailable {
+                input: FieldColliderInput::A,
+            },
+            FieldColliderDiagnostic::SingularTransform {
+                input: FieldColliderInput::B,
+            },
+        ] {
+            let rendered = diagnostic.to_string();
+            assert!(!rendered.is_empty());
+            // Authored identity only: no path separator, no drive letter, no
+            // filesystem metadata.
+            assert!(!rendered.contains('/'), "{rendered}");
+            assert!(!rendered.contains('\\'), "{rendered}");
+            assert!(!rendered.contains(':'), "{rendered}");
+        }
+        assert!(FieldColliderDiagnostic::InputMissing {
+            input: FieldColliderInput::A
+        }
+        .to_string()
+        .contains(" A "));
+        assert!(FieldColliderDiagnostic::SingularTransform {
+            input: FieldColliderInput::B
+        }
+        .to_string()
+        .contains(" B "));
+        assert_eq!(FieldColliderInput::A.to_string(), "A");
+        assert_eq!(FieldColliderInput::B.to_string(), "B");
     }
 
     #[test]

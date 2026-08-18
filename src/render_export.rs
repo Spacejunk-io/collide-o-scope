@@ -83,7 +83,21 @@ const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
 ///
 /// Both landed against the same schema-3 base, so there is one schema 4 that
 /// carries both sections rather than two competing definitions.
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 4;
+///
+/// Bumped from 4 when the sidecar began recording the Field Collider. Every
+/// schema-4 key keeps its name and meaning; schema 5 is purely additive and
+/// adds one section, following the same 3 -> 4 precedent:
+///
+/// - `field_collider`: the authored identity of both collider inputs, the
+///   admitted output slot, the typed diagnostic, the byte-exact resource
+///   delta, and the discrete recombination law of the one collider this job
+///   admitted. Absent when the job ran the exact M4 recipe.
+///
+/// The section carries authored identity, topology, diagnostics, and budgets
+/// only. Derived vectors, the transient mapped pair, gate parities, and raw
+/// codec records are deliberately never recorded, and neither is any host path
+/// or filesystem metadata.
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 5;
 const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
 const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
@@ -265,6 +279,9 @@ pub struct ExportMotionMetadata {
     pub algorithm_version: u16,
     pub scopes: Vec<ExportMotionScopeMetadata>,
     pub scopes_truncated: bool,
+    /// The one admitted Field Collider, recorded from the shared evaluated
+    /// plan. `None` is the exact M4 job.
+    pub(crate) field_collider: Option<FieldColliderSidecar>,
 }
 
 impl Default for ExportMotionMetadata {
@@ -274,6 +291,7 @@ impl Default for ExportMotionMetadata {
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             scopes: Vec::new(),
             scopes_truncated: false,
+            field_collider: None,
         }
     }
 }
@@ -308,7 +326,7 @@ impl MotionSidecarArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum MotionSidecarScopeIdentity {
+pub(crate) enum MotionSidecarScopeIdentity {
     Master,
     Layer {
         saved_position: u32,
@@ -425,6 +443,52 @@ struct MotionSidecarLastFrame {
     scopes_truncated: bool,
 }
 
+/// One collider input, recorded by named slot.
+///
+/// Both slots are emitted always and never compacted, so a tombstone is
+/// recorded as a tombstone rather than re-resolved against whatever now
+/// occupies the vacated position. `resolved` false with a `saved_position`
+/// present is exactly that tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FieldColliderSidecarInput {
+    /// The closed named slot token, never an index.
+    slot: &'static str,
+    resolved: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    saved_position: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stable_id: Option<u64>,
+    /// The admitted primitive field slot this input was read from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_slot: Option<u8>,
+}
+
+/// The one Field Collider this job admitted, recorded after an accepted frame.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FieldColliderSidecar {
+    algorithm_version: u16,
+    recipient: MotionSidecarScopeIdentity,
+    admitted: bool,
+    /// The discrete recombination law, as its closed snake_case token.
+    mode: &'static str,
+    boundary: &'static str,
+    /// Derived slots append after every primitive field slot.
+    output_slot: u8,
+    output_grid: [u32; 2],
+    inputs: Vec<FieldColliderSidecarInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<String>,
+    /// The byte-exact collider-specific delta, twenty bytes per grid cell.
+    bytes_per_cell: u64,
+    derived_vector_bytes: u64,
+    derived_gate_bytes: u64,
+    transient_pair_bytes: u64,
+    total_bytes: u64,
+    low_resolution_passes: u32,
+    nearest_lookups: u32,
+    max_sampled_textures_in_pass: u32,
+}
+
 /// The rack scope that owns one Symmetry Field. Unlike the motion scope
 /// identity this carries a group arm, because a rack — and therefore a
 /// dedicated pass — can be authored at master, layer, or group scope.
@@ -505,6 +569,8 @@ struct ExportMotionSidecar {
     distinct_dynamic_states_truncated: bool,
     symmetry_fields: Vec<SymmetrySidecarNode>,
     symmetry_fields_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field_collider: Option<FieldColliderSidecar>,
     last_accepted_frame: Option<MotionSidecarLastFrame>,
     warnings: Vec<String>,
 }
@@ -521,6 +587,7 @@ struct ExportMotionSidecarAccumulator {
     distinct_truncated: bool,
     symmetry_fields: Vec<SymmetrySidecarNode>,
     symmetry_fields_truncated: bool,
+    field_collider: Option<FieldColliderSidecar>,
     last: Option<MotionSidecarLastFrame>,
 }
 
@@ -2216,6 +2283,8 @@ impl ExportMotionSidecarAccumulator {
             distinct_truncated: false,
             symmetry_fields,
             symmetry_fields_truncated,
+            // Recorded only after an accepted frame, never at construction.
+            field_collider: None,
             last: None,
         }
     }
@@ -2249,6 +2318,13 @@ impl ExportMotionSidecarAccumulator {
                 state: state.clone(),
             });
         }
+        // Authored topology, resolved once per job by the shared evaluated
+        // plan, so the first accepted frame is complete and later frames cannot
+        // contradict it. Recording it here rather than at construction is what
+        // makes "only after an accepted frame" literal.
+        if self.field_collider.is_none() {
+            self.field_collider = metadata.field_collider.clone();
+        }
         self.last = Some(MotionSidecarLastFrame {
             accepted_frame: frame,
             scopes,
@@ -2272,6 +2348,7 @@ impl ExportMotionSidecarAccumulator {
             distinct_dynamic_states_truncated: self.distinct_truncated,
             symmetry_fields: self.symmetry_fields,
             symmetry_fields_truncated: self.symmetry_fields_truncated,
+            field_collider: self.field_collider,
             last_accepted_frame: self.last,
             warnings: warnings
                 .into_iter()
@@ -3215,10 +3292,15 @@ fn resolved_export_motion(
     config: Option<crate::patch::MotionConfig>,
     layer_ids: &[StableLayerId],
 ) -> crate::motion::MotionParams {
-    let config = config.unwrap_or_default().sanitized();
-    let mut params = config.to_params().sanitized();
-    params.transplant.donor = config.transplant.donor.resolve_runtime(layer_ids);
-    params
+    // Delegate to the single shared resolver rather than resolving one donor
+    // by hand here. `MotionConfig::resolve_runtime` sanitizes and then binds
+    // EVERY Motion-subsystem donor the block owns — the Faraday transplant's
+    // and both Field Collider inputs — so an offline render can never resolve a
+    // different set of donors than a live one.
+    config
+        .unwrap_or_default()
+        .sanitized()
+        .resolve_runtime(layer_ids)
 }
 
 fn resolved_export_patch_temporal(
@@ -3704,6 +3786,114 @@ fn export_rendered_motion_fields(
         .collect()
 }
 
+/// The saved, path-free export identity of one motion scope.
+///
+/// Extracted so the Field Collider's recipient is named by exactly the same
+/// rule as every authored motion scope, rather than by a second inline copy
+/// that could drift.
+fn export_motion_scope_identity(
+    scope: crate::visual_rack::VisualScopeId,
+    graph: &ExportCreativeGraph,
+) -> Option<ExportMotionScopeIdentity> {
+    match scope {
+        crate::visual_rack::VisualScopeId::Master => Some(ExportMotionScopeIdentity::Master),
+        crate::visual_rack::VisualScopeId::Layer(layer_id) => {
+            let saved_position = graph
+                .layer_ids
+                .iter()
+                .position(|candidate| *candidate == layer_id)?;
+            Some(ExportMotionScopeIdentity::Layer {
+                saved_position: u32::try_from(saved_position).unwrap_or(u32::MAX),
+                stable_id: layer_id.get(),
+                source_tap_id: export_selective_layer_id(saved_position),
+            })
+        }
+        crate::visual_rack::VisualScopeId::Group(_)
+        | crate::visual_rack::VisualScopeId::Program => None,
+    }
+}
+
+/// Record the one admitted Field Collider from the shared evaluated plan.
+///
+/// Live and export consume this same plan, so the section describes exactly
+/// what rendered. It carries authored identity, topology, diagnostics, and the
+/// byte-exact budget only — never a vector, a pair texel, or a codec record.
+fn field_collider_sidecar(
+    motion: &crate::evaluated_frame::evaluated_composition::AdvancedMotionPlan,
+    graph: &ExportCreativeGraph,
+) -> Option<FieldColliderSidecar> {
+    use crate::evaluated_frame::evaluated_composition::MotionPlanDiagnostic;
+    use crate::motion::{
+        FieldColliderDiagnostic, FieldColliderMode, MotionBoundaryMode, MotionDonor,
+    };
+
+    let plan = motion.collider()?;
+    let recipient_scope = motion.scope(plan.recipient_scope)?;
+    let recipient =
+        sidecar_scope_identity(export_motion_scope_identity(plan.recipient_scope, graph)?);
+    let authored = recipient_scope.params.collider;
+    let resources = motion.collider_resources();
+    let mut inputs = Vec::with_capacity(2);
+    for (slot, donor, field_slot) in [
+        ("a", authored.input_a, plan.input_a_slot),
+        ("b", authored.input_b, plan.input_b_slot),
+    ] {
+        let (resolved, saved_position, stable_id) = match donor {
+            MotionDonor::None => (false, None, None),
+            MotionDonor::Selected {
+                layer_id,
+                saved_position,
+            } => (true, Some(saved_position.get()), Some(layer_id.get())),
+            MotionDonor::Missing { saved_position } => (false, Some(saved_position.get()), None),
+        };
+        inputs.push(FieldColliderSidecarInput {
+            slot,
+            resolved,
+            saved_position,
+            stable_id,
+            field_slot: resolved.then_some(field_slot),
+        });
+    }
+    let diagnostic = motion.diagnostics().iter().find_map(|entry| match entry {
+        MotionPlanDiagnostic::FieldCollider { diagnostic, .. }
+            if *diagnostic != FieldColliderDiagnostic::None =>
+        {
+            Some(diagnostic.to_string())
+        }
+        _ => None,
+    });
+    Some(FieldColliderSidecar {
+        algorithm_version: plan.algorithm_version,
+        recipient,
+        admitted: recipient_scope.collider_admitted,
+        mode: match plan.mode {
+            FieldColliderMode::Sum => "sum",
+            FieldColliderMode::Difference => "difference",
+            FieldColliderMode::Curl => "curl",
+            FieldColliderMode::Projection => "projection",
+            FieldColliderMode::CollisionBoundary => "collision_boundary",
+        },
+        boundary: match plan.boundary {
+            MotionBoundaryMode::Transparent => "transparent",
+            MotionBoundaryMode::Mirror => "mirror",
+            MotionBoundaryMode::Wrap => "wrap",
+            MotionBoundaryMode::Hold => "hold",
+        },
+        output_slot: plan.output_slot,
+        output_grid: [plan.output_grid.width, plan.output_grid.height],
+        inputs,
+        diagnostic,
+        bytes_per_cell: resources.bytes_per_cell(),
+        derived_vector_bytes: resources.derived_vector_bytes,
+        derived_gate_bytes: resources.derived_gate_bytes,
+        transient_pair_bytes: resources.transient_pair_bytes,
+        total_bytes: resources.total_bytes,
+        low_resolution_passes: resources.low_resolution_passes,
+        nearest_lookups: resources.nearest_lookups,
+        max_sampled_textures_in_pass: resources.max_sampled_textures_in_pass,
+    })
+}
+
 fn export_motion_metadata_for_frame(
     plan: &EvaluatedCompositionPlan,
     graph: &ExportCreativeGraph,
@@ -3739,6 +3929,7 @@ fn export_motion_metadata_for_frame_from<'a>(
     let Some(motion) = plan.motion().advanced() else {
         return metadata;
     };
+    metadata.field_collider = field_collider_sidecar(motion, graph);
     metadata.scopes_truncated = motion.scopes().len() > MAX_EXPORT_MOTION_SIDECAR_SCOPES;
     metadata
         .scopes
@@ -3755,24 +3946,8 @@ fn export_motion_metadata_for_frame_from<'a>(
         .iter()
         .take(MAX_EXPORT_MOTION_SIDECAR_SCOPES)
     {
-        let identity = match scope.scope {
-            crate::visual_rack::VisualScopeId::Master => ExportMotionScopeIdentity::Master,
-            crate::visual_rack::VisualScopeId::Layer(layer_id) => {
-                let Some(saved_position) = graph
-                    .layer_ids
-                    .iter()
-                    .position(|candidate| *candidate == layer_id)
-                else {
-                    continue;
-                };
-                ExportMotionScopeIdentity::Layer {
-                    saved_position: u32::try_from(saved_position).unwrap_or(u32::MAX),
-                    stable_id: layer_id.get(),
-                    source_tap_id: export_selective_layer_id(saved_position),
-                }
-            }
-            crate::visual_rack::VisualScopeId::Group(_)
-            | crate::visual_rack::VisualScopeId::Program => continue,
+        let Some(identity) = export_motion_scope_identity(scope.scope, graph) else {
+            continue;
         };
         let (donor_saved_position, donor_stable_id) = match scope.params.transplant.donor {
             crate::motion::MotionDonor::None => (None, None),
@@ -3894,6 +4069,13 @@ fn export_motion_plan_warnings(plan: &EvaluatedCompositionPlan) -> Vec<String> {
                 "Master Faraday transplant has no layer recipient and was rendered inactive."
                     .to_owned()
             }
+            MotionPlanDiagnostic::FieldCollider {
+                recipient,
+                diagnostic,
+            } => format!(
+                "Motion recipient layer {} Field Collider was not admitted: {diagnostic}. The exact M4 transplant recipe rendered instead.",
+                recipient.get()
+            ),
             MotionPlanDiagnostic::DonorNotSelected { recipient } => format!(
                 "Motion recipient layer {} has no selected donor; Faraday transplant was rendered inactive.",
                 recipient.get()
@@ -8826,6 +9008,126 @@ layers:
     /// stayed a tombstone. The record is bounded and carries stable identities
     /// only — never a host path, a filename, or filesystem metadata.
     #[test]
+    fn field_collider_export_provenance_records_both_slots_and_no_pixels() {
+        use crate::evaluated_frame::evaluated_composition::EvaluatedFieldColliderPlan;
+        use crate::motion::{
+            FieldColliderMode, MotionBoundaryMode, MotionDonor, MotionGrid, MotionParams,
+            FIELD_COLLIDER_ALGORITHM_VERSION,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        // A record built from the shared evaluated plan: slot A resolves onto a
+        // live layer, slot B is a retained tombstone. Both are recorded, always
+        // and never compacted, so a tombstone can never be read as belonging to
+        // its partner.
+        let grid = MotionGrid::for_source([640, 480], Default::default()).unwrap();
+        let plan = EvaluatedFieldColliderPlan {
+            output_slot: 2,
+            recipient_scope: crate::visual_rack::VisualScopeId::Layer(
+                crate::image_routing::StableLayerId::new(41).unwrap(),
+            ),
+            input_a_scope: crate::visual_rack::VisualScopeId::Layer(
+                crate::image_routing::StableLayerId::new(42).unwrap(),
+            ),
+            input_a_slot: 0,
+            input_b_scope: crate::visual_rack::VisualScopeId::Layer(
+                crate::image_routing::StableLayerId::new(43).unwrap(),
+            ),
+            input_b_slot: 1,
+            output_grid: grid,
+            algorithm_version: FIELD_COLLIDER_ALGORITHM_VERSION,
+            mode: FieldColliderMode::CollisionBoundary,
+            boundary: MotionBoundaryMode::Wrap,
+        };
+        let _ = MotionParams::default();
+        let _ = MotionDonor::Missing {
+            saved_position: SavedLayerPosition::new(4).unwrap(),
+        };
+
+        let record = FieldColliderSidecar {
+            algorithm_version: plan.algorithm_version,
+            recipient: MotionSidecarScopeIdentity::Layer {
+                saved_position: 0,
+                stable_id: 41,
+                source_tap_id: 1,
+            },
+            admitted: true,
+            mode: "collision_boundary",
+            boundary: "wrap",
+            output_slot: plan.output_slot,
+            output_grid: [plan.output_grid.width, plan.output_grid.height],
+            inputs: vec![
+                FieldColliderSidecarInput {
+                    slot: "a",
+                    resolved: true,
+                    saved_position: Some(1),
+                    stable_id: Some(42),
+                    field_slot: Some(0),
+                },
+                FieldColliderSidecarInput {
+                    slot: "b",
+                    resolved: false,
+                    saved_position: Some(9),
+                    stable_id: None,
+                    field_slot: None,
+                },
+            ],
+            diagnostic: None,
+            bytes_per_cell: 20,
+            derived_vector_bytes: grid.vector_count * 8,
+            derived_gate_bytes: grid.vector_count * 4,
+            transient_pair_bytes: grid.vector_count * 8,
+            total_bytes: grid.vector_count * 20,
+            low_resolution_passes: 2,
+            nearest_lookups: 5,
+            max_sampled_textures_in_pass: 3,
+        };
+
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(json["algorithm_version"], 1);
+        assert_eq!(json["mode"], "collision_boundary");
+        assert_eq!(json["boundary"], "wrap");
+        assert_eq!(json["output_slot"], 2);
+        assert_eq!(json["bytes_per_cell"], 20);
+        assert_eq!(json["low_resolution_passes"], 2);
+        assert_eq!(json["max_sampled_textures_in_pass"], 3);
+
+        // BOTH slots are present, named, and never compacted.
+        let inputs = json["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["slot"], "a");
+        assert_eq!(inputs[0]["resolved"], true);
+        assert_eq!(inputs[0]["field_slot"], 0);
+        assert_eq!(inputs[1]["slot"], "b");
+        assert_eq!(inputs[1]["resolved"], false);
+        assert_eq!(inputs[1]["saved_position"], 9);
+        // A tombstone carries no live identity and no admitted field slot.
+        assert!(inputs[1].get("stable_id").is_none());
+        assert!(inputs[1].get("field_slot").is_none());
+
+        // Authored identity, topology, diagnostics, and budgets ONLY. No
+        // vector, no pair texel, no gate parity, no codec record, no host path.
+        let text = serde_json::to_string(&record).unwrap();
+        for forbidden in [
+            "velocity",
+            "pixels",
+            "texel",
+            "codec_record",
+            "renders/",
+            "\\\\",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "the collider provenance record leaked {forbidden}"
+            );
+        }
+        // `max_sampled_textures_in_pass` is a BUDGET key, not pixel content:
+        // the only occurrence of "texture" is that documented count.
+        assert_eq!(text.matches("texture").count(), 1);
+        assert!(text.contains("max_sampled_textures_in_pass"));
+    }
+
+    #[test]
     fn residual_export_provenance_names_every_route_slot_and_the_recombination_law() {
         use crate::image_routing::LayerImageStage;
         use crate::visual_rack::{ResidualBlock, ResidualQuantization, SavedImageSource};
@@ -8850,7 +9152,8 @@ layers:
         )
         .finish(Vec::new());
 
-        assert_eq!(sidecar.schema_version, 4);
+        assert_eq!(sidecar.schema_version, 5);
+        assert!(sidecar.field_collider.is_none());
         assert!(!sidecar.authored_residual_nodes_truncated);
         assert_eq!(sidecar.authored_residual_nodes.len(), 1);
         let record = &sidecar.authored_residual_nodes[0];
@@ -10411,6 +10714,7 @@ layers:
             distinct_truncated: false,
             symmetry_fields: Vec::new(),
             symmetry_fields_truncated: false,
+            field_collider: None,
             last: None,
         };
         let scope = ExportMotionScopeMetadata {
@@ -10447,6 +10751,7 @@ layers:
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             scopes: vec![scope.clone()],
             scopes_truncated: false,
+            field_collider: None,
         });
         let mut same_dynamic_state = scope.clone();
         same_dynamic_state.source_generation = Some(2);
@@ -10457,6 +10762,7 @@ layers:
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             scopes: vec![same_dynamic_state],
             scopes_truncated: false,
+            field_collider: None,
         });
         let mut fallback = scope.clone();
         fallback.source_origin = MotionFieldOrigin::LatticeFallback;
@@ -10474,12 +10780,14 @@ layers:
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             scopes: vec![fallback],
             scopes_truncated: false,
+            field_collider: None,
         });
         accumulator.observe_accepted(&ExportMotionMetadata {
             accepted_frame: Some(3),
             algorithm_version: crate::motion::MOTION_ALGORITHM_VERSION,
             scopes: vec![scope; MAX_EXPORT_MOTION_SIDECAR_SCOPES + 3],
             scopes_truncated: true,
+            field_collider: None,
         });
         let warnings = (0..MAX_EXPORT_WARNINGS + 5)
             .map(|index| format!("warning-{index}"))
@@ -10502,9 +10810,11 @@ layers:
         assert!(bytes.len() <= MAX_EXPORT_MOTION_SIDECAR_BYTES);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // Schema 4 appended the per-slot Symmetry Field route section and the
-        // Residual Counterpoint section. Every schema-3 key below is
-        // re-asserted unchanged.
-        assert_eq!(json["schema_version"], 4);
+        // Residual Counterpoint section; schema 5 appended the Field Collider
+        // section. Every earlier key below is re-asserted unchanged, and an
+        // exact-M4 job omits the collider section entirely.
+        assert_eq!(json["schema_version"], 5);
+        assert!(json.get("field_collider").is_none());
         assert!(json["symmetry_fields"].as_array().unwrap().is_empty());
         assert_eq!(json["symmetry_fields_truncated"], false);
         assert_eq!(json["cross_gpu_pixel_identity_guaranteed"], false);
@@ -16645,6 +16955,106 @@ mod effects_audit {
         .unwrap();
         patch.layers[0].rack = Some(rack);
         render("symmetry_field", patch);
+    }
+
+    /// Two stacked clips whose upper layer's Faraday carrier is advected by a
+    /// Field Collider. Input A names the recipient itself and input B names the
+    /// layer beneath it, which section 5 explicitly permits: either input may
+    /// equal the recipient, and only A aliasing B is forbidden.
+    ///
+    /// This is the labeled export case for the Motion-subsystem block: the
+    /// offline renderer consumes the same evaluated plan, the same two
+    /// low-resolution passes, and the same `motion_collide.wgsl`, with no
+    /// export-only collider path.
+    ///
+    /// The case carries a small Displace node for a reason unrelated to the
+    /// collider. An Advanced composition whose layers own NO image tap cannot
+    /// be scheduled today: `execution_order` breaks ties between equally-ready
+    /// sibling scopes with `BTreeSet::pop_first`, which orders by ascending
+    /// stable id, while `build_root_schedule` requires the composition's
+    /// back-to-front order. Export assigns ids front-to-back, so the two
+    /// disagree and preparation fails with "executed before structural
+    /// admission without a current retained tap". A plain single-donor Faraday
+    /// transplant on a two-layer tapless stack reproduces it exactly, with no
+    /// collider present, so it is a pre-existing M4 defect rather than a
+    /// collider one — motion simply had no labeled export case before now to
+    /// surface it. Every other labeled Advanced export case carries a rack node
+    /// for the same structural reason, and one image tap is what retains the
+    /// sibling and makes the schedule legal.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_field_collider_pipeline() {
+        use crate::patch::{
+            FaradayConfig, FieldColliderConfig, FieldColliderModeConfig, MotionBoundaryModeConfig,
+            MotionCarrierConfig, MotionConfig, MotionDonorConfig,
+        };
+        use crate::visual_rack::{
+            DisplaceBoundary, DisplaceParams, EdgeTiming, LegacyRackScope, SavedImageSource,
+            SavedImageTap, VisualNodeKind, VisualRack,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        let donor = patch.layers[0].clone();
+        patch.layers.push(donor);
+        // Give the lower input visibly different local colour so the collided
+        // advection is legible against either input taken alone.
+        patch.layers[1].effects.hue_shift = 200.0;
+
+        // A small Displace on the upper layer, tapping the layer below. It is
+        // NOT part of what this case demonstrates: it exists because an
+        // Advanced composition whose layers own no image tap at all cannot be
+        // scheduled today (see the doc comment above), and every other labeled
+        // Advanced export case carries a rack node for the same structural
+        // reason. Its amounts are deliberately small so the collided advection
+        // remains the legible subject of the render.
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Displace(DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::OneBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount_x: 0.02,
+            amount_y: 0.02,
+            boundary: DisplaceBoundary::Hold,
+        }))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+
+        // Layer 0 is the recipient and owns the shared carrier and advection
+        // controls. Input A is the recipient's own field, input B the layer
+        // below it; neither carries an authored Motion effect of its own, so
+        // only `required_as_donor` pulls their primitive fields into the plan.
+        patch.layers[0].motion = Some(MotionConfig {
+            transplant: FaradayConfig {
+                amount: 0.85,
+                carrier: MotionCarrierConfig::FirstSourceFrame,
+                confidence_threshold: 0.05,
+                confidence_softness: 0.1,
+                refresh: 0.35,
+                decay: 0.9,
+                ..FaradayConfig::default()
+            },
+            collider: FieldColliderConfig {
+                enabled: true,
+                mode: FieldColliderModeConfig::CollisionBoundary,
+                boundary: MotionBoundaryModeConfig::Mirror,
+                input_a: MotionDonorConfig::Selected {
+                    saved_position: SavedLayerPosition::new(0).expect("layer 0 exists"),
+                },
+                input_b: MotionDonorConfig::Selected {
+                    saved_position: SavedLayerPosition::new(1).expect("layer 1 exists"),
+                },
+                ..FieldColliderConfig::default()
+            },
+            ..MotionConfig::default()
+        });
+        render("field_collider", patch);
     }
 
     /// Three stacked clips where the upper layer's Residual Counterpoint node

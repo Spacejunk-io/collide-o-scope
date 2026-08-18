@@ -20,7 +20,7 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    GestureCanvasConfig, MotionConfig, MotionDonorConfig, RefreshGardenConfig,
+    FieldColliderConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig, RefreshGardenConfig,
     RefreshGardenMatteRouteConfig, RefreshGardenMotionRouteConfig, TemporalLoomConfig,
     TemporalOriginalsConfig, TemporalResetPolicyConfig,
 };
@@ -782,6 +782,14 @@ fn interpolate_motion_config(
             chromatic_lag: blend_finite(a.shutter.chromatic_lag, b.shutter.chromatic_lag, weights),
             quality: pick(a.shutter.quality, b.shutter.quality, choose_b),
         },
+        // Field Collider v1 has no continuous control, so the *entire* block is
+        // one endpoint recall taken at the midpoint. Picking the block whole —
+        // rather than each field independently — is what makes the choice
+        // endpoint-exact: a per-field pick would be identical here only by
+        // accident, and would start synthesizing third configurations the
+        // instant v2 adds a field whose meaning depends on the mode or on which
+        // pair of donors is armed.
+        collider: pick(a.collider, b.collider, choose_b),
     }
     .sanitized()
 }
@@ -1491,6 +1499,33 @@ fn remap_motion_donor_after_move(donor: &mut MotionDonorConfig, from: usize, to:
     *saved_position = remapped_saved_position_after_move(*saved_position, from, to);
 }
 
+/// Remap both Field Collider inputs after a layer move.
+///
+/// The two slots are remapped independently through the same single-donor law
+/// the transplant uses. This is deliberately a two-slot *variant* rather than a
+/// loop over a collection: slot identity is route identity, so A and B are
+/// named fields, and remapping them one at a time is what keeps input B's saved
+/// position from sliding when input A is cleared.
+///
+/// A Field Collider donor lives on the Motion subsystem path, not the visual
+/// rack. It is deliberately absent from `remap_saved_rack_routes_after_move`
+/// and its siblings, which match on `VisualNodeKind` and would never see it.
+fn remap_motion_collider_inputs_after_move(
+    collider: &mut FieldColliderConfig,
+    from: usize,
+    to: usize,
+) {
+    remap_motion_donor_after_move(&mut collider.input_a, from, to);
+    remap_motion_donor_after_move(&mut collider.input_b, from, to);
+}
+
+/// Remap both Field Collider inputs after a layer removal. A slot whose layer
+/// was the one removed becomes a `Missing` tombstone and never rebinds.
+fn remap_motion_collider_inputs_after_remove(collider: &mut FieldColliderConfig, removed: usize) {
+    remap_motion_donor_after_remove(&mut collider.input_a, removed);
+    remap_motion_donor_after_remove(&mut collider.input_b, removed);
+}
+
 fn remap_motion_donor_after_remove(donor: &mut MotionDonorConfig, removed: usize) {
     let MotionDonorConfig::Selected { saved_position } = *donor else {
         return;
@@ -1721,10 +1756,12 @@ impl MorphSlot {
         remap_score_driver_after_remove(&mut self.temporal.originals.score.loop_driver, removed);
         if let Some(motion) = &mut self.master_motion {
             remap_motion_donor_after_remove(&mut motion.transplant.donor, removed);
+            remap_motion_collider_inputs_after_remove(&mut motion.collider, removed);
         }
         for layer in &mut self.layers {
             if let Some(motion) = &mut layer.motion {
                 remap_motion_donor_after_remove(&mut motion.transplant.donor, removed);
+                remap_motion_collider_inputs_after_remove(&mut motion.collider, removed);
             }
         }
         if let Some(master_rack) = &mut self.master_rack {
@@ -1775,10 +1812,12 @@ impl MorphSlot {
         remap_score_driver_after_move(&mut self.temporal.originals.score.loop_driver, from, to);
         if let Some(motion) = &mut self.master_motion {
             remap_motion_donor_after_move(&mut motion.transplant.donor, from, to);
+            remap_motion_collider_inputs_after_move(&mut motion.collider, from, to);
         }
         for layer in &mut self.layers {
             if let Some(motion) = &mut layer.motion {
                 remap_motion_donor_after_move(&mut motion.transplant.donor, from, to);
+                remap_motion_collider_inputs_after_move(&mut motion.collider, from, to);
             }
         }
         if let Some(master_rack) = &mut self.master_rack {
@@ -3884,6 +3923,159 @@ mod tests {
         let legacy: MorphSlot = serde_yaml::from_str("master: {}\n").unwrap();
         assert_eq!(legacy.master_motion, None);
         assert!(legacy.layers.is_empty());
+    }
+
+    #[test]
+    fn morph_chooses_the_whole_collider_block_endpoint_exact() {
+        use crate::patch::{
+            FieldColliderConfig, FieldColliderModeConfig, MotionBoundaryModeConfig, MotionConfig,
+            MotionDonorConfig,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        let block = |enabled, mode, boundary, a: u32, b: u32| FieldColliderConfig {
+            enabled,
+            mode,
+            boundary,
+            input_a: MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(a).unwrap(),
+            },
+            input_b: MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(b).unwrap(),
+            },
+            ..FieldColliderConfig::default()
+        };
+        let a_block = block(
+            true,
+            FieldColliderModeConfig::Curl,
+            MotionBoundaryModeConfig::Wrap,
+            0,
+            1,
+        );
+        let b_block = block(
+            false,
+            FieldColliderModeConfig::Projection,
+            MotionBoundaryModeConfig::Hold,
+            2,
+            3,
+        );
+        let a = MotionConfig {
+            collider: a_block,
+            ..MotionConfig::default()
+        };
+        let b = MotionConfig {
+            collider: b_block,
+            ..MotionConfig::default()
+        };
+
+        // Before the midpoint the whole block is A's, after it the whole block
+        // is B's. No position synthesizes a third configuration — a mode from
+        // one end with a boundary or an input from the other.
+        for (weights, choose_b, expected) in [
+            ([1.0_f32, 0.0_f32], false, a_block),
+            ([0.75, 0.25], false, a_block),
+            ([0.5, 0.5], false, a_block),
+            ([0.25, 0.75], true, b_block),
+            ([0.0, 1.0], true, b_block),
+        ] {
+            let blended = interpolate_motion_config(a, b, weights, choose_b);
+            assert_eq!(blended.collider, expected, "weights {weights:?}");
+        }
+
+        // Endpoint exactness: each end recalls its own authored block bit for
+        // bit, including both saved positions.
+        assert_eq!(
+            interpolate_motion_config(a, b, [1.0, 0.0], false)
+                .collider
+                .input_b,
+            a_block.input_b
+        );
+        assert_eq!(
+            interpolate_motion_config(a, b, [0.0, 1.0], true)
+                .collider
+                .input_a,
+            b_block.input_a
+        );
+    }
+
+    #[test]
+    fn morph_remaps_both_collider_inputs_independently_and_a_tombstone_never_rebinds() {
+        use crate::patch::{FieldColliderConfig, MotionConfig, MotionDonorConfig};
+        use crate::performance::SavedLayerPosition;
+
+        let selected = |position: u32| MotionDonorConfig::Selected {
+            saved_position: SavedLayerPosition::new(position).unwrap(),
+        };
+        let armed = |a: u32, b: u32| MotionConfig {
+            collider: FieldColliderConfig {
+                enabled: true,
+                input_a: selected(a),
+                input_b: selected(b),
+                ..FieldColliderConfig::default()
+            },
+            ..MotionConfig::default()
+        };
+
+        let mut slot = MorphSlot {
+            master_motion: Some(armed(0, 2)),
+            layers: vec![LayerMorphSnapshot {
+                position: 0,
+                motion: Some(armed(1, 2)),
+                ..LayerMorphSnapshot::default()
+            }],
+            ..MorphSlot::default()
+        };
+
+        // Moving layer 0 to position 2 shifts 0 -> 2, 1 -> 0, 2 -> 1. Each slot
+        // follows its OWN saved position; B does not inherit A's.
+        slot.remap_layers_after_move(0, 2);
+        let master = slot.master_motion.unwrap().collider;
+        assert_eq!(master.input_a, selected(2));
+        assert_eq!(master.input_b, selected(1));
+        let layer = slot.layers[0].motion.unwrap().collider;
+        assert_eq!(layer.input_a, selected(0));
+        assert_eq!(layer.input_b, selected(1));
+
+        // Removing the layer at position 1 tombstones exactly the slot that
+        // named it and decrements only the slots above it.
+        let mut removal = MorphSlot {
+            master_motion: Some(armed(1, 2)),
+            layers: vec![LayerMorphSnapshot {
+                position: 0,
+                motion: Some(armed(0, 1)),
+                ..LayerMorphSnapshot::default()
+            }],
+            ..MorphSlot::default()
+        };
+        removal.remap_layers_after_remove(1);
+        let master = removal.master_motion.unwrap().collider;
+        assert_eq!(
+            master.input_a,
+            MotionDonorConfig::Missing {
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            },
+            "the slot that named the removed layer must tombstone"
+        );
+        assert_eq!(master.input_b, selected(1), "position 2 shifts down to 1");
+        let layer = removal.layers[0].motion.unwrap().collider;
+        assert_eq!(
+            layer.input_a,
+            selected(0),
+            "position 0 is below the removal"
+        );
+        assert_eq!(
+            layer.input_b,
+            MotionDonorConfig::Missing {
+                saved_position: SavedLayerPosition::new(1).unwrap()
+            }
+        );
+
+        // A tombstone never rebinds under a later permutation.
+        removal.remap_layers_after_move(0, 1);
+        assert!(matches!(
+            removal.master_motion.unwrap().collider.input_a,
+            MotionDonorConfig::Missing { saved_position } if saved_position.get() == 1
+        ));
     }
 
     #[test]
