@@ -32,7 +32,9 @@ use crate::spatial::{
     SCALE_MIN, SKEW_LIMIT_DEGREES,
 };
 use crate::symmetry::SymmetryParams;
-use crate::visual_rack::{DisplaceParams, GroupId, MaskParams, NodeId, VisualNodeKind, VisualRack};
+use crate::visual_rack::{
+    DisplaceParams, GroupId, MaskParams, NodeId, ResidualParams, VisualNodeKind, VisualRack,
+};
 
 /// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
 /// new isolated domains. Manifest readers remain data-driven and accept every
@@ -800,6 +802,15 @@ enum CreativeEdgeFallback {
         node_id: NodeId,
         prior: SymmetryParams,
     },
+    /// Residual collects both of its donors only while `mix` is nonzero, so
+    /// leaving zero wakes two saved edges at once. `mix` is the whole bypass
+    /// authority — `detail_gain` cannot wake anything — so restoring the prior
+    /// mix returns both routes to dormant in one step.
+    ResidualMix {
+        owner: ProceduralRackOwner,
+        node_id: NodeId,
+        prior_mix: f32,
+    },
     GroupMatteAmount {
         group_id: GroupId,
         prior: f32,
@@ -901,6 +912,20 @@ impl CreativeEdgeFallback {
                     params.hue_span = prior.hue_span;
                 }
             }
+            Self::ResidualMix {
+                owner,
+                node_id,
+                prior_mix,
+            } => {
+                let Some(node) =
+                    saved_rack_mut(patch, owner).and_then(|rack| rack.get_mut(node_id))
+                else {
+                    return;
+                };
+                if let VisualNodeKind::Residual(params) = &mut node.kind {
+                    params.mix = prior_mix;
+                }
+            }
             Self::GroupMatteAmount { group_id, prior } => {
                 let Some(matte) = patch
                     .composition
@@ -954,6 +979,10 @@ fn mutate_saved_rack_values(
         };
         let prior_symmetry = match node.kind {
             VisualNodeKind::Symmetry(params) => Some(params),
+            _ => None,
+        };
+        let prior_residual = match node.kind {
+            VisualNodeKind::Residual(params) => Some(params),
             _ => None,
         };
         let mut rng = procedural_node_rng(seed, index, owner, node_id);
@@ -1459,6 +1488,22 @@ fn mutate_saved_rack_values(
                     &mut rng,
                 );
             }
+            (VisualNodeKind::Residual(anchor), VisualNodeKind::Residual(value)) => {
+                // Both donor routes, the block vocabulary, the quantization law
+                // and the quantization seed are stable authored topology and are
+                // preserved exactly. Each node draws from its own domain, so
+                // this arm cannot perturb any older generated stream.
+                value.mix =
+                    mutate_linear(anchor.mix, value.mix, 0.0, 1.0, temperature * 0.2, &mut rng);
+                value.detail_gain = mutate_linear(
+                    anchor.detail_gain,
+                    value.detail_gain,
+                    0.0,
+                    4.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+            }
             (VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal, _)
             | (_, VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal) => {}
             // A generated patch never changes rack topology. Be defensive if
@@ -1481,8 +1526,13 @@ fn mutate_saved_rack_values(
             VisualNodeKind::Symmetry(params) => Some(params),
             _ => None,
         };
+        let current_residual = match node.kind {
+            VisualNodeKind::Residual(params) => Some(params),
+            _ => None,
+        };
         let route_effect_active = current_image_amount.is_some_and(|value| value > 0.0)
             || current_displace.is_some_and(|params| !params.is_exact_bypass())
+            || current_residual.is_some_and(|params| !params.is_exact_bypass())
             || current_symmetry.is_some_and(symmetry_claims_saved_image_edge);
         if prior_wet <= 0.0 && node.wet > 0.0 && route_effect_active {
             edge_fallbacks.push(CreativeEdgeFallback::NodeWet {
@@ -1523,6 +1573,17 @@ fn mutate_saved_rack_values(
                 owner,
                 node_id,
                 prior: prior_symmetry.unwrap_or_default(),
+            });
+        }
+        if node.wet > 0.0
+            && prior_residual.is_some_and(ResidualParams::is_exact_bypass)
+            && current_residual.is_some_and(|params| !params.is_exact_bypass())
+        {
+            let prior = prior_residual.unwrap_or_default();
+            edge_fallbacks.push(CreativeEdgeFallback::ResidualMix {
+                owner,
+                node_id,
+                prior_mix: prior.mix,
             });
         }
     }
@@ -2678,7 +2739,7 @@ pub fn generate_with_inventory(
     Ok(pieces)
 }
 
-fn sync_parent(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if let Ok(directory) = fs::File::open(parent) {
             directory.sync_all()?;
@@ -2688,7 +2749,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
@@ -2709,7 +2770,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -2736,7 +2797,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(target_vendor = "apple")]
-fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -2758,7 +2819,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     unix,
     not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
-fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is not implemented on this Unix target",
@@ -2766,14 +2827,14 @@ fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+pub(crate) fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace rename is not implemented on this platform",
     ))
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3163,6 +3224,8 @@ mod tests {
             temporal: None,
             morph: None,
             scenes: crate::performance::Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         }
     }
 
@@ -3484,6 +3547,13 @@ mod tests {
                     assert_eq!(actual.seed, expected.seed);
                     assert_eq!(actual.mode, expected.mode);
                     assert_eq!(actual.boundary, expected.boundary);
+                }
+                (VisualNodeKind::Residual(expected), VisualNodeKind::Residual(actual)) => {
+                    assert_eq!(actual.routes(), expected.routes());
+                    assert_eq!(actual.block, expected.block);
+                    assert_eq!(actual.quantization, expected.quantization);
+                    assert_eq!(actual.seed, expected.seed);
+                    assert_eq!(actual.algorithm_version, expected.algorithm_version);
                 }
                 _ => {}
             }
@@ -4903,5 +4973,332 @@ scenes:
             "a restore never rewrites a route"
         );
         assert_eq!(params.source_mask, armed.source_mask);
+    }
+
+    #[test]
+    fn generated_residual_moves_values_only_and_wakes_both_edges_transactionally() {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualQuantization, SavedImageSource, SavedImageTap,
+        };
+
+        let authored = ResidualParams {
+            structure: SavedImageTap {
+                source: SavedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            detail: SavedImageTap {
+                source: SavedImageSource::AllBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.5,
+            detail_gain: 2.0,
+            seed: 0x00c0_ffee,
+            ..ResidualParams::default()
+        };
+        let mut anchor_rack = VisualRack::empty();
+        let node_id = anchor_rack
+            .push(VisualNodeKind::Residual(authored))
+            .unwrap();
+        let params_of = |rack: &VisualRack| match rack.get(node_id).unwrap().kind {
+            VisualNodeKind::Residual(params) => params,
+            _ => panic!("residual node"),
+        };
+
+        let mut generated = anchor_rack.clone();
+        mutate_saved_rack_values(
+            &anchor_rack,
+            &mut generated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        let after = params_of(&generated);
+        assert_eq!(
+            after.routes(),
+            authored.routes(),
+            "generation never reroutes either donor"
+        );
+        assert_eq!(
+            (after.block, after.quantization),
+            (authored.block, authored.quantization)
+        );
+        assert_eq!(
+            after.seed, authored.seed,
+            "the quantization seed is authored topology, not a generated value"
+        );
+        assert_eq!(after.algorithm_version, authored.algorithm_version);
+        assert!(after.mix != authored.mix || after.detail_gain != authored.detail_gain);
+        assert!((0.0..=1.0).contains(&after.mix));
+        assert!((0.0..=4.0).contains(&after.detail_gain));
+
+        // Deterministic: identical seed and index reproduce identical values.
+        let mut repeated = anchor_rack.clone();
+        mutate_saved_rack_values(
+            &anchor_rack,
+            &mut repeated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(params_of(&repeated), after);
+
+        // Zero temperature is an exact no-op.
+        let mut untouched = anchor_rack.clone();
+        mutate_saved_rack_values(
+            &anchor_rack,
+            &mut untouched,
+            0.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(params_of(&untouched), authored);
+
+        // A neighbouring node draws from its own procedural domain, so
+        // appending this arm cannot perturb an older generated stream. The
+        // Grain node keeps the same NodeId in both racks.
+        let build = |with_residual: bool| {
+            let mut rack = VisualRack::empty();
+            let grain_id = rack
+                .push(VisualNodeKind::Grain(crate::visual_rack::GrainParams {
+                    intensity: 0.08,
+                    seed: 37,
+                    ..crate::visual_rack::GrainParams::default()
+                }))
+                .unwrap();
+            if with_residual {
+                rack.push(VisualNodeKind::Residual(authored)).unwrap();
+            }
+            (rack, grain_id)
+        };
+        let (with_anchor, grain_id) = build(true);
+        let (without_anchor, older_grain_id) = build(false);
+        assert_eq!(older_grain_id, grain_id);
+        let mut with_generated = with_anchor.clone();
+        let mut without_generated = without_anchor.clone();
+        mutate_saved_rack_values(
+            &with_anchor,
+            &mut with_generated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        mutate_saved_rack_values(
+            &without_anchor,
+            &mut without_generated,
+            1.0,
+            0x5EED,
+            3,
+            ProceduralRackOwner::Master,
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            with_generated.get(grain_id).unwrap(),
+            without_generated.get(grain_id).unwrap(),
+            "appending a Residual arm must not perturb an older generated stream"
+        );
+
+        // A node at zero mix has two dormant edges. Waking it must record one
+        // transactional fallback that restores both slots to dormant at once.
+        let mut dormant_anchor = VisualRack::empty();
+        let dormant_id = dormant_anchor
+            .push(VisualNodeKind::Residual(ResidualParams {
+                structure: SavedImageTap {
+                    source: SavedImageSource::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                detail: SavedImageTap {
+                    source: SavedImageSource::CleanProgram,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+        let dormant_params = match dormant_anchor.get(dormant_id).unwrap().kind {
+            VisualNodeKind::Residual(params) => params,
+            _ => panic!("residual node"),
+        };
+        assert!(dormant_params.is_exact_bypass());
+
+        let mut wakes = 0_u32;
+        for seed in 0..8_u64 {
+            let mut woken = dormant_anchor.clone();
+            let mut fallbacks = Vec::new();
+            mutate_saved_rack_values(
+                &dormant_anchor,
+                &mut woken,
+                1.0,
+                seed,
+                1,
+                ProceduralRackOwner::Master,
+                &mut fallbacks,
+            );
+            let VisualNodeKind::Residual(params) = woken.get(dormant_id).unwrap().kind else {
+                panic!("residual node")
+            };
+            if params.is_exact_bypass() {
+                assert!(
+                    !fallbacks.iter().any(|fallback| matches!(
+                        fallback,
+                        CreativeEdgeFallback::ResidualMix { .. }
+                    )),
+                    "a node that stayed dormant must not claim a woken edge"
+                );
+                continue;
+            }
+            wakes += 1;
+            assert!(
+                fallbacks.iter().any(|fallback| matches!(
+                    fallback,
+                    CreativeEdgeFallback::ResidualMix { node_id, prior_mix, .. }
+                        if *node_id == dormant_id && *prior_mix == 0.0
+                )),
+                "waking a dormant Residual edge must be transactionally restorable"
+            );
+
+            // Replaying the fallback returns both routes to dormant.
+            let mut patch = anchor();
+            patch.master_rack = Some(woken.clone());
+            patch.visual_schema_version = 1;
+            for fallback in fallbacks {
+                fallback.restore(&mut patch);
+            }
+            let restored = patch.master_rack.as_ref().unwrap();
+            let VisualNodeKind::Residual(params) = restored.get(dormant_id).unwrap().kind else {
+                panic!("residual node")
+            };
+            assert!(
+                params.is_exact_bypass(),
+                "restoring the prior mix must return both slots to dormant"
+            );
+            assert_eq!(
+                params.routes(),
+                dormant_params.routes(),
+                "a restore never rewrites a route"
+            );
+        }
+        assert!(
+            wakes > 0,
+            "at least one generated seed must wake the dormant edge"
+        );
+    }
+
+    /// Generation and Dice mutate authored *values*. A recorded gesture is
+    /// neither: nothing here may invent one, mutate one, or shift the RNG
+    /// streams of the racks beside one.
+    #[test]
+    fn generation_never_invents_or_mutates_a_recorded_gesture_and_older_streams_stay_bit_identical()
+    {
+        use crate::gesture::{
+            normalize_gesture_input, GestureEvent, GestureMode, GestureOrigin, GesturePhase,
+            GestureTrack, GestureTrackDocument, RawGestureSample,
+        };
+        use crate::patch::GestureCanvasConfig;
+
+        let sample = |phase, tick| {
+            normalize_gesture_input(
+                GestureOrigin::NativePointer,
+                RawGestureSample::new(0, phase, GestureMode::Curl, [0.4, 0.6])
+                    .with_direction([0.0, 1.0]),
+                tick,
+            )
+            .expect("well-formed sample")
+        };
+        let mut track = GestureTrack::default();
+        for (phase, tick) in [
+            (GesturePhase::Begin, 40_u64),
+            (GesturePhase::Move, 42),
+            (GesturePhase::End, 47),
+        ] {
+            assert!(matches!(
+                track.record_accepted(tick, sample(phase, 0)),
+                Ok(true)
+            ));
+        }
+        let document = GestureTrackDocument::capture(&track);
+        let digest = track.checksum_hex();
+        let canvas = GestureCanvasConfig {
+            radius: 0.3,
+            strength: 0.6,
+            retention: 0.5,
+        };
+
+        // A gesture-free anchor never gains a gesture section.
+        let anchor = advanced_anchor();
+        assert_eq!(anchor.gesture_track, None);
+        assert_eq!(anchor.gesture_canvas, None);
+        let mut without = anchor.clone();
+        let mut without_fallbacks = Vec::new();
+        mutate_saved_creative_values(
+            &anchor,
+            &mut without,
+            1.0,
+            0x5EED,
+            5,
+            &mut without_fallbacks,
+        );
+        assert_eq!(
+            without.gesture_track, None,
+            "generation invents no recording"
+        );
+        assert_eq!(without.gesture_canvas, None);
+
+        // The same anchor and seed carrying a recorded gesture must produce a
+        // byte-identical creative mutation: gesture state is in no RNG domain,
+        // so appending it cannot perturb an older Dice stream.
+        let mut with_anchor = anchor.clone();
+        with_anchor.gesture_track = Some(document.clone());
+        with_anchor.gesture_canvas = Some(canvas);
+        let mut with = with_anchor.clone();
+        let mut with_fallbacks = Vec::new();
+        mutate_saved_creative_values(&with_anchor, &mut with, 1.0, 0x5EED, 5, &mut with_fallbacks);
+        assert_eq!(
+            with.master_rack, without.master_rack,
+            "a recorded gesture must not shift any older Dice stream"
+        );
+        assert_eq!(with.layers[0].rack, without.layers[0].rack);
+        assert_eq!(with.composition, without.composition);
+        assert_eq!(with_fallbacks.len(), without_fallbacks.len());
+
+        // The recording itself is carried whole and still verifies.
+        assert_eq!(with.gesture_track, Some(document.clone()));
+        assert_eq!(with.gesture_canvas, Some(canvas));
+        let restored = with.gesture_track.as_ref().unwrap().decode().unwrap();
+        assert_eq!(restored.checksum_hex(), digest);
+        assert_eq!(restored.events(), track.events());
+
+        // Temperature zero is an exact identity, including the gesture world.
+        let mut untouched = with_anchor.clone();
+        let mut none = Vec::new();
+        mutate_saved_creative_values(&with_anchor, &mut untouched, 0.0, 0x5EED, 5, &mut none);
+        assert_eq!(untouched.gesture_track, with_anchor.gesture_track);
+        assert_eq!(untouched.gesture_canvas, with_anchor.gesture_canvas);
+
+        // A gesture-free patch also keeps its canonical identity: nothing this
+        // tranche added is serialized, so the hash is the pre-gesture hash.
+        let hash_before = canonical_patch_sha256(&anchor).unwrap();
+        let mut still_free = anchor.clone();
+        still_free.gesture_track = None;
+        still_free.gesture_canvas = None;
+        assert_eq!(canonical_patch_sha256(&still_free).unwrap(), hash_before);
+        assert_ne!(canonical_patch_sha256(&with_anchor).unwrap(), hash_before);
+
+        // Live Dice never sees gesture state at all.
+        let live = include_str!("randomization.rs");
+        assert!(
+            !live.contains("gesture"),
+            "live Dice must have no gesture awareness whatsoever"
+        );
+        // Silence the otherwise-unused binding without weakening the claim.
+        let _: &[GestureEvent] = track.events();
     }
 }

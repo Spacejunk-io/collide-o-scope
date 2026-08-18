@@ -34,9 +34,12 @@ src/
 ├── motion.rs            canonical codec/lattice fields, Motion authoring, resource preflight
 ├── symmetry.rs          closed symmetry groups, 32-sector table, 1,024-byte uniform
 ├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
+├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
+├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
+├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
 ├── video/threaded.rs    request decoder, codec motion, telemetry, latest-only mailbox
@@ -72,6 +75,7 @@ src/
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
+    ├── gesture_etch.wgsl one ordered etch sample per pass plus the donor present
     └── temporal*.wgsl   legacy Temporal plus Loom/Atlas/Garden/Score
 ```
 
@@ -878,6 +882,321 @@ frame against both a stationary field and an unarmed slot while the live and
 export layer-identity schemes stay byte-identical and warm frames still allocate
 nothing.
 
+### Named two-input Residual Counterpoint
+
+`Residual` is a Collision Rack node that recombines one route's large-scale
+structure with the carrier's detail measured against a second route.
+`NodeKindTag::Residual` holds append-only signature code 11; kind codes are
+never renumbered or reused.
+
+The recombination law, in linear premultiplied space:
+
+```text
+dc  = quantize(mean(structure))
+ac  = quantize(carrier_premultiplied - mean(detail))
+out = dc + detail_gain * ac
+```
+
+Authored state is `ResidualParams { algorithm_version, structure, detail,
+block, quantization, mix, detail_gain, seed }`. `mix` is
+`finite_clamp(v, 0.0, 0.0, 1.0)` and `detail_gain` is
+`finite_clamp(v, 1.0, 0.0, 4.0)`, so a non-finite input takes the neutral value
+rather than a clamped extreme. `ResidualBlock` is
+`Four | Eight | Sixteen | ThirtyTwo | SixtyFour` with codes 0…4, edges
+4/8/16/32/64 and `Eight` as the default. `ResidualQuantization` is
+`Off | Coarse | Medium | Fine` with codes 0…3 and levels 0/8/32/128; `Off`
+means exact identity, never a one-level collapse. A fixed `seed` shifts the
+quantization lattice per cell and is recalled, never re-drawn or interpolated.
+
+The node carries **two** authored route slots — slot 0 `structure`, slot 1
+`detail` — and both are read only through their reduced block means, never at
+full resolution. That is what keeps the recombination pass inside three
+simultaneously sampled textures: the carrier, `mean[0]` and `mean[1]`. A
+route's history age is exactly N or N-1 per slot, because `EdgeTiming` is
+`CurrentFrame | PreviousFrame` and nothing deeper is representable; the 24-deep
+clean-composite ring is a separate Temporal budget and is not reachable here.
+
+`ResidualParams::is_exact_bypass()` is `sanitized().mix == 0.0`, and the
+default is therefore an exact bypass. It is a real delegation: the planner
+collects no tap, the executor encodes no pass and allocates no mean surface,
+and the saved-patch dependency walk claims no edge. The admission predicate is
+character-identical in `collect_rack_taps`, `flush_segment`, and
+`collect_rack_dependencies`: enabled ∧ wet > 0 ∧ `!is_exact_bypass()`.
+
+Each mean cell is the premultiplied average of **four quadrant-centre loads**
+of its block — a bounded 4-tap estimator, not an exact box integral. Resource
+delta per active node, charged through the existing descriptor ledger:
+
+| Item | Exact charge |
+|---|---:|
+| Full-frame render passes | 1 |
+| Reduced-resolution passes | 2 |
+| Logical lookups/pixel | 3 |
+| Explicit texture operations/pixel | 12 |
+| Simultaneously sampled textures | 3 |
+| Cross-scope image taps | 2 |
+| New full-frame persistent surfaces | 0 |
+| Reduced-resolution surfaces | 2 |
+
+Block-mean bytes are charged through the byte-exact `ResidualResourcePlan`,
+never through `additional_rgba16_layers`, and meet the creative number only at
+the shared `MAX_CREATIVE_GPU_BYTES` cap where motion bytes join it. Every
+independent bound is its own typed rejection before any allocation: grid edge
+≤ 2,048, ≤ 2,100,000 cells per node, exactly 8 bytes per cell, exactly 2
+surfaces per node, ≤ 32 MiB per node, ≤ 64 MiB aggregate, ≤ 3 sampled
+textures, a 256-byte uniform stride, and ≤ 16 nominal active nodes. An
+over-budget grid is rejected with an actionable error, never silently clamped
+to a coarser one. `MAX_SAMPLED_TEXTURES_PER_PASS` stays 3.
+
+Routes, block, quantization and seed are stable authored topology. Morph
+interpolates `mix` and `detail_gain` only when both slots name the exact same
+pair of routes, switches `block` and `quantization` discretely at the midpoint,
+and carries slot A's `seed` verbatim. Dice and procedural generation mutate
+only `mix` and `detail_gain`, each node from its own stable RNG domain, and a
+generated mix that wakes a dormant edge records a transactional fallback.
+Modulation exposes only `mix` and `detail_gain`, under globally unique
+modulatable descriptor keys.
+
+The browser edits `mix`, `detail_gain`, `block`, `quantization` and `seed`
+through the ordinary coalescible parameter action. The two donors — the only
+fields that rewrite the image dependency graph — use the ordered,
+revision-protected `SetVisualNodeResidualRoute { scope, node_id, slot, route,
+composition_revision }`, which is priority, never coalesced and never latched
+into a Quantized batch. `slot` is a closed tagged vocabulary
+(`structure | detail`), not an index, so an unknown slot is a deserialization
+rejection rather than a positional fallback onto the partner input. Snapshot
+params are `{ structure_tap, detail_tap, block, quantization, mix,
+detail_gain, seed, diagnostic }`, and the diagnostic names the dead slot so a
+tombstone can never be read as belonging to the other route.
+
+Export consumes the same evaluated plan, the same two reduced block-mean
+passes and the same rack shader; there is no export-only recombination path.
+The `.motion.json` sidecar (schema 4) records, per admitted node, the scope,
+the discrete recombination law, the seed, and each slot's resolved or
+tombstoned route identity — stable identities only, never a host path or
+filesystem metadata.
+
+## Gesture-field etching
+
+A gesture is an ordered stream of quantized events addressed on the 30 Hz
+authoring reference, not a stroke of pixels. `src/gesture.rs` owns the portable
+contract; `src/gesture_canvas.rs` owns the bounded vector canvas it etches.
+Neither has a `wgpu`, clock, filesystem, or UI dependency, so the CPU field is
+the independent reference the GPU is checked against rather than a description
+of the shader.
+
+### The portable event contract
+
+`GESTURE_ALGORITHM_VERSION` is 1 and append-only. `GESTURE_REFERENCE_FPS` *is*
+`TEMPORAL_REFERENCE_FPS` — the same 30 Hz constant reused, never a second
+literal — so a gesture recorded at 24, 30, or 60 fps lands on the same tick.
+`MAX_GESTURE_EVENTS` is 4,096, `MAX_ACTIVE_STROKES` is 16 and equals the width
+of the open-stroke `u16` mask by compile-time assertion,
+`MAX_GESTURE_SERIALIZED_BYTES` is 256 KiB, and `MAX_GESTURE_DECAY_TICKS` is
+4,096.
+
+One event is 18 fixed-width bytes: `tick:u32le`, `stroke:u8`, `phase:u8`,
+`mode:u8`, `reserved:u8`, `x:u16le`, `y:u16le`, `pressure:u16le`, `dx:i16le`,
+`dy:i16le`. Position and pressure are Q16 (`value/65_535` → `[0,1]`); direction
+components are Q15 (`value/32_767` → `[-1,1]`), renormalized on decode.
+Quantization is the *only* representation — there is no float path, so live and
+replay see identical bits. `GesturePhase` is `Begin|Move|End` and `GestureMode`
+is `Push|Curl`, both with permanent append-only codes.
+
+Well-formedness is validated identically on ingest and on decode: ticks
+non-decreasing, `stroke` in range, a `Move`/`End` with no open `Begin` and a
+second `Begin` for an open stroke rejected rather than repaired, and a track
+whose strokes are not all closed valid but explicitly *incomplete* and never
+auto-closed. Over-cap ingest sets `truncated` and returns `false` — the
+`TemporalEventTrack::record_accepted` law — and never panics or drops silently.
+
+The canonical checksum is SHA-256 over a domain-separated explicit
+little-endian field stream, imitating `recovery_journal::record_checksum`
+rather than hashing JSON:
+
+```text
+b"collide-o-scope/gesture-track/v1\0"
+|| version:u16le || flags:u16le || origin_tick:u64le || event_count:u32le
+|| each event's 18 bytes
+```
+
+`GESTURE_FLAG_TRUNCATED` and `GESTURE_FLAG_INCOMPLETE` are inside the hashed
+stream, so a truncated or open-stroke recording can never present itself under
+a complete recording's digest. The checksum covers the portable stream only and
+is therefore invariant to how events were grouped into frames. Serde is bounded
+on both sides: count-capped `visit_seq` visitors, `deny_unknown_fields`, and a
+byte cap checked on encode *and* decode. Hostile input is refused by the cap,
+never by allocating first and measuring after.
+
+### Reference ticks and the pause law
+
+Live recording uses `GestureEventRecorder`, `TemporalEventRecorder`'s exact
+shape: it accumulates accepted, program-advancing seconds and derives the tick
+*before* adding this frame's delta, so the first accepted frame records at tick
+0. Offline uses `export_temporal_reference_tick(frame, fps)` — the rounded
+rational map, no accumulator. Program Freeze does not call the recorder and a
+rejected frame does not advance it, so neither accumulates catch-up debt for
+time the audience never saw; a frozen canvas frame likewise neither decays nor
+etches and consumes no reference address. Wall time never enters the track, the
+checksum, the canvas, or anything derived from them. Restoring a track from a
+patch resumes the clock at that track's last recorded address instead of
+rebasing, so a recovered recording's digest is byte-identical to the saved one.
+
+### One normalized adapter
+
+`normalize_gesture_input(origin, raw, tick)` is the only path from an input
+surface to an event. `GestureOrigin` is `NativePointer | Phone | Midi | Osc`
+and is provenance only: it reaches `GestureIngestError` and the host's status
+text, never the event bits, so the same logical gesture drawn on a tablet, sent
+by the phone panel, played from a MIDI controller, or received over OSC records
+byte-identical tracks and one identical checksum. An out-of-range stroke or a
+non-finite position/pressure is refused, not clamped, because clamping would
+merge two strokes or invent a mark the operator never made; only the direction
+vector is sanitized, to unit length with an inert zero fallback.
+
+**The honesty law.** An unrecorded gesture is never implied replayable. While
+recording is disarmed a normalized sample still etches the current session's
+canvas and nothing enters the track. `GestureStatusSnapshot` keeps
+`recorded_events` and `live_only_events` as separate counters and derives
+neither from the other, publishes `truncated` and `open_strokes` as their own
+facts, and an empty track publishes no checksum at all rather than a digest of
+nothing. Export decodes the recorded document through the same validator and
+re-derives the canonical checksum before the first frame renders; a mismatch is
+an actionable export error, never a silent re-render.
+
+### The canvas
+
+| Item | Bound |
+|---|---:|
+| Grid edge | ≤ 2,048 |
+| Grid cells | ≤ 2,100,000 |
+| Working bytes per cell | 12 |
+| Presented donor bytes per cell | 8 |
+| Bytes per canvas | ≤ 32 MiB |
+| Active canvases | ≤ 2 |
+| Aggregate bytes | ≤ 64 MiB |
+| Uniform stride | 256 |
+| Decay ticks per update | ≤ 4,096 |
+| Ordered samples per update | ≤ 256 |
+
+Each is an independently checked limit with its own typed `GestureCanvasError`,
+evaluated before any allocation and reconciled afterwards against the resources
+actually created. Twelve bytes a cell is an `Rg16Float` signed-vector ping-pong
+pair plus an `Rg8Unorm` coverage/hold ping-pong pair, breaking format uniformity
+for small surfaces exactly as `renderer/motion.rs` already does. The presented
+donor is one `Rgba16Float` image charged as its own named class against the same
+narrowable ceilings, deliberately never folded into the frozen twelve, so the
+working-set reconcile keeps its exact prior meaning.
+
+`GESTURE_CANVAS_HOST_MAX_CELLS` (262,144) is a *host* narrowing, not a second
+table: the portable field is the CPU reference and runs on the render thread,
+and a `const _: () = assert!(…)` makes the constant structurally unable to
+exceed the frozen bound. `gesture_canvas_host_grid` halves both edges together
+until the edge cap, the cell cap, and the host budget all hold.
+
+`Push` displaces along the stroke direction; `Curl` along its perpendicular.
+Both are analytic — a closed-form `(1 - d/r)²` falloff, zero with zero slope at
+the rim, never an iterative solve — so live and offline agree exactly.
+Overlapping strokes compose in *recorded order*: each sample blends the field
+toward its own etched vector, which does not commute, so reordering two
+overlapping strokes is a visible difference and order is part of the contract.
+Decay is closed form, so a long gap is one operation rather than a loop; the gap
+clamps to the tick budget and reports `clamped` instead of billing every tick,
+mirroring `history_ticks_for_delta`'s 24-tick burst clamp. `hold` decays at the
+authored rate too, so retention stays finite and nothing etches permanently.
+
+### Transactions and resets
+
+`GestureCanvasState` is transactional in the `temporal.rs` shape: `stage_frame`
+snapshots before it changes anything, `commit_staged` drops the snapshot, and
+`discard_staged` restores it, so a discarded frame leaves no visible change on
+either side. The staged plan and the staged *evaluated* parameters travel with
+the snapshot, so a renderer encodes the frame the CPU reference actually applied
+— including this frame's modulated radius, strength, and retention — rather than
+the authored values a later read would return.
+
+`GestureCanvasResetCause` is a typed vocabulary, never a boolean, resolving to
+two independent domains: the etched field and the decay clock. `PatchGeneration`,
+`ApplyLook`, `Resize`, `BroadRevert`, `ManualClear`, and `ExportCancelled` are
+hard resets; `SourceCut` and `SourceReplacement` rebase the clock and keep the
+etch, because a seek must stop the canvas billing skipped program time as decay
+without erasing what the operator drew. A reset abandons an open transaction
+rather than restoring it — a reset is not an undo — and every cause also raises
+the device flag that clears both working parities and the presented donor before
+the next etch.
+
+### The routable field
+
+`SavedImageSource::GestureCanvas` / `ResolvedImageSource::GestureCanvas` /
+`PlannedImageSource::GestureCanvas` join the closed image-route vocabulary
+(serde tag `gesture_canvas`, plan hash code 7), selectable by any existing image
+tap — Displace donor, Mask image matte, group matte — with no new node kind, no
+new bind slot, and no new surface. It is a master-scope singleton with no ID and
+no saved position: every positional accessor answers `None` and no missing-layer
+or missing-group tombstone can touch it. It is a producer with **no scope**, so
+it claims no dependency and no ordering edge, a same-frame route cannot close a
+cycle even from the master scope that owns it, and it charges zero retained tap
+surfaces on both sides of the fail-closed composition ledger — its bytes are
+charged once, by `GestureCanvasPlan`. With no canvas admitted the route resolves
+to `Transparent` with the named `GestureCanvasUnavailable` diagnostic and never
+rebinds to a layer or a group.
+
+The presented donor is the exact inverse of the frozen `displace_node` decode:
+straight `RG = clamp(vector, -1, 1) * 0.5 + 0.5`, premultiplied by the gate's
+coverage as alpha, blue an explicit zero. Because the decode subtracts the same
+alpha the presentation multiplied in, an un-etched cell, a zero-gate cell, and a
+missing binding all decode to *exactly* zero — the hostile-hidden-RGB law holds
+by arithmetic rather than by a second rule — while coverage scales the decoded
+displacement, which is the gate doing its job.
+
+The device half publishes that donor once per committed frame, from the
+committed parity, at the acceptance decision, so a routed donor reads the field
+as of the previous accepted frame. Acceptance is only known after the frame
+encoder has been submitted, and encoding into that encoder would advance the
+device field on rejected frames; this is the same N-1 law ProgramHistory already
+obeys, and offline export applies byte-for-byte the same ordering.
+
+### Closure
+
+Modulation exposes exactly three continuous destinations — `gesture_radius`,
+`gesture_strength`, `gesture_retention`, each `0…1` — and no address of any kind
+reaches the recorded track. `PatchState` gains two optional sections:
+`gesture_track` carries the whole checksum-verified document, because a track is
+topology rather than a value, and `gesture_canvas` carries the three authored
+scalars. An absent section is exactly the pre-gesture path, a hostile section
+sanitizes on load, and unknown fields are rejected. A Morph slot holds the
+recording's *identity* — its canonical checksum — and blends the three canvas
+values only when both slots name the exact same recording, so no morph position
+can synthesize a third recording neither slot captured. Dice and the generator
+move authored values only and never invent or mutate a recording.
+
+A completed authored gesture is **exactly one** manual-history entry, opened at
+its first `Begin` and closed at the matching final `End`. Every `Move` between
+them is deliberately invisible, so a long stroke cannot flood the bounded stack,
+and an automation origin (`Midi`, `Osc`) records no entry at all, matching
+`MutationOrigin::records_manual_history`.
+
+The browser sends `gesture_sample`, which deliberately has **no** coalesce key:
+replacing an older pending sample would delete path points the operator drew.
+`Begin` and `End` hold an admission reservation, because a dropped edge orphans
+a stroke or leaves it permanently open; an intermediate `Move` is ordinary and
+may be shed under saturation, and the track then honestly records what the host
+accepted. `set_gesture_recording { enabled, layer_stack_revision }` is an
+ordered priority barrier, never coalesced and never latched into a `Quantized`
+batch, so a sample cannot cross an arm/disarm edge into the wrong recording and
+a stale arm decision cannot arrive after a patch load replaced the program.
+`set_gesture_canvas` is an ordinary coalescible absolute scalar with no path to
+the track. `phase` and `mode` cross the wire as the engine's own closed
+vocabularies, so an unknown token is a deserialization error rather than a
+silently defaulted value.
+
+Export writes `<output>.gesture.json` beside the render —
+`{ version, origin_tick, event_count, truncated, checksum, events }` — through
+the staged atomic no-replace commit idiom, refusing to overwrite an existing
+sidecar and cleaned up with the video on cancellation. Operational paths and
+filesystem metadata never enter it, and a job with no recorded track writes no
+sidecar at all.
+
 ## Patches and native parameter editor
 
 `PatchState::capture` includes master and layer state, stable source identity,
@@ -1172,6 +1491,45 @@ mislead browser tests.
   frame byte-identically, that an unarmed or unmaterialized slot is
   byte-identical to the neutral pair, and that the warm-allocation snapshot
   survives eight prebuilt groups — carry the physical-GPU claim.
+- Residual Counterpoint tests must cover the append-only kind code 11 and the
+  two closed vocabularies, sanitize/exact-bypass laws including hostile
+  non-finite `mix`, the 1/2/3/12/3/2/2 descriptor ledger, the independent CPU
+  reference for the 4-tap block mean and the seeded lattice, constant-colour
+  (pure DC) and zero-mean (pure AC) fixtures, grid-border and non-divisible
+  dimensions, a transparent hostile-hidden-RGB donor decoding to exact zero,
+  `Off` as exact identity, fixed-seed stability with no leak into the route
+  table or the block grid, every independent resource limit rejected one unit
+  over with the byte cap proven to bind before the cell cap, per-slot planner
+  admission, self-cycle rejection with an admitted N-1 edge, per-slot
+  tombstones that never rebind after replacement, saved-patch
+  dormant-versus-woken edges, Morph both-slots route-match interpolation,
+  values-only Look/preset apply, Dice/generator value-only mutation,
+  `mix`/`detail_gain` modulation addresses, the uncoalesced
+  revision-barriered slot-naming browser route action, `ResetVisualProgram`
+  releasing every mean surface, bounded path-free export provenance per slot,
+  live/export payload parity at 24/30/60 fps, and a labeled export case. The
+  three `renderer::rack::tests::gpu_residual_` fixtures carry the
+  physical-GPU claim.
+- Gesture-field tests must cover the canonical checksum's domain-separated
+  field stream and both recording flags, hostile serde bounds (over-cap counts
+  and bytes on encode and decode, unknown fields, non-monotonic ticks, orphan
+  `Move`/`End`, a second `Begin`), Q16/Q15 lattice round trips, identical
+  grouped-versus-ungrouped reference-tick replay producing one canvas and one
+  checksum, analytic Push/Curl and falloff fixtures, overlapping strokes whose
+  reordering visibly changes the field, canvas-edge and corner samples, decay
+  and hold with the tick-budget clamp, commit/discard/freeze/over-cap and every
+  typed reset cause with its exact domains, the portable sidecar round trip
+  with no path or filesystem metadata and a no-replace re-export, a checksum
+  mismatch refused before any frame renders, live/export field equality at
+  24/30/60 fps, one completed authored gesture as exactly one undo entry with
+  automation origins excluded, every independent resource limit rejected one
+  unit over, and the honesty law that live-only samples are counted and
+  reported separately from the recorded track. The same logical gesture driven
+  through all four `GestureOrigin` values must record byte-identical tracks.
+  The five `renderer::gesture_canvas::tests::gpu_` fixtures and
+  `renderer::composition::tests::gpu_a_recorded_gesture_reaches_the_image_through_a_routed_displace_donor`
+  carry the physical-GPU claim; `render_gesture_field_etching_pipeline` and
+  `render_gesture_canvas_displace_donor_pipeline` are the labeled export cases.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
@@ -1215,7 +1573,18 @@ a passing claim.
   reordering law, so it disables selective-VHS bypass authoring
   (`AmbiguousMasterBypass`) exactly as any other non-marker master node does.
 - Physical MIDI, phone, audio-interface, Spout-host, and multi-monitor proof is
-  separate from software tests.
+  separate from software tests. Gesture ingress is proven through the one
+  normalized adapter and its four origins in software; a real tablet, phone
+  touch surface, MIDI controller, or OSC peer authoring a stroke is hardware
+  proof and is not transferable from those tests.
+- The gesture canvas is one master-scope singleton. The frozen table admits two
+  active canvases, but the second is the offline job's own; a genuinely second
+  *routable* canvas would need an index in the route vocabulary, which is a
+  wire and persistence change rather than a renderer one.
+- `GESTURE_CANVAS_HOST_MAX_CELLS` is a render-thread cost budget, not the
+  frozen resource table. The host runs the portable CPU reference every frame,
+  so raising it toward the 2,100,000-cell ceiling belongs with a presenter that
+  moves the per-cell work off that reference entirely.
 - Upstream original code has no blanket MIT grant; `LICENSE` only covers the
   additions described there. Publication/distribution of the combined fork is
   conditional on the publisher having authorization for the original portions

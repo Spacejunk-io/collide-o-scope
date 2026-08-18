@@ -142,6 +142,15 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("motion_shutter_phase", -1.0, 1.0),
     ("motion_shutter_curvature", -2.0, 2.0),
     ("motion_shutter_chromatic_lag", 0.0, 1.0),
+    // S3b gesture-field etching exposes only the three derived continuous
+    // canvas scalars. The recorded event track is authored topology and has no
+    // modulation address at all: nothing here can add, remove, retime, or
+    // rewrite a recorded gesture. The keys are deliberately prefixed rather
+    // than reusing bare `radius`/`strength`/`retention`, which would alias
+    // against another subsystem through key equality.
+    ("gesture_radius", 0.0, 1.0),
+    ("gesture_strength", 0.0, 1.0),
+    ("gesture_retention", 0.0, 1.0),
     // The patch-morph crossfader; applied by the app, not apply_offset.
     ("morph", 0.0, 1.0),
 ];
@@ -1308,6 +1317,14 @@ fn apply_stable_node_offset(
             "symmetry_center" => stable_component_slot(component, None, Some(&mut value.center)),
             _ => None,
         },
+        // Residual exposes its wet authority and its detail gain and nothing
+        // else: both routes, both discrete laws, and the quantization seed are
+        // topology and have no modulatable address.
+        RuntimeVisualNodeKind::Residual(value) => match descriptor.key {
+            "mix" => Some(&mut value.mix),
+            "detail_gain" => Some(&mut value.detail_gain),
+            _ => None,
+        },
     };
     if let Some(slot) = slot {
         if matches!(
@@ -1524,6 +1541,21 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
     }
 }
 
+/// Apply only the bounded continuous gesture-canvas destinations.
+///
+/// This is the entire modulation surface S3b owns. It reads three derived
+/// scalars off a *copy* of the authored canvas and never sees, borrows, or
+/// mutates the recorded event track.
+fn apply_gesture_canvas_offsets(
+    canvas: &mut crate::gesture_canvas::GestureCanvasParams,
+    mut offset: impl FnMut(&'static str, f32, f32) -> f32,
+) {
+    canvas.radius += offset("gesture_radius", 0.0, 1.0);
+    canvas.strength += offset("gesture_strength", 0.0, 1.0);
+    canvas.retention += offset("gesture_retention", 0.0, 1.0);
+    *canvas = canvas.sanitized();
+}
+
 pub fn is_valid_target(target: &str) -> bool {
     target_range(target).is_some()
 }
@@ -1568,6 +1600,16 @@ impl ModulationFrame {
     /// master. Base state and every discrete/provenance field remain intact.
     pub fn modulate_motion(&self, motion: &MotionParams) -> MotionParams {
         ModMatrix::modulate_master_motion_from_offsets(motion, &self.offsets)
+    }
+
+    /// Apply only the bounded continuous gesture-canvas destinations to an
+    /// authored base. The recorded track has no address here and is neither
+    /// read nor written.
+    pub fn modulate_gesture_canvas(
+        &self,
+        canvas: &crate::gesture_canvas::GestureCanvasParams,
+    ) -> crate::gesture_canvas::GestureCanvasParams {
+        ModMatrix::modulate_gesture_canvas_from_offsets(canvas, &self.offsets)
     }
 
     #[cfg(test)]
@@ -2529,6 +2571,23 @@ impl ModMatrix {
         };
         apply_motion_offsets(&mut motion, offset, false);
         motion.sanitized()
+    }
+
+    fn modulate_gesture_canvas_from_offsets(
+        base: &crate::gesture_canvas::GestureCanvasParams,
+        offsets: &RoutingOffsets,
+    ) -> crate::gesture_canvas::GestureCanvasParams {
+        let mut canvas = base.sanitized();
+        let offset = |target: &'static str, min: f32, max: f32| {
+            master_target_index(target)
+                .and_then(|index| offsets.master.get(index))
+                .copied()
+                .unwrap_or(0.0)
+                * (max - min)
+                * 0.5
+        };
+        apply_gesture_canvas_offsets(&mut canvas, offset);
+        canvas
     }
 
     fn modulate_layer_motion_from_offsets(
@@ -4400,6 +4459,8 @@ mod tests {
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(
                 RuntimeImageMatte::resolve_routes(ImageMatte::default(), &mut |_| None, &|_| false),
             )),
+            RuntimeVisualNodeKind::Displace(crate::visual_rack::RuntimeDisplaceParams::default()),
+            RuntimeVisualNodeKind::Residual(crate::visual_rack::RuntimeResidualParams::default()),
         ];
         let empty_composition =
             RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap();
@@ -5001,5 +5062,258 @@ mod tests {
             };
             assert!(!parameter.is_valid_for_kind(NodeKindTag::Symmetry), "{key}");
         }
+    }
+
+    #[test]
+    fn residual_exposes_stable_addresses_for_its_mix_and_detail_gain_under_unique_wire_keys() {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams, RuntimeVisualNodeKind, RuntimeVisualRack,
+        };
+
+        let authored = RuntimeResidualParams {
+            structure: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.25,
+            detail_gain: 2.0,
+            seed: 0x00c0_ffee,
+            ..RuntimeResidualParams::default()
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::Residual(authored))
+            .unwrap();
+
+        let mut book = StableModAddressBook::default();
+        book.add_rack(StableModScope::Master, &rack).unwrap();
+
+        // Exactly one address per continuous value, plus the shared wet. Both
+        // routes, both discrete laws and the seed register nothing.
+        let keys: Vec<_> = book
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                StableModTarget::Node { parameter, .. } => match parameter {
+                    StableNodeParameter::Wet => Some("wet"),
+                    StableNodeParameter::Descriptor {
+                        descriptor_index, ..
+                    } => NODE_PARAM_DESCRIPTORS
+                        .get(usize::from(*descriptor_index))
+                        .map(|descriptor| descriptor.key),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec!["wet", "mix", "detail_gain"]);
+
+        let address_of = |key: &str| {
+            book.targets
+                .iter()
+                .position(|target| {
+                    matches!(
+                        target,
+                        StableModTarget::Node {
+                            parameter: StableNodeParameter::Descriptor { descriptor_index, .. },
+                            ..
+                        } if NODE_PARAM_DESCRIPTORS[usize::from(*descriptor_index)].key == key
+                    )
+                })
+                .map(|index| StableModAddress(index as u16))
+                .unwrap()
+        };
+        let mut offsets = vec![0.0_f32; book.targets.len()];
+        offsets[address_of("mix").index()] = 0.5;
+        offsets[address_of("detail_gain").index()] = 9.0;
+        let frame = StableModulationFrame { offsets };
+
+        let mut modulated = rack.clone();
+        apply_stable_rack_modulation(&book, &frame, StableModScope::Master, &mut modulated);
+        let RuntimeVisualNodeKind::Residual(params) = modulated.get(node_id).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert!((params.mix - 0.75).abs() < 1e-5);
+        assert_eq!(
+            params.detail_gain, 4.0,
+            "offsets clamp into the declared gain domain"
+        );
+        assert_eq!(
+            params.routes(),
+            authored.routes(),
+            "modulation never touches either donor route"
+        );
+        assert_eq!(
+            (params.block, params.quantization),
+            (authored.block, authored.quantization)
+        );
+        assert_eq!(
+            params.seed, authored.seed,
+            "modulation never touches the quantization seed"
+        );
+
+        // Both routes, both discrete laws and the seed have no modulatable
+        // address at all.
+        for key in [
+            "structure_tap",
+            "detail_tap",
+            "block",
+            "quantization",
+            "seed",
+        ] {
+            let index = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .position(|descriptor| {
+                    descriptor.kind == NodeKindTag::Residual && descriptor.key == key
+                })
+                .unwrap();
+            let parameter = StableNodeParameter::Descriptor {
+                descriptor_index: index as u16,
+                component: StableModComponent::Scalar,
+            };
+            assert!(!parameter.is_valid_for_kind(NodeKindTag::Residual));
+        }
+
+        // The real cross-resolution hazard: `StableNodeParameter::parse` binds
+        // the FIRST modulatable row with a matching key, `same_wire_parameter`
+        // compares keys rather than indices, and `runtime_node_supports_
+        // descriptor` returns true for every non-Mask kind. Both Residual wire
+        // keys are therefore globally unique among modulatable rows, so no
+        // route authored for another kind can resolve onto this one.
+        for key in ["mix", "detail_gain"] {
+            let owners: Vec<_> = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .filter(|descriptor| descriptor.key == key && descriptor.modulatable)
+                .map(|descriptor| descriptor.kind)
+                .collect();
+            assert_eq!(
+                owners,
+                vec![NodeKindTag::Residual],
+                "modulatable wire key {key} must be owned by Residual alone"
+            );
+            let parsed = StableNodeParameter::parse(key).expect("a modulatable key parses");
+            assert!(parsed.is_valid_for_kind(NodeKindTag::Residual));
+            for other in [
+                NodeKindTag::Cellular,
+                NodeKindTag::Shift,
+                NodeKindTag::Grain,
+                NodeKindTag::DigitalColor,
+                NodeKindTag::Key,
+                NodeKindTag::Transform,
+                NodeKindTag::Mask,
+                NodeKindTag::Displace,
+            ] {
+                assert!(
+                    !parsed.is_valid_for_kind(other),
+                    "{key} must not cross-resolve onto {other:?}"
+                );
+            }
+        }
+
+        // A shared key such as `amount` still aliases across its own kinds, and
+        // that aliasing must never reach Residual.
+        let shared = StableNodeParameter::parse("amount").expect("a shared key parses");
+        assert!(!shared.is_valid_for_kind(NodeKindTag::Residual));
+        let mix = StableNodeParameter::parse("mix").unwrap();
+        assert!(!mix.same_wire_parameter(shared));
+        assert!(mix.same_wire_parameter(StableNodeParameter::parse("mix").unwrap()));
+    }
+
+    /// S3b's whole modulation surface: three derived continuous scalars with
+    /// distinct wire keys, applied to a copy, and no address anywhere that
+    /// could reach a recorded gesture.
+    #[test]
+    fn gesture_canvas_exposes_three_uniquely_named_continuous_targets_and_no_track_address() {
+        for (target, range) in [
+            ("gesture_radius", (0.0_f32, 1.0_f32)),
+            ("gesture_strength", (0.0, 1.0)),
+            ("gesture_retention", (0.0, 1.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+            assert!(is_valid_target(target));
+            assert_eq!(
+                TARGETS.iter().filter(|(key, _, _)| *key == target).count(),
+                1,
+                "{target} must appear exactly once in the master table"
+            );
+            assert!(
+                !LAYER_TARGET_SUFFIXES.contains(&target),
+                "{target} is a master-scope subsystem and owns no layer suffix"
+            );
+            assert!(
+                matches!(compile_target(target), CompiledTarget::Master(_)),
+                "{target} must compile to a master slot, not a stable node address"
+            );
+        }
+
+        // Distinct keys, not bare ones. A bare `radius`/`strength`/`retention`
+        // would cross-resolve against another subsystem through key equality.
+        for bare in ["radius", "strength", "retention", "gesture", "canvas"] {
+            assert_eq!(target_range(bare), None, "{bare} must not be a target");
+        }
+        // The recording itself has no address at all.
+        for track in [
+            "gesture_track",
+            "gesture_events",
+            "gesture_recording",
+            "gesture_checksum",
+            "layer1_gesture_radius",
+        ] {
+            assert_eq!(target_range(track), None, "{track} must not be modulatable");
+        }
+
+        // Appending before the crossfader keeps the compiled morph slot valid.
+        assert_eq!(TARGETS[MORPH_TARGET_INDEX].0, "morph");
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix
+            .routings
+            .push(Routing::new(ModSource::Midi(0), "gesture_strength", 1.0));
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        let base = crate::gesture_canvas::GestureCanvasParams {
+            radius: 0.25,
+            strength: 0.5,
+            retention: 0.75,
+        };
+        let frame = matrix.frame(0);
+        let evaluated = frame.modulate_gesture_canvas(&base);
+        assert!(
+            evaluated.strength > base.strength,
+            "a positive MIDI route must raise the evaluated strength"
+        );
+        assert_eq!(evaluated.radius, base.radius);
+        assert_eq!(evaluated.retention, base.retention);
+        assert_eq!(
+            base,
+            crate::gesture_canvas::GestureCanvasParams {
+                radius: 0.25,
+                strength: 0.5,
+                retention: 0.75,
+            },
+            "modulation must contribute to a copy and never rewrite the authored base"
+        );
+
+        // Offsets clamp into the declared range instead of escaping it.
+        let mut deep = ModMatrix::new();
+        deep.midi[0] = 1.0;
+        deep.routings
+            .push(Routing::new(ModSource::Midi(0), "gesture_retention", 1.0));
+        deep.routings
+            .push(Routing::new(ModSource::Midi(0), "gesture_radius", 1.0));
+        deep.update_at_beat(0.0, 1.0 / 30.0);
+        let saturated = deep.frame(0).modulate_gesture_canvas(&base);
+        assert!((0.0..=1.0).contains(&saturated.radius));
+        assert!((0.0..=1.0).contains(&saturated.retention));
+
+        // An inert matrix leaves the sanitized base exactly where it was.
+        let inert = ModMatrix::new().frame(0).modulate_gesture_canvas(&base);
+        assert_eq!(inert, base.sanitized());
     }
 }

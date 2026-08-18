@@ -190,6 +190,7 @@ function connect() {
         syncControllerRuntime(msg.controller_runtime);
         syncOscRuntime(msg.osc_runtime);
         syncTemporal(msg.temporal);
+        syncGesture(msg.gesture);
         syncMasterMotion(msg.master_motion);
         syncSpout(msg.spout);
         syncRemote(msg.remote_url);
@@ -402,6 +403,7 @@ const CREATIVE_NODE_INFO = Object.freeze({
   mask: { label: 'Mask' },
   displace: { label: 'Displace' },
   symmetry: { label: 'Symmetry Field' },
+  residual: { label: 'Residual' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -518,6 +520,13 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     boolDef('symmetry_motion_slot1', 'Motion · slot 1'),
     uintDef('symmetry_seed', 'Seed'),
   ],
+  residual: [
+    floatDef('mix', 'Mix', 0, 1, 0.001),
+    floatDef('detail_gain', 'Detail gain', 0, 4, 0.001),
+    enumDef('block', 'Block', [['four', '4 px'], ['eight', '8 px'], ['sixteen', '16 px'], ['thirty_two', '32 px'], ['sixty_four', '64 px']]),
+    enumDef('quantization', 'Quantization', [['off', 'Off'], ['coarse', 'Coarse'], ['medium', 'Medium'], ['fine', 'Fine']]),
+    uintDef('seed', 'Seed'),
+  ],
 });
 
 const GROUP_TRANSFORM_FIELDS = Object.freeze([
@@ -609,6 +618,7 @@ function creativeRouteToken(route) {
     case 'missing_group_output': return `missing-group:${input.group_id}`;
     case 'all_below': return 'all_below';
     case 'clean_program': return 'clean_program';
+    case 'gesture_canvas': return 'gesture_canvas';
     default: return 'one_below';
   }
 }
@@ -618,6 +628,7 @@ function creativeRouteOptions(route) {
     ['one_below', 'One below'],
     ['all_below', 'All below'],
     ['clean_program', 'Clean program (N−1)'],
+    ['gesture_canvas', 'Gesture canvas (etched field)'],
   ];
   for (const layer of latestLayers) {
     const id = String(layer.layer_id);
@@ -644,6 +655,10 @@ function creativeRouteFromToken(token, timing) {
     input = { source: 'all_below' };
   } else if (token === 'clean_program') {
     input = { source: 'clean_program' };
+  } else if (token === 'gesture_canvas') {
+    // The etched field is a master-scope singleton: no ID, no saved position,
+    // and no scope ordering, so both timings are authorable.
+    input = { source: 'gesture_canvas' };
   } else {
     input = { source: 'one_below' };
   }
@@ -651,8 +666,10 @@ function creativeRouteFromToken(token, timing) {
 }
 
 // `slot` tags the editor so a node owning more than one route binds each editor
-// to its own submit closure. Slot index is route identity, so it also travels
-// on the wire; an untagged editor is a single-route node.
+// to its own submit closure and its own ordered action. Slot index is route
+// identity, so it also travels on the wire; an untagged editor is a
+// single-route node. `label` keeps sibling donor selects distinguishable to a
+// screen reader instead of repeating one generic name.
 function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, fieldOnly = false, slot = '', label = 'Donor') {
   const token = creativeRouteToken(route);
   const timing = route?.timing || 'current_frame';
@@ -788,7 +805,9 @@ function renderCreativeRack() {
     const params = marker ? '' : creativeNodeVisibleDefs(node).map((def) => creativeControlHtml(def, creativeNodeValue(node, def.key))).join('');
     const maskVariant = node.kind === 'mask' ? `<label class="creative-control creative-control-wide"><span>Mask kind</span><select class="creative-mask-variant">${creativeOptionHtml([['rectangle', 'Rectangle'], ['ellipse', 'Ellipse'], ['image', 'Image donor']], node.params?.variant || 'rectangle')}</select><output></output></label>` : '';
     // Displace routes a donor vector field, not a matte, so it reuses the
-    // shared editor in field-only mode: no channel and no invert.
+    // shared editor in field-only mode: no channel and no invert. Residual
+    // owns two such routes and gets one slot-tagged editor each, so a reroute
+    // can never land on the partner input.
     // The Symmetry Field owns four fixed routes. Each editor carries its own
     // slot so the two image editors and the two motion editors bind to four
     // distinct submit closures instead of the first one found.
@@ -806,7 +825,9 @@ function renderCreativeRack() {
       ? creativeRouteEditorHtml(node.params.image_tap, node.params.image_channel, node.params.image_invert)
       : node.kind === 'displace'
         ? creativeRouteEditorHtml(node.params?.donor_tap, 'alpha', false, true)
-        : symmetryRoutes;
+        : node.kind === 'residual'
+          ? `${creativeRouteEditorHtml(node.params?.structure_tap, 'alpha', false, true, 'structure', 'Structure donor')}${creativeRouteEditorHtml(node.params?.detail_tap, 'alpha', false, true, 'detail', 'Detail donor')}`
+          : symmetryRoutes;
     const nodeDiagnostic = node.params?.diagnostic
       ? `<div class="creative-node-diagnostic">${escapeHtml(node.params.diagnostic)}</div>`
       : '';
@@ -828,6 +849,9 @@ function renderCreativeRack() {
     card.querySelector('.creative-mask-variant')?.addEventListener('change', (event) => creativeSend({
       action: 'set_visual_node_mask_variant', scope: creativeScopeWire(), node_id: String(node.node_id), variant: event.currentTarget.value, composition_revision: compositionRevision,
     }, 'Changing mask kind…'));
+    // A node may own more than one route, so every editor in the card is wired
+    // to the action naming its own slot. Binding only the first would leave a
+    // second select silently submitting nothing.
     const routeEditors = [...card.querySelectorAll('.creative-route-editor')];
     const selfGroupId = creativeScopeWire().scope === 'group' ? creativeScopeWire().group_id : '';
     const slotIndex = (editor) => Number(String(editor.dataset.routeSlot || '').split(':')[1] || 0);
@@ -849,14 +873,23 @@ function renderCreativeRack() {
           }, 'Preflighting symmetry motion donor…');
         });
       });
-    } else if (routeEditors[0] && node.kind === 'displace') {
-      wireCreativeRouteEditor(routeEditors[0], (route) => creativeSend({
-        action: 'set_visual_node_displace_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, composition_revision: compositionRevision,
-      }, 'Preflighting displace donor…'), selfGroupId);
-    } else if (routeEditors[0]) {
-      wireCreativeRouteEditor(routeEditors[0], (route, channel, invert) => creativeSend({
-        action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
-      }, 'Preflighting image route…'), selfGroupId);
+    } else {
+      for (const routeEditor of routeEditors) {
+        const slot = routeEditor.dataset.routeSlot || '';
+        if (node.kind === 'residual' && slot) {
+          wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
+            action: 'set_visual_node_residual_route', scope: creativeScopeWire(), node_id: String(node.node_id), slot, route, composition_revision: compositionRevision,
+          }, `Preflighting residual ${slot} donor…`), selfGroupId);
+        } else if (node.kind === 'displace') {
+          wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
+            action: 'set_visual_node_displace_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, composition_revision: compositionRevision,
+          }, 'Preflighting displace donor…'), selfGroupId);
+        } else {
+          wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
+            action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
+          }, 'Preflighting image route…'), selfGroupId);
+        }
+      }
     }
   });
 }
@@ -1046,7 +1079,12 @@ function creativeRackStructure(rack) {
     // is: changing it must rebuild the card's route editor, not just sync values.
     route: node.kind === 'displace'
       ? node.params?.donor_tap || null
-      : (node.params?.variant === 'image' ? node.params.image_tap : null),
+      : node.kind === 'residual'
+        ? node.params?.structure_tap || null
+        : (node.params?.variant === 'image' ? node.params.image_tap : null),
+    // Residual's second route needs its own fingerprint slot, or rerouting the
+    // detail input alone would leave a stale select submitting the old token.
+    detailRoute: node.kind === 'residual' ? node.params?.detail_tap || null : null,
     // All four Symmetry slots are structural, by slot index. Folding only the
     // first one in would leave a stale editor that then resubmits the old token.
     symmetryRoutes: node.kind === 'symmetry'
@@ -2147,6 +2185,105 @@ function syncTemporal(t) {
     const staged = telemetry.frame_staged ? ' · staged' : '';
     const resetText = telemetry.last_reset ? ` · reset ${telemetry.last_reset}` : '';
     telemetryEl.textContent = `History ${valid}/${capacity} · ${carrier} · ${hold} · tick ${ticks} · Score ${scoreState} · event ${ordinal} · ${track}${staged}${resetText}`;
+  }
+}
+
+// --- Gesture field etching ---
+//
+// The honesty law on the panel: `recorded_events` and `live_only_events` are
+// published as separate fields and are rendered as separate sentences, so an
+// unrecorded live gesture is never displayed as replayable. Only the armed
+// state is announced; the per-frame counters live outside the live region.
+
+const GESTURE_CANVAS_DEFAULTS = { radius: 0.12, strength: 0.5, retention: 0.99 };
+let gestureRecording = false;
+
+document.querySelectorAll('.param-row[data-gesture-canvas]').forEach((row) => {
+  const param = row.dataset.gestureCanvas;
+  const min = parseFloat(row.dataset.min);
+  const max = parseFloat(row.dataset.max);
+  const step = parseFloat(row.dataset.step);
+  const slider = row.querySelector('input[type="range"]');
+  const valueEl = row.querySelector('.value');
+  if (!slider || !valueEl) return;
+  slider.min = min;
+  slider.max = max;
+  slider.step = step;
+  const fallback = GESTURE_CANVAS_DEFAULTS[param] ?? min;
+  slider.value = fallback;
+  slider.addEventListener('input', () => {
+    const value = parseFloat(slider.value);
+    valueEl.textContent = formatValue(value, min, max, step);
+    sendAction({ action: 'set_gesture_canvas', param, value });
+  });
+  resetRangeOnDoubleActivation(slider, fallback);
+});
+
+document.getElementById('gesture-record-toggle')?.addEventListener('click', () => {
+  sendAction({
+    action: 'set_gesture_recording',
+    enabled: !gestureRecording,
+    layer_stack_revision: layerStackRevision,
+  });
+});
+
+function syncGesture(gesture) {
+  const g = gesture || {};
+  const canvas = g.canvas || {};
+  gestureRecording = Boolean(g.recording);
+
+  for (const param of ['radius', 'strength', 'retention']) {
+    const value = canvas[param];
+    if (value === undefined || value === null) continue;
+    const row = document.querySelector(`.param-row[data-gesture-canvas="${param}"]`);
+    if (!row) continue;
+    const slider = row.querySelector('input[type="range"]');
+    const valueEl = row.querySelector('.value');
+    if (!slider || !valueEl || !canSync(slider)) continue;
+    slider.value = value;
+    valueEl.textContent = formatValue(
+      value,
+      parseFloat(row.dataset.min),
+      parseFloat(row.dataset.max),
+      parseFloat(row.dataset.step)
+    );
+  }
+
+  const toggle = document.getElementById('gesture-record-toggle');
+  if (toggle) {
+    toggle.textContent = gestureRecording ? 'Disarm recording' : 'Arm recording';
+    toggle.setAttribute('aria-pressed', gestureRecording ? 'true' : 'false');
+  }
+
+  const open = Number(g.open_strokes) || 0;
+  const stateEl = document.getElementById('gesture-recording-state');
+  if (stateEl) {
+    const armed = gestureRecording ? 'Recording' : 'Not recording';
+    const incomplete = open > 0 ? ` · ${open} open stroke(s), track explicitly incomplete` : '';
+    const status = g.status ? ` · ${g.status}` : '';
+    stateEl.textContent = `${armed}${incomplete}${status}`;
+  }
+
+  const telemetryEl = document.getElementById('gesture-telemetry');
+  if (telemetryEl) {
+    const recorded = Number(g.recorded_events) || 0;
+    const liveOnly = Number(g.live_only_events) || 0;
+    const truncated = g.truncated ? ' (capped)' : '';
+    const width = Number(canvas.grid_width) || 0;
+    const height = Number(canvas.grid_height) || 0;
+    const generation = Number(canvas.generation) || 0;
+    telemetryEl.textContent =
+      `${recorded} recorded event(s)${truncated} · ${liveOnly} live-only sample(s) · ` +
+      `canvas ${width}×${height} · gen ${generation}`;
+  }
+
+  const checksumEl = document.getElementById('gesture-checksum');
+  if (checksumEl) {
+    // An empty track publishes no digest, so the panel says so instead of
+    // rendering an empty field that could read as a verified recording.
+    checksumEl.textContent = g.checksum
+      ? `Recorded track ${String(g.checksum).slice(0, 16)}… · replayable`
+      : 'No recorded track';
   }
 }
 
@@ -4742,6 +4879,9 @@ const MOD_TARGETS = [
   ['motion_shutter_phase', 'Motion Shutter Phase'],
   ['motion_shutter_curvature', 'Motion Shutter Curvature'],
   ['motion_shutter_chromatic_lag', 'Motion Shutter Chroma Lag'],
+  ['gesture_radius', 'Gesture Radius'],
+  ['gesture_strength', 'Gesture Strength'],
+  ['gesture_retention', 'Gesture Retention'],
   ['morph', 'Morph'],
 ];
 const MASTER_MOD_TARGETS = MOD_TARGETS.slice();

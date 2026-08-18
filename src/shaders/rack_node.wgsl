@@ -18,6 +18,14 @@ const RACK_RECTANGLE_MASK: u32 = 7u;
 const RACK_ELLIPSE_MASK: u32 = 8u;
 const RACK_IMAGE_MASK: u32 = 9u;
 const RACK_DISPLACE: u32 = 10u;
+const RACK_RESIDUAL: u32 = 11u;
+
+// Internal reduced-resolution block-mean pass. This is NOT a node kind: it has
+// no `NodeKindTag`, no descriptor and no signature code. It is deliberately
+// numbered far outside the append-only node-kind range so it can never collide
+// with a future node, and it mirrors `KIND_RESIDUAL_BLOCK_MEAN` in
+// `renderer::rack`. Its attachment is the block grid rather than the output.
+const RACK_RESIDUAL_BLOCK_MEAN: u32 = 1000u;
 
 // Displace boundary laws. These codes are permanent and append-only; they
 // mirror `visual_rack::DisplaceBoundary::code`.
@@ -46,6 +54,10 @@ struct RackUniforms {
 @group(0) @binding(1) var donor_tex: texture_2d<f32>;
 @group(0) @binding(2) var linear_samp: sampler;
 @group(0) @binding(3) var nearest_samp: sampler;
+// Second routed input. Only the Residual recombination reads it; every other
+// kind is bound the rack-owned 1x1 zero view here, so their behaviour is
+// unchanged. Appended at binding 4 rather than renumbering the two samplers.
+@group(0) @binding(4) var donor_b_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> rack: RackUniforms;
 
 fn straight_from_premultiplied_filter(value: vec4f) -> vec4f {
@@ -550,6 +562,115 @@ fn displace_node(uv: vec2f) -> vec4f {
     return select(vec4f(0.0), sampled, mapped.z > 0.5);
 }
 
+// One covered load of the routed block-mean source. The route arrives at
+// `donor_tex`, so a missing or stale route is the rack-owned 1x1 zero and its
+// block mean is exactly zero whatever hidden RGB it carries.
+fn residual_mean_tap(coordinate: vec2i, maximum: vec2i) -> vec4f {
+    let texel = textureLoad(donor_tex, clamp(coordinate, vec2i(0), maximum), 0);
+    let alpha = clamp(texel.a, 0.0, 1.0);
+    return vec4f(texel.rgb * alpha, alpha);
+}
+
+// Reduced-resolution block-mean pass. The attachment is the block grid, so
+// `rack.frame.zw` carries the grid dimensions and `rack.p1.x` the block edge.
+// Each cell is the premultiplied average of FOUR quadrant-centre loads of its
+// block: a bounded four-tap estimator of the block's DC, deliberately not a
+// full box integral, so the cost stays exactly four explicit loads per cell at
+// every block edge in the vocabulary. The result is returned PREMULTIPLIED —
+// the recombination consumes covered values and must not divide by alpha here.
+fn residual_block_mean_cell(uv: vec2f) -> vec4f {
+    let grid = max(rack.frame.zw, vec2f(1.0));
+    let cell = vec2i(clamp(floor(uv * grid), vec2f(0.0), grid - vec2f(1.0)));
+    let block = max(i32(rack.p1.x), 1);
+    let quarter = block / 4;
+    let three_quarters = (3 * block) / 4;
+    let maximum = vec2i(textureDimensions(donor_tex)) - vec2i(1);
+    let base = cell * block;
+    let s00 = residual_mean_tap(base + vec2i(quarter, quarter), maximum);
+    let s10 = residual_mean_tap(base + vec2i(three_quarters, quarter), maximum);
+    let s01 = residual_mean_tap(base + vec2i(quarter, three_quarters), maximum);
+    let s11 = residual_mean_tap(base + vec2i(three_quarters, three_quarters), maximum);
+    return (s00 + s10 + s01 + s11) * 0.25;
+}
+
+// Block means are stored already covered, so the recombination filters them
+// with a plain four-corner mix: covering them a second time would square their
+// alpha. Duplicated per texture because each reads a distinct binding.
+fn residual_structure_mean(uv: vec2f) -> vec4f {
+    let dimensions = vec2i(textureDimensions(donor_tex));
+    let coordinate = uv * vec2f(dimensions) - vec2f(0.5);
+    let base = vec2i(floor(coordinate));
+    let fraction = fract(coordinate);
+    let maximum = dimensions - vec2i(1);
+    let s00 = textureLoad(donor_tex, clamp(base, vec2i(0), maximum), 0);
+    let s10 = textureLoad(donor_tex, clamp(base + vec2i(1, 0), vec2i(0), maximum), 0);
+    let s01 = textureLoad(donor_tex, clamp(base + vec2i(0, 1), vec2i(0), maximum), 0);
+    let s11 = textureLoad(donor_tex, clamp(base + vec2i(1, 1), vec2i(0), maximum), 0);
+    return mix(mix(s00, s10, fraction.x), mix(s01, s11, fraction.x), fraction.y);
+}
+
+fn residual_detail_mean(uv: vec2f) -> vec4f {
+    let dimensions = vec2i(textureDimensions(donor_b_tex));
+    let coordinate = uv * vec2f(dimensions) - vec2f(0.5);
+    let base = vec2i(floor(coordinate));
+    let fraction = fract(coordinate);
+    let maximum = dimensions - vec2i(1);
+    let s00 = textureLoad(donor_b_tex, clamp(base, vec2i(0), maximum), 0);
+    let s10 = textureLoad(donor_b_tex, clamp(base + vec2i(1, 0), vec2i(0), maximum), 0);
+    let s01 = textureLoad(donor_b_tex, clamp(base + vec2i(0, 1), vec2i(0), maximum), 0);
+    let s11 = textureLoad(donor_b_tex, clamp(base + vec2i(1, 1), vec2i(0), maximum), 0);
+    return mix(mix(s00, s10, fraction.x), mix(s01, s11, fraction.x), fraction.y);
+}
+
+// Seeded per-cell lattice phase. The legacy sentinel zero keeps the canonical
+// unshifted lattice; otherwise the phase runs through the same 32-bit avalanche
+// the CPU reference uses, so one seed names one lattice on both sides.
+fn residual_cell_phase(cell: vec2u) -> f32 {
+    if rack.node_meta.w == 0u { return 0.0; }
+    let mixed = cell.x ^ (cell.y * 0x9e3779b9u) ^ avalanche(rack.node_meta.w);
+    return f32(avalanche(mixed) & 0x00ffffffu) / 16777216.0;
+}
+
+// Zero levels is exact identity — the authored default is never a one-level
+// collapse. Rust's `f32::round` breaks ties away from zero while WGSL's
+// `round` breaks them to even, so the nearest lattice point is taken
+// explicitly here and both sides stay on one law.
+fn residual_quantize(value: vec4f, levels: f32, phase: f32) -> vec4f {
+    if levels <= 0.0 { return value; }
+    let scaled = value * levels - vec4f(phase);
+    let nearest = sign(scaled) * floor(abs(scaled) + vec4f(0.5));
+    return (nearest + vec4f(phase)) / levels;
+}
+
+// Residual Counterpoint recombination, in linear premultiplied space:
+//
+//     dc  = quantize(mean0)
+//     ac  = quantize(carrier_premultiplied - mean1)
+//     out = dc + detail_gain * ac
+//
+// `dry` is the single carrier lookup `fs_main` already paid for; re-covering
+// it reproduces the covered premultiplied filter exactly, so the carrier is
+// both the dry signal and the full-resolution AC source for one lookup. With
+// the two reduced means that is three logical lookups and twelve explicit
+// texture operations per pixel, exactly as the ledger declares.
+fn residual_node(uv: vec2f, dry: vec4f) -> vec4f {
+    let dry_alpha = clamp(dry.a, 0.0, 1.0);
+    let carrier = vec4f(dry.rgb * dry_alpha, dry_alpha);
+    let structure = residual_structure_mean(uv);
+    let detail_reference = residual_detail_mean(uv);
+    let block = max(rack.p1.x, 1.0);
+    let pixel = floor(uv * max(rack.frame.zw, vec2f(1.0)));
+    let cell = vec2u(max(floor(pixel / block), vec2f(0.0)));
+    let phase = residual_cell_phase(cell);
+    let levels = rack.p1.y;
+    let dc = residual_quantize(structure, levels, phase);
+    let ac = residual_quantize(carrier - detail_reference, levels, phase);
+    let recombined = dc + rack.p0.y * ac;
+    // `mix` is the node's own wet/dry authority over the recombination; the
+    // rack's `wet` control remains a separate, later decision.
+    return straight_from_premultiplied_filter(mix(carrier, recombined, rack.p0.x));
+}
+
 fn apply_node_law(dry: vec4f, processed: vec4f) -> vec4f {
     let wet = clamp(rack.frame.x, 0.0, 1.0);
     if wet <= 0.0 { return dry; }
@@ -575,6 +696,10 @@ fn apply_node_law(dry: vec4f, processed: vec4f) -> vec4f {
 @fragment
 fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     let kind = rack.node_meta.x;
+    // The reduced block-mean pass renders into the grid, not the output, and
+    // reads only the routed source. It returns before the carrier lookup so it
+    // never pays for a dry sample it cannot use.
+    if kind == RACK_RESIDUAL_BLOCK_MEAN { return residual_block_mean_cell(uv); }
     let dry = source_linear(uv);
     if kind == RACK_PASSTHROUGH || rack.frame.x <= 0.0 { return dry; }
     var processed = dry;
@@ -593,6 +718,7 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
         case RACK_IMAGE_MASK: { processed = image_mask(uv, dry); }
         case RACK_DISPLACE: { processed = displace_node(uv); }
+        case RACK_RESIDUAL: { processed = residual_node(uv, dry); }
         default: {}
     }
     // Normal/full-wet uses the exact processed straight-alpha value. Other

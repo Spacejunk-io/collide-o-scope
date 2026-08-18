@@ -909,6 +909,8 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
         | "image_channel"
         | "image_invert"
         | "donor_tap"
+        | "structure_tap"
+        | "detail_tap"
         | "symmetry_donor0_tap"
         | "symmetry_donor1_tap"
         | "symmetry_motion0_donor"
@@ -960,6 +962,13 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
             ),
             // Displace's boundary law. Without this arm the shipped panel's
             // Boundary select is dropped here, before dispatch ever sees it.
+            //
+            // A discrete law that is declared `NodeParamType::Enum` but absent
+            // from this allowlist is silently dropped at ingress while the
+            // panel control still renders, so every closed vocabulary must
+            // list its exact snake_case tokens here. Displace's boundary was
+            // exactly that defect: `set_runtime_node_param` accepted the value
+            // while `valid_action` had already dropped it.
             "boundary" => matches!(
                 value.as_str(),
                 Some("transparent" | "mirror" | "wrap" | "hold")
@@ -984,6 +993,11 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
                 value.as_str(),
                 Some("transparent" | "mirror" | "wrap" | "hold" | "cellular_reentry")
             ),
+            "block" => matches!(
+                value.as_str(),
+                Some("four" | "eight" | "sixteen" | "thirty_two" | "sixty_four")
+            ),
+            "quantization" => matches!(value.as_str(), Some("off" | "coarse" | "medium" | "fine")),
             _ => false,
         },
         // Routes are stable authored topology and are never edited through the
@@ -1016,11 +1030,40 @@ fn valid_creative_route(route: &CreativeImageTapSnapshot) -> bool {
         CreativeImageSourceSnapshot::MissingSelectedLayer { .. }
         | CreativeImageSourceSnapshot::MissingGroupOutput { .. } => false,
         CreativeImageSourceSnapshot::GroupOutput { group_id } => valid_required_stable_id(group_id),
-        CreativeImageSourceSnapshot::OneBelow | CreativeImageSourceSnapshot::AllBelow => true,
+        // The etched gesture field is a master-scope singleton with no ID and
+        // no position, and it takes part in no scope ordering, so both timings
+        // are authorable. A vocabulary missing from this allowlist is silently
+        // dropped at ingress, so the value belongs here as well as in the panel.
+        CreativeImageSourceSnapshot::OneBelow
+        | CreativeImageSourceSnapshot::AllBelow
+        | CreativeImageSourceSnapshot::GestureCanvas => true,
         CreativeImageSourceSnapshot::CleanProgram => {
             route.timing == crate::visual_rack::EdgeTiming::PreviousFrame
         }
     }
+}
+
+/// Shared prefilter for an ordered rack-node route action that carries no
+/// channel or invert. A group's rack may not read that same group's output on
+/// the current frame; the identical rejection lives in `SetVisualNodeRoute`.
+fn valid_creative_node_route(
+    scope: &CreativeScopeSnapshot,
+    node_id: &str,
+    route: &CreativeImageTapSnapshot,
+    composition_revision: u64,
+) -> bool {
+    let self_group = match (scope, &route.input) {
+        (
+            CreativeScopeSnapshot::Group { group_id },
+            CreativeImageSourceSnapshot::GroupOutput { group_id: producer },
+        ) => group_id == producer && route.timing == crate::visual_rack::EdgeTiming::CurrentFrame,
+        _ => false,
+    };
+    valid_creative_scope(scope)
+        && valid_required_stable_id(node_id)
+        && !self_group
+        && valid_creative_route(route)
+        && valid_composition_revision(composition_revision)
 }
 
 fn valid_member_ids(ids: &[String]) -> bool {
@@ -1079,6 +1122,15 @@ fn integer_in(value: &serde_json::Value, min: u64, max: u64) -> bool {
 /// Closed M3/legacy temporal authoring vocabulary. Invalid enums, unknown
 /// fields, non-finite numbers, and out-of-range integers are rejected before
 /// they can occupy the bounded render queue.
+/// Closed vocabulary for the three authored gesture-canvas controls. There is
+/// deliberately no key here that could reach the recorded track.
+fn valid_gesture_canvas_edit(param: &str, value: &serde_json::Value) -> bool {
+    match param {
+        "radius" | "strength" | "retention" => number_in(value, 0.0, 1.0),
+        _ => false,
+    }
+}
+
 fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
     match param {
         "feedback" => number_in(value, 0.0, 0.95),
@@ -1291,6 +1343,12 @@ fn valid_f32(value: f32) -> bool {
     value.is_finite()
 }
 
+/// Typed-field counterpart of `number_in`: finite and inside an inclusive
+/// range, for actions whose values arrive as `f32` rather than JSON numbers.
+fn f32_in(value: f32, min: f32, max: f32) -> bool {
+    value.is_finite() && (min..=max).contains(&value)
+}
+
 fn valid_f64_for_f32(value: f64) -> bool {
     value.is_finite() && value.abs() <= f64::from(f32::MAX)
 }
@@ -1356,10 +1414,27 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     | WebAction::SetRefreshGardenMatteRoute { .. }
                     | WebAction::SetRefreshGardenMotionRoute { .. }
                     | WebAction::ClearTemporalEventTrack
+                    // A gesture is authored against the frame it was drawn in.
+                    // Holding a sample or an arm/disarm edge for the next
+                    // downbeat would rewrite the recorded stream.
+                    | WebAction::GestureSample { .. }
+                    | WebAction::SetGestureRecording { .. }
                     | WebAction::SetMotionDonor { .. }
                     | WebAction::ClearMotionMemory
                     | WebAction::SetVisualNodeDisplaceRoute { .. }
                     | WebAction::SetVisualNodeSymmetryRoute { .. }
+                    // Every ordered, revision-protected route action belongs
+                    // here as a class, not one kind at a time. Residual's is
+                    // the same barrier and is documented as never latched, but
+                    // neither branch could list it: the rule was authored where
+                    // Residual did not exist, and Residual was authored where
+                    // the rule did not. Today `quantized_action_key` answers
+                    // None for all three, so an admitted wrapper would execute
+                    // immediately rather than defer — which is exactly why the
+                    // refusal has to live here, at the gate, instead of resting
+                    // on a downstream lookup that a later latching change could
+                    // extend without noticing this omission.
+                    | WebAction::SetVisualNodeResidualRoute { .. }
                     | WebAction::BeginHistoryGesture { .. }
                     | WebAction::EndHistoryGesture { .. }
                     | WebAction::CancelHistoryGesture { .. }
@@ -1453,22 +1528,11 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 )
                 && valid_composition_revision(*composition_revision)
         }
-        // Displace and Symmetry both rewrite the image dependency graph, so
-        // they take the same decimal-ID, non-zero-revision, tombstone, and
-        // self-group current-frame prefilters as `SetVisualNodeRoute` instead
-        // of falling through to the permissive tail.
-        WebAction::SetVisualNodeDisplaceRoute {
-            scope,
-            node_id,
-            route,
-            composition_revision,
-        } => {
-            valid_creative_scope(scope)
-                && valid_required_stable_id(node_id)
-                && !creative_self_group_current_frame(scope, route)
-                && valid_creative_route(route)
-                && valid_composition_revision(*composition_revision)
-        }
+        // Displace, Residual, and Symmetry all rewrite the image dependency
+        // graph, so they take the same decimal-ID, non-zero-revision,
+        // tombstone, and self-group current-frame prefilters as
+        // `SetVisualNodeRoute` instead of falling through to the permissive
+        // tail.
         WebAction::SetVisualNodeSymmetryRoute {
             scope,
             node_id,
@@ -1499,6 +1563,26 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && payload_valid
                 && valid_composition_revision(*composition_revision)
         }
+        // The named single- and two-input node routes are ordered topology
+        // barriers with no channel or invert of their own. They still need
+        // every prefilter `SetVisualNodeRoute` applies, including the
+        // group's-own-output current-frame rejection, so a hostile message
+        // never reaches the bounded queue in the first place.
+        WebAction::SetVisualNodeDisplaceRoute {
+            scope,
+            node_id,
+            route,
+            composition_revision,
+        } => valid_creative_node_route(scope, node_id, route, *composition_revision),
+        WebAction::SetVisualNodeResidualRoute {
+            scope,
+            node_id,
+            route,
+            composition_revision,
+            // Every `ResidualRouteSlotSnapshot` token is a real authored slot;
+            // an unknown token is already a deserialization rejection.
+            slot: _,
+        } => valid_creative_node_route(scope, node_id, route, *composition_revision),
         WebAction::SetCompositionGroupMatteRoute {
             group_id,
             route,
@@ -1794,6 +1878,39 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             valid_f32(*alpha) && valid_f32(*beta) && valid_f32(*gamma)
         }
         WebAction::Pad { x, y, .. } => valid_f32(*x) && valid_f32(*y),
+        // Every gesture field is closed and finite-bounded before it can
+        // occupy the render queue. `phase` and `mode` are typed engine enums,
+        // so an unknown token already failed deserialization; the numeric
+        // fields are checked here against the same ranges the quantizer uses,
+        // and the stroke identity is checked against the same constant the
+        // ingest validator enforces, so the queue never carries a sample the
+        // adapter would refuse.
+        WebAction::GestureSample {
+            stroke,
+            x,
+            y,
+            pressure,
+            direction_x,
+            direction_y,
+            ..
+        } => {
+            usize::from(*stroke) < crate::gesture::MAX_ACTIVE_STROKES
+                && f32_in(*x, 0.0, 1.0)
+                && f32_in(*y, 0.0, 1.0)
+                && f32_in(*pressure, 0.0, 1.0)
+                && f32_in(*direction_x, -1.0, 1.0)
+                && f32_in(*direction_y, -1.0, 1.0)
+        }
+        // The recording barrier is revision-protected at ingress as well as at
+        // dispatch, so an arm decision aimed at a replaced program never
+        // occupies a queue slot it will only be refused from later.
+        WebAction::SetGestureRecording {
+            layer_stack_revision,
+            ..
+        } => *layer_stack_revision != 0,
+        WebAction::SetGestureCanvas { param, value } => {
+            valid_identifier(param, 64) && valid_gesture_canvas_edit(param, value)
+        }
         WebAction::MorphGlide {
             target,
             duration_beats,
@@ -3092,7 +3209,10 @@ mod tests {
             0
         ));
 
-        // Neither ordered route action may be wrapped in a quantized batch.
+        // No ordered route action may be wrapped in a quantized batch. This is
+        // a class rule over every revision-protected route barrier in the
+        // registry, so all three are asserted together rather than only the
+        // two that existed when the rule was first written.
         for inner in [
             WebAction::SetVisualNodeSymmetryRoute {
                 scope: CreativeScopeSnapshot::Master,
@@ -3109,12 +3229,420 @@ mod tests {
                 },
                 composition_revision: 7,
             },
+            WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                slot: crate::web::state::ResidualRouteSlotSnapshot::Detail,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: current,
+                },
+                composition_revision: 7,
+            },
         ] {
             assert!(!valid_action(
                 &WebAction::Quantized {
                     inner: Box::new(inner)
                 },
                 0
+            ));
+        }
+    }
+
+    /// Every `NodeParamType::Enum` needs an explicit token list in
+    /// `valid_node_param_value`; a missing arm renders the panel control
+    /// normally and then drops the message at the WebSocket gate.
+    #[test]
+    fn residual_ingress_closes_both_discrete_vocabularies_and_barriers_each_route_slot() {
+        use crate::web::state::ResidualRouteSlotSnapshot;
+
+        for token in ["four", "eight", "sixteen", "thirty_two", "sixty_four"] {
+            assert!(
+                valid_node_param_value("residual", "block", &serde_json::json!(token)),
+                "block token {token} must be admitted"
+            );
+        }
+        for token in ["off", "coarse", "medium", "fine"] {
+            assert!(
+                valid_node_param_value("residual", "quantization", &serde_json::json!(token)),
+                "quantization token {token} must be admitted"
+            );
+        }
+        // Neighbouring, cross-vocabulary and mistyped tokens are refused.
+        for (param, token) in [
+            ("block", "off"),
+            ("block", "one_hundred_twenty_eight"),
+            ("block", "thirtytwo"),
+            ("quantization", "eight"),
+            ("quantization", "coarser"),
+        ] {
+            assert!(
+                !valid_node_param_value("residual", param, &serde_json::json!(token)),
+                "{param} must refuse {token}"
+            );
+        }
+        assert!(!valid_node_param_value(
+            "residual",
+            "block",
+            &serde_json::json!(1)
+        ));
+        // The shipped Displace vocabulary is closed the same way.
+        for token in ["transparent", "mirror", "wrap", "hold"] {
+            assert!(valid_node_param_value(
+                "displace",
+                "boundary",
+                &serde_json::json!(token)
+            ));
+        }
+        assert!(!valid_node_param_value(
+            "displace",
+            "boundary",
+            &serde_json::json!("clamp")
+        ));
+
+        // Continuous values are bounded by the descriptor table itself.
+        assert!(valid_node_param_value(
+            "residual",
+            "mix",
+            &serde_json::json!(1.0)
+        ));
+        assert!(!valid_node_param_value(
+            "residual",
+            "mix",
+            &serde_json::json!(1.0001)
+        ));
+        assert!(valid_node_param_value(
+            "residual",
+            "detail_gain",
+            &serde_json::json!(4.0)
+        ));
+        assert!(!valid_node_param_value(
+            "residual",
+            "detail_gain",
+            &serde_json::json!(-0.001)
+        ));
+        assert!(valid_node_param_value(
+            "residual",
+            "seed",
+            &serde_json::json!(u32::MAX)
+        ));
+        assert!(!valid_node_param_value(
+            "residual",
+            "seed",
+            &serde_json::json!(u64::from(u32::MAX) + 1)
+        ));
+        // Both routes belong to the ordered action and are refused on the
+        // coalescible value path before the descriptor lookup ever runs.
+        for param in ["structure_tap", "detail_tap"] {
+            assert!(!valid_node_param_value(
+                "residual",
+                param,
+                &serde_json::json!({"input": {"source": "one_below"}, "timing": "current_frame"})
+            ));
+        }
+
+        let route =
+            |input: CreativeImageSourceSnapshot, timing| CreativeImageTapSnapshot { input, timing };
+        let action = |scope: CreativeScopeSnapshot,
+                      node_id: &str,
+                      slot: ResidualRouteSlotSnapshot,
+                      route: CreativeImageTapSnapshot,
+                      revision: u64| {
+            WebAction::SetVisualNodeResidualRoute {
+                scope,
+                node_id: node_id.into(),
+                slot,
+                route,
+                composition_revision: revision,
+            }
+        };
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            assert!(valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::OneBelow,
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            // A zero or non-decimal node ID, a zero revision, and either
+            // output-only tombstone are all refused before the queue.
+            for hostile in ["0", "", "7a", " 7"] {
+                assert!(!valid_action(
+                    &action(
+                        CreativeScopeSnapshot::Master,
+                        hostile,
+                        slot,
+                        route(
+                            CreativeImageSourceSnapshot::OneBelow,
+                            crate::visual_rack::EdgeTiming::CurrentFrame
+                        ),
+                        7
+                    ),
+                    0
+                ));
+            }
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::OneBelow,
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    0
+                ),
+                0
+            ));
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::MissingSelectedLayer {
+                            saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                            stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                        },
+                        crate::visual_rack::EdgeTiming::PreviousFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::MissingGroupOutput {
+                            group_id: "9".into()
+                        },
+                        crate::visual_rack::EdgeTiming::PreviousFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            // Clean Program is previous-frame only, per slot.
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::CleanProgram,
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            // A group's rack may not read its own output on the current frame,
+            // but the identical route at N-1 is an admitted feedback edge.
+            let self_group = CreativeScopeSnapshot::Group {
+                group_id: "9".into(),
+            };
+            assert!(!valid_action(
+                &action(
+                    self_group.clone(),
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::GroupOutput {
+                            group_id: "9".into()
+                        },
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            assert!(valid_action(
+                &action(
+                    self_group,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::GroupOutput {
+                            group_id: "9".into()
+                        },
+                        crate::visual_rack::EdgeTiming::PreviousFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+        }
+
+        // The Displace route action now runs through the same prefilters
+        // instead of falling through the permissive default.
+        assert!(!valid_action(
+            &WebAction::SetVisualNodeDisplaceRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "0".into(),
+                route: route(
+                    CreativeImageSourceSnapshot::OneBelow,
+                    crate::visual_rack::EdgeTiming::CurrentFrame
+                ),
+                composition_revision: 7,
+            },
+            0
+        ));
+        assert!(valid_action(
+            &WebAction::SetVisualNodeDisplaceRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                route: route(
+                    CreativeImageSourceSnapshot::OneBelow,
+                    crate::visual_rack::EdgeTiming::CurrentFrame
+                ),
+                composition_revision: 7,
+            },
+            0
+        ));
+    }
+
+    /// A route vocabulary the panel can send but the server-side allowlist does
+    /// not name is silently dropped at ingress rather than refused, so the two
+    /// sides are checked together here.
+    #[test]
+    fn the_gesture_canvas_route_is_accepted_at_ingress_at_both_timings() {
+        for timing in [
+            crate::visual_rack::EdgeTiming::CurrentFrame,
+            crate::visual_rack::EdgeTiming::PreviousFrame,
+        ] {
+            let route = CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::GestureCanvas,
+                timing,
+            };
+            assert!(
+                valid_creative_route(&route),
+                "the canvas is a positionless singleton and is authorable at {timing:?}"
+            );
+            assert!(valid_action(
+                &WebAction::SetVisualNodeRoute {
+                    scope: CreativeScopeSnapshot::Group {
+                        group_id: "9".into(),
+                    },
+                    node_id: "3".into(),
+                    route: route.clone(),
+                    channel: "alpha".into(),
+                    invert: false,
+                    composition_revision: 7,
+                },
+                0
+            ));
+            assert!(valid_action(
+                &WebAction::SetCompositionGroupMatteRoute {
+                    group_id: "9".into(),
+                    route: Some(route.clone()),
+                    channel: "luma".into(),
+                    invert: false,
+                    composition_revision: 7,
+                },
+                0
+            ));
+
+            // It resolves without an ID, a saved position, or a group lookup,
+            // and the resolvers below would happily answer for anything.
+            let resolved = route
+                .to_runtime(|_| crate::performance::SavedLayerPosition::new(4), |_| true)
+                .expect("the singleton resolves to itself");
+            assert_eq!(
+                resolved.source,
+                crate::visual_rack::ResolvedImageSource::GestureCanvas
+            );
+            assert_eq!(resolved.timing, timing);
+            assert_eq!(CreativeImageTapSnapshot::from_runtime(resolved), route);
+        }
+
+        // The wire vocabulary stays closed: a near-miss token is refused rather
+        // than defaulted onto another producer.
+        assert!(serde_json::from_str::<CreativeImageSourceSnapshot>(
+            r#"{"source":"gesture_field"}"#
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::from_str::<CreativeImageSourceSnapshot>(r#"{"source":"gesture_canvas"}"#)
+                .unwrap(),
+            CreativeImageSourceSnapshot::GestureCanvas
+        );
+
+        // Both panel route editors offer the token and map it back to the same
+        // wire value; a vocabulary present on only one side is the exact defect
+        // this test exists to catch.
+        let js = include_str!("../../static/app.js");
+        assert!(js.contains("['gesture_canvas', 'Gesture canvas (etched field)']"));
+        assert!(js.contains("case 'gesture_canvas': return 'gesture_canvas';"));
+        assert!(js.contains("input = { source: 'gesture_canvas' };"));
+    }
+
+    #[test]
+    fn discrete_node_enums_are_admitted_and_topology_fields_stay_barriered() {
+        // The panel renders Displace's Boundary as an ordinary coalescible
+        // parameter edit (static/app.js), so ingress must admit every authored
+        // value. A missing arm here silently drops the action before
+        // `set_runtime_node_param` ever sees it, leaving the authored law
+        // unreachable from a browser.
+        for value in ["transparent", "mirror", "wrap", "hold"] {
+            assert!(
+                valid_node_param_value("displace", "boundary", &serde_json::json!(value)),
+                "displace boundary {value} must be admitted at ingress"
+            );
+        }
+        for value in [
+            serde_json::json!("clamp"),
+            serde_json::json!("Transparent"),
+            serde_json::json!(""),
+            serde_json::json!(0),
+            serde_json::json!(true),
+            serde_json::json!(["mirror"]),
+        ] {
+            assert!(
+                !valid_node_param_value("displace", "boundary", &value),
+                "{value} is outside the closed boundary vocabulary"
+            );
+        }
+        // The vocabulary stays closed per kind: no other kind declares it.
+        assert!(!valid_node_param_value(
+            "grain",
+            "boundary",
+            &serde_json::json!("mirror")
+        ));
+        // The donor route rewrites the image dependency graph, so it remains a
+        // revision-protected barrier action and is refused on this path.
+        assert!(!valid_node_param_value(
+            "displace",
+            "donor_tap",
+            &serde_json::json!("one_below")
+        ));
+        // Both gains stay ordinary bounded floats.
+        for param in ["amount_x", "amount_y"] {
+            assert!(valid_node_param_value(
+                "displace",
+                param,
+                &serde_json::json!(-1.0)
+            ));
+            assert!(valid_node_param_value(
+                "displace",
+                param,
+                &serde_json::json!(1.0)
+            ));
+            assert!(!valid_node_param_value(
+                "displace",
+                param,
+                &serde_json::json!(1.5)
             ));
         }
     }
@@ -3991,5 +4519,195 @@ mod tests {
         rx = rx.resubscribe();
         tx.send(3).unwrap();
         assert_eq!(rx.recv().await.unwrap(), 3);
+    }
+    #[test]
+    fn gesture_ingress_bounds_every_field_and_closes_its_phase_and_mode_vocabularies() {
+        use crate::gesture::{GestureMode, GesturePhase, MAX_ACTIVE_STROKES};
+
+        let sample = |stroke: u8, x: f32, y: f32, pressure: f32, direction: [f32; 2]| {
+            WebAction::GestureSample {
+                stroke,
+                phase: GesturePhase::Move,
+                mode: GestureMode::Push,
+                x,
+                y,
+                pressure,
+                direction_x: direction[0],
+                direction_y: direction[1],
+            }
+        };
+
+        // The well-formed sample, and both inclusive extremes of every range.
+        assert!(valid_action(&sample(0, 0.5, 0.5, 1.0, [0.0, 0.0]), 0));
+        assert!(valid_action(&sample(0, 0.0, 0.0, 0.0, [-1.0, -1.0]), 0));
+        assert!(valid_action(
+            &sample((MAX_ACTIVE_STROKES - 1) as u8, 1.0, 1.0, 1.0, [1.0, 1.0]),
+            0
+        ));
+
+        // The stroke identity space is the same constant the ingest validator
+        // enforces, so the queue never carries a sample the adapter refuses.
+        assert!(!valid_action(
+            &sample(MAX_ACTIVE_STROKES as u8, 0.5, 0.5, 1.0, [0.0, 0.0]),
+            0
+        ));
+        assert!(!valid_action(&sample(255, 0.5, 0.5, 1.0, [0.0, 0.0]), 0));
+
+        // Every numeric field is finite and inside its own inclusive range.
+        for hostile in [f32::NAN, f32::INFINITY, -0.001, 1.001] {
+            assert!(
+                !valid_action(&sample(0, hostile, 0.5, 1.0, [0.0, 0.0]), 0),
+                "x {hostile}"
+            );
+            assert!(
+                !valid_action(&sample(0, 0.5, hostile, 1.0, [0.0, 0.0]), 0),
+                "y {hostile}"
+            );
+            assert!(
+                !valid_action(&sample(0, 0.5, 0.5, hostile, [0.0, 0.0]), 0),
+                "pressure {hostile}"
+            );
+        }
+        for hostile in [f32::NAN, f32::NEG_INFINITY, -1.001, 1.001] {
+            assert!(
+                !valid_action(&sample(0, 0.5, 0.5, 1.0, [hostile, 0.0]), 0),
+                "direction_x {hostile}"
+            );
+            assert!(
+                !valid_action(&sample(0, 0.5, 0.5, 1.0, [0.0, hostile]), 0),
+                "direction_y {hostile}"
+            );
+        }
+
+        // The discrete vocabularies are typed engine enums rather than a
+        // hand-maintained allowlist, so an unknown token fails at
+        // deserialization and can never be silently dropped later at ingress.
+        for phase in ["begin", "move", "end"] {
+            let text = format!(
+                r#"{{"action":"gesture_sample","stroke":0,"phase":"{phase}","mode":"push","x":0.5,"y":0.5}}"#
+            );
+            let action = serde_json::from_str::<WebAction>(&text).expect("closed phase token");
+            assert!(valid_action(&action, 0), "{phase}");
+        }
+        for mode in ["push", "curl"] {
+            let text = format!(
+                r#"{{"action":"gesture_sample","stroke":0,"phase":"move","mode":"{mode}","x":0.5,"y":0.5}}"#
+            );
+            let action = serde_json::from_str::<WebAction>(&text).expect("closed mode token");
+            assert!(valid_action(&action, 0), "{mode}");
+        }
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"hold","mode":"push","x":0.5,"y":0.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"etch","x":0.5,"y":0.5}"#
+        )
+        .is_err());
+
+        // A hostile value that arrived as JSON is rejected by the same arm.
+        let hostile = serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"push","x":9.0,"y":0.5}"#,
+        )
+        .unwrap();
+        assert!(!valid_action(&hostile, 0));
+
+        // Recording control is revision-protected at ingress and is never
+        // latchable: a sample must not cross an arm/disarm edge waiting for a
+        // downbeat, and an arm decision must not outlive its program.
+        assert!(valid_action(
+            &WebAction::SetGestureRecording {
+                enabled: true,
+                layer_stack_revision: 7,
+            },
+            0
+        ));
+        assert!(
+            !valid_action(
+                &WebAction::SetGestureRecording {
+                    enabled: true,
+                    layer_stack_revision: 0,
+                },
+                0
+            ),
+            "a zero revision is never a live program"
+        );
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(WebAction::SetGestureRecording {
+                    enabled: true,
+                    layer_stack_revision: 7,
+                }),
+            },
+            0
+        ));
+    }
+
+    /// The authored canvas vocabulary is closed, finite-bounded, and contains
+    /// no key that could reach the recorded track.
+    #[test]
+    fn gesture_canvas_ingress_is_a_closed_finite_vocabulary_with_no_track_key() {
+        for param in ["radius", "strength", "retention"] {
+            for accepted in [0.0, 0.5, 1.0] {
+                assert!(
+                    valid_action(
+                        &WebAction::SetGestureCanvas {
+                            param: param.into(),
+                            value: serde_json::json!(accepted),
+                        },
+                        0
+                    ),
+                    "{param} must accept {accepted}"
+                );
+            }
+            for rejected in [
+                serde_json::json!(-0.001),
+                serde_json::json!(1.001),
+                serde_json::json!(f64::NAN),
+                serde_json::json!(f64::INFINITY),
+                serde_json::json!("0.5"),
+                serde_json::json!(null),
+            ] {
+                assert!(
+                    !valid_action(
+                        &WebAction::SetGestureCanvas {
+                            param: param.into(),
+                            value: rejected.clone(),
+                        },
+                        0
+                    ),
+                    "{param} must refuse {rejected}"
+                );
+            }
+        }
+
+        // Neither the recording nor any neighbouring spelling is authorable
+        // through the value path.
+        for hostile in [
+            "track",
+            "events",
+            "checksum",
+            "recording",
+            "decay",
+            "radius_x",
+            "",
+        ] {
+            assert!(
+                !valid_action(
+                    &WebAction::SetGestureCanvas {
+                        param: hostile.into(),
+                        value: serde_json::json!(0.5),
+                    },
+                    0
+                ),
+                "{hostile} must not be an authorable canvas parameter"
+            );
+        }
+
+        let decoded = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_canvas","param":"strength","value":0.25}"#,
+        )
+        .unwrap();
+        assert!(valid_action(&decoded, 0));
     }
 }

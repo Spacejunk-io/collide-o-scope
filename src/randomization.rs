@@ -1343,6 +1343,16 @@ pub(crate) fn mutate_runtime_rack_values(
                     *slot = mutate_linear(0.5, *slot, -1.0, 2.0, amount * 0.1, &mut rng);
                 }
             }
+            RuntimeVisualNodeKind::Residual(value) => {
+                // Both routes, the block vocabulary, the quantization law, and
+                // the quantization seed are stable authored topology. Dice may
+                // move only the two continuous values, and this node draws from
+                // its own stable domain so appending the arm cannot perturb any
+                // previously authored node's stream.
+                value.mix = mutate_linear(0.0, value.mix, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.detail_gain =
+                    mutate_linear(1.0, value.detail_gain, 0.0, 4.0, amount * 0.2, &mut rng);
+            }
         }
     }
 }
@@ -2285,5 +2295,108 @@ mod tests {
             with_symmetry.get(neighbour).unwrap().kind,
             without_symmetry.get(neighbour).unwrap().kind
         );
+    }
+
+    #[test]
+    fn dice_moves_residual_values_only_and_leaves_older_streams_bit_identical() {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams,
+        };
+
+        let authored = RuntimeResidualParams {
+            structure: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.5,
+            detail_gain: 2.0,
+            seed: 0x00c0_ffee,
+            ..RuntimeResidualParams::default()
+        };
+
+        // The Grain and Shift nodes are pushed first so their NodeIds — and
+        // therefore their Dice domains — are identical in both racks.
+        let build = |with_residual: bool| {
+            let mut rack = RuntimeVisualRack::empty();
+            let grain_id = rack
+                .push(RuntimeVisualNodeKind::Grain(
+                    crate::visual_rack::GrainParams::default(),
+                ))
+                .unwrap();
+            let shift_id = rack
+                .push(RuntimeVisualNodeKind::Shift(
+                    crate::visual_rack::ShiftParams::default(),
+                ))
+                .unwrap();
+            let residual_id = with_residual.then(|| {
+                rack.push(RuntimeVisualNodeKind::Residual(authored))
+                    .unwrap()
+            });
+            (rack, grain_id, shift_id, residual_id)
+        };
+        let (rack, grain_id, shift_id, residual_id) = build(true);
+        let residual_id = residual_id.unwrap();
+        let baseline = rack.clone();
+
+        let params_of = |rack: &RuntimeVisualRack| match rack.get(residual_id).unwrap().kind {
+            RuntimeVisualNodeKind::Residual(params) => params,
+            _ => panic!("residual node"),
+        };
+
+        let mut diced = rack.clone();
+        mutate_runtime_rack_values(&mut diced, 1.0, 7, 11, DiceRackScope::Master);
+        let after = params_of(&diced);
+        assert_eq!(
+            after.routes(),
+            authored.routes(),
+            "Dice never reroutes either donor"
+        );
+        assert_eq!(
+            (after.block, after.quantization),
+            (authored.block, authored.quantization),
+            "the block and quantization vocabularies are stable authored topology"
+        );
+        assert_eq!(
+            after.seed, authored.seed,
+            "the quantization seed is authored topology, not a diced value"
+        );
+        assert_eq!(after.algorithm_version, authored.algorithm_version);
+        assert!(
+            after.mix != authored.mix || after.detail_gain != authored.detail_gain,
+            "Dice must actually move at least one value at full amount"
+        );
+        assert!((0.0..=1.0).contains(&after.mix));
+        assert!((0.0..=4.0).contains(&after.detail_gain));
+
+        // Determinism: the same amount/seed/stream/scope reproduces exactly.
+        let mut repeated = rack.clone();
+        mutate_runtime_rack_values(&mut repeated, 1.0, 7, 11, DiceRackScope::Master);
+        assert_eq!(params_of(&repeated), after);
+
+        // Zero amount is an exact no-op across the whole rack.
+        let mut untouched = rack.clone();
+        mutate_runtime_rack_values(&mut untouched, 0.0, 7, 11, DiceRackScope::Master);
+        assert_eq!(untouched, baseline);
+
+        // Domain separation: every pre-existing node's stream is bit-identical
+        // whether or not the Residual node is present in the rack.
+        let (older, older_grain, older_shift, _) = build(false);
+        assert_eq!((older_grain, older_shift), (grain_id, shift_id));
+        let mut older_diced = older;
+        mutate_runtime_rack_values(&mut older_diced, 1.0, 7, 11, DiceRackScope::Master);
+        for node_id in [grain_id, shift_id] {
+            assert_eq!(
+                older_diced.get(node_id).unwrap(),
+                diced.get(node_id).unwrap(),
+                "appending a Residual node must not perturb an older Dice stream"
+            );
+        }
     }
 }

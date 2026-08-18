@@ -20,9 +20,9 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    MotionConfig, MotionDonorConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
-    RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
-    TemporalResetPolicyConfig,
+    GestureCanvasConfig, MotionConfig, MotionDonorConfig, RefreshGardenConfig,
+    RefreshGardenMatteRouteConfig, RefreshGardenMotionRouteConfig, TemporalLoomConfig,
+    TemporalOriginalsConfig, TemporalResetPolicyConfig,
 };
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{
@@ -31,7 +31,7 @@ use crate::symmetry::{
 use crate::temporal::CollisionScoreLoopDriver;
 use crate::visual_rack::{
     CellularParams, DigitalColorParams, DisplaceParams, EllipseMask, GrainParams, ImageMatte,
-    KeyParams, MaskParams, RectangleMask, RuntimeImageMatte, RuntimeMaskParams,
+    KeyParams, MaskParams, RectangleMask, ResidualParams, RuntimeImageMatte, RuntimeMaskParams,
     RuntimeVisualNodeKind, RuntimeVisualRack, SavedImageSource, SavedImageTap, ShiftParams,
     VisualNodeKind, VisualRack,
 };
@@ -1108,6 +1108,69 @@ pub struct MorphSlot {
     /// duplicate/zero IDs, invalid cursors, and malformed one-level topology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composition: Option<CompositionTree>,
+    /// Authored S3b gesture state. Absence means this slot predates gesture
+    /// etching and therefore cannot claim any canvas value while the crossfader
+    /// moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture: Option<GestureMorphSnapshot>,
+}
+
+/// The gesture world one Morph slot owns.
+///
+/// The split here is the whole S3b Morph law. `canvas` holds the three authored
+/// continuous controls and interpolates like any other value. `track_checksum`
+/// is the canonical digest of the recording the slot was captured against — a
+/// *recorded track is topology, not a value*, so Morph holds only its identity,
+/// carries that identity from A after equality has been proven, and can never
+/// blend, rewrite, truncate, or reorder a single recorded event. Two slots
+/// captured against different recordings are two different pieces rather than
+/// two ends of a blend, exactly as two different Displace donors are.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GestureMorphSnapshot {
+    pub canvas: GestureCanvasConfig,
+    /// Empty means the slot was captured with nothing recorded.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub track_checksum: String,
+}
+
+impl GestureMorphSnapshot {
+    pub fn sanitized(&self) -> Self {
+        Self {
+            canvas: self.canvas.sanitized(),
+            track_checksum: self.track_checksum.clone(),
+        }
+    }
+}
+
+/// A recorded track is topology: two slots may only blend their canvas values
+/// when they name the exact same recording. This is the S3b analogue of
+/// `displace_route_matches`.
+fn gesture_track_matches(a: &GestureMorphSnapshot, b: &GestureMorphSnapshot) -> bool {
+    a.track_checksum == b.track_checksum
+}
+
+/// Blend only the authored canvas controls. The recorded track's identity is
+/// carried from A — A/B compatibility already proved it equal — and is never
+/// interpolated, so no morph position can synthesize a third recording that
+/// neither slot captured.
+fn interpolate_gesture(
+    a: &GestureMorphSnapshot,
+    b: &GestureMorphSnapshot,
+    weights: [f32; 2],
+) -> Option<GestureMorphSnapshot> {
+    if !gesture_track_matches(a, b) {
+        return None;
+    }
+    Some(GestureMorphSnapshot {
+        canvas: GestureCanvasConfig {
+            radius: blend_finite(a.canvas.radius, b.canvas.radius, weights),
+            strength: blend_finite(a.canvas.strength, b.canvas.strength, weights),
+            retention: blend_finite(a.canvas.retention, b.canvas.retention, weights),
+        }
+        .sanitized(),
+        track_checksum: a.track_checksum.clone(),
+    })
 }
 
 fn remapped_saved_position_after_move(
@@ -1143,6 +1206,11 @@ fn saved_node_image_taps_mut(
     match kind {
         VisualNodeKind::Mask(MaskParams::Image(matte)) => [Some(&mut matte.tap), None],
         VisualNodeKind::Displace(params) => [Some(&mut params.tap), None],
+        // Residual names both of its slots. Rewriting one route of the pair
+        // and leaving its partner stale would desynchronize the two Morph
+        // endpoints and make the node's own route-equality gate refuse to
+        // interpolate.
+        VisualNodeKind::Residual(params) => [Some(&mut params.structure), Some(&mut params.detail)],
         VisualNodeKind::Symmetry(params) => {
             let [first, second] = &mut params.donors;
             [Some(first), Some(second)]
@@ -1179,6 +1247,7 @@ fn saved_node_motion_donors_mut(
         | VisualNodeKind::Shift(_)
         | VisualNodeKind::Grain(_)
         | VisualNodeKind::Mask(_)
+        | VisualNodeKind::Residual(_)
         | VisualNodeKind::Displace(_) => [None, None],
     }
 }
@@ -1483,8 +1552,25 @@ impl MorphSlot {
             master_rack: None,
             layer_racks: None,
             composition: None,
+            gesture: None,
         }
         .sanitized()
+    }
+
+    /// Attach the authored gesture world to an already-captured slot.
+    ///
+    /// `track_checksum` is the recording's canonical digest, never its events:
+    /// a Morph slot names a recording, it does not own one.
+    pub fn with_gesture(
+        mut self,
+        canvas: crate::gesture_canvas::GestureCanvasParams,
+        track_checksum: String,
+    ) -> Self {
+        self.gesture = Some(GestureMorphSnapshot {
+            canvas: GestureCanvasConfig::from_params(canvas).sanitized(),
+            track_checksum,
+        });
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1617,6 +1703,7 @@ impl MorphSlot {
             master_rack: self.master_rack.clone(),
             layer_racks: self.layer_racks.clone(),
             composition: self.composition.clone(),
+            gesture: self.gesture.as_ref().map(GestureMorphSnapshot::sanitized),
         }
     }
 
@@ -1791,6 +1878,10 @@ pub struct MorphSample {
     /// Present only when group membership/root topology and every group rack
     /// signature match. The sampled tree contains values, never new topology.
     pub composition: Option<CompositionTree>,
+    /// Present only when both slots captured a gesture world against the same
+    /// recording. It carries authored canvas values and the track's identity —
+    /// never any recorded event.
+    pub gesture: Option<GestureMorphSnapshot>,
 }
 
 impl MorphSample {
@@ -1913,6 +2004,7 @@ impl MorphSample {
         master_rack: &mut RuntimeVisualRack,
         layer_racks: &mut [RuntimeVisualRack],
         composition: &mut RuntimeComposition,
+        gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
     ) {
         self.apply_to_with_composition(
             master,
@@ -1927,6 +2019,19 @@ impl MorphSample {
         if let Some(motion) = self.master_motion {
             let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
             *master_motion = motion.resolve_runtime(&layer_ids);
+        }
+        self.apply_gesture_to(gesture_canvas);
+    }
+
+    /// Write only the sampled authored canvas controls.
+    ///
+    /// There is deliberately no recorded-track destination here. A sample
+    /// carries a track's identity so ownership can be decided; it never
+    /// carries events, so no morph position can rewrite, truncate, or reorder
+    /// what the operator actually recorded.
+    pub fn apply_gesture_to(&self, canvas: &mut crate::gesture_canvas::GestureCanvasParams) {
+        if let Some(gesture) = &self.gesture {
+            *canvas = gesture.canvas.to_params();
         }
     }
 }
@@ -2071,6 +2176,20 @@ impl Morph {
         )
     }
 
+    /// Ownership of the authored canvas controls additionally requires that
+    /// both slots name the same recording. Two slots captured against
+    /// different tracks own nothing and stay directly editable.
+    pub(crate) fn controls_master_gesture(&self) -> bool {
+        matches!(
+            (&self.a, &self.b),
+            (Some(a), Some(b))
+                if match (&a.gesture, &b.gesture) {
+                    (Some(a), Some(b)) => gesture_track_matches(a, b),
+                    _ => false,
+                }
+        )
+    }
+
     pub fn clear(&mut self) {
         self.a = None;
         self.b = None;
@@ -2198,6 +2317,10 @@ impl Morph {
             master_rack,
             layer_racks,
             composition,
+            gesture: match (&a.gesture, &b.gesture) {
+                (Some(a), Some(b)) => interpolate_gesture(a, b, weights),
+                _ => None,
+            },
         })
     }
 
@@ -2293,6 +2416,7 @@ impl Morph {
         master_rack: &mut RuntimeVisualRack,
         layer_racks: &mut [RuntimeVisualRack],
         composition: &mut RuntimeComposition,
+        gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
     ) {
         if let Some(sample) = self.sample(t) {
             sample.apply_to_with_composition_and_motion(
@@ -2305,6 +2429,7 @@ impl Morph {
                 master_rack,
                 layer_racks,
                 composition,
+                gesture_canvas,
             );
         }
     }
@@ -2354,6 +2479,7 @@ fn saved_node_topology_matches(a: VisualNodeKind, b: VisualNodeKind) -> bool {
         (VisualNodeKind::Mask(_), VisualNodeKind::Mask(_)) => false,
         (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => displace_route_matches(a, b),
         (VisualNodeKind::Symmetry(a), VisualNodeKind::Symmetry(b)) => symmetry_route_matches(a, b),
+        (VisualNodeKind::Residual(a), VisualNodeKind::Residual(b)) => residual_route_matches(a, b),
         _ => true,
     }
 }
@@ -2381,6 +2507,14 @@ fn symmetry_route_matches(a: SymmetryParams, b: SymmetryParams) -> bool {
         && a.motion == b.motion
         && a.source_mask.sanitized() == b.source_mask.sanitized()
         && a.motion_mask == b.motion_mask
+}
+
+/// Residual owns two authored routes and both are compared, slot by slot. A
+/// pair that agrees on structure but not on detail is still different topology:
+/// blending across a mismatched donor would recombine one snapshot's large
+/// scale with an image the other snapshot never named.
+fn residual_route_matches(a: ResidualParams, b: ResidualParams) -> bool {
+    a.routes() == b.routes()
 }
 
 fn interpolate_rack(
@@ -2444,6 +2578,9 @@ fn interpolate_node_kind(
         }
         (VisualNodeKind::Symmetry(a), VisualNodeKind::Symmetry(b)) => {
             VisualNodeKind::Symmetry(interpolate_symmetry(a, b, weights, choose_b)?)
+        }
+        (VisualNodeKind::Residual(a), VisualNodeKind::Residual(b)) => {
+            VisualNodeKind::Residual(interpolate_residual(a, b, weights, choose_b)?)
         }
         _ => return None,
     })
@@ -2510,6 +2647,44 @@ fn interpolate_symmetry(
         motion_mask: a.motion_mask,
         donors: a.donors,
         motion: a.motion,
+    })
+}
+
+/// `mix` and `detail_gain` blend continuously; the block vocabulary and the
+/// quantization law are discrete and switch at the midpoint like every other
+/// authored enum. Both routes are topology: A/B compatibility already proved
+/// the pair equal, so they are carried, never interpolated.
+///
+/// Each endpoint is normalized before the blend because `detail_gain` is
+/// neutral at one, not at zero: `blend_finite`'s hostile fallback would
+/// otherwise silence a gain that neither snapshot authored as silent.
+fn interpolate_residual(
+    a: ResidualParams,
+    b: ResidualParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<ResidualParams> {
+    if !residual_route_matches(a, b) {
+        return None;
+    }
+    Some(ResidualParams {
+        algorithm_version: pick(a.algorithm_version, b.algorithm_version, choose_b),
+        structure: a.structure,
+        detail: a.detail,
+        block: pick(a.block, b.block, choose_b),
+        quantization: pick(a.quantization, b.quantization, choose_b),
+        mix: blend_finite(
+            finite_clamp(a.mix, 0.0, 0.0, 1.0),
+            finite_clamp(b.mix, 0.0, 0.0, 1.0),
+            weights,
+        ),
+        detail_gain: blend_finite(
+            finite_clamp(a.detail_gain, 1.0, 0.0, 4.0),
+            finite_clamp(b.detail_gain, 1.0, 0.0, 4.0),
+            weights,
+        ),
+        // Seed identity is an endpoint recall, never an interpolated RNG.
+        seed: pick(a.seed, b.seed, choose_b),
     })
 }
 
@@ -2800,6 +2975,10 @@ fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKi
             apply_saved_symmetry_values(value, live);
             true
         }
+        (VisualNodeKind::Residual(value), VisualNodeKind::Residual(live)) => {
+            apply_saved_residual_values(value, live);
+            true
+        }
         _ => false,
     }
 }
@@ -2841,6 +3020,23 @@ fn apply_saved_symmetry_values(sampled: SymmetryParams, live: &mut SymmetryParam
     live.boundary = sampled.boundary;
     live.motion_gain = sampled.motion_gain;
     live.hue_span = sampled.hue_span;
+    live.seed = sampled.seed;
+}
+
+/// Values only. Both live donor routes are preserved so applying a Look or a
+/// preset can never silently retarget either half of a Residual recombination.
+/// The quantization seed is a captured value here, not routing topology, so it
+/// transfers exactly like the block and quantization laws.
+#[allow(
+    dead_code,
+    reason = "implementation detail of retained saved value application"
+)]
+fn apply_saved_residual_values(sampled: ResidualParams, live: &mut ResidualParams) {
+    live.algorithm_version = sampled.algorithm_version;
+    live.block = sampled.block;
+    live.quantization = sampled.quantization;
+    live.mix = sampled.mix;
+    live.detail_gain = sampled.detail_gain;
     live.seed = sampled.seed;
 }
 
@@ -3056,6 +3252,16 @@ fn apply_saved_node_kind_values_to_runtime(
             live.seed = value.seed;
             true
         }
+        (VisualNodeKind::Residual(value), RuntimeVisualNodeKind::Residual(live)) => {
+            // Values only; both live donor routes stay under topology control.
+            live.algorithm_version = value.algorithm_version;
+            live.block = value.block;
+            live.quantization = value.quantization;
+            live.mix = value.mix;
+            live.detail_gain = value.detail_gain;
+            live.seed = value.seed;
+            true
+        }
         _ => false,
     }
 }
@@ -3096,6 +3302,12 @@ fn runtime_racks_share_strict_topology(a: &RuntimeVisualRack, b: &RuntimeVisualR
                     && a.motion == b.motion
                     && a.source_mask.sanitized() == b.source_mask.sanitized()
                     && a.motion_mask == b.motion_mask
+            }
+            // Both authored routes are compared slot by slot: a Look whose
+            // structure route agrees but whose detail route does not is a
+            // different recombination, not a values-only difference.
+            (RuntimeVisualNodeKind::Residual(a), RuntimeVisualNodeKind::Residual(b)) => {
+                a.routes() == b.routes()
             }
             _ => true,
         })
@@ -3185,6 +3397,16 @@ fn apply_runtime_node_kind_values(
             live.boundary = value.boundary;
             live.motion_gain = value.motion_gain;
             live.hue_span = value.hue_span;
+            live.seed = value.seed;
+            true
+        }
+        (RuntimeVisualNodeKind::Residual(value), RuntimeVisualNodeKind::Residual(live)) => {
+            // Values only; both live donor routes stay under topology control.
+            live.algorithm_version = value.algorithm_version;
+            live.block = value.block;
+            live.quantization = value.quantization;
+            live.mix = value.mix;
+            live.detail_gain = value.detail_gain;
             live.seed = value.seed;
             true
         }
@@ -5604,5 +5826,457 @@ glide:
         group_slot.remap_layers_after_move(0, 2);
         group_slot.remap_layers_after_remove(0);
         assert_eq!(read(&group_slot).donors, [group_tap, group_tap]);
+    }
+
+    fn residual_rack(params: ResidualParams) -> VisualRack {
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Residual(params)).unwrap();
+        rack
+    }
+
+    /// The single saved Residual node of a fixture rack.
+    fn residual_of(rack: &VisualRack) -> ResidualParams {
+        let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        params
+    }
+
+    #[test]
+    fn morph_interpolates_residual_values_only_when_both_route_slots_match() {
+        use crate::visual_rack::{ResidualBlock, ResidualQuantization};
+
+        // `displace_tap` is a plain saved layer route and carries no kind of
+        // its own; both Residual slots are built from it at distinct positions.
+        let structure = displace_tap(3);
+        let detail = displace_tap(5);
+        let a = residual_rack(ResidualParams {
+            structure,
+            detail,
+            block: ResidualBlock::Four,
+            quantization: ResidualQuantization::Off,
+            mix: 0.0,
+            detail_gain: 0.0,
+            seed: 11,
+            ..ResidualParams::default()
+        });
+        let b = residual_rack(ResidualParams {
+            structure,
+            detail,
+            block: ResidualBlock::SixtyFour,
+            quantization: ResidualQuantization::Fine,
+            mix: 1.0,
+            detail_gain: 4.0,
+            seed: 97,
+            ..ResidualParams::default()
+        });
+
+        // Midpoint: both continuous values blend, both discrete laws switch at
+        // the midpoint, both routes are carried, and the seed is recalled from
+        // an endpoint rather than mixed into a third unauthored lattice.
+        let sampled = interpolate_rack(&a, &b, [0.5, 0.5], true).expect("both route slots match");
+        let params = residual_of(&sampled);
+        assert!((params.mix - 0.5).abs() <= 1.0e-6);
+        assert!((params.detail_gain - 2.0).abs() <= 1.0e-6);
+        assert_eq!(params.block, ResidualBlock::SixtyFour);
+        assert_eq!(params.quantization, ResidualQuantization::Fine);
+        assert_eq!(params.structure, structure);
+        assert_eq!(params.detail, detail);
+        assert_eq!(
+            params.seed, 97,
+            "a seed is an endpoint recall, never an interpolated RNG"
+        );
+
+        // Endpoints are exact on the continuous values, the two discrete laws,
+        // and the seed.
+        for (weights, choose_b, expected_mix, expected_gain, expected_block, expected_seed) in [
+            (
+                [1.0_f32, 0.0_f32],
+                false,
+                0.0_f32,
+                0.0_f32,
+                ResidualBlock::Four,
+                11_u32,
+            ),
+            ([0.0, 1.0], true, 1.0, 4.0, ResidualBlock::SixtyFour, 97),
+        ] {
+            let sampled = interpolate_rack(&a, &b, weights, choose_b).unwrap();
+            let params = residual_of(&sampled);
+            assert_eq!(params.mix, expected_mix);
+            assert_eq!(params.detail_gain, expected_gain);
+            assert_eq!(params.block, expected_block);
+            assert_eq!(params.seed, expected_seed);
+        }
+
+        // A different structure route alone is different topology.
+        let restructured = residual_rack(ResidualParams {
+            structure: displace_tap(4),
+            ..residual_of(&b)
+        });
+        assert!(interpolate_rack(&a, &restructured, [0.5, 0.5], false).is_none());
+
+        // And so is a different detail route alone. A one-slot route predicate
+        // would agree on `structure` and blend two unrelated recombinations.
+        let redetailed = residual_rack(ResidualParams {
+            detail: displace_tap(6),
+            ..residual_of(&b)
+        });
+        assert!(
+            interpolate_rack(&a, &redetailed, [0.5, 0.5], false).is_none(),
+            "the detail slot must join the route-equality gate"
+        );
+
+        // A retimed edge on the same layer is a different route on either slot.
+        for retimed in [
+            residual_rack(ResidualParams {
+                structure: crate::visual_rack::SavedImageTap {
+                    timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+                    ..structure
+                },
+                ..residual_of(&b)
+            }),
+            residual_rack(ResidualParams {
+                detail: crate::visual_rack::SavedImageTap {
+                    timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+                    ..detail
+                },
+                ..residual_of(&b)
+            }),
+        ] {
+            assert!(interpolate_rack(&a, &retimed, [0.5, 0.5], false).is_none());
+        }
+
+        // The same saved-topology gate also guards the saved values-only apply,
+        // where no interpolator re-check exists to catch a mismatch later.
+        let mut mismatched = redetailed.clone();
+        assert!(
+            !apply_rack_values(&a, &mut mismatched),
+            "a mismatched detail route must be refused, not silently accepted"
+        );
+        let mut matching = b.clone();
+        assert!(apply_rack_values(&a, &mut matching));
+        let applied = residual_of(&matching);
+        assert_eq!(applied.mix, 0.0);
+        assert_eq!(applied.detail_gain, 0.0);
+        assert_eq!(applied.block, ResidualBlock::Four);
+        assert_eq!(applied.quantization, ResidualQuantization::Off);
+        assert_eq!(applied.seed, 11);
+        assert_eq!(applied.structure, structure);
+        assert_eq!(applied.detail, detail);
+    }
+
+    #[test]
+    fn applying_residual_values_never_retargets_either_live_donor_route() {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams,
+        };
+
+        let sampled = residual_rack(ResidualParams {
+            structure: displace_tap(3),
+            detail: displace_tap(5),
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.75,
+            detail_gain: 2.5,
+            seed: 4242,
+            ..ResidualParams::default()
+        });
+
+        // Saved-to-runtime apply (Look, preset) copies values only. Both live
+        // routes are deliberately unlike the captured ones.
+        let live_structure = ResolvedImageTap {
+            source: ResolvedImageSource::OneBelow,
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let live_detail = ResolvedImageTap {
+            source: ResolvedImageSource::CleanProgram,
+            timing: EdgeTiming::PreviousFrame,
+        };
+        let mut live = sampled.resolve_routes(|_| None, |_| false);
+        let node_id = live.iter().next().unwrap().stable_id;
+        let RuntimeVisualNodeKind::Residual(params) = &mut live.get_mut(node_id).unwrap().kind
+        else {
+            panic!("residual node")
+        };
+        *params = RuntimeResidualParams {
+            structure: live_structure,
+            detail: live_detail,
+            ..RuntimeResidualParams::default()
+        };
+
+        assert!(apply_saved_rack_values_to_runtime(&sampled, &mut live));
+        let RuntimeVisualNodeKind::Residual(params) = live.get(node_id).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(params.mix, 0.75);
+        assert_eq!(params.detail_gain, 2.5);
+        assert_eq!(params.block, ResidualBlock::Sixteen);
+        assert_eq!(params.quantization, ResidualQuantization::Medium);
+        assert_eq!(params.seed, 4242);
+        assert_eq!(
+            [params.structure, params.detail],
+            [live_structure, live_detail],
+            "value transfer must never rewrite either live donor route"
+        );
+
+        // The strict runtime-to-runtime path instead refuses a mismatch, and it
+        // must do so for either slot independently.
+        for slot in [
+            crate::visual_rack::RESIDUAL_STRUCTURE_SLOT,
+            crate::visual_rack::RESIDUAL_DETAIL_SLOT,
+        ] {
+            let mut other = live.clone();
+            let RuntimeVisualNodeKind::Residual(params) = &mut other.get_mut(node_id).unwrap().kind
+            else {
+                panic!("residual node")
+            };
+            *params.route_mut(slot).expect("both slots name a route") = ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::PreviousFrame,
+            };
+            let mut target = live.clone();
+            assert!(
+                !apply_runtime_rack_values_strict(&other, &mut target),
+                "strict apply must reject a Residual whose slot {slot} donor differs"
+            );
+        }
+        let mut target = live.clone();
+        assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
+        let RuntimeVisualNodeKind::Residual(params) = target.get(node_id).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(
+            [params.structure, params.detail],
+            [live_structure, live_detail]
+        );
+    }
+
+    #[test]
+    fn layer_stack_remaps_keep_both_residual_route_slots_aligned() {
+        use crate::image_routing::LayerImageStage;
+        use crate::performance::SavedLayerPosition;
+        use crate::visual_rack::{EdgeTiming, GroupId, SavedImageTap};
+
+        let layer_tap = |position: u32| SavedImageTap {
+            source: SavedImageSource::SelectedLayer {
+                layer_position: SavedLayerPosition::new(position).unwrap(),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let group_tap = SavedImageTap {
+            source: SavedImageSource::GroupOutput {
+                group_id: GroupId::new(91).unwrap(),
+            },
+            timing: EdgeTiming::PreviousFrame,
+        };
+
+        let residual_at = |rack: &VisualRack, index: usize| {
+            let VisualNodeKind::Residual(params) = rack.iter().nth(index).unwrap().kind else {
+                panic!("residual node")
+            };
+            params
+        };
+        let slot_with = |mix: f32| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Residual(ResidualParams {
+                structure: layer_tap(0),
+                detail: layer_tap(2),
+                mix,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+            rack.push(VisualNodeKind::Residual(ResidualParams {
+                structure: layer_tap(1),
+                detail: group_tap,
+                mix,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+            MorphSlot {
+                master_rack: Some(rack),
+                ..MorphSlot::default()
+            }
+        };
+        let mut morph = Morph {
+            a: Some(slot_with(0.25)),
+            b: Some(slot_with(0.75)),
+            ..Default::default()
+        };
+
+        // Moving position 0 to 2 pushes the old 2 down to 1. Each slot follows
+        // its own saved position; a one-slot remap would leave `detail` stale.
+        morph.remap_layers_after_move(0, 2);
+        for slot in [morph.a.as_ref().unwrap(), morph.b.as_ref().unwrap()] {
+            let rack = slot.master_rack.as_ref().unwrap();
+            assert_eq!(residual_at(rack, 0).structure, layer_tap(2));
+            assert_eq!(residual_at(rack, 0).detail, layer_tap(1));
+            assert_eq!(residual_at(rack, 1).structure, layer_tap(0));
+            assert_eq!(
+                residual_at(rack, 1).detail,
+                group_tap,
+                "layer permutations must never rewrite stable group identities"
+            );
+        }
+
+        // Removing position 1 decrements the structure slot and tombstones the
+        // detail slot, independently and without rebinding either.
+        morph.remap_layers_after_remove(1);
+        for slot in [morph.a.as_ref().unwrap(), morph.b.as_ref().unwrap()] {
+            let rack = slot.master_rack.as_ref().unwrap();
+            assert_eq!(residual_at(rack, 0).structure, layer_tap(1));
+            assert_eq!(
+                residual_at(rack, 0).detail.source,
+                SavedImageSource::MissingSelectedLayer {
+                    saved_position: SavedLayerPosition::new(1).unwrap(),
+                    stage: LayerImageStage::PostLocalEffects,
+                }
+            );
+            assert_eq!(residual_at(rack, 1).structure, layer_tap(0));
+            assert_eq!(residual_at(rack, 1).detail, group_tap);
+        }
+
+        // Both endpoints moved identically, so the pair is still route-equal and
+        // Morph keeps sampling the rack instead of silently dropping it.
+        let sampled = morph.sample(0.5).unwrap();
+        let rack = sampled.master_rack.as_ref().expect("rack still morphs");
+        assert!((residual_at(rack, 0).mix - 0.5).abs() <= 1.0e-6);
+    }
+
+    fn gesture_slot(radius: f32, strength: f32, retention: f32, track: &str) -> MorphSlot {
+        let mut slot = slot(1.0, 0.0, 0.0);
+        slot.gesture = Some(GestureMorphSnapshot {
+            canvas: GestureCanvasConfig {
+                radius,
+                strength,
+                retention,
+            },
+            track_checksum: track.to_string(),
+        });
+        slot
+    }
+
+    /// A recorded track is topology, not a value. The canvas controls blend;
+    /// the recording is carried by identity from A and two slots naming
+    /// different recordings do not blend at all.
+    #[test]
+    fn morph_blends_gesture_canvas_values_only_on_an_exact_recorded_track_match() {
+        let digest = "a".repeat(64);
+        let morph = Morph {
+            a: Some(gesture_slot(0.2, 0.4, 0.8, &digest)),
+            b: Some(gesture_slot(0.6, 0.8, 0.4, &digest)),
+            ..Default::default()
+        };
+        assert!(morph.controls_master_gesture());
+
+        let midpoint = morph.sample(0.5).unwrap();
+        let gesture = midpoint.gesture.as_ref().expect("both slots own gesture");
+        close(gesture.canvas.radius, 0.4);
+        close(gesture.canvas.strength, 0.6);
+        close(gesture.canvas.retention, 0.6);
+        assert_eq!(
+            gesture.track_checksum, digest,
+            "the recording is carried, never blended"
+        );
+
+        // Endpoints are exact, and a sampled world writes only the authored
+        // canvas values into the live state.
+        for (position, expected) in [(0.0_f32, [0.2_f32, 0.4, 0.8]), (1.0, [0.6, 0.8, 0.4])] {
+            let sample = morph.sample(position).unwrap();
+            let mut canvas = crate::gesture_canvas::GestureCanvasParams::default();
+            sample.apply_gesture_to(&mut canvas);
+            close(canvas.radius, expected[0]);
+            close(canvas.strength, expected[1]);
+            close(canvas.retention, expected[2]);
+        }
+
+        // Two different recordings are two pieces, not two ends of a blend.
+        let rerouted = Morph {
+            a: Some(gesture_slot(0.2, 0.4, 0.8, &digest)),
+            b: Some(gesture_slot(0.6, 0.8, 0.4, &"b".repeat(64))),
+            ..Default::default()
+        };
+        assert!(!rerouted.controls_master_gesture());
+        assert!(rerouted.sample(0.5).unwrap().gesture.is_none());
+        let mut untouched = crate::gesture_canvas::GestureCanvasParams::default();
+        let before = untouched;
+        rerouted
+            .sample(0.5)
+            .unwrap()
+            .apply_gesture_to(&mut untouched);
+        assert_eq!(untouched, before);
+
+        // A legacy slot that predates gesture etching claims nothing.
+        let legacy = Morph {
+            a: Some(gesture_slot(0.2, 0.4, 0.8, &digest)),
+            b: Some(slot(1.0, 0.0, 0.0)),
+            ..Default::default()
+        };
+        assert!(!legacy.controls_master_gesture());
+        assert!(legacy.sample(0.5).unwrap().gesture.is_none());
+    }
+
+    /// The slot names a recording; it never owns one. Nothing in the Morph
+    /// snapshot can add, remove, retime, or reorder a recorded event, and the
+    /// section is additive so a legacy slot round-trips unchanged.
+    #[test]
+    fn a_gesture_morph_slot_carries_only_a_recording_identity_and_never_its_events() {
+        let digest = "c".repeat(64);
+        let slot = gesture_slot(0.3, 0.5, 0.7, &digest);
+        let value = serde_json::to_value(&slot).unwrap();
+        let gesture = value["gesture"].as_object().expect("gesture section");
+        let mut keys: Vec<_> = gesture.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["canvas", "track_checksum"],
+            "a Morph slot must carry a recording's identity and nothing else"
+        );
+        let canvas = gesture["canvas"].as_object().expect("canvas values");
+        let mut canvas_keys: Vec<_> = canvas.keys().map(String::as_str).collect();
+        canvas_keys.sort_unstable();
+        assert_eq!(canvas_keys, ["radius", "retention", "strength"]);
+        assert!(
+            !value.to_string().contains("events"),
+            "no recorded event may reach a Morph slot"
+        );
+
+        let restored: MorphSlot = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.gesture, slot.gesture);
+
+        // Absent is exactly the pre-gesture path.
+        let legacy = MorphSlot::default();
+        assert_eq!(legacy.gesture, None);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("gesture").is_none());
+        assert_eq!(
+            serde_json::from_value::<MorphSlot>(legacy_json)
+                .unwrap()
+                .gesture,
+            None
+        );
+
+        // Sanitization runs on the section without touching the identity.
+        let hostile = MorphSlot {
+            gesture: Some(GestureMorphSnapshot {
+                canvas: GestureCanvasConfig {
+                    radius: f32::NAN,
+                    strength: 9.0,
+                    retention: -3.0,
+                },
+                track_checksum: digest.clone(),
+            }),
+            ..MorphSlot::default()
+        }
+        .sanitized();
+        let sanitized = hostile.gesture.expect("section retained");
+        close(
+            sanitized.canvas.radius,
+            GestureCanvasConfig::default().radius,
+        );
+        assert_eq!(sanitized.canvas.strength, 1.0);
+        assert_eq!(sanitized.canvas.retention, 0.0);
+        assert_eq!(sanitized.track_checksum, digest);
     }
 }

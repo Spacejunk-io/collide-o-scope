@@ -20,10 +20,14 @@ use crate::spatial::{SpatialGpuUniforms, SpatialTransform};
 use crate::visual_rack::{
     node_kind_descriptor, CellularParams, DigitalColorParams, EllipseMask, GrainAlgorithm,
     GrainParams, KeyMode, KeyParams, MatteChannel, NodeBlend, NodeId, NodeKindTag, RectangleMask,
-    ResolvedImageTap, RuntimeDisplaceParams, RuntimeImageMatte, RuntimeMaskParams,
-    RuntimeRackError, RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack, ShiftParams,
+    ResidualAllocationSnapshot, ResidualGrid, ResidualResourceError, ResidualResourceLimits,
+    ResidualResourcePlan, ResidualResourceRequest, ResolvedImageTap, RuntimeDisplaceParams,
+    RuntimeImageMatte, RuntimeMaskParams, RuntimeRackError, RuntimeResidualParams,
+    RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack, ShiftParams,
     MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK, MAX_NODES_PER_RACK, MAX_SAMPLED_TEXTURES_PER_PASS,
-    MAX_TEXTURE_SAMPLES_PER_RACK,
+    MAX_TEXTURE_SAMPLES_PER_RACK, RESIDUAL_AGGREGATE_MAX_BYTES, RESIDUAL_DETAIL_SLOT,
+    RESIDUAL_MEAN_BYTES_PER_CELL, RESIDUAL_MEAN_SURFACES_PER_NODE, RESIDUAL_ROUTE_SLOTS,
+    RESIDUAL_STRUCTURE_SLOT,
 };
 
 pub(crate) const RACK_TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -41,6 +45,27 @@ const KIND_RECTANGLE_MASK: u32 = 7;
 const KIND_ELLIPSE_MASK: u32 = 8;
 const KIND_IMAGE_MASK: u32 = 9;
 const KIND_DISPLACE: u32 = 10;
+const KIND_RESIDUAL: u32 = 11;
+/// Internal reduced-resolution block-mean pass. This is not a node kind: it
+/// has no [`NodeKindTag`], no descriptor and no signature code. It is
+/// deliberately numbered far outside the append-only node-kind range so it can
+/// never collide with a future node, and it mirrors `RACK_RESIDUAL_BLOCK_MEAN`
+/// in `shaders/rack_node.wgsl`.
+const KIND_RESIDUAL_BLOCK_MEAN: u32 = 1000;
+
+/// Route slots one rack node may author. Residual owns two; every other kind
+/// owns one. Derived from the domain constant so the executor cannot drift
+/// from the authored model.
+const MAX_NODE_ROUTE_SLOTS: usize = RESIDUAL_ROUTE_SLOTS;
+// A slot index is carried as a `u8` on every wire and binding key.
+const _: () = assert!(MAX_NODE_ROUTE_SLOTS <= u8::MAX as usize);
+/// Upper bound on prepared `(node, slot)` image bindings in one rack, and the
+/// width of the encode report's missing-route table.
+const MAX_RACK_IMAGE_BINDINGS: usize = MAX_NODES_PER_RACK * MAX_NODE_ROUTE_SLOTS;
+/// Extra uniform slots one executed Residual pass consumes beyond its own
+/// recombination record. Both reduced block-mean passes share a single record
+/// — same grid, same block edge, different bound route — so this is one.
+const RESIDUAL_REDUCED_UNIFORM_SLOTS: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum RackPassKind {
@@ -54,6 +79,7 @@ pub(crate) enum RackPassKind {
     EllipseMask(EllipseMask),
     ImageMask(RuntimeImageMatte),
     Displace(RuntimeDisplaceParams),
+    Residual(RuntimeResidualParams),
 }
 
 impl RackPassKind {
@@ -67,23 +93,37 @@ impl RackPassKind {
             Self::Grain(_) => NodeKindTag::Grain,
             Self::RectangleMask(_) | Self::EllipseMask(_) | Self::ImageMask(_) => NodeKindTag::Mask,
             Self::Displace(_) => NodeKindTag::Displace,
+            Self::Residual(_) => NodeKindTag::Residual,
         }
     }
 
-    pub const fn image_tap(self) -> Option<ResolvedImageTap> {
+    /// Every authored route this pass consumes, indexed by its slot. The array
+    /// is fixed-width and exhaustively matched: a kind that acquires a route
+    /// must be named here, because a silent `None` would bind the rack-owned
+    /// zero donor forever without any compile or runtime complaint.
+    pub const fn image_taps(self) -> [Option<ResolvedImageTap>; MAX_NODE_ROUTE_SLOTS] {
         match self {
-            Self::ImageMask(matte) => Some(matte.tap),
-            Self::Displace(displace) => Some(displace.tap),
-            _ => None,
+            Self::ImageMask(matte) => [Some(matte.tap), None],
+            Self::Displace(displace) => [Some(displace.tap), None],
+            Self::Residual(residual) => [Some(residual.structure), Some(residual.detail)],
+            Self::Transform(_)
+            | Self::DigitalColor(_)
+            | Self::Key(_)
+            | Self::Cellular(_)
+            | Self::Shift(_)
+            | Self::Grain(_)
+            | Self::RectangleMask(_)
+            | Self::EllipseMask(_) => [None; MAX_NODE_ROUTE_SLOTS],
         }
     }
 
-    /// Kinds whose authored values make the whole pass a no-op. Only Displace
-    /// declares one: zero gain on both axes must delegate to the dry carrier
-    /// exactly, without encoding a pass or binding a donor.
+    /// Kinds whose authored values make the whole pass a no-op. Displace at
+    /// zero gain and Residual at zero mix must both delegate to the dry
+    /// carrier exactly, without encoding a pass or binding a donor.
     fn is_exact_value_bypass(self) -> bool {
         match self {
             Self::Displace(displace) => displace.is_exact_bypass(),
+            Self::Residual(residual) => residual.is_exact_bypass(),
             _ => false,
         }
     }
@@ -105,6 +145,17 @@ impl RackPassDescriptor {
     pub fn is_exact_bypass(self) -> bool {
         !self.enabled || self.wet <= 0.0 || self.kind.is_exact_value_bypass()
     }
+
+    /// Uniform slots one executed pass consumes. Residual adds a single shared
+    /// record for both of its reduced block-mean passes; every other kind is
+    /// exactly one full-frame record.
+    const fn uniform_slots(self) -> usize {
+        if matches!(self.kind, RackPassKind::Residual(_)) {
+            1 + RESIDUAL_REDUCED_UNIFORM_SLOTS
+        } else {
+            1
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +167,8 @@ pub(crate) struct CollisionRackPlan {
     texture_samples_per_pixel: u32,
     max_sampled_textures_in_pass: u32,
     cross_input_taps: u32,
+    reduced_resolution_passes: u32,
+    reduced_resolution_surfaces: u32,
 }
 
 impl CollisionRackPlan {
@@ -159,6 +212,8 @@ impl CollisionRackPlan {
         let mut independently_counted_textures = 0_u32;
         let mut independently_counted_inputs = 0_u32;
         let mut independently_counted_passes = 0_u32;
+        let mut independently_counted_reduced_passes = 0_u32;
+        let mut independently_counted_reduced_surfaces = 0_u32;
         for node in rack.iter() {
             if !ids.insert(node.stable_id) {
                 return Err(RackCompileError::DuplicateNodeId(node.stable_id));
@@ -181,6 +236,12 @@ impl CollisionRackPlan {
                 independently_counted_inputs = independently_counted_inputs
                     .checked_add(u32::from(descriptor.cross_input_taps))
                     .ok_or(RackCompileError::BudgetOverflow)?;
+                independently_counted_reduced_passes = independently_counted_reduced_passes
+                    .checked_add(u32::from(descriptor.reduced_resolution_passes))
+                    .ok_or(RackCompileError::BudgetOverflow)?;
+                independently_counted_reduced_surfaces = independently_counted_reduced_surfaces
+                    .checked_add(u32::from(descriptor.reduced_resolution_surfaces))
+                    .ok_or(RackCompileError::BudgetOverflow)?;
             }
             let pass = compile_pass(*node)?;
             if pass.kind.tag() != node.kind.tag() {
@@ -193,6 +254,8 @@ impl CollisionRackPlan {
             || independently_counted_samples != declared.texture_samples_per_pixel
             || independently_counted_textures != declared.max_sampled_textures_in_pass
             || independently_counted_inputs != declared.cross_input_taps
+            || independently_counted_reduced_passes != declared.reduced_resolution_passes
+            || independently_counted_reduced_surfaces != declared.reduced_resolution_surfaces
         {
             return Err(RackCompileError::BudgetContractMismatch);
         }
@@ -204,11 +267,23 @@ impl CollisionRackPlan {
             texture_samples_per_pixel: declared.texture_samples_per_pixel,
             max_sampled_textures_in_pass: declared.max_sampled_textures_in_pass,
             cross_input_taps: declared.cross_input_taps,
+            reduced_resolution_passes: declared.reduced_resolution_passes,
+            reduced_resolution_surfaces: declared.reduced_resolution_surfaces,
         })
     }
 
     pub fn passes(&self) -> &[RackPassDescriptor] {
         &self.passes
+    }
+
+    /// Uniform arena slots this plan can ever demand: the source seed plus
+    /// every pass's own requirement, counted for bypassed passes too. Callers
+    /// reserve disjoint bases from this figure, so it must stay at or above
+    /// what [`CollisionRackExecutor::encode_at`] computes for any frame.
+    pub fn uniform_slots(&self) -> usize {
+        self.passes.iter().fold(1_usize, |total, pass| {
+            total.saturating_add(pass.uniform_slots())
+        })
     }
 
     #[cfg_attr(
@@ -270,6 +345,31 @@ impl CollisionRackPlan {
     pub const fn cross_input_taps(&self) -> u32 {
         self.cross_input_taps
     }
+
+    /// Reduced-resolution passes and persistent reduced surfaces are counted
+    /// separately from the full-frame ledger: their bytes are charged by the
+    /// byte-exact block-mean plan, never as full-output layers.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "reduced-resolution accounting is exposed for rack goldens"
+        )
+    )]
+    pub const fn reduced_resolution_passes(&self) -> u32 {
+        self.reduced_resolution_passes
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "reduced-resolution accounting is exposed for rack goldens"
+        )
+    )]
+    pub const fn reduced_resolution_surfaces(&self) -> u32 {
+        self.reduced_resolution_surfaces
+    }
 }
 
 fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompileError> {
@@ -311,6 +411,9 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
                 node_id: node.stable_id,
                 tag: node.kind.tag(),
             });
+        }
+        RuntimeVisualNodeKind::Residual(value) => {
+            RackPassKind::Residual(sanitize_runtime_residual(value))
         }
     };
     Ok(RackPassDescriptor {
@@ -425,6 +528,18 @@ impl RackUniforms {
             p7: [0.0; 4],
             modes: [0; 4],
         }
+    }
+
+    /// The reduced block-mean record. `frame.zw` carries the grid dimensions
+    /// because the attachment is the grid, not the output, and `p1[0]` carries
+    /// the block edge. Both of a node's mean passes are identical here — same
+    /// grid, same edge — and differ only in the routed texture bound at
+    /// `donor_tex`, so one record serves both.
+    fn residual_block_mean(grid: [u32; 2], block_edge: u32) -> Self {
+        let mut uniforms = Self::passthrough(grid);
+        uniforms.meta[0] = KIND_RESIDUAL_BLOCK_MEAN;
+        uniforms.p1[0] = block_edge as f32;
+        uniforms
     }
 
     fn for_pass(
@@ -556,6 +671,22 @@ impl RackUniforms {
                     0.0,
                 ];
             }
+            RackPassKind::Residual(value) => {
+                uniforms.meta[0] = KIND_RESIDUAL;
+                uniforms.meta[3] = value.seed;
+                uniforms.p0 = [
+                    value.mix,
+                    value.detail_gain,
+                    value.block.code() as f32,
+                    value.quantization.code() as f32,
+                ];
+                uniforms.p1 = [
+                    value.block.edge() as f32,
+                    value.quantization.levels() as f32,
+                    0.0,
+                    0.0,
+                ];
+            }
         }
         uniforms
     }
@@ -664,19 +795,26 @@ impl RackSourceBinding {
 
 pub(crate) struct RackImageInput<'a> {
     pub node_id: NodeId,
+    /// Which of the node's authored route slots this donor fills. A node with
+    /// two routes supplies two inputs under distinct slots; the pair is never
+    /// collapsed onto one binding.
+    pub slot: u8,
     pub tap: ResolvedImageTap,
     pub view: Option<&'a wgpu::TextureView>,
 }
 
 struct RackImageBinding {
     node_id: NodeId,
+    slot: u8,
     tap: ResolvedImageTap,
     groups: Option<[wgpu::BindGroup; 2]>,
     valid: bool,
 }
 
-/// Bounded route-resolved image-mask bindings, prepared outside encode and
-/// searched without allocation by stable node ID plus resolved route value.
+/// Bounded route-resolved image bindings, prepared outside encode and searched
+/// without allocation by stable node ID, route slot, and resolved route value.
+/// The slot is part of the key, so a two-route node holds two entries that can
+/// never alias while a genuine duplicate `(node, slot)` is still rejected.
 pub(crate) struct RackImageBindings {
     entries: Box<[RackImageBinding]>,
 }
@@ -696,10 +834,16 @@ impl RackImageBindings {
     /// Update only the frame-local readiness bit of an already prepared
     /// donor. The texture binding remains immutable, so cold N-1 histories
     /// can become valid without allocating a replacement bind group.
-    pub fn set_valid(&mut self, node_id: NodeId, tap: ResolvedImageTap, valid: bool) -> bool {
+    pub fn set_valid(
+        &mut self,
+        node_id: NodeId,
+        slot: u8,
+        tap: ResolvedImageTap,
+        valid: bool,
+    ) -> bool {
         let Ok(index) = self
             .entries
-            .binary_search_by_key(&node_id, |entry| entry.node_id)
+            .binary_search_by_key(&(node_id, slot), |entry| (entry.node_id, entry.slot))
         else {
             return false;
         };
@@ -711,10 +855,10 @@ impl RackImageBindings {
         true
     }
 
-    fn find(&self, node_id: NodeId, tap: ResolvedImageTap) -> Option<&RackImageBinding> {
+    fn find(&self, node_id: NodeId, slot: u8, tap: ResolvedImageTap) -> Option<&RackImageBinding> {
         let index = self
             .entries
-            .binary_search_by_key(&node_id, |entry| entry.node_id)
+            .binary_search_by_key(&(node_id, slot), |entry| (entry.node_id, entry.slot))
             .ok()?;
         let entry = &self.entries[index];
         (entry.tap == tap).then_some(entry)
@@ -727,11 +871,69 @@ impl Default for RackImageBindings {
     }
 }
 
+/// One active Residual node's reduced working set: two grid-sized block-mean
+/// surfaces plus the recombination bind group for each carrier parity. These
+/// are sub-full-frame and are budgeted by the byte-exact residual plan, never
+/// as full-output layers, so they are named fields here rather than entries in
+/// the executor's positional `[RackSurface; 2]` ping-pong pair.
+struct RackResidualMean {
+    node_id: NodeId,
+    grid: ResidualGrid,
+    _textures: [wgpu::Texture; RESIDUAL_ROUTE_SLOTS],
+    mean_views: [wgpu::TextureView; RESIDUAL_ROUTE_SLOTS],
+    recombination_groups: [wgpu::BindGroup; 2],
+}
+
+/// Bounded per-node block-mean surfaces, prepared outside encode from the
+/// admitted plan and searched without allocation by stable node ID.
+pub(crate) struct RackResidualMeans {
+    entries: Box<[RackResidualMean]>,
+}
+
+impl RackResidualMeans {
+    pub fn empty() -> Self {
+        Self {
+            entries: Box::new([]),
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "block-mean cardinality is exposed for GPU goldens"
+        )
+    )]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn find(&self, node_id: NodeId) -> Option<&RackResidualMean> {
+        let index = self
+            .entries
+            .binary_search_by_key(&node_id, |entry| entry.node_id)
+            .ok()?;
+        Some(&self.entries[index])
+    }
+}
+
+impl Default for RackResidualMeans {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+/// Missing routes are reported per `(node, slot)`, so the table is as wide as
+/// the prepared binding set rather than the node count: a two-route node whose
+/// donors both vanish reports twice and can never index past the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RackEncodeReport {
     pub surface_index: usize,
+    /// Authored full-frame node passes that ran. Reduced block-mean passes are
+    /// interior to their node and are not counted here; they write only that
+    /// node's own grid surfaces and never flip the ping-pong parity.
     pub executed_passes: u8,
-    pub missing_image_nodes: [Option<NodeId>; MAX_NODES_PER_RACK],
+    pub missing_image_nodes: [Option<NodeId>; MAX_RACK_IMAGE_BINDINGS],
     pub missing_image_count: u8,
 }
 
@@ -778,7 +980,20 @@ pub(crate) enum RackGpuError {
         requested: usize,
         limit: usize,
     },
-    DuplicateImageBinding(NodeId),
+    DuplicateImageBinding {
+        node_id: NodeId,
+        slot: u8,
+    },
+    /// A block-mean working set could not be admitted or does not match what
+    /// the executor actually allocated. Reduced surfaces are budgeted by the
+    /// byte-exact residual plan, never as full-frame layers.
+    ResidualResources(ResidualResourceError),
+    /// An active Residual pass reached encode with no prepared block-mean
+    /// surfaces. Refusing is fail-closed: rendering the recombination against
+    /// another node's means would silently produce a wrong image.
+    MissingResidualSurfaces {
+        node_id: NodeId,
+    },
     PlanOutputMismatch {
         plan: [u32; 2],
         executor: [u32; 2],
@@ -817,9 +1032,19 @@ impl fmt::Display for RackGpuError {
                 formatter,
                 "rack image binding set contains {requested} entries; limit is {limit}"
             ),
-            Self::DuplicateImageBinding(id) => {
-                write!(formatter, "duplicate image binding for node {}", id.get())
+            Self::DuplicateImageBinding { node_id, slot } => write!(
+                formatter,
+                "duplicate image binding for node {} route slot {slot}",
+                node_id.get()
+            ),
+            Self::ResidualResources(error) => {
+                write!(formatter, "residual block-mean resources: {error}")
             }
+            Self::MissingResidualSurfaces { node_id } => write!(
+                formatter,
+                "residual node {} has no prepared block-mean surfaces",
+                node_id.get()
+            ),
             Self::PlanOutputMismatch { plan, executor } => write!(
                 formatter,
                 "rack plan output {}x{} does not match executor {}x{}",
@@ -938,6 +1163,11 @@ impl CollisionRackExecutor {
                         sampled_texture_entry(1),
                         sampler_entry(2),
                         sampler_entry(3),
+                        // Second routed input. Appended rather than
+                        // renumbering the samplers; every kind but the
+                        // Residual recombination binds the rack-owned 1x1
+                        // zero view here and is byte-unchanged.
+                        sampled_texture_entry(4),
                     ],
                 });
             let uniform_layout =
@@ -1062,6 +1292,7 @@ impl CollisionRackExecutor {
                     &texture_layout,
                     &surfaces[index].view,
                     &zero_view,
+                    &zero_view,
                     &linear_sampler,
                     &nearest_sampler,
                     "Collision Rack missing-donor BG",
@@ -1151,6 +1382,7 @@ impl CollisionRackExecutor {
                 &self.texture_layout,
                 view,
                 &self.zero_view,
+                &self.zero_view,
                 &self.linear_sampler,
                 &self.nearest_sampler,
                 "Collision Rack prepared source BG",
@@ -1168,20 +1400,36 @@ impl CollisionRackExecutor {
         device: &wgpu::Device,
         inputs: &[RackImageInput<'_>],
     ) -> Result<RackImageBindings, RackGpuError> {
-        if inputs.len() > MAX_NODES_PER_RACK {
+        self.prepare_image_bindings_with_second_slot(device, inputs, &self.zero_view)
+    }
+
+    /// Prepare routed bindings, filling the appended second routed slot with
+    /// `second_slot`. Production always passes the rack-owned 1x1 zero view,
+    /// so every kind but the Residual recombination sees exactly what it saw
+    /// before the layout widened; a fixture passes a hostile view to prove
+    /// that none of them reads the slot at all.
+    fn prepare_image_bindings_with_second_slot(
+        &self,
+        device: &wgpu::Device,
+        inputs: &[RackImageInput<'_>],
+        second_slot: &wgpu::TextureView,
+    ) -> Result<RackImageBindings, RackGpuError> {
+        if inputs.len() > MAX_RACK_IMAGE_BINDINGS {
             return Err(RackGpuError::TooManyImageBindings {
                 requested: inputs.len(),
-                limit: MAX_NODES_PER_RACK,
+                limit: MAX_RACK_IMAGE_BINDINGS,
             });
         }
         let mut sorted = inputs.iter().collect::<Vec<_>>();
-        sorted.sort_unstable_by_key(|input| input.node_id);
-        if let Some(duplicate) = sorted
+        sorted.sort_unstable_by_key(|input| (input.node_id, input.slot));
+        // Two routes on one node are two entries under distinct slots; only a
+        // repeated `(node, slot)` is a genuine duplicate.
+        if let Some((node_id, slot)) = sorted
             .windows(2)
-            .find(|pair| pair[0].node_id == pair[1].node_id)
-            .map(|pair| pair[0].node_id)
+            .find(|pair| pair[0].node_id == pair[1].node_id && pair[0].slot == pair[1].slot)
+            .map(|pair| (pair[0].node_id, pair[0].slot))
         {
-            return Err(RackGpuError::DuplicateImageBinding(duplicate));
+            return Err(RackGpuError::DuplicateImageBinding { node_id, slot });
         }
         let entries = create_checked(device, "Collision Rack image bindings", || {
             sorted
@@ -1194,14 +1442,16 @@ impl CollisionRackExecutor {
                                 &self.texture_layout,
                                 &self.surfaces[index].view,
                                 view,
+                                second_slot,
                                 &self.linear_sampler,
                                 &self.nearest_sampler,
-                                "Collision Rack routed image-mask BG",
+                                "Collision Rack routed image BG",
                             )
                         })
                     });
                     RackImageBinding {
                         node_id: input.node_id,
+                        slot: input.slot,
                         tap: input.tap,
                         groups,
                         valid: input.view.is_some(),
@@ -1221,10 +1471,166 @@ impl CollisionRackExecutor {
         Ok(RackImageBindings { entries })
     }
 
+    /// Allocate the two block-mean surfaces every active Residual node owns,
+    /// from the admitted plan and outside encode. Admission runs before any
+    /// GPU allocation: each independent bound is checked by
+    /// [`ResidualResourcePlan::preflight`], and what was actually created is
+    /// then reconciled against that plan and fails closed on any disagreement.
+    /// A bypassed, disabled, or zero-wet node allocates nothing at all.
+    pub fn prepare_residual_means(
+        &self,
+        device: &wgpu::Device,
+        plan: &CollisionRackPlan,
+    ) -> Result<RackResidualMeans, RackGpuError> {
+        if plan.output_dimensions != self.dimensions {
+            return Err(RackGpuError::PlanOutputMismatch {
+                plan: plan.output_dimensions,
+                executor: self.dimensions,
+            });
+        }
+        let active = plan
+            .passes
+            .iter()
+            .filter(|pass| !pass.is_exact_bypass())
+            .filter_map(|pass| match pass.kind {
+                RackPassKind::Residual(residual) => Some((pass.node_id, residual.block)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            return Ok(RackResidualMeans::empty());
+        }
+
+        let device_limits = device.limits();
+        let limits = ResidualResourceLimits {
+            max_texture_dimension_2d: device_limits.max_texture_dimension_2d,
+            min_uniform_buffer_offset_alignment: device_limits.min_uniform_buffer_offset_alignment,
+            max_sampled_textures_per_shader_stage: device_limits
+                .max_sampled_textures_per_shader_stage,
+            max_residual_bytes: RESIDUAL_AGGREGATE_MAX_BYTES,
+        };
+        let requests = active
+            .iter()
+            .map(|(_, block)| ResidualResourceRequest {
+                output_dimensions: self.dimensions,
+                block: *block,
+            })
+            .collect::<Vec<_>>();
+        let declared = ResidualResourcePlan::preflight(&requests, limits)
+            .map_err(RackGpuError::ResidualResources)?;
+
+        let mut grids = Vec::with_capacity(active.len());
+        for (node_id, block) in &active {
+            let grid = ResidualGrid::for_output(self.dimensions, *block)
+                .map_err(RackGpuError::ResidualResources)?;
+            grids.push((*node_id, grid));
+        }
+        grids.sort_unstable_by_key(|(node_id, _)| *node_id);
+
+        let entries = create_checked(device, "Collision Rack residual block means", || {
+            grids
+                .iter()
+                .map(|(node_id, grid)| {
+                    let textures: [wgpu::Texture; RESIDUAL_ROUTE_SLOTS] =
+                        std::array::from_fn(|slot| {
+                            device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some(if slot == usize::from(RESIDUAL_STRUCTURE_SLOT) {
+                                    "Collision Rack residual structure mean"
+                                } else {
+                                    "Collision Rack residual detail mean"
+                                }),
+                                size: wgpu::Extent3d {
+                                    width: grid.width,
+                                    height: grid.height,
+                                    depth_or_array_layers: 1,
+                                },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: RACK_TEXTURE_FORMAT,
+                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            })
+                        });
+                    let mean_views: [wgpu::TextureView; RESIDUAL_ROUTE_SLOTS] =
+                        std::array::from_fn(|slot| {
+                            textures[slot].create_view(&wgpu::TextureViewDescriptor::default())
+                        });
+                    let recombination_groups = std::array::from_fn(|parity| {
+                        create_texture_group(
+                            device,
+                            &self.texture_layout,
+                            &self.surfaces[parity].view,
+                            &mean_views[usize::from(RESIDUAL_STRUCTURE_SLOT)],
+                            &mean_views[usize::from(RESIDUAL_DETAIL_SLOT)],
+                            &self.linear_sampler,
+                            &self.nearest_sampler,
+                            "Collision Rack residual recombination BG",
+                        )
+                    });
+                    RackResidualMean {
+                        node_id: *node_id,
+                        grid: *grid,
+                        _textures: textures,
+                        mean_views,
+                        recombination_groups,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })?;
+
+        let allocated_cells = entries
+            .iter()
+            .try_fold(0_u64, |total, entry| {
+                entry
+                    .grid
+                    .cell_count
+                    .checked_mul(u64::from(RESIDUAL_MEAN_SURFACES_PER_NODE))
+                    .and_then(|cells| total.checked_add(cells))
+            })
+            .ok_or(RackGpuError::ResidualResources(
+                ResidualResourceError::ArithmeticOverflow,
+            ))?;
+        let snapshot = ResidualAllocationSnapshot {
+            mean_surfaces: u32::try_from(entries.len())
+                .ok()
+                .and_then(|nodes| nodes.checked_mul(RESIDUAL_MEAN_SURFACES_PER_NODE))
+                .ok_or(RackGpuError::ResidualResources(
+                    ResidualResourceError::ArithmeticOverflow,
+                ))?,
+            bytes_per_cell: RESIDUAL_MEAN_BYTES_PER_CELL,
+            surfaces_per_node: RESIDUAL_MEAN_SURFACES_PER_NODE,
+            uniform_stride_bytes: self.uniform_stride,
+            total_bytes: allocated_cells
+                .checked_mul(RESIDUAL_MEAN_BYTES_PER_CELL)
+                .ok_or(RackGpuError::ResidualResources(
+                    ResidualResourceError::ArithmeticOverflow,
+                ))?,
+        };
+        declared
+            .reconcile(snapshot)
+            .map_err(RackGpuError::ResidualResources)?;
+
+        self.allocations.textures.fetch_add(
+            entries.len() as u64 * u64::from(RESIDUAL_MEAN_SURFACES_PER_NODE),
+            Ordering::Relaxed,
+        );
+        self.allocations
+            .bind_groups
+            .fetch_add(entries.len() as u64 * 2, Ordering::Relaxed);
+        Ok(RackResidualMeans { entries })
+    }
+
     /// Encode seed conversion plus every active node in exact authored order.
     /// Uniform writes update preallocated dynamic slots; render passes only
     /// reference warmed pipelines, bind groups, buffers and surfaces.
     #[cfg(test)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the allocation-free encode boundary keeps every borrowed GPU input explicit"
+    )]
     pub fn encode(
         &self,
         queue: &wgpu::Queue,
@@ -1232,9 +1638,10 @@ impl CollisionRackExecutor {
         plan: &CollisionRackPlan,
         source: &RackSourceBinding,
         images: &RackImageBindings,
+        means: &RackResidualMeans,
         time_seconds: f32,
     ) -> Result<RackEncodeReport, RackGpuError> {
-        self.encode_at(queue, encoder, plan, source, images, 0, time_seconds)
+        self.encode_at(queue, encoder, plan, source, images, means, 0, time_seconds)
     }
 
     /// Encode at a caller-reserved uniform base. Disjoint bases are required
@@ -1251,6 +1658,7 @@ impl CollisionRackExecutor {
         plan: &CollisionRackPlan,
         source: &RackSourceBinding,
         images: &RackImageBindings,
+        means: &RackResidualMeans,
         uniform_base_slot: usize,
         time_seconds: f32,
     ) -> Result<RackEncodeReport, RackGpuError> {
@@ -1270,8 +1678,9 @@ impl CollisionRackExecutor {
             .passes
             .iter()
             .filter(|pass| !pass.is_exact_bypass())
-            .count()
-            .checked_add(1)
+            .try_fold(1_usize, |total, pass| {
+                total.checked_add(pass.uniform_slots())
+            })
             .ok_or(RackGpuError::BufferSizeOverflow)?;
         if uniform_base_slot
             .checked_add(required_slots)
@@ -1305,34 +1714,100 @@ impl CollisionRackExecutor {
 
         let mut current_surface = 0_usize;
         let mut executed = 0_u8;
-        let mut missing_image_nodes = [None; MAX_NODES_PER_RACK];
+        let mut next_slot = uniform_base_slot
+            .checked_add(1)
+            .ok_or(RackGpuError::BufferSizeOverflow)?;
+        let mut missing_image_nodes = [None; MAX_RACK_IMAGE_BINDINGS];
         let mut missing_count = 0_u8;
         for pass in plan.passes.iter().copied() {
             if pass.is_exact_bypass() {
                 continue;
             }
             let target_surface = current_surface ^ 1;
-            let mut donor_valid = false;
-            let texture_group = match pass.kind.image_tap() {
-                Some(tap) => match images.find(pass.node_id, tap) {
-                    Some(binding) => match binding.groups.as_ref() {
-                        Some(groups) if binding.valid => {
-                            donor_valid = true;
-                            &groups[current_surface]
-                        }
-                        Some(_) | None => {
+
+            // Resolve every authored slot independently. A route binds by
+            // stable node id, route slot, and exact resolved tap; a mismatch
+            // or a cold history falls back to the rack-owned zero donor for
+            // that slot alone and is reported, never onto the node's other
+            // route and never onto a stale donor.
+            let taps = pass.kind.image_taps();
+            let mut route_groups: [Option<&wgpu::BindGroup>; MAX_NODE_ROUTE_SLOTS] =
+                [None; MAX_NODE_ROUTE_SLOTS];
+            let mut authored_routes = 0_usize;
+            let mut every_route_valid = true;
+            for (index, tap) in taps.iter().enumerate() {
+                let Some(tap) = *tap else {
+                    continue;
+                };
+                authored_routes += 1;
+                let resolved = images
+                    .find(pass.node_id, index as u8, tap)
+                    .and_then(|binding| match binding.groups.as_ref() {
+                        Some(groups) if binding.valid => Some(&groups[current_surface]),
+                        Some(_) | None => None,
+                    });
+                match resolved {
+                    Some(group) => route_groups[index] = Some(group),
+                    None => {
+                        every_route_valid = false;
+                        if usize::from(missing_count) < MAX_RACK_IMAGE_BINDINGS {
                             missing_image_nodes[usize::from(missing_count)] = Some(pass.node_id);
                             missing_count += 1;
-                            &self.missing_groups[current_surface]
                         }
-                    },
-                    None => {
-                        missing_image_nodes[usize::from(missing_count)] = Some(pass.node_id);
-                        missing_count += 1;
-                        &self.missing_groups[current_surface]
                     }
-                },
-                None => &self.missing_groups[current_surface],
+                }
+            }
+            let donor_valid = authored_routes > 0 && every_route_valid;
+
+            // The reduced block means come first. They read the routed donors
+            // at their own grid resolution, write only the node's own reduced
+            // surfaces, and therefore never disturb the ping-pong parity.
+            let residual_means = match pass.kind {
+                RackPassKind::Residual(residual) => {
+                    let prepared =
+                        means
+                            .find(pass.node_id)
+                            .ok_or(RackGpuError::MissingResidualSurfaces {
+                                node_id: pass.node_id,
+                            })?;
+                    let mean_slot = next_slot;
+                    next_slot = next_slot
+                        .checked_add(RESIDUAL_REDUCED_UNIFORM_SLOTS)
+                        .ok_or(RackGpuError::BufferSizeOverflow)?;
+                    let mean_offset = self
+                        .uniform_stride
+                        .checked_mul(
+                            u64::try_from(mean_slot)
+                                .map_err(|_| RackGpuError::BufferSizeOverflow)?,
+                        )
+                        .ok_or(RackGpuError::BufferSizeOverflow)?;
+                    queue.write_buffer(
+                        &self.uniform_buffer,
+                        mean_offset,
+                        bytemuck::bytes_of(&RackUniforms::residual_block_mean(
+                            [prepared.grid.width, prepared.grid.height],
+                            residual.block.edge(),
+                        )),
+                    );
+                    let mean_offset =
+                        u32::try_from(mean_offset).map_err(|_| RackGpuError::BufferSizeOverflow)?;
+                    for (index, view) in prepared.mean_views.iter().enumerate() {
+                        self.encode_pass(
+                            encoder,
+                            "Collision Rack residual block mean",
+                            route_groups[index].unwrap_or(&self.missing_groups[current_surface]),
+                            mean_offset,
+                            view,
+                        );
+                    }
+                    Some(prepared)
+                }
+                _ => None,
+            };
+
+            let texture_group = match residual_means {
+                Some(prepared) => &prepared.recombination_groups[current_surface],
+                None => route_groups[0].unwrap_or(&self.missing_groups[current_surface]),
             };
             let uniform = RackUniforms::for_pass(
                 pass,
@@ -1341,9 +1816,9 @@ impl CollisionRackExecutor {
                 time_seconds,
                 donor_valid,
             );
-            let slot = uniform_base_slot
-                .checked_add(usize::from(executed))
-                .and_then(|slot| slot.checked_add(1))
+            let slot = next_slot;
+            next_slot = next_slot
+                .checked_add(1)
                 .ok_or(RackGpuError::BufferSizeOverflow)?;
             let offset = self
                 .uniform_stride
@@ -1455,12 +1930,16 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// Build one rack texture group. `donor_b` is the second routed input: pass
+/// the rack-owned 1x1 zero view for every kind except the Residual
+/// recombination, whose two block means occupy `donor` and `donor_b`.
 #[allow(clippy::too_many_arguments)]
 fn create_texture_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     source: &wgpu::TextureView,
     donor: &wgpu::TextureView,
+    donor_b: &wgpu::TextureView,
     linear_sampler: &wgpu::Sampler,
     nearest_sampler: &wgpu::Sampler,
     label: &'static str,
@@ -1484,6 +1963,10 @@ fn create_texture_group(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(nearest_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(donor_b),
             },
         ],
     })
@@ -1639,6 +2122,10 @@ fn sanitize_runtime_matte(value: RuntimeImageMatte) -> RuntimeImageMatte {
     }
 }
 
+fn sanitize_runtime_residual(value: RuntimeResidualParams) -> RuntimeResidualParams {
+    value.sanitized()
+}
+
 fn sanitize_runtime_displace(value: RuntimeDisplaceParams) -> RuntimeDisplaceParams {
     RuntimeDisplaceParams {
         tap: value.tap,
@@ -1680,8 +2167,9 @@ const fn matte_channel_code(channel: MatteChannel) -> u32 {
 mod tests {
     use super::*;
     use crate::visual_rack::{
-        DisplaceBoundary, EdgeTiming, LegacyRackScope, ResolvedImageSource, RuntimeVisualNodeKind,
-        PREMULTIPLIED_BILINEAR_TEXTURE_OPS,
+        DisplaceBoundary, EdgeTiming, LegacyRackScope, ResidualBlock, ResidualQuantization,
+        ResolvedImageSource, RuntimeVisualNodeKind, PREMULTIPLIED_BILINEAR_TEXTURE_OPS,
+        RACK_PRIMARY_ROUTE_SLOT, RESIDUAL_MEAN_TAPS_PER_CELL,
     };
 
     fn node_id(value: u64) -> NodeId {
@@ -1732,6 +2220,29 @@ mod tests {
             let c10 = cover(self.load(bx + 1, by));
             let c01 = cover(self.load(bx, by + 1));
             let c11 = cover(self.load(bx + 1, by + 1));
+            std::array::from_fn(|channel| {
+                let top = c00[channel] + (c10[channel] - c00[channel]) * fraction[0];
+                let bottom = c01[channel] + (c11[channel] - c01[channel]) * fraction[0];
+                top + (bottom - top) * fraction[1]
+            })
+        }
+
+        /// Bilinear filter for a surface that already stores premultiplied
+        /// values. Block means are written covered, so covering them a second
+        /// time would square their alpha; this is the plain four-corner mix a
+        /// linear sampler performs on such a surface.
+        fn premultiplied_stored_bilinear(&self, uv: [f32; 2]) -> [f32; 4] {
+            let coordinate = [
+                uv[0] * self.dimensions[0] as f32 - 0.5,
+                uv[1] * self.dimensions[1] as f32 - 0.5,
+            ];
+            let base = [coordinate[0].floor(), coordinate[1].floor()];
+            let fraction = [coordinate[0] - base[0], coordinate[1] - base[1]];
+            let (bx, by) = (base[0] as i32, base[1] as i32);
+            let c00 = self.load(bx, by);
+            let c10 = self.load(bx + 1, by);
+            let c01 = self.load(bx, by + 1);
+            let c11 = self.load(bx + 1, by + 1);
             std::array::from_fn(|channel| {
                 let top = c00[channel] + (c10[channel] - c00[channel]) * fraction[0];
                 let bottom = c01[channel] + (c11[channel] - c01[channel]) * fraction[0];
@@ -1818,6 +2329,182 @@ mod tests {
             boundary,
             ..RuntimeDisplaceParams::default()
         }
+    }
+
+    /// Block-mean grid cell that owns one output pixel.
+    fn residual_cell(pixel: [u32; 2], block_edge: u32) -> [u32; 2] {
+        [pixel[0] / block_edge, pixel[1] / block_edge]
+    }
+
+    /// Premultiplied four-tap block mean. Each cell averages the four quadrant
+    /// centres of its block, covered into premultiplied space before the
+    /// average, so a transparent or partially covered block contributes exactly
+    /// its coverage and never its hidden RGB. This is a bounded estimator of
+    /// the block's DC and deliberately not a full box integral: the cost stays
+    /// exactly four explicit loads per cell whatever the block edge is. Every
+    /// block edge in the closed vocabulary is a multiple of four, so both
+    /// quadrant centres are exact texel indices; the loads clamp, which is what
+    /// keeps the last row and column of a non-divisible grid on real texels.
+    fn residual_block_mean(image: &RefImage, block_edge: u32, grid: [u32; 2]) -> Vec<[f32; 4]> {
+        let quarter = (block_edge / 4) as i32;
+        let three_quarters = (3 * block_edge / 4) as i32;
+        let mut cells = Vec::with_capacity(grid[0] as usize * grid[1] as usize);
+        for cell_y in 0..grid[1] {
+            for cell_x in 0..grid[0] {
+                let base_x = (cell_x * block_edge) as i32;
+                let base_y = (cell_y * block_edge) as i32;
+                let mut total = [0.0_f32; 4];
+                for (offset_x, offset_y) in [
+                    (quarter, quarter),
+                    (three_quarters, quarter),
+                    (quarter, three_quarters),
+                    (three_quarters, three_quarters),
+                ] {
+                    let pixel = image.load(base_x + offset_x, base_y + offset_y);
+                    let alpha = pixel[3].clamp(0.0, 1.0);
+                    total[0] += pixel[0] * alpha;
+                    total[1] += pixel[1] * alpha;
+                    total[2] += pixel[2] * alpha;
+                    total[3] += alpha;
+                }
+                let taps = RESIDUAL_MEAN_TAPS_PER_CELL as f32;
+                cells.push(total.map(|channel| channel / taps));
+            }
+        }
+        cells
+    }
+
+    /// Seeded per-cell lattice phase, derived through the same 32-bit avalanche
+    /// the shader uses so one seed names one lattice on both sides. The legacy
+    /// sentinel zero keeps the canonical unshifted lattice.
+    fn residual_cell_phase(seed: u32, cell: [u32; 2]) -> f32 {
+        if seed == 0 {
+            return 0.0;
+        }
+        let mixed =
+            cell[0] ^ cell[1].wrapping_mul(0x9e37_79b9) ^ crate::randomization::avalanche32(seed);
+        (crate::randomization::avalanche32(mixed) & 0x00ff_ffff) as f32 / 16_777_216.0
+    }
+
+    /// Seeded fixed quantization. Zero levels is exact identity — the authored
+    /// default is never a one-level collapse. Otherwise the value snaps to a
+    /// lattice of `1 / levels` steps whose phase is the cell's seeded offset,
+    /// so the lattice is deterministic, signed, and independent of the routes.
+    fn residual_quantize(value: f32, levels: u32, seed: u32, cell: [u32; 2]) -> f32 {
+        if levels == 0 {
+            return value;
+        }
+        let scale = levels as f32;
+        let phase = residual_cell_phase(seed, cell);
+        ((value * scale - phase).round() + phase) / scale
+    }
+
+    /// CPU reference for the whole Residual Counterpoint node. `mean0` and
+    /// `mean1` hold the premultiplied block means of the structure and detail
+    /// routes; the carrier supplies both the dry signal and the full-resolution
+    /// detail that is measured against `mean1`:
+    ///
+    /// ```text
+    /// dc  = quantize(mean0)
+    /// ac  = quantize(carrier_premultiplied - mean1)
+    /// out = dc + detail_gain * ac
+    /// ```
+    ///
+    /// `mix` is the wet/dry authority over that result, so zero mix returns the
+    /// carrier exactly and the node delegates.
+    fn residual_reference(
+        carrier: &RefImage,
+        mean0: &RefImage,
+        mean1: &RefImage,
+        params: RuntimeResidualParams,
+    ) -> RefImage {
+        let params = params.sanitized();
+        let levels = params.quantization.levels();
+        let block_edge = params.block.edge();
+        let [width, height] = carrier.dimensions;
+        let mut pixels = Vec::with_capacity(width as usize * height as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let uv = [
+                    (x as f32 + 0.5) / width as f32,
+                    (y as f32 + 0.5) / height as f32,
+                ];
+                let dry = carrier.premultiplied_bilinear(uv);
+                let structure = mean0.premultiplied_stored_bilinear(uv);
+                let detail_reference = mean1.premultiplied_stored_bilinear(uv);
+                let cell = residual_cell([x, y], block_edge);
+                let recombined: [f32; 4] = std::array::from_fn(|channel| {
+                    let dc = residual_quantize(structure[channel], levels, params.seed, cell);
+                    let ac = residual_quantize(
+                        dry[channel] - detail_reference[channel],
+                        levels,
+                        params.seed,
+                        cell,
+                    );
+                    dc + params.detail_gain * ac
+                });
+                let blended: [f32; 4] = std::array::from_fn(|channel| {
+                    dry[channel] + (recombined[channel] - dry[channel]) * params.mix
+                });
+                let alpha = blended[3].clamp(0.0, 1.0);
+                pixels.push(if alpha <= 0.000_001 {
+                    [0.0; 4]
+                } else {
+                    [
+                        blended[0] / alpha,
+                        blended[1] / alpha,
+                        blended[2] / alpha,
+                        alpha,
+                    ]
+                });
+            }
+        }
+        RefImage::new(carrier.dimensions, pixels)
+    }
+
+    fn residual(
+        block: ResidualBlock,
+        quantization: ResidualQuantization,
+        mix: f32,
+        detail_gain: f32,
+    ) -> RuntimeResidualParams {
+        RuntimeResidualParams {
+            block,
+            quantization,
+            mix,
+            detail_gain,
+            ..RuntimeResidualParams::default()
+        }
+    }
+
+    /// A Residual whose two slots name deliberately different routes, so a
+    /// fixture that binds one donor per slot cannot pass by accident if the
+    /// executor collapsed both slots onto one binding.
+    fn residual_routed(
+        block: ResidualBlock,
+        quantization: ResidualQuantization,
+        mix: f32,
+        detail_gain: f32,
+    ) -> RuntimeResidualParams {
+        RuntimeResidualParams {
+            structure: route(ResolvedImageSource::CleanProgram),
+            detail: route(ResolvedImageSource::OneBelow),
+            ..residual(block, quantization, mix, detail_gain)
+        }
+    }
+
+    /// The grid-sized block-mean surface one route produces, as the CPU
+    /// reference sees it.
+    fn residual_mean_image(
+        image: &RefImage,
+        block: ResidualBlock,
+        dimensions: [u32; 2],
+    ) -> RefImage {
+        let grid = ResidualGrid::for_output(dimensions, block).unwrap();
+        RefImage::new(
+            [grid.width, grid.height],
+            residual_block_mean(image, grid.block_pixels, [grid.width, grid.height]),
+        )
     }
 
     fn route(source: ResolvedImageSource) -> ResolvedImageTap {
@@ -1956,7 +2643,10 @@ mod tests {
             .unwrap();
         let compiled = plan(&rack, [16, 9]);
         assert_eq!(compiled.passes()[0].node_id, id);
-        assert_eq!(compiled.passes()[0].kind.image_tap(), Some(expected_route));
+        assert_eq!(
+            compiled.passes()[0].kind.image_taps(),
+            [Some(expected_route), None]
+        );
         assert_eq!(compiled.cross_input_taps(), 1);
         assert_eq!(compiled.max_sampled_textures_in_pass(), 2);
     }
@@ -2048,6 +2738,32 @@ mod tests {
             images: &RackImageBindings,
             time: f32,
         ) -> (RackEncodeReport, Vec<u8>) {
+            self.render_with_means(
+                executor,
+                plan,
+                source,
+                images,
+                &RackResidualMeans::empty(),
+                time,
+            )
+        }
+
+        /// Render a plan whose reduced block-mean surfaces were prepared in
+        /// advance. Preparing them inside the render helper would allocate
+        /// during encode and defeat the warm-allocation proof.
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the fixture mirrors the executor's explicit encode boundary"
+        )]
+        fn render_with_means(
+            &self,
+            executor: &CollisionRackExecutor,
+            plan: &CollisionRackPlan,
+            source: &RackSourceBinding,
+            images: &RackImageBindings,
+            means: &RackResidualMeans,
+            time: f32,
+        ) -> (RackEncodeReport, Vec<u8>) {
             let dimensions = plan.output_dimensions();
             let unpadded_row = dimensions[0] * 8;
             let padded_row = (unpadded_row + 255) & !255;
@@ -2063,7 +2779,7 @@ mod tests {
                     label: Some("Collision Rack test encoder"),
                 });
             let report = executor
-                .encode(&self.queue, &mut encoder, plan, source, images, time)
+                .encode(&self.queue, &mut encoder, plan, source, images, means, time)
                 .unwrap();
             let output = executor.output(report);
             encoder.copy_texture_to_buffer(
@@ -2312,6 +3028,7 @@ mod tests {
                 &gpu.device,
                 &[RackImageInput {
                     node_id: id,
+                    slot: RACK_PRIMARY_ROUTE_SLOT,
                     tap: route(ResolvedImageSource::OneBelow),
                     view: Some(&donor_view),
                 }],
@@ -2327,6 +3044,7 @@ mod tests {
                 &gpu.device,
                 &[RackImageInput {
                     node_id: id,
+                    slot: RACK_PRIMARY_ROUTE_SLOT,
                     tap: expected_route,
                     view: Some(&donor_view),
                 }],
@@ -2463,14 +3181,24 @@ mod tests {
         let bindings = RackImageBindings {
             entries: vec![RackImageBinding {
                 node_id: node_id(3),
+                slot: RACK_PRIMARY_ROUTE_SLOT,
                 tap: other,
                 groups: None,
                 valid: false,
             }]
             .into_boxed_slice(),
         };
-        assert!(bindings.find(node_id(3), expected).is_none());
-        assert!(bindings.find(node_id(3), other).is_some());
+        assert!(bindings
+            .find(node_id(3), RACK_PRIMARY_ROUTE_SLOT, expected)
+            .is_none());
+        assert!(bindings
+            .find(node_id(3), RACK_PRIMARY_ROUTE_SLOT, other)
+            .is_some());
+        // A second slot on the same node is a different key entirely, so the
+        // one prepared entry can never be reused for it.
+        assert!(bindings
+            .find(node_id(3), RESIDUAL_DETAIL_SLOT, other)
+            .is_none());
     }
 
     #[test]
@@ -2504,8 +3232,8 @@ mod tests {
         assert!(compiled.max_sampled_textures_in_pass() <= MAX_SAMPLED_TEXTURES_PER_PASS);
         assert_eq!(compiled.passes()[0].node_id, id);
         assert_eq!(
-            compiled.passes()[0].kind.image_tap(),
-            Some(RuntimeDisplaceParams::default().tap),
+            compiled.passes()[0].kind.image_taps(),
+            [Some(RuntimeDisplaceParams::default().tap), None],
             "an active Displace must expose exactly one cross-scope donor tap"
         );
     }
@@ -2703,6 +3431,461 @@ mod tests {
     }
 
     #[test]
+    fn residual_ledger_charges_one_full_frame_pass_two_reduced_passes_and_twelve_explicit_operations(
+    ) {
+        let budget = node_kind_descriptor(NodeKindTag::Residual).budget;
+        assert_eq!(budget.full_frame_passes, 1);
+        assert_eq!(budget.logical_texture_lookups_per_pixel, 3);
+        assert_eq!(budget.texture_samples_per_pixel, 12);
+        assert_eq!(budget.sampled_textures_in_pass, 3);
+        assert_eq!(budget.cross_input_taps, 2);
+        assert_eq!(budget.reduced_resolution_passes, 2);
+        assert_eq!(budget.reduced_resolution_surfaces, 2);
+        // Three logical bilinear lookups are exactly twelve explicit loads:
+        // dry carrier, structure block mean, detail block mean.
+        assert_eq!(
+            budget.texture_samples_per_pixel,
+            budget.logical_texture_lookups_per_pixel * PREMULTIPLIED_BILINEAR_TEXTURE_OPS
+        );
+
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack
+            .push(RuntimeVisualNodeKind::Residual(residual(
+                ResidualBlock::Sixteen,
+                ResidualQuantization::Coarse,
+                0.5,
+                1.5,
+            )))
+            .unwrap();
+        // The independent re-count in `compile` now carries the reduced rows
+        // too, so a descriptor that lied about them would be a contract
+        // mismatch rather than an untracked surface.
+        let compiled = plan(&rack, [64, 64]);
+        assert_eq!(compiled.passes().len(), 1);
+        assert_eq!(compiled.passes()[0].node_id, id);
+        assert_eq!(compiled.logical_texture_lookups_per_pixel(), 3);
+        assert_eq!(compiled.texture_samples_per_pixel(), 12);
+        assert_eq!(compiled.max_sampled_textures_in_pass(), 3);
+        assert_eq!(compiled.cross_input_taps(), 2);
+        assert_eq!(compiled.reduced_resolution_passes(), 2);
+        assert_eq!(compiled.reduced_resolution_surfaces(), 2);
+        assert!(compiled.max_sampled_textures_in_pass() <= MAX_SAMPLED_TEXTURES_PER_PASS);
+
+        // Both authored slots are visible to the slot-indexed accessor, in
+        // slot order, so the executor binds two donors that never alias.
+        let authored = RuntimeResidualParams::default();
+        assert_eq!(
+            compiled.passes()[0].kind.image_taps(),
+            [Some(authored.structure), Some(authored.detail)],
+            "an active Residual must expose exactly two cross-scope route slots"
+        );
+        // An executed Residual consumes its own recombination record plus one
+        // shared record for both reduced block-mean passes; the plan's arena
+        // reservation is that figure plus the source seed.
+        assert_eq!(compiled.passes()[0].uniform_slots(), 2);
+        assert_eq!(compiled.uniform_slots(), 3);
+
+        // The uniform record carries the authored vocabulary and the seed.
+        let mut seeded = residual(
+            ResidualBlock::Sixteen,
+            ResidualQuantization::Coarse,
+            0.5,
+            1.5,
+        );
+        seeded.seed = 0x00c0_ffee;
+        let uniforms = RackUniforms::for_pass(
+            RackPassDescriptor {
+                node_id: node_id(11),
+                enabled: true,
+                wet: 1.0,
+                blend: NodeBlend::Normal,
+                kind: RackPassKind::Residual(seeded),
+            },
+            [64, 64],
+            [64, 64],
+            0.0,
+            true,
+        );
+        assert_eq!(uniforms.meta[0], KIND_RESIDUAL);
+        assert_eq!(uniforms.meta[3], 0x00c0_ffee);
+        assert_eq!(uniforms.p0[0], 0.5);
+        assert_eq!(uniforms.p0[1], 1.5);
+        assert_eq!(uniforms.p0[2], ResidualBlock::Sixteen.code() as f32);
+        assert_eq!(uniforms.p0[3], ResidualQuantization::Coarse.code() as f32);
+        assert_eq!(uniforms.p1[0], 16.0);
+        assert_eq!(uniforms.p1[1], 8.0);
+
+        // The reduced record is not a node: it carries the grid as its frame
+        // dimensions and the block edge, and both of a node's mean passes
+        // share it because only the bound route differs.
+        let mean = RackUniforms::residual_block_mean([4, 4], 16);
+        assert_eq!(mean.meta[0], KIND_RESIDUAL_BLOCK_MEAN);
+        assert_eq!(mean.frame[2], 4.0);
+        assert_eq!(mean.frame[3], 4.0);
+        assert_eq!(mean.p1[0], 16.0);
+        assert_eq!(RESIDUAL_REDUCED_UNIFORM_SLOTS, 1);
+
+        // Kind codes stay append-only, Residual takes the next one, and the
+        // internal reduced pass is numbered far outside that range so it can
+        // never collide with a future node kind.
+        assert_eq!(KIND_RESIDUAL, 11);
+        assert_eq!(KIND_DISPLACE, 10);
+        assert_eq!(KIND_RESIDUAL_BLOCK_MEAN, 1000);
+        let shader = include_str!("../shaders/rack_node.wgsl");
+        assert!(shader.contains("const RACK_RESIDUAL: u32 = 11u;"));
+        assert!(shader.contains("const RACK_RESIDUAL_BLOCK_MEAN: u32 = 1000u;"));
+        assert!(shader.contains("case RACK_RESIDUAL: { processed = residual_node(uv, dry); }"));
+    }
+
+    #[test]
+    fn residual_zero_mix_and_zero_wet_are_exact_bypasses_that_encode_no_pass() {
+        let live = residual(ResidualBlock::Eight, ResidualQuantization::Off, 0.5, 1.0);
+
+        // The authored default is an exact bypass.
+        let mut default_rack = RuntimeVisualRack::empty();
+        default_rack
+            .push(RuntimeVisualNodeKind::Residual(
+                RuntimeResidualParams::default(),
+            ))
+            .unwrap();
+        assert!(plan(&default_rack, [8, 8]).passes()[0].is_exact_bypass());
+
+        // Hostile non-finite mix collapses to bypass, never to full mix.
+        for hostile in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut rack = RuntimeVisualRack::empty();
+            rack.push(RuntimeVisualNodeKind::Residual(residual(
+                ResidualBlock::Eight,
+                ResidualQuantization::Fine,
+                hostile,
+                1.0,
+            )))
+            .unwrap();
+            assert!(plan(&rack, [8, 8]).passes()[0].is_exact_bypass());
+        }
+
+        // A live mix is not a bypass, and zero wet still is.
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack.push(RuntimeVisualNodeKind::Residual(live)).unwrap();
+        assert!(!plan(&rack, [8, 8]).passes()[0].is_exact_bypass());
+        rack.get_mut(id).unwrap().wet = 0.0;
+        assert!(plan(&rack, [8, 8]).passes()[0].is_exact_bypass());
+
+        // No other node kind acquired a value-driven bypass from this change.
+        let mut others = RuntimeVisualRack::empty();
+        others
+            .push(RuntimeVisualNodeKind::Grain(GrainParams::default()))
+            .unwrap();
+        others
+            .push(RuntimeVisualNodeKind::Cellular(CellularParams::default()))
+            .unwrap();
+        others
+            .push(RuntimeVisualNodeKind::Shift(ShiftParams::default()))
+            .unwrap();
+        for pass in plan(&others, [8, 8]).passes() {
+            assert!(!pass.is_exact_bypass());
+        }
+    }
+
+    #[test]
+    fn residual_pass_sanitizes_hostile_values_without_touching_routes_or_the_vocabulary() {
+        let tap = route(ResolvedImageSource::CleanProgram);
+        let authored = RuntimeResidualParams {
+            algorithm_version: 9_999,
+            structure: tap,
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::OneBelow,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            block: ResidualBlock::SixtyFour,
+            quantization: ResidualQuantization::Fine,
+            mix: 9.0,
+            detail_gain: f32::NAN,
+            seed: 0xdead_beef,
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        rack.push(RuntimeVisualNodeKind::Residual(authored))
+            .unwrap();
+        let RackPassKind::Residual(sanitized) = plan(&rack, [16, 16]).passes()[0].kind else {
+            panic!("the compiled pass keeps its Residual identity");
+        };
+        // Continuous values clamp; a non-finite gain takes the neutral
+        // fallback rather than either clamped extreme.
+        assert_eq!(sanitized.mix, 1.0);
+        assert_eq!(sanitized.detail_gain, 1.0);
+        // Routes, the discrete vocabulary, and the seed are authored topology
+        // and are never rewritten by sanitization.
+        assert_eq!(sanitized.structure, tap);
+        assert_eq!(sanitized.detail.timing, EdgeTiming::PreviousFrame);
+        assert_eq!(sanitized.block, ResidualBlock::SixtyFour);
+        assert_eq!(sanitized.quantization, ResidualQuantization::Fine);
+        assert_eq!(sanitized.seed, 0xdead_beef);
+        // A hostile persisted version normalizes to the one this build knows.
+        assert_eq!(
+            sanitized.algorithm_version,
+            crate::visual_rack::RESIDUAL_ALGORITHM_VERSION
+        );
+    }
+
+    #[test]
+    fn residual_constant_colour_input_has_no_detail_and_resolves_to_pure_dc() {
+        let carrier = RefImage::uniform([8, 8], [0.25, 0.5, 0.75, 1.0]);
+        let grid = ResidualGrid::for_output([8, 8], ResidualBlock::Eight).unwrap();
+        assert_eq!((grid.width, grid.height, grid.cell_count), (1, 1, 1));
+
+        // A constant block is its own mean, exactly, in premultiplied space.
+        let cells = residual_block_mean(&carrier, grid.block_pixels, [grid.width, grid.height]);
+        assert_eq!(cells, vec![[0.25, 0.5, 0.75, 1.0]]);
+        let mean = RefImage::new([grid.width, grid.height], cells);
+
+        // AC is therefore exactly zero, so no detail gain can move the result
+        // and the output is pure DC — the carrier itself.
+        for detail_gain in [0.0_f32, 1.0, 4.0] {
+            let output = residual_reference(
+                &carrier,
+                &mean,
+                &mean,
+                residual(
+                    ResidualBlock::Eight,
+                    ResidualQuantization::Off,
+                    1.0,
+                    detail_gain,
+                ),
+            );
+            assert_eq!(
+                output.pixels, carrier.pixels,
+                "a constant carrier has no detail for gain {detail_gain} to amplify"
+            );
+        }
+
+        // Zero mix delegates exactly, whatever the rest of the state says.
+        let bypass = residual_reference(
+            &carrier,
+            &RefImage::uniform([1, 1], [0.9, 0.1, 0.2, 1.0]),
+            &RefImage::uniform([1, 1], [0.0; 4]),
+            residual(ResidualBlock::Eight, ResidualQuantization::Fine, 0.0, 4.0),
+        );
+        assert_eq!(bypass.pixels, carrier.pixels);
+    }
+
+    #[test]
+    fn residual_zero_mean_donors_contribute_no_dc_and_leave_the_carrier_as_pure_ac() {
+        let carrier = RefImage::new(
+            [4, 4],
+            (0..16)
+                .map(|index| {
+                    let x = (index % 4) as f32 / 4.0;
+                    let y = (index / 4) as f32 / 4.0;
+                    [x, y, 0.5, 1.0]
+                })
+                .collect(),
+        );
+
+        // Fully transparent donors carrying maximally hostile hidden RGB.
+        let hostile = RefImage::uniform([4, 4], [1.0, 1.0, 1.0, 0.0]);
+        let cells = residual_block_mean(&hostile, 4, [1, 1]);
+        assert_eq!(
+            cells,
+            vec![[0.0; 4]],
+            "the premultiplied mean of a transparent donor is exactly zero"
+        );
+        let zero = RefImage::new([1, 1], cells);
+
+        // With no DC and no detail reference the carrier's whole premultiplied
+        // signal survives as AC, so unit gain is transparent to it.
+        let unit = residual_reference(
+            &carrier,
+            &zero,
+            &zero,
+            residual(ResidualBlock::Four, ResidualQuantization::Off, 1.0, 1.0),
+        );
+        assert_eq!(unit.pixels, carrier.pixels);
+
+        // Pure AC carries coverage as well as colour, so a half gain halves
+        // alpha and leaves straight RGB untouched.
+        let half = residual_reference(
+            &carrier,
+            &zero,
+            &zero,
+            residual(ResidualBlock::Four, ResidualQuantization::Off, 1.0, 0.5),
+        );
+        for (index, pixel) in half.pixels.iter().enumerate() {
+            let expected = carrier.pixels[index];
+            assert_eq!(*pixel, [expected[0], expected[1], expected[2], 0.5]);
+        }
+    }
+
+    #[test]
+    fn residual_block_means_clamp_at_grid_borders_and_non_divisible_dimensions() {
+        // Every pixel names its own coordinates, so a clamped tap is visible.
+        let coordinates = |dimensions: [u32; 2]| {
+            RefImage::new(
+                dimensions,
+                (0..dimensions[0] * dimensions[1])
+                    .map(|index| {
+                        let x = (index % dimensions[0]) as f32;
+                        let y = (index / dimensions[0]) as f32;
+                        [x, y, 0.0, 1.0]
+                    })
+                    .collect(),
+            )
+        };
+
+        // Six pixels over a four-pixel block is a two-cell axis whose second
+        // cell hangs two pixels outside the image.
+        let grid = ResidualGrid::for_output([6, 6], ResidualBlock::Four).unwrap();
+        assert_eq!(
+            (grid.width, grid.height, grid.block_pixels, grid.cell_count),
+            (2, 2, 4, 4)
+        );
+        assert_eq!(
+            residual_block_mean(&coordinates([6, 6]), 4, [2, 2]),
+            vec![
+                [2.0, 2.0, 0.0, 1.0],
+                [5.0, 2.0, 0.0, 1.0],
+                [2.0, 5.0, 0.0, 1.0],
+                [5.0, 5.0, 0.0, 1.0],
+            ],
+            "an overhanging quadrant centre clamps onto the last real texel"
+        );
+
+        // The divisible case reaches both quadrant centres, so the same cell
+        // averages columns 5 and 7 instead of repeating column 5.
+        assert_eq!(
+            residual_block_mean(&coordinates([8, 8]), 4, [2, 2]),
+            vec![
+                [2.0, 2.0, 0.0, 1.0],
+                [6.0, 2.0, 0.0, 1.0],
+                [2.0, 6.0, 0.0, 1.0],
+                [6.0, 6.0, 0.0, 1.0],
+            ]
+        );
+
+        // A one-pixel image is one cell whose four taps all clamp onto it.
+        let single = ResidualGrid::for_output([1, 1], ResidualBlock::SixtyFour).unwrap();
+        assert_eq!((single.width, single.height, single.cell_count), (1, 1, 1));
+        assert_eq!(
+            residual_block_mean(
+                &RefImage::uniform([1, 1], [0.5, 0.25, 0.125, 1.0]),
+                single.block_pixels,
+                [single.width, single.height]
+            ),
+            vec![[0.5, 0.25, 0.125, 1.0]]
+        );
+    }
+
+    #[test]
+    fn residual_quantization_lands_on_its_declared_lattice_and_off_is_exact_identity() {
+        assert_eq!(ResidualQuantization::Off.levels(), 0);
+        assert_eq!(ResidualQuantization::Coarse.levels(), 8);
+        assert_eq!(ResidualQuantization::Medium.levels(), 32);
+        assert_eq!(ResidualQuantization::Fine.levels(), 128);
+
+        // Off is exact identity for hostile magnitudes and both signs, and no
+        // seed can perturb it.
+        for value in [-3.25_f32, -0.371, 0.0, 0.371, 1.0, 7.5] {
+            for seed in [0_u32, 1, 0xdead_beef] {
+                assert_eq!(residual_quantize(value, 0, seed, [3, 5]), value);
+            }
+        }
+
+        // The unshifted lattice is exactly the multiples of one over levels.
+        assert_eq!(residual_quantize(0.3, 8, 0, [0, 0]), 0.25);
+        assert_eq!(residual_quantize(-0.3, 8, 0, [0, 0]), -0.25);
+        assert_eq!(residual_quantize(1.0, 8, 0, [0, 0]), 1.0);
+        assert_eq!(residual_quantize(0.02, 32, 0, [0, 0]), 0.031_25);
+        assert_eq!(residual_quantize(0.004, 128, 0, [0, 0]), 0.007_812_5);
+
+        for quantization in [
+            ResidualQuantization::Coarse,
+            ResidualQuantization::Medium,
+            ResidualQuantization::Fine,
+        ] {
+            let levels = quantization.levels();
+            let scale = levels as f32;
+            for step in 0..41 {
+                let value = -1.0 + step as f32 * 0.05;
+                let quantized = residual_quantize(value, levels, 0, [1, 2]);
+                assert_eq!(
+                    (quantized * scale).round(),
+                    quantized * scale,
+                    "{quantization:?} left {value} off its lattice"
+                );
+                assert!((quantized - value).abs() <= 0.5 / scale + 1.0e-6);
+            }
+        }
+
+        // A seeded lattice keeps the same spacing on a per-cell phase.
+        let seed = 0x0051_d3a1;
+        let levels = ResidualQuantization::Medium.levels();
+        for cell in [[0_u32, 0_u32], [1, 0], [0, 1], [7, 11]] {
+            let phase = residual_cell_phase(seed, cell);
+            assert!((0.0..1.0).contains(&phase));
+            let offset = residual_quantize(0.3, levels, seed, cell) * levels as f32 - phase;
+            assert!(
+                (offset.round() - offset).abs() <= 1.0e-4,
+                "cell {cell:?} left the seeded lattice"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_fixed_seed_is_stable_and_never_reaches_the_route_table_or_the_block_grid() {
+        let carrier = RefImage::new(
+            [8, 8],
+            (0..64)
+                .map(|index| {
+                    let x = (index % 8) as f32 / 8.0;
+                    let y = (index / 8) as f32 / 8.0;
+                    [x, y, 1.0 - x, 1.0]
+                })
+                .collect(),
+        );
+        let grid = ResidualGrid::for_output([8, 8], ResidualBlock::Four).unwrap();
+        let cells = residual_block_mean(&carrier, grid.block_pixels, [grid.width, grid.height]);
+        let mean = RefImage::new([grid.width, grid.height], cells.clone());
+        let seeded = |seed: u32| {
+            let mut params = residual(ResidualBlock::Four, ResidualQuantization::Coarse, 1.0, 1.0);
+            params.seed = seed;
+            params
+        };
+
+        // The same seed is the same lattice, and therefore the same pixels.
+        let first = residual_reference(&carrier, &mean, &mean, seeded(0x1357_9bdf));
+        let again = residual_reference(&carrier, &mean, &mean, seeded(0x1357_9bdf));
+        assert_eq!(first.pixels, again.pixels);
+
+        // A different seed is a different lattice.
+        let other = residual_reference(&carrier, &mean, &mean, seeded(0x2468_ace0));
+        assert_ne!(first.pixels, other.pixels);
+
+        // The seed is not topology: it never rewrites a route, the block
+        // vocabulary, or the grid the block means were reduced onto.
+        let (a, b) = (seeded(0x1357_9bdf), seeded(0x2468_ace0));
+        assert_eq!(a.routes(), b.routes());
+        assert_eq!(a.block, b.block);
+        assert_eq!(
+            ResidualGrid::for_output([8, 8], a.block),
+            ResidualGrid::for_output([8, 8], b.block)
+        );
+        assert_eq!(
+            residual_block_mean(&carrier, b.block.edge(), [grid.width, grid.height]),
+            cells
+        );
+
+        // The legacy sentinel keeps the canonical unshifted lattice, and with
+        // quantization off the seed cannot reach the result at all.
+        assert_eq!(residual_cell_phase(0, [4, 9]), 0.0);
+        let mut plain = seeded(0);
+        plain.quantization = ResidualQuantization::Off;
+        let mut hostile_seed = plain;
+        hostile_seed.seed = 0xffff_ffff;
+        assert_eq!(
+            residual_reference(&carrier, &mean, &mean, plain).pixels,
+            residual_reference(&carrier, &mean, &mean, hostile_seed).pixels
+        );
+    }
+
+    #[test]
     fn displace_boundary_codes_are_append_only_and_uniforms_carry_them() {
         assert_eq!(DisplaceBoundary::Transparent.code(), 0);
         assert_eq!(DisplaceBoundary::Mirror.code(), 1);
@@ -2794,6 +3977,7 @@ mod tests {
                 &gpu.device,
                 &[RackImageInput {
                     node_id: id,
+                    slot: RACK_PRIMARY_ROUTE_SLOT,
                     tap: params.tap,
                     view: Some(&donor_view),
                 }],
@@ -2876,6 +4060,7 @@ mod tests {
                 &gpu.device,
                 &[RackImageInput {
                     node_id: id,
+                    slot: RACK_PRIMARY_ROUTE_SLOT,
                     tap: params.tap,
                     view: Some(&neutral_view),
                 }],
@@ -2892,6 +4077,7 @@ mod tests {
                 &gpu.device,
                 &[RackImageInput {
                     node_id: id,
+                    slot: RACK_PRIMARY_ROUTE_SLOT,
                     tap: params.tap,
                     view: Some(&hostile_view),
                 }],
@@ -2916,17 +4102,18 @@ mod tests {
         assert_eq!(missing_bytes, neutral_bytes);
     }
 
-    /// Closes `RackPassKind::image_tap`'s `_ => None` for the Symmetry Field.
+    /// Closes `RackPassKind::image_taps`'s routeless row for the Symmetry Field.
     ///
     /// The field owns four routes and samples eight textures; the fixed rack
-    /// texture layout carries two. It therefore has no `RackPassKind` at all,
-    /// and `compile_pass` refuses it by name. If a future change ever admitted
-    /// it into a rack pass, `image_tap` would silently hand back a single
-    /// donor — or `None` — and the node would bind the rack-owned 1x1 zero
-    /// texture forever with no error anywhere, so the refusal is what closes
-    /// the row. The shader half is closed too: `rack_node.wgsl` must never gain
-    /// a Symmetry case, or its `default: {}` would leave `processed = dry`
-    /// while the Rust ledger still charged a pass.
+    /// texture layout carries three across two authored slots. It therefore has
+    /// no `RackPassKind` at all, and `compile_pass` refuses it by name. If a
+    /// future change ever admitted it into a rack pass, `image_taps` would
+    /// silently hand back a two-slot array — short by half, or all `None` — and
+    /// the node would bind the rack-owned 1x1 zero texture forever with no
+    /// error anywhere, so the refusal is what closes the row. The shader half
+    /// is closed too: `rack_node.wgsl` must never gain a Symmetry case, or its
+    /// `default: {}` would leave `processed = dry` while the Rust ledger still
+    /// charged a pass.
     #[test]
     fn a_symmetry_node_is_refused_by_name_and_never_reaches_the_rack_image_tap() {
         use crate::symmetry::RuntimeSymmetryParams;
@@ -2952,12 +4139,13 @@ mod tests {
             "the planner's split predicate and this refusal must agree"
         );
 
-        // Every kind that IS encodable here still answers `image_tap` exactly,
-        // so the catch-all remains a statement about routeless kinds only.
+        // Every kind that IS encodable here still answers `image_taps` exactly,
+        // slot for slot, so the routeless row remains a statement about kinds
+        // that own no route at all.
         let tap = route(ResolvedImageSource::OneBelow);
         assert_eq!(
-            RackPassKind::Displace(displace(0.5, 0.0, DisplaceBoundary::Wrap)).image_tap(),
-            Some(route(ResolvedImageSource::OneBelow))
+            RackPassKind::Displace(displace(0.5, 0.0, DisplaceBoundary::Wrap)).image_taps(),
+            [Some(route(ResolvedImageSource::OneBelow)), None]
         );
         assert_eq!(
             RackPassKind::ImageMask(RuntimeImageMatte {
@@ -2968,12 +4156,12 @@ mod tests {
                 threshold: 0.5,
                 softness: 0.1,
             })
-            .image_tap(),
-            Some(tap)
+            .image_taps(),
+            [Some(tap), None]
         );
         assert_eq!(
-            RackPassKind::Grain(crate::visual_rack::GrainParams::default()).image_tap(),
-            None
+            RackPassKind::Grain(crate::visual_rack::GrainParams::default()).image_taps(),
+            [None; MAX_NODE_ROUTE_SLOTS]
         );
 
         // The rack shader carries exactly the kinds the rack can encode, and
@@ -2985,8 +4173,8 @@ mod tests {
         );
         assert_eq!(
             rack_shader.matches("\n        case RACK_").count(),
-            10,
-            "the rack switch covers exactly the ten rack-encodable kinds"
+            11,
+            "the rack switch covers exactly the eleven rack-encodable kinds"
         );
     }
 
@@ -3090,6 +4278,544 @@ mod tests {
                     "{name} must be used by at least one branch, not merely declared"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_appended_second_routed_texture_is_read_only_by_the_residual_recombination() {
+        let shader = include_str!("../shaders/rack_node.wgsl");
+
+        // The historical bindings keep their numbers, so widening the layout
+        // renumbers nothing and no existing kind's bind group moves.
+        assert!(shader.contains("@group(0) @binding(0) var source_tex: texture_2d<f32>;"));
+        assert!(shader.contains("@group(0) @binding(1) var donor_tex: texture_2d<f32>;"));
+        assert!(shader.contains("@group(0) @binding(2) var linear_samp: sampler;"));
+        assert!(shader.contains("@group(0) @binding(3) var nearest_samp: sampler;"));
+        assert!(shader.contains("@group(0) @binding(4) var donor_b_tex: texture_2d<f32>;"));
+
+        // One declaration plus exactly five reads, every one of them inside
+        // the recombination's second block mean: a `textureDimensions` and the
+        // four clamped `textureLoad` corners. Any other kind reading the slot
+        // would raise this count.
+        assert_eq!(shader.matches("donor_b_tex").count(), 6);
+        assert_eq!(shader.matches("textureLoad(donor_b_tex").count(), 4);
+        let only_reader = shader
+            .split_once("fn residual_detail_mean")
+            .expect("the second routed input has exactly one reader")
+            .1;
+        assert_eq!(only_reader.matches("donor_b_tex").count(), 5);
+
+        // The reduced pass reads the routed source through `donor_tex`, so a
+        // missing route is the rack-owned 1x1 zero and its mean is exactly
+        // zero rather than an unbound slot. Nine written loads on that
+        // binding: Displace's four covered corners, the single reduced tap
+        // the block mean calls four times, and the structure mean's four.
+        assert!(shader.contains("fn residual_block_mean_cell"));
+        assert_eq!(shader.matches("textureLoad(donor_tex").count(), 9);
+        let reduced_tap = shader
+            .split_once("fn residual_mean_tap")
+            .expect("the reduced pass has one covered tap")
+            .1;
+        assert_eq!(
+            reduced_tap
+                .split_once("fn residual_structure_mean")
+                .expect("the reduced tap precedes the structure mean")
+                .0
+                .matches("textureLoad(donor_tex")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn residual_reserves_one_reduced_uniform_record_without_disturbing_other_passes() {
+        // Single-slot kinds keep the historical law exactly: one record each
+        // plus the source seed.
+        let mut plain = RuntimeVisualRack::empty();
+        plain
+            .push(RuntimeVisualNodeKind::Grain(GrainParams::default()))
+            .unwrap();
+        plain
+            .push(RuntimeVisualNodeKind::Displace(displace(
+                0.25,
+                0.0,
+                DisplaceBoundary::Wrap,
+            )))
+            .unwrap();
+        let compiled = plan(&plain, [8, 8]);
+        assert!(compiled
+            .passes()
+            .iter()
+            .all(|pass| pass.uniform_slots() == 1));
+        assert_eq!(compiled.uniform_slots(), 3);
+
+        // A Residual adds exactly one shared record for both block means, and
+        // it is charged even while the node is a dormant exact bypass so a
+        // later value change can never outgrow the warmed arena.
+        let mut mixed = RuntimeVisualRack::empty();
+        mixed
+            .push(RuntimeVisualNodeKind::Grain(GrainParams::default()))
+            .unwrap();
+        mixed
+            .push(RuntimeVisualNodeKind::Residual(
+                RuntimeResidualParams::default(),
+            ))
+            .unwrap();
+        let compiled = plan(&mixed, [8, 8]);
+        assert!(compiled.passes()[1].is_exact_bypass());
+        assert_eq!(compiled.passes()[1].uniform_slots(), 2);
+        assert_eq!(compiled.uniform_slots(), 4);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_residual_matches_the_cpu_reference_and_zero_mix_is_byte_identical() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let carrier_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| {
+                let x = (index % 8) as f32 / 8.0;
+                let y = (index / 8) as f32 / 8.0;
+                [x, y, 0.5 - x * 0.25, if index % 3 == 0 { 0.5 } else { 1.0 }]
+            })
+            .collect();
+        let structure_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| {
+                let y = (index / 8) as f32 / 8.0;
+                [0.75 - y * 0.5, y, 0.25, 1.0]
+            })
+            .collect();
+        let detail_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| {
+                let x = (index % 8) as f32 / 8.0;
+                [0.25, 0.5 - x * 0.25, x, 1.0]
+            })
+            .collect();
+
+        let (_carrier_texture, carrier_view, carrier_bytes) =
+            gpu.texture(dimensions, &carrier_pixels, "residual carrier");
+        let (_structure_texture, structure_view, _) =
+            gpu.texture(dimensions, &structure_pixels, "residual structure donor");
+        let (_detail_texture, detail_view, _) =
+            gpu.texture(dimensions, &detail_pixels, "residual detail donor");
+        let executor = CollisionRackExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        // Widening the bind layout added no GPU object: the warmed executor
+        // still owns the ping and pong surfaces plus the 1x1 zero donor, one
+        // uniform buffer, the uniform group and both missing-donor groups,
+        // and one pipeline. The hard-coded warm counters remain truthful.
+        assert_eq!(
+            executor.allocation_snapshot(),
+            RackAllocationSnapshot {
+                textures: 3,
+                buffers: 1,
+                bind_groups: 3,
+                pipelines: 1,
+            }
+        );
+        let source = executor
+            .prepare_source(&gpu.device, &carrier_view, dimensions)
+            .unwrap();
+
+        let carrier = RefImage::new(dimensions, carrier_pixels);
+        let structure = RefImage::new(dimensions, structure_pixels);
+        let detail = RefImage::new(dimensions, detail_pixels);
+
+        for params in [
+            residual_routed(ResidualBlock::Four, ResidualQuantization::Off, 1.0, 1.0),
+            residual_routed(ResidualBlock::Eight, ResidualQuantization::Off, 0.5, 2.5),
+        ] {
+            let mut rack = RuntimeVisualRack::empty();
+            let id = rack.push(RuntimeVisualNodeKind::Residual(params)).unwrap();
+            let compiled = plan(&rack, dimensions);
+            let bindings = executor
+                .prepare_image_bindings(
+                    &gpu.device,
+                    &[
+                        RackImageInput {
+                            node_id: id,
+                            slot: RESIDUAL_STRUCTURE_SLOT,
+                            tap: params.structure,
+                            view: Some(&structure_view),
+                        },
+                        RackImageInput {
+                            node_id: id,
+                            slot: RESIDUAL_DETAIL_SLOT,
+                            tap: params.detail,
+                            view: Some(&detail_view),
+                        },
+                    ],
+                )
+                .unwrap();
+            let before_means = executor.allocation_snapshot();
+            let means = executor
+                .prepare_residual_means(&gpu.device, &compiled)
+                .unwrap();
+            let after_means = executor.allocation_snapshot();
+            assert_eq!(
+                means.len(),
+                1,
+                "one active node owns one reduced working set"
+            );
+            // Exactly two grid surfaces and one recombination group per
+            // carrier parity, and no buffer or pipeline at all.
+            assert_eq!(after_means.textures - before_means.textures, 2);
+            assert_eq!(after_means.bind_groups - before_means.bind_groups, 2);
+            assert_eq!(after_means.buffers, before_means.buffers);
+            assert_eq!(after_means.pipelines, before_means.pipelines);
+
+            // Everything the node needs now exists; the encode itself must
+            // create nothing at all.
+            let warm = executor.allocation_snapshot();
+            let (report, bytes) =
+                gpu.render_with_means(&executor, &compiled, &source, &bindings, &means, 0.0);
+            assert_eq!(warm, executor.allocation_snapshot());
+            assert_eq!(report.executed_passes, 1);
+            assert_eq!(report.missing_image_count, 0);
+
+            let mean0 = residual_mean_image(&structure, params.block, dimensions);
+            let mean1 = residual_mean_image(&detail, params.block, dimensions);
+            let expected = residual_reference(&carrier, &mean0, &mean1, params);
+            for (index, actual) in decode_pixels(&bytes).into_iter().enumerate() {
+                let expected = expected.pixels[index];
+                for channel in 0..4 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() <= 0.01,
+                        "block {:?} pixel {index} channel {channel}: GPU {} vs reference {}",
+                        params.block,
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+        }
+
+        // A seeded lattice must land on the same points on both sides. The
+        // constants below make every scaled value an exact integer, so the
+        // only possible disagreement is a rounding tie, which happens at
+        // exactly one phase and is asserted away rather than hoped away.
+        let flat_carrier = vec![[0.5, 0.25, 0.75, 1.0]; 64];
+        let flat_structure = vec![[0.375, 0.125, 0.625, 1.0]; 64];
+        let flat_detail = vec![[0.25, 0.5, 0.125, 1.0]; 64];
+        let (_flat_carrier_texture, flat_carrier_view, _) =
+            gpu.texture(dimensions, &flat_carrier, "residual flat carrier");
+        let (_flat_structure_texture, flat_structure_view, _) =
+            gpu.texture(dimensions, &flat_structure, "residual flat structure");
+        let (_flat_detail_texture, flat_detail_view, _) =
+            gpu.texture(dimensions, &flat_detail, "residual flat detail");
+        let flat_source = executor
+            .prepare_source(&gpu.device, &flat_carrier_view, dimensions)
+            .unwrap();
+
+        let mut seeded =
+            residual_routed(ResidualBlock::Four, ResidualQuantization::Coarse, 1.0, 1.0);
+        seeded.seed = 0x00c0_ffee;
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack.push(RuntimeVisualNodeKind::Residual(seeded)).unwrap();
+        let compiled = plan(&rack, dimensions);
+        let grid = ResidualGrid::for_output(dimensions, seeded.block).unwrap();
+        for cell_y in 0..grid.height {
+            for cell_x in 0..grid.width {
+                let phase = residual_cell_phase(seeded.seed, [cell_x, cell_y]);
+                assert!(
+                    (phase - 0.5).abs() > 1.0e-3,
+                    "cell {cell_x},{cell_y} sits on the one phase where an exact \
+                     integer lattice value is a rounding tie"
+                );
+            }
+        }
+        let bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_STRUCTURE_SLOT,
+                        tap: seeded.structure,
+                        view: Some(&flat_structure_view),
+                    },
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_DETAIL_SLOT,
+                        tap: seeded.detail,
+                        view: Some(&flat_detail_view),
+                    },
+                ],
+            )
+            .unwrap();
+        let means = executor
+            .prepare_residual_means(&gpu.device, &compiled)
+            .unwrap();
+        let (_, seeded_bytes) =
+            gpu.render_with_means(&executor, &compiled, &flat_source, &bindings, &means, 0.0);
+        let expected = residual_reference(
+            &RefImage::new(dimensions, flat_carrier),
+            &residual_mean_image(
+                &RefImage::new(dimensions, flat_structure),
+                seeded.block,
+                dimensions,
+            ),
+            &residual_mean_image(
+                &RefImage::new(dimensions, flat_detail),
+                seeded.block,
+                dimensions,
+            ),
+            seeded,
+        );
+        for (index, actual) in decode_pixels(&seeded_bytes).into_iter().enumerate() {
+            let expected = expected.pixels[index];
+            for channel in 0..4 {
+                assert!(
+                    (actual[channel] - expected[channel]).abs() <= 0.01,
+                    "seeded pixel {index} channel {channel}: GPU {} vs reference {}",
+                    actual[channel],
+                    expected[channel]
+                );
+            }
+        }
+
+        // Zero mix delegates exactly: no pass, no reduced surface, no
+        // allocation, and the carrier bytes survive untouched.
+        let mut bypass = RuntimeVisualRack::empty();
+        bypass
+            .push(RuntimeVisualNodeKind::Residual(
+                RuntimeResidualParams::default(),
+            ))
+            .unwrap();
+        let bypass_plan = plan(&bypass, dimensions);
+        let before = executor.allocation_snapshot();
+        let bypass_means = executor
+            .prepare_residual_means(&gpu.device, &bypass_plan)
+            .unwrap();
+        assert_eq!(bypass_means.len(), 0);
+        assert_eq!(
+            before,
+            executor.allocation_snapshot(),
+            "an exact-bypass Residual must allocate no block-mean surface"
+        );
+        let (bypass_report, bypass_bytes) = gpu.render_with_means(
+            &executor,
+            &bypass_plan,
+            &source,
+            &RackImageBindings::empty(),
+            &bypass_means,
+            0.0,
+        );
+        assert_eq!(bypass_report.executed_passes, 0);
+        assert_eq!(
+            bypass_bytes, carrier_bytes,
+            "zero-mix Residual must be a byte-exact bypass"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_residual_transparent_hostile_donor_contributes_exactly_zero() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let carrier_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| [(index % 8) as f32 / 8.0, 0.25, 0.75, 1.0])
+            .collect();
+        let (_carrier_texture, carrier_view, _) =
+            gpu.texture(dimensions, &carrier_pixels, "residual hostile carrier");
+        let executor = CollisionRackExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        let source = executor
+            .prepare_source(&gpu.device, &carrier_view, dimensions)
+            .unwrap();
+
+        let params = residual_routed(ResidualBlock::Four, ResidualQuantization::Off, 1.0, 1.0);
+        let mut rack = RuntimeVisualRack::empty();
+        let id = rack.push(RuntimeVisualNodeKind::Residual(params)).unwrap();
+        let compiled = plan(&rack, dimensions);
+        let means = executor
+            .prepare_residual_means(&gpu.device, &compiled)
+            .unwrap();
+
+        let detail_pixels = vec![[0.5, 0.5, 0.5, 1.0]; 64];
+        let (_detail_texture, detail_view, _) =
+            gpu.texture(dimensions, &detail_pixels, "residual live detail donor");
+
+        // Transparent structure donor carrying maximally hostile hidden RGB.
+        let hostile = vec![[1.0, 1.0, 1.0, 0.0]; 64];
+        let (_hostile_texture, hostile_view, _) =
+            gpu.texture(dimensions, &hostile, "residual hostile structure");
+        let hostile_bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_STRUCTURE_SLOT,
+                        tap: params.structure,
+                        view: Some(&hostile_view),
+                    },
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_DETAIL_SLOT,
+                        tap: params.detail,
+                        view: Some(&detail_view),
+                    },
+                ],
+            )
+            .unwrap();
+        let (hostile_report, hostile_bytes) = gpu.render_with_means(
+            &executor,
+            &compiled,
+            &source,
+            &hostile_bindings,
+            &means,
+            0.0,
+        );
+        assert_eq!(hostile_report.missing_image_count, 0);
+
+        // An honestly empty structure donor.
+        let empty = vec![[0.0, 0.0, 0.0, 0.0]; 64];
+        let (_empty_texture, empty_view, _) =
+            gpu.texture(dimensions, &empty, "residual empty structure");
+        let empty_bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_STRUCTURE_SLOT,
+                        tap: params.structure,
+                        view: Some(&empty_view),
+                    },
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_DETAIL_SLOT,
+                        tap: params.detail,
+                        view: Some(&detail_view),
+                    },
+                ],
+            )
+            .unwrap();
+        let (_, empty_bytes) =
+            gpu.render_with_means(&executor, &compiled, &source, &empty_bindings, &means, 0.0);
+        assert_eq!(
+            hostile_bytes, empty_bytes,
+            "hidden RGB at alpha zero must never reach the structure term"
+        );
+
+        // A deliberately transparent structure tap keeps the detail route
+        // live: only slot 0 falls back to the rack-owned zero donor, and only
+        // slot 0 is reported.
+        let absent_bindings = executor
+            .prepare_image_bindings(
+                &gpu.device,
+                &[
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_STRUCTURE_SLOT,
+                        tap: params.structure,
+                        view: None,
+                    },
+                    RackImageInput {
+                        node_id: id,
+                        slot: RESIDUAL_DETAIL_SLOT,
+                        tap: params.detail,
+                        view: Some(&detail_view),
+                    },
+                ],
+            )
+            .unwrap();
+        let (absent_report, absent_bytes) =
+            gpu.render_with_means(&executor, &compiled, &source, &absent_bindings, &means, 0.0);
+        assert_eq!(absent_report.missing_image_count, 1);
+        assert_eq!(
+            absent_report.missing_image_nodes().collect::<Vec<_>>(),
+            vec![id]
+        );
+        assert_eq!(
+            absent_bytes, hostile_bytes,
+            "a missing structure route is the same exact zero as a transparent one"
+        );
+
+        // Losing both routes reports both slots and must not index past the
+        // report's table.
+        let (both_missing, _) = gpu.render_with_means(
+            &executor,
+            &compiled,
+            &source,
+            &RackImageBindings::empty(),
+            &means,
+            0.0,
+        );
+        assert_eq!(both_missing.missing_image_count, 2);
+        assert_eq!(
+            both_missing.missing_image_nodes().collect::<Vec<_>>(),
+            vec![id, id]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_residual_second_texture_slot_leaves_every_other_kind_byte_identical() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let carrier_pixels: Vec<[f32; 4]> = (0..64)
+            .map(|index| [(index % 8) as f32 / 8.0, 0.5, 0.25, 1.0])
+            .collect();
+        let (_carrier_texture, carrier_view, _) =
+            gpu.texture(dimensions, &carrier_pixels, "second slot carrier");
+        let executor = CollisionRackExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        let source = executor
+            .prepare_source(&gpu.device, &carrier_view, dimensions)
+            .unwrap();
+
+        let donor_pixels = vec![[0.75, 0.25, 0.5, 1.0]; 64];
+        let (_donor_texture, donor_view, _) =
+            gpu.texture(dimensions, &donor_pixels, "second slot donor");
+        // Maximally hostile content for the appended slot: fully opaque and
+        // saturated, so any kind that read it would move visibly.
+        let hostile_pixels = vec![[1.0, 1.0, 1.0, 1.0]; 64];
+        let (_hostile_texture, hostile_view, _) =
+            gpu.texture(dimensions, &hostile_pixels, "second slot hostile");
+
+        let displace_params = displace(0.5, -0.25, DisplaceBoundary::Wrap);
+        let matte_route = route(ResolvedImageSource::CleanProgram);
+        for (kind, tap) in [
+            (
+                RuntimeVisualNodeKind::Displace(displace_params),
+                displace_params.tap,
+            ),
+            (
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(RuntimeImageMatte {
+                    tap: matte_route,
+                    channel: MatteChannel::Luma,
+                    invert: false,
+                    amount: 0.8,
+                    threshold: 0.4,
+                    softness: 0.2,
+                })),
+                matte_route,
+            ),
+        ] {
+            let mut rack = RuntimeVisualRack::empty();
+            let id = rack.push(kind).unwrap();
+            let compiled = plan(&rack, dimensions);
+            let input = |second: &wgpu::TextureView| {
+                executor
+                    .prepare_image_bindings_with_second_slot(
+                        &gpu.device,
+                        &[RackImageInput {
+                            node_id: id,
+                            slot: RACK_PRIMARY_ROUTE_SLOT,
+                            tap,
+                            view: Some(&donor_view),
+                        }],
+                        second,
+                    )
+                    .unwrap()
+            };
+            let zeroed = input(&executor.zero_view);
+            let hostile = input(&hostile_view);
+            let (_, zeroed_bytes) = gpu.render(&executor, &compiled, &source, &zeroed, 0.0);
+            let (_, hostile_bytes) = gpu.render(&executor, &compiled, &source, &hostile, 0.0);
+            assert_eq!(
+                zeroed_bytes, hostile_bytes,
+                "no kind outside the Residual recombination may read the appended slot"
+            );
         }
     }
 }

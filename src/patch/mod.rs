@@ -33,7 +33,6 @@ use crate::performance::{
     SceneReferenceIssue, Scenes,
 };
 use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
-use crate::symmetry::SYMMETRY_IMAGE_SLOTS;
 use crate::temporal::{
     CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
     TemporalEventResetMode, TemporalResetPolicy,
@@ -41,7 +40,8 @@ use crate::temporal::{
 use crate::visual_rack::{
     EdgeTiming, GroupId, ImageDependency, ImageDependencyGraph, ImageGraphMode, ImageOrderingEdge,
     LegacyRackScope, MaskParams, NodeId, RuntimeImageMatte, RuntimeVisualRack, SavedImageSource,
-    SavedImageTap, VisualNodeKind, VisualRack, VisualScopeId,
+    SavedImageTap, VisualNodeKind, VisualRack, VisualScopeId, RACK_PRIMARY_ROUTE_SLOT,
+    RESIDUAL_DETAIL_SLOT, RESIDUAL_ROUTE_SLOTS, RESIDUAL_STRUCTURE_SLOT,
 };
 
 // --- Helpers for serde defaults ---
@@ -351,6 +351,18 @@ pub struct PatchState {
     /// Prepared multi-layer recalls. Empty is the exact legacy behavior.
     #[serde(default, skip_serializing_if = "Scenes::is_empty")]
     pub scenes: Scenes,
+    /// Recorded gesture track. A track is authored topology rather than a
+    /// value: it is carried whole, never interpolated, and an absent section is
+    /// exactly the pre-gesture path. Its own bounded, checksum-verifying
+    /// deserializer is the single acceptance gate, so a hostile patch cannot
+    /// smuggle an ill-formed stream in through YAML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture_track: Option<crate::gesture::GestureTrackDocument>,
+    /// Authored gesture-canvas controls. These are ordinary continuous values,
+    /// so unlike the track they interpolate; omitting the section is exactly
+    /// the pre-gesture path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture_canvas: Option<GestureCanvasConfig>,
 }
 
 impl<'de> Deserialize<'de> for PatchState {
@@ -386,6 +398,10 @@ impl<'de> Deserialize<'de> for PatchState {
             morph: Option<crate::morph::MorphStateSnapshot>,
             #[serde(default)]
             scenes: Scenes,
+            #[serde(default)]
+            gesture_track: Option<crate::gesture::GestureTrackDocument>,
+            #[serde(default)]
+            gesture_canvas: Option<GestureCanvasConfig>,
         }
 
         let raw = RawPatchState::deserialize(deserializer)?;
@@ -404,6 +420,8 @@ impl<'de> Deserialize<'de> for PatchState {
             temporal: raw.temporal,
             morph: raw.morph,
             scenes: raw.scenes,
+            gesture_track: raw.gesture_track,
+            gesture_canvas: raw.gesture_canvas.map(GestureCanvasConfig::sanitized),
         };
         patch
             .validate_creative_persistence()
@@ -1616,6 +1634,58 @@ fn apply_motion_look(config: MotionConfig, live: &mut MotionParams) {
     *live = config.to_params().sanitized();
     // A Look transfers bounded values and recipe laws, never donor-route topology.
     live.transplant.donor = donor;
+}
+
+/// Serializable S3b gesture-canvas authoring.
+///
+/// This carries the three *authored continuous* canvas controls and nothing
+/// else. Etched pixels, the decay clock, the grid the host derived from the
+/// current output, the canvas generation, and the recorded event track are all
+/// deliberately absent: the first four are runtime state and the last is
+/// topology carried whole by [`PatchState::gesture_track`]. An omitted section
+/// is exactly the pre-gesture path, so every patch written before S3b keeps its
+/// original bytes and its original canonical hash.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GestureCanvasConfig {
+    pub radius: f32,
+    pub strength: f32,
+    pub retention: f32,
+}
+
+impl Default for GestureCanvasConfig {
+    fn default() -> Self {
+        Self::from_params(crate::gesture_canvas::GestureCanvasParams::default())
+    }
+}
+
+impl GestureCanvasConfig {
+    pub const fn from_params(value: crate::gesture_canvas::GestureCanvasParams) -> Self {
+        Self {
+            radius: value.radius,
+            strength: value.strength,
+            retention: value.retention,
+        }
+    }
+
+    /// Every consumer sanitizes, so a hostile or legacy field lands on the
+    /// documented default rather than a clamped extreme.
+    pub fn to_params(self) -> crate::gesture_canvas::GestureCanvasParams {
+        crate::gesture_canvas::GestureCanvasParams {
+            radius: self.radius,
+            strength: self.strength,
+            retention: self.retention,
+        }
+        .sanitized()
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self::from_params(self.to_params())
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Serializable modulation matrix state for patch files.
@@ -3302,6 +3372,10 @@ fn runtime_group_visual_topology_matches(sampled: &RuntimeGroup, live: &RuntimeG
                                 && sampled.source_mask.sanitized() == live.source_mask.sanitized()
                                 && sampled.motion_mask == live.motion_mask
                         }
+                        (
+                            crate::visual_rack::RuntimeVisualNodeKind::Residual(sampled),
+                            crate::visual_rack::RuntimeVisualNodeKind::Residual(live),
+                        ) => sampled.routes() == live.routes(),
                         _ => true,
                     }
             })
@@ -3458,20 +3532,34 @@ fn collect_rack_dependencies(
         // Mirror the live planner's admission predicate exactly, slot for
         // slot: a node that cannot collect a tap at frame time must not claim a
         // saved edge here, and a slot that cannot be sampled must not claim one
-        // either.
-        let slots: [Option<SavedImageTap>; SYMMETRY_IMAGE_SLOTS] = match node.kind {
+        // either. Slot-ordered, so a multi-route kind claims every slot it will
+        // bind.
+        let mut routes: [Option<SavedImageTap>; RESIDUAL_ROUTE_SLOTS] =
+            [None; RESIDUAL_ROUTE_SLOTS];
+        match node.kind {
             VisualNodeKind::Mask(MaskParams::Image(matte)) if matte.amount > 0.0 => {
-                [Some(matte.tap), None]
+                routes[usize::from(RACK_PRIMARY_ROUTE_SLOT)] = Some(matte.tap);
             }
             VisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => {
-                [Some(displace.tap), None]
+                routes[usize::from(RACK_PRIMARY_ROUTE_SLOT)] = Some(displace.tap);
             }
+            VisualNodeKind::Residual(residual) if !residual.is_exact_bypass() => {
+                let [structure, detail] = residual.routes();
+                routes[usize::from(RESIDUAL_STRUCTURE_SLOT)] = Some(structure);
+                routes[usize::from(RESIDUAL_DETAIL_SLOT)] = Some(detail);
+            }
+            // A Symmetry Field answers admission per image slot: a donor no
+            // sector record can name claims nothing here, exactly as it
+            // collects no tap in the live planner. The destructure is the
+            // compile-time proof that both frozen image slots are carried.
             VisualNodeKind::Symmetry(symmetry) if !symmetry.is_exact_bypass() => {
-                symmetry.admitted_donor_taps()
+                let [donor0, donor1] = symmetry.admitted_donor_taps();
+                routes[0] = donor0;
+                routes[1] = donor1;
             }
             _ => continue,
-        };
-        for tap in slots.into_iter().flatten() {
+        }
+        for tap in routes.into_iter().flatten() {
             collect_saved_tap_dependency(tap, consumer, below, dependencies, ordering_edges)?;
         }
     }
@@ -3534,6 +3622,11 @@ fn collect_saved_tap_dependency(
             producer: VisualScopeId::Program,
             timing: tap.timing,
         }),
+        // The gesture canvas is not produced by any scope in this saved graph,
+        // so a route to it claims no dependency edge and no ordering edge. A
+        // dormant saved route and a woken one therefore agree by construction
+        // rather than by a second rule.
+        SavedImageSource::GestureCanvas => {}
     }
     Ok(())
 }
@@ -4028,6 +4121,15 @@ impl PatchState {
                 self.visual_schema_version
             ));
         }
+        // A patch may also be assembled in Rust, so the document's own
+        // deserializer is not the only way in. Re-run the single acceptance
+        // path here: it revalidates every event through the live-ingest
+        // validator and re-derives the canonical checksum.
+        if let Some(track) = &self.gesture_track {
+            track
+                .validate()
+                .map_err(|error| format!("invalid saved gesture track: {error}"))?;
+        }
         if let Some(rack) = &self.master_rack {
             rack.validate_for_scope(LegacyRackScope::Master)
                 .map_err(|error| format!("invalid saved master rack: {error}"))?;
@@ -4277,6 +4379,8 @@ impl PatchState {
             )),
             morph: Some(morph.snapshot_at_beat(mod_matrix.current_beat)),
             scenes: Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         }
     }
 
@@ -5135,6 +5239,8 @@ mod tests {
             temporal: None,
             morph: None,
             scenes: Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         };
         let mut master = EffectUniforms {
             brightness: -0.4,
@@ -5448,6 +5554,8 @@ scenes:
             temporal: None,
             morph: None,
             scenes: Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -5535,6 +5643,8 @@ scenes:
             temporal: None,
             morph: None,
             scenes: Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -6706,6 +6816,8 @@ routings:
             temporal: None,
             morph: None,
             scenes: Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         }
     }
 
@@ -7211,6 +7323,274 @@ routings:
         patch_with(previous_frame)
             .validate_creative_persistence()
             .unwrap();
+    }
+
+    /// The saved graph has no scope that produces the gesture canvas, so a
+    /// route to it claims no dependency edge whether it is dormant or woken.
+    /// That is what lets a group tap the field at the current frame from inside
+    /// itself — the case that would be an immediate cycle for every other
+    /// producer in the vocabulary.
+    #[test]
+    fn a_saved_gesture_canvas_route_claims_no_edge_dormant_or_woken() {
+        use crate::visual_rack::{DisplaceBoundary, DisplaceParams};
+
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let canvas_route = |timing, amount_x| DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::GestureCanvas,
+                timing,
+            },
+            amount_x,
+            boundary: DisplaceBoundary::Wrap,
+            ..DisplaceParams::default()
+        };
+        let patch_with = |params: DisplaceParams| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Displace(params)).unwrap();
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            patch
+        };
+
+        for timing in [EdgeTiming::CurrentFrame, EdgeTiming::PreviousFrame] {
+            for amount_x in [0.0, 0.25] {
+                let mut patch = patch_with(canvas_route(timing, amount_x));
+                patch
+                    .validate_creative_persistence()
+                    .expect("a canvas route never closes a saved cycle");
+
+                // It survives the YAML round trip as itself: a positionless
+                // singleton has nothing to lose and nothing to tombstone.
+                let yaml = serde_yaml::to_string(&patch).unwrap();
+                assert!(yaml.contains("gesture_canvas"), "{yaml}");
+                let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+                let composition = restored.composition.unwrap();
+                let rack = &composition.group(group_id).unwrap().rack;
+                let VisualNodeKind::Displace(params) = rack.iter().next().unwrap().kind else {
+                    panic!("displace node")
+                };
+                assert_eq!(params.tap.source, SavedImageSource::GestureCanvas);
+                assert_eq!(params.tap.timing, timing);
+                assert!(rack.referenced_group_ids().next().is_none());
+                assert!(rack.selected_layer_positions().next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn saved_residual_edges_are_dormant_at_zero_mix_and_cycle_per_slot_when_woken() {
+        use crate::visual_rack::{ResidualParams, RESIDUAL_DETAIL_SLOT, RESIDUAL_STRUCTURE_SLOT};
+
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let self_source = SavedImageSource::GroupOutput { group_id };
+        let residual_rack = |params: ResidualParams| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Residual(params)).unwrap();
+            rack
+        };
+        // Both slots are inert `OneBelow` until one of them is pointed at the
+        // owning group's own output.
+        let self_route = |slot: u8, timing: EdgeTiming, mix: f32| {
+            let mut params = ResidualParams {
+                mix,
+                ..ResidualParams::default()
+            };
+            *params.route_mut(slot).expect("both slots name a route") = SavedImageTap {
+                source: self_source,
+                timing,
+            };
+            params
+        };
+        let patch_with = |rack: VisualRack| {
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            patch
+        };
+
+        for slot in [RESIDUAL_STRUCTURE_SLOT, RESIDUAL_DETAIL_SLOT] {
+            // Dormant forms claim no saved edge, so a self route round trips.
+            let mut disabled = residual_rack(self_route(slot, EdgeTiming::CurrentFrame, 0.5));
+            let disabled_id = disabled.iter().next().unwrap().stable_id;
+            disabled.get_mut(disabled_id).unwrap().enabled = false;
+            let mut zero_wet = residual_rack(self_route(slot, EdgeTiming::CurrentFrame, 0.5));
+            let zero_wet_id = zero_wet.iter().next().unwrap().stable_id;
+            zero_wet.get_mut(zero_wet_id).unwrap().wet = 0.0;
+            let zero_mix = residual_rack(self_route(slot, EdgeTiming::CurrentFrame, 0.0));
+
+            for dormant in [disabled, zero_wet, zero_mix] {
+                let mut patch = patch_with(dormant);
+                patch.validate_creative_persistence().unwrap();
+                let yaml = serde_yaml::to_string(&patch).unwrap();
+                let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+                let composition = restored.composition.unwrap();
+                let rack = &composition.group(group_id).unwrap().rack;
+                assert!(matches!(
+                    rack.iter().next().unwrap().kind,
+                    VisualNodeKind::Residual(_)
+                ));
+            }
+
+            // Waking the mix wakes the saved edge on whichever slot carries the
+            // self route, and the same-frame cycle is rejected at load rather
+            // than reaching the planner.
+            let error = patch_with(residual_rack(self_route(
+                slot,
+                EdgeTiming::CurrentFrame,
+                0.25,
+            )))
+            .validate_creative_persistence()
+            .expect_err("a woken same-frame Residual self route must be rejected");
+            assert!(
+                error.contains("cycle") || error.contains("graph"),
+                "unexpected saved-edge rejection for slot {slot}: {error}"
+            );
+
+            // The identical route at N-1 is a legitimate saved feedback edge.
+            patch_with(residual_rack(self_route(
+                slot,
+                EdgeTiming::PreviousFrame,
+                0.25,
+            )))
+            .validate_creative_persistence()
+            .unwrap();
+        }
+    }
+
+    /// A group-scope Look is refused whole when any node's routing topology
+    /// differs. Without the Residual arm the `_ => true` default would accept a
+    /// mismatched pair and then copy values across two different recombinations.
+    #[test]
+    fn group_look_refuses_a_residual_whose_structure_or_detail_route_differs() {
+        use crate::visual_rack::{
+            EdgeTiming as RackEdgeTiming, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams, RuntimeVisualNodeKind, RESIDUAL_DETAIL_SLOT,
+            RESIDUAL_STRUCTURE_SLOT,
+        };
+
+        let group_id = GroupId::new(9).unwrap();
+        let routed = |source: ResolvedImageSource| ResolvedImageTap {
+            source,
+            timing: RackEdgeTiming::CurrentFrame,
+        };
+        let base = RuntimeResidualParams {
+            structure: routed(ResolvedImageSource::OneBelow),
+            detail: routed(ResolvedImageSource::CleanProgram),
+            mix: 0.5,
+            ..RuntimeResidualParams::default()
+        };
+        let group_with = |params: RuntimeResidualParams| {
+            let mut group = empty_runtime_group_with_matte(group_id, None);
+            group
+                .rack
+                .push(RuntimeVisualNodeKind::Residual(params))
+                .unwrap();
+            group
+        };
+
+        let sampled = group_with(base);
+        let mut live = group_with(base);
+        assert!(
+            runtime_group_visual_topology_matches(&sampled, &live),
+            "an identical pair of routes is Look-compatible"
+        );
+        assert!(apply_runtime_group_look_values(&sampled, &mut live));
+
+        for slot in [RESIDUAL_STRUCTURE_SLOT, RESIDUAL_DETAIL_SLOT] {
+            let mut rerouted = base;
+            *rerouted.route_mut(slot).expect("both slots name a route") =
+                routed(ResolvedImageSource::AllBelow);
+            let mut live = group_with(rerouted);
+            let before = live.clone();
+            assert!(
+                !runtime_group_visual_topology_matches(&sampled, &live),
+                "slot {slot} must join the group Look routing gate"
+            );
+            assert!(!apply_runtime_group_look_values(&sampled, &mut live));
+            assert_eq!(live.rack, before.rack, "a refused Look changes nothing");
+        }
+    }
+
+    /// A pre-Residual patch has no `residual` node kind anywhere, and adding
+    /// the kind must leave that YAML byte-identical on the way back out. The
+    /// node's own absent fields default through `#[serde(default)]` to the
+    /// exact bypass, so a legacy visual path is unchanged.
+    #[test]
+    fn a_legacy_patch_without_any_residual_section_round_trips_unchanged() {
+        use crate::visual_rack::{ResidualBlock, ResidualParams, ResidualQuantization};
+
+        let mut patch = minimal_patch(1);
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Grain(
+            crate::visual_rack::GrainParams::default(),
+        ))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+        patch.visual_schema_version = 1;
+        patch.validate_creative_persistence().unwrap();
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(
+            !yaml.contains("residual"),
+            "a patch with no Residual node must not gain a residual section"
+        );
+        let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&restored).unwrap(),
+            yaml,
+            "a legacy patch must round trip byte for byte"
+        );
+        assert_eq!(
+            restored.layers[0].rack.as_ref().unwrap().iter().count(),
+            patch.layers[0].rack.as_ref().unwrap().iter().count()
+        );
+
+        // An authored Residual node whose params section is entirely absent
+        // deserializes through the patch's own YAML reader to the exact-bypass
+        // default, so it claims no edge and renders the pre-Residual path.
+        let rack_yaml =
+            "nodes:\n- stable_id: 3\n  kind:\n    kind: residual\n    params: {}\nnext_node_id: 4\n";
+        let rack: VisualRack = serde_yaml::from_str(rack_yaml).unwrap();
+        let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(params, ResidualParams::default());
+        assert_eq!(params.mix, 0.0);
+        assert_eq!(params.detail_gain, 1.0);
+        assert_eq!(params.block, ResidualBlock::Eight);
+        assert_eq!(params.quantization, ResidualQuantization::Off);
+        assert_eq!(params.seed, 0);
+        assert!(
+            params.is_exact_bypass(),
+            "an absent residual section must be an exact bypass"
+        );
+
+        // That dormant node claims no saved image edge, so a patch carrying it
+        // validates and round trips exactly like the legacy one.
+        let mut with_dormant = minimal_patch(1);
+        with_dormant.layers[0].rack = Some(rack);
+        with_dormant.visual_schema_version = 1;
+        with_dormant.validate_creative_persistence().unwrap();
+        let dormant_yaml = serde_yaml::to_string(&with_dormant).unwrap();
+        let restored = serde_yaml::from_str::<PatchState>(&dormant_yaml).unwrap();
+        assert_eq!(serde_yaml::to_string(&restored).unwrap(), dormant_yaml);
     }
 
     #[test]
@@ -7992,5 +8372,79 @@ routings:
                 stage: LayerImageStage::PostLocalEffects,
             }
         );
+    }
+
+    /// The gesture sections are additive in the strictest sense: a patch that
+    /// never authored one must serialize to the exact bytes it did before S3b
+    /// existed, and a patch written before S3b must load with both sections
+    /// absent rather than defaulted-and-claimed.
+    #[test]
+    fn an_absent_gesture_section_is_exactly_the_pre_gesture_path_and_round_trips_unchanged() {
+        let patch = minimal_patch(2);
+        assert_eq!(patch.gesture_track, None);
+        assert_eq!(patch.gesture_canvas, None);
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(!yaml.contains("gesture_track:"));
+        assert!(!yaml.contains("gesture_canvas:"));
+
+        // A pre-S3b document names neither section and must not acquire one.
+        let legacy_yaml = "master: {}\nmaster_transform: {}\nlayers:\n  - filename: old.mov\n";
+        let legacy: PatchState = serde_yaml::from_str(legacy_yaml).unwrap();
+        assert_eq!(legacy.gesture_track, None);
+        assert_eq!(legacy.gesture_canvas, None);
+        let reserialized = serde_yaml::to_string(&legacy).unwrap();
+        assert!(!reserialized.contains("gesture"));
+        let round_tripped: PatchState = serde_yaml::from_str(&reserialized).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&round_tripped).unwrap(),
+            reserialized,
+            "a legacy patch must round-trip unchanged"
+        );
+
+        // The default canvas is the pre-gesture path too, so an authored patch
+        // only grows the section once a value actually moved.
+        let mut authored = minimal_patch(1);
+        authored.gesture_canvas = Some(GestureCanvasConfig::default());
+        assert!(authored.gesture_canvas.unwrap().is_default());
+        let mut moved = minimal_patch(1);
+        moved.gesture_canvas = Some(GestureCanvasConfig {
+            radius: 0.25,
+            strength: 0.75,
+            retention: 0.5,
+        });
+        let yaml = serde_yaml::to_string(&moved).unwrap();
+        assert!(yaml.contains("gesture_canvas:"));
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.gesture_canvas, moved.gesture_canvas);
+    }
+
+    /// Hostile canvas values sanitize on load and an unknown key inside the
+    /// section fails closed rather than being silently ignored.
+    #[test]
+    fn a_hostile_gesture_canvas_section_sanitizes_on_load_and_rejects_unknown_fields() {
+        let hostile: PatchState = serde_yaml::from_str(
+            "master: {}\nlayers: []\ngesture_canvas:\n  radius: .nan\n  strength: 9\n  retention: -4\n",
+        )
+        .unwrap();
+        let canvas = hostile.gesture_canvas.expect("section present");
+        // Non-finite takes the documented default; finite out-of-range clamps.
+        assert!((canvas.radius - GestureCanvasConfig::default().radius).abs() < 1.0e-6);
+        assert_eq!(canvas.strength, 1.0);
+        assert_eq!(canvas.retention, 0.0);
+
+        assert!(serde_yaml::from_str::<PatchState>(
+            "master: {}\nlayers: []\ngesture_canvas:\n  radius: 0.2\n  decay: 3\n",
+        )
+        .is_err());
+
+        // An omitted field inside a present section falls back to its default
+        // rather than to zero.
+        let partial: PatchState =
+            serde_yaml::from_str("master: {}\nlayers: []\ngesture_canvas:\n  radius: 0.2\n")
+                .unwrap();
+        let canvas = partial.gesture_canvas.expect("section present");
+        assert_eq!(canvas.radius, 0.2);
+        assert_eq!(canvas.strength, GestureCanvasConfig::default().strength);
+        assert_eq!(canvas.retention, GestureCanvasConfig::default().retention);
     }
 }

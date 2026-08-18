@@ -29,19 +29,19 @@ use crate::performance::SavedLayerPosition;
 use crate::renderer::compositor::{MatteChannelCode, ResolvedMatteParams};
 use crate::renderer::rack::{CollisionRackPlan, RackCompileError};
 use crate::spatial::{EffectPassUniforms, SpatialGpuUniforms, SpatialTransform};
-use crate::symmetry::{
-    RuntimeSymmetryParams, SymmetryNodeDomain, SYMMETRY_IMAGE_SLOTS, SYMMETRY_MOTION_SLOTS,
-};
+use crate::symmetry::{RuntimeSymmetryParams, SymmetryNodeDomain, SYMMETRY_MOTION_SLOTS};
 use crate::temporal::{RefreshGardenMatteRoute, RefreshGardenMotionRoute};
 use crate::visual_rack::{
     CreativeResourceLimits, CreativeResourcePlan, EdgeTiming, GroupId, ImageDependency,
     ImageDependencyGraph, ImageGraphError, ImageGraphMode, ImageGraphPlan, LegacyRackScope,
-    NodeBlend, NodeId, NodeKindTag, ResolvedImageSource, ResolvedImageTap, ResourcePreflightError,
-    RouteCaptureError, RuntimeImageMatte, RuntimeMaskParams, RuntimeRackError, RuntimeVisualNode,
-    RuntimeVisualNodeKind, RuntimeVisualRack, VisualRack, VisualScopeId,
-    ADVANCED_PROGRAM_HISTORY_STAGING_LAYERS, ADVANCED_RACK_SURFACE_LAYERS,
-    ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS, MAX_IMAGE_DEPENDENCIES,
-    MAX_LOGICAL_TEXTURE_LOOKUPS_PER_FRAME, MAX_TEXTURE_SAMPLES_PER_FRAME,
+    NodeBlend, NodeId, NodeKindTag, ResidualResourceError, ResidualResourceLimits,
+    ResidualResourcePlan, ResidualResourceRequest, ResolvedImageSource, ResolvedImageTap,
+    ResourcePreflightError, RouteCaptureError, RuntimeImageMatte, RuntimeMaskParams,
+    RuntimeRackError, RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack, VisualNodeKind,
+    VisualRack, VisualScopeId, ADVANCED_PROGRAM_HISTORY_STAGING_LAYERS,
+    ADVANCED_RACK_SURFACE_LAYERS, ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS, MAX_IMAGE_DEPENDENCIES,
+    MAX_LOGICAL_TEXTURE_LOOKUPS_PER_FRAME, MAX_TEXTURE_SAMPLES_PER_FRAME, RACK_PRIMARY_ROUTE_SLOT,
+    RESIDUAL_DETAIL_SLOT, RESIDUAL_ROUTE_SLOTS, RESIDUAL_STRUCTURE_SLOT,
 };
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -64,6 +64,14 @@ pub struct CompositionPlanInput<'a> {
     /// Omitted motion retains the literal pre-M4 exact path. Live and export
     /// provide the same immutable values through `with_motion`.
     pub motion: Option<MotionPlanInput<'a>>,
+    /// Whether this session has an admitted gesture canvas.
+    ///
+    /// `false` is the pre-gesture default: a route to the canvas resolves to a
+    /// transparent field with a named diagnostic, exactly as a missing donor
+    /// does, and never silently rebinds to a layer or a group. The canvas is a
+    /// master-scope singleton, so this is a bare admission fact rather than an
+    /// identity — there is nothing to name and no position to preserve.
+    pub gesture_canvas_admitted: bool,
 }
 
 impl<'a> CompositionPlanInput<'a> {
@@ -80,7 +88,16 @@ impl<'a> CompositionPlanInput<'a> {
             program_history_initialized: false,
             resource_limits: CreativeResourceLimits::default(),
             motion: None,
+            gesture_canvas_admitted: false,
         }
+    }
+
+    /// Declare whether an admitted gesture canvas backs this frame. Live and
+    /// export must supply the same fact so a routed donor plans identically on
+    /// both sides.
+    pub const fn with_gesture_canvas(mut self, admitted: bool) -> Self {
+        self.gesture_canvas_admitted = admitted;
+        self
     }
 
     /// Route authored mattes through the unified stable-ID composition graph.
@@ -445,6 +462,11 @@ pub struct EvaluatedGroupScopePlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ImageTapConsumer {
+    /// One authored route slot of one rack node. Single-route kinds always
+    /// occupy slot 0; a multi-route kind names each slot explicitly, because
+    /// the consumer identity is what orders, hashes, and binds a tap. Without
+    /// the slot, two routes on one node would collapse to one identity and the
+    /// second donor would silently resolve onto the first one's surface.
     RackNode {
         scope: VisualScopeId,
         node_id: NodeId,
@@ -505,6 +527,13 @@ pub enum PlannedImageSource {
     /// Exact root/group-local prefix, ordered back-to-front.
     AllBelow(CompositePrefix),
     ProgramHistory,
+    /// The etched gesture field, presented as a premultiplied donor image.
+    ///
+    /// It is a *producer with no scope*: nothing in the composition graph makes
+    /// it, so it contributes no dependency, no ordering edge, and no retained
+    /// tap surface. That is what keeps a same-frame route to it from ever
+    /// closing a cycle, including from the master scope that owns it.
+    GestureCanvas,
     Transparent,
 }
 
@@ -561,6 +590,12 @@ pub enum CompositionPlanDiagnostic {
         consumer: ImageTapConsumer,
     },
     ProgramHistoryUninitialized {
+        consumer: ImageTapConsumer,
+    },
+    /// A route named the gesture canvas but no canvas is admitted. The tap
+    /// resolves transparent and stays visible as this diagnostic; it is never
+    /// repointed at some other producer.
+    GestureCanvasUnavailable {
         consumer: ImageTapConsumer,
     },
     RefreshGardenMatteNotSelected,
@@ -990,6 +1025,14 @@ pub struct AdvancedCompositionPlan {
     graph: ImageGraphPlan,
     execution_order: Box<[VisualScopeId]>,
     resources: CreativeResourcePlan,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the reduced block-mean ledger is consumed by the prepared executor"
+        )
+    )]
+    residual_resources: ResidualResourcePlan,
     motion: EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
     refresh_garden_resources: RefreshGardenResourcePlan,
@@ -1076,6 +1119,19 @@ impl AdvancedCompositionPlan {
 
     pub const fn resources(&self) -> CreativeResourcePlan {
         self.resources
+    }
+
+    /// Byte-exact reduced block-mean working set, deliberately outside the
+    /// full-frame layer ledger and reconciled against the prepared executor.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the reduced block-mean ledger is consumed by the prepared executor"
+        )
+    )]
+    pub const fn residual_resources(&self) -> ResidualResourcePlan {
+        self.residual_resources
     }
 
     pub const fn motion(&self) -> &EvaluatedMotionPlan {
@@ -1299,6 +1355,17 @@ pub enum CompositionPlanError {
         layers: Vec<StableLayerId>,
     },
     Resource(ResourcePreflightError),
+    /// A Residual Counterpoint block-mean working set broke one of its own
+    /// independently enforced bounds. Reduced surfaces are never silently
+    /// clamped to a smaller grid; the offending bound is named instead.
+    Residual(ResidualResourceError),
+    /// The reduced block-mean bytes are admissible on their own but push the
+    /// composition past the shared creative cap once full-frame and motion
+    /// bytes are counted with them.
+    ResidualCombinedMemoryBudget {
+        bytes: u64,
+        limit: u64,
+    },
     Motion(MotionPlanError),
     MotionCombinedMemoryBudget {
         bytes: u64,
@@ -1400,6 +1467,13 @@ impl fmt::Display for CompositionPlanError {
             Self::Resource(error) => {
                 write!(formatter, "creative resource preflight failed: {error}")
             }
+            Self::Residual(error) => {
+                write!(formatter, "residual resource preflight failed: {error}")
+            }
+            Self::ResidualCombinedMemoryBudget { bytes, limit } => write!(
+                formatter,
+                "creative plus residual block-mean resources request {bytes} bytes; limit is {limit}"
+            ),
             Self::Motion(error) => write!(formatter, "motion resource preflight failed: {error}"),
             Self::MotionCombinedMemoryBudget { bytes, limit } => write!(
                 formatter,
@@ -1779,6 +1853,7 @@ impl<'a> Planner<'a> {
         };
 
         let below = below_topology(self.input.composition)?;
+        let gesture_canvas_admitted = self.input.gesture_canvas_admitted;
         let mut taps = Vec::new();
         let mut diagnostics = Vec::new();
         let mut dependencies = Vec::new();
@@ -1800,6 +1875,7 @@ impl<'a> Planner<'a> {
                 self.racks[&layer.stable_id],
                 &below,
                 &known_scopes,
+                gesture_canvas_admitted,
                 &mut taps,
                 &mut diagnostics,
                 &mut dependencies,
@@ -1817,6 +1893,7 @@ impl<'a> Planner<'a> {
                     },
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1839,6 +1916,7 @@ impl<'a> Planner<'a> {
                     &runtime.rack,
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1851,6 +1929,7 @@ impl<'a> Planner<'a> {
                         PlannedImageTapOrigin::Rack(matte.tap),
                         &below,
                         &known_scopes,
+                        gesture_canvas_admitted,
                         &mut taps,
                         &mut diagnostics,
                         &mut dependencies,
@@ -1865,6 +1944,7 @@ impl<'a> Planner<'a> {
             self.input.master_rack,
             &below,
             &known_scopes,
+            gesture_canvas_admitted,
             &mut taps,
             &mut diagnostics,
             &mut dependencies,
@@ -1893,6 +1973,7 @@ impl<'a> Planner<'a> {
                     }),
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1913,6 +1994,7 @@ impl<'a> Planner<'a> {
                     }),
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1984,7 +2066,7 @@ impl<'a> Planner<'a> {
             &group_plans,
             &master,
         )?)?;
-        let resources = resource_preflight(
+        let (resources, residual_resources) = resource_preflight(
             output,
             self.input,
             &layer_plans,
@@ -2006,6 +2088,7 @@ impl<'a> Planner<'a> {
             &motion,
             refresh_garden_signal,
             symmetry_field_resources,
+            residual_resources,
         );
 
         Ok(EvaluatedCompositionPlan::Advanced(Box::new(
@@ -2022,6 +2105,7 @@ impl<'a> Planner<'a> {
                 graph,
                 execution_order: execution_order.into_boxed_slice(),
                 resources,
+                residual_resources,
                 motion,
                 refresh_garden_signal,
                 refresh_garden_resources,
@@ -2578,10 +2662,15 @@ fn flush_segment(
             });
             continue;
         }
+        // Deliberately kind-only, unlike the value-gated admission predicate in
+        // `collect_rack_taps`: segment indices must never depend on frame-local
+        // gains, or the uniform-slot reservation renumbers whenever one crosses
+        // zero.
         let is_image_consumer = matches!(
             node.kind,
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_))
                 | RuntimeVisualNodeKind::Displace(_)
+                | RuntimeVisualNodeKind::Residual(_)
         );
         if is_image_consumer {
             compile_segment_nodes(
@@ -2726,6 +2815,7 @@ fn collect_rack_taps(
     rack: &RuntimeVisualRack,
     below: &BelowTopology,
     known_scopes: &BTreeSet<VisualScopeId>,
+    gesture_canvas_admitted: bool,
     taps: &mut Vec<PlannedImageTap>,
     diagnostics: &mut Vec<CompositionPlanDiagnostic>,
     dependencies: &mut Vec<ImageDependency>,
@@ -2738,31 +2828,46 @@ fn collect_rack_taps(
         }
         // Routes are collected by slot, so a node carrying several fixed
         // routes yields one tap per admitted slot and slot index stays route
-        // identity all the way into the consumer key.
-        let slots: [Option<ResolvedImageTap>; SYMMETRY_IMAGE_SLOTS] = match node.kind {
+        // identity all the way into the consumer key. A single-route kind fills
+        // slot 0 only; Residual names both of its slots and Symmetry both of
+        // its image slots, so those donors are separate consumer identities
+        // that can never alias.
+        let mut routes: [Option<ResolvedImageTap>; RESIDUAL_ROUTE_SLOTS] =
+            [None; RESIDUAL_ROUTE_SLOTS];
+        match node.kind {
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) if matte.amount > 0.0 => {
-                [Some(matte.tap), None]
+                routes[usize::from(RACK_PRIMARY_ROUTE_SLOT)] = Some(matte.tap);
             }
             // A Displace whose two amounts are both zero is an exact bypass:
             // it encodes no pass, so it must not claim a cross-scope donor,
             // a dependency edge, or a binding slot either.
             RuntimeVisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => {
-                [Some(displace.tap), None]
+                routes[usize::from(RACK_PRIMARY_ROUTE_SLOT)] = Some(displace.tap);
+            }
+            // A Residual at zero mix is the same real delegation, and it
+            // delegates both slots at once rather than half a decomposition.
+            RuntimeVisualNodeKind::Residual(residual) if !residual.is_exact_bypass() => {
+                let [structure, detail] = residual.routes();
+                routes[usize::from(RESIDUAL_STRUCTURE_SLOT)] = Some(structure);
+                routes[usize::from(RESIDUAL_DETAIL_SLOT)] = Some(detail);
             }
             // A Symmetry Field answers admission per image slot: a donor no
             // sector record can name claims nothing, exactly as a whole
-            // bypassed node claims nothing.
+            // bypassed node claims nothing. The destructure is the
+            // compile-time proof that both frozen image slots are carried.
             RuntimeVisualNodeKind::Symmetry(symmetry) if !symmetry.is_exact_bypass() => {
-                symmetry.admitted_donor_taps()
+                let [donor0, donor1] = symmetry.admitted_donor_taps();
+                routes[0] = donor0;
+                routes[1] = donor1;
             }
             _ => continue,
-        };
-        for (slot, tap) in slots.into_iter().enumerate() {
-            let Some(tap) = tap else {
+        }
+        for (slot, tap) in routes.iter().enumerate() {
+            let Some(tap) = *tap else {
                 continue;
             };
             let slot = u8::try_from(slot).map_err(|_| {
-                CompositionPlanError::Internal("image route slot exceeds its bounded domain")
+                CompositionPlanError::Internal("rack route slot left its bounded domain")
             })?;
             collect_tap(
                 ImageTapConsumer::RackNode {
@@ -2773,6 +2878,7 @@ fn collect_rack_taps(
                 PlannedImageTapOrigin::Rack(tap),
                 below,
                 known_scopes,
+                gesture_canvas_admitted,
                 taps,
                 diagnostics,
                 dependencies,
@@ -2790,6 +2896,7 @@ fn collect_tap(
     origin: PlannedImageTapOrigin,
     below: &BelowTopology,
     known_scopes: &BTreeSet<VisualScopeId>,
+    gesture_canvas_admitted: bool,
     taps: &mut Vec<PlannedImageTap>,
     diagnostics: &mut Vec<CompositionPlanDiagnostic>,
     dependencies: &mut Vec<ImageDependency>,
@@ -2920,6 +3027,19 @@ fn collect_tap(
             current_edge = Some(VisualScopeId::Program);
             PlannedImageSource::Scope(VisualScopeId::Program)
         }
+        // The canvas is etched outside the composition graph, so it is a
+        // producer with no scope: no `dependency_producer`, no `current_edge`,
+        // and therefore no ordering constraint and no cycle. It also has no
+        // N-1 parity — a frame-committed singleton has one image — so both
+        // timings read the same committed field rather than quietly claiming a
+        // history pair nothing writes.
+        TapRouteSource::GestureCanvas if gesture_canvas_admitted => {
+            PlannedImageSource::GestureCanvas
+        }
+        TapRouteSource::GestureCanvas => {
+            diagnostics.push(CompositionPlanDiagnostic::GestureCanvasUnavailable { consumer });
+            PlannedImageSource::Transparent
+        }
     };
     if let Some(producer) = dependency_producer {
         dependencies.push(ImageDependency {
@@ -2957,6 +3077,7 @@ enum TapRouteSource {
     CleanProgram,
     ProgramHistory,
     ProgramHistoryUninitialized,
+    GestureCanvas,
 }
 
 impl From<ResolvedImageSource> for TapRouteSource {
@@ -2973,6 +3094,7 @@ impl From<ResolvedImageSource> for TapRouteSource {
             ResolvedImageSource::GroupOutput(group_id) => Self::GroupOutput(group_id),
             ResolvedImageSource::MissingGroupOutput(group_id) => Self::MissingGroupOutput(group_id),
             ResolvedImageSource::CleanProgram => Self::CleanProgram,
+            ResolvedImageSource::GestureCanvas => Self::GestureCanvas,
         }
     }
 }
@@ -3301,7 +3423,7 @@ fn resource_preflight(
     motion: &EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
     symmetry_field: SymmetryFieldResourcePlan,
-) -> Result<CreativeResourcePlan, CompositionPlanError> {
+) -> Result<(CreativeResourcePlan, ResidualResourcePlan), CompositionPlanError> {
     let mut racks = Vec::with_capacity(
         input
             .layer_racks
@@ -3356,7 +3478,14 @@ fn resource_preflight(
         let needs_staging = tap.origin.timing() == EdgeTiming::PreviousFrame
             && !matches!(
                 tap.resolved,
-                PlannedImageSource::ProgramHistory | PlannedImageSource::Transparent
+                PlannedImageSource::ProgramHistory
+                    // The gesture canvas is a frame-committed singleton with
+                    // one image and no N-1 parity, so an N-1 route to it stages
+                    // nothing. The executor allocates nothing for it either;
+                    // charging a parity pair here would put the declared and
+                    // actual ledgers permanently one apart.
+                    | PlannedImageSource::GestureCanvas
+                    | PlannedImageSource::Transparent
             );
         count
             .checked_add(u32::from(needs_staging))
@@ -3406,6 +3535,14 @@ fn resource_preflight(
     // once through `capture_budget_rack` above, and charging it again here
     // would double count the same pass.
     validate_symmetry_field_textures(symmetry_field, input.resource_limits)?;
+    // Reduced block-mean surfaces are sub-full-frame and byte-exact, so they
+    // are budgeted entirely outside the full-frame layer ledger. Charging them
+    // as `additional_rgba16_layers` would over-count by orders of magnitude.
+    let residual = ResidualResourcePlan::preflight(
+        &residual_resource_requests(output, &racks),
+        ResidualResourceLimits::from(input.resource_limits),
+    )
+    .map_err(CompositionPlanError::Residual)?;
     let garden_budget = refresh_garden_resource_plan(refresh_garden_signal);
     if let Some(motion) = motion.advanced() {
         let combined_bytes = creative
@@ -3508,7 +3645,61 @@ fn resource_preflight(
             ));
         }
     }
-    Ok(creative)
+    // The block-mean bytes meet the creative number only here, at the shared
+    // cap, exactly the way motion bytes do. A composition with no live
+    // Residual node charges nothing and this check is byte-for-byte inert.
+    if residual.total_bytes > 0 {
+        let motion_bytes = motion
+            .advanced()
+            .map_or(0, |motion| motion.resources.total_bytes);
+        let combined_bytes = creative
+            .creative_bytes
+            .checked_add(motion_bytes)
+            .and_then(|value| value.checked_add(residual.total_bytes))
+            .ok_or(CompositionPlanError::Resource(
+                ResourcePreflightError::ArithmeticOverflow,
+            ))?;
+        let byte_limit = input
+            .resource_limits
+            .max_creative_bytes
+            .min(crate::visual_rack::MAX_CREATIVE_GPU_BYTES);
+        if combined_bytes > byte_limit {
+            return Err(CompositionPlanError::ResidualCombinedMemoryBudget {
+                bytes: combined_bytes,
+                limit: byte_limit,
+            });
+        }
+    }
+    Ok((creative, residual))
+}
+
+/// Every admitted Residual node's block-mean working set, gathered under the
+/// same admission predicate the live planner and the saved-patch dependency
+/// walk use. A disabled, zero-wet, or exact-bypass node delegates completely
+/// and therefore charges no reduced surface here either.
+fn residual_resource_requests(
+    output: [u32; 2],
+    racks: &[VisualRack],
+) -> Vec<ResidualResourceRequest> {
+    let mut requests = Vec::new();
+    for rack in racks {
+        for node in rack.iter() {
+            if !node.enabled || node.wet <= 0.0 {
+                continue;
+            }
+            let VisualNodeKind::Residual(residual) = node.kind else {
+                continue;
+            };
+            if residual.is_exact_bypass() {
+                continue;
+            }
+            requests.push(ResidualResourceRequest {
+                output_dimensions: output,
+                block: residual.block,
+            });
+        }
+    }
+    requests
 }
 
 fn synthetic_legacy_matte_budget_rack(
@@ -3591,6 +3782,7 @@ fn advanced_topology_signature(
     motion: &EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
     symmetry_field: SymmetryFieldResourcePlan,
+    residual: ResidualResourcePlan,
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4144_5641_4e43_4544);
     hash = hash_value(hash, master.topology_signature());
@@ -3683,6 +3875,17 @@ fn advanced_topology_signature(
         hash = hash_value(hash, u64::from(symmetry_field.full_frame_passes));
         hash = hash_value(hash, u64::from(symmetry_field.max_sampled_textures_in_pass));
         hash = hash_value(hash, u64::from(symmetry_field.uniform_bytes));
+    }
+    // The reduced block-mean grid is plan-visible resource topology: its
+    // dimensions come from the authored block vocabulary, which the rack
+    // signature deliberately does not hash. Without this a block change would
+    // reuse mean surfaces sized for the previous grid.
+    if residual.active_nodes > 0 {
+        hash = hash_value(hash, 0x5245_5349_4455_414c);
+        hash = hash_value(hash, u64::from(residual.active_nodes));
+        hash = hash_value(hash, u64::from(residual.max_grid_dimensions[0]));
+        hash = hash_value(hash, u64::from(residual.max_grid_dimensions[1]));
+        hash = hash_value(hash, residual.total_bytes);
     }
     hash
 }
@@ -3798,8 +4001,9 @@ fn hash_consumer(mut hash: u64, consumer: ImageTapConsumer) -> u64 {
             hash = hash_value(hash, 1);
             hash = hash_scope(hash, scope);
             hash = hash_value(hash, node_id.get());
-            // The slot must enter the hash. Without it a change confined to a
-            // node's second route leaves the topology signature unchanged and
+            // The slot is part of the identity, not decoration, and it must
+            // enter the hash. Without it a change confined to a node's second
+            // route leaves the topology signature unchanged and
             // `CompositionGpuExecutor::is_prepared_for` silently reuses the
             // stale bindings built for the previous route.
             hash_value(hash, u64::from(slot))
@@ -3854,6 +4058,8 @@ fn hash_source(mut hash: u64, source: &PlannedImageSource) -> u64 {
         }
         PlannedImageSource::ProgramHistory => hash_value(hash, 4),
         PlannedImageSource::Transparent => hash_value(hash, 5),
+        // Append-only, exactly like the node kind codes: 6 is SelectedLayer.
+        PlannedImageSource::GestureCanvas => hash_value(hash, 7),
     }
 }
 
@@ -4101,6 +4307,48 @@ mod tests {
             },
         ))
         .unwrap()
+    }
+
+    fn residual_params(
+        structure: (ResolvedImageSource, EdgeTiming),
+        detail: (ResolvedImageSource, EdgeTiming),
+        mix: f32,
+    ) -> crate::visual_rack::RuntimeResidualParams {
+        crate::visual_rack::RuntimeResidualParams {
+            structure: ResolvedImageTap {
+                source: structure.0,
+                timing: structure.1,
+            },
+            detail: ResolvedImageTap {
+                source: detail.0,
+                timing: detail.1,
+            },
+            mix,
+            ..crate::visual_rack::RuntimeResidualParams::default()
+        }
+    }
+
+    fn push_residual(
+        rack: &mut RuntimeVisualRack,
+        params: crate::visual_rack::RuntimeResidualParams,
+    ) -> NodeId {
+        rack.push(RuntimeVisualNodeKind::Residual(params)).unwrap()
+    }
+
+    /// Slot-addressed tap lookup. A node-only lookup would silently return the
+    /// first collected slot for a two-route node.
+    fn residual_tap_for(
+        plan: &AdvancedCompositionPlan,
+        node: NodeId,
+        slot: u8,
+    ) -> Option<&PlannedImageTap> {
+        plan.image_taps().iter().find(|tap| {
+            matches!(
+                tap.consumer,
+                ImageTapConsumer::RackNode { node_id, slot: owner, .. }
+                    if node_id == node && owner == slot
+            )
+        })
     }
 
     fn plan(
@@ -5463,6 +5711,145 @@ mod tests {
         assert!(plan(&base, &composition, &master, &racks).is_ok());
     }
 
+    fn plan_with_gesture_canvas(
+        base: &EvaluatedFramePlan,
+        composition: &RuntimeComposition,
+        master: &RuntimeVisualRack,
+        racks: &[(StableLayerId, RuntimeVisualRack)],
+        admitted: bool,
+    ) -> Result<EvaluatedCompositionPlan, CompositionPlanError> {
+        EvaluatedCompositionPlan::evaluate(
+            base,
+            CompositionPlanInput::new(composition, master, racks).with_gesture_canvas(admitted),
+        )
+    }
+
+    #[test]
+    fn a_gesture_canvas_donor_plans_outside_scope_ordering_and_charges_no_tap_surface() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+
+        // Baseline: the same topology, advanced for the same reason, but with
+        // no image route at all.
+        let mut bare_master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        bare_master
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..DigitalColorParams::default()
+            }))
+            .unwrap();
+        let bare = advanced(
+            plan_with_gesture_canvas(
+                &base,
+                &composition,
+                &bare_master,
+                &legacy_racks(&[1, 2]),
+                true,
+            )
+            .unwrap(),
+        );
+
+        // Every scope routes a same-frame donor at the canvas at once —
+        // including the master, which is the scope that owns it and would be
+        // the self-cycle if the canvas were an ordinary producer.
+        let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let master_node = push_displace(
+            &mut master,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let mut racks = legacy_racks(&[1, 2]);
+        let lower_node = push_displace(
+            &mut racks[0].1,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let upper_node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::PreviousFrame,
+            -0.25,
+        );
+        let compiled =
+            advanced(plan_with_gesture_canvas(&base, &composition, &master, &racks, true).unwrap());
+
+        for node in [master_node, lower_node, upper_node] {
+            let tap = displace_tap_for(&compiled, node).expect("the canvas donor is admitted");
+            assert_eq!(tap.resolved, PlannedImageSource::GestureCanvas);
+        }
+        assert!(!compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::GestureCanvasUnavailable { .. }
+        )));
+
+        // A producer with no scope claims no dependency at either timing, so it
+        // takes part in no ordering and cannot close a cycle.
+        assert_eq!(compiled.graph().current_taps, 0);
+        assert_eq!(compiled.graph().previous_taps, 0);
+        assert_eq!(
+            compiled.graph().current_topological_order,
+            bare.graph().current_topological_order
+        );
+
+        // The canvas surface is charged once, by `GestureCanvasPlan`. Routing
+        // to it must not also claim a retained tap surface in the composition
+        // ledger, which `validate_actual_surface_ledger` reconciles exactly.
+        assert_eq!(
+            compiled.resources().rgba16_surface_layers,
+            bare.resources().rgba16_surface_layers,
+            "a canvas route must not add a retained tap surface"
+        );
+        assert_eq!(
+            compiled.resources().creative_bytes,
+            bare.resources().creative_bytes
+        );
+    }
+
+    #[test]
+    fn an_unadmitted_gesture_canvas_route_is_transparent_and_named_rather_than_rebound() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        let node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+
+        let compiled = advanced(
+            plan_with_gesture_canvas(&base, &composition, &master, &racks, false).unwrap(),
+        );
+        let tap = displace_tap_for(&compiled, node)
+            .expect("an unavailable canvas still reports a diagnostic tap");
+        assert_eq!(
+            tap.resolved,
+            PlannedImageSource::Transparent,
+            "an unadmitted canvas resolves transparent, exactly as a missing donor does"
+        );
+        assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::GestureCanvasUnavailable { consumer }
+                if matches!(consumer, ImageTapConsumer::RackNode { node_id, .. } if *node_id == node)
+        )));
+        // It is never quietly repointed at the layer below, a group, or the
+        // program: that is the whole reason the diagnostic exists.
+        assert_eq!(compiled.graph().current_taps, 0);
+        assert_eq!(compiled.graph().previous_taps, 0);
+
+        // Admission is the only difference. The identical rack, planned with a
+        // canvas, resolves to the field.
+        let admitted =
+            advanced(plan_with_gesture_canvas(&base, &composition, &master, &racks, true).unwrap());
+        assert_eq!(
+            displace_tap_for(&admitted, node).unwrap().resolved,
+            PlannedImageSource::GestureCanvas
+        );
+    }
+
     #[test]
     fn displace_removal_leaves_a_tombstone_that_never_rebinds_after_replacement() {
         let frame = base(&[1, 2], &[]);
@@ -5561,6 +5948,433 @@ mod tests {
         rack.move_node(node, 0, LegacyRackScope::Layer).unwrap();
         assert_eq!(rack.iter().next().unwrap().stable_id, node);
         assert_eq!(rack.get(node).unwrap().kind, before);
+    }
+
+    #[test]
+    fn residual_collects_both_slots_only_while_enabled_wet_and_live() {
+        let base = base(&[1, 2, 3], &[]);
+        let composition = legacy_composition(&[1, 2, 3]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let structure = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let detail = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(2),
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let authored = |mix| {
+            residual_params(
+                (structure, EdgeTiming::CurrentFrame),
+                (detail, EdgeTiming::CurrentFrame),
+                mix,
+            )
+        };
+
+        // Exact-default Residual: zero mix collects neither slot and charges
+        // no reduced surface.
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        let node = push_residual(&mut racks[2].1, authored(0.0));
+        let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        assert!(residual_tap_for(&compiled, node, RESIDUAL_STRUCTURE_SLOT).is_none());
+        assert!(residual_tap_for(&compiled, node, RESIDUAL_DETAIL_SLOT).is_none());
+        assert_eq!(
+            compiled.residual_resources(),
+            ResidualResourcePlan::default()
+        );
+
+        // A live mix wakes both slots at once, each onto its own donor.
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        let node = push_residual(&mut racks[2].1, authored(0.4));
+        let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        assert_eq!(
+            residual_tap_for(&compiled, node, RESIDUAL_STRUCTURE_SLOT)
+                .unwrap()
+                .resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(1),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            residual_tap_for(&compiled, node, RESIDUAL_DETAIL_SLOT)
+                .unwrap()
+                .resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(2),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            compiled
+                .image_taps()
+                .iter()
+                .filter(|tap| matches!(
+                    tap.consumer,
+                    ImageTapConsumer::RackNode { node_id, .. } if node_id == node
+                ))
+                .count(),
+            2,
+            "two authored slots are two consumer identities, never one aliased tap"
+        );
+        assert_eq!(compiled.residual_resources().active_nodes, 1);
+        assert_eq!(compiled.residual_resources().mean_surfaces, 2);
+        assert_eq!(compiled.residual_resources().total_bytes, 8 * 8 * 2 * 8);
+
+        // Disabled and zero-wet nodes stay dormant on both slots.
+        let mutations: [fn(&mut RuntimeVisualNode); 2] =
+            [|node| node.enabled = false, |node| node.wet = 0.0];
+        for mutate in mutations {
+            let mut racks = legacy_racks(&[1, 2, 3]);
+            let node = push_residual(&mut racks[2].1, authored(0.4));
+            mutate(racks[2].1.get_mut(node).unwrap());
+            let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+            assert!(residual_tap_for(&compiled, node, RESIDUAL_STRUCTURE_SLOT).is_none());
+            assert!(residual_tap_for(&compiled, node, RESIDUAL_DETAIL_SLOT).is_none());
+            assert_eq!(compiled.residual_resources().active_nodes, 0);
+        }
+
+        // Hostile non-finite mix collapses to bypass, never to full mix.
+        for hostile in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut racks = legacy_racks(&[1, 2, 3]);
+            let node = push_residual(&mut racks[2].1, authored(hostile));
+            let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+            assert!(residual_tap_for(&compiled, node, RESIDUAL_STRUCTURE_SLOT).is_none());
+            assert!(residual_tap_for(&compiled, node, RESIDUAL_DETAIL_SLOT).is_none());
+        }
+    }
+
+    #[test]
+    fn residual_self_route_cycles_per_slot_on_the_current_frame_but_n_minus_one_is_admitted() {
+        let base = base(&[1, 2, 3], &[]);
+        let composition = legacy_composition(&[1, 2, 3]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let neighbour = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let own_output = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(3),
+            saved_position: SavedLayerPosition::new(2).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+
+        for slot in [RESIDUAL_STRUCTURE_SLOT, RESIDUAL_DETAIL_SLOT] {
+            let route_for = |timing, mix| {
+                let mut params = residual_params(
+                    (neighbour, EdgeTiming::CurrentFrame),
+                    (neighbour, EdgeTiming::CurrentFrame),
+                    mix,
+                );
+                *params.route_mut(slot).expect("both slots name a route") = ResolvedImageTap {
+                    source: own_output,
+                    timing,
+                };
+                params
+            };
+
+            let mut racks = legacy_racks(&[1, 2, 3]);
+            push_residual(&mut racks[2].1, route_for(EdgeTiming::CurrentFrame, 0.6));
+            let Err(error) = plan(&base, &composition, &master, &racks) else {
+                panic!("a current-frame self route on slot {slot} must be rejected");
+            };
+            // The graph rejects it before scope ordering runs and names the
+            // offending scope rather than failing anonymously.
+            assert!(
+                matches!(
+                    error,
+                    CompositionPlanError::ImageGraph(ImageGraphError::CurrentCycle { ref scopes })
+                        if scopes.as_slice() == [VisualScopeId::Layer(layer_id(3))]
+                ),
+                "unexpected rejection for a Residual self route on slot {slot}: {error:?}"
+            );
+
+            // The identical route at N-1 is a legitimate feedback edge, and
+            // the other slot keeps its ordinary current-frame donor.
+            let mut racks = legacy_racks(&[1, 2, 3]);
+            let node = push_residual(&mut racks[2].1, route_for(EdgeTiming::PreviousFrame, 0.6));
+            let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+            assert_eq!(compiled.graph().previous_taps, 1);
+            assert_eq!(
+                residual_tap_for(&compiled, node, slot).unwrap().resolved,
+                PlannedImageSource::SelectedLayer {
+                    layer_id: layer_id(3),
+                    stage: LayerImageStage::PostLocalEffects,
+                }
+            );
+
+            // A zero-mix self route collects nothing, so it cannot cycle.
+            let mut racks = legacy_racks(&[1, 2, 3]);
+            push_residual(&mut racks[2].1, route_for(EdgeTiming::CurrentFrame, 0.0));
+            assert!(plan(&base, &composition, &master, &racks).is_ok());
+        }
+    }
+
+    #[test]
+    fn residual_slot_routes_never_alias_and_a_slot_one_change_moves_the_topology_signature() {
+        let base = base(&[1, 2, 3], &[]);
+        let composition = legacy_composition(&[1, 2, 3]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let first = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let second = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(2),
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let signature_of = |params: crate::visual_rack::RuntimeResidualParams| {
+            let mut racks = legacy_racks(&[1, 2, 3]);
+            push_residual(&mut racks[2].1, params);
+            advanced(plan(&base, &composition, &master, &racks).unwrap()).topology_signature()
+        };
+        let authored = |detail: ResolvedImageSource, timing| {
+            residual_params((first, EdgeTiming::CurrentFrame), (detail, timing), 0.5)
+        };
+
+        // Identical authored state is an identical signature.
+        assert_eq!(
+            signature_of(authored(first, EdgeTiming::CurrentFrame)),
+            signature_of(authored(first, EdgeTiming::CurrentFrame))
+        );
+
+        // Changing only slot 1's source or timing must move it, or a prepared
+        // executor reuses the previous frame bindings for a rewritten graph.
+        assert_ne!(
+            signature_of(authored(first, EdgeTiming::CurrentFrame)),
+            signature_of(authored(second, EdgeTiming::CurrentFrame))
+        );
+        assert_ne!(
+            signature_of(authored(second, EdgeTiming::CurrentFrame)),
+            signature_of(authored(second, EdgeTiming::PreviousFrame))
+        );
+
+        // The block vocabulary drives the reduced grid dimensions, which the
+        // rack signature deliberately does not carry.
+        let with_block = |block| {
+            let mut params = authored(second, EdgeTiming::CurrentFrame);
+            params.block = block;
+            params
+        };
+        assert_ne!(
+            signature_of(with_block(crate::visual_rack::ResidualBlock::Eight)),
+            signature_of(with_block(crate::visual_rack::ResidualBlock::Sixteen))
+        );
+    }
+
+    #[test]
+    fn residual_removal_leaves_a_per_slot_tombstone_that_never_rebinds_after_replacement() {
+        let frame = base(&[1, 2, 3], &[]);
+        let replaced_frame = base(&[4, 2, 3], &[]);
+        let composition = legacy_composition(&[1, 2, 3]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let saved = SavedLayerPosition::new(0).unwrap();
+        let structure = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: saved,
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let detail = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(2),
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+
+        let mut racks = legacy_racks(&[1, 2, 3]);
+        let node = push_residual(
+            &mut racks[2].1,
+            residual_params(
+                (structure, EdgeTiming::CurrentFrame),
+                (detail, EdgeTiming::CurrentFrame),
+                0.5,
+            ),
+        );
+        let compiled = advanced(plan(&frame, &composition, &master, &racks).unwrap());
+        assert!(matches!(
+            residual_tap_for(&compiled, node, RESIDUAL_STRUCTURE_SLOT)
+                .unwrap()
+                .resolved,
+            PlannedImageSource::SelectedLayer { .. }
+        ));
+
+        // Deleting the structure donor tombstones that slot alone. A different
+        // layer later occupying its saved position must not inherit it.
+        racks[2].1.mark_layer_output_missing(layer_id(1));
+        let replaced_composition = legacy_composition(&[4, 2, 3]);
+        let mut replaced_racks = legacy_racks(&[4, 2, 3]);
+        let owner = replaced_racks
+            .iter_mut()
+            .find(|(id, _)| *id == layer_id(3))
+            .expect("layer 3 survives the replacement");
+        owner.1 = racks[2].1.clone();
+        let compiled = advanced(
+            plan(
+                &replaced_frame,
+                &replaced_composition,
+                &master,
+                &replaced_racks,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            residual_tap_for(&compiled, node, RESIDUAL_STRUCTURE_SLOT)
+                .expect("a missing donor still reports a diagnostic tap")
+                .resolved,
+            PlannedImageSource::Transparent
+        );
+        assert_eq!(
+            residual_tap_for(&compiled, node, RESIDUAL_DETAIL_SLOT)
+                .unwrap()
+                .resolved,
+            PlannedImageSource::SelectedLayer {
+                layer_id: layer_id(2),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            "the surviving slot keeps its own donor"
+        );
+        assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::MissingSelectedLayer {
+                consumer: ImageTapConsumer::RackNode { slot, .. },
+                saved_position,
+            } if *saved_position == saved && *slot == RESIDUAL_STRUCTURE_SLOT
+        )));
+    }
+
+    #[test]
+    fn residual_block_means_join_the_shared_creative_cap_outside_the_full_frame_ledger() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let donor = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let mut racks = legacy_racks(&[1, 2]);
+        push_residual(
+            &mut racks[1].1,
+            residual_params(
+                (donor, EdgeTiming::CurrentFrame),
+                (donor, EdgeTiming::CurrentFrame),
+                0.5,
+            ),
+        );
+        let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+
+        // The full-frame ledger is still exactly its own formula: reduced
+        // block means are never folded into it as whole output layers.
+        let resources = compiled.resources();
+        let pixels = 64_u64 * 64;
+        assert_eq!(
+            resources.creative_bytes,
+            pixels * 8 * u64::from(resources.rgba16_surface_layers)
+                + pixels * 4 * u64::from(resources.compat8_surface_layers)
+        );
+        let residual = compiled.residual_resources();
+        assert_eq!(residual.active_nodes, 1);
+        assert_eq!(residual.max_grid_dimensions, [8, 8]);
+        assert_eq!(residual.total_bytes, 1_024);
+
+        // They meet the creative number only at the shared cap, so a limit
+        // that admits the full-frame ledger alone still rejects the pair.
+        let mut input = CompositionPlanInput::new(&composition, &master, &racks);
+        input.resource_limits.max_creative_bytes = resources.creative_bytes;
+        let rejected = EvaluatedCompositionPlan::evaluate(&base, input);
+        assert!(
+            matches!(
+                rejected,
+                Err(CompositionPlanError::ResidualCombinedMemoryBudget { bytes, limit })
+                    if bytes == resources.creative_bytes + residual.total_bytes
+                        && limit == resources.creative_bytes
+            ),
+            "unexpected combined-cap outcome"
+        );
+    }
+
+    #[test]
+    fn residual_admission_agrees_with_the_saved_predicate_while_segmentation_stays_kind_only() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let donor = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+
+        for enabled in [true, false] {
+            for wet in [1.0_f32, 0.0] {
+                for mix in [0.5_f32, 0.0, f32::NAN] {
+                    let mut racks = legacy_racks(&[1, 2]);
+                    let node = push_residual(
+                        &mut racks[1].1,
+                        residual_params(
+                            (donor, EdgeTiming::CurrentFrame),
+                            (donor, EdgeTiming::CurrentFrame),
+                            mix,
+                        ),
+                    );
+                    {
+                        let authored = racks[1].1.get_mut(node).unwrap();
+                        authored.enabled = enabled;
+                        authored.wet = wet;
+                    }
+                    let RuntimeVisualNodeKind::Residual(live) = racks[1].1.get(node).unwrap().kind
+                    else {
+                        panic!("the pushed node is a Residual");
+                    };
+                    // The saved twin's predicate is the one the saved-patch
+                    // dependency walk consults; it must agree value for value.
+                    let captured = racks[1].1.capture_routes(|_| None).unwrap();
+                    let VisualNodeKind::Residual(saved) = captured.iter().last().unwrap().kind
+                    else {
+                        panic!("the captured node is a Residual");
+                    };
+                    assert_eq!(saved.is_exact_bypass(), live.is_exact_bypass());
+                    let admitted = enabled && wet > 0.0 && !live.is_exact_bypass();
+
+                    let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+                    for slot in [RESIDUAL_STRUCTURE_SLOT, RESIDUAL_DETAIL_SLOT] {
+                        assert_eq!(
+                            residual_tap_for(&compiled, node, slot).is_some(),
+                            admitted,
+                            "slot {slot} disagreed for enabled={enabled} wet={wet} mix={mix}"
+                        );
+                    }
+                    assert_eq!(
+                        compiled.residual_resources().active_nodes,
+                        u32::from(admitted)
+                    );
+
+                    // Segmentation is deliberately kind-only: the node is
+                    // always alone in its own rack segment, so segment indices
+                    // never renumber when a frame-local value crosses zero.
+                    let owner = compiled
+                        .layers()
+                        .iter()
+                        .find(|layer| layer.stable_id == racks[1].0)
+                        .expect("the consumer layer keeps a scope plan");
+                    let segments: Vec<_> = owner
+                        .execution
+                        .steps()
+                        .iter()
+                        .filter_map(|step| match step {
+                            EvaluatedScopeStep::CollisionRack { plan, .. } => Some(plan),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(segments.len(), 1);
+                    assert_eq!(segments[0].passes().len(), 1);
+                    assert_eq!(segments[0].passes()[0].node_id, node);
+                }
+            }
+        }
     }
 
     #[test]

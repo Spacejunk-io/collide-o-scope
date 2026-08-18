@@ -31,7 +31,8 @@ use crate::renderer::motion::{
     MotionRuntimeMetrics,
 };
 use crate::renderer::rack::{
-    CollisionRackExecutor, RackGpuError, RackImageBindings, RackImageInput, RackSourceBinding,
+    CollisionRackExecutor, RackGpuError, RackImageBindings, RackImageInput, RackResidualMeans,
+    RackSourceBinding,
 };
 use crate::renderer::readback::{
     PreparedRgbaReadback, RecorderReadbackAdmission, RecorderReadbackAllocationSnapshot,
@@ -50,7 +51,9 @@ use crate::renderer::symmetry_field::{
 };
 use crate::symmetry::{SYMMETRY_IMAGE_SLOTS, SYMMETRY_MOTION_SLOTS};
 use crate::temporal::{TemporalFrameInput, TemporalResetCause, TemporalStateMetrics};
-use crate::visual_rack::{EdgeTiming, GroupId, MatteChannel, NodeId, VisualScopeId};
+use crate::visual_rack::{
+    EdgeTiming, GroupId, MatteChannel, NodeId, VisualScopeId, RACK_PRIMARY_ROUTE_SLOT,
+};
 
 pub(crate) const COMPOSITION_WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub(crate) const COMPOSITION_PRESENT_FORMAT: wgpu::TextureFormat =
@@ -345,6 +348,11 @@ struct RetainedSurface {
 enum TapBacking {
     Transparent,
     ProgramHistory,
+    /// The etched gesture field. It owns **no** tap surface: the canvas
+    /// textures are charged once by `GestureCanvasPlan`, and allocating a
+    /// retained parity here as well would double-charge the same image against
+    /// two independent ledgers.
+    GestureCanvas,
     CurrentPreLocal {
         layer_id: StableLayerId,
     },
@@ -405,7 +413,10 @@ struct PreparedRackSegment {
     /// Bind groups retain their texture views, so both committed N-1 read
     /// parities are prepared once and selected without allocating in encode.
     bindings: [RackImageBindings; 2],
-    tap_indices: Box<[(NodeId, crate::visual_rack::ResolvedImageTap, usize)]>,
+    /// Reduced block-mean surfaces for every active Residual node in this
+    /// segment, allocated once from the admitted plan and never in encode.
+    residual_means: RackResidualMeans,
+    tap_indices: Box<[(NodeId, u8, crate::visual_rack::ResolvedImageTap, usize)]>,
 }
 
 /// One prepared dedicated Symmetry Field step.
@@ -437,6 +448,13 @@ struct PreparedSymmetryField {
 struct PreparedAdvanced {
     topology_signature: u64,
     source_keys: Box<[(StableLayerId, [u32; 2], u64)]>,
+    /// The gesture-canvas identity these bind groups were built against. A
+    /// changed identity is a rebuild, not a repair: nothing here rebinds.
+    gesture_canvas_identity: (bool, u64),
+    /// Whether a routed canvas tap actually reads a presented field. This is
+    /// what `tap_ready` answers with, so an unbound canvas gives its consumer
+    /// `donor_valid = false` instead of a confident empty field.
+    gesture_canvas_bound: bool,
     host: CompositionHost,
     rack: CollisionRackExecutor,
     /// Present only when the plan emits at least one dedicated step. It owns no
@@ -640,11 +658,50 @@ const fn capture_target_scope(target: CaptureTarget) -> Option<VisualScopeId> {
 
 /// Executor-owned preparation. The public boundary intentionally returns only
 /// a value report; callers never own a half-built advanced resource graph.
+/// The etched gesture field this executor binds for canvas image routes.
+///
+/// `None` is the exact pre-gesture path: a canvas route reads the rack-owned
+/// zero texture and its consumer sees `donor_valid = false`. The `epoch` is a
+/// caller-owned monotonic identity for the *resources*, not for their contents:
+/// a canvas rebuild (resize, admission change, host restart) advances it, which
+/// is what forces the executor to re-prepare bind groups that would otherwise
+/// be reused across a topology that did not itself change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GestureCanvasBinding {
+    view: Option<wgpu::TextureView>,
+    epoch: u64,
+}
+
+impl GestureCanvasBinding {
+    pub(crate) fn bound(view: wgpu::TextureView, epoch: u64) -> Self {
+        Self {
+            view: Some(view),
+            epoch,
+        }
+    }
+
+    pub(crate) fn is_bound(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// The identity two bindings are compared by. An unbound binding is always
+    /// epoch zero so it cannot be confused with a bound one that happens to
+    /// share a caller's counter.
+    fn identity(&self) -> (bool, u64) {
+        (self.view.is_some(), self.epoch)
+    }
+}
+
 pub(crate) struct CompositionGpuExecutor {
     dimensions: [u32; 2],
     topology_signature: Option<u64>,
     prepared: Option<PreparedAdvanced>,
     scope_recorder_readback: Option<PreparedScopeRecorderReadback>,
+    /// The gesture canvas binding future prepares will use, plus the identity
+    /// the last prepare actually used. They are separate facts: setting a
+    /// binding never rebuilds anything on its own, and a stale prepared
+    /// identity is what makes the next prepare rebuild rather than reuse.
+    gesture_canvas: GestureCanvasBinding,
 }
 
 impl CompositionGpuExecutor {
@@ -668,11 +725,34 @@ impl CompositionGpuExecutor {
             topology_signature: None,
             prepared: None,
             scope_recorder_readback: None,
+            gesture_canvas: GestureCanvasBinding::default(),
         })
     }
 
     pub const fn dimensions(&self) -> [u32; 2] {
         self.dimensions
+    }
+
+    /// Publish the etched gesture field a canvas image route will bind.
+    ///
+    /// This is deliberately separate from `prepare`: every other executor input
+    /// is per-topology, while the canvas is a long-lived singleton the host
+    /// owns. Calling this never allocates and never rebuilds — the next
+    /// `prepare` observes the changed identity and rebuilds then, in the one
+    /// place that already owns bind-group construction.
+    pub(crate) fn bind_gesture_canvas(&mut self, binding: GestureCanvasBinding) {
+        self.gesture_canvas = binding;
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the physical-GPU payoff fixture asserts the binding it prepared against"
+        )
+    )]
+    pub(crate) fn gesture_canvas_bound(&self) -> bool {
+        self.gesture_canvas.is_bound()
     }
 
     pub fn program_history_initialized(&self) -> bool {
@@ -973,9 +1053,11 @@ impl CompositionGpuExecutor {
         let EvaluatedCompositionPlan::Advanced(plan) = plan else {
             return false;
         };
+        let gesture_identity = self.gesture_canvas.identity();
         self.prepared.as_ref().is_some_and(|prepared| {
             prepared.topology_signature == plan.topology_signature()
                 && prepared.source_keys.as_ref() == source_keys
+                && prepared.gesture_canvas_identity == gesture_identity
         })
     }
 
@@ -1046,8 +1128,15 @@ impl CompositionGpuExecutor {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let signature = plan.topology_signature();
+        let gesture_identity = self.gesture_canvas.identity();
         if self.prepared.as_ref().is_some_and(|prepared| {
-            prepared.topology_signature == signature && prepared.source_keys == source_keys
+            prepared.topology_signature == signature
+                && prepared.source_keys == source_keys
+                // A rebuilt gesture canvas produces a new presented view while
+                // the topology and every source key stay identical, so the
+                // canvas identity has to be part of the reuse test or the tap
+                // bind groups would keep a destroyed surface's view.
+                && prepared.gesture_canvas_identity == gesture_identity
         }) {
             self.topology_signature = Some(signature);
             return Ok(CompositionPreparedKind::Advanced {
@@ -1055,8 +1144,15 @@ impl CompositionGpuExecutor {
             });
         }
 
-        let prepared =
-            PreparedAdvanced::new(device, queue, self.dimensions, plan, sources, source_keys)?;
+        let prepared = PreparedAdvanced::new(
+            device,
+            queue,
+            self.dimensions,
+            plan,
+            sources,
+            source_keys,
+            &self.gesture_canvas,
+        )?;
         self.prepared = Some(prepared);
         self.topology_signature = Some(signature);
         Ok(CompositionPreparedKind::Advanced {
@@ -1229,6 +1325,7 @@ impl PreparedAdvanced {
         plan: &AdvancedCompositionPlan,
         sources: &[CompositionSourceDescriptor<'_>],
         source_keys: Box<[(StableLayerId, [u32; 2], u64)]>,
+        gesture_canvas: &GestureCanvasBinding,
     ) -> Result<Self, CompositionGpuError> {
         let (
             effect_slot_count,
@@ -1435,6 +1532,7 @@ impl PreparedAdvanced {
                             &host,
                             &prelocal_surfaces,
                             rack_zero.view,
+                            gesture_canvas.view.as_ref(),
                             &taps[tap_index],
                             read_index,
                         );
@@ -1460,8 +1558,15 @@ impl PreparedAdvanced {
                 }
             }
 
-            let rack_segments =
-                prepare_rack_segments(device, plan, &host, &rack, &taps, &prelocal_surfaces)?;
+            let rack_segments = prepare_rack_segments(
+                device,
+                plan,
+                &host,
+                &rack,
+                &taps,
+                &prelocal_surfaces,
+                gesture_canvas.view.as_ref(),
+            )?;
             let symmetry_slot_count = symmetry_field_step_count(plan);
             let symmetry = if symmetry_slot_count == 0 {
                 None
@@ -1483,6 +1588,7 @@ impl PreparedAdvanced {
                     &taps,
                     &prelocal_surfaces,
                     rack_zero.view,
+                    gesture_canvas.view.as_ref(),
                     [ping.view, pong.view],
                 )?,
                 None => Vec::new(),
@@ -1512,6 +1618,7 @@ impl PreparedAdvanced {
                                         &host,
                                         &prelocal_surfaces,
                                         rack_zero.view,
+                                        gesture_canvas.view.as_ref(),
                                         &taps[tap_index],
                                         0,
                                     )
@@ -1564,6 +1671,7 @@ impl PreparedAdvanced {
                     }
                     TapBacking::Transparent
                     | TapBacking::ProgramHistory
+                    | TapBacking::GestureCanvas
                     | TapBacking::CurrentPreLocal { .. } => {}
                 }
             }
@@ -1584,6 +1692,8 @@ impl PreparedAdvanced {
             Ok(Self {
                 topology_signature: plan.topology_signature(),
                 source_keys,
+                gesture_canvas_identity: gesture_canvas.identity(),
+                gesture_canvas_bound: gesture_canvas.is_bound(),
                 host,
                 rack,
                 symmetry,
@@ -1984,6 +2094,10 @@ impl PreparedAdvanced {
         match self.taps[index].backing {
             TapBacking::Transparent => false,
             TapBacking::ProgramHistory => self.host.program_history_initialized(),
+            // Ready exactly when the host published a presented field. This is
+            // the same binding `prepared_tap_view` reads, recorded at prepare
+            // time, so readiness and the bound view cannot disagree.
+            TapBacking::GestureCanvas => self.gesture_canvas_bound,
             TapBacking::CurrentPreLocal { .. } | TapBacking::Current(_) => true,
             TapBacking::Previous { initialized, .. } => initialized,
         }
@@ -2399,7 +2513,7 @@ impl PreparedAdvanced {
         let prelocal = self.rack_segments[prepared_index]
             .tap_indices
             .iter()
-            .find_map(|(_, _, tap_index)| {
+            .find_map(|(_, _, _, tap_index)| {
                 matches!(
                     self.taps[*tap_index].backing,
                     TapBacking::CurrentPreLocal { .. }
@@ -2410,11 +2524,11 @@ impl PreparedAdvanced {
             self.ensure_current_prelocal(encoder, tap_index)?;
         }
         for binding_index in 0..self.rack_segments[prepared_index].tap_indices.len() {
-            let (node_id, tap, tap_index) =
+            let (node_id, slot, tap, tap_index) =
                 self.rack_segments[prepared_index].tap_indices[binding_index];
             let valid = self.tap_ready(tap_index);
             let updated = self.rack_segments[prepared_index].bindings[self.tap_history_read_index]
-                .set_valid(node_id, tap, valid);
+                .set_valid(node_id, slot, tap, valid);
             debug_assert!(updated);
         }
         let report = self.rack.encode_at(
@@ -2423,6 +2537,7 @@ impl PreparedAdvanced {
             rack_plan,
             &self.ping_rack_source,
             &self.rack_segments[prepared_index].bindings[self.tap_history_read_index],
+            &self.rack_segments[prepared_index].residual_means,
             self.rack_segments[prepared_index].uniform_base_slot,
             plan.base().context().time_seconds,
         )?;
@@ -2894,6 +3009,13 @@ fn prepare_tap_surfaces(
                 TapBacking::Transparent
             } else if matches!(planned.resolved, PlannedImageSource::ProgramHistory) {
                 TapBacking::ProgramHistory
+            } else if matches!(planned.resolved, PlannedImageSource::GestureCanvas) {
+                // Deliberately ahead of the previous-frame branch. A canvas
+                // route at N-1 timing must not allocate a parity pair: the
+                // canvas is a frame-committed singleton with one image, and the
+                // planner records no previous-frame dependency for it either,
+                // so the declared and actual ledgers agree at zero.
+                TapBacking::GestureCanvas
             } else if planned.origin.timing() == EdgeTiming::PreviousFrame {
                 TapBacking::Previous {
                     surfaces: std::array::from_fn(|_| {
@@ -2956,12 +3078,18 @@ fn validate_actual_surface_ledger(
     taps: &[PreparedTap],
     current_prelocal_surfaces: usize,
 ) -> Result<(), CompositionGpuError> {
+    // Spelled exhaustively rather than with a wildcard: this is the fail-closed
+    // reconcile seam, so a new backing must be charged deliberately instead of
+    // inheriting zero by accident.
     let tap_surfaces: u32 = taps
         .iter()
         .map(|tap| match tap.backing {
             TapBacking::Current(_) => 1,
             TapBacking::Previous { .. } => 2,
-            _ => 0,
+            TapBacking::Transparent
+            | TapBacking::ProgramHistory
+            | TapBacking::GestureCanvas
+            | TapBacking::CurrentPreLocal { .. } => 0,
         })
         .sum();
     let actual = 6_u32
@@ -2983,6 +3111,7 @@ fn prepared_tap_view<'a>(
     host: &'a CompositionHost,
     prelocal_surfaces: &'a BTreeMap<StableLayerId, RetainedSurface>,
     zero: &'a wgpu::TextureView,
+    gesture_canvas: Option<&'a wgpu::TextureView>,
     tap: &'a PreparedTap,
     read_index: usize,
 ) -> &'a wgpu::TextureView {
@@ -2991,6 +3120,14 @@ fn prepared_tap_view<'a>(
         TapBacking::ProgramHistory => host
             .program_history_views()
             .map_or(zero, |views| views[read_index]),
+        // The presented gesture field when the host published one, and the
+        // rack-owned zero texture when it did not. An unbound canvas is inert
+        // rather than wrong: under the frozen donor decode a fully transparent
+        // donor yields exactly zero displacement, which is the same answer an
+        // un-etched canvas gives. `tap_ready` reports the same fact, so the
+        // node also sees `donor_valid = false` instead of a confident empty
+        // field. Both sites read the one binding, so they cannot disagree.
+        TapBacking::GestureCanvas => gesture_canvas.unwrap_or(zero),
         TapBacking::CurrentPreLocal { layer_id } => prelocal_surfaces
             .get(layer_id)
             .map_or(zero, |surface| &surface.view),
@@ -3012,6 +3149,9 @@ fn tap_boundary_scope(tap: &PlannedImageTap) -> Option<VisualScopeId> {
         }
         | PlannedImageSource::AllBelow(_)
         | PlannedImageSource::ProgramHistory
+        // The gesture canvas is etched outside the composition graph, so it
+        // names no producing scope and takes part in no scope ordering.
+        | PlannedImageSource::GestureCanvas
         | PlannedImageSource::Transparent => None,
     }
 }
@@ -3035,6 +3175,7 @@ fn stage_tap_from_texture(
         }
         TapBacking::Transparent
         | TapBacking::ProgramHistory
+        | TapBacking::GestureCanvas
         | TapBacking::CurrentPreLocal { .. } => {}
     }
 }
@@ -3282,6 +3423,7 @@ fn prepare_symmetry_fields(
     taps: &[PreparedTap],
     prelocal_surfaces: &BTreeMap<StableLayerId, RetainedSurface>,
     zero: &wgpu::TextureView,
+    gesture_canvas: Option<&wgpu::TextureView>,
     carriers: [&wgpu::TextureView; 2],
 ) -> Result<Vec<PreparedSymmetryField>, CompositionGpuError> {
     let mut prepared = Vec::new();
@@ -3329,6 +3471,7 @@ fn prepare_symmetry_fields(
                             host,
                             prelocal_surfaces,
                             zero,
+                            gesture_canvas,
                             &taps[*tap_index],
                             read_index,
                         )),
@@ -3418,6 +3561,10 @@ fn prepare_symmetry_fields(
     Ok(prepared)
 }
 
+/// Resolve one planned tap by its complete consumer identity. `RackNode`
+/// carries its route slot, so the first positional match is the exact route
+/// rather than whichever slot of a multi-route node happened to be collected
+/// first.
 fn tap_index_for_consumer(
     plan: &AdvancedCompositionPlan,
     consumer: ImageTapConsumer,
@@ -3434,6 +3581,7 @@ fn prepare_rack_segments(
     rack: &CollisionRackExecutor,
     taps: &[PreparedTap],
     prelocal_surfaces: &BTreeMap<StableLayerId, RetainedSurface>,
+    gesture_canvas: Option<&wgpu::TextureView>,
 ) -> Result<Vec<PreparedRackSegment>, CompositionGpuError> {
     let zero = rack
         .surface(1)
@@ -3453,25 +3601,31 @@ fn prepare_rack_segments(
             };
             let mut indices = Vec::new();
             for pass in rack_plan.passes() {
-                let Some(tap) = pass.kind.image_tap() else {
-                    continue;
-                };
-                // An ordinary rack pass carries exactly one route, so it is
-                // always slot 0. Multi-route nodes are lifted into their own
-                // dedicated step and never reach this segment builder.
-                let consumer = ImageTapConsumer::RackNode {
-                    scope,
-                    node_id: pass.node_id,
-                    slot: 0,
-                };
-                let Some(tap_index) = tap_index_for_consumer(plan, consumer) else {
-                    continue;
-                };
-                indices.push((pass.node_id, tap, tap_index));
+                // Every authored slot of an ordinary rack pass is bound
+                // independently. A single-route kind fills only the primary
+                // slot; a two-route kind reaches this loop twice and its
+                // donors can never alias. The Symmetry Field is lifted into
+                // its own dedicated step and never reaches this segment
+                // builder at all.
+                for (index, tap) in pass.kind.image_taps().into_iter().enumerate() {
+                    let Some(tap) = tap else {
+                        continue;
+                    };
+                    let slot = u8::try_from(index).unwrap_or(RACK_PRIMARY_ROUTE_SLOT);
+                    let consumer = ImageTapConsumer::RackNode {
+                        scope,
+                        node_id: pass.node_id,
+                        slot,
+                    };
+                    let Some(tap_index) = tap_index_for_consumer(plan, consumer) else {
+                        continue;
+                    };
+                    indices.push((pass.node_id, slot, tap, tap_index));
+                }
             }
             let prelocal_donors = indices
                 .iter()
-                .filter_map(|(_, _, tap_index)| match taps[*tap_index].backing {
+                .filter_map(|(_, _, _, tap_index)| match taps[*tap_index].backing {
                     TapBacking::CurrentPreLocal { layer_id } => Some(layer_id),
                     _ => None,
                 })
@@ -3484,19 +3638,21 @@ fn prepare_rack_segments(
             let bindings = std::array::from_fn(|read_index| {
                 let inputs = indices
                     .iter()
-                    .map(|(node_id, tap, tap_index)| {
+                    .map(|(node_id, slot, tap, tap_index)| {
                         let view = match taps[*tap_index].backing {
                             TapBacking::Transparent => None,
                             _ => Some(prepared_tap_view(
                                 host,
                                 prelocal_surfaces,
                                 zero.view,
+                                gesture_canvas,
                                 &taps[*tap_index],
                                 read_index,
                             )),
                         };
                         RackImageInput {
                             node_id: *node_id,
+                            slot: *slot,
                             tap: *tap,
                             view,
                         }
@@ -3505,9 +3661,10 @@ fn prepare_rack_segments(
                 rack.prepare_image_bindings(device, &inputs)
             });
             let [first, second] = bindings;
+            let residual_means = rack.prepare_residual_means(device, rack_plan)?;
             let uniform_base_slot = next_uniform_slot;
             next_uniform_slot = next_uniform_slot
-                .checked_add(rack_plan.passes().len().saturating_add(1))
+                .checked_add(rack_plan.uniform_slots())
                 .ok_or_else(|| {
                     CompositionGpuError::InvalidSchedule(
                         "rack uniform slot count overflowed during preparation".into(),
@@ -3518,6 +3675,7 @@ fn prepare_rack_segments(
                 segment_index: *segment_index,
                 uniform_base_slot,
                 bindings: [first?, second?],
+                residual_means,
                 tap_indices: indices.into_boxed_slice(),
             });
         }
@@ -3550,7 +3708,7 @@ fn rack_uniform_slot_count(plan: &AdvancedCompositionPlan) -> Result<usize, Comp
                 continue;
             };
             count = count
-                .checked_add(rack_plan.passes().len().saturating_add(1))
+                .checked_add(rack_plan.uniform_slots())
                 .ok_or_else(|| {
                     CompositionGpuError::InvalidSchedule(
                         "rack uniform slot count overflowed during planning".into(),
@@ -3577,6 +3735,9 @@ fn tap_scope_producer(tap: &PreparedTap) -> Option<VisualScopeId> {
         }
         | PlannedImageSource::AllBelow(_)
         | PlannedImageSource::ProgramHistory
+        // The gesture canvas is etched outside the composition graph, so it
+        // names no producing scope and takes part in no scope ordering.
+        | PlannedImageSource::GestureCanvas
         | PlannedImageSource::Transparent => None,
     }
 }
@@ -3933,6 +4094,63 @@ mod tests {
             source
         }
 
+        /// A deliberately non-uniform carrier. A displacement that moves a
+        /// sample by a fraction of the frame is invisible against a flat
+        /// colour, so the payoff fixture needs a source whose pixels actually
+        /// differ from their neighbours.
+        fn patterned_source(&self, dimensions: [u32; 2], label: &'static str) -> TestSource {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut bytes = Vec::with_capacity(dimensions[0] as usize * dimensions[1] as usize * 4);
+            for y in 0..dimensions[1] {
+                for x in 0..dimensions[0] {
+                    let checker = u8::from((x / 3 + y / 3) % 2 == 0) * 200;
+                    bytes.extend_from_slice(&[
+                        checker.saturating_add((x * 5) as u8),
+                        (y * 7) as u8,
+                        255 - checker,
+                        255,
+                    ]);
+                }
+            }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dimensions[0] * 4),
+                    rows_per_image: Some(dimensions[1]),
+                },
+                wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+            TestSource {
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                texture,
+                dimensions,
+            }
+        }
+
         fn write_source(&self, source: &TestSource, rgba: [u8; 4]) {
             let bytes = rgba
                 .into_iter()
@@ -4217,6 +4435,406 @@ mod tests {
         .unwrap();
         assert!(matches!(plan, EvaluatedCompositionPlan::Advanced(_)));
         (plan, composition)
+    }
+
+    /// A canvas route is charged exactly once — by `GestureCanvasPlan` — and
+    /// must never also claim a retained tap surface here. The declared and
+    /// actual ledgers are reconciled by `validate_actual_surface_ledger`, which
+    /// fails closed on any disagreement, so this is the fixture that proves the
+    /// two sides agree at zero rather than merely asserting it in prose.
+    #[test]
+    fn a_gesture_canvas_tap_charges_no_retained_surface_on_either_side_of_the_ledger() {
+        let base = evaluated_base(&[2, 1], [64, 48]);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let canvas_displace = |timing| {
+            RuntimeVisualNodeKind::Displace(crate::visual_rack::RuntimeDisplaceParams {
+                tap: ResolvedImageTap {
+                    source: crate::visual_rack::ResolvedImageSource::GestureCanvas,
+                    timing,
+                },
+                amount_x: 0.5,
+                amount_y: -0.25,
+                boundary: crate::visual_rack::DisplaceBoundary::Wrap,
+            })
+        };
+        let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        master
+            .push(canvas_displace(EdgeTiming::CurrentFrame))
+            .unwrap();
+        let mut layer_rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        // Both timings, because an N-1 route is where a parity pair would
+        // otherwise be allocated behind the ledger's back.
+        layer_rack
+            .push(canvas_displace(EdgeTiming::PreviousFrame))
+            .unwrap();
+        let racks = vec![
+            (stable_layer(2), layer_rack),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let plan = EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_gesture_canvas(true),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            panic!("a canvas-routed Displace is an advanced composition");
+        };
+        assert_eq!(plan.image_taps().len(), 2);
+        assert!(plan.image_taps().iter().all(|tap| tap.resolved
+            == crate::evaluated_frame::evaluated_composition::PlannedImageSource::GestureCanvas));
+
+        // The backings the executor would build for these taps, by the same law
+        // `prepare_tap_surfaces` applies — and none of them owns a surface.
+        let taps: Vec<_> = plan
+            .image_taps()
+            .iter()
+            .cloned()
+            .map(|planned| PreparedTap {
+                planned,
+                backing: TapBacking::GestureCanvas,
+            })
+            .collect();
+        validate_actual_surface_ledger(&plan, false, &taps, 0)
+            .expect("a canvas route charges zero retained surfaces on both sides");
+
+        // The validator really is live: one extra actual surface fails closed.
+        assert!(validate_actual_surface_ledger(&plan, false, &taps, 1).is_err());
+        assert!(validate_actual_surface_ledger(&plan, true, &taps, 0).is_err());
+    }
+
+    /// One layer carrying one Displace node whose donor is the etched gesture
+    /// canvas. This is the shape the payoff fixture renders three ways.
+    fn gesture_donor_plan(dimensions: [u32; 2], amount: f32) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        layer_rack
+            .push(RuntimeVisualNodeKind::Displace(
+                crate::visual_rack::RuntimeDisplaceParams {
+                    tap: ResolvedImageTap {
+                        source: crate::visual_rack::ResolvedImageSource::GestureCanvas,
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    amount_x: amount,
+                    amount_y: amount,
+                    boundary: crate::visual_rack::DisplaceBoundary::Hold,
+                },
+            ))
+            .unwrap();
+        let racks = vec![(stable_layer(1), layer_rack)];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_gesture_canvas(true),
+        )
+        .unwrap()
+    }
+
+    /// THE PAYOFF. A recorded stroke is etched into a real GPU canvas, that
+    /// canvas is routed as the donor of a real Displace node over a real
+    /// carrier, and the result is read back off the device.
+    ///
+    /// Three claims, and each of them is the whole point of wiring the canvas:
+    ///
+    /// (a) the live 30 Hz derivation and the offline one produce *byte
+    ///     identical* presented donor images — the same recorded performance
+    ///     lands on the same addresses in both sessions;
+    /// (b) the rendered pixels differ from the same plan rendered without a
+    ///     canvas — the recording actually reaches the image, rather than
+    ///     merely existing beside it;
+    /// (c) an admitted but never-etched canvas renders byte-identically to no
+    ///     canvas at all — an unrecorded field is inert, which is the honesty
+    ///     law spelled in pixels.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_a_recorded_gesture_reaches_the_image_through_a_routed_displace_donor() {
+        use crate::gesture::{GestureEvent, GestureEventRecorder, GestureMode, GesturePhase};
+        use crate::gesture_canvas::{
+            GestureCanvasFrameInput, GestureCanvasGrid, GestureCanvasLimits, GestureCanvasParams,
+            GestureCanvasRequest, GestureCanvasState, GESTURE_CANVAS_MAX_EDGE,
+        };
+        use crate::render_export::export_temporal_reference_tick;
+        use crate::renderer::gesture_canvas::{
+            GestureCanvasResources, GESTURE_CANVAS_PRESENTED_TEXEL_BYTES,
+        };
+
+        let gpu = GpuHarness::new();
+        let dimensions = [48_u32, 32];
+        let canvas_grid = GestureCanvasGrid::new(24, 16).unwrap();
+        let canvas_limits = GestureCanvasLimits::device(GESTURE_CANVAS_MAX_EDGE, 256);
+        let params = GestureCanvasParams {
+            radius: 0.6,
+            strength: 1.0,
+            retention: 1.0,
+        };
+        let fps = 30_u32;
+        let frames = 8_u64;
+
+        // A short deterministic stroke straight down the middle. Recorded
+        // once, replayed twice.
+        let mut track = crate::gesture::GestureTrack::default();
+        for (tick, phase, x) in [
+            (0_u64, GesturePhase::Begin, 0.35_f32),
+            (2, GesturePhase::Move, 0.5),
+            (4, GesturePhase::Move, 0.65),
+            (6, GesturePhase::End, 0.8),
+        ] {
+            assert!(
+                track
+                    .record_accepted(
+                        tick,
+                        GestureEvent::quantized(
+                            0,
+                            phase,
+                            GestureMode::Push,
+                            [x, 0.5],
+                            1.0,
+                            [1.0, 0.0],
+                        ),
+                    )
+                    .unwrap()
+            );
+        }
+
+        // The two reference-tick derivations, proven equal before a pixel is
+        // rendered so a later pixel difference cannot be blamed on the clock.
+        let mut live_ticks = Vec::with_capacity(frames as usize);
+        let mut recorder = GestureEventRecorder::default();
+        for _ in 0..frames {
+            live_ticks.push(recorder.reference_tick());
+            recorder.record_accepted(1.0 / fps as f32, &[]);
+        }
+        let export_ticks: Vec<u64> = (0..frames)
+            .map(|frame| export_temporal_reference_tick(frame, fps))
+            .collect();
+        assert_eq!(live_ticks, export_ticks);
+
+        // Etch one session. The ordering is the wired ordering exactly:
+        // stage, encode the staged transaction, then commit.
+        let etch = |ticks: &[u64]| {
+            let mut resources = GestureCanvasResources::prepare(
+                &gpu.device,
+                &gpu.queue,
+                &[GestureCanvasRequest::new(canvas_grid)],
+                canvas_limits,
+            )
+            .unwrap();
+            let mut state = GestureCanvasState::new(canvas_grid, params).unwrap();
+            let mut replay = track.replay();
+            for tick in ticks {
+                let due = replay.events_due(u32::try_from(*tick).unwrap());
+                state
+                    .stage_frame(GestureCanvasFrameInput {
+                        reference_tick: *tick,
+                        program_advances: true,
+                        events: due,
+                        evaluated_params: Some(params),
+                    })
+                    .unwrap();
+                let mut encoder =
+                    gpu.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("Gesture payoff etch"),
+                        });
+                resources
+                    .encode_staged_frame(&gpu.queue, &mut encoder, 0, &state)
+                    .unwrap();
+                gpu.queue.submit(std::iter::once(encoder.finish()));
+                state.commit_staged();
+            }
+            resources
+        };
+
+        let live_resources = etch(&live_ticks);
+        let export_resources = etch(&export_ticks);
+
+        // (a) The two presented donor images are byte identical.
+        let read_presented = |resources: &GestureCanvasResources| {
+            let canvas = resources.canvas(0).unwrap();
+            let unpadded = canvas_grid.width * GESTURE_CANVAS_PRESENTED_TEXEL_BYTES;
+            let padded = (unpadded + 255) & !255;
+            let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Gesture payoff presented readback"),
+                size: u64::from(padded) * u64::from(canvas_grid.height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Gesture payoff presented encoder"),
+                });
+            encoder.copy_texture_to_buffer(
+                canvas.presented_texture().as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded),
+                        rows_per_image: Some(canvas_grid.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: canvas_grid.width,
+                    height: canvas_grid.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            let slice = staging.slice(..);
+            let (send, receive) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = send.send(result);
+            });
+            gpu.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .unwrap();
+            receive.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range();
+            let mut compact = Vec::new();
+            for row in 0..canvas_grid.height as usize {
+                let start = row * padded as usize;
+                compact.extend_from_slice(&mapped[start..start + unpadded as usize]);
+            }
+            drop(mapped);
+            staging.unmap();
+            compact
+        };
+        let live_presented = read_presented(&live_resources);
+        assert_eq!(
+            live_presented,
+            read_presented(&export_resources),
+            "the live and offline presented gesture fields differ"
+        );
+        assert!(
+            live_presented.iter().any(|byte| *byte != 0),
+            "the recorded stroke etched nothing at all"
+        );
+
+        // Render the same plan three ways.
+        let source = gpu.patterned_source(dimensions, "Gesture payoff carrier");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let plan = gesture_donor_plan(dimensions, 0.4);
+        let render = |binding: GestureCanvasBinding| {
+            let mut executor =
+                CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+            let bound = binding.is_bound();
+            executor.bind_gesture_canvas(binding);
+            assert_eq!(executor.gesture_canvas_bound(), bound);
+            executor
+                .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+                .unwrap();
+            gpu.render(&mut executor, &plan, 1.0 / 30.0, true)
+        };
+
+        let unbound = render(GestureCanvasBinding::default());
+        let empty_canvas = GestureCanvasResources::prepare(
+            &gpu.device,
+            &gpu.queue,
+            &[GestureCanvasRequest::new(canvas_grid)],
+            canvas_limits,
+        )
+        .unwrap();
+        let empty = render(GestureCanvasBinding::bound(
+            empty_canvas.presented_view().unwrap().clone(),
+            1,
+        ));
+        let etched = render(GestureCanvasBinding::bound(
+            live_resources.presented_view().unwrap().clone(),
+            2,
+        ));
+
+        // (c) An admitted but never-etched canvas is exactly no canvas at all.
+        // This is arithmetic, not tolerance: a fully transparent donor and a
+        // missing binding both decode to exactly zero displacement.
+        assert_eq!(
+            empty, unbound,
+            "an unrecorded gesture canvas changed the rendered image"
+        );
+
+        // (b) The recording reaches the image.
+        let differing = |left: &[[f32; 4]], right: &[[f32; 4]]| {
+            left.iter()
+                .zip(right)
+                .filter(|(a, b)| {
+                    a.iter()
+                        .zip(b.iter())
+                        .any(|(left, right)| (left - right).abs() > 1.0e-3)
+                })
+                .count()
+        };
+        assert!(
+            differing(&etched, &unbound) > 0,
+            "the etched gesture field displaced nothing; the donor never reached the node"
+        );
+
+        // One executor, one topology, two different canvases. The tap bind
+        // groups are built at prepare time and reused across frames, so without
+        // the canvas identity in the reuse test this second prepare would keep
+        // the empty canvas's view and the image would not move at all.
+        let mut reused = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        reused.bind_gesture_canvas(GestureCanvasBinding::bound(
+            empty_canvas.presented_view().unwrap().clone(),
+            1,
+        ));
+        reused
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let reused_empty = gpu.render(&mut reused, &plan, 1.0 / 30.0, true);
+        assert_eq!(reused_empty, empty);
+        reused.bind_gesture_canvas(GestureCanvasBinding::bound(
+            live_resources.presented_view().unwrap().clone(),
+            2,
+        ));
+        reused
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let reused_etched = gpu.render(&mut reused, &plan, 1.0 / 30.0, true);
+        assert!(
+            differing(&reused_etched, &reused_empty) > 0,
+            "a rebuilt canvas left a stale presented view bound to an unchanged topology"
+        );
     }
 
     fn motion_shutter_fixture(dimensions: [u32; 2]) -> EvaluatedCompositionPlan {

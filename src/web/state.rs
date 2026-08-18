@@ -230,6 +230,10 @@ pub enum CreativeImageSourceSnapshot {
         group_id: String,
     },
     CleanProgram,
+    /// The etched gesture field. A master-scope singleton: it carries no ID and
+    /// no saved position, and it is authorable from the browser at either
+    /// timing.
+    GestureCanvas,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +268,36 @@ impl SymmetryRouteSnapshot {
     pub const fn index(&self) -> u8 {
         match self {
             Self::Image { index, .. } | Self::Motion { index, .. } => *index,
+        }
+    }
+}
+
+/// Which of a Residual node's two authored routes an ordered reroute names.
+/// The vocabulary is closed and tagged so an out-of-range slot is a
+/// deserialization error rather than a positional fallback onto the other
+/// route — the same law that keeps a stale node ID from rebinding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualRouteSlotSnapshot {
+    Structure,
+    Detail,
+}
+
+impl ResidualRouteSlotSnapshot {
+    /// The authored slot index this wire token names.
+    pub const fn slot(self) -> u8 {
+        match self {
+            Self::Structure => crate::visual_rack::RESIDUAL_STRUCTURE_SLOT,
+            Self::Detail => crate::visual_rack::RESIDUAL_DETAIL_SLOT,
+        }
+    }
+
+    /// Operator-facing name of the slot, so a commit status names the input
+    /// that actually moved rather than a bare index.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Structure => "structure",
+            Self::Detail => "detail",
         }
     }
 }
@@ -396,6 +430,7 @@ impl CreativeImageTapSnapshot {
                 }
             }
             ResolvedImageSource::CleanProgram => CreativeImageSourceSnapshot::CleanProgram,
+            ResolvedImageSource::GestureCanvas => CreativeImageSourceSnapshot::GestureCanvas,
         };
         Self {
             input,
@@ -456,6 +491,10 @@ impl CreativeImageTapSnapshot {
                 }
                 ResolvedImageSource::CleanProgram
             }
+            // No ID to parse and no position to invent: the singleton resolves
+            // to itself, and its availability is a planner fact rather than an
+            // ingress one.
+            CreativeImageSourceSnapshot::GestureCanvas => ResolvedImageSource::GestureCanvas,
             CreativeImageSourceSnapshot::MissingSelectedLayer { .. }
             | CreativeImageSourceSnapshot::MissingGroupOutput { .. } => {
                 return Err("missing creative image sources are output-only diagnostics".into());
@@ -587,6 +626,16 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "motion0_diagnostic": creative_motion_diagnostic(value.motion[0]),
             "motion1_diagnostic": creative_motion_diagnostic(value.motion[1]),
         }),
+        RuntimeVisualNodeKind::Residual(value) => serde_json::json!({
+            "structure_tap": CreativeImageTapSnapshot::from_runtime(value.structure),
+            "detail_tap": CreativeImageTapSnapshot::from_runtime(value.detail),
+            "block": value.block,
+            "quantization": value.quantization,
+            "mix": value.mix,
+            "detail_gain": value.detail_gain,
+            "seed": value.seed,
+            "diagnostic": creative_two_slot_route_diagnostic(value.structure.source, value.detail.source),
+        }),
     }
 }
 
@@ -622,6 +671,23 @@ fn creative_motion_diagnostic(donor: crate::motion::MotionDonor) -> String {
             String::new()
         }
     }
+}
+
+/// Operator-facing text for a two-slot route pair. Each dead slot names itself
+/// so a tombstone can never be read as belonging to the other route, and a
+/// fully live pair stays empty exactly as the single-route diagnostic does.
+fn creative_two_slot_route_diagnostic(
+    structure: crate::visual_rack::ResolvedImageSource,
+    detail: crate::visual_rack::ResolvedImageSource,
+) -> String {
+    let mut parts = Vec::new();
+    for (label, source) in [("structure", structure), ("detail", detail)] {
+        let diagnostic = creative_route_diagnostic(source);
+        if !diagnostic.is_empty() {
+            parts.push(format!("{label}: {diagnostic}"));
+        }
+    }
+    parts.join("; ")
 }
 
 /// Operator-facing text for a route that resolves to nothing. Empty means the
@@ -1135,6 +1201,10 @@ pub struct AppSnapshot {
     /// Temporal (feedback/slit-scan) effect state
     #[serde(default)]
     pub temporal: TemporalSnapshot,
+    /// Gesture-field recording truth. Additive: an older panel deserializes an
+    /// otherwise complete snapshot as a disarmed, empty recording.
+    #[serde(default)]
+    pub gesture: GestureStatusSnapshot,
     /// Program-wide Curved Shutter authoring and read-only execution truth.
     /// Faraday controls remain disabled for this master scope.
     #[serde(default)]
@@ -1231,6 +1301,7 @@ impl Default for AppSnapshot {
             controller_runtime: ControllerRuntimeSnapshot::default(),
             osc_runtime: OscRuntimeSnapshot::default(),
             temporal: TemporalSnapshot::default(),
+            gesture: GestureStatusSnapshot::default(),
             master_motion: MotionSnapshot::default(),
             spout: SpoutSnapshot::default(),
             recorder: ProgramRecorderSnapshot::default(),
@@ -2153,6 +2224,52 @@ pub struct TemporalOriginalsSnapshot {
     pub garden: RefreshGardenSnapshot,
     pub score: CollisionScoreSnapshot,
     pub reset: TemporalResetPolicySnapshot,
+}
+
+/// Operator-facing gesture recording truth.
+///
+/// The honesty law lives in these fields. `recording` is the armed flag;
+/// `recorded_events` counts only what actually entered the replayable track;
+/// `live_only_events` counts normalized samples that affected this session and
+/// were never recorded. A snapshot must never let the second be mistaken for
+/// the first, so they are separate counters and neither is derived from the
+/// other.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GestureStatusSnapshot {
+    /// True while recording is armed. While false, a live gesture is
+    /// session-local and is not replayable.
+    pub recording: bool,
+    /// Events in the replayable track.
+    pub recorded_events: u32,
+    /// The track reached its bounded cap and newer events stayed live-only.
+    pub truncated: bool,
+    /// Strokes still open in the recorded track. A track with open strokes is
+    /// valid but explicitly incomplete and is never auto-closed.
+    pub open_strokes: u32,
+    /// Normalized samples that reached this session without being recorded.
+    pub live_only_events: u64,
+    /// Canonical checksum of the recorded track, empty while it is empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub checksum: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Authored canvas controls. These are values, not a recording, and are
+    /// published beside the recording truth rather than inside it.
+    #[serde(default)]
+    pub canvas: GestureCanvasStatusSnapshot,
+}
+
+/// Authored gesture-canvas controls and the session-local field they drive.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GestureCanvasStatusSnapshot {
+    pub radius: f32,
+    pub strength: f32,
+    pub retention: f32,
+    pub grid_width: u32,
+    pub grid_height: u32,
+    /// Committed canvas frames since the last reset. This is session state and
+    /// says nothing about whether any of it was recorded.
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3262,6 +3379,20 @@ pub enum WebAction {
         route: SymmetryRouteSnapshot,
         composition_revision: u64,
     },
+    /// Reroute one slot of a Residual node. Both routes rewrite the image
+    /// dependency graph, so the action is an ordered, revision-protected,
+    /// uncoalesced barrier and carries a closed slot token rather than an
+    /// index: a slot the engine does not know names no route at all instead of
+    /// silently landing on its partner. The two gains, both discrete laws and
+    /// the seed travel on the ordinary coalescible parameter action.
+    #[serde(rename = "set_visual_node_residual_route")]
+    SetVisualNodeResidualRoute {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        slot: ResidualRouteSlotSnapshot,
+        route: CreativeImageTapSnapshot,
+        composition_revision: u64,
+    },
     /// Enable/disable or reroute the separate group matte. `None` disables it;
     /// numeric matte values remain untouched and use the coalescible action.
     #[serde(rename = "set_composition_group_matte_route")]
@@ -3733,6 +3864,54 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// One phone/browser gesture-field sample.
+    ///
+    /// This is a stream event, not an absolute value, so it deliberately has no
+    /// `coalesce_key`: replacing an older pending sample would silently delete
+    /// path points and the recorded track would then differ from what the
+    /// operator actually drew. `phase` and `mode` cross the wire as the engine's
+    /// own closed vocabularies, so an unknown token is a deserialization error
+    /// rather than a silently defaulted value.
+    #[serde(rename = "gesture_sample")]
+    GestureSample {
+        stroke: u8,
+        phase: crate::gesture::GesturePhase,
+        mode: crate::gesture::GestureMode,
+        x: f32,
+        y: f32,
+        /// Absent means full contact, matching a surface with no pressure axis.
+        #[serde(default = "unit_pressure")]
+        pressure: f32,
+        /// Absent means an unset direction, which is inert rather than an
+        /// invented axis.
+        #[serde(default)]
+        direction_x: f32,
+        #[serde(default)]
+        direction_y: f32,
+    },
+    /// Arm or disarm gesture recording.
+    ///
+    /// The honesty law made explicit: while this is off a live gesture affects
+    /// the current session only and nothing is added to the replayable track.
+    /// It is an ordered barrier so a sample can never cross an arm/disarm edge
+    /// and land in the wrong recording, and it is protected by the current
+    /// layer-stack revision so an arm decision taken against one program can
+    /// never arrive after a patch load has replaced it.
+    #[serde(rename = "set_gesture_recording")]
+    SetGestureRecording {
+        enabled: bool,
+        layer_stack_revision: u64,
+    },
+    /// Coalescible bounded gesture-canvas value edit.
+    ///
+    /// Unlike the recording barrier this is an ordinary absolute scalar: the
+    /// newest value for one control is the only one worth applying. It reaches
+    /// authored canvas controls only and has no path to the recorded track.
+    #[serde(rename = "set_gesture_canvas")]
+    SetGestureCanvas {
+        param: String,
+        value: serde_json::Value,
+    },
     /// Set fullscreen audience output explicitly. Current clients use this
     /// idempotent command so a delayed/retried packet cannot invert the
     /// performer's requested state.
@@ -3972,6 +4151,11 @@ fn bool_true() -> bool {
     true
 }
 
+/// A surface with no pressure axis reports full contact.
+fn unit_pressure() -> f32 {
+    1.0
+}
+
 impl WebAction {
     fn creative_scope_key(scope: &CreativeScopeSnapshot) -> String {
         match scope {
@@ -4118,6 +4302,10 @@ impl WebAction {
             Self::SetMorph { .. } => Some("morph:position".into()),
             Self::SetMorphLaw { .. } => Some("morph:law".into()),
             Self::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
+            // An authored canvas scalar coalesces per control. The recording
+            // barrier deliberately gets no arm here: `_ => None` is what stops
+            // a later absolute value from jumping an arm/disarm edge.
+            Self::SetGestureCanvas { param, .. } => Some(format!("gesture:canvas:{param}")),
             Self::SetMotion { scope, param, .. } => Some(match scope {
                 MotionScopeSnapshot::Master => format!("motion:master:{param}"),
                 MotionScopeSnapshot::Layer { layer_id } => {
@@ -4151,6 +4339,8 @@ impl WebAction {
                 | Self::GyroStream { .. }
                 | Self::GyroCalibrate
                 | Self::Pad { .. }
+                | Self::GestureSample { .. }
+                | Self::SetGestureRecording { .. }
                 | Self::TriggerCollisionScore
                 | Self::TriggerRefreshGarden
                 | Self::ClearTemporalEventTrack
@@ -4215,6 +4405,7 @@ impl WebAction {
             | Self::SetRefreshGardenMatteRoute { .. }
             | Self::SetRefreshGardenMotionRoute { .. }
             | Self::ClearTemporalEventTrack
+            | Self::SetGestureRecording { .. }
             | Self::SetMotionDonor { .. }
             | Self::ClearMotionMemory
             | Self::SetLayerPaused { .. }
@@ -4238,6 +4429,7 @@ impl WebAction {
             | Self::SetVisualNodeRoute { .. }
             | Self::SetVisualNodeDisplaceRoute { .. }
             | Self::SetVisualNodeSymmetryRoute { .. }
+            | Self::SetVisualNodeResidualRoute { .. }
             | Self::SetCompositionGroupMatteRoute { .. }
             | Self::CreateCompositionGroup { .. }
             | Self::RemoveCompositionGroup { .. }
@@ -4257,6 +4449,14 @@ impl WebAction {
                 mode: crate::media_safety::MediaSafetyMode::Safe,
             } => true,
             Self::Pad { active, .. } => !active,
+            // A dropped `Begin` orphans every later point of that stroke and a
+            // dropped `End` leaves it permanently open, so both edges hold an
+            // admission reservation. An intermediate `Move` is ordinary: under
+            // saturation the queue sheds a path point, and the track then
+            // honestly records what the host accepted.
+            Self::GestureSample { phase, .. } => {
+                !matches!(phase, crate::gesture::GesturePhase::Move)
+            }
             Self::Quantized { inner } => inner.is_priority(),
             _ => false,
         }
@@ -6149,6 +6349,7 @@ mod protocol_tests {
             "class=\"fx-group\" data-group=\"motion\"",
             "id=\"motion-fields-group\"",
             "id=\"temporal-group\"",
+            "id=\"gesture-group\"",
             "id=\"audio-group\"",
         ];
         let mut previous = 0;
@@ -6157,7 +6358,7 @@ mod protocol_tests {
             assert!(position >= previous, "{marker} is out of column order");
             previous = position;
         }
-        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 6);
+        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 7);
         assert!(!second_column.contains("id=\"mod-group\""));
         assert!(!second_column.contains("id=\"pad-group\""));
         assert!(!second_column.contains("id=\"midi-group\""));
@@ -6324,7 +6525,7 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 94);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 97);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [
@@ -6855,6 +7056,39 @@ mod protocol_tests {
             Some("creative:master:node:7:symmetry_seed")
         );
         assert!(!seed.is_priority());
+
+        // A Residual value rides the one coalescible node action and keys on
+        // its own parameter, while both of its routes stay ordered barriers.
+        let residual_value = WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "3".into(),
+            node_kind: "residual".into(),
+            param: "detail_gain".into(),
+            value: serde_json::json!(2.0),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            residual_value.coalesce_key().as_deref(),
+            Some("creative:master:node:3:detail_gain")
+        );
+        assert!(!residual_value.is_priority());
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            let residual_route = WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                slot,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                composition_revision: 9,
+            };
+            assert_eq!(residual_route.coalesce_key(), None);
+            assert!(residual_route.is_priority());
+        }
     }
 
     #[test]
@@ -7985,6 +8219,8 @@ mod protocol_tests {
             "action: 'set_visual_node_route'",
             "action: 'set_visual_node_displace_route'",
             "action: 'set_visual_node_symmetry_route'",
+            "action: 'set_visual_node_displace_route'",
+            "action: 'set_visual_node_residual_route'",
             "action: 'set_composition_group_param'",
             "action: 'set_composition_group_matte_route'",
             "action: 'set_composition_group_matte_param'",
@@ -8816,5 +9052,736 @@ mod protocol_tests {
             .0;
         assert!(!quantizable.contains("set_visual_node_symmetry_route"));
         assert!(!quantizable.contains("set_visual_node_displace_route"));
+    }
+
+    #[test]
+    fn residual_route_action_is_an_uncoalesced_ordered_barrier_that_names_its_slot() {
+        let route = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::OneBelow,
+            timing: EdgeTiming::CurrentFrame,
+        };
+
+        // The slot token is the whole reason this action exists once instead of
+        // twice, so it must resolve to the authored index and nothing else.
+        assert_eq!(
+            ResidualRouteSlotSnapshot::Structure.slot(),
+            crate::visual_rack::RESIDUAL_STRUCTURE_SLOT
+        );
+        assert_eq!(
+            ResidualRouteSlotSnapshot::Detail.slot(),
+            crate::visual_rack::RESIDUAL_DETAIL_SLOT
+        );
+        assert_ne!(
+            ResidualRouteSlotSnapshot::Structure.slot(),
+            ResidualRouteSlotSnapshot::Detail.slot()
+        );
+
+        for (slot, wire) in [
+            (ResidualRouteSlotSnapshot::Structure, "structure"),
+            (ResidualRouteSlotSnapshot::Detail, "detail"),
+        ] {
+            let action = WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "7".into(),
+                slot,
+                route: route.clone(),
+                composition_revision: 12,
+            };
+
+            // Both slots are ordered, revision-protected barriers and neither
+            // may coalesce behind a later absolute value.
+            assert!(action.is_priority());
+            assert!(action.coalesce_key().is_none());
+
+            let value = serde_json::to_value(&action).unwrap();
+            assert_eq!(value["action"], "set_visual_node_residual_route");
+            assert_eq!(value["slot"], wire);
+            assert_eq!(value["composition_revision"], 12);
+            assert_eq!(value["input"], serde_json::Value::Null);
+            let WebAction::SetVisualNodeResidualRoute {
+                scope: decoded_scope,
+                node_id: decoded_node,
+                slot: decoded_slot,
+                route: decoded_route,
+                composition_revision: decoded_revision,
+            } = serde_json::from_value::<WebAction>(value).unwrap()
+            else {
+                panic!("the residual route action must decode to its own variant");
+            };
+            assert_eq!(decoded_scope, CreativeScopeSnapshot::Master);
+            assert_eq!(decoded_node, "7");
+            assert_eq!(decoded_slot, slot);
+            assert_eq!(decoded_route, route);
+            assert_eq!(decoded_revision, 12);
+        }
+
+        // The well-formed message is accepted for either slot...
+        for slot in ["structure", "detail"] {
+            assert!(
+                serde_json::from_str::<WebAction>(&format!(
+                    r#"{{"action":"set_visual_node_residual_route","scope":{{"scope":"master"}},"node_id":"7","slot":"{slot}","route":{{"input":{{"source":"one_below"}},"timing":"current_frame"}},"composition_revision":1}}"#
+                ))
+                .is_ok(),
+                "slot {slot} must be accepted"
+            );
+        }
+        // ...the revision is mandatory, so a route edit can never arrive
+        // unbarriered...
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_residual_route","scope":{"scope":"master"},"node_id":"7","slot":"structure","route":{"input":{"source":"one_below"},"timing":"current_frame"}}"#
+        )
+        .is_err());
+        // ...the slot is mandatory, so a reroute can never default onto one of
+        // the two inputs...
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_residual_route","scope":{"scope":"master"},"node_id":"7","route":{"input":{"source":"one_below"},"timing":"current_frame"},"composition_revision":1}"#
+        )
+        .is_err());
+        // ...an unknown slot token is a closed-vocabulary rejection rather than
+        // a positional fallback onto the partner route...
+        for hostile in [r#""dc""#, r#""2""#, "1", "null"] {
+            assert!(
+                serde_json::from_str::<WebAction>(&format!(
+                    r#"{{"action":"set_visual_node_residual_route","scope":{{"scope":"master"}},"node_id":"7","slot":{hostile},"route":{{"input":{{"source":"one_below"}},"timing":"current_frame"}},"composition_revision":1}}"#
+                ))
+                .is_err(),
+                "hostile slot {hostile} must be refused"
+            );
+        }
+        // ...and an unknown donor token is rejected, not defaulted.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_residual_route","scope":{"scope":"master"},"node_id":"7","slot":"detail","route":{"input":{"source":"teleport"},"timing":"current_frame"},"composition_revision":1}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn residual_snapshot_publishes_both_routes_values_and_per_slot_diagnostics() {
+        use crate::visual_rack::{
+            ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams, RuntimeVisualNodeKind,
+        };
+
+        let live = creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+            structure: ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            block: ResidualBlock::ThirtyTwo,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.75,
+            detail_gain: 2.5,
+            seed: 0x00c0_ffee,
+            ..RuntimeResidualParams::default()
+        }));
+        assert_eq!(live["structure_tap"]["input"]["source"], "all_below");
+        assert_eq!(live["structure_tap"]["timing"], "current_frame");
+        assert_eq!(live["detail_tap"]["input"]["source"], "clean_program");
+        assert_eq!(live["detail_tap"]["timing"], "previous_frame");
+        assert_eq!(live["block"], "thirty_two");
+        assert_eq!(live["quantization"], "medium");
+        assert_eq!(live["mix"], 0.75);
+        assert_eq!(live["detail_gain"], 2.5);
+        assert_eq!(live["seed"], 0x00c0_ffee_u32);
+        assert_eq!(
+            live["diagnostic"], "",
+            "a fully live route pair reports no diagnostic text"
+        );
+        // The published key set is exactly the frozen snapshot contract.
+        let mut keys: Vec<_> = live.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "block",
+                "detail_gain",
+                "detail_tap",
+                "diagnostic",
+                "mix",
+                "quantization",
+                "seed",
+                "structure_tap",
+            ]
+        );
+
+        // Each dead slot names itself, so a tombstone can never be read as
+        // belonging to the other route, and neither slot rebinds.
+        let structure_gone =
+            creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                structure: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingSelectedLayer {
+                        saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                        stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ..RuntimeResidualParams::default()
+            }));
+        assert_eq!(
+            structure_gone["diagnostic"],
+            "structure: missing saved layer 4"
+        );
+        assert_eq!(
+            structure_gone["structure_tap"]["input"]["source"],
+            "missing_selected_layer"
+        );
+        assert_eq!(structure_gone["detail_tap"]["input"]["source"], "one_below");
+
+        let detail_gone =
+            creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                detail: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingGroupOutput(
+                        crate::visual_rack::GroupId::new(9).unwrap(),
+                    ),
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                ..RuntimeResidualParams::default()
+            }));
+        assert_eq!(detail_gone["diagnostic"], "detail: missing group output 9");
+        assert_eq!(
+            detail_gone["structure_tap"]["input"]["source"], "one_below",
+            "a dead detail slot must never tombstone its partner"
+        );
+
+        let both_gone =
+            creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                structure: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingSelectedLayer {
+                        saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                        stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                detail: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingGroupOutput(
+                        crate::visual_rack::GroupId::new(9).unwrap(),
+                    ),
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                ..RuntimeResidualParams::default()
+            }));
+        assert_eq!(
+            both_gone["diagnostic"],
+            "structure: missing saved layer 4; detail: missing group output 9"
+        );
+    }
+
+    #[test]
+    fn every_browser_node_registry_matches_the_rust_descriptor_tables() {
+        let js = include_str!("../../static/app.js");
+        let html = include_str!("../../static/index.html");
+        let node_info = js
+            .split_once("const CREATIVE_NODE_INFO = Object.freeze({")
+            .expect("app.js declares CREATIVE_NODE_INFO")
+            .1
+            .split_once("});")
+            .expect("CREATIVE_NODE_INFO is closed")
+            .0;
+        let node_params = js
+            .split_once("const CREATIVE_NODE_PARAMS = Object.freeze({")
+            .expect("app.js declares CREATIVE_NODE_PARAMS")
+            .1
+            .split_once("\n});")
+            .expect("CREATIVE_NODE_PARAMS is closed")
+            .0;
+
+        // The panel's kind picker, its label registry and its parameter
+        // registry are hand-maintained beside the Rust table. Cross-check all
+        // three so a kind can never be fully functional yet uninsertable.
+        for descriptor in crate::visual_rack::NODE_KIND_DESCRIPTORS {
+            let key = descriptor.key;
+            let marker = matches!(
+                descriptor.tag,
+                crate::visual_rack::NodeKindTag::LegacyCanonical
+                    | crate::visual_rack::NodeKindTag::LegacyTemporal
+            );
+            assert!(
+                node_info.contains(&format!("\n  {key}: {{")),
+                "CREATIVE_NODE_INFO is missing node kind {key}"
+            );
+            assert_eq!(
+                html.contains(&format!("<option value=\"{key}\">")),
+                !marker,
+                "index.html kind picker disagrees about node kind {key}"
+            );
+            assert_eq!(
+                node_params.contains(&format!("\n  {key}: [")),
+                !marker,
+                "CREATIVE_NODE_PARAMS disagrees about node kind {key}"
+            );
+        }
+
+        // Every browser-editable Residual field is declared, and neither route
+        // is: both belong to the ordered slot-naming action.
+        let residual = node_params
+            .split_once("\n  residual: [")
+            .expect("CREATIVE_NODE_PARAMS declares residual")
+            .1
+            .split_once("\n  ]")
+            .expect("the residual block is closed")
+            .0;
+        for descriptor in crate::visual_rack::NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == crate::visual_rack::NodeKindTag::Residual)
+        {
+            let declared = residual.contains(&format!("'{}'", descriptor.key));
+            let routed = descriptor.value_type == crate::visual_rack::NodeParamType::ImageTap;
+            assert_eq!(
+                declared, !routed,
+                "residual param {} is on the wrong browser path",
+                descriptor.key
+            );
+        }
+        assert!(residual.contains("floatDef('mix', 'Mix', 0, 1,"));
+        assert!(residual.contains("floatDef('detail_gain', 'Detail gain', 0, 4,"));
+        assert!(residual.contains("uintDef('seed', 'Seed')"));
+
+        // Both discrete vocabularies are published exactly as the engine spells
+        // them, or the server's Enum allowlist drops the select at ingress.
+        for token in ["four", "eight", "sixteen", "thirty_two", "sixty_four"] {
+            assert!(
+                residual.contains(&format!("['{token}',")),
+                "residual block vocabulary is missing {token}"
+            );
+        }
+        for token in ["off", "coarse", "medium", "fine"] {
+            assert!(
+                residual.contains(&format!("['{token}',")),
+                "residual quantization vocabulary is missing {token}"
+            );
+        }
+
+        // Two routes need two independently wired, slot-tagged editors and two
+        // structural fingerprint slots.
+        assert!(js.contains("data-route-slot=\"${escapeHtml(slot)}\""));
+        assert!(js.contains("card.querySelectorAll('.creative-route-editor')"));
+        assert!(js.contains("routeEditor.dataset.routeSlot"));
+        assert!(js.contains("'structure', 'Structure donor'"));
+        assert!(js.contains("'detail', 'Detail donor'"));
+        assert!(js.contains("detailRoute: node.kind === 'residual'"));
+
+        // A topology barrier is never beat-latched by the panel.
+        let quantizable = js
+            .split_once("const QUANTIZABLE_ACTIONS")
+            .unwrap()
+            .1
+            .split_once("]);")
+            .unwrap()
+            .0;
+        assert!(!quantizable.contains("set_visual_node_residual_route"));
+        assert!(!quantizable.contains("set_visual_node_displace_route"));
+        assert!(!quantizable.contains("set_visual_node_route"));
+    }
+    #[test]
+    fn gesture_samples_are_uncoalesced_stream_events_whose_stroke_edges_hold_priority() {
+        use crate::gesture::{GestureMode, GesturePhase};
+
+        let begin = WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::Begin,
+            mode: GestureMode::Push,
+            x: 0.25,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 0.0,
+            direction_y: 0.0,
+        };
+        let motion = WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::Move,
+            mode: GestureMode::Push,
+            x: 0.5,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 1.0,
+            direction_y: 0.0,
+        };
+        let end = WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::End,
+            mode: GestureMode::Push,
+            x: 0.75,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 1.0,
+            direction_y: 0.0,
+        };
+
+        // A sample is a stream event, never an absolute value: coalescing one
+        // would silently delete a path point the operator actually drew.
+        for action in [&begin, &motion, &end] {
+            assert!(
+                action.coalesce_key().is_none(),
+                "a gesture sample must never coalesce"
+            );
+            assert!(action.is_performance_only_for_history());
+        }
+        // A dropped Begin orphans the stroke and a dropped End leaves it open,
+        // so both edges hold an admission reservation while ordinary motion
+        // may shed under saturation.
+        assert!(begin.is_priority());
+        assert!(end.is_priority());
+        assert!(!motion.is_priority());
+
+        // Because a sample carries no coalesce key it is also an ordering
+        // barrier, so a later absolute value can never jump ahead of a stroke.
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.1),
+                }
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(&mut queue, motion.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetParam {
+                    param: "brightness".into(),
+                    value: serde_json::json!(0.9),
+                }
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(queue.len(), 3, "the sample separates the two scalars");
+
+        // Wire shape: a well-formed sample decodes, an absent pressure means
+        // full contact, an absent direction is the inert zero, and both
+        // vocabularies are closed rather than defaulted.
+        let value = serde_json::to_value(&begin).unwrap();
+        assert_eq!(value["action"], "gesture_sample");
+        assert_eq!(value["phase"], "begin");
+        assert_eq!(value["mode"], "push");
+
+        let defaulted = serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"curl","x":0.5,"y":0.5}"#,
+        )
+        .unwrap();
+        let WebAction::GestureSample {
+            mode,
+            pressure,
+            direction_x,
+            direction_y,
+            ..
+        } = defaulted
+        else {
+            panic!("a gesture sample must decode to its own variant");
+        };
+        assert_eq!(mode, GestureMode::Curl);
+        assert_eq!(pressure, 1.0);
+        assert_eq!(direction_x, 0.0);
+        assert_eq!(direction_y, 0.0);
+
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"scrub","mode":"push","x":0.5,"y":0.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"smear","x":0.5,"y":0.5}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"gesture_sample","stroke":0,"phase":"move","mode":"push","y":0.5}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gesture_recording_control_is_an_uncoalesced_priority_barrier() {
+        let arm = WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: 9,
+        };
+        assert!(arm.is_priority());
+        assert!(
+            arm.coalesce_key().is_none(),
+            "a sample must never cross an arm/disarm edge into the wrong recording"
+        );
+        assert!(arm.is_performance_only_for_history());
+        assert_eq!(
+            serde_json::to_value(&arm).unwrap(),
+            serde_json::json!({
+                "action": "set_gesture_recording",
+                "enabled": true,
+                "layer_stack_revision": 9
+            })
+        );
+        let decoded = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_recording","enabled":false,"layer_stack_revision":9}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            decoded,
+            WebAction::SetGestureRecording {
+                enabled: false,
+                layer_stack_revision: 9,
+            }
+        ));
+        // Both fields are mandatory: the revision is the barrier that keeps an
+        // arm decision attached to the program it was taken against.
+        for hostile in [
+            r#"{"action":"set_gesture_recording"}"#,
+            r#"{"action":"set_gesture_recording","enabled":true}"#,
+            r#"{"action":"set_gesture_recording","layer_stack_revision":9}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WebAction>(hostile).is_err(),
+                "accepted an incomplete recording barrier: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_snapshot_reports_live_only_samples_separately_from_the_recorded_track() {
+        // The honesty law on the wire: an unrecorded gesture is counted in its
+        // own field and never merged into the recorded total, and an empty
+        // track publishes no checksum because it has nothing to verify.
+        let disarmed = GestureStatusSnapshot {
+            recording: false,
+            recorded_events: 0,
+            truncated: false,
+            open_strokes: 0,
+            live_only_events: 512,
+            checksum: String::new(),
+            status: String::new(),
+            canvas: GestureCanvasStatusSnapshot::default(),
+        };
+        let value = serde_json::to_value(&disarmed).unwrap();
+        assert_eq!(value["recording"], false);
+        assert_eq!(value["recorded_events"], 0);
+        assert_eq!(value["live_only_events"], 512);
+        assert!(
+            value.get("checksum").is_none(),
+            "an empty track must not offer a digest that implies it is replayable"
+        );
+
+        let recorded = GestureStatusSnapshot {
+            recording: true,
+            recorded_events: 3,
+            truncated: true,
+            open_strokes: 1,
+            live_only_events: 4,
+            checksum: "abc".into(),
+            status: "held".into(),
+            canvas: GestureCanvasStatusSnapshot::default(),
+        };
+        let value = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["open_strokes"], 1);
+        assert_eq!(value["checksum"], "abc");
+        assert_eq!(value["status"], "held");
+
+        // The section is additive: an older snapshot with no gesture block
+        // deserializes as a disarmed, empty, unrecorded one.
+        let legacy = serde_json::to_value(AppSnapshot::default()).unwrap();
+        let mut trimmed = legacy.clone();
+        trimmed.as_object_mut().unwrap().remove("gesture");
+        let restored = serde_json::from_value::<AppSnapshot>(trimmed).unwrap();
+        assert_eq!(restored.gesture, GestureStatusSnapshot::default());
+        assert!(!restored.gesture.recording);
+        assert_eq!(restored.gesture.recorded_events, 0);
+        assert_eq!(restored.gesture.live_only_events, 0);
+    }
+
+    /// The canvas scalar is an ordinary absolute value that coalesces per
+    /// control - and it can never jump the recording barrier, because the
+    /// barrier has no coalesce key at all.
+    #[test]
+    fn gesture_canvas_scalars_coalesce_per_control_and_never_cross_the_recording_barrier() {
+        let radius = WebAction::SetGestureCanvas {
+            param: "radius".into(),
+            value: serde_json::json!(0.2),
+        };
+        let strength = WebAction::SetGestureCanvas {
+            param: "strength".into(),
+            value: serde_json::json!(0.4),
+        };
+        assert_eq!(
+            radius.coalesce_key().as_deref(),
+            Some("gesture:canvas:radius")
+        );
+        assert_eq!(
+            strength.coalesce_key().as_deref(),
+            Some("gesture:canvas:strength")
+        );
+        assert!(!radius.is_priority());
+        assert!(
+            !radius.is_performance_only_for_history(),
+            "a canvas value is an authored edit and belongs in manual history"
+        );
+        assert_eq!(
+            serde_json::to_value(&radius).unwrap(),
+            serde_json::json!({"action": "set_gesture_canvas", "param": "radius", "value": 0.2})
+        );
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_canvas","param":"retention","value":0.5}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_gesture_canvas","param":"retention"}"#
+        )
+        .is_err());
+
+        // Two edits to one control coalesce; the arm/disarm barrier between
+        // two edits stops the later one from replacing the earlier.
+        let mut queue = Vec::new();
+        assert_eq!(
+            enqueue_bounded(&mut queue, radius.clone()),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetGestureCanvas {
+                    param: "radius".into(),
+                    value: serde_json::json!(0.3),
+                }
+            ),
+            EnqueueOutcome::Coalesced
+        );
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetGestureRecording {
+                    enabled: true,
+                    layer_stack_revision: 4,
+                }
+            ),
+            EnqueueOutcome::Added
+        );
+        assert_eq!(
+            enqueue_bounded(
+                &mut queue,
+                WebAction::SetGestureCanvas {
+                    param: "radius".into(),
+                    value: serde_json::json!(0.9),
+                }
+            ),
+            EnqueueOutcome::Added,
+            "an absolute value must never jump an arm/disarm edge"
+        );
+        assert_eq!(queue.len(), 3);
+        assert!(matches!(queue[1], WebAction::SetGestureRecording { .. }));
+    }
+
+    /// The panel must state which of the two counts is replayable. The armed
+    /// state is the only thing announced; the per-frame counters live outside
+    /// the live region so a stream of samples cannot flood a screen reader.
+    #[test]
+    fn gesture_browser_surface_is_accessible_truthful_and_stays_out_of_a_quantized_batch() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "id=\"gesture-group\"",
+            "role=\"region\" aria-label=\"Gesture field etching\"",
+            "data-gesture-canvas=\"radius\" data-min=\"0\" data-max=\"1\" data-step=\"0.001\"",
+            "data-gesture-canvas=\"strength\"",
+            "data-gesture-canvas=\"retention\"",
+            "id=\"gesture-record-toggle\" aria-pressed=\"false\"",
+            "id=\"gesture-recording-state\" role=\"status\" aria-live=\"polite\"",
+            "id=\"gesture-telemetry\" aria-live=\"off\"",
+            "id=\"gesture-checksum\" aria-live=\"off\"",
+            "etches this session only and is never added to the replayable track",
+        ] {
+            assert!(html.contains(contract), "missing gesture HTML: {contract}");
+        }
+        // The fast counters must not sit inside a live announcement region.
+        let telemetry = html
+            .find("id=\"gesture-telemetry\"")
+            .expect("gesture telemetry element");
+        let telemetry_tag = &html[telemetry..telemetry + html[telemetry..].find('>').unwrap()];
+        assert!(!telemetry_tag.contains("role=\"status\""));
+        assert!(!telemetry_tag.contains("aria-live=\"polite\""));
+
+        for contract in [
+            "syncGesture(msg.gesture)",
+            "action: 'set_gesture_canvas', param, value",
+            "action: 'set_gesture_recording',",
+            "layer_stack_revision: layerStackRevision,",
+            "recorded event(s)",
+            "live-only sample(s)",
+            "'No recorded track'",
+            "['gesture_radius', 'Gesture Radius']",
+            "['gesture_strength', 'Gesture Strength']",
+            "['gesture_retention', 'Gesture Retention']",
+        ] {
+            assert!(js.contains(contract), "missing gesture JS: {contract}");
+        }
+
+        // Neither gesture action may ever be wrapped in a quantized batch.
+        let start = js.find("const QUANTIZABLE_ACTIONS").expect("allowlist");
+        let tail = &js[start..];
+        let end = tail.find("]);").expect("allowlist end") + 3;
+        let allowlist = &tail[..end];
+        for forbidden in [
+            "set_gesture_recording",
+            "set_gesture_canvas",
+            "gesture_sample",
+        ] {
+            assert!(
+                !allowlist.contains(forbidden),
+                "{forbidden} must never be latchable"
+            );
+        }
+    }
+
+    /// The published canvas block is session state and sits beside the
+    /// recording truth rather than inside it.
+    #[test]
+    fn the_gesture_snapshot_separates_authored_canvas_state_from_recording_truth() {
+        let mut snapshot = GestureStatusSnapshot {
+            recording: false,
+            recorded_events: 0,
+            truncated: false,
+            open_strokes: 2,
+            live_only_events: 90,
+            checksum: String::new(),
+            status: String::new(),
+            canvas: GestureCanvasStatusSnapshot {
+                radius: 0.2,
+                strength: 0.4,
+                retention: 0.6,
+                grid_width: 320,
+                grid_height: 180,
+                generation: 77,
+            },
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["canvas"]["generation"], 77);
+        assert_eq!(value["canvas"]["grid_width"], 320);
+        assert_eq!(value["recorded_events"], 0);
+        assert_eq!(value["live_only_events"], 90);
+        assert!(
+            value.get("checksum").is_none(),
+            "a busy canvas with nothing recorded must not publish a digest"
+        );
+
+        // An older panel that never learned about the canvas keeps working.
+        let mut trimmed = value.clone();
+        trimmed.as_object_mut().unwrap().remove("canvas");
+        let restored = serde_json::from_value::<GestureStatusSnapshot>(trimmed).unwrap();
+        assert_eq!(restored.canvas, GestureCanvasStatusSnapshot::default());
+        assert_eq!(restored.live_only_events, 90);
+
+        snapshot.recording = true;
+        snapshot.recorded_events = 5;
+        snapshot.checksum = "d".repeat(64);
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["recording"], true);
+        assert_eq!(value["recorded_events"], 5);
+        assert_eq!(value["live_only_events"], 90);
+        assert_eq!(value["checksum"], snapshot.checksum);
     }
 }

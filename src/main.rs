@@ -5,6 +5,8 @@ mod composition;
 mod controller_profile;
 mod effects;
 mod evaluated_frame;
+mod gesture;
+mod gesture_canvas;
 mod history;
 mod image_routing;
 mod input;
@@ -589,6 +591,87 @@ const fn show_stage_editor_health(output_on_main: bool) -> bool {
     !output_on_main
 }
 
+/// The native pointer gesture surface is drawn over the editor preview and is
+/// therefore a native control: it follows the same no-leak boundary as the
+/// RECOVERY strip and the health HUD when the main swapchain is the audience
+/// output.
+const fn show_native_gesture_surface(output_on_main: bool) -> bool {
+    !output_on_main
+}
+
+/// Stroke identities reserved for the host surfaces that have no stroke of
+/// their own.
+///
+/// They are taken from the top of the identity space because the browser
+/// authors its own identities from the bottom: a phone's first touch is
+/// naturally stroke 0, and it must not collide with a physical pointer or a
+/// controller that happens to be mid-stroke. A collision is still refused by
+/// the one stream validator rather than merged, so this is an ergonomic
+/// reservation, not the safety law.
+const GESTURE_NATIVE_STROKE: u8 = (gesture::MAX_ACTIVE_STROKES - 3) as u8;
+const GESTURE_MIDI_STROKE: u8 = (gesture::MAX_ACTIVE_STROKES - 2) as u8;
+const GESTURE_OSC_STROKE: u8 = (gesture::MAX_ACTIVE_STROKES - 1) as u8;
+
+/// CPU-reference cell budget for one host-owned gesture canvas.
+///
+/// The frozen table admits up to `GESTURE_CANVAS_MAX_CELLS`, which is a GPU
+/// figure. The portable `GestureCanvasField` is the CPU reference, and it is
+/// what the *host* runs: every live frame snapshots the field for the
+/// transaction, decays every cell, and etches every ordered sample over every
+/// cell. That is a render-thread cost law, not a resource-table one, so the
+/// host keeps its own narrower budget — a caller may always narrow and never
+/// widen, exactly as `GestureCanvasLimits::bounded` and
+/// `RecoveryLimits::bounded` already require.
+///
+/// The field now has a real consumer: `SavedImageSource::GestureCanvas` is a
+/// routable stable image source, so a donor or matte can sample it and the
+/// budget was raised fourfold. It is deliberately *not* raised to the frozen
+/// 2,100,000-cell ceiling: at that size one frame would snapshot 32 MiB and
+/// evaluate four million `powf` calls on the render thread, which is a stall
+/// rather than a resolution. Raising it further belongs with a GPU-resident
+/// presenter that moves the per-cell work off the CPU reference entirely.
+const GESTURE_CANVAS_HOST_MAX_CELLS: u64 = 262_144;
+
+/// The host budget can only ever narrow the frozen table, never widen it. This
+/// is structural: the constant cannot be edited past the frozen bound without
+/// failing to compile.
+const _: () = assert!(GESTURE_CANVAS_HOST_MAX_CELLS <= gesture_canvas::GESTURE_CANVAS_MAX_CELLS);
+
+/// Halvings needed to bring any `u32` edge pair inside the host budget. A
+/// `u32` reaches one in thirty-two halvings, so the derivation below provably
+/// terminates instead of looping on a hostile dimension.
+const GESTURE_CANVAS_HOST_HALVINGS: u32 = 32;
+
+/// Derive the host canvas grid for a program surface.
+///
+/// Both edges halve together until the frozen edge cap, the frozen cell cap,
+/// and the narrower host CPU budget are all satisfied. The result is
+/// deterministic, holds the surface's aspect to within one halving, and can
+/// only ever narrow what the frozen table already admits.
+fn gesture_canvas_host_grid(width: u32, height: u32) -> gesture_canvas::GestureCanvasGrid {
+    let mut width = width.max(1);
+    let mut height = height.max(1);
+    for _ in 0..GESTURE_CANVAS_HOST_HALVINGS {
+        let cells = u64::from(width) * u64::from(height);
+        if width <= gesture_canvas::GESTURE_CANVAS_MAX_EDGE
+            && height <= gesture_canvas::GESTURE_CANVAS_MAX_EDGE
+            && cells <= GESTURE_CANVAS_HOST_MAX_CELLS
+        {
+            break;
+        }
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+    gesture_canvas::GestureCanvasGrid::new(width, height)
+        .expect("the halving law narrows to the frozen edge and cell caps")
+}
+
+/// Grid a canvas starts on before any program surface exists. It is derived by
+/// the same halving law rather than being a second authored number.
+fn default_gesture_canvas_grid() -> gesture_canvas::GestureCanvasGrid {
+    gesture_canvas_host_grid(1280, 720)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NativeRecoveryAction {
     SetProgramFrozen(bool),
@@ -596,6 +679,129 @@ enum NativeRecoveryAction {
     RevertVisualProgram,
     RescanLibrary,
     ChooseLibrary,
+}
+
+/// The digest a snapshot may publish for a recorded gesture track.
+///
+/// An empty track publishes nothing at all: offering a digest would imply
+/// there is something replayable to verify.
+fn published_gesture_checksum(recorder: &gesture::GestureEventRecorder) -> String {
+    let track = recorder.track();
+    if track.events().is_empty() {
+        String::new()
+    } else {
+        track.checksum_hex()
+    }
+}
+
+/// Publish one gesture-canvas transaction to the device.
+///
+/// Ordering is the whole contract here, and it has exactly two steps:
+///
+/// 1. any pending typed reset clears both working parities and the presented
+///    donor, so a reset can never leave a stale etched field bound;
+/// 2. an *accepted* frame's staged transaction is encoded, in recorded sample
+///    order, through the same `encode_staged_frame` seam offline export calls.
+///
+/// A reset abandons the open CPU transaction rather than restoring it, so a
+/// frame that was reset this tick has nothing staged and step two is a no-op by
+/// construction rather than by a second rule. A rejected frame encodes nothing
+/// at all, which is what keeps the device field and the CPU reference on the
+/// same committed sequence.
+///
+/// This is a free function because the frame loop calls it while the renderer
+/// borrow is still live, exactly like `published_gesture_checksum` beside it.
+fn publish_gesture_canvas_frame(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    resources: &mut renderer::gesture_canvas::GestureCanvasResources,
+    state: &gesture_canvas::GestureCanvasState,
+    reset_pending: &mut bool,
+    accepted: bool,
+) -> Result<(), String> {
+    let encode_frame = accepted && state.has_staged_frame();
+    if !*reset_pending && !encode_frame {
+        return Ok(());
+    }
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Gesture canvas frame"),
+    });
+    if *reset_pending {
+        resources.encode_clear(&mut encoder);
+        *reset_pending = false;
+    }
+    let result = if encode_frame {
+        resources
+            .encode_staged_frame(queue, &mut encoder, 0, state)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(())
+    };
+    // The clear is submitted even when the frame encode was refused: a reset
+    // that stayed on the CPU would leave the previous field bound, which is
+    // strictly worse than a refused update.
+    queue.submit(std::iter::once(encoder.finish()));
+    result
+}
+
+/// One native pointer edge observed while building the egui frame.
+///
+/// It carries the phase and the normalized canvas position only. The direction
+/// and the stroke identity are derived later, at dispatch, where the previous
+/// point of the stroke is known — the same deterministic local-last boundary
+/// the RECOVERY strip uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NativeGestureSample {
+    phase: gesture::GesturePhase,
+    position: [f32; 2],
+}
+
+/// Map a pointer position onto normalized canvas space.
+///
+/// A degenerate rect has no canvas space to map into and yields `None` rather
+/// than a division by zero or an invented corner sample.
+fn normalized_pointer_position(rect: egui::Rect, pointer: egui::Pos2) -> Option<[f32; 2]> {
+    let width = rect.width();
+    let height = rect.height();
+    // A non-finite extent compares false here and is refused with a zero one:
+    // neither describes a canvas a sample could be placed in.
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    Some([
+        ((pointer.x - rect.min.x) / width).clamp(0.0, 1.0),
+        ((pointer.y - rect.min.y) / height).clamp(0.0, 1.0),
+    ])
+}
+
+/// Collect at most one native pointer edge per frame from the preview surface.
+///
+/// egui reports a drag start, continued motion, and a release as separate
+/// per-frame facts, which map exactly onto the three gesture phases. A frame
+/// with no pointer position produces nothing rather than an invented point.
+fn collect_native_gesture_sample(
+    rect: egui::Rect,
+    response: &egui::Response,
+    latest_pointer: Option<egui::Pos2>,
+    samples: &mut Vec<NativeGestureSample>,
+) {
+    let phase = if response.drag_started() {
+        gesture::GesturePhase::Begin
+    } else if response.drag_stopped() {
+        gesture::GesturePhase::End
+    } else if response.dragged() {
+        gesture::GesturePhase::Move
+    } else {
+        return;
+    };
+    let Some(pointer) = response.interact_pointer_pos().or(latest_pointer) else {
+        return;
+    };
+    let Some(position) = normalized_pointer_position(rect, pointer) else {
+        return;
+    };
+    samples.push(NativeGestureSample { phase, position });
 }
 
 struct NativeRecoveryView {
@@ -1306,6 +1512,10 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         // exact bypass, so an inserted Symmetry Field collects no tap, requests
         // no motion field, and encodes no dedicated pass until it is authored.
         "symmetry" => Kind::Symmetry(symmetry::RuntimeSymmetryParams::default()),
+        // Both slots start on the deterministic OneBelow/current-frame donor at
+        // zero mix, so an inserted node is an exact bypass that claims no image
+        // edge until the operator authors one.
+        "residual" => Kind::Residual(visual_rack::RuntimeResidualParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -1534,6 +1744,20 @@ fn set_runtime_node_param(
                 }
                 _ => return Err(format!("unsupported symmetry parameter {param}")),
             },
+            Kind::Residual(params) => match param {
+                "mix" => params.mix = finite_json_f32(value)?,
+                "detail_gain" => params.detail_gain = finite_json_f32(value)?,
+                "block" => params.block = json_enum(value)?,
+                "quantization" => params.quantization = json_enum(value)?,
+                "seed" => params.seed = json_u32(value)?,
+                // Only the two routes rewrite the image dependency graph, so
+                // each owns the dedicated revision-protected ordered action
+                // that names its slot.
+                "structure_tap" | "detail_tap" => {
+                    return Err(format!("{param} requires its ordered topology action"));
+                }
+                _ => return Err(format!("unsupported residual parameter {param}")),
+            },
         },
     }
     normalize_runtime_rack(rack)
@@ -1596,6 +1820,10 @@ struct StagedMorphWorld {
     master_motion: motion::MotionParams,
     ntsc_params: ntsc::NtscParams,
     temporal_params: effects::params::TemporalParams,
+    /// Authored gesture-canvas controls only. The recorded track and the
+    /// etched field are deliberately absent: a rejected morph sample must not
+    /// be able to rewind, replace, or re-etch a recording.
+    gesture_canvas: gesture_canvas::GestureCanvasParams,
     layers: Vec<StagedLayerLook>,
     graph: StagedCreativeGraph,
 }
@@ -1636,6 +1864,7 @@ impl StagedMorphWorld {
             master_motion: app.master_motion,
             ntsc_params: app.ntsc_params.clone(),
             temporal_params: app.temporal_params,
+            gesture_canvas: app.gesture_canvas.params(),
             layers: app.layers.iter().map(StagedLayerLook::capture).collect(),
             graph: StagedCreativeGraph {
                 master_rack: app.master_rack.clone(),
@@ -1657,6 +1886,7 @@ impl StagedMorphWorld {
             master_motion: app.master_motion,
             ntsc_params: app.ntsc_params.clone(),
             temporal_params: app.temporal_params,
+            gesture_canvas: app.gesture_canvas.params(),
             layers: app.layers.iter().map(StagedLayerLook::capture).collect(),
             graph: app.authored_creative_graph(),
         }
@@ -1668,6 +1898,7 @@ impl StagedMorphWorld {
         app.master_motion = self.master_motion;
         app.ntsc_params = self.ntsc_params.clone();
         app.temporal_params = self.temporal_params;
+        app.gesture_canvas.set_params(self.gesture_canvas);
         for (layer, values) in app.layers.iter_mut().zip(self.layers.iter().copied()) {
             values.install(layer);
         }
@@ -3206,6 +3437,76 @@ struct App {
     /// for deterministic offline replay. Automatic events are regenerated
     /// from their authoritative loop/beat/audio inputs instead.
     temporal_event_recorder: temporal::TemporalEventRecorder,
+    /// True while gesture recording is armed. The honesty law: while this is
+    /// false a normalized live gesture reaches the session only and is never
+    /// added to the replayable track.
+    gesture_recording: bool,
+    /// Normalized gesture events observed this frame, retained until one
+    /// complete frame is accepted exactly as `pending_temporal_events` is. It
+    /// is bounded by the same `MAX_GESTURE_EVENTS` cap the track uses, so a
+    /// frozen or stalled program cannot grow it without limit.
+    pending_gesture_events: Vec<gesture::GestureEvent>,
+    /// Normalized samples this frame stages into the live canvas, armed or
+    /// not. The honesty law splits the two destinations deliberately: an
+    /// unrecorded gesture still etches the current session's canvas, and only
+    /// an armed one may enter the replayable track.
+    pending_gesture_canvas_events: Vec<gesture::GestureEvent>,
+    /// Accepted authored gesture events retained as a bounded 30 Hz track for
+    /// deterministic offline replay.
+    gesture_event_recorder: gesture::GestureEventRecorder,
+    /// Continuous-controller stroke machines. MIDI and OSC own separate
+    /// surfaces so two protocols can never interleave into one stroke.
+    gesture_midi_surface: gesture::GestureControlSurface,
+    gesture_osc_surface: gesture::GestureControlSurface,
+    /// Native pointer stroke state: the last normalized position while a drag
+    /// owns the preview, used to derive the travelled direction.
+    gesture_native_stroke: Option<[f32; 2]>,
+    /// Saturating count of normalized samples that affected this session
+    /// without being recorded. Published beside — never merged into — the
+    /// recorded count.
+    gesture_live_only_events: u64,
+    /// Canonical checksum of the recorded track, recomputed only when the
+    /// track actually changes. The snapshot is published every frame and the
+    /// digest covers the whole bounded stream, so deriving it per broadcast
+    /// would hash the track at display rate for no new truth.
+    gesture_checksum: String,
+    gesture_status: String,
+    /// Routes a completed authored stroke onto exactly one manual-history
+    /// entry. Automation-driven origins never reach the store at all.
+    gesture_history: history::GestureHistoryRouter,
+    /// Identity of the history entry a stroke actually opened. It stays `None`
+    /// when the store refused the transaction, so a later `End` can never
+    /// finish an entry that was never begun.
+    gesture_history_open: Option<history::HistoryGestureId>,
+    /// The one live gesture canvas. Its private staged snapshot is the frame
+    /// transaction: an accepted frame commits, a rejected or abandoned frame
+    /// discards, and a typed reset cause abandons whatever was open.
+    gesture_canvas: gesture_canvas::GestureCanvasState,
+    /// The admitted resource plan covering every currently active canvas. The
+    /// frozen table allows at most two, which is exactly the live canvas plus
+    /// the one an export owns.
+    gesture_canvas_plan: gesture_canvas::GestureCanvasPlan,
+    /// The second admitted canvas, owned by a running export job. It is
+    /// created when the job starts and hard-reset with `ExportCancelled` when
+    /// the job is cancelled, so a cancelled export can never leave etched
+    /// state behind and never touches the operator's live canvas.
+    export_gesture_canvas: Option<gesture_canvas::GestureCanvasState>,
+    /// Device half of the live canvas. It is built from the same admitted
+    /// `gesture_canvas_plan` the CPU reference was admitted under, and it holds
+    /// the one presented donor image a `GestureCanvas` image route binds.
+    ///
+    /// `None` is the exact pre-gesture path: nothing is bound and a canvas
+    /// route reads transparent black, which the frozen decode reads as zero
+    /// displacement.
+    gesture_canvas_gpu: Option<renderer::gesture_canvas::GestureCanvasResources>,
+    /// Monotonic identity of `gesture_canvas_gpu`. It advances whenever the
+    /// resources are rebuilt, which is what makes the composition executor
+    /// re-prepare bind groups that would otherwise keep a destroyed view.
+    gesture_canvas_gpu_epoch: u64,
+    /// A typed reset cause reached the CPU canvas and the device half has not
+    /// caught up yet. It is cleared by encoding the clear, so no reset can be
+    /// observed by the CPU field and silently skipped on the GPU.
+    gesture_canvas_gpu_reset_pending: bool,
     /// Ordered M4 clear/topology edits are consumed by the Advanced executor
     /// at the next encode boundary. This never clears Temporal,
     /// ProgramHistory, image taps, or the held audience frame.
@@ -3566,6 +3867,30 @@ impl App {
             temporal_boundaries: performance::BeatBoundaryTracker::default(),
             pending_temporal_events: temporal::TemporalFrameEvents::default(),
             temporal_event_recorder: temporal::TemporalEventRecorder::default(),
+            gesture_recording: false,
+            pending_gesture_events: Vec::new(),
+            pending_gesture_canvas_events: Vec::new(),
+            gesture_event_recorder: gesture::GestureEventRecorder::default(),
+            gesture_midi_surface: gesture::GestureControlSurface::default()
+                .with_stroke(GESTURE_MIDI_STROKE),
+            gesture_osc_surface: gesture::GestureControlSurface::default()
+                .with_stroke(GESTURE_OSC_STROKE),
+            gesture_native_stroke: None,
+            gesture_live_only_events: 0,
+            gesture_checksum: String::new(),
+            gesture_status: String::new(),
+            gesture_history: history::GestureHistoryRouter::default(),
+            gesture_history_open: None,
+            gesture_canvas: gesture_canvas::GestureCanvasState::new(
+                default_gesture_canvas_grid(),
+                gesture_canvas::GestureCanvasParams::default(),
+            )
+            .expect("the default gesture canvas grid is inside the frozen table"),
+            gesture_canvas_plan: gesture_canvas::GestureCanvasPlan::default(),
+            export_gesture_canvas: None,
+            gesture_canvas_gpu: None,
+            gesture_canvas_gpu_epoch: 0,
+            gesture_canvas_gpu_reset_pending: false,
             pending_motion_memory_clear: false,
             temporal_audio_onsets: temporal::TemporalAudioOnsetTracker::default(),
             image_routing_diagnostics: Vec::new(),
@@ -3906,7 +4231,8 @@ impl App {
             &staged.master_rack,
             &staged.layer_racks,
         )
-        .with_layer_mattes(&mattes, false);
+        .with_layer_mattes(&mattes, false)
+        .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0);
         let motion_limits = self.renderer.as_ref().map_or_else(
             || motion::MotionDeviceLimits::new(u32::MAX, u64::MAX),
             |renderer| {
@@ -3924,6 +4250,8 @@ impl App {
             input.resource_limits.max_texture_array_layers = limits.max_texture_array_layers;
             input.resource_limits.max_sampled_textures_per_shader_stage =
                 limits.max_sampled_textures_per_shader_stage;
+            input.resource_limits.min_uniform_buffer_offset_alignment =
+                limits.min_uniform_buffer_offset_alignment;
         } else {
             // `CreativeResourceLimits::default()` carries the ordinary rack
             // constant in the sampled-texture slot, which is bind-layout policy
@@ -4094,6 +4422,7 @@ impl App {
                 | WebAction::SetVisualNodeRoute { .. }
                 | WebAction::SetVisualNodeDisplaceRoute { .. }
                 | WebAction::SetVisualNodeSymmetryRoute { .. }
+                | WebAction::SetVisualNodeResidualRoute { .. }
                 | WebAction::SetCompositionGroupMatteRoute { .. }
                 | WebAction::SetCompositionGroupMatteParam { .. }
                 | WebAction::SetCompositionGroupParam { .. }
@@ -4443,6 +4772,47 @@ impl App {
                     normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
                     self.preflight_creative_graph(&staged)?;
                     self.commit_creative_graph(staged, true, label)?;
+                }
+                WebAction::SetVisualNodeResidualRoute {
+                    scope,
+                    node_id,
+                    slot,
+                    route,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let tap = self.creative_route_from_snapshot(route, &staged.composition)?;
+                    let node = staged
+                        .rack_mut(scope)
+                        .and_then(|rack| rack.get_mut(node_id))
+                        .ok_or_else(|| format!("residual node {} is absent", node_id.get()))?;
+                    let visual_rack::RuntimeVisualNodeKind::Residual(params) = &mut node.kind
+                    else {
+                        return Err(format!("node {} is not a residual", node_id.get()));
+                    };
+                    // Exactly one named slot moves. The partner route, both
+                    // gains, both discrete laws and the seed keep their
+                    // authored values across a reroute.
+                    let named = params.route_mut(slot.slot()).ok_or_else(|| {
+                        format!("residual node {} has no such route slot", node_id.get())
+                    })?;
+                    *named = tap;
+                    normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!(
+                            "Routed residual node {} {} input",
+                            node_id.get(),
+                            slot.label()
+                        ),
+                    )?;
                 }
                 WebAction::SetCompositionGroupMatteRoute {
                     group_id,
@@ -5198,6 +5568,12 @@ impl App {
         self.quantized_bar = Some((self.mod_matrix.current_beat / 4.0).floor() as i64);
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
         self.temporal_event_recorder.clear();
+        // A patch load, an Apply Look, and a broad revert are authored
+        // generation barriers: the recorded gesture track belongs to the
+        // program that was replaced. A source cut deliberately does not clear
+        // it, exactly as it does not clear the temporal track.
+        self.clear_gesture_recording_state();
+        self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::PatchGeneration);
         self.temporal_boundaries
             .reanchor(self.mod_matrix.current_beat);
         self.temporal_audio_onsets
@@ -5244,7 +5620,50 @@ impl App {
             &self.morph,
         )?;
         captured.scenes = self.scenes.clone();
+        // A track is authored topology carried whole. An operator who never
+        // recorded a gesture emits no section at all, so the saved patch, the
+        // recovery journal payload, and every fingerprint derived from them
+        // stay byte-identical to the pre-gesture path.
+        let track = self.gesture_event_recorder.track();
+        captured.gesture_track =
+            (!track.events().is_empty()).then(|| gesture::GestureTrackDocument::capture(track));
+        // Same law for the authored canvas controls: an untouched canvas is
+        // the pre-gesture path, so a default section is omitted rather than
+        // written out and silently changing every canonical patch hash.
+        let canvas = patch::GestureCanvasConfig::from_params(self.gesture_canvas.params());
+        captured.gesture_canvas = (!canvas.is_default()).then_some(canvas);
         Ok(captured)
+    }
+
+    /// Restore a recorded gesture track from a committed patch.
+    ///
+    /// This runs *after* `reset_patch_generation`, which clears the recorder
+    /// belonging to the program that was just replaced. The document's own
+    /// acceptance path revalidates every event and re-derives the canonical
+    /// checksum, so a track that survives here is the exact recorded stream and
+    /// not a repaired one.
+    fn restore_gesture_track_from_patch(&mut self, patch: &patch::PatchState) {
+        // Authored values first: an absent section is the pre-gesture path and
+        // leaves the live canvas controls exactly where the barrier reset them.
+        if let Some(canvas) = patch.gesture_canvas {
+            self.gesture_canvas.set_params(canvas.to_params());
+        }
+        let Some(document) = patch.gesture_track.as_ref() else {
+            return;
+        };
+        match document.decode() {
+            Ok(track) => {
+                self.gesture_event_recorder.restore(track);
+                self.gesture_checksum = published_gesture_checksum(&self.gesture_event_recorder);
+                self.gesture_status = format!(
+                    "Restored {} recorded gesture event(s) from the patch",
+                    self.gesture_event_recorder.track().events().len()
+                );
+            }
+            Err(error) => {
+                self.gesture_status = format!("Saved gesture track rejected: {error}");
+            }
+        }
     }
 
     fn capture_manual_history_world(&self) -> Result<(ManualHistoryWorld, Vec<u8>), String> {
@@ -6520,6 +6939,9 @@ impl App {
         // no temporal/readback/NTSC pixel from the prior patch may leak into
         // this one.
         self.reset_patch_generation();
+        // Strictly after the barrier that cleared the retired program's
+        // recorder, so a restored track cannot be wiped by its own load.
+        self.restore_gesture_track_from_patch(&patch);
 
         // Patch recall stores the requested CPAL device. If a stream is still
         // open for another preference, stop it now; the frame pump reopens
@@ -6722,6 +7144,12 @@ impl App {
         self.selective_hold_spout_readback_epoch = None;
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
         self.temporal_event_recorder.clear();
+        // A patch load, an Apply Look, and a broad revert are authored
+        // generation barriers: the recorded gesture track belongs to the
+        // program that was replaced. A source cut deliberately does not clear
+        // it, exactly as it does not clear the temporal track.
+        self.clear_gesture_recording_state();
+        self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::ApplyLook);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_visual_generation_for(temporal::TemporalResetCause::ApplyLook);
         }
@@ -6746,6 +7174,10 @@ impl App {
         self.selective_hold_spout_barrier_epoch = None;
         self.selective_hold_spout_readback_epoch = None;
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+        // A cut rebases the canvas decay clock and deliberately keeps the
+        // authored etch, exactly as it deliberately keeps the recorded track.
+        // A seek is not an erase.
+        self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::SourceCut);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_visual_generation_for(temporal::TemporalResetCause::SourceCut);
         }
@@ -7048,6 +7480,7 @@ impl App {
             | WebAction::SetVisualNodeMaskVariant { scope, .. }
             | WebAction::SetVisualNodeRoute { scope, .. }
             | WebAction::SetVisualNodeDisplaceRoute { scope, .. }
+            | WebAction::SetVisualNodeResidualRoute { scope, .. }
             | WebAction::SetVisualNodeSymmetryRoute { scope, .. } => {
                 matches!(scope, CreativeScopeSnapshot::Master)
             }
@@ -7196,6 +7629,10 @@ impl App {
     /// authored controls, non-temporal M2 donor histories, and the exact
     /// audience image held by Program Freeze.
     fn clear_temporal_memory(&mut self) {
+        // The operator's explicit "erase the accumulated memory" action. It
+        // clears the etched field and deliberately leaves the recorded track
+        // alone, exactly as it leaves the recorded temporal event track alone.
+        self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::ManualClear);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.clear_temporal_memory();
         }
@@ -7240,6 +7677,7 @@ impl App {
             let fallback = attempt_index != 0;
             baseline.install(self);
             let mut layer_racks = self.layer_racks();
+            let mut gesture_canvas = self.gesture_canvas.params();
             self.morph.apply_with_composition_and_motion(
                 sample_t,
                 &mut self.master_effects,
@@ -7251,7 +7689,9 @@ impl App {
                 &mut self.master_rack,
                 &mut layer_racks,
                 &mut self.composition,
+                &mut gesture_canvas,
             );
+            self.gesture_canvas.set_params(gesture_canvas);
             let candidate = StagedMorphWorld::capture(self, layer_racks);
             baseline.install(self);
 
@@ -8563,6 +9003,13 @@ impl App {
                 scope: web::state::MotionScopeSnapshot::Master,
                 ..
             } => self.morph.controls_master_motion(),
+            // Only the authored canvas values are owned. Arming or disarming
+            // recording is a performance control over a recording, not an edit
+            // to a morphable value, so it never transfers A/B ownership.
+            WebAction::SetGestureCanvas { param, value } => {
+                Self::valid_gesture_canvas_edit(param, value)
+                    && self.morph.controls_master_gesture()
+            }
             WebAction::SetMotion {
                 scope: web::state::MotionScopeSnapshot::Layer { layer_id },
                 ..
@@ -8738,6 +9185,12 @@ impl App {
         self.selective_hold_spout_readback_epoch = None;
         self.pending_temporal_events = temporal::TemporalFrameEvents::default();
         self.temporal_event_recorder.clear();
+        // A patch load, an Apply Look, and a broad revert are authored
+        // generation barriers: the recorded gesture track belongs to the
+        // program that was replaced. A source cut deliberately does not clear
+        // it, exactly as it does not clear the temporal track.
+        self.clear_gesture_recording_state();
+        self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::BroadRevert);
         // A broad revert starts a new visual generation. If a blackout is
         // already requested, consider its audience edge consumed so the next
         // frame cannot capture (and later restore) pre-revert pixels.
@@ -8799,6 +9252,11 @@ impl App {
                 | web::state::WebAction::TriggerCollisionScore
                 | web::state::WebAction::TriggerRefreshGarden
                 | web::state::WebAction::ClearTemporalEventTrack
+                // A gesture is authored against the frame it was drawn in.
+                // Latching a sample or an arm/disarm edge to the next downbeat
+                // would rewrite the recorded stream.
+                | web::state::WebAction::GestureSample { .. }
+                | web::state::WebAction::SetGestureRecording { .. }
         ) {
             self.composition_status =
                 "Ordered memory/event and donor actions cannot be quantized".to_string();
@@ -10387,6 +10845,13 @@ impl App {
                     ));
                 }
                 self.invalidate_source_cut_generation();
+                // A prepared transaction swaps the pixels a layer or a whole
+                // scene reads from. That is a source replacement rather than a
+                // seek, so the canvas records the more specific cause; both
+                // rebase the decay clock and keep the authored etch.
+                self.reset_gesture_canvas_for(
+                    gesture_canvas::GestureCanvasResetCause::SourceReplacement,
+                );
                 if let Some(before) = deferred_before {
                     if let Err(error) = self.record_deferred_performance_history(before) {
                         self.history_status =
@@ -11832,8 +12297,14 @@ impl App {
         }
     }
 
+    /// The one normalized typed-control adapter for MIDI and OSC.
+    ///
+    /// `origin` is provenance. It selects which protocol's gesture stroke
+    /// machine a gesture scalar reaches and never changes any resulting value:
+    /// every other address ignores it entirely.
     fn apply_automation_control(
         &mut self,
+        origin: controller_profile::AutomationOrigin,
         address: controller_profile::RuntimeControlAddress,
         value: controller_profile::AutomationValue,
     ) -> Result<f32, String> {
@@ -11930,6 +12401,23 @@ impl App {
                         param: param.into(),
                         value: serde_json::json!(actual),
                     }
+                }
+                // A controller has no stroke of its own, so a gesture scalar
+                // never becomes a browser action: it feeds this protocol's
+                // stroke machine directly and returns the value it set.
+                Param::GestureX
+                | Param::GestureY
+                | Param::GesturePressure
+                | Param::GestureContact => {
+                    let input = match parameter {
+                        Param::GestureX => gesture::GestureControlInput::X(requested),
+                        Param::GestureY => gesture::GestureControlInput::Y(requested),
+                        Param::GesturePressure => gesture::GestureControlInput::Pressure(requested),
+                        Param::GestureContact => gesture::GestureControlInput::Contact(bool_value),
+                        _ => unreachable!(),
+                    };
+                    self.apply_gesture_control(origin, input);
+                    return Ok(requested);
                 }
                 Param::BusCrossfade => WebAction::SetCompositionBusCrossfade { value: requested },
                 Param::Paused | Param::ProgramFreeze => {
@@ -12350,7 +12838,7 @@ impl App {
             let event = self.midi_events[index];
             match event.kind {
                 controller_profile::ControllerEventKind::Control { address, value, .. } => {
-                    match self.apply_automation_control(address, value) {
+                    match self.apply_automation_control(event.origin, address, value) {
                         Ok(normalized) => {
                             self.publish_controller_feedback(address, normalized, event.origin);
                         }
@@ -12382,7 +12870,7 @@ impl App {
         self.osc.drain_events(&mut self.osc_events);
         for index in 0..self.osc_events.len() {
             let event = self.osc_events[index];
-            match self.apply_automation_control(event.address, event.value) {
+            match self.apply_automation_control(event.origin, event.address, event.value) {
                 Ok(normalized) => {
                     self.publish_controller_feedback(event.address, normalized, event.origin);
                 }
@@ -12390,6 +12878,575 @@ impl App {
             }
         }
         self.osc_events.clear();
+        self.pump_gesture_surfaces();
+    }
+
+    /// Sample this frame's continuous-controller gesture motion.
+    ///
+    /// MIDI and OSC carry no stroke timing of their own, so exactly one `Move`
+    /// per open surface per frame becomes exactly one 30 Hz reference address.
+    /// A stationary open surface emits nothing.
+    fn pump_gesture_surfaces(&mut self) {
+        let midi = self.gesture_midi_surface.sample_motion();
+        let osc = self.gesture_osc_surface.sample_motion();
+        if let Some(raw) = midi {
+            self.ingest_gesture_sample(gesture::GestureOrigin::Midi, raw);
+        }
+        if let Some(raw) = osc {
+            self.ingest_gesture_sample(gesture::GestureOrigin::Osc, raw);
+        }
+    }
+
+    /// Feed one continuous-controller scalar into its protocol's stroke
+    /// machine. Only a contact edge produces a sample here; axis motion is
+    /// observed by `pump_gesture_surfaces` at the frame boundary.
+    fn apply_gesture_control(
+        &mut self,
+        origin: controller_profile::AutomationOrigin,
+        input: gesture::GestureControlInput,
+    ) {
+        let (gesture_origin, sample) = match origin {
+            controller_profile::AutomationOrigin::Osc(_) => (
+                gesture::GestureOrigin::Osc,
+                self.gesture_osc_surface.apply(input),
+            ),
+            controller_profile::AutomationOrigin::Midi
+            | controller_profile::AutomationOrigin::HostAutomation => (
+                gesture::GestureOrigin::Midi,
+                self.gesture_midi_surface.apply(input),
+            ),
+        };
+        if let Some(raw) = sample {
+            self.ingest_gesture_sample(gesture_origin, raw);
+        }
+    }
+
+    /// Turn one native pointer edge into a normalized sample, deriving the
+    /// travelled direction from the previous point of the same stroke.
+    fn apply_native_gesture_sample(&mut self, sample: NativeGestureSample) {
+        let previous = match sample.phase {
+            gesture::GesturePhase::Begin => {
+                self.gesture_native_stroke = Some(sample.position);
+                None
+            }
+            gesture::GesturePhase::Move => {
+                let previous = self.gesture_native_stroke;
+                if previous.is_none() {
+                    // A drag whose Begin was never observed is an orphan. The
+                    // ingest validator would reject it anyway; refusing it here
+                    // keeps the refusal named rather than counted.
+                    self.gesture_status =
+                        "Native gesture motion without an open stroke ignored".to_string();
+                    return;
+                }
+                self.gesture_native_stroke = Some(sample.position);
+                previous
+            }
+            gesture::GesturePhase::End => self.gesture_native_stroke.take(),
+        };
+        let direction = previous.map_or([0.0, 0.0], |previous| {
+            [
+                sample.position[0] - previous[0],
+                sample.position[1] - previous[1],
+            ]
+        });
+        let raw = gesture::RawGestureSample::new(
+            GESTURE_NATIVE_STROKE,
+            sample.phase,
+            gesture::GestureMode::Push,
+            sample.position,
+        )
+        .with_direction(direction);
+        self.ingest_gesture_sample(gesture::GestureOrigin::NativePointer, raw);
+    }
+
+    /// The single host-side gesture ingest. Every surface reaches the one
+    /// normalized adapter through here and nowhere else.
+    ///
+    /// Recording is explicit. While it is disarmed the normalized event is a
+    /// session-local fact and is counted separately as live-only — it is never
+    /// added to the replayable track and must never be reported as replayable.
+    fn ingest_gesture_sample(
+        &mut self,
+        origin: gesture::GestureOrigin,
+        raw: gesture::RawGestureSample,
+    ) {
+        let tick = self.gesture_event_recorder.reference_tick_u32();
+        let event = match gesture::normalize_gesture_input(origin, raw, tick) {
+            Ok(event) => event,
+            Err(error) => {
+                self.gesture_status = format!("Gesture sample ignored: {error}");
+                return;
+            }
+        };
+        // §4. One completed authored gesture is exactly one manual-history
+        // entry, opened at its first Begin and closed at its final End.
+        // Automation origins never reach the store, and every Move in between
+        // is deliberately invisible so a long stroke cannot flood the bounded
+        // stack.
+        match self
+            .gesture_history
+            .observe(origin, event.phase, event.stroke)
+        {
+            history::GestureHistoryStep::Idle => {}
+            history::GestureHistoryStep::Open(id) => self.open_gesture_history_entry(origin, id),
+            history::GestureHistoryStep::Close(id) => self.close_gesture_history_entry(id),
+        }
+        // A disarmed sample still etches the current session's canvas; only an
+        // armed one may enter the replayable track. Keeping the two batches
+        // separate is what makes "affects this session only" a fact rather
+        // than a claim.
+        if self.pending_gesture_canvas_events.len()
+            < gesture_canvas::GESTURE_CANVAS_MAX_SAMPLES_PER_UPDATE
+        {
+            self.pending_gesture_canvas_events.push(event);
+        } else {
+            self.gesture_status = format!(
+                "Gesture canvas frame reached its {}-sample cap; newer samples etch nothing this frame",
+                gesture_canvas::GESTURE_CANVAS_MAX_SAMPLES_PER_UPDATE
+            );
+        }
+        if !self.gesture_recording {
+            self.gesture_live_only_events = self.gesture_live_only_events.saturating_add(1);
+            return;
+        }
+        if self.pending_gesture_events.len() >= gesture::MAX_GESTURE_EVENTS {
+            self.gesture_live_only_events = self.gesture_live_only_events.saturating_add(1);
+            self.gesture_status = format!(
+                "Gesture batch reached its {}-event cap; newer samples remain live-only",
+                gesture::MAX_GESTURE_EVENTS
+            );
+            return;
+        }
+        self.pending_gesture_events.push(event);
+    }
+
+    /// Open the one manual-history entry a beginning authored gesture owns.
+    ///
+    /// A refusal is reported and then forgotten: `gesture_history_open` stays
+    /// `None`, so the matching `End` finishes nothing rather than closing an
+    /// entry the store never accepted.
+    fn open_gesture_history_entry(
+        &mut self,
+        origin: gesture::GestureOrigin,
+        id: history::HistoryGestureId,
+    ) {
+        let checkpoint = match self.history_checkpoint("Etch gesture", "gesture") {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.history_status = format!("Gesture history rejected before mutation: {error}");
+                return;
+            }
+        };
+        let fingerprint = checkpoint.fingerprint();
+        match self.manual_history.begin_gesture(
+            id,
+            history::MutationOrigin::for_gesture_origin(origin),
+            checkpoint,
+        ) {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.gesture_history_open = Some(id);
+                self.history_gesture_begin = Some((id, fingerprint));
+                self.history_status = format!("Gesture history {} started", id.get());
+            }
+            Ok(outcome) => {
+                self.history_status = format!("Gesture history not opened: {outcome:?}");
+            }
+            Err(error) => {
+                self.history_status = format!("Gesture history could not start: {error}");
+            }
+        }
+    }
+
+    /// Close the one entry this gesture opened. An unchanged authored world is
+    /// `NoChange` and records nothing, exactly as every other manual gesture.
+    fn close_gesture_history_entry(&mut self, id: history::HistoryGestureId) {
+        if self.gesture_history_open.take() != Some(id) {
+            return;
+        }
+        let fingerprint = match self.capture_manual_history_world() {
+            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+            Err(error) => {
+                self.history_status = format!("Gesture history capture failed: {error}");
+                return;
+            }
+        };
+        match self.manual_history.finish_gesture(id, fingerprint) {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("Gesture history {} committed", id.get());
+                self.append_recovery_checkpoint("gesture");
+            }
+            Ok(history::HistoryRecordOutcome::NoChange) => {
+                self.history_gesture_begin = None;
+                self.history_status = "Gesture made no authored change".to_string();
+            }
+            Ok(outcome) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("Gesture history: {outcome:?}");
+            }
+            Err(error) => {
+                self.history_status = format!("Gesture history could not finish: {error}");
+            }
+        }
+    }
+
+    /// Arm or disarm recording. Disarming closes nothing: a stroke that was
+    /// open when recording stopped stays explicitly incomplete in the track
+    /// rather than gaining an `End` the operator never made.
+    fn set_gesture_recording(&mut self, enabled: bool) {
+        if self.gesture_recording == enabled {
+            return;
+        }
+        self.gesture_recording = enabled;
+        if enabled {
+            self.gesture_status = "Gesture recording armed".to_string();
+        } else {
+            self.pending_gesture_events.clear();
+            self.gesture_status = if self.gesture_event_recorder.track().is_complete() {
+                "Gesture recording disarmed".to_string()
+            } else {
+                format!(
+                    "Gesture recording disarmed with {} stroke(s) still open; the track stays explicitly incomplete",
+                    self.gesture_event_recorder.track().open_stroke_count()
+                )
+            };
+        }
+    }
+
+    /// Author one bounded continuous canvas control.
+    ///
+    /// The vocabulary is closed and contains no key that could reach the
+    /// recorded track: a browser scalar edits authored values only.
+    /// The same closed vocabulary the server enforces at ingress, reused so
+    /// the ownership predicate and the dispatcher can never disagree about
+    /// what counts as an authored canvas edit.
+    fn valid_gesture_canvas_edit(param: &str, value: &serde_json::Value) -> bool {
+        matches!(param, "radius" | "strength" | "retention")
+            && value.as_f64().is_some_and(f64::is_finite)
+    }
+
+    fn set_gesture_canvas_param(
+        &mut self,
+        param: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), String> {
+        let number = value
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(|number| number as f32)
+            .ok_or_else(|| format!("Gesture canvas {param} requires a finite number"))?;
+        let mut params = self.gesture_canvas.params();
+        match param {
+            "radius" => params.radius = number,
+            "strength" => params.strength = number,
+            "retention" => params.retention = number,
+            _ => return Err(format!("Unsupported gesture canvas parameter {param}")),
+        }
+        self.gesture_canvas.set_params(params);
+        if let Some(canvas) = self.export_gesture_canvas.as_mut() {
+            canvas.set_params(params);
+        }
+        Ok(())
+    }
+
+    /// Publish gesture recording truth.
+    ///
+    /// Recorded and live-only counts are separate fields and neither is
+    /// derived from the other, so an unrecorded live gesture can never be read
+    /// as replayable. The checksum is published only for a non-empty track: an
+    /// empty track has nothing to verify and an offered digest would imply it
+    /// did. The canvas block sits beside these fields rather than inside them,
+    /// because an etched canvas is session state and says nothing about
+    /// whether any of it was recorded.
+    fn gesture_status_snapshot(&self) -> web::state::GestureStatusSnapshot {
+        let track = self.gesture_event_recorder.track();
+        let params = self.gesture_canvas.params();
+        let grid = self.gesture_canvas.grid();
+        web::state::GestureStatusSnapshot {
+            recording: self.gesture_recording,
+            recorded_events: u32::try_from(track.events().len()).unwrap_or(u32::MAX),
+            truncated: track.truncated(),
+            open_strokes: track.open_stroke_count(),
+            live_only_events: self.gesture_live_only_events,
+            checksum: self.gesture_checksum.clone(),
+            status: self.gesture_status.clone(),
+            canvas: web::state::GestureCanvasStatusSnapshot {
+                radius: params.radius,
+                strength: params.strength,
+                retention: params.retention,
+                grid_width: grid.width,
+                grid_height: grid.height,
+                generation: self.gesture_canvas.generation(),
+            },
+        }
+    }
+
+    /// Clear the recorded track and every surface's open stroke. Used by the
+    /// same authored-generation barriers that clear the temporal event track.
+    fn clear_gesture_recording_state(&mut self) {
+        self.pending_gesture_events.clear();
+        self.pending_gesture_canvas_events.clear();
+        self.gesture_event_recorder.clear();
+        self.gesture_checksum.clear();
+        self.gesture_midi_surface =
+            gesture::GestureControlSurface::default().with_stroke(GESTURE_MIDI_STROKE);
+        self.gesture_osc_surface =
+            gesture::GestureControlSurface::default().with_stroke(GESTURE_OSC_STROKE);
+        self.gesture_native_stroke = None;
+        // The open manual-history transaction described the authored world
+        // that this barrier just replaced. Abandon it rather than committing a
+        // checkpoint against a program that no longer exists.
+        if let Some(id) = self.gesture_history.abandon() {
+            if self.gesture_history_open.take() == Some(id) {
+                let _ = self.manual_history.cancel_gesture(id);
+                self.history_gesture_begin = None;
+            }
+        }
+    }
+
+    /// Device facts a gesture canvas is admitted under. Without a renderer the
+    /// host uses the frozen edge and the ordinary 256-byte uniform alignment,
+    /// which is the same conservative shape `MediaSafetyPolicy` uses before an
+    /// adapter is known.
+    fn gesture_canvas_limits(&self) -> gesture_canvas::GestureCanvasLimits {
+        self.renderer.as_ref().map_or_else(
+            || {
+                gesture_canvas::GestureCanvasLimits::device(
+                    gesture_canvas::GESTURE_CANVAS_MAX_EDGE,
+                    gesture_canvas::GESTURE_CANVAS_UNIFORM_STRIDE as u32,
+                )
+            },
+            |renderer| {
+                let limits = renderer.device.limits();
+                gesture_canvas::GestureCanvasLimits::device(
+                    limits.max_texture_dimension_2d,
+                    limits.min_uniform_buffer_offset_alignment,
+                )
+            },
+        )
+    }
+
+    /// Admit every currently active canvas through one preflight.
+    ///
+    /// The frozen table allows at most two active canvases and one aggregate
+    /// budget across them, which is exactly the live canvas plus the one an
+    /// export owns. Both are therefore charged together, before either is
+    /// created, rather than each admitting itself in isolation.
+    fn admit_gesture_canvases(
+        &self,
+        export: Option<gesture_canvas::GestureCanvasGrid>,
+    ) -> Result<gesture_canvas::GestureCanvasPlan, gesture_canvas::GestureCanvasError> {
+        let mut requests = Vec::with_capacity(gesture_canvas::GESTURE_CANVAS_MAX_ACTIVE as usize);
+        requests.push(
+            gesture_canvas::GestureCanvasRequest::new(self.gesture_canvas.grid())
+                .with_decay_ticks(gesture::MAX_GESTURE_DECAY_TICKS),
+        );
+        if let Some(grid) = export {
+            requests.push(
+                gesture_canvas::GestureCanvasRequest::new(grid)
+                    .with_decay_ticks(gesture::MAX_GESTURE_DECAY_TICKS),
+            );
+        }
+        gesture_canvas::GestureCanvasPlan::preflight(&requests, self.gesture_canvas_limits())
+    }
+
+    /// Stage this frame's normalized samples into the live canvas.
+    ///
+    /// The transaction opens here and closes at the frame's acceptance
+    /// decision. A frame that never reached that decision — a device loss, an
+    /// early return — is discarded exactly like a rejected one, because an
+    /// abandoned frame must also leave no visible change.
+    fn stage_gesture_canvas_frame(
+        &mut self,
+        program_advances: bool,
+        evaluated_params: Option<gesture_canvas::GestureCanvasParams>,
+    ) {
+        if self.gesture_canvas.has_staged_frame() {
+            self.gesture_canvas.discard_staged();
+            self.gesture_status =
+                "Abandoned gesture canvas frame discarded before the next one".to_string();
+        }
+        let input = gesture_canvas::GestureCanvasFrameInput {
+            reference_tick: self.gesture_event_recorder.reference_tick(),
+            program_advances,
+            events: &self.pending_gesture_canvas_events,
+            evaluated_params,
+        };
+        match self.gesture_canvas.stage_frame(input) {
+            Ok(plan) => {
+                if plan.decay_clamped {
+                    self.gesture_status = format!(
+                        "Gesture canvas decay clamped to its {}-tick budget",
+                        gesture::MAX_GESTURE_DECAY_TICKS
+                    );
+                }
+            }
+            Err(error) => {
+                self.gesture_status = format!("Gesture canvas frame refused: {error}");
+            }
+        }
+    }
+
+    /// Reset the live canvas for a typed cause. Never a boolean, and never a
+    /// second reset path: the cause selects the domains.
+    fn reset_gesture_canvas_for(&mut self, cause: gesture_canvas::GestureCanvasResetCause) {
+        self.gesture_canvas.reset_for(cause);
+        self.pending_gesture_canvas_events.clear();
+        // Every typed cause reaches the device half through this one flag. A
+        // reset that cleared only the CPU field would leave the previously
+        // etched donor image bound and readable, which is exactly the stale
+        // state a reset exists to remove.
+        self.gesture_canvas_gpu_reset_pending = true;
+    }
+
+    /// Build or rebuild the device half of the live canvas from the already
+    /// admitted plan.
+    ///
+    /// Admission is not repeated here as a second policy: the requests are the
+    /// ones `admit_gesture_canvases` accepted, and `GestureCanvasResources`
+    /// preflights them again in full before it allocates, so the two can only
+    /// ever agree or fail closed together.
+    fn ensure_gesture_canvas_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let grid = self.gesture_canvas.grid();
+        if self.gesture_canvas_plan.canvases == 0 {
+            if self.gesture_canvas_gpu.take().is_some() {
+                self.gesture_canvas_gpu_epoch = self.gesture_canvas_gpu_epoch.saturating_add(1);
+            }
+            return;
+        }
+        if self
+            .gesture_canvas_gpu
+            .as_ref()
+            .is_some_and(|resources| resources.canvas(0).is_some_and(|c| c.grid() == grid))
+        {
+            return;
+        }
+        let request = gesture_canvas::GestureCanvasRequest::new(grid)
+            .with_decay_ticks(gesture::MAX_GESTURE_DECAY_TICKS);
+        match renderer::gesture_canvas::GestureCanvasResources::prepare(
+            device,
+            queue,
+            &[request],
+            self.gesture_canvas_limits(),
+        ) {
+            Ok(resources) => {
+                self.gesture_canvas_gpu = Some(resources);
+                self.gesture_canvas_gpu_epoch = self.gesture_canvas_gpu_epoch.saturating_add(1);
+                // A fresh canvas is already cleared by its own initialization,
+                // so a pending reset has nothing left to do.
+                self.gesture_canvas_gpu_reset_pending = false;
+            }
+            Err(error) => {
+                let message = format!("Gesture canvas GPU resources refused: {error}");
+                if message != self.gesture_status {
+                    log::error!("{message}");
+                }
+                self.gesture_status = message;
+                if self.gesture_canvas_gpu.take().is_some() {
+                    self.gesture_canvas_gpu_epoch = self.gesture_canvas_gpu_epoch.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Resize the live canvas to follow a new program surface. A resize is a
+    /// hard reset: the etch is authored in normalized space but its sampled
+    /// resolution is part of what was authored, so resampling would invent
+    /// cells nobody etched. A refused geometry changes nothing at all.
+    fn resize_gesture_canvas_for_output(&mut self, width: u32, height: u32) {
+        let grid = gesture_canvas_host_grid(width, height);
+        if self.gesture_canvas.grid() != grid {
+            if let Err(error) = self.gesture_canvas.resize(grid.width, grid.height) {
+                self.gesture_status = format!("Gesture canvas resize refused: {error}");
+                return;
+            }
+            self.pending_gesture_canvas_events.clear();
+            // `GestureCanvasState::resize` raises `Resize` on the state itself
+            // rather than through `reset_gesture_canvas_for`, so the device
+            // flag is raised explicitly here. The rebuilt resources will clear
+            // themselves at construction and lower it again; raising it is what
+            // keeps the "every cause reaches the GPU" law true even if the
+            // rebuild is ever made conditional.
+            self.gesture_canvas_gpu_reset_pending = true;
+        }
+        // Admission is refreshed even when the geometry is unchanged. The
+        // process starts with an empty plan, and a program surface that happens
+        // to derive the starting grid would otherwise leave the canvas
+        // permanently unadmitted — which a routed image tap would then see as a
+        // transparent donor for the whole session.
+        match self.admit_gesture_canvases(
+            self.export_gesture_canvas
+                .as_ref()
+                .map(gesture_canvas::GestureCanvasState::grid),
+        ) {
+            Ok(plan) => self.gesture_canvas_plan = plan,
+            Err(error) => {
+                self.gesture_status = format!("Gesture canvas admission refused: {error}");
+            }
+        }
+    }
+
+    /// Admit and create the export-owned canvas. This is the second of the two
+    /// canvases the frozen table allows; both are charged against the one
+    /// aggregate budget before either exists.
+    fn open_export_gesture_canvas(&mut self, width: u32, height: u32) {
+        let grid = gesture_canvas_host_grid(width, height);
+        match self.admit_gesture_canvases(Some(grid)) {
+            Ok(plan) => {
+                match gesture_canvas::GestureCanvasState::new(grid, self.gesture_canvas.params()) {
+                    Ok(canvas) => {
+                        self.gesture_canvas_plan = plan;
+                        self.export_gesture_canvas = Some(canvas);
+                    }
+                    Err(error) => {
+                        self.gesture_status = format!("Export gesture canvas refused: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                self.gesture_status = format!("Export gesture canvas admission refused: {error}");
+            }
+        }
+    }
+
+    /// Release the export-owned canvas once its job reaches a terminal state.
+    ///
+    /// A completed export is not a cancellation, so nothing is reset: the
+    /// canvas is simply destroyed and its bytes returned to the aggregate
+    /// budget. Only an abandoned render takes the `ExportCancelled` path.
+    fn release_finished_export_gesture_canvas(&mut self) {
+        if self.export_gesture_canvas.is_none() {
+            return;
+        }
+        let finished = self
+            .export_job
+            .as_ref()
+            .is_none_or(render_export::ExportJob::is_done);
+        if !finished {
+            return;
+        }
+        self.export_gesture_canvas = None;
+        if let Ok(plan) = self.admit_gesture_canvases(None) {
+            self.gesture_canvas_plan = plan;
+        }
+    }
+
+    /// Release the export-owned canvas for a typed cause.
+    ///
+    /// A cancelled export hard-resets its own canvas and never touches the
+    /// operator's live one: the two are separate admitted canvases, and an
+    /// abandoned render is not an authored erase.
+    fn close_export_gesture_canvas(&mut self, cause: gesture_canvas::GestureCanvasResetCause) {
+        let Some(mut canvas) = self.export_gesture_canvas.take() else {
+            return;
+        };
+        canvas.reset_for(cause);
+        debug_assert!(!canvas.has_staged_frame());
+        drop(canvas);
+        if let Ok(plan) = self.admit_gesture_canvases(None) {
+            self.gesture_canvas_plan = plan;
+        }
     }
 
     fn feedback_address_for_web_action(
@@ -13531,6 +14588,43 @@ impl App {
                 }
             }
             WebAction::Pad { x, y, active } => self.mod_matrix.set_pad(x, y, active),
+            WebAction::GestureSample {
+                stroke,
+                phase,
+                mode,
+                x,
+                y,
+                pressure,
+                direction_x,
+                direction_y,
+            } => {
+                // The phone panel already knows its own stroke lifecycle, so
+                // it authors phases directly. Everything else — bounds,
+                // quantization, refusal — is the one adapter's job.
+                let raw = gesture::RawGestureSample::new(stroke, phase, mode, [x, y])
+                    .with_pressure(pressure)
+                    .with_direction([direction_x, direction_y]);
+                self.ingest_gesture_sample(gesture::GestureOrigin::Phone, raw);
+            }
+            WebAction::SetGestureRecording {
+                enabled,
+                layer_stack_revision,
+            } => {
+                if layer_stack_revision == self.layer_stack_revision {
+                    self.set_gesture_recording(enabled);
+                } else {
+                    self.gesture_status = format!(
+                        "Gesture recording control rejected: stale stack revision {layer_stack_revision}; current is {}",
+                        self.layer_stack_revision
+                    );
+                    log::warn!("{}", self.gesture_status);
+                }
+            }
+            WebAction::SetGestureCanvas { param, value } => {
+                if let Err(error) = self.set_gesture_canvas_param(&param, &value) {
+                    self.gesture_status = error;
+                }
+            }
             WebAction::SetPadConfig { axis, param, value } => match param.as_str() {
                 "spring_enabled" => {
                     if let Some(enabled) = value.as_bool() {
@@ -13619,6 +14713,11 @@ impl App {
                         return disposition;
                     }
                 };
+                // The slot names the recording it was captured against; it
+                // never copies its events. Two slots holding different
+                // recordings are two pieces, not two ends of a blend.
+                let snap =
+                    snap.with_gesture(self.gesture_canvas.params(), self.gesture_checksum.clone());
                 match slot.as_str() {
                     "a" => self.morph.a = Some(snap),
                     "b" => self.morph.b = Some(snap),
@@ -14532,6 +15631,15 @@ impl App {
                         shutter_samples,
                         media_safety_policy: self.media_safety_policy.clone(),
                         temporal_event_track: self.temporal_event_recorder.track().clone(),
+                        gesture_track: {
+                            // The recorded performance travels as its portable
+                            // document so the job can verify the digest the
+                            // operator holds. An empty track emits no section,
+                            // exactly as patch capture does.
+                            let track = self.gesture_event_recorder.track();
+                            (!track.events().is_empty())
+                                .then(|| gesture::GestureTrackDocument::capture(track))
+                        },
                     };
                     for layer in self.layers.iter().filter(|layer| !layer.is_file_media()) {
                         log::warn!(
@@ -14550,6 +15658,10 @@ impl App {
                         renderer.device.clone(),
                         renderer.queue.clone(),
                     ));
+                    // The export owns the second of the two canvases the
+                    // frozen table admits. Both are charged against the one
+                    // aggregate budget here, before either is created.
+                    self.open_export_gesture_canvas(width, height);
                     log::info!("Export started");
                 }
             }
@@ -14557,6 +15669,12 @@ impl App {
                 if let Some(ref job) = self.export_job {
                     job.cancel();
                 }
+                // A cancelled export hard-resets its own canvas and never
+                // touches the operator's live one. An abandoned render is not
+                // an authored erase.
+                self.close_export_gesture_canvas(
+                    gesture_canvas::GestureCanvasResetCause::ExportCancelled,
+                );
             }
             WebAction::SetVisualNodeParam { .. }
             | WebAction::InsertVisualNode { .. }
@@ -14566,6 +15684,7 @@ impl App {
             | WebAction::SetVisualNodeRoute { .. }
             | WebAction::SetVisualNodeDisplaceRoute { .. }
             | WebAction::SetVisualNodeSymmetryRoute { .. }
+            | WebAction::SetVisualNodeResidualRoute { .. }
             | WebAction::SetCompositionGroupMatteRoute { .. }
             | WebAction::SetCompositionGroupMatteParam { .. }
             | WebAction::SetCompositionGroupParam { .. }
@@ -15267,6 +16386,7 @@ impl App {
                 &self.osc.runtime_snapshot(),
             ),
             temporal: temporal_snapshot,
+            gesture: self.gesture_status_snapshot(),
             spout: {
                 let status = self.spout.status();
                 SpoutSnapshot {
@@ -16007,6 +17127,10 @@ impl ApplicationHandler for App {
         // Master effects operate in output pixels. Keep their resolution in
         // lock-step with the final renderer output, including safe recovery.
         self.master_effects.resolution = [output_width as f32, output_height as f32];
+        // The gesture canvas is a program-space field, so its sampled
+        // resolution follows the output in the same lock-step, including the
+        // 1280x720 recovery attempt.
+        self.resize_gesture_canvas_for_output(output_width, output_height);
 
         configure_fonts(&self.egui_ctx);
 
@@ -16430,6 +17554,7 @@ impl ApplicationHandler for App {
                         media_status: self.media_safety_status.clone(),
                     };
                     let mut native_recovery_actions = Vec::new();
+                    let mut native_gesture_samples = Vec::new();
 
                     let egui_context = self.egui_ctx.clone();
                     let stage_health_snapshot = self.stage_health_snapshot();
@@ -16494,12 +17619,33 @@ impl ApplicationHandler for App {
                                     let available = ui.available_size();
                                     let aspect = output_width as f32 / output_height as f32;
                                     let (w, h) = fit_to_area(available.x, available.y, aspect);
-                                    ui.centered_and_justified(|ui| {
-                                        ui.image(egui::load::SizedTexture::new(
-                                            tex_id,
-                                            egui::vec2(w, h),
-                                        ));
-                                    });
+                                    let image = ui
+                                        .centered_and_justified(|ui| {
+                                            ui.image(egui::load::SizedTexture::new(
+                                                tex_id,
+                                                egui::vec2(w, h),
+                                            ))
+                                        })
+                                        .inner;
+                                    // The preview doubles as the native
+                                    // pointer/tablet gesture surface. It is a
+                                    // native control, so it disappears with
+                                    // every other one when the main swapchain
+                                    // is the audience output.
+                                    if show_native_gesture_surface(output_on_main) {
+                                        let rect = image.rect;
+                                        let gesture_response = ui.interact(
+                                            rect,
+                                            ui.id().with("native_gesture_surface"),
+                                            egui::Sense::drag(),
+                                        );
+                                        collect_native_gesture_sample(
+                                            rect,
+                                            &gesture_response,
+                                            ui.ctx().pointer_latest_pos(),
+                                            &mut native_gesture_samples,
+                                        );
+                                    }
                                 }
                                 if show_stage_editor_health(output_on_main) {
                                     if let Some(permit) = stage_health::editor_preview_permit(
@@ -16527,6 +17673,15 @@ impl ApplicationHandler for App {
                     // does not depend on the server queue or any live browser.
                     for action in native_recovery_actions {
                         self.apply_native_recovery_action(action);
+                    }
+                    // A native pointer stroke is performance data, not an
+                    // authored one-shot: it deliberately does not take the
+                    // manual-history boundary that `apply_native_manual_action`
+                    // applies. It follows the same local-last ordering as the
+                    // RECOVERY strip so a physical operator's stroke lands in
+                    // the same frame it was drawn in.
+                    for sample in native_gesture_samples {
+                        self.apply_native_gesture_sample(sample);
                     }
 
                     // Controller transport is sampled before this frame's
@@ -16594,6 +17749,7 @@ impl ApplicationHandler for App {
                         .program_clock
                         .tick(program_wall_delta, program_transport_paused);
                     self.release_stale_gyro();
+                    self.release_finished_export_gesture_canvas();
 
                     let window = self.window.as_ref().unwrap().clone();
                     let egui_winit = self.egui_winit.as_mut().unwrap();
@@ -17015,6 +18171,7 @@ impl ApplicationHandler for App {
                             &authored_layer_mattes,
                             advanced_program_history_initialized,
                         )
+                        .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
                         .with_motion(
                             evaluated_master_motion,
                             &evaluated_layer_motion,
@@ -17028,6 +18185,10 @@ impl ApplicationHandler for App {
                         .resource_limits
                         .max_sampled_textures_per_shader_stage =
                         limits.max_sampled_textures_per_shader_stage;
+                    creative_input
+                        .resource_limits
+                        .min_uniform_buffer_offset_alignment =
+                        limits.min_uniform_buffer_offset_alignment;
                     let mut evaluated_creative =
                         match evaluated_frame.plan_composition(creative_input) {
                             Ok(plan) => Some(plan),
@@ -17083,6 +18244,7 @@ impl ApplicationHandler for App {
                                 &authored_layer_mattes,
                                 advanced_program_history_initialized,
                             )
+                            .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
                             .with_motion(
                                 evaluated_master_motion,
                                 &evaluated_layer_motion,
@@ -17096,6 +18258,10 @@ impl ApplicationHandler for App {
                             .resource_limits
                             .max_sampled_textures_per_shader_stage =
                             limits.max_sampled_textures_per_shader_stage;
+                        retry_input
+                            .resource_limits
+                            .min_uniform_buffer_offset_alignment =
+                            limits.min_uniform_buffer_offset_alignment;
                         evaluated_creative = match evaluated_frame.plan_composition(retry_input) {
                             Ok(plan) => Some(plan),
                             Err(error) => {
@@ -17165,6 +18331,7 @@ impl ApplicationHandler for App {
                                     &evaluated_layer_racks,
                                 )
                                 .with_layer_mattes(&authored_layer_mattes, false)
+                                .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
                                 .with_motion(
                                     evaluated_master_motion,
                                     &evaluated_layer_motion,
@@ -17178,6 +18345,10 @@ impl ApplicationHandler for App {
                                 .resource_limits
                                 .max_sampled_textures_per_shader_stage =
                                 limits.max_sampled_textures_per_shader_stage;
+                            cold_input
+                                .resource_limits
+                                .min_uniform_buffer_offset_alignment =
+                                limits.min_uniform_buffer_offset_alignment;
                             evaluated_creative = match evaluated_frame.plan_composition(cold_input)
                             {
                                 Ok(plan) => Some(plan),
@@ -17393,6 +18564,32 @@ impl ApplicationHandler for App {
                         self.pending_temporal_events,
                     )
                     .with_audio_energy(self.mod_matrix.audio.level);
+                    // Open the canvas transaction for this frame. It closes at
+                    // the acceptance decision below: an accepted frame commits,
+                    // and a rejected, device-lost, or abandoned one discards so
+                    // it leaves no visible change.
+                    // The one architectural law: a route contributes an
+                    // offset to a copy of the base state for this frame. The
+                    // authored canvas values the operator sees and saves are
+                    // never rewritten as a side effect of modulation.
+                    let evaluated_gesture_canvas =
+                        modulation_frame.modulate_gesture_canvas(&self.gesture_canvas.params());
+                    self.stage_gesture_canvas_frame(
+                        temporal_input.freeze.program_advances(),
+                        Some(evaluated_gesture_canvas),
+                    );
+                    // The device half is built here, before the renderer borrow
+                    // opens, from the same admitted plan the CPU canvas was
+                    // admitted under. `Device`/`Queue` are refcounted handles,
+                    // so cloning them is how a `&mut self` builder runs beside
+                    // the renderer rather than a second ownership path.
+                    if let Some((device, queue)) = self
+                        .renderer
+                        .as_ref()
+                        .map(|renderer| (renderer.device.clone(), renderer.queue.clone()))
+                    {
+                        self.ensure_gesture_canvas_gpu(&device, &queue);
+                    }
                     let motion_attachments = self
                         .motion_field_cache
                         .iter()
@@ -17534,6 +18731,25 @@ impl ApplicationHandler for App {
                                 executor.clear_motion_memory();
                                 self.pending_motion_memory_clear = false;
                             }
+                            // Publish the etched field this topology's canvas
+                            // routes will bind. Binding never allocates; the
+                            // `prepare` below observes the changed identity and
+                            // rebuilds the tap bind groups exactly once.
+                            executor.bind_gesture_canvas(
+                                match self
+                                    .gesture_canvas_gpu
+                                    .as_ref()
+                                    .and_then(renderer::gesture_canvas::GestureCanvasResources::presented_view)
+                                {
+                                    Some(view) => {
+                                        renderer::composition::GestureCanvasBinding::bound(
+                                            view.clone(),
+                                            self.gesture_canvas_gpu_epoch,
+                                        )
+                                    }
+                                    None => renderer::composition::GestureCanvasBinding::default(),
+                                },
+                            );
                             executor
                                 .prepare(&renderer.device, &renderer.queue, plan, &sources)
                                 .map_err(|error| error.to_string())?;
@@ -17998,6 +19214,8 @@ impl ApplicationHandler for App {
                                     &mut self.output_error,
                                     event_loop,
                                 ) {
+                                    self.gesture_canvas.discard_staged();
+                                    self.pending_gesture_canvas_events.clear();
                                     return;
                                 }
                             }
@@ -18201,9 +19419,47 @@ impl ApplicationHandler for App {
                             if let Some(executor) = &mut self.composition_gpu {
                                 executor.discard_frame_history();
                             }
+                            self.gesture_canvas.discard_staged();
+                            self.pending_gesture_canvas_events.clear();
                             return;
                         }
                         renderer.commit_temporal_frame();
+                        // The canvas shares the temporal acceptance decision
+                        // exactly. A discarded frame rewinds the field, the
+                        // decay clock, and the generation together.
+                        //
+                        // The device half is published here rather than inside
+                        // the frame encoder above, and that is deliberate: this
+                        // is the only point at which acceptance is known, so
+                        // the GPU only ever sees committed frames, in order,
+                        // and a rejected frame leaves no visible change on the
+                        // device either. The cost is that a canvas route reads
+                        // the field as of the previous accepted frame — the
+                        // same N-1 law ProgramHistory already obeys, and
+                        // offline export applies the identical ordering.
+                        //
+                        // A free function because the renderer borrow is still
+                        // live here, exactly like the checksum helper below.
+                        if let Some(resources) = self.gesture_canvas_gpu.as_mut() {
+                            if let Err(error) = publish_gesture_canvas_frame(
+                                &renderer.device,
+                                &renderer.queue,
+                                resources,
+                                &self.gesture_canvas,
+                                &mut self.gesture_canvas_gpu_reset_pending,
+                                temporal_frame_accepted,
+                            ) {
+                                self.gesture_status =
+                                    format!("Gesture canvas device update refused: {error}");
+                                log::error!("{}", self.gesture_status);
+                            }
+                        }
+                        if temporal_frame_accepted {
+                            self.gesture_canvas.commit_staged();
+                        } else {
+                            self.gesture_canvas.discard_staged();
+                        }
+                        self.pending_gesture_canvas_events.clear();
                         if advanced_audience_rendered {
                             if let Some(executor) = &mut self.composition_gpu {
                                 executor.commit_frame_history();
@@ -18251,6 +19507,37 @@ impl ApplicationHandler for App {
                                 );
                             }
                             self.pending_temporal_events = temporal::TemporalFrameEvents::default();
+                            // The gesture clock shares the temporal gate
+                            // exactly: a discarded frame or a frozen program
+                            // neither consumes a 30 Hz address nor records a
+                            // point, so a pause holds rather than accumulating
+                            // catch-up debt.
+                            let gesture_outcome = self
+                                .gesture_event_recorder
+                                .record_accepted(program_delta, &self.pending_gesture_events);
+                            if gesture_outcome.truncated > 0 {
+                                self.gesture_status = format!(
+                                    "Gesture event track reached its {}-event cap; newer samples remain live-only",
+                                    gesture::MAX_GESTURE_EVENTS
+                                );
+                            } else if gesture_outcome.rejected > 0 {
+                                self.gesture_status = format!(
+                                    "{} gesture sample(s) rejected as ill-formed rather than repaired",
+                                    gesture_outcome.rejected
+                                );
+                            }
+                            self.gesture_live_only_events = self
+                                .gesture_live_only_events
+                                .saturating_add(u64::from(gesture_outcome.truncated))
+                                .saturating_add(u64::from(gesture_outcome.rejected));
+                            if gesture_outcome.recorded > 0 || gesture_outcome.truncated > 0 {
+                                // The renderer borrow is still live here, so
+                                // this goes through the shared free function
+                                // rather than a second `&mut self` method.
+                                self.gesture_checksum =
+                                    published_gesture_checksum(&self.gesture_event_recorder);
+                            }
+                            self.pending_gesture_events.clear();
                         }
                         if selective_required {
                             renderer.map_selective_ntsc_readback();
@@ -20447,6 +21734,362 @@ mod app_state_tests {
             app.master_rack.get(grain_id).unwrap().kind,
             visual_rack::RuntimeVisualNodeKind::Grain(_)
         ));
+
+        // The etched gesture field is a member of the same closed route
+        // vocabulary, so the same ordered action selects it — at the current
+        // frame, from the master scope that owns the canvas, which would be a
+        // self-cycle for any producer that lived in the composition graph.
+        let canvas_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeDisplaceRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::GestureCanvas,
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            },
+            composition_revision: canvas_revision,
+        });
+        assert_eq!(
+            params(&app).tap.source,
+            visual_rack::ResolvedImageSource::GestureCanvas
+        );
+        assert_eq!(
+            params(&app).tap.timing,
+            visual_rack::EdgeTiming::CurrentFrame
+        );
+        assert_eq!(params(&app).amount_x, 1.0, "a reroute preserves the gains");
+        assert_ne!(app.composition_revision, canvas_revision);
+    }
+
+    #[test]
+    fn residual_browser_protocol_edits_values_and_barriers_each_route_slot_by_revision() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot,
+            ResidualRouteSlotSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "residual".into(),
+            composition_revision: app.composition_revision,
+        });
+        let node_id = app.master_rack.iter().next().unwrap().stable_id;
+        let params = |app: &App| match app.master_rack.get(node_id).unwrap().kind {
+            visual_rack::RuntimeVisualNodeKind::Residual(params) => params,
+            _ => panic!("inserted node must be a residual"),
+        };
+        // A newly inserted node is the deterministic exact-bypass default with
+        // both slots on the same neutral donor.
+        assert!(params(&app).is_exact_bypass());
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::OneBelow
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::OneBelow
+        );
+        assert_eq!(params(&app).block, visual_rack::ResidualBlock::Eight);
+        assert_eq!(
+            params(&app).quantization,
+            visual_rack::ResidualQuantization::Off
+        );
+        assert_eq!(params(&app).detail_gain, 1.0);
+
+        // Values, both discrete laws and the seed travel on the ordinary
+        // coalescible action.
+        let revision = app.composition_revision;
+        let set = |app: &mut App, param: &str, value: serde_json::Value| {
+            app.handle_web_action(WebAction::SetVisualNodeParam {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                node_kind: "residual".into(),
+                param: param.into(),
+                value,
+                composition_revision: revision,
+            });
+        };
+        set(&mut app, "mix", serde_json::json!(0.5));
+        set(&mut app, "detail_gain", serde_json::json!(2.5));
+        set(&mut app, "block", serde_json::json!("thirty_two"));
+        set(&mut app, "quantization", serde_json::json!("coarse"));
+        set(&mut app, "seed", serde_json::json!(0x00c0_ffee_u32));
+        assert_eq!(params(&app).mix, 0.5);
+        assert_eq!(params(&app).detail_gain, 2.5);
+        assert_eq!(params(&app).block, visual_rack::ResidualBlock::ThirtyTwo);
+        assert_eq!(
+            params(&app).quantization,
+            visual_rack::ResidualQuantization::Coarse
+        );
+        assert_eq!(params(&app).seed, 0x00c0_ffee);
+        assert!(!params(&app).is_exact_bypass());
+
+        // Hostile finite overshoot clamps and a non-finite value collapses to
+        // the neutral fallback, never to a clamped extreme.
+        set(&mut app, "mix", serde_json::json!(42.0));
+        assert_eq!(params(&app).mix, 1.0);
+        set(&mut app, "detail_gain", serde_json::json!(-9.0));
+        assert_eq!(params(&app).detail_gain, 0.0);
+        set(&mut app, "detail_gain", serde_json::json!(2.5));
+
+        // Neither route may be rewritten on the coalescible value path.
+        for param in ["structure_tap", "detail_tap"] {
+            set(&mut app, param, serde_json::json!("one_below"));
+        }
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "the structure route must reject the coalescible value path"
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "the detail route must reject the coalescible value path"
+        );
+
+        // Each slot reroutes independently and leaves its partner alone.
+        let clean_program = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::CleanProgram,
+            timing: visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let structure_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            slot: ResidualRouteSlotSnapshot::Structure,
+            route: clean_program.clone(),
+            composition_revision: structure_revision,
+        });
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::CleanProgram
+        );
+        assert_eq!(
+            params(&app).structure.timing,
+            visual_rack::EdgeTiming::PreviousFrame
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "rerouting one slot must never move its partner"
+        );
+        assert_ne!(
+            app.composition_revision, structure_revision,
+            "a route change is a topology barrier and advances the revision"
+        );
+        assert_eq!(params(&app).mix, 1.0, "a reroute preserves the values");
+        assert_eq!(params(&app).detail_gain, 2.5);
+        assert_eq!(params(&app).block, visual_rack::ResidualBlock::ThirtyTwo);
+        assert_eq!(
+            params(&app).quantization,
+            visual_rack::ResidualQuantization::Coarse
+        );
+        assert_eq!(params(&app).seed, 0x00c0_ffee);
+
+        let detail_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            slot: ResidualRouteSlotSnapshot::Detail,
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::AllBelow,
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            },
+            composition_revision: detail_revision,
+        });
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::AllBelow
+        );
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::CleanProgram,
+            "the structure route survives a detail reroute"
+        );
+
+        // A stale revision is rejected outright on either slot; both live
+        // routes are untouched.
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                slot,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                composition_revision: detail_revision,
+            });
+        }
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::CleanProgram,
+            "a stale revision must never apply a reroute"
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::AllBelow
+        );
+
+        // The route action is an ordered barrier that is never beat-latched
+        // and is always recognized as master-rack work.
+        let route_action = WebAction::SetVisualNodeResidualRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            slot: ResidualRouteSlotSnapshot::Structure,
+            route: clean_program,
+            composition_revision: app.composition_revision,
+        };
+        assert!(App::quantized_action_key(&route_action).is_none());
+        assert!(App::action_targets_master_rack(&route_action));
+
+        // Addressing a node of another kind is a typed refusal on either slot,
+        // not a silent rewrite of that node.
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 1,
+            node_kind: "grain".into(),
+            composition_revision: app.composition_revision,
+        });
+        let grain_id = app.master_rack.iter().nth(1).unwrap().stable_id;
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: grain_id.get().to_string(),
+                slot,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                composition_revision: app.composition_revision,
+            });
+        }
+        assert!(matches!(
+            app.master_rack.get(grain_id).unwrap().kind,
+            visual_rack::RuntimeVisualNodeKind::Grain(_)
+        ));
+
+        // The published snapshot carries both routes and both diagnostics.
+        app.push_web_state();
+        let published = app.web_state.app.try_read().expect("published snapshot");
+        let node = published
+            .creative
+            .master_rack
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id.get().to_string())
+            .expect("the residual node is published");
+        assert_eq!(node.kind, "residual");
+        assert_eq!(
+            node.params["structure_tap"]["input"]["source"],
+            "clean_program"
+        );
+        assert_eq!(node.params["detail_tap"]["input"]["source"], "all_below");
+        assert_eq!(node.params["block"], "thirty_two");
+        assert_eq!(node.params["quantization"], "coarse");
+        assert_eq!(node.params["seed"], 0x00c0_ffee_u32);
+        assert_eq!(node.params["diagnostic"], "");
+    }
+
+    /// `ResetVisualProgram` replaces the master rack wholesale with the
+    /// synthetic legacy rack, so every reduced-resolution block-mean surface a
+    /// Residual node owned must be released with it. Nothing may survive the
+    /// swap, including a route edit already latched for a later downbeat.
+    #[test]
+    fn resetting_the_master_visual_program_releases_every_residual_mean_surface() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot,
+            ResidualRouteSlotSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "residual".into(),
+            composition_revision: app.composition_revision,
+        });
+        let node_id = app.master_rack.iter().next().unwrap().stable_id;
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            node_kind: "residual".into(),
+            param: "mix".into(),
+            value: serde_json::json!(1.0),
+            composition_revision: app.composition_revision,
+        });
+
+        // A live Residual owns exactly two reduced-resolution surfaces and two
+        // reduced passes, on top of its single full-frame pass.
+        let live = app.master_rack.resource_budget().expect("live rack budget");
+        assert_eq!(live.reduced_resolution_surfaces, 2);
+        assert_eq!(live.reduced_resolution_passes, 2);
+        let live_signature = app.master_rack.topology_signature();
+
+        // Latch a route edit for a later downbeat and freeze the program, so
+        // the reset has to purge queued work as well as live topology.
+        app.quantized_actions
+            .push(WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                slot: ResidualRouteSlotSnapshot::Detail,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::AllBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                composition_revision: app.composition_revision,
+            });
+        app.quantized_actions.push(WebAction::SetLayerPaused {
+            index: 0,
+            layer_id: None,
+            paused: true,
+        });
+
+        app.handle_web_action(WebAction::ResetVisualProgram);
+
+        // No Residual node survives, so the reset rack declares no reduced
+        // pass and no reduced surface at all.
+        assert!(
+            !app.master_rack
+                .iter()
+                .any(|node| node.kind.tag() == visual_rack::NodeKindTag::Residual),
+            "the reset master rack must hold no residual node"
+        );
+        let reset = app
+            .master_rack
+            .resource_budget()
+            .expect("reset rack budget");
+        assert_eq!(reset.reduced_resolution_surfaces, 0);
+        assert_eq!(reset.reduced_resolution_passes, 0);
+        assert_ne!(
+            app.master_rack.topology_signature(),
+            live_signature,
+            "the executor must not be able to reuse a prepared segment whose \
+             mean surfaces belong to the discarded rack"
+        );
+
+        // The latched reroute is purged; unrelated latched transport survives.
+        assert!(
+            !app.quantized_actions
+                .iter()
+                .any(App::action_targets_master_rack),
+            "a latched master route edit must never resurrect a reset node"
+        );
+        assert!(app
+            .quantized_actions
+            .iter()
+            .any(|action| matches!(action, WebAction::SetLayerPaused { .. })));
     }
 
     /// Closes the four main.rs sites for the Symmetry route action: the
@@ -24413,6 +26056,7 @@ mod app_state_tests {
 
         let depth = app.manual_history.metrics().undo_depth;
         app.apply_automation_control(
+            controller_profile::AutomationOrigin::Midi,
             RuntimeControlAddress::Master(ControlParameter::Brightness),
             AutomationValue::Absolute(0.25),
         )
@@ -24900,5 +26544,1282 @@ mod app_state_tests {
         assert!(rejected_body.contains("if self.stage_presenter.is_none()"));
         assert!(!rejected_body.contains("self.stage_presenter = None"));
         assert!(body.contains("self.stage_presenter = Some(presenter)"));
+    }
+    #[test]
+    fn native_gesture_pointer_positions_normalize_over_the_preview_rect_and_refuse_a_degenerate_one(
+    ) {
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 40.0), egui::vec2(200.0, 100.0));
+        assert_eq!(
+            normalized_pointer_position(rect, egui::pos2(20.0, 40.0)),
+            Some([0.0, 0.0])
+        );
+        assert_eq!(
+            normalized_pointer_position(rect, egui::pos2(220.0, 140.0)),
+            Some([1.0, 1.0])
+        );
+        assert_eq!(
+            normalized_pointer_position(rect, egui::pos2(120.0, 90.0)),
+            Some([0.5, 0.5])
+        );
+        // A pointer outside the preview clamps to the canvas edge rather than
+        // authoring a coordinate the canvas has no room for.
+        assert_eq!(
+            normalized_pointer_position(rect, egui::pos2(-500.0, 5000.0)),
+            Some([0.0, 1.0])
+        );
+        // A degenerate rect has no canvas space, so it yields nothing rather
+        // than an invented corner sample.
+        let empty = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(0.0, 50.0));
+        assert!(normalized_pointer_position(empty, egui::pos2(10.0, 30.0)).is_none());
+        let flat = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(50.0, 0.0));
+        assert!(normalized_pointer_position(flat, egui::pos2(30.0, 10.0)).is_none());
+
+        // The three native surfaces hold distinct stroke identities so two
+        // surfaces can never merge into one stroke.
+        let identities = [
+            GESTURE_NATIVE_STROKE,
+            GESTURE_MIDI_STROKE,
+            GESTURE_OSC_STROKE,
+        ];
+        for (index, identity) in identities.iter().enumerate() {
+            assert!(usize::from(*identity) < gesture::MAX_ACTIVE_STROKES);
+            assert!(!identities[index + 1..].contains(identity));
+        }
+    }
+
+    #[test]
+    fn every_gesture_surface_reaches_one_adapter_and_an_unarmed_stroke_is_never_recorded() {
+        use controller_profile::{
+            AutomationOrigin, AutomationValue, ControlParameter, RuntimeControlAddress,
+        };
+        use gesture::{GestureMode, GesturePhase};
+        use web::state::WebAction;
+
+        // The browser authors its own identity from the bottom of the space,
+        // which is exactly where a phone's first touch lands.
+        const PHONE_STROKE: u8 = 0;
+        let phone_sample = |phase: GesturePhase, x: f32| WebAction::GestureSample {
+            stroke: PHONE_STROKE,
+            phase,
+            mode: GestureMode::Push,
+            x,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 1.0,
+            direction_y: 0.0,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+
+        // Recording is explicit. A disarmed stroke is normalized, counted as
+        // live-only, and never added to the replayable track.
+        assert!(!app.gesture_recording);
+        app.handle_web_action(phone_sample(GesturePhase::Begin, 0.25));
+        app.handle_web_action(phone_sample(GesturePhase::End, 0.5));
+        assert_eq!(app.gesture_live_only_events, 2);
+        assert!(app.pending_gesture_events.is_empty());
+        assert!(app.gesture_event_recorder.track().events().is_empty());
+        let disarmed = app.gesture_status_snapshot();
+        assert!(!disarmed.recording);
+        assert_eq!(disarmed.recorded_events, 0);
+        assert_eq!(disarmed.live_only_events, 2);
+        assert!(
+            disarmed.checksum.is_empty(),
+            "an unrecorded gesture must not publish a digest that implies replay"
+        );
+
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(app.gesture_recording);
+
+        // Phone ingress.
+        app.handle_web_action(phone_sample(GesturePhase::Begin, 0.25));
+        assert_eq!(app.pending_gesture_events.len(), 1);
+        assert_eq!(app.pending_gesture_events[0].phase, GesturePhase::Begin);
+        assert_eq!(
+            app.pending_gesture_events[0].stroke, PHONE_STROKE,
+            "the phone authors its own stroke identity"
+        );
+
+        // Native pointer ingress: the same edges, with the direction derived
+        // from the previous point of the stroke rather than authored.
+        app.apply_native_gesture_sample(NativeGestureSample {
+            phase: GesturePhase::Begin,
+            position: [0.25, 0.5],
+        });
+        app.apply_native_gesture_sample(NativeGestureSample {
+            phase: GesturePhase::Move,
+            position: [0.5, 0.5],
+        });
+        let native = *app.pending_gesture_events.last().unwrap();
+        assert_eq!(native.phase, GesturePhase::Move);
+        assert_eq!(native.direction(), [1.0, 0.0]);
+        app.apply_native_gesture_sample(NativeGestureSample {
+            phase: GesturePhase::End,
+            position: [0.75, 0.5],
+        });
+        assert!(app.gesture_native_stroke.is_none());
+
+        // A native motion with no open stroke is refused by name rather than
+        // repaired into one.
+        let before = app.pending_gesture_events.len();
+        app.apply_native_gesture_sample(NativeGestureSample {
+            phase: GesturePhase::Move,
+            position: [0.9, 0.5],
+        });
+        assert_eq!(app.pending_gesture_events.len(), before);
+        assert!(app.gesture_status.contains("without an open stroke"));
+
+        // MIDI ingress, through the one typed automation adapter.
+        app.apply_automation_control(
+            AutomationOrigin::Midi,
+            RuntimeControlAddress::Master(ControlParameter::GestureX),
+            AutomationValue::Absolute(0.25),
+        )
+        .unwrap();
+        app.apply_automation_control(
+            AutomationOrigin::Midi,
+            RuntimeControlAddress::Master(ControlParameter::GestureY),
+            AutomationValue::Absolute(0.5),
+        )
+        .unwrap();
+        app.apply_automation_control(
+            AutomationOrigin::Midi,
+            RuntimeControlAddress::Master(ControlParameter::GestureContact),
+            AutomationValue::Gate(true),
+        )
+        .unwrap();
+        let midi_begin = *app.pending_gesture_events.last().unwrap();
+        assert_eq!(midi_begin.phase, GesturePhase::Begin);
+        assert_eq!(midi_begin.stroke, GESTURE_MIDI_STROKE);
+
+        // OSC ingress uses the identical adapter but its own stroke machine,
+        // so the two protocols cannot interleave into one stroke.
+        let peer = "127.0.0.1:9000".parse().unwrap();
+        app.apply_automation_control(
+            AutomationOrigin::Osc(peer),
+            RuntimeControlAddress::Master(ControlParameter::GestureContact),
+            AutomationValue::Gate(true),
+        )
+        .unwrap();
+        let osc_begin = *app.pending_gesture_events.last().unwrap();
+        assert_eq!(osc_begin.phase, GesturePhase::Begin);
+        assert_eq!(osc_begin.stroke, GESTURE_OSC_STROKE);
+
+        // Axis motion is observed once per frame, so a controller sweeping at
+        // any physical rate authors one point per 30 Hz address.
+        app.apply_automation_control(
+            AutomationOrigin::Midi,
+            RuntimeControlAddress::Master(ControlParameter::GestureX),
+            AutomationValue::Absolute(0.75),
+        )
+        .unwrap();
+        let before = app.pending_gesture_events.len();
+        app.pump_gesture_surfaces();
+        assert_eq!(
+            app.pending_gesture_events.len(),
+            before + 1,
+            "only the moved surface authors a point"
+        );
+        let midi_move = *app.pending_gesture_events.last().unwrap();
+        assert_eq!(midi_move.phase, GesturePhase::Move);
+        assert_eq!(midi_move.stroke, GESTURE_MIDI_STROKE);
+        app.pump_gesture_surfaces();
+        assert_eq!(
+            app.pending_gesture_events.len(),
+            before + 1,
+            "a stationary open surface authors nothing"
+        );
+
+        // The accepted-frame boundary is what turns the staged batch into the
+        // recorded track, and it is the same gate the temporal recorder uses.
+        let staged = app.pending_gesture_events.len();
+        let outcome = app.gesture_event_recorder.record_accepted(
+            1.0 / gesture::GESTURE_REFERENCE_FPS,
+            &app.pending_gesture_events,
+        );
+        app.gesture_checksum = published_gesture_checksum(&app.gesture_event_recorder);
+        app.pending_gesture_events.clear();
+        assert_eq!(outcome.recorded as usize, staged);
+        assert_eq!(outcome.truncated, 0);
+        assert_eq!(outcome.rejected, 0);
+        let armed = app.gesture_status_snapshot();
+        assert!(armed.recording);
+        assert_eq!(armed.recorded_events as usize, staged);
+        assert_eq!(
+            armed.live_only_events, 2,
+            "the disarmed samples stay counted separately and are never promoted"
+        );
+        assert_eq!(armed.checksum.len(), 64);
+        assert_eq!(
+            armed.checksum,
+            app.gesture_event_recorder.track().checksum_hex(),
+            "the published digest is the recorded track's own canonical checksum"
+        );
+        assert!(
+            armed.open_strokes > 0,
+            "the MIDI and OSC strokes are still open and the track says so"
+        );
+
+        // Disarming closes nothing: an open stroke stays explicitly incomplete
+        // rather than gaining an End the operator never made.
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(!app.gesture_recording);
+        assert!(app.pending_gesture_events.is_empty());
+        assert!(!app.gesture_event_recorder.track().is_complete());
+        assert!(app.gesture_status.contains("explicitly incomplete"));
+
+        // A hostile stroke identity is refused by the one adapter, named, and
+        // never recorded through any surface.
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        let recorded_before = app.gesture_event_recorder.track().events().len();
+        app.ingest_gesture_sample(
+            gesture::GestureOrigin::Phone,
+            gesture::RawGestureSample::new(
+                gesture::MAX_ACTIVE_STROKES as u8,
+                GesturePhase::Begin,
+                GestureMode::Push,
+                [0.5, 0.5],
+            ),
+        );
+        assert!(app.pending_gesture_events.is_empty());
+        assert!(app.gesture_status.contains("Gesture sample ignored"));
+        assert_eq!(
+            app.gesture_event_recorder.track().events().len(),
+            recorded_before
+        );
+    }
+
+    #[test]
+    fn gesture_recording_never_advances_on_a_rejected_or_frozen_frame_and_clears_with_the_patch() {
+        use gesture::{GestureMode, GesturePhase};
+        use web::state::WebAction;
+
+        // The live tick clock shares the temporal event track's acceptance
+        // gate verbatim, so a rejected or program-frozen frame cannot move the
+        // gesture address. That ordering is a property of the frame loop, so
+        // it is pinned as source text exactly as the M3 gate is.
+        let source = include_str!("main.rs");
+        let gate = source
+            .find("if temporal_frame_accepted && temporal_input.freeze.program_advances() {")
+            .expect("the gesture clock must share the temporal acceptance gate");
+        let tail = &source[gate..];
+        let end = tail
+            .find("if selective_required {")
+            .expect("the acceptance block is bounded by the selective readback step");
+        let block = &tail[..end];
+        assert!(block.contains("gesture_event_recorder"));
+        assert!(block.contains("record_accepted(program_delta"));
+        assert!(block.contains("pending_gesture_events.clear()"));
+        assert!(
+            source.find("renderer.commit_temporal_frame();").unwrap() < gate,
+            "recording happens after the frame is committed, never before"
+        );
+
+        // Wall time never reaches the gesture clock: the recorder is only ever
+        // advanced with the program delta the frame gate supplies.
+        assert!(!block.contains("Instant::now()"));
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        app.handle_web_action(WebAction::GestureSample {
+            stroke: 0,
+            phase: GesturePhase::Begin,
+            mode: GestureMode::Push,
+            x: 0.5,
+            y: 0.5,
+            pressure: 1.0,
+            direction_x: 0.0,
+            direction_y: 0.0,
+        });
+        app.gesture_event_recorder.record_accepted(
+            1.0 / gesture::GESTURE_REFERENCE_FPS,
+            &app.pending_gesture_events,
+        );
+        app.gesture_checksum = published_gesture_checksum(&app.gesture_event_recorder);
+        app.pending_gesture_events.clear();
+        assert_eq!(app.gesture_event_recorder.track().events().len(), 1);
+        assert_eq!(app.gesture_status_snapshot().checksum.len(), 64);
+
+        // A source cut is not an authored-generation barrier: it deliberately
+        // preserves the recorded track, exactly as it preserves the temporal
+        // event track.
+        app.invalidate_source_cut_generation();
+        assert_eq!(app.gesture_event_recorder.track().events().len(), 1);
+
+        // A broad revert is: the recorded track belongs to the program that
+        // was replaced.
+        app.revert_master_visual_state();
+        assert!(app.gesture_event_recorder.track().events().is_empty());
+        assert!(app.pending_gesture_events.is_empty());
+        assert_eq!(app.gesture_event_recorder.reference_tick(), 0);
+        assert!(
+            app.gesture_status_snapshot().checksum.is_empty(),
+            "a cleared track offers no digest that implies it is replayable"
+        );
+
+        // Every authored-generation barrier clears it, and none of them clears
+        // it from the source-cut path.
+        for name in [
+            "fn reset_patch_generation(",
+            "fn invalidate_visual_generation_after_look(",
+            "fn revert_master_visual_state(",
+        ] {
+            let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
+            let body = &source[start..start + 6_000];
+            assert!(
+                body.contains("self.clear_gesture_recording_state();"),
+                "{name} must clear the recorded gesture track"
+            );
+        }
+        let cut = source.find("fn invalidate_source_cut_generation(").unwrap();
+        let cut_end = source[cut..].find("\n    fn ").unwrap();
+        assert!(!source[cut..cut + cut_end].contains("clear_gesture_recording_state"));
+    }
+
+    /// Arm recording and push one normalized sample through the browser
+    /// surface, which is the ordinary phone ingress.
+    fn gesture_sample(
+        app: &mut App,
+        phase: gesture::GesturePhase,
+        position: [f32; 2],
+        direction: [f32; 2],
+    ) {
+        app.handle_web_action(web::state::WebAction::GestureSample {
+            stroke: 0,
+            phase,
+            mode: gesture::GestureMode::Push,
+            x: position[0],
+            y: position[1],
+            pressure: 1.0,
+            direction_x: direction[0],
+            direction_y: direction[1],
+        });
+    }
+
+    /// Advance one accepted, program-advancing frame's worth of canvas
+    /// transaction without the renderer: stage, then take the frame's
+    /// acceptance decision.
+    fn accepted_canvas_frame(app: &mut App, accepted: bool) {
+        app.stage_gesture_canvas_frame(true, None);
+        assert!(app.gesture_canvas.has_staged_frame());
+        if accepted {
+            app.gesture_canvas.commit_staged();
+        } else {
+            app.gesture_canvas.discard_staged();
+        }
+        app.pending_gesture_canvas_events.clear();
+    }
+
+    #[test]
+    fn the_host_gesture_canvas_grid_only_ever_narrows_the_frozen_table() {
+        // Both edges halve together, so the derivation is deterministic and
+        // holds the surface aspect to within one halving.
+        for (width, height, expected) in [
+            (1280_u32, 720_u32, [640_u32, 360_u32]),
+            (1920, 1080, [480, 270]),
+            (3840, 2160, [480, 270]),
+            (640, 360, [640, 360]),
+            (320, 180, [320, 180]),
+            (64, 64, [64, 64]),
+            (0, 0, [1, 1]),
+            (u32::MAX, 1, [2_047, 1]),
+        ] {
+            let grid = gesture_canvas_host_grid(width, height);
+            assert_eq!(grid.dimensions(), expected, "{width}x{height}");
+            assert!(grid.width <= gesture_canvas::GESTURE_CANVAS_MAX_EDGE);
+            assert!(grid.height <= gesture_canvas::GESTURE_CANVAS_MAX_EDGE);
+            assert!(grid.cell_count <= gesture_canvas::GESTURE_CANVAS_MAX_CELLS);
+            assert!(
+                grid.cell_count <= GESTURE_CANVAS_HOST_MAX_CELLS,
+                "the host budget may only narrow the frozen table, never widen it"
+            );
+        }
+        const {
+            assert!(GESTURE_CANVAS_HOST_MAX_CELLS <= gesture_canvas::GESTURE_CANVAS_MAX_CELLS);
+        }
+        assert_eq!(default_gesture_canvas_grid().dimensions(), [640, 360]);
+    }
+
+    #[test]
+    fn a_submitted_canvas_frame_commits_and_a_discarded_or_frozen_one_leaves_no_visible_change() {
+        use gesture::GesturePhase;
+
+        // The transaction opens before the renderer borrow and closes at the
+        // frame's acceptance decision. Both halves are frame-loop ordering, so
+        // they are pinned as source text exactly as the M3 gate is.
+        let source = include_str!("main.rs");
+        let stage = source
+            .find("self.stage_gesture_canvas_frame(")
+            .expect("the canvas transaction opens with the frame's temporal input");
+        let commit = source
+            .find("self.gesture_canvas.commit_staged();")
+            .expect("an accepted frame commits the staged canvas");
+        let borrow = source
+            .find("let renderer = self.renderer.as_mut().unwrap();")
+            .expect("the frame loop borrows the renderer once");
+        assert!(
+            stage < borrow && borrow < commit,
+            "the transaction must span the frame, opening before the renderer borrow"
+        );
+        let decision = &source[commit - 400..commit + 400];
+        assert!(decision.contains("if temporal_frame_accepted {"));
+        assert!(decision.contains("self.gesture_canvas.discard_staged();"));
+        let loss = source
+            .find("renderer.discard_temporal_frame();")
+            .expect("the device-loss branch discards the temporal frame");
+        assert!(
+            source[loss..loss + 400].contains("self.gesture_canvas.discard_staged();"),
+            "a device loss abandons the frame, and an abandoned frame discards"
+        );
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        assert_eq!(app.gesture_canvas.generation(), 0);
+        assert_eq!(app.gesture_canvas.last_tick(), None);
+
+        // Submitted frame: the etch is visible and the generation advances.
+        gesture_sample(&mut app, GesturePhase::Begin, [0.5, 0.5], [1.0, 0.0]);
+        assert_eq!(app.pending_gesture_canvas_events.len(), 1);
+        accepted_canvas_frame(&mut app, true);
+        assert_eq!(app.gesture_canvas.generation(), 1);
+        assert_eq!(app.gesture_canvas.last_tick(), Some(0));
+        let centre = app.gesture_canvas.grid();
+        let etched = app
+            .gesture_canvas
+            .field()
+            .cell(centre.width / 2, centre.height / 2)
+            .expect("the canvas centre exists");
+        assert!(etched.vector[0] > 0.0, "Push displaces along the stroke");
+        assert!(etched.coverage > 0.0);
+
+        // Discarded frame: no visible change at all.
+        let before = app.gesture_canvas.field().clone();
+        gesture_sample(&mut app, GesturePhase::Move, [0.5, 0.5], [-1.0, 0.0]);
+        accepted_canvas_frame(&mut app, false);
+        assert_eq!(app.gesture_canvas.field(), &before);
+        assert_eq!(app.gesture_canvas.generation(), 1);
+        assert_eq!(app.gesture_canvas.last_tick(), Some(0));
+
+        // Program Freeze holds: neither decay nor etch, and the decay clock
+        // never accumulates catch-up debt for time the audience never saw.
+        gesture_sample(&mut app, GesturePhase::Move, [0.5, 0.5], [-1.0, 0.0]);
+        for _ in 0..900 {
+            app.stage_gesture_canvas_frame(false, None);
+            app.gesture_canvas.commit_staged();
+        }
+        app.pending_gesture_canvas_events.clear();
+        assert_eq!(app.gesture_canvas.field(), &before);
+        assert_eq!(app.gesture_canvas.last_tick(), Some(0));
+
+        // An abandoned transaction is discarded before the next one opens
+        // rather than panicking the render thread on the staging assertion.
+        app.stage_gesture_canvas_frame(true, None);
+        assert!(app.gesture_canvas.has_staged_frame());
+        app.stage_gesture_canvas_frame(true, None);
+        assert!(app
+            .gesture_status
+            .contains("Abandoned gesture canvas frame"));
+        app.gesture_canvas.discard_staged();
+        assert_eq!(app.gesture_canvas.field(), &before);
+    }
+
+    /// A route is only planned against an *admitted* canvas, so admission is
+    /// not optional bookkeeping. The process starts with an empty plan, and a
+    /// program surface that happens to derive the starting grid must still
+    /// admit it rather than leaving every canvas route transparent for the
+    /// whole session.
+    #[test]
+    fn the_host_admits_its_gesture_canvas_even_when_the_output_grid_is_unchanged() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        assert_eq!(
+            app.gesture_canvas_plan.canvases, 0,
+            "the process starts with nothing admitted"
+        );
+
+        // 1280x720 derives exactly the starting grid, so nothing resizes.
+        let starting = app.gesture_canvas.grid();
+        assert_eq!(gesture_canvas_host_grid(1280, 720), starting);
+        app.resize_gesture_canvas_for_output(1280, 720);
+        assert_eq!(app.gesture_canvas.grid(), starting);
+        assert_eq!(app.gesture_canvas_plan.canvases, 1);
+        assert_eq!(
+            app.gesture_canvas_plan.max_dimensions,
+            starting.dimensions()
+        );
+        assert!(app.gesture_canvas_plan.total_bytes > 0);
+        assert!(
+            app.gesture_canvas_plan.total_bytes
+                <= gesture_canvas::GESTURE_CANVAS_AGGREGATE_MAX_BYTES
+        );
+
+        // A real geometry change re-admits at the new grid.
+        app.resize_gesture_canvas_for_output(1920, 1080);
+        assert_eq!(
+            app.gesture_canvas_plan.max_dimensions,
+            app.gesture_canvas.grid().dimensions()
+        );
+        assert_eq!(app.gesture_canvas_plan.canvases, 1);
+    }
+
+    /// The live loop's half of the same three-step law the offline job obeys:
+    /// build the device canvas from the admitted plan, bind its presented donor
+    /// before the executor prepares tap bind groups, and publish the staged
+    /// transaction at the acceptance decision — only for an accepted frame, and
+    /// before the CPU commit closes it.
+    #[test]
+    fn the_live_loop_builds_binds_and_publishes_its_gesture_canvas_in_the_offline_order() {
+        let source = include_str!("main.rs");
+
+        let stage = source
+            .find("self.stage_gesture_canvas_frame(\n                        temporal_input")
+            .expect("the live loop stages the canvas transaction");
+        let after_stage = &source[stage..stage + 1_200];
+        assert!(
+            after_stage.contains("self.ensure_gesture_canvas_gpu(&device, &queue);"),
+            "the device half is built beside the staged frame, before the renderer borrow"
+        );
+
+        let bind = source
+            .find("executor.bind_gesture_canvas(")
+            .expect("the live executor binds the presented canvas");
+        let prepare = source[bind..]
+            .find(".prepare(&renderer.device, &renderer.queue, plan, &sources)")
+            .expect("the live executor prepares after binding");
+        assert!(
+            prepare > 0,
+            "the canvas must be bound before prepare builds the tap bind groups"
+        );
+
+        let commit = source
+            .find("self.gesture_canvas.commit_staged();\n                        } else {")
+            .expect("the live acceptance decision commits the canvas");
+        let publish = source[..commit]
+            .rfind("publish_gesture_canvas_frame(")
+            .expect("the live loop publishes the staged transaction");
+        assert!(
+            source[publish..commit].contains("temporal_frame_accepted,"),
+            "the publisher must be told whether this frame was accepted"
+        );
+        assert!(
+            source[..publish].contains("renderer.commit_temporal_frame();"),
+            "publication belongs at the acceptance decision, not inside the frame encoder"
+        );
+
+        // The publisher itself refuses to encode a frame for a rejected or
+        // abandoned transaction, which is what keeps the device field and the
+        // CPU reference on the same committed sequence.
+        let publisher = source
+            .find("fn publish_gesture_canvas_frame(")
+            .expect("the publisher exists");
+        let body = &source[publisher..publisher + 2_000];
+        assert!(body.contains("let encode_frame = accepted && state.has_staged_frame();"));
+    }
+
+    /// §4 of this stage: a reset that stopped at the CPU field would leave the
+    /// previously etched donor image bound and readable by every canvas route
+    /// until something else happened to etch. Every typed cause must therefore
+    /// reach the device half, and exactly one seam may lower the flag again.
+    #[test]
+    fn every_gesture_canvas_reset_cause_reaches_the_device_half() {
+        use gesture_canvas::GestureCanvasResetCause;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        assert!(
+            !app.gesture_canvas_gpu_reset_pending,
+            "a fresh process has nothing to clear"
+        );
+
+        // Every real host barrier, driven through its own entry point rather
+        // than through one shared helper.
+        type Barrier = fn(&mut App);
+        let barriers: Vec<(&str, Barrier)> = vec![
+            ("patch generation", |app: &mut App| {
+                app.reset_patch_generation();
+            }),
+            ("broad revert", |app: &mut App| {
+                app.revert_master_visual_state();
+            }),
+            ("source cut", |app: &mut App| {
+                app.invalidate_source_cut_generation();
+            }),
+            ("manual clear", |app: &mut App| {
+                app.clear_temporal_memory();
+            }),
+            ("source replacement", |app: &mut App| {
+                app.reset_gesture_canvas_for(GestureCanvasResetCause::SourceReplacement);
+            }),
+            ("apply look", |app: &mut App| {
+                app.invalidate_visual_generation_after_look(&AppliedLookScope {
+                    mapped_layer_ids: Vec::new(),
+                    applied_ntsc: false,
+                    applied_temporal: false,
+                    applied_nodes: Vec::new(),
+                    applied_group_ids: Vec::new(),
+                    applied_bus_crossfade: false,
+                });
+            }),
+        ];
+        for (name, barrier) in barriers {
+            app.gesture_canvas_gpu_reset_pending = false;
+            barrier(&mut app);
+            assert!(
+                app.gesture_canvas_gpu_reset_pending,
+                "{name} reset the CPU canvas without reaching the device half"
+            );
+        }
+
+        // A resize raises the cause on the state directly, so it raises the
+        // device flag explicitly at its own site.
+        app.gesture_canvas_gpu_reset_pending = false;
+        app.resize_gesture_canvas_for_output(1920, 1080);
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::Resize)
+        );
+        assert!(app.gesture_canvas_gpu_reset_pending);
+
+        // Exactly two seams touch the flag on the raising side, and the one
+        // lowering seam is the publisher — which clears the device *before* it
+        // lowers the flag, and submits that clear even when the frame encode
+        // was refused.
+        let source = include_str!("main.rs");
+        // Two real raising sites plus this scan's own needle, which is itself
+        // part of the file it searches.
+        let raises = source
+            .matches("self.gesture_canvas_gpu_reset_pending = true;")
+            .count();
+        assert_eq!(
+            raises, 3,
+            "only `reset_gesture_canvas_for` and the resize site may raise the device reset flag"
+        );
+        let start = source
+            .find("fn publish_gesture_canvas_frame(")
+            .expect("the publisher exists");
+        let body = &source[start..start + 2_000];
+        assert!(body.contains("resources.encode_clear(&mut encoder);"));
+        assert!(body.contains("*reset_pending = false;"));
+        assert!(
+            body.find("resources.encode_clear(&mut encoder);") < body.find("encode_staged_frame"),
+            "a pending clear must be encoded before this frame's etch, never after it"
+        );
+        assert!(body.contains("queue.submit(std::iter::once(encoder.finish()));"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_gesture_canvas_reset_cause_is_raised_from_its_real_host_barrier() {
+        use gesture::GesturePhase;
+        use gesture_canvas::GestureCanvasResetCause;
+
+        fn etched(app: &mut App) {
+            gesture_sample(app, GesturePhase::Begin, [0.5, 0.5], [1.0, 0.0]);
+            accepted_canvas_frame(app, true);
+            gesture_sample(app, GesturePhase::End, [0.5, 0.5], [1.0, 0.0]);
+            accepted_canvas_frame(app, true);
+            assert!(app.gesture_canvas.generation() > 0);
+            assert!(app.gesture_canvas.last_tick().is_some());
+        }
+
+        fn is_cleared(app: &App) -> bool {
+            app.gesture_canvas
+                .field()
+                .cells()
+                .iter()
+                .all(|cell| cell.coverage == 0.0 && cell.vector == [0.0, 0.0])
+        }
+
+        // Patch load, Apply Look, and a broad revert are authored generation
+        // barriers: they clear the field and the decay clock together.
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        etched(&mut app);
+        app.reset_patch_generation();
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::PatchGeneration)
+        );
+        assert!(is_cleared(&app));
+        assert_eq!(app.gesture_canvas.generation(), 0);
+        assert_eq!(app.gesture_canvas.last_tick(), None);
+
+        etched(&mut app);
+        app.revert_master_visual_state();
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::BroadRevert)
+        );
+        assert!(is_cleared(&app));
+
+        // A cut and a source replacement rebase the decay clock and keep the
+        // authored etch. A seek is not an erase.
+        etched(&mut app);
+        let held = app.gesture_canvas.field().clone();
+        app.invalidate_source_cut_generation();
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::SourceCut)
+        );
+        assert_eq!(app.gesture_canvas.field(), &held);
+        assert_eq!(app.gesture_canvas.last_tick(), None);
+        app.reset_gesture_canvas_for(GestureCanvasResetCause::SourceReplacement);
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::SourceReplacement)
+        );
+        assert_eq!(app.gesture_canvas.field(), &held);
+
+        // The operator's explicit memory clear erases the field and
+        // deliberately preserves the recorded track, exactly as it preserves
+        // the recorded temporal event track.
+        app.handle_web_action(web::state::WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        gesture_sample(&mut app, GesturePhase::Begin, [0.5, 0.5], [1.0, 0.0]);
+        app.gesture_event_recorder.record_accepted(
+            1.0 / gesture::GESTURE_REFERENCE_FPS,
+            &app.pending_gesture_events,
+        );
+        app.pending_gesture_events.clear();
+        assert_eq!(app.gesture_event_recorder.track().events().len(), 1);
+        app.clear_temporal_memory();
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::ManualClear)
+        );
+        assert!(is_cleared(&app));
+        assert_eq!(
+            app.gesture_event_recorder.track().events().len(),
+            1,
+            "a manual memory clear is not an authored-track reset"
+        );
+
+        // A resize is a hard reset that never resamples cells nobody etched.
+        etched(&mut app);
+        assert_eq!(app.gesture_canvas.grid().dimensions(), [640, 360]);
+        app.resize_gesture_canvas_for_output(1920, 1080);
+        assert_eq!(app.gesture_canvas.grid().dimensions(), [480, 270]);
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::Resize)
+        );
+        assert!(is_cleared(&app));
+        assert_eq!(app.gesture_canvas.generation(), 0);
+        // An identical output leaves the canvas exactly alone.
+        etched(&mut app);
+        let unchanged = app.gesture_canvas.field().clone();
+        let generation = app.gesture_canvas.generation();
+        app.resize_gesture_canvas_for_output(1920, 1080);
+        assert_eq!(app.gesture_canvas.field(), &unchanged);
+        assert_eq!(app.gesture_canvas.generation(), generation);
+
+        // An export owns the second admitted canvas. Cancelling it hard-resets
+        // and releases that canvas and never touches the operator's live one.
+        assert!(app.export_gesture_canvas.is_none());
+        app.open_export_gesture_canvas(1280, 720);
+        let export = app
+            .export_gesture_canvas
+            .as_ref()
+            .expect("the export canvas was admitted");
+        assert_eq!(export.grid().dimensions(), [640, 360]);
+        assert_eq!(app.gesture_canvas_plan.canvases, 2);
+        assert!(
+            app.gesture_canvas_plan.total_bytes
+                <= gesture_canvas::GESTURE_CANVAS_AGGREGATE_MAX_BYTES
+        );
+        app.close_export_gesture_canvas(GestureCanvasResetCause::ExportCancelled);
+        assert!(app.export_gesture_canvas.is_none());
+        assert_eq!(app.gesture_canvas_plan.canvases, 1);
+        // A finished job releases its canvas without claiming a cancellation.
+        app.open_export_gesture_canvas(1280, 720);
+        assert!(app.export_gesture_canvas.is_some());
+        app.release_finished_export_gesture_canvas();
+        assert!(app.export_gesture_canvas.is_none());
+        assert_eq!(app.gesture_canvas_plan.canvases, 1);
+        assert_eq!(
+            app.gesture_canvas.field(),
+            &unchanged,
+            "a cancelled export is not an authored erase of the live canvas"
+        );
+        assert_eq!(
+            app.gesture_canvas.last_reset(),
+            Some(GestureCanvasResetCause::Resize),
+            "the live canvas records no cause it did not observe"
+        );
+
+        // Each cause is raised from its real host site rather than from one
+        // shared helper.
+        let source = include_str!("main.rs");
+        for (name, cause) in [
+            ("fn reset_patch_generation(", "PatchGeneration"),
+            ("fn invalidate_visual_generation_after_look(", "ApplyLook"),
+            ("fn invalidate_source_cut_generation(", "SourceCut"),
+            ("fn revert_master_visual_state(", "BroadRevert"),
+            ("fn clear_temporal_memory(", "ManualClear"),
+        ] {
+            let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
+            let body = &source[start..start + 6_000];
+            assert!(
+                body.contains(&format!("GestureCanvasResetCause::{cause}")),
+                "{name} must raise {cause}"
+            );
+        }
+        // Source replacement is raised where a prepared transaction swaps the
+        // pixels a layer or a whole scene reads from, not from some shared
+        // helper that a seek also reaches.
+        let slot = source
+            .find("\"Activated layer {} slot {}\"")
+            .expect("the prepared-transaction commit reports the layer slot swap it applied");
+        assert!(
+            source[slot..slot + 1_500].contains("GestureCanvasResetCause::SourceReplacement"),
+            "a prepared source swap must raise SourceReplacement"
+        );
+        // Every path that abandons the frame between opening the transaction
+        // and taking the acceptance decision discards it, so no early exit can
+        // strand a staged frame.
+        let stage = source
+            .find("self.stage_gesture_canvas_frame(")
+            .expect("the canvas transaction opens with the frame's temporal input");
+        let decision = source
+            .find("self.gesture_canvas.commit_staged();")
+            .expect("an accepted frame commits the staged canvas");
+        let span = &source[stage..decision];
+        assert_eq!(
+            span.matches("return;").count(),
+            2,
+            "only the two device-loss exits leave the frame early"
+        );
+        assert_eq!(
+            span.matches("self.gesture_canvas.discard_staged();")
+                .count(),
+            2,
+            "each early exit discards the frame it abandoned"
+        );
+        let cancel = source
+            .find("WebAction::CancelExport => {")
+            .expect("the export cancel handler exists");
+        assert!(
+            source[cancel..cancel + 600].contains("GestureCanvasResetCause::ExportCancelled"),
+            "a cancelled export releases its own canvas"
+        );
+    }
+
+    #[test]
+    fn a_completed_authored_gesture_is_one_undo_entry_and_automation_gestures_record_none() {
+        use gesture::GesturePhase;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.handle_web_action(web::state::WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        let undo_before = app.manual_history.metrics().undo_depth;
+
+        gesture_sample(&mut app, GesturePhase::Begin, [0.4, 0.4], [1.0, 0.0]);
+        assert!(
+            app.manual_history.metrics().gesture_open,
+            "the first Begin opens exactly one manual-history entry"
+        );
+        assert!(app.gesture_history_open.is_some());
+        assert_eq!(app.manual_history.metrics().undo_depth, undo_before);
+
+        // Four hundred and ninety-eight motion samples plus the Begin and the
+        // End are five hundred events in one stroke. None of the motion may
+        // reach the bounded stack.
+        for index in 0..498 {
+            let offset = index as f32 / 1_000.0;
+            gesture_sample(
+                &mut app,
+                GesturePhase::Move,
+                [0.4 + offset, 0.4],
+                [1.0, 0.0],
+            );
+            // Retire the frame batch so the ingest cap never truncates the
+            // stroke; the frame loop does exactly this at every accepted frame.
+            app.gesture_event_recorder.record_accepted(
+                1.0 / gesture::GESTURE_REFERENCE_FPS,
+                &app.pending_gesture_events,
+            );
+            app.pending_gesture_events.clear();
+            app.pending_gesture_canvas_events.clear();
+        }
+        assert_eq!(app.manual_history.metrics().undo_depth, undo_before);
+        assert!(app.manual_history.metrics().gesture_open);
+
+        gesture_sample(&mut app, GesturePhase::End, [0.9, 0.4], [1.0, 0.0]);
+        app.gesture_event_recorder.record_accepted(
+            1.0 / gesture::GESTURE_REFERENCE_FPS,
+            &app.pending_gesture_events,
+        );
+        app.pending_gesture_events.clear();
+        assert!(!app.manual_history.metrics().gesture_open);
+        assert!(app.gesture_history_open.is_none());
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            undo_before + 1,
+            "one completed authored gesture is exactly one manual-history entry"
+        );
+        assert_eq!(app.gesture_event_recorder.track().events().len(), 500);
+
+        // A MIDI stroke reaches the same adapter and the same canvas, and
+        // records no history entry at all.
+        let depth = app.manual_history.metrics().undo_depth;
+        for input in [
+            gesture::GestureControlInput::X(0.2),
+            gesture::GestureControlInput::Y(0.8),
+            gesture::GestureControlInput::Contact(true),
+            gesture::GestureControlInput::X(0.6),
+            gesture::GestureControlInput::Contact(false),
+        ] {
+            app.apply_gesture_control(controller_profile::AutomationOrigin::Midi, input);
+            app.pump_gesture_surfaces();
+        }
+        assert!(!app.manual_history.metrics().gesture_open);
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            depth,
+            "automation-origin gestures are excluded from manual history"
+        );
+        assert_eq!(app.gesture_history.entry(), None);
+        assert_eq!(app.gesture_history.open_stroke_count(), 0);
+    }
+
+    #[test]
+    fn a_patch_carries_the_recorded_track_whole_and_restores_it_after_the_load_barrier() {
+        use gesture::GesturePhase;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        // An operator who never recorded a gesture emits no section at all,
+        // so the saved patch is byte-identical to the pre-gesture path.
+        assert!(app.capture_current_patch().gesture_track.is_none());
+
+        app.handle_web_action(web::state::WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        for (phase, position) in [
+            (GesturePhase::Begin, [0.25, 0.25]),
+            (GesturePhase::Move, [0.5, 0.5]),
+            (GesturePhase::End, [0.75, 0.75]),
+        ] {
+            gesture_sample(&mut app, phase, position, [1.0, 0.0]);
+            app.gesture_event_recorder.record_accepted(
+                1.0 / gesture::GESTURE_REFERENCE_FPS,
+                &app.pending_gesture_events,
+            );
+            app.pending_gesture_events.clear();
+            app.pending_gesture_canvas_events.clear();
+        }
+        let recorded = app.gesture_event_recorder.track().clone();
+        assert_eq!(recorded.events().len(), 3);
+        let digest = recorded.checksum_hex();
+
+        let patch = app.capture_current_patch();
+        let document = patch
+            .gesture_track
+            .as_ref()
+            .expect("a recorded track is captured whole");
+        assert_eq!(document.checksum, digest);
+
+        // The load barrier clears the retired program's recorder; the restore
+        // runs strictly afterwards, so a track cannot be wiped by its own load.
+        app.reset_patch_generation();
+        assert!(app.gesture_event_recorder.track().events().is_empty());
+        app.restore_gesture_track_from_patch(&patch);
+        assert_eq!(app.gesture_event_recorder.track(), &recorded);
+        assert_eq!(app.gesture_event_recorder.track().checksum_hex(), digest);
+        assert_eq!(app.gesture_status_snapshot().checksum, digest);
+
+        // The restored session clock resumes at the track's last recorded
+        // address, so a later live event stays monotonic without rebasing the
+        // hashed origin of a recording the operator already holds.
+        assert_eq!(
+            app.gesture_event_recorder.reference_tick(),
+            recorded.last_absolute_tick()
+        );
+        assert_eq!(
+            app.capture_current_patch().gesture_track,
+            patch.gesture_track
+        );
+
+        let source = include_str!("main.rs");
+        let barrier = source
+            .find("self.restore_gesture_track_from_patch(&patch);")
+            .expect("patch load restores the recorded track");
+        assert!(
+            source[..barrier].contains("self.reset_patch_generation();"),
+            "the restore must follow the barrier that clears the retired recorder"
+        );
+    }
+
+    /// The recording control is an ordered barrier protected by the live stack
+    /// revision, and it is unreachable from a quantized batch. An arm decision
+    /// taken against a program that has since been replaced changes nothing.
+    #[test]
+    fn gesture_recording_control_is_a_revision_protected_barrier_outside_every_quantized_batch() {
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let live = app.layer_stack_revision;
+        assert_ne!(live, 0);
+
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: live.wrapping_add(1),
+        });
+        assert!(
+            !app.gesture_recording,
+            "a stale stack revision must not arm recording"
+        );
+        assert!(app.gesture_status.contains("stale stack revision"));
+
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: live,
+        });
+        assert!(app.gesture_recording);
+        assert!(app.gesture_status_snapshot().recording);
+
+        // A patch-load barrier advances the revision, so an arm/disarm edge
+        // queued against the previous program is refused rather than applied
+        // to the new one.
+        app.bump_layer_stack_revision();
+        let stale = live;
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: false,
+            layer_stack_revision: stale,
+        });
+        assert!(app.gesture_recording, "a stale disarm must not take effect");
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(!app.gesture_recording);
+
+        // Neither gesture action may ever be latched to a downbeat.
+        for action in [
+            WebAction::SetGestureRecording {
+                enabled: true,
+                layer_stack_revision: app.layer_stack_revision,
+            },
+            WebAction::GestureSample {
+                stroke: 0,
+                phase: gesture::GesturePhase::Begin,
+                mode: gesture::GestureMode::Push,
+                x: 0.5,
+                y: 0.5,
+                pressure: 1.0,
+                direction_x: 1.0,
+                direction_y: 0.0,
+            },
+        ] {
+            assert!(App::quantized_action_key(&action).is_none());
+            app.queue_quantized_action(action);
+            assert!(app.composition_status.contains("cannot be quantized"));
+            assert!(app.quantized_actions.is_empty());
+        }
+    }
+
+    /// A browser canvas scalar edits authored values only. Its vocabulary is
+    /// closed, every value is clamped, and no spelling reaches the recording.
+    #[test]
+    fn gesture_canvas_scalars_edit_authored_values_only_and_never_reach_the_recorded_track() {
+        use gesture::GesturePhase;
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        gesture_sample(&mut app, GesturePhase::Begin, [0.5, 0.5], [1.0, 0.0]);
+        app.gesture_event_recorder.record_accepted(
+            1.0 / gesture::GESTURE_REFERENCE_FPS,
+            &app.pending_gesture_events,
+        );
+        app.pending_gesture_events.clear();
+        app.gesture_checksum = published_gesture_checksum(&app.gesture_event_recorder);
+        let recorded = app.gesture_event_recorder.track().clone();
+        let digest = app.gesture_checksum.clone();
+        assert_eq!(recorded.events().len(), 1);
+
+        for (param, value, expected) in [
+            ("radius", 0.25_f64, 0.25_f32),
+            ("strength", 0.75, 0.75),
+            ("retention", 0.5, 0.5),
+        ] {
+            app.handle_web_action(WebAction::SetGestureCanvas {
+                param: param.into(),
+                value: serde_json::json!(value),
+            });
+            let params = app.gesture_canvas.params();
+            let actual = match param {
+                "radius" => params.radius,
+                "strength" => params.strength,
+                _ => params.retention,
+            };
+            assert!((actual - expected).abs() < 1.0e-6, "{param}");
+        }
+
+        // Out-of-range clamps, non-finite takes the default, and an unknown
+        // key is a typed refusal rather than a silent write.
+        assert!(app
+            .set_gesture_canvas_param("radius", &serde_json::json!(9.0))
+            .is_ok());
+        assert_eq!(app.gesture_canvas.params().radius, 1.0);
+        assert!(app
+            .set_gesture_canvas_param("strength", &serde_json::json!(f64::NAN))
+            .is_err());
+        for hostile in ["track", "events", "checksum", "recording"] {
+            assert!(
+                app.set_gesture_canvas_param(hostile, &serde_json::json!(0.5))
+                    .is_err(),
+                "{hostile} must not be an authorable canvas parameter"
+            );
+        }
+
+        // Every one of those edits left the recording exactly as recorded.
+        assert_eq!(app.gesture_event_recorder.track(), &recorded);
+        assert_eq!(app.gesture_status_snapshot().checksum, digest);
+        assert_eq!(app.gesture_status_snapshot().recorded_events, 1);
+
+        // The published canvas block reports the authored values.
+        let snapshot = app.gesture_status_snapshot();
+        assert_eq!(snapshot.canvas.radius, 1.0);
+        assert!((snapshot.canvas.retention - 0.5).abs() < 1.0e-6);
+        assert_eq!(snapshot.canvas.grid_width, app.gesture_canvas.grid().width);
+        assert_eq!(
+            snapshot.canvas.grid_height,
+            app.gesture_canvas.grid().height
+        );
+    }
+
+    /// Authored canvas values persist; a default canvas emits no section at
+    /// all so the saved patch stays byte-identical to the pre-gesture path.
+    #[test]
+    fn an_authored_gesture_canvas_persists_and_a_default_one_emits_no_section() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let captured = app.try_capture_current_patch().expect("capture");
+        assert_eq!(
+            captured.gesture_canvas, None,
+            "an untouched canvas is the pre-gesture path"
+        );
+        let yaml = serde_yaml::to_string(&captured).unwrap();
+        assert!(!yaml.contains("gesture_canvas:"));
+        assert!(!yaml.contains("gesture_track:"));
+
+        app.set_gesture_canvas_param("radius", &serde_json::json!(0.4))
+            .unwrap();
+        app.set_gesture_canvas_param("retention", &serde_json::json!(0.25))
+            .unwrap();
+        let captured = app.try_capture_current_patch().expect("capture");
+        let canvas = captured.gesture_canvas.expect("authored section");
+        assert!((canvas.radius - 0.4).abs() < 1.0e-6);
+        assert!((canvas.retention - 0.25).abs() < 1.0e-6);
+
+        // A patch-generation barrier clears the etched field, not the
+        // authored controls: those belong to the patch and are replaced by the
+        // restore that follows the barrier.
+        app.set_gesture_canvas_param("radius", &serde_json::json!(0.9))
+            .unwrap();
+        app.reset_patch_generation();
+        assert!((app.gesture_canvas.params().radius - 0.9).abs() < 1.0e-6);
+        app.restore_gesture_track_from_patch(&captured);
+        assert!((app.gesture_canvas.params().radius - 0.4).abs() < 1.0e-6);
+        assert!((app.gesture_canvas.params().retention - 0.25).abs() < 1.0e-6);
+
+        // A legacy patch with no section leaves the live canvas alone.
+        let mut legacy = captured.clone();
+        legacy.gesture_canvas = None;
+        legacy.gesture_track = None;
+        let before = app.gesture_canvas.params();
+        app.restore_gesture_track_from_patch(&legacy);
+        assert_eq!(app.gesture_canvas.params(), before);
+    }
+
+    /// An engaged A/B pair owns the authored canvas values only when both
+    /// slots name the same recording, and the sampled world writes those
+    /// values without ever touching the recording itself.
+    #[test]
+    fn morph_owns_gesture_canvas_values_only_when_both_slots_name_the_same_recording() {
+        use gesture::GesturePhase;
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let capture = |app: &mut App, slot: &str| {
+            app.handle_web_action(WebAction::MorphCapture {
+                slot: slot.to_string(),
+                stack_revision: Some(app.layer_stack_revision),
+                composition_revision: Some(app.composition_revision),
+            });
+        };
+
+        app.set_gesture_canvas_param("radius", &serde_json::json!(0.2))
+            .unwrap();
+        capture(&mut app, "a");
+        app.set_gesture_canvas_param("radius", &serde_json::json!(0.6))
+            .unwrap();
+        capture(&mut app, "b");
+        assert!(app.morph.a.is_some() && app.morph.b.is_some());
+        assert!(
+            app.morph.controls_master_gesture(),
+            "two slots captured against the same (empty) recording own the canvas"
+        );
+
+        // The materialized midpoint blends the authored value.
+        app.morph.set_position(0.5);
+        app.materialize_morph_at_current_beat();
+        assert!(
+            (app.gesture_canvas.params().radius - 0.4).abs() < 1.0e-3,
+            "midpoint radius was {}",
+            app.gesture_canvas.params().radius
+        );
+
+        // Record a gesture, recapture only B, and the pair stops owning the
+        // canvas: two different recordings are two pieces, not two ends of a
+        // blend. The recorded track is untouched by any of this.
+        app.morph.clear();
+        app.handle_web_action(WebAction::SetGestureRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        app.set_gesture_canvas_param("radius", &serde_json::json!(0.2))
+            .unwrap();
+        capture(&mut app, "a");
+        gesture_sample(&mut app, GesturePhase::Begin, [0.5, 0.5], [1.0, 0.0]);
+        app.gesture_event_recorder.record_accepted(
+            1.0 / gesture::GESTURE_REFERENCE_FPS,
+            &app.pending_gesture_events,
+        );
+        app.pending_gesture_events.clear();
+        app.gesture_checksum = published_gesture_checksum(&app.gesture_event_recorder);
+        let recorded = app.gesture_event_recorder.track().clone();
+        app.set_gesture_canvas_param("radius", &serde_json::json!(0.6))
+            .unwrap();
+        capture(&mut app, "b");
+        assert!(!app.morph.controls_master_gesture());
+        let sample = app.morph.sample(0.5).expect("sample");
+        assert!(
+            sample.gesture.is_none(),
+            "slots naming different recordings must not blend"
+        );
+        app.morph.set_position(0.5);
+        app.materialize_morph_at_current_beat();
+        assert!((app.gesture_canvas.params().radius - 0.6).abs() < 1.0e-6);
+        assert_eq!(
+            app.gesture_event_recorder.track(),
+            &recorded,
+            "no morph position may rewrite a recording"
+        );
     }
 }

@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+use crate::gesture::{GestureOrigin, GesturePhase, MAX_ACTIVE_STROKES};
+
 pub const HISTORY_MAX_ENTRIES: usize = 128;
 pub const HISTORY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const HISTORY_MAX_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
@@ -45,6 +47,23 @@ impl MutationOrigin {
     pub const fn is_manual(self) -> bool {
         matches!(self, Self::BrowserManual | Self::NativeManual)
     }
+
+    /// Manual-history class of a normalized gesture surface.
+    ///
+    /// Provenance decides whether a stroke was authored by a person at all: a
+    /// native pointer and a phone are hands, while MIDI and OSC are automation
+    /// and are excluded from history by exactly the same law that already
+    /// excludes every other automation origin. The mapping lives here rather
+    /// than in `crate::gesture` so the portable event contract keeps no
+    /// knowledge of the history store.
+    pub const fn for_gesture_origin(origin: GestureOrigin) -> Self {
+        match origin {
+            GestureOrigin::NativePointer => Self::NativeManual,
+            GestureOrigin::Phone => Self::BrowserManual,
+            GestureOrigin::Midi => Self::Midi,
+            GestureOrigin::Osc => Self::Osc,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -60,6 +79,157 @@ impl HistoryGestureId {
 
     pub const fn get(self) -> u64 {
         self.0.get()
+    }
+}
+
+/// What one observed gesture sample asks the manual-history store to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GestureHistoryStep {
+    /// Nothing. A motion sample, an automation origin, an out-of-range stroke
+    /// identity, an unmatched phase, or a stroke that joined a gesture already
+    /// being recorded all land here.
+    Idle,
+    /// Open exactly one manual-history entry for the gesture now beginning.
+    Open(HistoryGestureId),
+    /// Close the one entry this gesture opened.
+    Close(HistoryGestureId),
+}
+
+/// Router that turns a normalized gesture stroke set into **exactly one**
+/// manual-history entry.
+///
+/// The law is deliberately narrow. An entry opens at the first `Begin`
+/// observed while the router holds nothing open, and closes at the `End` that
+/// closes the last still-open stroke, so a multi-touch gesture is one authored
+/// transaction rather than one per finger. Every `Move` in between is
+/// invisible: a five-hundred-sample stroke must cost the bounded stack exactly
+/// one checkpoint, not five hundred. An automation-driven origin is refused
+/// before any identity is allocated, so MIDI and OSC gestures record nothing at
+/// all.
+///
+/// The router allocates the identity and reports the boundary; it never touches
+/// the store, because the authored world a checkpoint captures belongs to the
+/// application and not to this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GestureHistoryRouter {
+    /// One bit per stroke identity. `MAX_ACTIVE_STROKES` is exactly `u16::BITS`
+    /// and `crate::gesture` asserts that at compile time, so this mask covers
+    /// the whole identity space by construction.
+    open_strokes: u16,
+    entry: Option<HistoryGestureId>,
+    next_id: u64,
+}
+
+impl Default for GestureHistoryRouter {
+    fn default() -> Self {
+        Self {
+            open_strokes: 0,
+            entry: None,
+            next_id: 1,
+        }
+    }
+}
+
+impl GestureHistoryRouter {
+    /// Identity of the one entry currently open, if any.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the open entry is read by the §4 router goldens; the host tracks its own accepted identity"
+        )
+    )]
+    pub const fn entry(&self) -> Option<HistoryGestureId> {
+        self.entry
+    }
+
+    /// Strokes the router believes are still down. This is history bookkeeping
+    /// only; the recorded track keeps its own authoritative open-stroke set.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the open-stroke set is asserted by the §4 multi-touch golden"
+        )
+    )]
+    pub const fn open_stroke_count(&self) -> u32 {
+        self.open_strokes.count_ones()
+    }
+
+    /// Observe one normalized sample and report the manual-history boundary it
+    /// crosses, if any.
+    pub fn observe(
+        &mut self,
+        origin: GestureOrigin,
+        phase: GesturePhase,
+        stroke: u8,
+    ) -> GestureHistoryStep {
+        // Automation records nothing. Returning before the mask is even
+        // computed keeps an automation stroke out of the open-stroke set, so a
+        // controller sweep can never close an entry a person opened.
+        if origin.is_automation() {
+            return GestureHistoryStep::Idle;
+        }
+        let Some(mask) = Self::stroke_mask(stroke) else {
+            return GestureHistoryStep::Idle;
+        };
+        match phase {
+            GesturePhase::Begin => {
+                if self.open_strokes & mask != 0 {
+                    return GestureHistoryStep::Idle;
+                }
+                self.open_strokes |= mask;
+                if self.entry.is_some() {
+                    return GestureHistoryStep::Idle;
+                }
+                let id = self.allocate();
+                self.entry = Some(id);
+                GestureHistoryStep::Open(id)
+            }
+            // The whole point of §4. Motion between the boundaries never
+            // reaches the bounded stack.
+            GesturePhase::Move => GestureHistoryStep::Idle,
+            GesturePhase::End => {
+                if self.open_strokes & mask == 0 {
+                    return GestureHistoryStep::Idle;
+                }
+                self.open_strokes &= !mask;
+                if self.open_strokes != 0 {
+                    return GestureHistoryStep::Idle;
+                }
+                match self.entry.take() {
+                    Some(id) => GestureHistoryStep::Close(id),
+                    None => GestureHistoryStep::Idle,
+                }
+            }
+        }
+    }
+
+    /// Abandon whatever this router holds open and report the entry identity so
+    /// the caller can cancel it. A generation barrier replaces the authored
+    /// world the open checkpoint described, so the transaction is abandoned
+    /// rather than committed against a program that no longer exists.
+    pub fn abandon(&mut self) -> Option<HistoryGestureId> {
+        self.open_strokes = 0;
+        self.entry.take()
+    }
+
+    fn stroke_mask(stroke: u8) -> Option<u16> {
+        (usize::from(stroke) < MAX_ACTIVE_STROKES).then(|| 1_u16 << stroke)
+    }
+
+    /// Allocate the next non-zero identity. The counter wraps rather than
+    /// saturating, and zero is skipped, so a very long session keeps producing
+    /// usable identities instead of failing closed on a boundary nobody can
+    /// reach in practice.
+    fn allocate(&mut self) -> HistoryGestureId {
+        loop {
+            let raw = self.next_id;
+            self.next_id = raw.wrapping_add(1);
+            if let Some(id) = HistoryGestureId::new(raw) {
+                return id;
+            }
+        }
     }
 }
 
@@ -1001,6 +1171,345 @@ mod tests {
         assert_eq!(metrics.bytes, limits.max_bytes);
         assert!(metrics.gesture_open);
         history.cancel_gesture(gesture).unwrap();
+    }
+
+    /// Drive one router step into a real store, exactly as the host does: an
+    /// `Open` takes a before-checkpoint, a `Close` finishes against the value
+    /// the world now holds, and an `Idle` is genuinely nothing.
+    fn route(
+        router: &mut GestureHistoryRouter,
+        history: &mut ManualHistory<u64>,
+        origin: GestureOrigin,
+        phase: GesturePhase,
+        stroke: u8,
+        before: u64,
+        after: u64,
+    ) -> GestureHistoryStep {
+        let step = router.observe(origin, phase, stroke);
+        match step {
+            GestureHistoryStep::Idle => {}
+            GestureHistoryStep::Open(id) => {
+                history
+                    .begin_gesture(
+                        id,
+                        MutationOrigin::for_gesture_origin(origin),
+                        checkpoint(before, "Etch gesture"),
+                    )
+                    .unwrap();
+            }
+            GestureHistoryStep::Close(id) => {
+                history.finish_gesture(id, fingerprint(after)).unwrap();
+            }
+        }
+        step
+    }
+
+    #[test]
+    fn a_five_hundred_sample_authored_stroke_yields_exactly_one_undo_entry() {
+        let mut router = GestureHistoryRouter::default();
+        let mut history = ManualHistory::<u64>::default();
+
+        assert!(matches!(
+            route(
+                &mut router,
+                &mut history,
+                GestureOrigin::NativePointer,
+                GesturePhase::Begin,
+                0,
+                1,
+                2,
+            ),
+            GestureHistoryStep::Open(_)
+        ));
+        assert!(history.metrics().gesture_open);
+
+        // Four hundred and ninety-eight motion samples plus the opening Begin
+        // and the closing End are five hundred events in one stroke.
+        for _ in 0..498 {
+            assert_eq!(
+                route(
+                    &mut router,
+                    &mut history,
+                    GestureOrigin::NativePointer,
+                    GesturePhase::Move,
+                    0,
+                    1,
+                    2,
+                ),
+                GestureHistoryStep::Idle,
+                "pointer motion must never reach the bounded history stack"
+            );
+        }
+        assert_eq!(history.metrics().undo_depth, 0);
+
+        assert!(matches!(
+            route(
+                &mut router,
+                &mut history,
+                GestureOrigin::NativePointer,
+                GesturePhase::End,
+                0,
+                1,
+                2,
+            ),
+            GestureHistoryStep::Close(_)
+        ));
+
+        let metrics = history.metrics();
+        assert_eq!(
+            metrics.undo_depth, 1,
+            "one completed authored gesture is exactly one manual-history entry"
+        );
+        assert!(!metrics.gesture_open);
+        assert_eq!(router.open_stroke_count(), 0);
+        assert_eq!(router.entry(), None);
+    }
+
+    #[test]
+    fn automation_origin_gestures_open_no_entry_and_never_close_an_authored_one() {
+        let mut router = GestureHistoryRouter::default();
+        let mut history = ManualHistory::<u64>::default();
+
+        // A complete MIDI and a complete OSC stroke each record nothing.
+        for origin in [GestureOrigin::Midi, GestureOrigin::Osc] {
+            for phase in [GesturePhase::Begin, GesturePhase::Move, GesturePhase::End] {
+                assert_eq!(
+                    route(&mut router, &mut history, origin, phase, 3, 1, 2),
+                    GestureHistoryStep::Idle,
+                    "{origin} is automation and must record no manual history"
+                );
+            }
+            assert!(!MutationOrigin::for_gesture_origin(origin).is_manual());
+        }
+        assert_eq!(history.metrics().undo_depth, 0);
+        assert!(!history.metrics().gesture_open);
+        assert_eq!(router.open_stroke_count(), 0);
+
+        // An automation stroke sharing a person's stroke identity cannot close
+        // the entry the person opened.
+        route(
+            &mut router,
+            &mut history,
+            GestureOrigin::Phone,
+            GesturePhase::Begin,
+            3,
+            1,
+            2,
+        );
+        let owned = router.entry().expect("the phone opened an entry");
+        assert_eq!(
+            router.observe(GestureOrigin::Midi, GesturePhase::End, 3),
+            GestureHistoryStep::Idle
+        );
+        assert_eq!(router.entry(), Some(owned));
+        assert!(history.metrics().gesture_open);
+        assert_eq!(
+            route(
+                &mut router,
+                &mut history,
+                GestureOrigin::Phone,
+                GesturePhase::End,
+                3,
+                1,
+                2,
+            ),
+            GestureHistoryStep::Close(owned)
+        );
+        assert_eq!(history.metrics().undo_depth, 1);
+
+        assert_eq!(
+            MutationOrigin::for_gesture_origin(GestureOrigin::NativePointer),
+            MutationOrigin::NativeManual
+        );
+        assert_eq!(
+            MutationOrigin::for_gesture_origin(GestureOrigin::Phone),
+            MutationOrigin::BrowserManual
+        );
+    }
+
+    #[test]
+    fn a_multi_touch_gesture_is_one_entry_opened_at_the_first_begin_and_closed_at_the_last_end() {
+        let mut router = GestureHistoryRouter::default();
+        let mut history = ManualHistory::<u64>::default();
+
+        let GestureHistoryStep::Open(first) = route(
+            &mut router,
+            &mut history,
+            GestureOrigin::Phone,
+            GesturePhase::Begin,
+            0,
+            1,
+            2,
+        ) else {
+            panic!("the first Begin opens the one entry");
+        };
+        for stroke in 1..u8::try_from(MAX_ACTIVE_STROKES).unwrap() {
+            assert_eq!(
+                route(
+                    &mut router,
+                    &mut history,
+                    GestureOrigin::Phone,
+                    GesturePhase::Begin,
+                    stroke,
+                    1,
+                    2,
+                ),
+                GestureHistoryStep::Idle,
+                "a stroke joining an open gesture never opens a second entry"
+            );
+        }
+        assert_eq!(
+            router.open_stroke_count(),
+            u32::try_from(MAX_ACTIVE_STROKES).unwrap()
+        );
+        // A duplicate Begin and an out-of-range identity are both inert.
+        assert_eq!(
+            router.observe(GestureOrigin::Phone, GesturePhase::Begin, 0),
+            GestureHistoryStep::Idle
+        );
+        assert_eq!(
+            router.observe(
+                GestureOrigin::Phone,
+                GesturePhase::Begin,
+                u8::try_from(MAX_ACTIVE_STROKES).unwrap()
+            ),
+            GestureHistoryStep::Idle
+        );
+        assert_eq!(
+            router.observe(GestureOrigin::Phone, GesturePhase::Begin, 255),
+            GestureHistoryStep::Idle
+        );
+        assert_eq!(
+            router.open_stroke_count(),
+            u32::try_from(MAX_ACTIVE_STROKES).unwrap()
+        );
+
+        for stroke in 0..u8::try_from(MAX_ACTIVE_STROKES).unwrap() - 1 {
+            assert_eq!(
+                route(
+                    &mut router,
+                    &mut history,
+                    GestureOrigin::Phone,
+                    GesturePhase::End,
+                    stroke,
+                    1,
+                    2,
+                ),
+                GestureHistoryStep::Idle,
+                "the entry stays open while any stroke is still down"
+            );
+        }
+        assert!(history.metrics().gesture_open);
+        assert_eq!(
+            route(
+                &mut router,
+                &mut history,
+                GestureOrigin::Phone,
+                GesturePhase::End,
+                u8::try_from(MAX_ACTIVE_STROKES).unwrap() - 1,
+                1,
+                2,
+            ),
+            GestureHistoryStep::Close(first)
+        );
+        assert_eq!(history.metrics().undo_depth, 1);
+
+        // An orphan End and a Move with nothing open are both inert.
+        assert_eq!(
+            router.observe(GestureOrigin::Phone, GesturePhase::End, 0),
+            GestureHistoryStep::Idle
+        );
+        assert_eq!(
+            router.observe(GestureOrigin::Phone, GesturePhase::Move, 0),
+            GestureHistoryStep::Idle
+        );
+        assert_eq!(router.entry(), None);
+    }
+
+    #[test]
+    fn an_unchanged_gesture_records_nothing_and_a_barrier_abandons_an_open_one() {
+        let mut router = GestureHistoryRouter::default();
+        let mut history = ManualHistory::<u64>::default();
+
+        // A stroke that leaves the authored world exactly as it found it is
+        // NoChange, not an empty undo step.
+        let GestureHistoryStep::Open(id) = route(
+            &mut router,
+            &mut history,
+            GestureOrigin::NativePointer,
+            GesturePhase::Begin,
+            2,
+            7,
+            7,
+        ) else {
+            panic!("Begin opens an entry");
+        };
+        assert_eq!(
+            history.finish_gesture(id, fingerprint(7)).unwrap(),
+            HistoryRecordOutcome::NoChange
+        );
+        assert_eq!(
+            router.observe(GestureOrigin::NativePointer, GesturePhase::End, 2),
+            GestureHistoryStep::Close(id)
+        );
+        assert_eq!(history.metrics().undo_depth, 0);
+
+        // A generation barrier abandons the open transaction rather than
+        // committing it against a program that no longer exists.
+        let GestureHistoryStep::Open(open) = route(
+            &mut router,
+            &mut history,
+            GestureOrigin::Phone,
+            GesturePhase::Begin,
+            5,
+            11,
+            12,
+        ) else {
+            panic!("Begin opens an entry");
+        };
+        router.observe(GestureOrigin::Phone, GesturePhase::Begin, 6);
+        assert_eq!(router.abandon(), Some(open));
+        assert_eq!(router.open_stroke_count(), 0);
+        assert_eq!(router.entry(), None);
+        history.cancel_gesture(open).unwrap();
+        assert_eq!(history.metrics().undo_depth, 0);
+        assert!(!history.metrics().gesture_open);
+        assert_eq!(router.abandon(), None);
+    }
+
+    #[test]
+    fn router_identities_are_non_zero_distinct_and_survive_a_counter_wrap() {
+        let mut router = GestureHistoryRouter::default();
+        let mut seen = Vec::new();
+        for stroke in 0..4_u8 {
+            let GestureHistoryStep::Open(id) =
+                router.observe(GestureOrigin::NativePointer, GesturePhase::Begin, stroke)
+            else {
+                panic!("each completed gesture opens its own entry");
+            };
+            assert_eq!(
+                router.observe(GestureOrigin::NativePointer, GesturePhase::End, stroke),
+                GestureHistoryStep::Close(id)
+            );
+            assert!(!seen.contains(&id.get()));
+            seen.push(id.get());
+        }
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+
+        router.next_id = u64::MAX;
+        let GestureHistoryStep::Open(last) =
+            router.observe(GestureOrigin::Phone, GesturePhase::Begin, 0)
+        else {
+            panic!("Begin opens an entry");
+        };
+        assert_eq!(last.get(), u64::MAX);
+        router.observe(GestureOrigin::Phone, GesturePhase::End, 0);
+        let GestureHistoryStep::Open(wrapped) =
+            router.observe(GestureOrigin::Phone, GesturePhase::Begin, 0)
+        else {
+            panic!("Begin opens an entry");
+        };
+        assert_eq!(wrapped.get(), 1, "zero is skipped rather than allocated");
     }
 
     #[test]
