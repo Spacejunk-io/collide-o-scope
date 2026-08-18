@@ -62,6 +62,17 @@ pub const NUDGE_FINE_STEP: f32 = 1.0 / 1024.0;
 /// Pick radius for a point handle, in composition-output UV.
 pub const HANDLE_PICK_RADIUS_UV: f32 = 0.02;
 
+/// Stroke width for every gizmo outline, in egui points.
+///
+/// Named rather than written inline at the two call sites, and the reason is a
+/// compiler law rather than taste. `egui::Stroke::new` takes `impl Into<f32>`,
+/// so a bare `1.5` there is inferred through an `f32: From<f64>` fallback that
+/// rustc 1.97 reports as `float_literal_f32_fallback` — a warning under check
+/// and test, and an error under `-D warnings`. A typed constant fixes the
+/// inference at its definition, states the width once, and cannot drift back
+/// into an inline literal at a third call site.
+const GIZMO_STROKE_WIDTH: f32 = 1.5;
+
 /// Local-space offset of the rotation handle above the footprint's top edge.
 pub const ROTATE_HANDLE_LOCAL_OFFSET: f32 = 0.12;
 
@@ -1105,7 +1116,7 @@ pub fn paint_transform_gizmo(
     for index in 0..4 {
         painter.line_segment(
             [pane_corners[index], pane_corners[(index + 1) % 4]],
-            egui::Stroke::new(1.5, stroke_color),
+            egui::Stroke::new(GIZMO_STROKE_WIDTH, stroke_color),
         );
     }
     let point = |handle: GizmoHandle, color: egui::Color32, radius: f32| {
@@ -1120,7 +1131,7 @@ pub fn paint_transform_gizmo(
         if filled {
             painter.circle_filled(centre, radius, color);
         } else {
-            painter.circle_stroke(centre, radius, egui::Stroke::new(1.5, color));
+            painter.circle_stroke(centre, radius, egui::Stroke::new(GIZMO_STROKE_WIDTH, color));
         }
     };
     for corner in ScaleCorner::ALL {
