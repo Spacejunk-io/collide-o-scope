@@ -2670,6 +2670,15 @@ fn strict_content_addressed_export_source(source_path: &str) -> bool {
     source_path.starts_with(crate::media_source::CONTENT_SHA256_PREFIX)
 }
 
+/// A legal muxed export audio source is any media file that can carry an
+/// audio stream: an audio file, or a video whose own track is selected.
+/// Stills are excluded — `is_supported_visual_file` was the wrong predicate
+/// here, admitting images that carry no audio while filtering out
+/// audio-only files that are this field's whole point.
+fn is_supported_export_audio_source(path: &std::path::Path) -> bool {
+    crate::audio::is_supported_audio_file(path) || crate::layers::is_video_file(path)
+}
+
 fn resolve_export_file_source<F>(
     persisted_source: &str,
     logical_name: &str,
@@ -5346,7 +5355,7 @@ fn run_export(
                     &logical_name,
                     config.audio_path_hint.as_deref(),
                     &source_context,
-                    crate::layers::is_supported_visual_file,
+                    is_supported_export_audio_source,
                     &mut source_fingerprints,
                 )
                 .map_err(|error| format!("selected export audio source: {error}"))?
@@ -16354,6 +16363,86 @@ layers:
             &context,
             |path: &std::path::Path| crate::audio::is_supported_audio_file(path),
             &mut changed_audio_preflight,
+        )
+        .is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn muxed_export_audio_accepts_audio_only_and_video_sources_but_not_stills() {
+        // The predicate law itself: a muxed audio source is any media file
+        // that can carry an audio stream — audio files and videos — and
+        // never a still, which carries none.
+        assert!(is_supported_export_audio_source(std::path::Path::new(
+            "track.wav"
+        )));
+        assert!(is_supported_export_audio_source(std::path::Path::new(
+            "track.flac"
+        )));
+        assert!(is_supported_export_audio_source(std::path::Path::new(
+            "clip.mp4"
+        )));
+        assert!(!is_supported_export_audio_source(std::path::Path::new(
+            "image.png"
+        )));
+
+        // A content-addressed audio-only export audio source resolves
+        // through the muxed-audio predicate, exactly what ExportConfig's
+        // "optional media file" doc promises.
+        let unique = format!(
+            "collide-o-scope-muxed-audio-accepts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let library = root.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let score = library.join("score.flac");
+        std::fs::write(&score, b"audio-only export source bytes").unwrap();
+
+        let mut identity_session = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        let reference = identity_session
+            .fingerprint(&score)
+            .unwrap()
+            .source_reference();
+        let context = crate::media_source::ResolveContext::new(None, Some(library));
+
+        let mut session = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        let resolved = resolve_export_file_source(
+            &reference,
+            "score.flac",
+            None,
+            &context,
+            is_supported_export_audio_source,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(resolved.path, score.canonicalize().unwrap());
+
+        // The defect this fix removes, pinned so it cannot return: the
+        // visual-file predicate filters the same audio-only source out and
+        // resolution fails.
+        let mut wrong_predicate_session = crate::media_source::FingerprintSession::new(
+            crate::media_source::FingerprintLimits::default(),
+        )
+        .unwrap();
+        assert!(resolve_export_file_source(
+            &reference,
+            "score.flac",
+            None,
+            &context,
+            crate::layers::is_supported_visual_file,
+            &mut wrong_predicate_session,
         )
         .is_err());
 
