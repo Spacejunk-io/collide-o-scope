@@ -3993,6 +3993,263 @@ mod tests {
         );
     }
 
+    /// A tapless Advanced composition must schedule.
+    ///
+    /// `execution_order` is a topological sort whose ready set is drained with
+    /// `BTreeSet::pop_first`, i.e. by ascending `StableLayerId`.
+    /// `build_block_schedules` then drains the composition's *back-to-front*
+    /// stack as each scope renders, and only the first drain after a task may
+    /// read that task's own output; every later one needs a retained tap.
+    ///
+    /// When no layer taps another there are no edges to order the siblings, so
+    /// the sort falls back to id order. A stack whose ids ascend front-to-back
+    /// — exactly what an export job produces, numbering layers `position + 1` —
+    /// therefore executes in the reverse of the order the schedule wants, and
+    /// preparation fails on a layer that owns no tap to retain.
+    ///
+    /// This needs no GPU and no rack node: an ordinary Faraday transplant is
+    /// enough to force an Advanced plan.
+    #[test]
+    fn a_tapless_advanced_stack_schedules_in_composition_order() {
+        use crate::evaluated_frame::evaluated_composition::CompositionPlanInput;
+
+        // Front-to-back [1, 2] means layer 1 is the front, so the back-to-front
+        // composite order is [2, 1] while ascending id order is [1, 2]. The two
+        // disagree, which is the whole defect.
+        let dimensions = [16, 16];
+        let base = evaluated_base(&[1, 2], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(2),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let motion = [
+            LayerMotionPlanInput {
+                stable_id: stable_layer(1),
+                params: MotionParams {
+                    transplant: FaradayParams {
+                        amount: 0.75,
+                        donor: MotionDonor::Selected {
+                            layer_id: stable_layer(2),
+                            saved_position: SavedLayerPosition::new(1).unwrap(),
+                        },
+                        ..Default::default()
+                    },
+                    ..MotionParams::default()
+                },
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(2),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        let evaluated = EvaluatedCompositionPlan::evaluate(
+            &base,
+            CompositionPlanInput::new(&composition, &master, &racks).with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = evaluated else {
+            panic!("an admitted transplant forces an Advanced plan");
+        };
+
+        // No layer taps any other, so nothing is retained anywhere.
+        assert!(
+            advanced.image_taps().is_empty(),
+            "this fixture must be genuinely tapless, or it proves nothing"
+        );
+
+        // Among scopes with no ordering edge between them, execution follows
+        // the composition's back-to-front order rather than ascending id.
+        let layers_in_execution: Vec<_> = advanced
+            .execution_order()
+            .iter()
+            .filter_map(|scope| match scope {
+                VisualScopeId::Layer(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            layers_in_execution,
+            vec![stable_layer(2), stable_layer(1)],
+            "independent siblings must execute back-to-front, not by ascending id"
+        );
+
+        // The renderer's schedule therefore builds against an EMPTY retained
+        // map: every drain reads the output of the task that just rendered.
+        let (root, members) = build_block_schedules(&advanced, &BTreeMap::new())
+            .expect("a tapless Advanced stack must schedule");
+        assert!(members.is_empty());
+        assert_eq!(root.len(), 2);
+        for entry in root.iter() {
+            assert_eq!(entry.drains.len(), 1, "each task drains exactly itself");
+            assert!(
+                matches!(entry.drains[0].source, ScheduledSource::Ping),
+                "a self-drain reads Ping, never a retained tap"
+            );
+        }
+    }
+
+    /// The composite-rank tie-break must survive collapsed groups.
+    ///
+    /// `atomic_group_execution_order` runs a *second* topological sort over
+    /// group-collapsed tasks, and its output — not the scope sort's — becomes
+    /// the plan's execution order. Both sorts therefore carry the same rank.
+    /// A group is ranked at its own root slot, which `below_topology` records,
+    /// so a group task sorts into exactly the slot its members occupy and the
+    /// two sorts cannot disagree about where the block belongs.
+    ///
+    /// Here the group sits at the BOTTOM of the stack while holding the LOWEST
+    /// member ids, so id order and composite order disagree for the group as a
+    /// whole — the case a rank that only understood loose layers would miss.
+    #[test]
+    fn the_composite_rank_tie_break_survives_collapsed_groups() {
+        use crate::evaluated_frame::evaluated_composition::CompositionPlanInput;
+
+        let dimensions = [16, 16];
+        // Front-to-back [9, 1, 2]: the loose layer 9 is the front, and the
+        // group holding 1 and 2 is beneath it.
+        let base = evaluated_base(&[9, 1, 2], dimensions);
+        let group_id = GroupId::new(5).unwrap();
+        let group = RuntimeGroup {
+            id: group_id,
+            name: GroupName::new("collapsed").unwrap(),
+            // Member order is back-to-front inside the group, so layer 2 sits
+            // beneath layer 1 and the two disagree with ascending id order.
+            members: RuntimeGroupMembers::try_from_vec(vec![stable_layer(2), stable_layer(1)])
+                .unwrap(),
+            opacity: 1.0,
+            transform: SpatialTransform::default(),
+            rack: RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Group),
+            matte: None,
+            solo: false,
+            bypass: false,
+            bus: BusAssignment::Program,
+        };
+        let composition = RuntimeComposition::try_from_parts(
+            vec![group],
+            vec![
+                RuntimeRootItem::Group { group_id },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(9),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let racks = vec![
+            (
+                stable_layer(9),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+            (
+                stable_layer(2),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let motion = [
+            LayerMotionPlanInput {
+                stable_id: stable_layer(9),
+                params: MotionParams {
+                    transplant: FaradayParams {
+                        amount: 0.75,
+                        donor: MotionDonor::Selected {
+                            layer_id: stable_layer(1),
+                            saved_position: SavedLayerPosition::new(1).unwrap(),
+                        },
+                        ..Default::default()
+                    },
+                    ..MotionParams::default()
+                },
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(1),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+            LayerMotionPlanInput {
+                stable_id: stable_layer(2),
+                params: MotionParams::default(),
+                codec: MotionCodecFrameFacts::default(),
+            },
+        ];
+        let evaluated = EvaluatedCompositionPlan::evaluate(
+            &base,
+            CompositionPlanInput::new(&composition, &master, &racks).with_motion(
+                MotionParams::default(),
+                &motion,
+                MotionDeviceLimits::new(8_192, u64::MAX),
+            ),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = evaluated else {
+            panic!("an admitted transplant forces an Advanced plan");
+        };
+        assert!(advanced.image_taps().is_empty(), "genuinely tapless");
+
+        // The group's members stay contiguous and in member order, the whole
+        // group block precedes the loose layer above it, and the block sits
+        // where the composition put it rather than where the ids would.
+        let layers_in_execution: Vec<_> = advanced
+            .execution_order()
+            .iter()
+            .filter_map(|scope| match scope {
+                VisualScopeId::Layer(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            layers_in_execution,
+            vec![stable_layer(2), stable_layer(1), stable_layer(9)],
+            "a collapsed group must execute as one contiguous back-to-front block"
+        );
+
+        // And the renderer schedules it with nothing retained.
+        let (root, members) = build_block_schedules(&advanced, &BTreeMap::new())
+            .expect("a tapless grouped stack must schedule");
+        assert_eq!(root.len(), 2);
+        assert_eq!(members.len(), 1);
+        for entry in root.iter() {
+            assert_eq!(entry.drains.len(), 1);
+            assert!(matches!(entry.drains[0].source, ScheduledSource::Ping));
+        }
+    }
+
     fn stable_layer(value: u64) -> StableLayerId {
         StableLayerId::new(value).unwrap()
     }

@@ -1263,6 +1263,30 @@ impl BelowTopology {
         &self.root_outputs
     }
 
+    /// Where one scope sits in the composition's back-to-front composite order.
+    ///
+    /// This is the order `build_block_schedules` drains, so it is the order
+    /// scopes should execute in whenever nothing forces otherwise. A grouped
+    /// layer ranks inside its own group's root slot, so a group's members stay
+    /// contiguous and in member order; the group itself ranks at that same root
+    /// slot, immediately after its members. Master ranks last among scopes, and
+    /// anything absent from the topology — Program — ranks after that.
+    ///
+    /// The tuple is deliberately ordered `(root, member)`: comparing it
+    /// lexicographically reproduces the composite walk exactly, without a
+    /// second flattening pass that could disagree with `root_outputs`.
+    fn composite_rank(&self, scope: VisualScopeId) -> (usize, usize) {
+        match self.locations.get(&scope).copied() {
+            Some(BelowLocation::Root { root_index }) => (root_index, usize::MAX),
+            Some(BelowLocation::GroupMember {
+                root_index,
+                member_index,
+                ..
+            }) => (root_index, member_index),
+            Some(BelowLocation::Master) | None => (usize::MAX, usize::MAX),
+        }
+    }
+
     pub fn prefix_for(&self, consumer: VisualScopeId) -> Option<CompositePrefix> {
         match self.locations.get(&consumer).copied()? {
             BelowLocation::Root { root_index } => Some(CompositePrefix::Root {
@@ -3365,12 +3389,23 @@ fn execution_order(
             .get_mut(consumer)
             .expect("known prefix consumer has indegree") += below.prefix_len(*prefix);
     }
+    // Among scopes whose dependencies are all satisfied, execute in the
+    // composition's back-to-front composite order rather than in whatever order
+    // `VisualScopeId` happens to sort. Both are valid topological orders — the
+    // tie is between genuinely independent scopes — but only the composite one
+    // agrees with the order `build_block_schedules` drains, and a scope drained
+    // out of turn needs a retained tap it may not own. A tapless stack has no
+    // edges at all between siblings, so before this the fallback decided the
+    // whole order, and a stack whose ids ascend front-to-back could not be
+    // scheduled. The scope id remains the final tiebreak, so the sort stays
+    // total and deterministic.
+    let rank = |scope: VisualScopeId| (below.composite_rank(scope), scope);
     let mut ready: BTreeSet<_> = indegree
         .iter()
-        .filter_map(|(scope, degree)| (*degree == 0).then_some(*scope))
+        .filter_map(|(scope, degree)| (*degree == 0).then_some(rank(*scope)))
         .collect();
     let mut order = Vec::with_capacity(known_scopes.len());
-    while let Some(scope) = ready.pop_first() {
+    while let Some((_, scope)) = ready.pop_first() {
         order.push(scope);
         if let Some(consumers) = adjacency.get(&scope) {
             for consumer in consumers {
@@ -3380,12 +3415,12 @@ fn execution_order(
                 {
                     continue;
                 }
-                decrement_indegree(*consumer, &mut indegree, &mut ready);
+                decrement_indegree(*consumer, &mut indegree, &mut ready, rank);
             }
         }
         for (consumer, prefix) in prefix_constraints {
             if below.prefix_contains(*prefix, scope) {
-                decrement_indegree(*consumer, &mut indegree, &mut ready);
+                decrement_indegree(*consumer, &mut indegree, &mut ready, rank);
             }
         }
     }
@@ -3497,16 +3532,22 @@ fn atomic_group_execution_order(
                 .expect("collapsed group consumer is a known task") += 1;
         }
     }
+    // This is the sort whose output becomes the plan's execution order, so it
+    // carries the same composite-rank tie-break as the scope sort above. A
+    // collapsed group is ranked too: `below_topology` records the group itself
+    // at its root index, so a group task sorts into the same root slot its
+    // members occupy and the two sorts cannot disagree.
+    let rank = |task: VisualScopeId| (below.composite_rank(task), task);
     let mut ready: BTreeSet<_> = indegree
         .iter()
-        .filter_map(|(task, degree)| (*degree == 0).then_some(*task))
+        .filter_map(|(task, degree)| (*degree == 0).then_some(rank(*task)))
         .collect();
     let mut task_order = Vec::with_capacity(tasks.len());
-    while let Some(task) = ready.pop_first() {
+    while let Some((_, task)) = ready.pop_first() {
         task_order.push(task);
         if let Some(consumers) = adjacency.get(&task) {
             for consumer in consumers {
-                decrement_indegree(*consumer, &mut indegree, &mut ready);
+                decrement_indegree(*consumer, &mut indegree, &mut ready, rank);
             }
         }
     }
@@ -3536,10 +3577,18 @@ fn atomic_group_execution_order(
     Ok(order)
 }
 
-fn decrement_indegree(
+/// Retire one edge into `consumer`, admitting it to `ready` when it has none
+/// left.
+///
+/// The ready set is keyed by whatever order its caller wants to drain in:
+/// `execution_order` keys by composite rank so independent scopes execute in
+/// the order the renderer's schedule drains, while the atomic-group sort keys
+/// by scope identity, where no composite order exists to prefer.
+fn decrement_indegree<K: Ord>(
     consumer: VisualScopeId,
     indegree: &mut BTreeMap<VisualScopeId, usize>,
-    ready: &mut BTreeSet<VisualScopeId>,
+    ready: &mut BTreeSet<K>,
+    key: impl Fn(VisualScopeId) -> K,
 ) {
     let degree = indegree
         .get_mut(&consumer)
@@ -3547,7 +3596,7 @@ fn decrement_indegree(
     debug_assert!(*degree > 0);
     *degree = degree.saturating_sub(1);
     if *degree == 0 {
-        ready.insert(consumer);
+        ready.insert(key(consumer));
     }
 }
 
