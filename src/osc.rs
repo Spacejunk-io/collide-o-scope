@@ -1468,6 +1468,33 @@ mod tests {
         );
     }
 
+    /// Poll `probe` until it yields a value or a generous deadline passes.
+    ///
+    /// The OSC worker is a real thread on a real UDP socket, so delivery
+    /// latency belongs to the host scheduler and the loopback stack rather
+    /// than to this crate. A fixed iteration budget therefore encodes a
+    /// latency bound the test never meant to assert: the previous 100 polls at
+    /// 5 ms gave the worker 500 ms to be scheduled, which a loaded hosted macOS
+    /// runner exceeded, failing a test whose actual claim is that the event
+    /// arrives at all and that the host is never blocked while waiting. The
+    /// deadline below is far longer than any plausible scheduling delay, so a
+    /// failure here means the datagram genuinely never arrived rather than that
+    /// the runner was busy. Success still returns as soon as the value appears,
+    /// so the ordinary run is no slower.
+    fn poll_until<T>(mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+        const BUDGET: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            if let Some(value) = probe() {
+                return Some(value);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn udp_worker_receives_typed_loopback_packets_without_blocking_the_host() {
         let mut engine = OscEngine::new(OscConfigDocument {
@@ -1476,14 +1503,7 @@ mod tests {
         })
         .unwrap();
         engine.start().unwrap();
-        let bound = (0..100)
-            .find_map(|_| {
-                let address = engine.runtime_snapshot().bound_address;
-                if address.is_none() {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                address
-            })
+        let bound = poll_until(|| engine.runtime_snapshot().bound_address)
             .expect("OSC worker should bind its loopback socket");
         assert!(bound.ip().is_loopback());
 
@@ -1493,15 +1513,10 @@ mod tests {
         let packet = encode_feedback(address, 1.0).unwrap();
         sender.send_to(&packet, bound).unwrap();
 
-        let received = (0..100).find_map(|_| {
+        let received = poll_until(|| {
             let mut events = Vec::new();
             engine.drain_events(&mut events);
-            if events.is_empty() {
-                thread::sleep(Duration::from_millis(5));
-                None
-            } else {
-                events.into_iter().next()
-            }
+            events.into_iter().next()
         });
         let event = received.expect("OSC worker should publish the loopback event");
         assert_eq!(event.address, address);
@@ -1514,13 +1529,11 @@ mod tests {
         // with `EMSGSIZE` before the worker can observe it. A small malformed
         // packet exercises the same worker counter/rejection path portably.
         sender.send_to(&[0], bound).unwrap();
-        let rejected = (0..100).any(|_| {
+        let rejected = poll_until(|| {
             let malformed = engine.runtime_snapshot().counters.malformed;
-            if malformed == 0 {
-                thread::sleep(Duration::from_millis(5));
-            }
-            malformed == 1
-        });
+            (malformed > 0).then_some(malformed)
+        })
+        .is_some_and(|malformed| malformed == 1);
         engine.stop();
         assert!(
             rejected,
