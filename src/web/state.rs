@@ -242,6 +242,36 @@ pub struct CreativeImageTapSnapshot {
     pub timing: EdgeTiming,
 }
 
+/// Which of a Residual node's two authored routes an ordered reroute names.
+/// The vocabulary is closed and tagged so an out-of-range slot is a
+/// deserialization error rather than a positional fallback onto the other
+/// route — the same law that keeps a stale node ID from rebinding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualRouteSlotSnapshot {
+    Structure,
+    Detail,
+}
+
+impl ResidualRouteSlotSnapshot {
+    /// The authored slot index this wire token names.
+    pub const fn slot(self) -> u8 {
+        match self {
+            Self::Structure => crate::visual_rack::RESIDUAL_STRUCTURE_SLOT,
+            Self::Detail => crate::visual_rack::RESIDUAL_DETAIL_SLOT,
+        }
+    }
+
+    /// Operator-facing name of the slot, so a commit status names the input
+    /// that actually moved rather than a bare index.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Structure => "structure",
+            Self::Detail => "detail",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreativeMatteSnapshot {
     pub route: CreativeImageTapSnapshot,
@@ -529,7 +559,34 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "boundary": value.boundary,
             "diagnostic": creative_route_diagnostic(value.tap.source),
         }),
+        RuntimeVisualNodeKind::Residual(value) => serde_json::json!({
+            "structure_tap": CreativeImageTapSnapshot::from_runtime(value.structure),
+            "detail_tap": CreativeImageTapSnapshot::from_runtime(value.detail),
+            "block": value.block,
+            "quantization": value.quantization,
+            "mix": value.mix,
+            "detail_gain": value.detail_gain,
+            "seed": value.seed,
+            "diagnostic": creative_two_slot_route_diagnostic(value.structure.source, value.detail.source),
+        }),
     }
+}
+
+/// Operator-facing text for a two-slot route pair. Each dead slot names itself
+/// so a tombstone can never be read as belonging to the other route, and a
+/// fully live pair stays empty exactly as the single-route diagnostic does.
+fn creative_two_slot_route_diagnostic(
+    structure: crate::visual_rack::ResolvedImageSource,
+    detail: crate::visual_rack::ResolvedImageSource,
+) -> String {
+    let mut parts = Vec::new();
+    for (label, source) in [("structure", structure), ("detail", detail)] {
+        let diagnostic = creative_route_diagnostic(source);
+        if !diagnostic.is_empty() {
+            parts.push(format!("{label}: {diagnostic}"));
+        }
+    }
+    parts.join("; ")
 }
 
 /// Operator-facing text for a route that resolves to nothing. Empty means the
@@ -3207,6 +3264,20 @@ pub enum WebAction {
         route: CreativeImageTapSnapshot,
         composition_revision: u64,
     },
+    /// Reroute one slot of a Residual node. Both routes rewrite the image
+    /// dependency graph, so the action is an ordered, revision-protected,
+    /// uncoalesced barrier and carries a closed slot token rather than an
+    /// index: a slot the engine does not know names no route at all instead of
+    /// silently landing on its partner. The two gains, both discrete laws and
+    /// the seed travel on the ordinary coalescible parameter action.
+    #[serde(rename = "set_visual_node_residual_route")]
+    SetVisualNodeResidualRoute {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        slot: ResidualRouteSlotSnapshot,
+        route: CreativeImageTapSnapshot,
+        composition_revision: u64,
+    },
     /// Enable/disable or reroute the separate group matte. `None` disables it;
     /// numeric matte values remain untouched and use the coalescible action.
     #[serde(rename = "set_composition_group_matte_route")]
@@ -4242,6 +4313,7 @@ impl WebAction {
             | Self::SetVisualNodeMaskVariant { .. }
             | Self::SetVisualNodeRoute { .. }
             | Self::SetVisualNodeDisplaceRoute { .. }
+            | Self::SetVisualNodeResidualRoute { .. }
             | Self::SetCompositionGroupMatteRoute { .. }
             | Self::CreateCompositionGroup { .. }
             | Self::RemoveCompositionGroup { .. }
@@ -6830,6 +6902,39 @@ mod protocol_tests {
         assert!(matte_route.is_priority());
         assert_eq!(layer_bus.coalesce_key(), None);
         assert!(layer_bus.is_priority());
+
+        // A Residual value rides the one coalescible node action and keys on
+        // its own parameter, while both of its routes stay ordered barriers.
+        let residual_value = WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "3".into(),
+            node_kind: "residual".into(),
+            param: "detail_gain".into(),
+            value: serde_json::json!(2.0),
+            composition_revision: 9,
+        };
+        assert_eq!(
+            residual_value.coalesce_key().as_deref(),
+            Some("creative:master:node:3:detail_gain")
+        );
+        assert!(!residual_value.is_priority());
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            let residual_route = WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                slot,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                composition_revision: 9,
+            };
+            assert_eq!(residual_route.coalesce_key(), None);
+            assert!(residual_route.is_priority());
+        }
     }
 
     #[test]
@@ -7958,6 +8063,8 @@ mod protocol_tests {
             "action: 'move_visual_node'",
             "action: 'set_visual_node_mask_variant'",
             "action: 'set_visual_node_route'",
+            "action: 'set_visual_node_displace_route'",
+            "action: 'set_visual_node_residual_route'",
             "action: 'set_composition_group_param'",
             "action: 'set_composition_group_matte_route'",
             "action: 'set_composition_group_matte_param'",
@@ -8508,6 +8615,329 @@ mod protocol_tests {
             missing["donor_tap"]["input"]["source"],
             "missing_selected_layer"
         );
+    }
+
+    #[test]
+    fn residual_route_action_is_an_uncoalesced_ordered_barrier_that_names_its_slot() {
+        let route = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::OneBelow,
+            timing: EdgeTiming::CurrentFrame,
+        };
+
+        // The slot token is the whole reason this action exists once instead of
+        // twice, so it must resolve to the authored index and nothing else.
+        assert_eq!(
+            ResidualRouteSlotSnapshot::Structure.slot(),
+            crate::visual_rack::RESIDUAL_STRUCTURE_SLOT
+        );
+        assert_eq!(
+            ResidualRouteSlotSnapshot::Detail.slot(),
+            crate::visual_rack::RESIDUAL_DETAIL_SLOT
+        );
+        assert_ne!(
+            ResidualRouteSlotSnapshot::Structure.slot(),
+            ResidualRouteSlotSnapshot::Detail.slot()
+        );
+
+        for (slot, wire) in [
+            (ResidualRouteSlotSnapshot::Structure, "structure"),
+            (ResidualRouteSlotSnapshot::Detail, "detail"),
+        ] {
+            let action = WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "7".into(),
+                slot,
+                route: route.clone(),
+                composition_revision: 12,
+            };
+
+            // Both slots are ordered, revision-protected barriers and neither
+            // may coalesce behind a later absolute value.
+            assert!(action.is_priority());
+            assert!(action.coalesce_key().is_none());
+
+            let value = serde_json::to_value(&action).unwrap();
+            assert_eq!(value["action"], "set_visual_node_residual_route");
+            assert_eq!(value["slot"], wire);
+            assert_eq!(value["composition_revision"], 12);
+            assert_eq!(value["input"], serde_json::Value::Null);
+            let WebAction::SetVisualNodeResidualRoute {
+                scope: decoded_scope,
+                node_id: decoded_node,
+                slot: decoded_slot,
+                route: decoded_route,
+                composition_revision: decoded_revision,
+            } = serde_json::from_value::<WebAction>(value).unwrap()
+            else {
+                panic!("the residual route action must decode to its own variant");
+            };
+            assert_eq!(decoded_scope, CreativeScopeSnapshot::Master);
+            assert_eq!(decoded_node, "7");
+            assert_eq!(decoded_slot, slot);
+            assert_eq!(decoded_route, route);
+            assert_eq!(decoded_revision, 12);
+        }
+
+        // The well-formed message is accepted for either slot...
+        for slot in ["structure", "detail"] {
+            assert!(
+                serde_json::from_str::<WebAction>(&format!(
+                    r#"{{"action":"set_visual_node_residual_route","scope":{{"scope":"master"}},"node_id":"7","slot":"{slot}","route":{{"input":{{"source":"one_below"}},"timing":"current_frame"}},"composition_revision":1}}"#
+                ))
+                .is_ok(),
+                "slot {slot} must be accepted"
+            );
+        }
+        // ...the revision is mandatory, so a route edit can never arrive
+        // unbarriered...
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_residual_route","scope":{"scope":"master"},"node_id":"7","slot":"structure","route":{"input":{"source":"one_below"},"timing":"current_frame"}}"#
+        )
+        .is_err());
+        // ...the slot is mandatory, so a reroute can never default onto one of
+        // the two inputs...
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_residual_route","scope":{"scope":"master"},"node_id":"7","route":{"input":{"source":"one_below"},"timing":"current_frame"},"composition_revision":1}"#
+        )
+        .is_err());
+        // ...an unknown slot token is a closed-vocabulary rejection rather than
+        // a positional fallback onto the partner route...
+        for hostile in [r#""dc""#, r#""2""#, "1", "null"] {
+            assert!(
+                serde_json::from_str::<WebAction>(&format!(
+                    r#"{{"action":"set_visual_node_residual_route","scope":{{"scope":"master"}},"node_id":"7","slot":{hostile},"route":{{"input":{{"source":"one_below"}},"timing":"current_frame"}},"composition_revision":1}}"#
+                ))
+                .is_err(),
+                "hostile slot {hostile} must be refused"
+            );
+        }
+        // ...and an unknown donor token is rejected, not defaulted.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_residual_route","scope":{"scope":"master"},"node_id":"7","slot":"detail","route":{"input":{"source":"teleport"},"timing":"current_frame"},"composition_revision":1}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn residual_snapshot_publishes_both_routes_values_and_per_slot_diagnostics() {
+        use crate::visual_rack::{
+            ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams, RuntimeVisualNodeKind,
+        };
+
+        let live = creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+            structure: ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            block: ResidualBlock::ThirtyTwo,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.75,
+            detail_gain: 2.5,
+            seed: 0x00c0_ffee,
+            ..RuntimeResidualParams::default()
+        }));
+        assert_eq!(live["structure_tap"]["input"]["source"], "all_below");
+        assert_eq!(live["structure_tap"]["timing"], "current_frame");
+        assert_eq!(live["detail_tap"]["input"]["source"], "clean_program");
+        assert_eq!(live["detail_tap"]["timing"], "previous_frame");
+        assert_eq!(live["block"], "thirty_two");
+        assert_eq!(live["quantization"], "medium");
+        assert_eq!(live["mix"], 0.75);
+        assert_eq!(live["detail_gain"], 2.5);
+        assert_eq!(live["seed"], 0x00c0_ffee_u32);
+        assert_eq!(
+            live["diagnostic"], "",
+            "a fully live route pair reports no diagnostic text"
+        );
+        // The published key set is exactly the frozen snapshot contract.
+        let mut keys: Vec<_> = live.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "block",
+                "detail_gain",
+                "detail_tap",
+                "diagnostic",
+                "mix",
+                "quantization",
+                "seed",
+                "structure_tap",
+            ]
+        );
+
+        // Each dead slot names itself, so a tombstone can never be read as
+        // belonging to the other route, and neither slot rebinds.
+        let structure_gone =
+            creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                structure: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingSelectedLayer {
+                        saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                        stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ..RuntimeResidualParams::default()
+            }));
+        assert_eq!(
+            structure_gone["diagnostic"],
+            "structure: missing saved layer 4"
+        );
+        assert_eq!(
+            structure_gone["structure_tap"]["input"]["source"],
+            "missing_selected_layer"
+        );
+        assert_eq!(structure_gone["detail_tap"]["input"]["source"], "one_below");
+
+        let detail_gone =
+            creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                detail: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingGroupOutput(
+                        crate::visual_rack::GroupId::new(9).unwrap(),
+                    ),
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                ..RuntimeResidualParams::default()
+            }));
+        assert_eq!(detail_gone["diagnostic"], "detail: missing group output 9");
+        assert_eq!(
+            detail_gone["structure_tap"]["input"]["source"], "one_below",
+            "a dead detail slot must never tombstone its partner"
+        );
+
+        let both_gone =
+            creative_node_params(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                structure: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingSelectedLayer {
+                        saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                        stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                detail: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingGroupOutput(
+                        crate::visual_rack::GroupId::new(9).unwrap(),
+                    ),
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                ..RuntimeResidualParams::default()
+            }));
+        assert_eq!(
+            both_gone["diagnostic"],
+            "structure: missing saved layer 4; detail: missing group output 9"
+        );
+    }
+
+    #[test]
+    fn every_browser_node_registry_matches_the_rust_descriptor_tables() {
+        let js = include_str!("../../static/app.js");
+        let html = include_str!("../../static/index.html");
+        let node_info = js
+            .split_once("const CREATIVE_NODE_INFO = Object.freeze({")
+            .expect("app.js declares CREATIVE_NODE_INFO")
+            .1
+            .split_once("});")
+            .expect("CREATIVE_NODE_INFO is closed")
+            .0;
+        let node_params = js
+            .split_once("const CREATIVE_NODE_PARAMS = Object.freeze({")
+            .expect("app.js declares CREATIVE_NODE_PARAMS")
+            .1
+            .split_once("\n});")
+            .expect("CREATIVE_NODE_PARAMS is closed")
+            .0;
+
+        // The panel's kind picker, its label registry and its parameter
+        // registry are hand-maintained beside the Rust table. Cross-check all
+        // three so a kind can never be fully functional yet uninsertable.
+        for descriptor in crate::visual_rack::NODE_KIND_DESCRIPTORS {
+            let key = descriptor.key;
+            let marker = matches!(
+                descriptor.tag,
+                crate::visual_rack::NodeKindTag::LegacyCanonical
+                    | crate::visual_rack::NodeKindTag::LegacyTemporal
+            );
+            assert!(
+                node_info.contains(&format!("\n  {key}: {{")),
+                "CREATIVE_NODE_INFO is missing node kind {key}"
+            );
+            assert_eq!(
+                html.contains(&format!("<option value=\"{key}\">")),
+                !marker,
+                "index.html kind picker disagrees about node kind {key}"
+            );
+            assert_eq!(
+                node_params.contains(&format!("\n  {key}: [")),
+                !marker,
+                "CREATIVE_NODE_PARAMS disagrees about node kind {key}"
+            );
+        }
+
+        // Every browser-editable Residual field is declared, and neither route
+        // is: both belong to the ordered slot-naming action.
+        let residual = node_params
+            .split_once("\n  residual: [")
+            .expect("CREATIVE_NODE_PARAMS declares residual")
+            .1
+            .split_once("\n  ]")
+            .expect("the residual block is closed")
+            .0;
+        for descriptor in crate::visual_rack::NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == crate::visual_rack::NodeKindTag::Residual)
+        {
+            let declared = residual.contains(&format!("'{}'", descriptor.key));
+            let routed = descriptor.value_type == crate::visual_rack::NodeParamType::ImageTap;
+            assert_eq!(
+                declared, !routed,
+                "residual param {} is on the wrong browser path",
+                descriptor.key
+            );
+        }
+        assert!(residual.contains("floatDef('mix', 'Mix', 0, 1,"));
+        assert!(residual.contains("floatDef('detail_gain', 'Detail gain', 0, 4,"));
+        assert!(residual.contains("uintDef('seed', 'Seed')"));
+
+        // Both discrete vocabularies are published exactly as the engine spells
+        // them, or the server's Enum allowlist drops the select at ingress.
+        for token in ["four", "eight", "sixteen", "thirty_two", "sixty_four"] {
+            assert!(
+                residual.contains(&format!("['{token}',")),
+                "residual block vocabulary is missing {token}"
+            );
+        }
+        for token in ["off", "coarse", "medium", "fine"] {
+            assert!(
+                residual.contains(&format!("['{token}',")),
+                "residual quantization vocabulary is missing {token}"
+            );
+        }
+
+        // Two routes need two independently wired, slot-tagged editors and two
+        // structural fingerprint slots.
+        assert!(js.contains("data-route-slot=\"${escapeHtml(slot)}\""));
+        assert!(js.contains("card.querySelectorAll('.creative-route-editor')"));
+        assert!(js.contains("routeEditor.dataset.routeSlot"));
+        assert!(js.contains("'structure', 'Structure donor'"));
+        assert!(js.contains("'detail', 'Detail donor'"));
+        assert!(js.contains("detailRoute: node.kind === 'residual'"));
+
+        // A topology barrier is never beat-latched by the panel.
+        let quantizable = js
+            .split_once("const QUANTIZABLE_ACTIONS")
+            .unwrap()
+            .1
+            .split_once("]);")
+            .unwrap()
+            .0;
+        assert!(!quantizable.contains("set_visual_node_residual_route"));
+        assert!(!quantizable.contains("set_visual_node_displace_route"));
+        assert!(!quantizable.contains("set_visual_node_route"));
     }
     #[test]
     fn gesture_samples_are_uncoalesced_stream_events_whose_stroke_edges_hold_priority() {

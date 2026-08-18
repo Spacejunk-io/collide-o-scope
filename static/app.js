@@ -402,6 +402,7 @@ const CREATIVE_NODE_INFO = Object.freeze({
   grain: { label: 'Grain' },
   mask: { label: 'Mask' },
   displace: { label: 'Displace' },
+  residual: { label: 'Residual' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -490,6 +491,13 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     floatDef('amount_x', 'Amount X', -1, 1, 0.001),
     floatDef('amount_y', 'Amount Y', -1, 1, 0.001),
     enumDef('boundary', 'Boundary', [['transparent', 'Transparent'], ['mirror', 'Mirror'], ['wrap', 'Wrap'], ['hold', 'Hold']]),
+  ],
+  residual: [
+    floatDef('mix', 'Mix', 0, 1, 0.001),
+    floatDef('detail_gain', 'Detail gain', 0, 4, 0.001),
+    enumDef('block', 'Block', [['four', '4 px'], ['eight', '8 px'], ['sixteen', '16 px'], ['thirty_two', '32 px'], ['sixty_four', '64 px']]),
+    enumDef('quantization', 'Quantization', [['off', 'Off'], ['coarse', 'Coarse'], ['medium', 'Medium'], ['fine', 'Fine']]),
+    uintDef('seed', 'Seed'),
   ],
 });
 
@@ -629,14 +637,17 @@ function creativeRouteFromToken(token, timing) {
   return { input, timing: normalizedTiming };
 }
 
-function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, fieldOnly = false) {
+// `slot` tags an editor so a node owning more than one route can bind each
+// select to its own ordered action; `label` keeps the two donor selects
+// distinguishable to a screen reader instead of repeating one generic name.
+function creativeRouteEditorHtml(route, channel = 'alpha', invert = false, fieldOnly = false, slot = '', label = 'Donor') {
   const token = creativeRouteToken(route);
   const timing = route?.timing || 'current_frame';
   const channelControls = fieldOnly ? '' : `<label>Channel <select class="creative-route-channel">${creativeOptionHtml([['alpha', 'Alpha'], ['luma', 'Luma'], ['red', 'Red'], ['green', 'Green'], ['blue', 'Blue']], channel)}</select></label>
       <label><input class="creative-route-invert" type="checkbox" ${invert ? 'checked' : ''}> Invert</label>`;
-  return `<div class="creative-route-editor">
+  return `<div class="creative-route-editor"${slot ? ` data-route-slot="${escapeHtml(slot)}"` : ''}>
     <div class="creative-route-row">
-      <label>Donor <select class="creative-route-source">${creativeOptionHtml(creativeRouteOptions(route), token)}</select></label>
+      <label>${escapeHtml(label)} <select class="creative-route-source">${creativeOptionHtml(creativeRouteOptions(route), token)}</select></label>
       <label>Timing <select class="creative-route-timing">
         <option value="current_frame" ${timing === 'current_frame' ? 'selected' : ''}>Current frame</option>
         <option value="previous_frame" ${timing === 'previous_frame' ? 'selected' : ''}>Previous frame N−1</option>
@@ -737,12 +748,16 @@ function renderCreativeRack() {
     const params = marker ? '' : creativeNodeVisibleDefs(node).map((def) => creativeControlHtml(def, creativeNodeValue(node, def.key))).join('');
     const maskVariant = node.kind === 'mask' ? `<label class="creative-control creative-control-wide"><span>Mask kind</span><select class="creative-mask-variant">${creativeOptionHtml([['rectangle', 'Rectangle'], ['ellipse', 'Ellipse'], ['image', 'Image donor']], node.params?.variant || 'rectangle')}</select><output></output></label>` : '';
     // Displace routes a donor vector field, not a matte, so it reuses the
-    // shared editor in field-only mode: no channel and no invert.
+    // shared editor in field-only mode: no channel and no invert. Residual
+    // owns two such routes and gets one slot-tagged editor each, so a reroute
+    // can never land on the partner input.
     const imageRoute = node.kind === 'mask' && node.params?.variant === 'image'
       ? creativeRouteEditorHtml(node.params.image_tap, node.params.image_channel, node.params.image_invert)
       : node.kind === 'displace'
         ? creativeRouteEditorHtml(node.params?.donor_tap, 'alpha', false, true)
-        : '';
+        : node.kind === 'residual'
+          ? `${creativeRouteEditorHtml(node.params?.structure_tap, 'alpha', false, true, 'structure', 'Structure donor')}${creativeRouteEditorHtml(node.params?.detail_tap, 'alpha', false, true, 'detail', 'Detail donor')}`
+          : '';
     const nodeDiagnostic = node.params?.diagnostic
       ? `<div class="creative-node-diagnostic">${escapeHtml(node.params.diagnostic)}</div>`
       : '';
@@ -764,16 +779,25 @@ function renderCreativeRack() {
     card.querySelector('.creative-mask-variant')?.addEventListener('change', (event) => creativeSend({
       action: 'set_visual_node_mask_variant', scope: creativeScopeWire(), node_id: String(node.node_id), variant: event.currentTarget.value, composition_revision: compositionRevision,
     }, 'Changing mask kind…'));
-    const routeEditor = card.querySelector('.creative-route-editor');
+    // A node may own more than one route, so every editor in the card is wired
+    // to the action naming its own slot. Binding only the first would leave a
+    // second select silently submitting nothing.
     const selfGroupId = creativeScopeWire().scope === 'group' ? creativeScopeWire().group_id : '';
-    if (routeEditor && node.kind === 'displace') {
-      wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
-        action: 'set_visual_node_displace_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, composition_revision: compositionRevision,
-      }, 'Preflighting displace donor…'), selfGroupId);
-    } else if (routeEditor) {
-      wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
-        action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
-      }, 'Preflighting image route…'), selfGroupId);
+    for (const routeEditor of card.querySelectorAll('.creative-route-editor')) {
+      const slot = routeEditor.dataset.routeSlot || '';
+      if (node.kind === 'residual' && slot) {
+        wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
+          action: 'set_visual_node_residual_route', scope: creativeScopeWire(), node_id: String(node.node_id), slot, route, composition_revision: compositionRevision,
+        }, `Preflighting residual ${slot} donor…`), selfGroupId);
+      } else if (node.kind === 'displace') {
+        wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
+          action: 'set_visual_node_displace_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, composition_revision: compositionRevision,
+        }, 'Preflighting displace donor…'), selfGroupId);
+      } else {
+        wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
+          action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
+        }, 'Preflighting image route…'), selfGroupId);
+      }
     }
   });
 }
@@ -963,7 +987,12 @@ function creativeRackStructure(rack) {
     // is: changing it must rebuild the card's route editor, not just sync values.
     route: node.kind === 'displace'
       ? node.params?.donor_tap || null
-      : (node.params?.variant === 'image' ? node.params.image_tap : null),
+      : node.kind === 'residual'
+        ? node.params?.structure_tap || null
+        : (node.params?.variant === 'image' ? node.params.image_tap : null),
+    // Residual's second route needs its own fingerprint slot, or rerouting the
+    // detail input alone would leave a stale select submitting the old token.
+    detailRoute: node.kind === 'residual' ? node.params?.detail_tap || null : null,
     channel: node.params?.image_channel || '', invert: !!node.params?.image_invert,
   }));
 }

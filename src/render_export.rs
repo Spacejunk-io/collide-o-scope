@@ -71,11 +71,18 @@ const OUTCOME_CANCELLED: u8 = 4;
 /// contains an excessive number of unavailable layers.
 const MAX_EXPORT_WARNINGS: usize = 128;
 const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 3;
+/// Schema 4 adds `authored_residual_nodes`: the per-slot resolved/missing
+/// route identity and the discrete recombination law of every Residual
+/// Counterpoint node admitted by this job.
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 4;
 const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
 const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
 const MAX_EXPORT_MOTION_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
+/// One rack holds at most `MAX_NODES_PER_RACK` nodes and a job admits at most
+/// `MAX_EXPORT_MOTION_SIDECAR_SCOPES` scopes, so this cap is generous for any
+/// admissible patch and still bounds a hand-authored one.
+const MAX_EXPORT_RESIDUAL_SIDECAR_NODES: usize = 512;
 
 const fn transparent_accumulation_clear() -> wgpu::Color {
     wgpu::Color {
@@ -350,6 +357,48 @@ struct MotionSidecarScopeState {
     shutter_sample_count: u8,
 }
 
+/// One authored Residual Counterpoint route slot as this job resolved it.
+/// Only stable identities travel: a saved position, a job-local stable ID, or
+/// a group ID. Operational paths and filesystem metadata never enter here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ResidualSidecarRoute {
+    slot: u8,
+    slot_name: &'static str,
+    source: &'static str,
+    timing: crate::visual_rack::EdgeTiming,
+    /// False only for a retained tombstone. A tombstone keeps its saved
+    /// provenance and is never rebound onto a neighbouring source.
+    resolved: bool,
+    saved_position: Option<u32>,
+    stable_id: Option<u64>,
+    group_id: Option<u64>,
+    stage: Option<crate::image_routing::LayerImageStage>,
+}
+
+/// One admitted Residual Counterpoint node. `authored_mix` and
+/// `authored_detail_gain` are the values this job admitted, before Morph and
+/// stable modulation are projected into the per-frame graph; every other
+/// field is stable authored topology that neither can move.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct ResidualSidecarNode {
+    scope: MotionSidecarScopeIdentity,
+    node_id: u64,
+    enabled: bool,
+    wet: f32,
+    algorithm_version: u16,
+    block: crate::visual_rack::ResidualBlock,
+    block_edge: u32,
+    quantization: crate::visual_rack::ResidualQuantization,
+    quantization_levels: u32,
+    authored_mix: f32,
+    authored_detail_gain: f32,
+    seed: u32,
+    /// True when the admitted values make the node an exact delegation: no
+    /// tap, no pass, no mean surface, and no saved dependency edge.
+    exact_bypass: bool,
+    routes: Vec<ResidualSidecarRoute>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct MotionSidecarDistinctState {
     first_accepted_frame: u64,
@@ -373,6 +422,8 @@ struct ExportMotionSidecar {
     sources_truncated: bool,
     authored_scopes: Vec<MotionSidecarAuthoredScope>,
     authored_scopes_truncated: bool,
+    authored_residual_nodes: Vec<ResidualSidecarNode>,
+    authored_residual_nodes_truncated: bool,
     distinct_dynamic_states: Vec<MotionSidecarDistinctState>,
     distinct_dynamic_states_truncated: bool,
     last_accepted_frame: Option<MotionSidecarLastFrame>,
@@ -385,6 +436,8 @@ struct ExportMotionSidecarAccumulator {
     sources_truncated: bool,
     authored_scopes: Vec<MotionSidecarAuthoredScope>,
     authored_scopes_truncated: bool,
+    residual_nodes: Vec<ResidualSidecarNode>,
+    residual_nodes_truncated: bool,
     distinct: Vec<MotionSidecarDistinctState>,
     distinct_truncated: bool,
     last: Option<MotionSidecarLastFrame>,
@@ -1612,6 +1665,148 @@ fn sidecar_authored_scope(
     }
 }
 
+/// Operator-facing name of one Residual route slot. The slot is named, never
+/// implied by array position, so a provenance reader can never attribute one
+/// input's tombstone to the other.
+fn residual_slot_name(slot: u8) -> &'static str {
+    match slot {
+        crate::visual_rack::RESIDUAL_DETAIL_SLOT => "detail",
+        _ => "structure",
+    }
+}
+
+/// One resolved route slot, reduced to stable identity only. Both halves of
+/// the missing pair keep their saved provenance so a tombstone is legible
+/// without ever naming a host path.
+fn residual_sidecar_route(
+    slot: u8,
+    tap: crate::visual_rack::ResolvedImageTap,
+) -> ResidualSidecarRoute {
+    use crate::visual_rack::ResolvedImageSource;
+
+    let mut record = ResidualSidecarRoute {
+        slot,
+        slot_name: residual_slot_name(slot),
+        source: "one_below",
+        timing: tap.timing,
+        resolved: true,
+        saved_position: None,
+        stable_id: None,
+        group_id: None,
+        stage: None,
+    };
+    match tap.source {
+        ResolvedImageSource::SelectedLayer {
+            layer_id,
+            saved_position,
+            stage,
+        } => {
+            record.source = "selected_layer";
+            record.saved_position = Some(saved_position.get());
+            record.stable_id = Some(layer_id.get());
+            record.stage = Some(stage);
+        }
+        ResolvedImageSource::MissingSelectedLayer {
+            saved_position,
+            stage,
+        } => {
+            record.source = "missing_selected_layer";
+            record.resolved = false;
+            record.saved_position = Some(saved_position.get());
+            record.stage = Some(stage);
+        }
+        ResolvedImageSource::OneBelow => record.source = "one_below",
+        ResolvedImageSource::AllBelow => record.source = "all_below",
+        ResolvedImageSource::GroupOutput(group_id) => {
+            record.source = "group_output";
+            record.group_id = Some(group_id.get());
+        }
+        ResolvedImageSource::MissingGroupOutput(group_id) => {
+            record.source = "missing_group_output";
+            record.resolved = false;
+            record.group_id = Some(group_id.get());
+        }
+        ResolvedImageSource::CleanProgram => record.source = "clean_program",
+        // S3b's etched canvas is a positionless master-scope singleton, so it
+        // resolves with no saved position, stable id, group, or layer stage.
+        ResolvedImageSource::GestureCanvas => record.source = "gesture_canvas",
+    }
+    record
+}
+
+/// Every Residual Counterpoint node in one scope's admitted rack, in authored
+/// node then slot order.
+fn residual_sidecar_scope_nodes(
+    scope: MotionSidecarScopeIdentity,
+    rack: &RuntimeVisualRack,
+    records: &mut Vec<ResidualSidecarNode>,
+    truncated: &mut bool,
+) {
+    use crate::visual_rack::RuntimeVisualNodeKind;
+
+    for node in rack.iter() {
+        let RuntimeVisualNodeKind::Residual(params) = node.kind else {
+            continue;
+        };
+        if records.len() == MAX_EXPORT_RESIDUAL_SIDECAR_NODES {
+            *truncated = true;
+            return;
+        }
+        let params = params.sanitized();
+        records.push(ResidualSidecarNode {
+            scope: scope.clone(),
+            node_id: node.stable_id.get(),
+            enabled: node.enabled,
+            wet: node.wet,
+            algorithm_version: params.algorithm_version,
+            block: params.block,
+            block_edge: params.block.edge(),
+            quantization: params.quantization,
+            quantization_levels: params.quantization.levels(),
+            authored_mix: params.mix,
+            authored_detail_gain: params.detail_gain,
+            seed: params.seed,
+            exact_bypass: !node.enabled || node.wet <= 0.0 || params.is_exact_bypass(),
+            routes: params
+                .routes()
+                .into_iter()
+                .enumerate()
+                .map(|(slot, tap)| {
+                    residual_sidecar_route(u8::try_from(slot).unwrap_or(u8::MAX), tap)
+                })
+                .collect(),
+        });
+    }
+}
+
+/// Per-slot route provenance for every Residual node this job admitted, master
+/// scope first and then each layer scope in saved order. The walk uses the
+/// resolved creative graph rather than the opened-source vector, so a failed
+/// media open cannot quietly drop a scope's authored recombination law.
+fn residual_sidecar_nodes(graph: &ExportCreativeGraph) -> (Vec<ResidualSidecarNode>, bool) {
+    let mut records = Vec::new();
+    let mut truncated = false;
+    residual_sidecar_scope_nodes(
+        MotionSidecarScopeIdentity::Master,
+        &graph.master_rack,
+        &mut records,
+        &mut truncated,
+    );
+    for (position, (stable_id, rack)) in graph.layer_racks.iter().enumerate() {
+        residual_sidecar_scope_nodes(
+            MotionSidecarScopeIdentity::Layer {
+                saved_position: u32::try_from(position).unwrap_or(u32::MAX),
+                stable_id: stable_id.get(),
+                source_tap_id: export_selective_layer_id(position),
+            },
+            rack,
+            &mut records,
+            &mut truncated,
+        );
+    }
+    (records, truncated)
+}
+
 fn sidecar_scope_state(value: &ExportMotionScopeMetadata) -> MotionSidecarScopeState {
     MotionSidecarScopeState {
         scope: sidecar_scope_identity(value.scope),
@@ -1715,12 +1910,15 @@ impl ExportMotionSidecarAccumulator {
                 *params,
             ));
         }
+        let (residual_nodes, residual_nodes_truncated) = residual_sidecar_nodes(graph);
         Self {
             artifact: MotionSidecarArtifact::from_config(config),
             sources,
             sources_truncated,
             authored_scopes,
             authored_scopes_truncated,
+            residual_nodes,
+            residual_nodes_truncated,
             distinct: Vec::new(),
             distinct_truncated: false,
             last: None,
@@ -1773,6 +1971,8 @@ impl ExportMotionSidecarAccumulator {
             sources_truncated: self.sources_truncated,
             authored_scopes: self.authored_scopes,
             authored_scopes_truncated: self.authored_scopes_truncated,
+            authored_residual_nodes: self.residual_nodes,
+            authored_residual_nodes_truncated: self.residual_nodes_truncated,
             distinct_dynamic_states: self.distinct,
             distinct_dynamic_states_truncated: self.distinct_truncated,
             last_accepted_frame: self.last,
@@ -3864,6 +4064,7 @@ fn run_export(
         max_texture_array_layers: raw_device_limits.max_texture_array_layers,
         max_sampled_textures_per_shader_stage: raw_device_limits
             .max_sampled_textures_per_shader_stage,
+        min_uniform_buffer_offset_alignment: raw_device_limits.min_uniform_buffer_offset_alignment,
         ..CreativeResourceLimits::default()
     };
     let media_device_limits =
@@ -8213,6 +8414,589 @@ layers:
         );
     }
 
+    /// One Residual Counterpoint node whose two slots are named independently.
+    /// Every discrete field is deliberately off its default so a value that
+    /// fails to travel is visible rather than accidentally correct.
+    fn residual_saved_rack(
+        scope: crate::visual_rack::LegacyRackScope,
+        structure: crate::visual_rack::SavedImageSource,
+        detail: crate::visual_rack::SavedImageSource,
+        mix: f32,
+    ) -> crate::visual_rack::VisualRack {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualParams, ResidualQuantization, SavedImageTap,
+            VisualNodeKind, VisualRack,
+        };
+
+        let mut rack = VisualRack::synthetic_legacy(scope);
+        rack.push(VisualNodeKind::Residual(ResidualParams {
+            structure: SavedImageTap {
+                source: structure,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            detail: SavedImageTap {
+                source: detail,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix,
+            detail_gain: 2.5,
+            seed: 0x00c0_ffee,
+            ..ResidualParams::default()
+        }))
+        .unwrap();
+        rack
+    }
+
+    /// Two stacked clips where the upper scope carries the Residual node.
+    fn residual_export_patch(
+        structure: crate::visual_rack::SavedImageSource,
+        detail: crate::visual_rack::SavedImageSource,
+        mix: f32,
+    ) -> PatchState {
+        let mut patch: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: carrier.mp4
+  - filename: donor.mp4
+"#,
+        )
+        .unwrap();
+        patch.layers[0].rack = Some(residual_saved_rack(
+            crate::visual_rack::LegacyRackScope::Layer,
+            structure,
+            detail,
+            mix,
+        ));
+        patch
+    }
+
+    fn residual_saved_layer(
+        position: u32,
+        stage: crate::image_routing::LayerImageStage,
+    ) -> crate::visual_rack::SavedImageSource {
+        crate::visual_rack::SavedImageSource::SelectedLayer {
+            layer_position: SavedLayerPosition::new(position).unwrap(),
+            stage,
+        }
+    }
+
+    /// The payload the shader actually consumes, taken through the real rack
+    /// compiler. Legacy markers belong to the frozen legacy path and never
+    /// enter that compiler, so this mirrors the executor's own segmentation
+    /// instead of comparing the authored struct with itself.
+    fn compiled_residual_payload(
+        rack: &crate::visual_rack::RuntimeVisualRack,
+    ) -> crate::visual_rack::RuntimeResidualParams {
+        use crate::renderer::rack::{CollisionRackPlan, RackPassKind};
+        use crate::visual_rack::{RuntimeVisualNodeKind, RuntimeVisualRack};
+
+        let authored = rack
+            .iter()
+            .find_map(|node| match node.kind {
+                RuntimeVisualNodeKind::Residual(params) => Some(params),
+                _ => None,
+            })
+            .expect("authored residual node");
+        let mut segment = RuntimeVisualRack::empty();
+        segment
+            .push(RuntimeVisualNodeKind::Residual(authored))
+            .unwrap();
+        let compiled = CollisionRackPlan::compile(&segment, [128, 64], [128, 64]).unwrap();
+        match compiled.passes()[0].kind {
+            RackPassKind::Residual(params) => params,
+            other => panic!("compiled a {other:?} where a residual pass was authored"),
+        }
+    }
+
+    /// A job records what it actually admitted: the discrete recombination law
+    /// and, per slot, whether that route resolved onto a job-local identity or
+    /// stayed a tombstone. The record is bounded and carries stable identities
+    /// only — never a host path, a filename, or filesystem metadata.
+    #[test]
+    fn residual_export_provenance_names_every_route_slot_and_the_recombination_law() {
+        use crate::image_routing::LayerImageStage;
+        use crate::visual_rack::{ResidualBlock, ResidualQuantization, SavedImageSource};
+
+        // Slot 0 resolves onto the donor below. Slot 1 names a saved position
+        // this export does not contain and must stay a retained tombstone
+        // instead of sliding onto its live partner.
+        let patch = residual_export_patch(
+            residual_saved_layer(1, LayerImageStage::PostLocalEffects),
+            residual_saved_layer(9, LayerImageStage::PreLocalEffects),
+            0.8,
+        );
+        let graph = resolve_export_creative_graph(&patch).unwrap();
+        let mut export_config = config(1.0);
+        export_config.output_path = "renders/residual-provenance.mp4".to_owned();
+        let sidecar = ExportMotionSidecarAccumulator::new(
+            &export_config,
+            &graph,
+            &[],
+            crate::motion::MotionParams::default(),
+            &[],
+        )
+        .finish(Vec::new());
+
+        assert_eq!(sidecar.schema_version, 4);
+        assert!(!sidecar.authored_residual_nodes_truncated);
+        assert_eq!(sidecar.authored_residual_nodes.len(), 1);
+        let record = &sidecar.authored_residual_nodes[0];
+        assert_eq!(
+            record.scope,
+            MotionSidecarScopeIdentity::Layer {
+                saved_position: 0,
+                stable_id: 1,
+                source_tap_id: export_selective_layer_id(0),
+            }
+        );
+        assert!(record.enabled);
+        assert_eq!(record.wet, 1.0);
+        assert_eq!(
+            record.algorithm_version,
+            crate::visual_rack::RESIDUAL_ALGORITHM_VERSION
+        );
+        assert_eq!(record.block, ResidualBlock::Sixteen);
+        assert_eq!(record.block_edge, 16);
+        assert_eq!(record.quantization, ResidualQuantization::Medium);
+        assert_eq!(record.quantization_levels, 32);
+        assert_eq!(record.authored_mix, 0.8);
+        assert_eq!(record.authored_detail_gain, 2.5);
+        assert_eq!(record.seed, 0x00c0_ffee);
+        assert!(!record.exact_bypass);
+
+        assert_eq!(
+            record.routes.len(),
+            crate::visual_rack::RESIDUAL_ROUTE_SLOTS
+        );
+        let structure = &record.routes[usize::from(crate::visual_rack::RESIDUAL_STRUCTURE_SLOT)];
+        assert_eq!(structure.slot, crate::visual_rack::RESIDUAL_STRUCTURE_SLOT);
+        assert_eq!(structure.slot_name, "structure");
+        assert_eq!(structure.source, "selected_layer");
+        assert_eq!(
+            structure.timing,
+            crate::visual_rack::EdgeTiming::CurrentFrame
+        );
+        assert!(structure.resolved);
+        assert_eq!(structure.saved_position, Some(1));
+        assert_eq!(structure.stable_id, Some(2));
+        assert_eq!(structure.stage, Some(LayerImageStage::PostLocalEffects));
+        assert_eq!(structure.group_id, None);
+
+        let detail = &record.routes[usize::from(crate::visual_rack::RESIDUAL_DETAIL_SLOT)];
+        assert_eq!(detail.slot, crate::visual_rack::RESIDUAL_DETAIL_SLOT);
+        assert_eq!(detail.slot_name, "detail");
+        assert_eq!(detail.source, "missing_selected_layer");
+        assert_eq!(detail.timing, crate::visual_rack::EdgeTiming::PreviousFrame);
+        assert!(
+            !detail.resolved,
+            "an out-of-range saved position is a tombstone, never a neighbour"
+        );
+        assert_eq!(detail.saved_position, Some(9));
+        assert_eq!(
+            detail.stable_id, None,
+            "a tombstone must not publish a job-local identity it never had"
+        );
+        assert_eq!(detail.stage, Some(LayerImageStage::PreLocalEffects));
+
+        // The published document carries no operational path or filename.
+        let json = serde_json::to_string(&sidecar.authored_residual_nodes).unwrap();
+        for forbidden in ["carrier.mp4", "donor.mp4", "renders", "/", "\\", ".mp4"] {
+            assert!(
+                !json.contains(forbidden),
+                "residual provenance leaked {forbidden}: {json}"
+            );
+        }
+
+        // A dormant node is still fully documented — the provenance says what
+        // the job admitted, and delegation is one of its facts.
+        let dormant = residual_export_patch(
+            residual_saved_layer(1, LayerImageStage::PostLocalEffects),
+            SavedImageSource::AllBelow,
+            0.0,
+        );
+        let dormant_graph = resolve_export_creative_graph(&dormant).unwrap();
+        let (dormant_records, dormant_truncated) = residual_sidecar_nodes(&dormant_graph);
+        assert!(!dormant_truncated);
+        assert_eq!(dormant_records.len(), 1);
+        assert!(dormant_records[0].exact_bypass);
+        assert_eq!(dormant_records[0].authored_mix, 0.0);
+        assert_eq!(dormant_records[0].routes[1].source, "all_below");
+        assert!(dormant_records[0].routes[1].resolved);
+
+        // The cap bounds a hand-authored patch instead of growing the report.
+        let mut saturated = vec![dormant_records[0].clone(); MAX_EXPORT_RESIDUAL_SIDECAR_NODES];
+        let mut truncated = false;
+        residual_sidecar_scope_nodes(
+            MotionSidecarScopeIdentity::Master,
+            &dormant_graph.layer_racks[0].1,
+            &mut saturated,
+            &mut truncated,
+        );
+        assert!(truncated);
+        assert_eq!(saturated.len(), MAX_EXPORT_RESIDUAL_SIDECAR_NODES);
+    }
+
+    /// The recombination pass consumes no clock of its own: its shader payload
+    /// and its reduced-surface budget are a pure function of the patch, the
+    /// authored seed, and the resolved routes. Export must therefore produce
+    /// exactly one payload for a given frame index at every rate, and the same
+    /// payload at every frame index.
+    #[test]
+    fn residual_export_payload_is_frame_index_derived_and_carries_no_clock() {
+        use crate::evaluated_frame::evaluated_composition::{ImageTapConsumer, PlannedImageTap};
+        use crate::image_routing::LayerImageStage;
+        use crate::visual_rack::{ResidualResourcePlan, SavedImageSource};
+
+        let patch = residual_export_patch(
+            residual_saved_layer(1, LayerImageStage::PostLocalEffects),
+            SavedImageSource::OneBelow,
+            0.65,
+        );
+        let graph = resolve_export_creative_graph(&patch).unwrap();
+        let effects = EffectUniforms {
+            // A neighbouring effect that genuinely does consume program time,
+            // so an accidental clock dependency would have somewhere to leak
+            // in from rather than being trivially absent.
+            shift_amount: 0.6,
+            shift_speed: 4.0,
+            cellular_amount: 0.5,
+            cellular_speed: 1.5,
+            ..EffectUniforms::default()
+        };
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+
+        let mut canonical: Option<(
+            crate::visual_rack::RuntimeResidualParams,
+            ResidualResourcePlan,
+            Vec<PlannedImageTap>,
+        )> = None;
+        for fps in [24_u32, 30, 60] {
+            for frame_index in [0_u64, 45, 1234] {
+                let (time, _delta) = export_program_transport(frame_index, 1.0 / fps as f32, false);
+                let modulation = crate::modulation::ModMatrix::new().frame(graph.layer_ids.len());
+                let evaluated = EvaluatedFramePlan::evaluate(
+                    &modulation,
+                    FramePlanContext::new(64, 32, time),
+                    MasterFrameInput {
+                        effects: &effects,
+                        transform: &transform,
+                        ntsc: &ntsc,
+                        temporal: &temporal,
+                    },
+                    graph
+                        .layer_ids
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(slot, id)| LayerFrameInput {
+                            source: SourceTap::new(id.get(), slot, 64, 32),
+                            effects: &effects,
+                            transform: &transform,
+                            opacity: 1.0,
+                            speed: 1.0,
+                            fps: fps as f32,
+                            blend_mode: BlendMode::Normal,
+                            visible: true,
+                            paused: false,
+                            bypass_master_fx: false,
+                        }),
+                );
+                let planned = plan_export_composition(
+                    &evaluated,
+                    &graph,
+                    &[LayerMatte::default(); 2],
+                    false,
+                    CreativeResourceLimits::default(),
+                )
+                .unwrap();
+                // The shared executor accepts the shared planner's result. A
+                // planner/executor disagreement is a hard export error, so
+                // this is the point where an export-only path would have to
+                // exist — and does not.
+                CompositionGpuExecutor::validate_plan(&planned).unwrap();
+                let EvaluatedCompositionPlan::Advanced(advanced) = planned else {
+                    panic!("a live Residual mix must enter the unified advanced plan");
+                };
+
+                // Both slots are collected as two distinct consumers.
+                let taps = advanced
+                    .image_taps()
+                    .iter()
+                    .filter(|tap| matches!(tap.consumer, ImageTapConsumer::RackNode { .. }))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(taps.len(), crate::visual_rack::RESIDUAL_ROUTE_SLOTS);
+
+                let residual = advanced.residual_resources();
+                assert_eq!(residual.active_nodes, 1);
+                assert_eq!(residual.mean_surfaces, 2);
+                assert_eq!(residual.max_grid_dimensions, [4, 2]);
+
+                // The executor payload the shader actually consumes.
+                let compiled = compiled_residual_payload(&graph.layer_racks[0].1);
+                assert_eq!(
+                    compiled.seed, 0x00c0_ffee,
+                    "the authored seed is recalled, never re-drawn offline"
+                );
+
+                let evidence = (compiled, residual, taps);
+                if let Some(expected) = &canonical {
+                    assert_eq!(
+                        &evidence, expected,
+                        "residual payload moved at {fps} fps, frame {frame_index}"
+                    );
+                } else {
+                    canonical = Some(evidence);
+                }
+            }
+        }
+
+        // There is no export-only recombination path. Everything this module
+        // contributes is provenance; the rack shader, the two reduced passes,
+        // the mean surfaces and their preflight all live behind the shared
+        // executor, reached identically by live and offline rendering.
+        let source = include_str!("render_export.rs");
+        let production = &source[..source.find("\nmod tests {").expect("test module")];
+        for forbidden in [
+            "RackPassKind",
+            "CollisionRackPlan",
+            "rack_node.wgsl",
+            "ResidualResourcePlan",
+            "prepare_residual_means",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "export grew its own residual path through {forbidden}"
+            );
+        }
+    }
+
+    /// Live and offline build their stable creative graph independently — live
+    /// from process-lifetime layer IDs, export from `position + 1` — and then
+    /// run the same address book, the same stable modulation frame, and the
+    /// same rack compiler. A master-scope address is identical on both sides,
+    /// so the same patch, the same seed and the same frame ordinal must hand
+    /// the shader the same Residual payload on both, derived from the frame
+    /// ordinal rather than read off a wall clock.
+    #[test]
+    fn residual_live_and_export_share_one_stable_modulation_payload_at_24_30_and_60_fps() {
+        use crate::modulation::{ModMatrix, ModSource, Routing, StableModAddressBook};
+        use crate::visual_rack::{LegacyRackScope, RuntimeVisualRack, SavedImageSource};
+
+        let saved_master = residual_saved_rack(
+            LegacyRackScope::Master,
+            SavedImageSource::AllBelow,
+            SavedImageSource::CleanProgram,
+            0.25,
+        );
+        let node_id = saved_master
+            .iter()
+            .find(|node| matches!(node.kind, crate::visual_rack::VisualNodeKind::Residual(_)))
+            .expect("authored residual node")
+            .stable_id;
+
+        // Live process-lifetime identities and export's position-derived ones
+        // are deliberately different numbers; only the master-scope address is
+        // shared, which is exactly what makes this a parity proof rather than
+        // a comparison of one value with itself.
+        let live_ids = [
+            StableLayerId::new(4242).unwrap(),
+            StableLayerId::new(777).unwrap(),
+        ];
+        let patch = {
+            let mut patch: PatchState = serde_yaml::from_str(
+                r#"
+master: {}
+layers:
+  - filename: carrier.mp4
+  - filename: donor.mp4
+"#,
+            )
+            .unwrap();
+            patch.master_rack = Some(saved_master.clone());
+            patch
+        };
+        let export_graph = resolve_export_creative_graph(&patch).unwrap();
+        assert_eq!(
+            export_graph.layer_ids.as_ref(),
+            &[
+                StableLayerId::new(1).unwrap(),
+                StableLayerId::new(2).unwrap(),
+            ],
+            "export identity stays position-derived"
+        );
+
+        let live_composition = crate::composition::RuntimeComposition::try_from_parts(
+            Vec::new(),
+            live_ids
+                .iter()
+                .rev()
+                .map(|layer_id| crate::composition::RuntimeRootItem::Layer {
+                    layer_id: *layer_id,
+                    bus: crate::composition::BusAssignment::Program,
+                })
+                .collect(),
+            None,
+            0.5,
+        )
+        .unwrap();
+        let live_master_template = saved_master.resolve_routes(
+            |position| live_ids.get(position.get() as usize).copied(),
+            |_| false,
+        );
+        let live_layer_template = live_ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let routings = vec![
+            Routing::new(
+                ModSource::Lfo(0),
+                format!("node/master/{}/mix", node_id.get()),
+                0.6,
+            ),
+            Routing::new(
+                ModSource::Lfo(0),
+                format!("node/master/{}/detail_gain", node_id.get()),
+                0.4,
+            ),
+        ];
+        let matrix_at = |beat: f64, delta_seconds: f32| {
+            let mut matrix = ModMatrix::new();
+            matrix.lfos[0].beats = 3.0;
+            matrix.lfos[0].set_phase(0.125);
+            matrix.routings = routings.clone();
+            matrix.update_at_beat(beat, delta_seconds);
+            matrix
+        };
+        // One (beat, delta) instant projected into both worlds. Each side runs
+        // its own address book over its own resolved racks; only the authored
+        // master-scope address is shared.
+        let sample = |beat: f64, delta_seconds: f32| {
+            let matrix = matrix_at(beat, delta_seconds);
+            let mut export_master = export_graph.master_rack.clone();
+            let mut export_layers = export_graph.layer_racks.clone();
+            let mut export_composition = export_graph.composition.clone();
+            let export_book = StableModAddressBook::from_composition(
+                &export_master,
+                &export_layers,
+                &export_composition,
+            )
+            .unwrap();
+            crate::modulation::apply_stable_modulation(
+                &export_book,
+                &matrix.stable_frame(&export_book),
+                &mut export_master,
+                &mut export_layers,
+                &mut export_composition,
+            );
+
+            let live_matrix = matrix_at(beat, delta_seconds);
+            let mut live_master = live_master_template.clone();
+            let mut live_layers = live_layer_template.clone();
+            let mut live_composition = live_composition.clone();
+            let live_book = StableModAddressBook::from_composition(
+                &live_master,
+                &live_layers,
+                &live_composition,
+            )
+            .unwrap();
+            crate::modulation::apply_stable_modulation(
+                &live_book,
+                &live_matrix.stable_frame(&live_book),
+                &mut live_master,
+                &mut live_layers,
+                &mut live_composition,
+            );
+            (
+                compiled_residual_payload(&export_master),
+                compiled_residual_payload(&live_master),
+            )
+        };
+
+        // Both worlds resolved the two authored slots to the same thing before
+        // any modulation ran, so a later divergence can only come from the
+        // per-frame projection under test.
+        let authored_routes = compiled_residual_payload(&live_master_template).routes();
+        assert_eq!(
+            compiled_residual_payload(&export_graph.master_rack).routes(),
+            authored_routes
+        );
+
+        let mut moved = false;
+        for fps in [24_u32, 30, 60] {
+            let mut previous: Option<crate::visual_rack::RuntimeResidualParams> = None;
+            for frame_index in [0_u64, 45, 90] {
+                // Offline time is the frame ordinal times the frame interval —
+                // never a wall clock and never a live input.
+                let (time, delta_seconds) =
+                    export_program_transport(frame_index, 1.0 / fps as f32, false);
+                assert_eq!(time, frame_index as f32 * (1.0 / fps as f32));
+                let beat = f64::from(time) * 2.0;
+
+                let (export_params, live_params) = sample(beat, delta_seconds);
+                assert_eq!(
+                    export_params, live_params,
+                    "live and export diverged at {fps} fps, frame {frame_index}"
+                );
+
+                // Re-deriving the same ordinal reproduces it exactly. Nothing
+                // on this path reads a clock the replay cannot also see.
+                assert_eq!(
+                    sample(beat, delta_seconds).0,
+                    export_params,
+                    "the payload for {fps} fps frame {frame_index} was not reproducible"
+                );
+
+                // The topology half is authored recall, never a per-frame draw.
+                assert_eq!(export_params.routes(), authored_routes);
+                assert_eq!(
+                    export_params.block,
+                    crate::visual_rack::ResidualBlock::Sixteen
+                );
+                assert_eq!(
+                    export_params.quantization,
+                    crate::visual_rack::ResidualQuantization::Medium
+                );
+                assert_eq!(
+                    export_params.seed, 0x00c0_ffee,
+                    "the authored seed is recalled, never re-drawn offline"
+                );
+                assert_eq!(
+                    export_params.algorithm_version,
+                    crate::visual_rack::RESIDUAL_ALGORITHM_VERSION
+                );
+                assert!((0.0..=1.0).contains(&export_params.mix));
+                assert!((0.0..=4.0).contains(&export_params.detail_gain));
+
+                if previous.is_some_and(|previous: crate::visual_rack::RuntimeResidualParams| {
+                    previous.mix != export_params.mix
+                        || previous.detail_gain != export_params.detail_gain
+                }) {
+                    moved = true;
+                }
+                previous = Some(export_params);
+            }
+        }
+
+        // The routes really drive the two continuous values, so the equalities
+        // above are not the trivial equality of one constant with itself.
+        assert!(
+            moved,
+            "a beat-driven residual route must move as the frame ordinal advances"
+        );
+    }
+
     fn m4_motion_evaluated_frame(graph: &ExportCreativeGraph, fps: u32) -> EvaluatedFramePlan {
         let effects = EffectUniforms::default();
         let transform = SpatialTransform::default();
@@ -9311,6 +10095,8 @@ layers:
                 crate::motion::MotionParams::default(),
             )],
             authored_scopes_truncated: false,
+            residual_nodes: Vec::new(),
+            residual_nodes_truncated: false,
             distinct: Vec::new(),
             distinct_truncated: false,
             last: None,
@@ -9403,8 +10189,15 @@ layers:
         let bytes = std::fs::read(&sidecar_path).unwrap();
         assert!(bytes.len() <= MAX_EXPORT_MOTION_SIDECAR_BYTES);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["cross_gpu_pixel_identity_guaranteed"], false);
+        // Schema 4's residual section is present and empty for a patch with no
+        // Residual node, so an existing consumer sees no dynamic-state change.
+        assert_eq!(
+            json["authored_residual_nodes"],
+            serde_json::Value::Array(Vec::new())
+        );
+        assert_eq!(json["authored_residual_nodes_truncated"], false);
         assert_eq!(
             json["artifact"]["requested_shutter_sample_policy"],
             "samples_16"
@@ -14893,6 +15686,69 @@ mod effects_audit {
         patch.layers[0].rack = Some(rack);
         patch.layers[0].effects.hue_shift = 90.0;
         render("displace_two_input", patch);
+    }
+
+    /// Three stacked clips where the upper layer's Residual Counterpoint node
+    /// recombines the middle layer's large-scale structure with its own detail
+    /// measured against the bottom layer. This is the labeled export case for
+    /// the shared node implementation: the offline renderer consumes the same
+    /// evaluated plan, the same two reduced block-mean passes, and the same
+    /// rack shader, with no export-only recombination path.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_residual_counterpoint_pipeline() {
+        use crate::image_routing::LayerImageStage;
+        use crate::visual_rack::{
+            EdgeTiming, LegacyRackScope, ResidualBlock, ResidualParams, ResidualQuantization,
+            SavedImageSource, SavedImageTap, VisualNodeKind, VisualRack,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        let structure_donor = patch.layers[0].clone();
+        patch.layers.push(structure_donor);
+        let detail_donor = patch.layers[0].clone();
+        patch.layers.push(detail_donor);
+        // Give the donors visibly different local colour so the recombination
+        // is legible: the DC term comes from one and the AC from the other.
+        patch.layers[1].effects.hue_shift = 200.0;
+        patch.layers[2].effects.brightness = -0.35;
+
+        // Layer 0 is the upper scope. Slot 0 takes its large-scale structure
+        // from the middle layer; slot 1 measures its own detail against the
+        // bottom layer, so both authored slots are exercised independently.
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Residual(ResidualParams {
+            structure: SavedImageTap {
+                source: SavedImageSource::SelectedLayer {
+                    layer_position: SavedLayerPosition::new(1).unwrap(),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            detail: SavedImageTap {
+                source: SavedImageSource::SelectedLayer {
+                    layer_position: SavedLayerPosition::new(2).unwrap(),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.85,
+            detail_gain: 2.0,
+            seed: 0x00c0_ffee,
+            ..ResidualParams::default()
+        }))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+        patch.layers[0].effects.hue_shift = 90.0;
+        render("residual_counterpoint", patch);
     }
 
     /// S3b's labeled export case. It is the one that renders a job carrying a

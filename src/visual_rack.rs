@@ -778,6 +778,678 @@ impl DisplaceParams {
     }
 }
 
+/// Persisted schema stamp for the Residual Counterpoint decomposition. It is a
+/// version of the algorithm, not an authored value: sanitization always
+/// normalizes it to the current constant so an older or hostile patch cannot
+/// select a decomposition law this build does not implement.
+pub const RESIDUAL_ALGORITHM_VERSION: u16 = 1;
+/// Every single-route node kind occupies this one slot. Naming it keeps a
+/// one-route consumer identity explicit rather than an unexplained literal.
+pub const RACK_PRIMARY_ROUTE_SLOT: u8 = 0;
+/// Residual carries exactly two authored image routes. The slot index is the
+/// route identity everywhere a consumer must distinguish them.
+pub const RESIDUAL_ROUTE_SLOTS: usize = 2;
+/// Slot 0 supplies the large-scale structure whose block mean becomes DC.
+pub const RESIDUAL_STRUCTURE_SLOT: u8 = 0;
+/// Slot 1 supplies the large scale the carrier's detail is measured against.
+pub const RESIDUAL_DETAIL_SLOT: u8 = 1;
+
+/// Fixed block-mean grid vocabulary. The edge is in output pixels and the grid
+/// is `ceil(output_dim / edge)`, so a smaller block is a larger, more expensive
+/// grid. Codes are permanent and append-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualBlock {
+    Four,
+    #[default]
+    Eight,
+    Sixteen,
+    ThirtyTwo,
+    SixtyFour,
+}
+
+impl ResidualBlock {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Four => 0,
+            Self::Eight => 1,
+            Self::Sixteen => 2,
+            Self::ThirtyTwo => 3,
+            Self::SixtyFour => 4,
+        }
+    }
+
+    /// Block edge in output pixels. The vocabulary is closed so a grid can be
+    /// preflighted against its own byte and cell limits before any allocation.
+    pub const fn edge(self) -> u32 {
+        match self {
+            Self::Four => 4,
+            Self::Eight => 8,
+            Self::Sixteen => 16,
+            Self::ThirtyTwo => 32,
+            Self::SixtyFour => 64,
+        }
+    }
+}
+
+/// Fixed quantization vocabulary applied to both the DC and the AC term.
+/// Codes are permanent and append-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualQuantization {
+    #[default]
+    Off,
+    Coarse,
+    Medium,
+    Fine,
+}
+
+impl ResidualQuantization {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Coarse => 1,
+            Self::Medium => 2,
+            Self::Fine => 3,
+        }
+    }
+
+    /// Level count of the seeded lattice. Zero is the authored default and
+    /// means exact identity, not a one-level collapse.
+    pub const fn levels(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Coarse => 8,
+            Self::Medium => 32,
+            Self::Fine => 128,
+        }
+    }
+}
+
+/// Authored state of the named two-input Residual Counterpoint node. The node
+/// recombines one route's large-scale structure with the carrier's detail
+/// measured against a second route:
+///
+/// ```text
+/// dc  = quantize(mean(structure))
+/// ac  = quantize(carrier_premultiplied - mean(detail))
+/// out = dc + detail_gain * ac
+/// ```
+///
+/// Both routes are stable image taps under the generic tap laws and are read
+/// only through their reduced block means, never at full resolution. `mix` is
+/// the wet/dry authority: zero is the authored default and an exact bypass.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResidualParams {
+    pub algorithm_version: u16,
+    pub structure: SavedImageTap,
+    pub detail: SavedImageTap,
+    pub block: ResidualBlock,
+    pub quantization: ResidualQuantization,
+    pub mix: f32,
+    pub detail_gain: f32,
+    pub seed: u32,
+}
+
+impl Default for ResidualParams {
+    fn default() -> Self {
+        Self {
+            algorithm_version: RESIDUAL_ALGORITHM_VERSION,
+            structure: SavedImageTap::default(),
+            detail: SavedImageTap::default(),
+            block: ResidualBlock::Eight,
+            quantization: ResidualQuantization::Off,
+            mix: 0.0,
+            detail_gain: 1.0,
+            seed: 0,
+        }
+    }
+}
+
+impl ResidualParams {
+    fn sanitized(self) -> Self {
+        Self {
+            algorithm_version: RESIDUAL_ALGORITHM_VERSION,
+            structure: self.structure,
+            detail: self.detail,
+            block: self.block,
+            quantization: self.quantization,
+            mix: finite_clamp(self.mix, 0.0, 0.0, 1.0),
+            detail_gain: finite_clamp(self.detail_gain, 1.0, 0.0, 4.0),
+            seed: self.seed,
+        }
+    }
+
+    /// Zero mix is an authored no-op. The planner then collects neither route,
+    /// the executor encodes no pass and allocates no block-mean surface, and
+    /// the saved-patch dependency walk claims no edge. Hostile non-finite mix
+    /// sanitizes to zero and is therefore also an exact bypass, never a full
+    /// recombination.
+    pub fn is_exact_bypass(self) -> bool {
+        self.sanitized().mix == 0.0
+    }
+
+    /// Slot 0 is `structure` and slot 1 is `detail`. Any other index names no
+    /// route at all: it yields `None` rather than silently aliasing a real
+    /// slot, so an unknown remote slot is rejected instead of misapplied.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "slot-indexed saved route access is consumed by the ordered route action"
+        )
+    )]
+    pub const fn route(self, slot: u8) -> Option<SavedImageTap> {
+        match slot {
+            RESIDUAL_STRUCTURE_SLOT => Some(self.structure),
+            RESIDUAL_DETAIL_SLOT => Some(self.detail),
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "slot-indexed saved route access is consumed by the ordered route action"
+        )
+    )]
+    pub fn route_mut(&mut self, slot: u8) -> Option<&mut SavedImageTap> {
+        match slot {
+            RESIDUAL_STRUCTURE_SLOT => Some(&mut self.structure),
+            RESIDUAL_DETAIL_SLOT => Some(&mut self.detail),
+            _ => None,
+        }
+    }
+
+    /// Both routes in slot order. Route walkers iterate this fixed array so a
+    /// second slot can never be dropped by a one-value closure.
+    pub const fn routes(self) -> [SavedImageTap; RESIDUAL_ROUTE_SLOTS] {
+        [self.structure, self.detail]
+    }
+
+    pub const fn selected_layer_positions(
+        self,
+    ) -> [Option<SavedLayerPosition>; RESIDUAL_ROUTE_SLOTS] {
+        [
+            self.structure.selected_layer_position(),
+            self.detail.selected_layer_position(),
+        ]
+    }
+
+    pub const fn referenced_groups(self) -> [Option<GroupId>; RESIDUAL_ROUTE_SLOTS] {
+        [
+            self.structure.referenced_group(),
+            self.detail.referenced_group(),
+        ]
+    }
+
+    /// Preserve a deleted group identity explicitly in every slot so a future
+    /// group at the same root position cannot inherit either route.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "saved residual invalidation supports patch/editor migrations"
+        )
+    )]
+    pub fn mark_group_output_missing(&mut self, removed: GroupId) {
+        for route in [&mut self.structure, &mut self.detail] {
+            if route.source == (SavedImageSource::GroupOutput { group_id: removed }) {
+                route.source = SavedImageSource::MissingGroupOutput { group_id: removed };
+            }
+        }
+    }
+}
+
+/// Hard edge bound for either dimension of one block-mean grid.
+pub const RESIDUAL_GRID_MAX_EDGE: u32 = 2_048;
+/// Hard cell bound for one node's block-mean grid.
+pub const RESIDUAL_GRID_MAX_CELLS: u64 = 2_100_000;
+/// Exact storage cost of one block-mean cell: a single `Rgba16Float` texel.
+/// This is an equality, not a ceiling — a wider cell is a different plan.
+pub const RESIDUAL_MEAN_BYTES_PER_CELL: u64 = 8;
+/// Exact number of block-mean surfaces one active node owns: one per authored
+/// route slot, structure and detail. Also an equality, not a ceiling.
+pub const RESIDUAL_MEAN_SURFACES_PER_NODE: u32 = 2;
+/// Explicit texture operations per mean cell: the four quadrant centres of its
+/// block. This is a bounded four-tap estimator, not a full box integral.
+pub const RESIDUAL_MEAN_TAPS_PER_CELL: u64 = 4;
+/// Hard byte bound for one node's complete block-mean working set. The cell
+/// cap alone does not imply it: a full-cap grid is 33,600,000 bytes across two
+/// surfaces, so this bound binds first.
+pub const RESIDUAL_NODE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Composition-wide block-mean working-set ceiling.
+pub const RESIDUAL_AGGREGATE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// The recombination pass binds the carrier plus both block means, and never
+/// either route at full resolution.
+pub const RESIDUAL_RECOMBINATION_SAMPLED_TEXTURES: u32 = 3;
+/// Frozen dynamic-offset stride of one recombination uniform record.
+pub const RESIDUAL_UNIFORM_STRIDE_BYTES: u64 = 256;
+/// Nominal ceiling on simultaneously active Residual nodes. The aggregate byte
+/// cap can bind well before it and is checked independently.
+pub const RESIDUAL_MAX_ACTIVE_NODES: u32 = 16;
+
+/// Typed rejection from Residual Counterpoint resource admission. Every §2
+/// bound is a separate variant so an over-budget grid names the bound it broke
+/// instead of being silently clamped to a smaller one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualResourceError {
+    InvalidDimensions([u32; 2]),
+    DeviceTextureDimension {
+        dimensions: [u32; 2],
+        limit: u32,
+    },
+    GridEdge {
+        dimensions: [u32; 2],
+        limit: u32,
+    },
+    CellCount {
+        count: u64,
+        limit: u64,
+    },
+    NodeBytes {
+        bytes: u64,
+        limit: u64,
+    },
+    AggregateBytes {
+        bytes: u64,
+        limit: u64,
+    },
+    TooManyActiveNodes {
+        count: u32,
+        limit: u32,
+    },
+    SampledTextures {
+        requested: u32,
+        limit: u32,
+    },
+    UniformStride {
+        stride: u64,
+        alignment: u32,
+    },
+    /// Reconciliation: the executor allocated a cell wider or narrower than the
+    /// exact `Rgba16Float` texel the plan charged for.
+    AllocatedCellBytes {
+        allocated: u64,
+        expected: u64,
+    },
+    /// Reconciliation: the executor owns a different number of block-mean
+    /// surfaces per node than the exact two the plan charged for.
+    AllocatedSurfacesPerNode {
+        allocated: u32,
+        expected: u32,
+    },
+    /// Reconciliation: the executor's uniform arena stride is not the frozen
+    /// dynamic-offset stride the plan declared.
+    AllocatedUniformStride {
+        allocated: u64,
+        expected: u64,
+    },
+    /// Reconciliation: declared and physical byte totals disagree.
+    AllocatedBytes {
+        allocated: u64,
+        planned: u64,
+    },
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for ResidualResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDimensions([width, height]) => write!(
+                formatter,
+                "residual block-mean grid needs positive dimensions, got {width}x{height}"
+            ),
+            Self::DeviceTextureDimension { dimensions, limit } => write!(
+                formatter,
+                "residual carrier {}x{} exceeds this device's {limit}px texture limit",
+                dimensions[0], dimensions[1]
+            ),
+            Self::GridEdge { dimensions, limit } => write!(
+                formatter,
+                "residual block-mean grid {}x{} exceeds the {limit} cell edge bound",
+                dimensions[0], dimensions[1]
+            ),
+            Self::CellCount { count, limit } => write!(
+                formatter,
+                "residual block-mean grid holds {count} cells, above the {limit} cell bound"
+            ),
+            Self::NodeBytes { bytes, limit } => write!(
+                formatter,
+                "one residual node's block means need {bytes} bytes, above the {limit} byte bound"
+            ),
+            Self::AggregateBytes { bytes, limit } => write!(
+                formatter,
+                "residual block means need {bytes} bytes, above the {limit} byte composition bound"
+            ),
+            Self::TooManyActiveNodes { count, limit } => write!(
+                formatter,
+                "{count} active residual nodes exceed the nominal {limit} node bound"
+            ),
+            Self::SampledTextures { requested, limit } => write!(
+                formatter,
+                "residual recombination samples {requested} textures, above this pass's {limit}"
+            ),
+            Self::UniformStride { stride, alignment } => write!(
+                formatter,
+                "residual uniform stride {stride} is not a multiple of this device's {alignment} byte dynamic-offset alignment"
+            ),
+            Self::AllocatedCellBytes {
+                allocated,
+                expected,
+            } => write!(
+                formatter,
+                "residual block-mean cells allocate {allocated} bytes rather than exactly {expected}"
+            ),
+            Self::AllocatedSurfacesPerNode {
+                allocated,
+                expected,
+            } => write!(
+                formatter,
+                "residual nodes allocate {allocated} block-mean surfaces rather than exactly {expected}"
+            ),
+            Self::AllocatedUniformStride {
+                allocated,
+                expected,
+            } => write!(
+                formatter,
+                "residual uniform arena strides {allocated} bytes rather than the declared {expected}"
+            ),
+            Self::AllocatedBytes { allocated, planned } => write!(
+                formatter,
+                "residual block means allocate {allocated} bytes while the plan declared {planned}"
+            ),
+            Self::ArithmeticOverflow => {
+                write!(formatter, "residual resource accounting overflowed")
+            }
+        }
+    }
+}
+
+/// Canonical block-mean grid for one active node. `ceil(output / block edge)`
+/// on each axis, admitted against its own edge and cell bounds before any
+/// allocation. An over-budget grid is a typed rejection, never a clamp to a
+/// smaller grid that would silently change the authored decomposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualGrid {
+    pub width: u32,
+    pub height: u32,
+    pub block_pixels: u32,
+    pub cell_count: u64,
+}
+
+impl ResidualGrid {
+    pub fn for_output(
+        output_dimensions: [u32; 2],
+        block: ResidualBlock,
+    ) -> Result<Self, ResidualResourceError> {
+        let [output_width, output_height] = output_dimensions;
+        if output_width == 0 || output_height == 0 {
+            return Err(ResidualResourceError::InvalidDimensions(output_dimensions));
+        }
+        let block_pixels = block.edge();
+        let width = output_width
+            .checked_add(block_pixels - 1)
+            .ok_or(ResidualResourceError::ArithmeticOverflow)?
+            / block_pixels;
+        let height = output_height
+            .checked_add(block_pixels - 1)
+            .ok_or(ResidualResourceError::ArithmeticOverflow)?
+            / block_pixels;
+        if width > RESIDUAL_GRID_MAX_EDGE || height > RESIDUAL_GRID_MAX_EDGE {
+            return Err(ResidualResourceError::GridEdge {
+                dimensions: [width, height],
+                limit: RESIDUAL_GRID_MAX_EDGE,
+            });
+        }
+        let cell_count = u64::from(width)
+            .checked_mul(u64::from(height))
+            .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+        if cell_count > RESIDUAL_GRID_MAX_CELLS {
+            return Err(ResidualResourceError::CellCount {
+                count: cell_count,
+                limit: RESIDUAL_GRID_MAX_CELLS,
+            });
+        }
+        Ok(Self {
+            width,
+            height,
+            block_pixels,
+            cell_count,
+        })
+    }
+}
+
+/// Device facts the block-mean budget needs. Hosts copy these from their
+/// adapter; the residual domain never depends on `wgpu`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualResourceLimits {
+    pub max_texture_dimension_2d: u32,
+    pub min_uniform_buffer_offset_alignment: u32,
+    pub max_sampled_textures_per_shader_stage: u32,
+    pub max_residual_bytes: u64,
+}
+
+impl Default for ResidualResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_texture_dimension_2d: 8_192,
+            min_uniform_buffer_offset_alignment: 256,
+            max_sampled_textures_per_shader_stage: MAX_SAMPLED_TEXTURES_PER_PASS,
+            max_residual_bytes: RESIDUAL_AGGREGATE_MAX_BYTES,
+        }
+    }
+}
+
+/// One active Residual node offered to composition-wide block-mean preflight.
+/// Bypassed, disabled, and zero-wet nodes are filtered by the caller under the
+/// same admission predicate the planner and the saved-patch walk use, so a
+/// delegating node charges nothing here either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualResourceRequest {
+    pub output_dimensions: [u32; 2],
+    pub block: ResidualBlock,
+}
+
+/// Byte-exact block-mean working set, budgeted entirely outside the full-frame
+/// layer ledger. Reduced surfaces are sub-full-frame and cannot be honestly
+/// expressed as `additional_rgba16_layers`; they meet the creative number only
+/// at the shared `MAX_CREATIVE_GPU_BYTES` cap, exactly as motion bytes do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualResourcePlan {
+    pub active_nodes: u32,
+    pub mean_surfaces: u32,
+    pub mean_cells: u64,
+    pub mean_sample_operations: u64,
+    pub mean_surface_bytes: u64,
+    pub total_bytes: u64,
+    pub max_grid_dimensions: [u32; 2],
+    pub bytes_per_cell: u64,
+    pub surfaces_per_node: u32,
+    pub sampled_textures_in_recombination: u32,
+    pub uniform_stride_bytes: u64,
+}
+
+impl Default for ResidualResourcePlan {
+    fn default() -> Self {
+        Self {
+            active_nodes: 0,
+            mean_surfaces: 0,
+            mean_cells: 0,
+            mean_sample_operations: 0,
+            mean_surface_bytes: 0,
+            total_bytes: 0,
+            max_grid_dimensions: [0, 0],
+            bytes_per_cell: RESIDUAL_MEAN_BYTES_PER_CELL,
+            surfaces_per_node: RESIDUAL_MEAN_SURFACES_PER_NODE,
+            sampled_textures_in_recombination: RESIDUAL_RECOMBINATION_SAMPLED_TEXTURES,
+            uniform_stride_bytes: RESIDUAL_UNIFORM_STRIDE_BYTES,
+        }
+    }
+}
+
+/// Physical facts read back from a prepared executor. Reconciliation fails
+/// closed when they disagree with the declared plan, the way motion resources
+/// and the runtime precision ledger already do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResidualAllocationSnapshot {
+    pub mean_surfaces: u32,
+    pub bytes_per_cell: u64,
+    pub surfaces_per_node: u32,
+    pub uniform_stride_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl ResidualResourcePlan {
+    pub fn preflight(
+        requests: &[ResidualResourceRequest],
+        limits: ResidualResourceLimits,
+    ) -> Result<Self, ResidualResourceError> {
+        let mut plan = Self::default();
+
+        // The recombination pass reads the carrier and both reduced means. It
+        // never reads either route at full resolution, which is exactly what
+        // keeps it inside the fixed three-texture bind layout.
+        let texture_limit = limits
+            .max_sampled_textures_per_shader_stage
+            .min(MAX_SAMPLED_TEXTURES_PER_PASS);
+        if RESIDUAL_RECOMBINATION_SAMPLED_TEXTURES > texture_limit {
+            return Err(ResidualResourceError::SampledTextures {
+                requested: RESIDUAL_RECOMBINATION_SAMPLED_TEXTURES,
+                limit: texture_limit,
+            });
+        }
+
+        // The stride is frozen, so a device whose dynamic-offset alignment does
+        // not divide it cannot host the arena at all.
+        let alignment = limits.min_uniform_buffer_offset_alignment;
+        if alignment == 0 || !RESIDUAL_UNIFORM_STRIDE_BYTES.is_multiple_of(u64::from(alignment)) {
+            return Err(ResidualResourceError::UniformStride {
+                stride: RESIDUAL_UNIFORM_STRIDE_BYTES,
+                alignment,
+            });
+        }
+
+        for request in requests {
+            let dimensions = request.output_dimensions;
+            if dimensions[0] == 0 || dimensions[1] == 0 {
+                return Err(ResidualResourceError::InvalidDimensions(dimensions));
+            }
+            if dimensions[0] > limits.max_texture_dimension_2d
+                || dimensions[1] > limits.max_texture_dimension_2d
+            {
+                return Err(ResidualResourceError::DeviceTextureDimension {
+                    dimensions,
+                    limit: limits.max_texture_dimension_2d,
+                });
+            }
+            let grid = ResidualGrid::for_output(dimensions, request.block)?;
+            let node_cells = grid
+                .cell_count
+                .checked_mul(u64::from(RESIDUAL_MEAN_SURFACES_PER_NODE))
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            let node_bytes = node_cells
+                .checked_mul(RESIDUAL_MEAN_BYTES_PER_CELL)
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            if node_bytes > RESIDUAL_NODE_MAX_BYTES {
+                return Err(ResidualResourceError::NodeBytes {
+                    bytes: node_bytes,
+                    limit: RESIDUAL_NODE_MAX_BYTES,
+                });
+            }
+            plan.active_nodes = plan
+                .active_nodes
+                .checked_add(1)
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            if plan.active_nodes > RESIDUAL_MAX_ACTIVE_NODES {
+                return Err(ResidualResourceError::TooManyActiveNodes {
+                    count: plan.active_nodes,
+                    limit: RESIDUAL_MAX_ACTIVE_NODES,
+                });
+            }
+            plan.mean_surfaces = plan
+                .mean_surfaces
+                .checked_add(RESIDUAL_MEAN_SURFACES_PER_NODE)
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            plan.mean_cells = plan
+                .mean_cells
+                .checked_add(node_cells)
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            plan.mean_sample_operations = node_cells
+                .checked_mul(RESIDUAL_MEAN_TAPS_PER_CELL)
+                .and_then(|operations| plan.mean_sample_operations.checked_add(operations))
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            plan.mean_surface_bytes = plan
+                .mean_surface_bytes
+                .checked_add(node_bytes)
+                .ok_or(ResidualResourceError::ArithmeticOverflow)?;
+            plan.max_grid_dimensions[0] = plan.max_grid_dimensions[0].max(grid.width);
+            plan.max_grid_dimensions[1] = plan.max_grid_dimensions[1].max(grid.height);
+        }
+
+        plan.total_bytes = plan.mean_surface_bytes;
+        let byte_limit = limits.max_residual_bytes.min(RESIDUAL_AGGREGATE_MAX_BYTES);
+        if plan.total_bytes > byte_limit {
+            return Err(ResidualResourceError::AggregateBytes {
+                bytes: plan.total_bytes,
+                limit: byte_limit,
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Fail closed when the physical working set disagrees with the declared
+    /// plan. The exact rows of the resource table — eight bytes per cell, two
+    /// surfaces per node, the frozen uniform stride — are equalities here.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "block-mean reconciliation is consumed by the prepared executor"
+        )
+    )]
+    pub fn reconcile(
+        self,
+        actual: ResidualAllocationSnapshot,
+    ) -> Result<(), ResidualResourceError> {
+        if actual.bytes_per_cell != RESIDUAL_MEAN_BYTES_PER_CELL {
+            return Err(ResidualResourceError::AllocatedCellBytes {
+                allocated: actual.bytes_per_cell,
+                expected: RESIDUAL_MEAN_BYTES_PER_CELL,
+            });
+        }
+        if actual.surfaces_per_node != RESIDUAL_MEAN_SURFACES_PER_NODE {
+            return Err(ResidualResourceError::AllocatedSurfacesPerNode {
+                allocated: actual.surfaces_per_node,
+                expected: RESIDUAL_MEAN_SURFACES_PER_NODE,
+            });
+        }
+        if actual.uniform_stride_bytes != self.uniform_stride_bytes {
+            return Err(ResidualResourceError::AllocatedUniformStride {
+                allocated: actual.uniform_stride_bytes,
+                expected: self.uniform_stride_bytes,
+            });
+        }
+        if actual.mean_surfaces != self.mean_surfaces {
+            return Err(ResidualResourceError::AllocatedSurfacesPerNode {
+                allocated: actual.mean_surfaces,
+                expected: self.mean_surfaces,
+            });
+        }
+        if actual.total_bytes != self.total_bytes {
+            return Err(ResidualResourceError::AllocatedBytes {
+                allocated: actual.total_bytes,
+                planned: self.total_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RectangleMask {
@@ -893,6 +1565,7 @@ pub enum VisualNodeKind {
     Grain(GrainParams),
     Mask(MaskParams),
     Displace(DisplaceParams),
+    Residual(ResidualParams),
 }
 
 impl VisualNodeKind {
@@ -908,6 +1581,7 @@ impl VisualNodeKind {
             Self::Grain(_) => NodeKindTag::Grain,
             Self::Mask(_) => NodeKindTag::Mask,
             Self::Displace(_) => NodeKindTag::Displace,
+            Self::Residual(_) => NodeKindTag::Residual,
         }
     }
 
@@ -921,6 +1595,7 @@ impl VisualNodeKind {
             Self::Grain(value) => Self::Grain(value.sanitized()),
             Self::Mask(value) => Self::Mask(value.sanitized()),
             Self::Displace(value) => Self::Displace(value.sanitized()),
+            Self::Residual(value) => Self::Residual(value.sanitized()),
             marker => marker,
         }
     }
@@ -1013,6 +1688,7 @@ pub enum NodeKindTag {
     Grain,
     Mask,
     Displace,
+    Residual,
 }
 
 impl NodeKindTag {
@@ -1031,6 +1707,7 @@ impl NodeKindTag {
             Self::Grain => 8,
             Self::Mask => 9,
             Self::Displace => 10,
+            Self::Residual => 11,
         }
     }
 }
@@ -1046,6 +1723,15 @@ pub struct NodeResourceBudget {
     pub texture_samples_per_pixel: u8,
     pub sampled_textures_in_pass: u8,
     pub cross_input_taps: u8,
+    /// Passes that run over a reduced block grid instead of the full output.
+    /// They are charged separately from `full_frame_passes` because their cost
+    /// scales with the grid, not with the frame.
+    pub reduced_resolution_passes: u8,
+    /// Sub-full-frame surfaces the node owns for the lifetime of its plan.
+    /// Full-output-resolution layers are charged as RGBA16/Compat8 layers by
+    /// the creative resource plan; this field counts only reduced grids, whose
+    /// bytes are accounted byte-exactly rather than per output pixel.
+    pub reduced_resolution_surfaces: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1056,7 +1742,7 @@ pub struct NodeKindDescriptor {
     pub budget: NodeResourceBudget,
 }
 
-pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
+pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 11] = [
     NodeKindDescriptor {
         tag: NodeKindTag::LegacyCanonical,
         key: "legacy_canonical",
@@ -1070,6 +1756,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: 12,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1086,6 +1774,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: 9,
             sampled_textures_in_pass: 3,
             cross_input_taps: 1,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1099,6 +1789,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 2,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1113,6 +1805,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 4,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1125,6 +1819,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1138,6 +1834,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 2,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1151,6 +1849,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 2,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1163,6 +1863,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS,
             sampled_textures_in_pass: 1,
             cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1177,6 +1879,8 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS + 1,
             sampled_textures_in_pass: 2,
             cross_input_taps: 1,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
         },
     },
     NodeKindDescriptor {
@@ -1192,6 +1896,31 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 3,
             sampled_textures_in_pass: 2,
             cross_input_taps: 1,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::Residual,
+        key: "residual",
+        title: "Residual Counterpoint",
+        budget: NodeResourceBudget {
+            full_frame_passes: 1,
+            // The recombination pass reads the dry carrier, the structure
+            // route's block mean, and the detail route's block mean. Each is a
+            // four-load premultiplied bilinear, so three logical lookups cost
+            // twelve explicit shader texture operations.
+            logical_texture_lookups_per_pixel: 3,
+            texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 3,
+            // Carrier plus both block-mean surfaces. Both authored routes are
+            // read through their means, never at full resolution, so the pass
+            // stays inside the fixed three-texture rack bind layout.
+            sampled_textures_in_pass: 3,
+            cross_input_taps: 2,
+            // One reduction pass per route, each writing its own block-mean
+            // grid. Neither is a full-output-resolution surface.
+            reduced_resolution_passes: 2,
+            reduced_resolution_surfaces: 2,
         },
     },
 ];
@@ -1576,6 +2305,59 @@ pub const NODE_PARAM_DESCRIPTORS: &[NodeParamDescriptor] = &[
         dice_eligible: false,
         modulatable: false,
     },
+    // Residual exposes exactly two continuous values, under wire keys that are
+    // unique across every kind so a modulation route authored for another node
+    // can never cross-resolve onto this one. Both routes, both discrete laws,
+    // and the quantization seed are stable authored topology: enumerable, but
+    // never modulatable and never diced. `algorithm_version` is deliberately
+    // absent — it is a persisted schema stamp, not an authored field.
+    NodeParamDescriptor {
+        kind: NodeKindTag::Residual,
+        key: "structure_tap",
+        value_type: NodeParamType::ImageTap,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Residual,
+        key: "detail_tap",
+        value_type: NodeParamType::ImageTap,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    float_param!(Residual, "mix", 0.0, 1.0, 0.0),
+    float_param!(Residual, "detail_gain", 0.0, 4.0, 1.0),
+    NodeParamDescriptor {
+        kind: NodeKindTag::Residual,
+        key: "block",
+        value_type: NodeParamType::Enum,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Residual,
+        key: "quantization",
+        value_type: NodeParamType::Enum,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::Residual,
+        key: "seed",
+        value_type: NodeParamType::Unsigned,
+        range: None,
+        default: Some(0.0),
+        dice_eligible: false,
+        modulatable: false,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1700,6 +2482,13 @@ pub struct RackResourceBudget {
     pub texture_samples_per_pixel: u32,
     pub max_sampled_textures_in_pass: u32,
     pub cross_input_taps: u32,
+    /// Summed reduced-grid passes. These are additional to
+    /// `full_frame_passes`; a node that declares one of each encodes both.
+    pub reduced_resolution_passes: u32,
+    /// Summed reduced-grid surfaces the rack's nodes own. Their bytes are
+    /// charged byte-exactly by the owning node's resource plan, not per output
+    /// pixel, so they are counted here rather than as full-frame layers.
+    pub reduced_resolution_surfaces: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1984,6 +2773,14 @@ impl VisualRack {
                 .cross_input_taps
                 .checked_add(u32::from(budget.cross_input_taps))
                 .ok_or(RackError::ResourceOverflow)?;
+            result.reduced_resolution_passes = result
+                .reduced_resolution_passes
+                .checked_add(u32::from(budget.reduced_resolution_passes))
+                .ok_or(RackError::ResourceOverflow)?;
+            result.reduced_resolution_surfaces = result
+                .reduced_resolution_surfaces
+                .checked_add(u32::from(budget.reduced_resolution_surfaces))
+                .ok_or(RackError::ResourceOverflow)?;
         }
         if result.logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK {
             return Err(RackError::RackLogicalLookupBudget {
@@ -2006,20 +2803,36 @@ impl VisualRack {
         Ok(result)
     }
 
+    /// Every group named by every route slot, in node then slot order. The
+    /// walk yields a fixed slot-width array per node so a two-route kind can
+    /// never have its second route silently dropped by a one-value closure.
     pub fn referenced_group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
-        self.nodes.iter().filter_map(|node| match node.kind {
-            VisualNodeKind::Mask(mask) => mask.image_tap()?.referenced_group(),
-            VisualNodeKind::Displace(displace) => displace.referenced_group(),
-            _ => None,
-        })
+        self.nodes
+            .iter()
+            .flat_map(|node| match node.kind {
+                VisualNodeKind::Mask(mask) => [
+                    mask.image_tap().and_then(SavedImageTap::referenced_group),
+                    None,
+                ],
+                VisualNodeKind::Displace(displace) => [displace.referenced_group(), None],
+                VisualNodeKind::Residual(residual) => residual.referenced_groups(),
+                _ => [None, None],
+            })
+            .flatten()
     }
 
     pub fn selected_layer_positions(&self) -> impl Iterator<Item = SavedLayerPosition> + '_ {
-        self.nodes.iter().filter_map(|node| match node.kind {
-            VisualNodeKind::Mask(MaskParams::Image(matte)) => matte.selected_layer_position(),
-            VisualNodeKind::Displace(displace) => displace.selected_layer_position(),
-            _ => None,
-        })
+        self.nodes
+            .iter()
+            .flat_map(|node| match node.kind {
+                VisualNodeKind::Mask(MaskParams::Image(matte)) => {
+                    [matte.selected_layer_position(), None]
+                }
+                VisualNodeKind::Displace(displace) => [displace.selected_layer_position(), None],
+                VisualNodeKind::Residual(residual) => residual.selected_layer_positions(),
+                _ => [None, None],
+            })
+            .flatten()
     }
 
     #[cfg_attr(
@@ -2037,6 +2850,9 @@ impl VisualRack {
                 }
                 VisualNodeKind::Displace(displace) => {
                     displace.mark_group_output_missing(removed);
+                }
+                VisualNodeKind::Residual(residual) => {
+                    residual.mark_group_output_missing(removed);
                 }
                 _ => {}
             }
@@ -2332,6 +3148,160 @@ impl RuntimeDisplaceParams {
     }
 }
 
+/// Route-resolved Residual Counterpoint state. Both saved positions survive
+/// only inside their resolved tap's missing-source provenance; live routing is
+/// by stable ID, per slot and independently.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeResidualParams {
+    pub algorithm_version: u16,
+    pub structure: ResolvedImageTap,
+    pub detail: ResolvedImageTap,
+    pub block: ResidualBlock,
+    pub quantization: ResidualQuantization,
+    pub mix: f32,
+    pub detail_gain: f32,
+    pub seed: u32,
+}
+
+impl Default for RuntimeResidualParams {
+    fn default() -> Self {
+        Self {
+            algorithm_version: RESIDUAL_ALGORITHM_VERSION,
+            structure: ResolvedImageTap {
+                source: ResolvedImageSource::OneBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::OneBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::Eight,
+            quantization: ResidualQuantization::Off,
+            mix: 0.0,
+            detail_gain: 1.0,
+            seed: 0,
+        }
+    }
+}
+
+impl RuntimeResidualParams {
+    pub fn resolve_routes(
+        saved: ResidualParams,
+        layer_at_position: &mut impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+        group_exists: &impl Fn(GroupId) -> bool,
+    ) -> Self {
+        let saved = saved.sanitized();
+        Self {
+            algorithm_version: saved.algorithm_version,
+            structure: saved
+                .structure
+                .to_runtime(&mut *layer_at_position, group_exists),
+            detail: saved.detail.to_runtime(layer_at_position, group_exists),
+            block: saved.block,
+            quantization: saved.quantization,
+            mix: saved.mix,
+            detail_gain: saved.detail_gain,
+            seed: saved.seed,
+        }
+    }
+
+    pub fn capture_routes(
+        self,
+        position_of_layer: &mut impl FnMut(StableLayerId) -> Option<SavedLayerPosition>,
+    ) -> ResidualParams {
+        ResidualParams {
+            algorithm_version: self.algorithm_version,
+            structure: self.structure.to_saved(&mut *position_of_layer),
+            detail: self.detail.to_saved(position_of_layer),
+            block: self.block,
+            quantization: self.quantization,
+            mix: self.mix,
+            detail_gain: self.detail_gain,
+            seed: self.seed,
+        }
+        .sanitized()
+    }
+
+    pub(crate) fn sanitized(self) -> Self {
+        Self {
+            algorithm_version: RESIDUAL_ALGORITHM_VERSION,
+            structure: self.structure,
+            detail: self.detail,
+            block: self.block,
+            quantization: self.quantization,
+            mix: finite_clamp(self.mix, 0.0, 0.0, 1.0),
+            detail_gain: finite_clamp(self.detail_gain, 1.0, 0.0, 4.0),
+            seed: self.seed,
+        }
+    }
+
+    /// Mirror of [`ResidualParams::is_exact_bypass`] for the live model.
+    pub fn is_exact_bypass(self) -> bool {
+        self.sanitized().mix == 0.0
+    }
+
+    /// Slot 0 is `structure` and slot 1 is `detail`; any other index names no
+    /// route and is rejected rather than aliased onto a real slot.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "slot-indexed runtime route access is consumed by the ordered route action"
+        )
+    )]
+    pub const fn route(self, slot: u8) -> Option<ResolvedImageTap> {
+        match slot {
+            RESIDUAL_STRUCTURE_SLOT => Some(self.structure),
+            RESIDUAL_DETAIL_SLOT => Some(self.detail),
+            _ => None,
+        }
+    }
+
+    /// The ordered `SetVisualNodeResidualRoute` action rewrites exactly the
+    /// slot it names through this accessor; an unknown slot names no route.
+    pub fn route_mut(&mut self, slot: u8) -> Option<&mut ResolvedImageTap> {
+        match slot {
+            RESIDUAL_STRUCTURE_SLOT => Some(&mut self.structure),
+            RESIDUAL_DETAIL_SLOT => Some(&mut self.detail),
+            _ => None,
+        }
+    }
+
+    pub const fn routes(self) -> [ResolvedImageTap; RESIDUAL_ROUTE_SLOTS] {
+        [self.structure, self.detail]
+    }
+
+    pub const fn selected_layer_ids(self) -> [Option<StableLayerId>; RESIDUAL_ROUTE_SLOTS] {
+        [
+            match self.structure.source {
+                ResolvedImageSource::SelectedLayer { layer_id, .. } => Some(layer_id),
+                _ => None,
+            },
+            match self.detail.source {
+                ResolvedImageSource::SelectedLayer { layer_id, .. } => Some(layer_id),
+                _ => None,
+            },
+        ]
+    }
+
+    pub const fn referenced_groups(self) -> [Option<GroupId>; RESIDUAL_ROUTE_SLOTS] {
+        [
+            self.structure.referenced_group(),
+            self.detail.referenced_group(),
+        ]
+    }
+
+    pub fn mark_layer_output_missing(&mut self, removed: StableLayerId) {
+        self.structure.mark_layer_missing(removed);
+        self.detail.mark_layer_missing(removed);
+    }
+
+    pub fn mark_group_output_missing(&mut self, removed: GroupId) {
+        self.structure.mark_group_missing(removed);
+        self.detail.mark_group_missing(removed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RuntimeMaskParams {
     Rectangle(RectangleMask),
@@ -2395,6 +3365,7 @@ pub enum RuntimeVisualNodeKind {
     Grain(GrainParams),
     Mask(RuntimeMaskParams),
     Displace(RuntimeDisplaceParams),
+    Residual(RuntimeResidualParams),
 }
 
 impl RuntimeVisualNodeKind {
@@ -2410,6 +3381,7 @@ impl RuntimeVisualNodeKind {
             Self::Grain(_) => NodeKindTag::Grain,
             Self::Mask(_) => NodeKindTag::Mask,
             Self::Displace(_) => NodeKindTag::Displace,
+            Self::Residual(_) => NodeKindTag::Residual,
         }
     }
 
@@ -2435,6 +3407,9 @@ impl RuntimeVisualNodeKind {
             VisualNodeKind::Displace(value) => Self::Displace(
                 RuntimeDisplaceParams::resolve_routes(value, layer_at_position, group_exists),
             ),
+            VisualNodeKind::Residual(value) => Self::Residual(
+                RuntimeResidualParams::resolve_routes(value, layer_at_position, group_exists),
+            ),
         }
     }
 
@@ -2455,6 +3430,9 @@ impl RuntimeVisualNodeKind {
             Self::Displace(value) => {
                 VisualNodeKind::Displace(value.capture_routes(position_of_layer))
             }
+            Self::Residual(value) => {
+                VisualNodeKind::Residual(value.capture_routes(position_of_layer))
+            }
         }
     }
 
@@ -2468,6 +3446,7 @@ impl RuntimeVisualNodeKind {
             Self::Grain(value) => Self::Grain(value.sanitized()),
             Self::Mask(value) => Self::Mask(value.sanitized()),
             Self::Displace(value) => Self::Displace(value.sanitized()),
+            Self::Residual(value) => Self::Residual(value.sanitized()),
             marker => marker,
         }
     }
@@ -2894,6 +3873,14 @@ impl RuntimeVisualRack {
                 .cross_input_taps
                 .checked_add(u32::from(budget.cross_input_taps))
                 .ok_or(RackError::ResourceOverflow)?;
+            result.reduced_resolution_passes = result
+                .reduced_resolution_passes
+                .checked_add(u32::from(budget.reduced_resolution_passes))
+                .ok_or(RackError::ResourceOverflow)?;
+            result.reduced_resolution_surfaces = result
+                .reduced_resolution_surfaces
+                .checked_add(u32::from(budget.reduced_resolution_surfaces))
+                .ok_or(RackError::ResourceOverflow)?;
         }
         if result.logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK {
             return Err(RackError::RackLogicalLookupBudget {
@@ -2919,22 +3906,36 @@ impl RuntimeVisualRack {
         Ok(result)
     }
 
+    /// Every group named by every route slot, in node then slot order, walked
+    /// over a fixed slot-width array so a two-route kind reports both.
     pub fn referenced_group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
-        self.nodes.iter().filter_map(|node| match node.kind {
-            RuntimeVisualNodeKind::Mask(mask) => mask.image_tap()?.referenced_group(),
-            RuntimeVisualNodeKind::Displace(displace) => displace.referenced_group(),
-            _ => None,
-        })
+        self.nodes
+            .iter()
+            .flat_map(|node| match node.kind {
+                RuntimeVisualNodeKind::Mask(mask) => [
+                    mask.image_tap()
+                        .and_then(ResolvedImageTap::referenced_group),
+                    None,
+                ],
+                RuntimeVisualNodeKind::Displace(displace) => [displace.referenced_group(), None],
+                RuntimeVisualNodeKind::Residual(residual) => residual.referenced_groups(),
+                _ => [None, None],
+            })
+            .flatten()
     }
 
     pub fn selected_layer_ids(&self) -> impl Iterator<Item = StableLayerId> + '_ {
-        self.nodes.iter().filter_map(|node| match node.kind {
-            RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
-                matte.selected_layer_id()
-            }
-            RuntimeVisualNodeKind::Displace(displace) => displace.selected_layer_id(),
-            _ => None,
-        })
+        self.nodes
+            .iter()
+            .flat_map(|node| match node.kind {
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
+                    [matte.selected_layer_id(), None]
+                }
+                RuntimeVisualNodeKind::Displace(displace) => [displace.selected_layer_id(), None],
+                RuntimeVisualNodeKind::Residual(residual) => residual.selected_layer_ids(),
+                _ => [None, None],
+            })
+            .flatten()
     }
 
     pub fn mark_layer_output_missing(&mut self, removed: StableLayerId) {
@@ -2945,6 +3946,9 @@ impl RuntimeVisualRack {
                 }
                 RuntimeVisualNodeKind::Displace(displace) => {
                     displace.mark_layer_output_missing(removed);
+                }
+                RuntimeVisualNodeKind::Residual(residual) => {
+                    residual.mark_layer_output_missing(removed);
                 }
                 _ => {}
             }
@@ -2959,6 +3963,9 @@ impl RuntimeVisualRack {
                 }
                 RuntimeVisualNodeKind::Displace(displace) => {
                     displace.mark_group_output_missing(removed);
+                }
+                RuntimeVisualNodeKind::Residual(residual) => {
+                    residual.mark_group_output_missing(removed);
                 }
                 _ => {}
             }
@@ -3308,6 +4315,10 @@ pub struct CreativeResourceLimits {
     pub max_texture_dimension_2d: u32,
     pub max_texture_array_layers: u32,
     pub max_sampled_textures_per_shader_stage: u32,
+    /// Dynamic-offset granularity of the device's uniform arena. Reduced
+    /// creative passes freeze their stride, so this is a real admission fact
+    /// rather than a formatting detail.
+    pub min_uniform_buffer_offset_alignment: u32,
     pub max_creative_bytes: u64,
 }
 
@@ -3317,7 +4328,19 @@ impl Default for CreativeResourceLimits {
             max_texture_dimension_2d: 8_192,
             max_texture_array_layers: 256,
             max_sampled_textures_per_shader_stage: MAX_SAMPLED_TEXTURES_PER_PASS,
+            min_uniform_buffer_offset_alignment: 256,
             max_creative_bytes: MAX_CREATIVE_GPU_BYTES,
+        }
+    }
+}
+
+impl From<CreativeResourceLimits> for ResidualResourceLimits {
+    fn from(limits: CreativeResourceLimits) -> Self {
+        Self {
+            max_texture_dimension_2d: limits.max_texture_dimension_2d,
+            min_uniform_buffer_offset_alignment: limits.min_uniform_buffer_offset_alignment,
+            max_sampled_textures_per_shader_stage: limits.max_sampled_textures_per_shader_stage,
+            max_residual_bytes: RESIDUAL_AGGREGATE_MAX_BYTES,
         }
     }
 }
@@ -3773,13 +4796,28 @@ mod tests {
             .collect();
         assert_eq!(tags.len(), NODE_KIND_DESCRIPTORS.len());
         assert_eq!(keys.len(), NODE_KIND_DESCRIPTORS.len());
-        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 10);
+        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 11);
         for descriptor in NODE_KIND_DESCRIPTORS {
             assert!(descriptor.budget.full_frame_passes > 0);
             assert!(descriptor.budget.logical_texture_lookups_per_pixel > 0);
             assert!(descriptor.budget.texture_samples_per_pixel > 0);
             assert!(descriptor.budget.sampled_textures_in_pass > 0);
             assert_eq!(node_kind_descriptor(descriptor.tag), &descriptor);
+            // Reduced-resolution work is an opt-in charge: every historical
+            // kind declares zero of both, so the new fields cannot inflate an
+            // existing plan.
+            if descriptor.tag != NodeKindTag::Residual {
+                assert_eq!(
+                    descriptor.budget.reduced_resolution_passes, 0,
+                    "{:?} must not declare reduced-resolution passes",
+                    descriptor.tag
+                );
+                assert_eq!(
+                    descriptor.budget.reduced_resolution_surfaces, 0,
+                    "{:?} must not declare reduced-resolution surfaces",
+                    descriptor.tag
+                );
+            }
         }
         assert!(NODE_PARAM_DESCRIPTORS
             .iter()
@@ -3818,6 +4856,7 @@ mod tests {
             (NodeKindTag::Shift, 8),
             (NodeKindTag::Grain, 4),
             (NodeKindTag::Mask, 5),
+            (NodeKindTag::Residual, 12),
         ];
         for (kind, expected) in advanced_texture_ops {
             assert_eq!(
@@ -3947,6 +4986,21 @@ mod tests {
                     "image_amount",
                     "image_threshold",
                     "image_softness",
+                ],
+            ),
+            (
+                // `algorithm_version` is deliberately absent: it is a persisted
+                // schema stamp that sanitization always normalizes, not an
+                // authored field any consumer may edit.
+                NodeKindTag::Residual,
+                &[
+                    "structure_tap",
+                    "detail_tap",
+                    "mix",
+                    "detail_gain",
+                    "block",
+                    "quantization",
+                    "seed",
                 ],
             ),
         ];
@@ -4160,6 +5214,7 @@ mod tests {
                 max_texture_dimension_2d: u32::MAX,
                 max_texture_array_layers: u32::MAX,
                 max_sampled_textures_per_shader_stage: u32::MAX,
+                min_uniform_buffer_offset_alignment: u32::MAX,
                 max_creative_bytes: u64::MAX,
             },
         );
@@ -4618,6 +5673,7 @@ mod tests {
             (NodeKindTag::Grain, 8),
             (NodeKindTag::Mask, 9),
             (NodeKindTag::Displace, 10),
+            (NodeKindTag::Residual, 11),
         ] {
             assert_eq!(tag.signature_code(), code);
         }
@@ -4984,5 +6040,878 @@ mod tests {
         assert!(budget.logical_texture_lookups_per_pixel <= MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK);
         assert!(budget.texture_samples_per_pixel <= MAX_TEXTURE_SAMPLES_PER_RACK);
         assert!(budget.max_sampled_textures_in_pass <= MAX_SAMPLED_TEXTURES_PER_PASS);
+    }
+
+    #[test]
+    fn residual_kind_code_is_eleven_and_append_only() {
+        assert_eq!(NodeKindTag::Residual.signature_code(), 11);
+        // Every historical code keeps its value; Residual only appends.
+        for (tag, code) in [
+            (NodeKindTag::LegacyCanonical, 1_u8),
+            (NodeKindTag::LegacyTemporal, 2),
+            (NodeKindTag::Transform, 3),
+            (NodeKindTag::DigitalColor, 4),
+            (NodeKindTag::Key, 5),
+            (NodeKindTag::Cellular, 6),
+            (NodeKindTag::Shift, 7),
+            (NodeKindTag::Grain, 8),
+            (NodeKindTag::Mask, 9),
+            (NodeKindTag::Displace, 10),
+            (NodeKindTag::Residual, 11),
+        ] {
+            assert_eq!(tag.signature_code(), code);
+        }
+        let codes: BTreeSet<_> = NODE_KIND_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.tag.signature_code())
+            .collect();
+        assert_eq!(codes.len(), NODE_KIND_DESCRIPTORS.len());
+        assert_eq!(node_kind_descriptor(NodeKindTag::Residual).key, "residual");
+
+        // Both discrete vocabularies are closed and their shader codes are
+        // append-only from zero, exactly like DisplaceBoundary.
+        for (block, code, edge) in [
+            (ResidualBlock::Four, 0_u32, 4_u32),
+            (ResidualBlock::Eight, 1, 8),
+            (ResidualBlock::Sixteen, 2, 16),
+            (ResidualBlock::ThirtyTwo, 3, 32),
+            (ResidualBlock::SixtyFour, 4, 64),
+        ] {
+            assert_eq!(block.code(), code);
+            assert_eq!(block.edge(), edge);
+        }
+        for (quantization, code, levels) in [
+            (ResidualQuantization::Off, 0_u32, 0_u32),
+            (ResidualQuantization::Coarse, 1, 8),
+            (ResidualQuantization::Medium, 2, 32),
+            (ResidualQuantization::Fine, 3, 128),
+        ] {
+            assert_eq!(quantization.code(), code);
+            assert_eq!(quantization.levels(), levels);
+        }
+        assert_eq!(
+            ResidualQuantization::default().levels(),
+            0,
+            "the default quantization is exact identity, not a one-level collapse"
+        );
+        assert_eq!(RESIDUAL_ALGORITHM_VERSION, 1);
+        assert_eq!(RESIDUAL_ROUTE_SLOTS, 2);
+        assert_eq!(RESIDUAL_STRUCTURE_SLOT, 0);
+        assert_eq!(RESIDUAL_DETAIL_SLOT, 1);
+
+        // Adding the kind must not disturb the frozen legacy rack signatures.
+        assert_eq!(
+            VisualRack::synthetic_legacy(LegacyRackScope::Layer).topology_signature(),
+            LEGACY_LAYER_RACK_SIGNATURE
+        );
+        assert_eq!(
+            VisualRack::synthetic_legacy(LegacyRackScope::Master).topology_signature(),
+            LEGACY_MASTER_RACK_SIGNATURE
+        );
+    }
+
+    #[test]
+    fn residual_defaults_sanitize_and_declare_exact_bypass() {
+        let default = ResidualParams::default();
+        assert_eq!(default.algorithm_version, RESIDUAL_ALGORITHM_VERSION);
+        assert_eq!(default.structure, SavedImageTap::default());
+        assert_eq!(default.detail, SavedImageTap::default());
+        assert_eq!(default.structure.source, SavedImageSource::OneBelow);
+        assert_eq!(default.detail.source, SavedImageSource::OneBelow);
+        assert_eq!(default.structure.timing, EdgeTiming::CurrentFrame);
+        assert_eq!(default.detail.timing, EdgeTiming::CurrentFrame);
+        assert_eq!(default.block, ResidualBlock::Eight);
+        assert_eq!(default.quantization, ResidualQuantization::Off);
+        assert_eq!(default.mix, 0.0);
+        assert_eq!(default.detail_gain, 1.0);
+        assert_eq!(default.seed, 0);
+        assert!(default.is_exact_bypass());
+
+        // Non-finite mix takes the neutral zero fallback rather than a clamped
+        // extreme, so hostile input collapses to an exact bypass and never to a
+        // full recombination. A non-finite detail gain takes its own neutral
+        // 1.0, not either end of the range.
+        for hostile_mix in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let hostile = ResidualParams {
+                mix: hostile_mix,
+                detail_gain: f32::NAN,
+                ..ResidualParams::default()
+            }
+            .sanitized();
+            assert_eq!(hostile.mix, 0.0);
+            assert_eq!(hostile.detail_gain, 1.0);
+            assert!(hostile.is_exact_bypass());
+        }
+
+        // Finite overshoot clamps into range and stays live.
+        let overshoot = ResidualParams {
+            mix: 12.0,
+            detail_gain: 12.0,
+            seed: 4_242,
+            ..ResidualParams::default()
+        }
+        .sanitized();
+        assert_eq!(overshoot.mix, 1.0);
+        assert_eq!(overshoot.detail_gain, 4.0);
+        assert_eq!(overshoot.seed, 4_242, "the seed is never rescaled");
+        assert!(!overshoot.is_exact_bypass());
+        assert_eq!(
+            ResidualParams {
+                detail_gain: -12.0,
+                ..ResidualParams::default()
+            }
+            .sanitized()
+            .detail_gain,
+            0.0
+        );
+
+        // The version stamp is normalized rather than trusted, so a patch can
+        // never select a decomposition law this build does not implement.
+        assert_eq!(
+            ResidualParams {
+                algorithm_version: 9_999,
+                ..ResidualParams::default()
+            }
+            .sanitized()
+            .algorithm_version,
+            RESIDUAL_ALGORITHM_VERSION
+        );
+
+        // The runtime twin follows the identical law.
+        let runtime = RuntimeResidualParams::default();
+        assert!(runtime.is_exact_bypass());
+        assert_eq!(runtime.structure.source, ResolvedImageSource::OneBelow);
+        assert_eq!(runtime.detail.source, ResolvedImageSource::OneBelow);
+        assert_eq!(runtime.block, ResidualBlock::Eight);
+        assert_eq!(runtime.quantization, ResidualQuantization::Off);
+        assert_eq!(runtime.detail_gain, 1.0);
+        let hostile_runtime = RuntimeResidualParams {
+            mix: f32::NEG_INFINITY,
+            detail_gain: 9.0,
+            ..RuntimeResidualParams::default()
+        }
+        .sanitized();
+        assert_eq!(hostile_runtime.mix, 0.0);
+        assert_eq!(hostile_runtime.detail_gain, 4.0);
+        assert!(hostile_runtime.is_exact_bypass());
+    }
+
+    #[test]
+    fn residual_serde_round_trips_and_defaults_every_absent_field() {
+        let authored = ResidualParams {
+            algorithm_version: RESIDUAL_ALGORITHM_VERSION,
+            structure: SavedImageTap {
+                source: SavedImageSource::SelectedLayer {
+                    layer_position: saved_position(4),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                timing: EdgeTiming::PreviousFrame,
+            },
+            detail: SavedImageTap {
+                source: SavedImageSource::CleanProgram,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::ThirtyTwo,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.75,
+            detail_gain: 2.5,
+            seed: 9,
+        };
+        let json = serde_json::to_string(&authored).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ResidualParams>(&json).unwrap(),
+            authored
+        );
+
+        // An empty object is the exact default: absent fields never fabricate a
+        // mix, a gain, a block, a quantization law, or a route.
+        assert_eq!(
+            serde_json::from_str::<ResidualParams>("{}").unwrap(),
+            ResidualParams::default()
+        );
+
+        // The node round trips through the bounded rack deserializer.
+        let node = r#"{"nodes":[{"stable_id":3,"kind":{"kind":"residual","params":{"mix":0.5,"block":"sixty_four"}}}],"next_node_id":4}"#;
+        let rack: VisualRack = serde_json::from_str(node).unwrap();
+        let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
+            panic!("residual node must survive deserialization");
+        };
+        assert_eq!(params.mix, 0.5);
+        assert_eq!(params.detail_gain, 1.0);
+        assert_eq!(params.block, ResidualBlock::SixtyFour);
+        assert_eq!(params.quantization, ResidualQuantization::Off);
+        assert_eq!(params.structure, SavedImageTap::default());
+        assert_eq!(params.detail, SavedImageTap::default());
+
+        // Hostile out-of-range values sanitize during deserialization.
+        let hostile = r#"{"nodes":[{"stable_id":3,"kind":{"kind":"residual","params":{"mix":50,"detail_gain":-50,"algorithm_version":600}}}],"next_node_id":4}"#;
+        let rack: VisualRack = serde_json::from_str(hostile).unwrap();
+        let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!((params.mix, params.detail_gain), (1.0, 0.0));
+        assert_eq!(params.algorithm_version, RESIDUAL_ALGORITHM_VERSION);
+
+        // Both vocabularies are closed: an unknown token is a rejection, not a
+        // silent default.
+        assert!(serde_json::from_str::<ResidualParams>(r#"{"block":"three"}"#).is_err());
+        assert!(serde_json::from_str::<ResidualParams>(r#"{"quantization":"lossy"}"#).is_err());
+    }
+
+    #[test]
+    fn residual_routes_are_visible_to_every_saved_and_runtime_accessor() {
+        let structure_group = GroupId::new(21).unwrap();
+        let detail_group = GroupId::new(22).unwrap();
+        let mut saved = VisualRack::empty();
+        let layer_node = saved
+            .push(VisualNodeKind::Residual(ResidualParams {
+                structure: SavedImageTap {
+                    source: SavedImageSource::SelectedLayer {
+                        layer_position: saved_position(6),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                detail: SavedImageTap {
+                    source: SavedImageSource::SelectedLayer {
+                        layer_position: saved_position(9),
+                        stage: LayerImageStage::PreLocalEffects,
+                    },
+                    timing: EdgeTiming::PreviousFrame,
+                },
+                mix: 0.5,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+        let group_node = saved
+            .push(VisualNodeKind::Residual(ResidualParams {
+                structure: SavedImageTap {
+                    source: SavedImageSource::GroupOutput {
+                        group_id: structure_group,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                detail: SavedImageTap {
+                    source: SavedImageSource::GroupOutput {
+                        group_id: detail_group,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                mix: 0.25,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+
+        // Both slots reach the tombstone machinery, in slot order. A one-value
+        // walker would report only the structure route.
+        assert_eq!(
+            saved.selected_layer_positions().collect::<Vec<_>>(),
+            vec![saved_position(6), saved_position(9)]
+        );
+        assert_eq!(
+            saved.referenced_group_ids().collect::<Vec<_>>(),
+            vec![structure_group, detail_group]
+        );
+
+        // Slot indices are the route identity; an unknown index names no route
+        // at all rather than aliasing a real one.
+        let VisualNodeKind::Residual(mut params) = saved.get(layer_node).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(
+            params.route(RESIDUAL_STRUCTURE_SLOT),
+            Some(params.structure)
+        );
+        assert_eq!(params.route(RESIDUAL_DETAIL_SLOT), Some(params.detail));
+        assert_eq!(params.route(2), None);
+        assert_eq!(params.route(u8::MAX), None);
+        assert_eq!(params.routes(), [params.structure, params.detail]);
+        assert!(params.route_mut(2).is_none());
+        params.route_mut(RESIDUAL_DETAIL_SLOT).unwrap().source = SavedImageSource::CleanProgram;
+        assert_eq!(params.detail.source, SavedImageSource::CleanProgram);
+        assert_eq!(
+            params.structure.source,
+            SavedImageSource::SelectedLayer {
+                layer_position: saved_position(6),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            "editing one slot never touches the other"
+        );
+
+        // Deleting one group tombstones only that slot, and the tombstone never
+        // rebinds to a replacement at the same identity.
+        saved.mark_group_output_missing(detail_group);
+        let VisualNodeKind::Residual(params) = saved.get(group_node).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(
+            params.structure.source,
+            SavedImageSource::GroupOutput {
+                group_id: structure_group
+            }
+        );
+        assert_eq!(
+            params.detail.source,
+            SavedImageSource::MissingGroupOutput {
+                group_id: detail_group
+            }
+        );
+        assert_eq!(
+            saved.referenced_group_ids().collect::<Vec<_>>(),
+            vec![structure_group, detail_group],
+            "a tombstone still names its saved identity"
+        );
+
+        // Resolution binds each live donor independently; a vacated position
+        // never retargets the other slot.
+        let structure_live = live_id(77);
+        let detail_live = live_id(78);
+        let mut runtime = saved.resolve_routes(
+            |position| {
+                if position == saved_position(6) {
+                    Some(structure_live)
+                } else if position == saved_position(9) {
+                    Some(detail_live)
+                } else {
+                    None
+                }
+            },
+            |group| group == structure_group,
+        );
+        assert_eq!(
+            runtime.selected_layer_ids().collect::<Vec<_>>(),
+            vec![structure_live, detail_live]
+        );
+        assert_eq!(
+            runtime.referenced_group_ids().collect::<Vec<_>>(),
+            vec![structure_group, detail_group]
+        );
+        let RuntimeVisualNodeKind::Residual(mut live) = runtime.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(live.route(RESIDUAL_STRUCTURE_SLOT), Some(live.structure));
+        assert_eq!(live.route(RESIDUAL_DETAIL_SLOT), Some(live.detail));
+        assert_eq!(live.route(9), None);
+        assert_eq!(live.routes(), [live.structure, live.detail]);
+        assert!(live.route_mut(9).is_none());
+        assert_eq!(
+            live.detail.timing,
+            EdgeTiming::PreviousFrame,
+            "each slot keeps its own edge timing"
+        );
+
+        // Removing one live donor tombstones only its slot.
+        runtime.mark_layer_output_missing(structure_live);
+        assert_eq!(
+            runtime.selected_layer_ids().collect::<Vec<_>>(),
+            vec![detail_live]
+        );
+        let RuntimeVisualNodeKind::Residual(params) = runtime.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(
+            params.structure.source,
+            ResolvedImageSource::MissingSelectedLayer {
+                saved_position: saved_position(6),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert!(matches!(
+            params.detail.source,
+            ResolvedImageSource::SelectedLayer {
+                layer_id,
+                ..
+            } if layer_id == detail_live
+        ));
+
+        // Capture preserves the missing identity rather than inventing a donor,
+        // and never writes a live id back into the patch.
+        let recaptured = runtime
+            .capture_routes(|id| (id == detail_live).then_some(saved_position(9)))
+            .unwrap();
+        let VisualNodeKind::Residual(params) = recaptured.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(
+            params.structure.source,
+            SavedImageSource::MissingSelectedLayer {
+                saved_position: saved_position(6),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(
+            params.detail.source,
+            SavedImageSource::SelectedLayer {
+                layer_position: saved_position(9),
+                stage: LayerImageStage::PreLocalEffects,
+            }
+        );
+        assert_eq!(params.mix, 0.5, "route capture preserves the values");
+        assert_eq!(params.detail.timing, EdgeTiming::PreviousFrame);
+    }
+
+    #[test]
+    fn residual_exposes_only_two_modulatable_dice_eligible_parameters() {
+        let descriptors: Vec<_> = NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == NodeKindTag::Residual)
+            .collect();
+        assert_eq!(descriptors.len(), 7);
+
+        let continuous: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.modulatable)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(continuous, vec!["mix", "detail_gain"]);
+        let diceable: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.dice_eligible)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(diceable, vec!["mix", "detail_gain"]);
+
+        // Both modulatable keys are unique across the whole registry, so a
+        // route authored for another kind can never cross-resolve onto this
+        // one through first-modulatable-row key resolution.
+        for key in ["mix", "detail_gain"] {
+            assert_eq!(
+                NODE_PARAM_DESCRIPTORS
+                    .iter()
+                    .filter(|descriptor| descriptor.key == key)
+                    .count(),
+                1,
+                "{key} must remain a unique modulation wire key"
+            );
+        }
+
+        for descriptor in &descriptors {
+            match descriptor.key {
+                "mix" => {
+                    assert_eq!(descriptor.range, Some([0.0, 1.0]));
+                    assert_eq!(descriptor.default, Some(0.0));
+                    assert_eq!(descriptor.value_type, NodeParamType::Float);
+                }
+                "detail_gain" => {
+                    assert_eq!(descriptor.range, Some([0.0, 4.0]));
+                    assert_eq!(descriptor.default, Some(1.0));
+                    assert_eq!(descriptor.value_type, NodeParamType::Float);
+                }
+                // Routes, discrete laws, and the quantization seed are stable
+                // authored topology: enumerable but never modulatable, never
+                // diced, and never ranged.
+                "structure_tap" | "detail_tap" => {
+                    assert_eq!(descriptor.value_type, NodeParamType::ImageTap);
+                    assert!(descriptor.range.is_none());
+                }
+                "block" | "quantization" => {
+                    assert_eq!(descriptor.value_type, NodeParamType::Enum);
+                    assert!(descriptor.range.is_none());
+                }
+                "seed" => {
+                    assert_eq!(descriptor.value_type, NodeParamType::Unsigned);
+                    assert!(descriptor.range.is_none());
+                }
+                other => panic!("unexpected residual parameter {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn residual_nodes_stay_inside_the_rack_lookup_and_pass_ceilings() {
+        // The per-node ledger delta is exact, not a bound.
+        let ledger = node_kind_descriptor(NodeKindTag::Residual).budget;
+        assert_eq!(ledger.full_frame_passes, 1);
+        assert_eq!(ledger.logical_texture_lookups_per_pixel, 3);
+        assert_eq!(ledger.texture_samples_per_pixel, 12);
+        assert_eq!(ledger.sampled_textures_in_pass, 3);
+        assert_eq!(ledger.cross_input_taps, 2);
+        assert_eq!(ledger.reduced_resolution_passes, 2);
+        assert_eq!(ledger.reduced_resolution_surfaces, 2);
+
+        let mut rack = VisualRack::empty();
+        for _ in 0..MAX_NODES_PER_RACK {
+            rack.push(VisualNodeKind::Residual(ResidualParams {
+                mix: 0.5,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+        }
+        let budget = rack.resource_budget().unwrap();
+        assert_eq!(budget.full_frame_passes, MAX_NODES_PER_RACK as u32);
+        assert_eq!(
+            budget.logical_texture_lookups_per_pixel,
+            3 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(
+            budget.texture_samples_per_pixel,
+            12 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(budget.max_sampled_textures_in_pass, 3);
+        assert_eq!(budget.cross_input_taps, 2 * MAX_NODES_PER_RACK as u32);
+        assert_eq!(
+            budget.reduced_resolution_passes,
+            2 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(
+            budget.reduced_resolution_surfaces,
+            2 * MAX_NODES_PER_RACK as u32
+        );
+        assert!(budget.logical_texture_lookups_per_pixel <= MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK);
+        assert!(budget.texture_samples_per_pixel <= MAX_TEXTURE_SAMPLES_PER_RACK);
+        assert!(budget.max_sampled_textures_in_pass <= MAX_SAMPLED_TEXTURES_PER_PASS);
+        assert!(budget.cross_input_taps as usize <= MAX_CURRENT_IMAGE_TAPS);
+
+        // A full rack of Residual nodes still fits the fixed three-texture rack
+        // bind layout exactly; it must never be admitted by raising the cap.
+        assert_eq!(MAX_SAMPLED_TEXTURES_PER_PASS, 3);
+
+        // The runtime twin declares the identical ledger.
+        let runtime = rack.resolve_routes(|_| None, |_| false);
+        assert_eq!(runtime.resource_budget().unwrap(), budget);
+    }
+
+    #[test]
+    fn residual_block_mean_grids_derive_from_the_block_vocabulary_and_reject_over_budget_edges() {
+        // The grid is ceil(output / block edge) on each axis, so the closed
+        // vocabulary alone fixes the reduction factor.
+        for (block, expected) in [
+            (ResidualBlock::Four, [480_u32, 270_u32]),
+            (ResidualBlock::Eight, [240, 135]),
+            (ResidualBlock::Sixteen, [120, 68]),
+            (ResidualBlock::ThirtyTwo, [60, 34]),
+            (ResidualBlock::SixtyFour, [30, 17]),
+        ] {
+            let grid = ResidualGrid::for_output([1920, 1080], block).unwrap();
+            assert_eq!([grid.width, grid.height], expected, "{block:?}");
+            assert_eq!(grid.block_pixels, block.edge());
+            assert_eq!(
+                grid.cell_count,
+                u64::from(expected[0]) * u64::from(expected[1])
+            );
+        }
+
+        // Zero is not a grid.
+        assert_eq!(
+            ResidualGrid::for_output([0, 8], ResidualBlock::Four),
+            Err(ResidualResourceError::InvalidDimensions([0, 8]))
+        );
+
+        // The edge bound holds at exactly the limit and rejects one cell over
+        // rather than clamping onto a coarser grid the author never chose.
+        let widest =
+            ResidualGrid::for_output([RESIDUAL_GRID_MAX_EDGE * 4, 4], ResidualBlock::Four).unwrap();
+        assert_eq!(widest.width, RESIDUAL_GRID_MAX_EDGE);
+        assert_eq!(
+            ResidualGrid::for_output([RESIDUAL_GRID_MAX_EDGE * 4 + 1, 4], ResidualBlock::Four),
+            Err(ResidualResourceError::GridEdge {
+                dimensions: [RESIDUAL_GRID_MAX_EDGE + 1, 1],
+                limit: RESIDUAL_GRID_MAX_EDGE,
+            })
+        );
+
+        // The cell bound is independent of the edge bound: 2048 x 1025 is
+        // inside every edge and inside the cell cap, and one further cell row
+        // is over the cell cap while still inside every edge.
+        let inside = ResidualGrid::for_output([8192, 4100], ResidualBlock::Four).unwrap();
+        assert_eq!([inside.width, inside.height], [2048, 1025]);
+        assert_eq!(inside.cell_count, 2_099_200);
+        assert!(inside.cell_count <= RESIDUAL_GRID_MAX_CELLS);
+        assert_eq!(
+            ResidualGrid::for_output([8192, 4104], ResidualBlock::Four),
+            Err(ResidualResourceError::CellCount {
+                count: 2_101_248,
+                limit: RESIDUAL_GRID_MAX_CELLS,
+            })
+        );
+    }
+
+    #[test]
+    fn residual_resource_plan_charges_exact_reduced_bytes_and_binds_before_the_cell_cap() {
+        // Two 240x135 means at eight bytes a cell is the entire charge. No
+        // full-frame layer appears in this ledger at all.
+        let plan = ResidualResourcePlan::preflight(
+            &[ResidualResourceRequest {
+                output_dimensions: [1920, 1080],
+                block: ResidualBlock::Eight,
+            }],
+            ResidualResourceLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.active_nodes, 1);
+        assert_eq!(plan.mean_surfaces, 2);
+        assert_eq!(plan.mean_cells, 240 * 135 * 2);
+        assert_eq!(plan.mean_sample_operations, 240 * 135 * 2 * 4);
+        assert_eq!(plan.mean_surface_bytes, 518_400);
+        assert_eq!(plan.total_bytes, 518_400);
+        assert_eq!(plan.max_grid_dimensions, [240, 135]);
+        assert_eq!(plan.bytes_per_cell, RESIDUAL_MEAN_BYTES_PER_CELL);
+        assert_eq!(plan.surfaces_per_node, RESIDUAL_MEAN_SURFACES_PER_NODE);
+        assert_eq!(
+            plan.sampled_textures_in_recombination,
+            RESIDUAL_RECOMBINATION_SAMPLED_TEXTURES
+        );
+        assert_eq!(plan.uniform_stride_bytes, RESIDUAL_UNIFORM_STRIDE_BYTES);
+
+        // A composition with no live node charges nothing while still
+        // declaring every exact row.
+        let dormant =
+            ResidualResourcePlan::preflight(&[], ResidualResourceLimits::default()).unwrap();
+        assert_eq!(dormant, ResidualResourcePlan::default());
+        assert_eq!(dormant.total_bytes, 0);
+
+        // The per-node byte cap binds before the cell cap. A 2048 x 1024 grid
+        // is 2,097,152 cells — inside the 2,100,000 cell bound — and is
+        // exactly the 32 MiB node bound.
+        let exact = ResidualResourcePlan::preflight(
+            &[ResidualResourceRequest {
+                output_dimensions: [8192, 4096],
+                block: ResidualBlock::Four,
+            }],
+            ResidualResourceLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(exact.mean_cells, 2_097_152 * 2);
+        assert_eq!(exact.total_bytes, RESIDUAL_NODE_MAX_BYTES);
+
+        // One further cell row is still inside the cell bound and is rejected
+        // by the byte bound, so neither bound is derived from the other.
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &[ResidualResourceRequest {
+                    output_dimensions: [8192, 4100],
+                    block: ResidualBlock::Four,
+                }],
+                ResidualResourceLimits::default(),
+            ),
+            Err(ResidualResourceError::NodeBytes {
+                bytes: 33_587_200,
+                limit: RESIDUAL_NODE_MAX_BYTES,
+            })
+        );
+        const { assert!(2_099_200 <= RESIDUAL_GRID_MAX_CELLS) };
+        const { assert!(33_587_200 > RESIDUAL_NODE_MAX_BYTES) };
+
+        // A full-cap grid is 16,800,000 mean sample operations: 2,100,000
+        // cells, four quadrant taps each, across both surfaces. It is a
+        // nominal arithmetic bound, not an admissible node.
+        assert_eq!(
+            RESIDUAL_GRID_MAX_CELLS * RESIDUAL_MEAN_TAPS_PER_CELL * 2,
+            16_800_000
+        );
+        const {
+            assert!(
+                RESIDUAL_GRID_MAX_CELLS * RESIDUAL_MEAN_BYTES_PER_CELL * 2
+                    > RESIDUAL_NODE_MAX_BYTES
+            )
+        };
+    }
+
+    #[test]
+    fn residual_resource_plan_rejects_every_independent_limit_one_unit_over() {
+        let tiny = |count: usize| {
+            vec![
+                ResidualResourceRequest {
+                    output_dimensions: [64, 64],
+                    block: ResidualBlock::SixtyFour,
+                };
+                count
+            ]
+        };
+
+        // Nominal active-node bound.
+        assert!(ResidualResourcePlan::preflight(
+            &tiny(RESIDUAL_MAX_ACTIVE_NODES as usize),
+            ResidualResourceLimits::default(),
+        )
+        .is_ok());
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &tiny(RESIDUAL_MAX_ACTIVE_NODES as usize + 1),
+                ResidualResourceLimits::default(),
+            ),
+            Err(ResidualResourceError::TooManyActiveNodes {
+                count: RESIDUAL_MAX_ACTIVE_NODES + 1,
+                limit: RESIDUAL_MAX_ACTIVE_NODES,
+            })
+        );
+
+        // Aggregate byte bound, with every node comfortably inside its own.
+        let large = ResidualResourceRequest {
+            output_dimensions: [5600, 4000],
+            block: ResidualBlock::Four,
+        };
+        let pair =
+            ResidualResourcePlan::preflight(&[large, large], ResidualResourceLimits::default())
+                .unwrap();
+        assert_eq!(pair.total_bytes, 44_800_000);
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &[large, large, large],
+                ResidualResourceLimits::default(),
+            ),
+            Err(ResidualResourceError::AggregateBytes {
+                bytes: 67_200_000,
+                limit: RESIDUAL_AGGREGATE_MAX_BYTES,
+            })
+        );
+        const { assert!(22_400_000 < RESIDUAL_NODE_MAX_BYTES) };
+
+        // Recombination texture bound, against a device narrower than the pass.
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &tiny(1),
+                ResidualResourceLimits {
+                    max_sampled_textures_per_shader_stage: 2,
+                    ..ResidualResourceLimits::default()
+                },
+            ),
+            Err(ResidualResourceError::SampledTextures {
+                requested: RESIDUAL_RECOMBINATION_SAMPLED_TEXTURES,
+                limit: 2,
+            })
+        );
+
+        // Frozen uniform stride against the device's dynamic-offset alignment.
+        for alignment in [0_u32, 96, 512, RESIDUAL_UNIFORM_STRIDE_BYTES as u32 + 1] {
+            assert_eq!(
+                ResidualResourcePlan::preflight(
+                    &tiny(1),
+                    ResidualResourceLimits {
+                        min_uniform_buffer_offset_alignment: alignment,
+                        ..ResidualResourceLimits::default()
+                    },
+                ),
+                Err(ResidualResourceError::UniformStride {
+                    stride: RESIDUAL_UNIFORM_STRIDE_BYTES,
+                    alignment,
+                })
+            );
+        }
+        for alignment in [1_u32, 64, 128, 256] {
+            assert!(ResidualResourcePlan::preflight(
+                &tiny(1),
+                ResidualResourceLimits {
+                    min_uniform_buffer_offset_alignment: alignment,
+                    ..ResidualResourceLimits::default()
+                },
+            )
+            .is_ok());
+        }
+
+        // Device texture bound on the carrier the grid is reduced from.
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &[ResidualResourceRequest {
+                    output_dimensions: [8_193, 8],
+                    block: ResidualBlock::Four,
+                }],
+                ResidualResourceLimits::default(),
+            ),
+            Err(ResidualResourceError::DeviceTextureDimension {
+                dimensions: [8_193, 8],
+                limit: 8_192,
+            })
+        );
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &[ResidualResourceRequest {
+                    output_dimensions: [0, 8],
+                    block: ResidualBlock::Four,
+                }],
+                ResidualResourceLimits::default(),
+            ),
+            Err(ResidualResourceError::InvalidDimensions([0, 8]))
+        );
+
+        // The grid edge bound survives a device wide enough to reach it.
+        assert_eq!(
+            ResidualResourcePlan::preflight(
+                &[ResidualResourceRequest {
+                    output_dimensions: [RESIDUAL_GRID_MAX_EDGE * 4 + 4, 4],
+                    block: ResidualBlock::Four,
+                }],
+                ResidualResourceLimits {
+                    max_texture_dimension_2d: 16_384,
+                    ..ResidualResourceLimits::default()
+                },
+            ),
+            Err(ResidualResourceError::GridEdge {
+                dimensions: [RESIDUAL_GRID_MAX_EDGE + 1, 1],
+                limit: RESIDUAL_GRID_MAX_EDGE,
+            })
+        );
+    }
+
+    #[test]
+    fn residual_resource_plan_reconciles_actual_allocations_and_fails_closed() {
+        let plan = ResidualResourcePlan::preflight(
+            &[ResidualResourceRequest {
+                output_dimensions: [1920, 1080],
+                block: ResidualBlock::Eight,
+            }],
+            ResidualResourceLimits::default(),
+        )
+        .unwrap();
+        let honest = ResidualAllocationSnapshot {
+            mean_surfaces: plan.mean_surfaces,
+            bytes_per_cell: RESIDUAL_MEAN_BYTES_PER_CELL,
+            surfaces_per_node: RESIDUAL_MEAN_SURFACES_PER_NODE,
+            uniform_stride_bytes: RESIDUAL_UNIFORM_STRIDE_BYTES,
+            total_bytes: plan.total_bytes,
+        };
+        assert_eq!(plan.reconcile(honest), Ok(()));
+
+        // Every exact row is an equality, so one unit either way fails closed.
+        assert_eq!(
+            plan.reconcile(ResidualAllocationSnapshot {
+                bytes_per_cell: RESIDUAL_MEAN_BYTES_PER_CELL + 1,
+                ..honest
+            }),
+            Err(ResidualResourceError::AllocatedCellBytes {
+                allocated: RESIDUAL_MEAN_BYTES_PER_CELL + 1,
+                expected: RESIDUAL_MEAN_BYTES_PER_CELL,
+            })
+        );
+        assert_eq!(
+            plan.reconcile(ResidualAllocationSnapshot {
+                surfaces_per_node: RESIDUAL_MEAN_SURFACES_PER_NODE + 1,
+                ..honest
+            }),
+            Err(ResidualResourceError::AllocatedSurfacesPerNode {
+                allocated: RESIDUAL_MEAN_SURFACES_PER_NODE + 1,
+                expected: RESIDUAL_MEAN_SURFACES_PER_NODE,
+            })
+        );
+        assert_eq!(
+            plan.reconcile(ResidualAllocationSnapshot {
+                uniform_stride_bytes: RESIDUAL_UNIFORM_STRIDE_BYTES * 2,
+                ..honest
+            }),
+            Err(ResidualResourceError::AllocatedUniformStride {
+                allocated: RESIDUAL_UNIFORM_STRIDE_BYTES * 2,
+                expected: RESIDUAL_UNIFORM_STRIDE_BYTES,
+            })
+        );
+        assert_eq!(
+            plan.reconcile(ResidualAllocationSnapshot {
+                mean_surfaces: plan.mean_surfaces + 1,
+                ..honest
+            }),
+            Err(ResidualResourceError::AllocatedSurfacesPerNode {
+                allocated: plan.mean_surfaces + 1,
+                expected: plan.mean_surfaces,
+            })
+        );
+        assert_eq!(
+            plan.reconcile(ResidualAllocationSnapshot {
+                total_bytes: plan.total_bytes - 1,
+                ..honest
+            }),
+            Err(ResidualResourceError::AllocatedBytes {
+                allocated: plan.total_bytes - 1,
+                planned: plan.total_bytes,
+            })
+        );
     }
 }

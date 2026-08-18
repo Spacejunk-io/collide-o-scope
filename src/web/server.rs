@@ -904,7 +904,8 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
             );
         }
         // These are topology/routing fields and use barrier actions.
-        "variant" | "image_tap" | "image_channel" | "image_invert" | "donor_tap" => {
+        "variant" | "image_tap" | "image_channel" | "image_invert" | "donor_tap"
+        | "structure_tap" | "detail_tap" => {
             return false;
         }
         _ => {}
@@ -950,14 +951,21 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
                 value.as_str(),
                 Some("gaussian" | "perlin" | "salt_pepper" | "blue")
             ),
-            // Displace's boundary law. Omitting it here dropped the panel's
-            // select at ingress even though `set_runtime_node_param` already
-            // accepted the value, so the authored law was unreachable from a
-            // browser. Every discrete node enum must appear in this allowlist.
+            // A discrete law that is declared `NodeParamType::Enum` but absent
+            // from this allowlist is silently dropped at ingress while the
+            // panel control still renders, so every closed vocabulary must
+            // list its exact snake_case tokens here. Displace's boundary was
+            // exactly that defect: `set_runtime_node_param` accepted the value
+            // while `valid_action` had already dropped it.
             "boundary" => matches!(
                 value.as_str(),
                 Some("transparent" | "mirror" | "wrap" | "hold")
             ),
+            "block" => matches!(
+                value.as_str(),
+                Some("four" | "eight" | "sixteen" | "thirty_two" | "sixty_four")
+            ),
+            "quantization" => matches!(value.as_str(), Some("off" | "coarse" | "medium" | "fine")),
             _ => false,
         },
         NodeParamType::ImageTap => false,
@@ -983,6 +991,29 @@ fn valid_creative_route(route: &CreativeImageTapSnapshot) -> bool {
             route.timing == crate::visual_rack::EdgeTiming::PreviousFrame
         }
     }
+}
+
+/// Shared prefilter for an ordered rack-node route action that carries no
+/// channel or invert. A group's rack may not read that same group's output on
+/// the current frame; the identical rejection lives in `SetVisualNodeRoute`.
+fn valid_creative_node_route(
+    scope: &CreativeScopeSnapshot,
+    node_id: &str,
+    route: &CreativeImageTapSnapshot,
+    composition_revision: u64,
+) -> bool {
+    let self_group = match (scope, &route.input) {
+        (
+            CreativeScopeSnapshot::Group { group_id },
+            CreativeImageSourceSnapshot::GroupOutput { group_id: producer },
+        ) => group_id == producer && route.timing == crate::visual_rack::EdgeTiming::CurrentFrame,
+        _ => false,
+    };
+    valid_creative_scope(scope)
+        && valid_required_stable_id(node_id)
+        && !self_group
+        && valid_creative_route(route)
+        && valid_composition_revision(composition_revision)
 }
 
 fn valid_member_ids(ids: &[String]) -> bool {
@@ -1443,6 +1474,26 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 )
                 && valid_composition_revision(*composition_revision)
         }
+        // Both named two-input node routes are ordered topology barriers with
+        // no channel or invert of their own. They still need every prefilter
+        // `SetVisualNodeRoute` applies, including the group's-own-output
+        // current-frame rejection, so a hostile message never reaches the
+        // bounded queue in the first place.
+        WebAction::SetVisualNodeDisplaceRoute {
+            scope,
+            node_id,
+            route,
+            composition_revision,
+        } => valid_creative_node_route(scope, node_id, route, *composition_revision),
+        WebAction::SetVisualNodeResidualRoute {
+            scope,
+            node_id,
+            route,
+            composition_revision,
+            // Every `ResidualRouteSlotSnapshot` token is a real authored slot;
+            // an unknown token is already a deserialization rejection.
+            slot: _,
+        } => valid_creative_node_route(scope, node_id, route, *composition_revision),
         WebAction::SetCompositionGroupMatteRoute {
             group_id,
             route,
@@ -2832,6 +2883,270 @@ mod tests {
                 scope: CreativeScopeSnapshot::Master,
                 node_id: "3".into(),
                 variant: "missing".into(),
+                composition_revision: 7,
+            },
+            0
+        ));
+    }
+
+    /// Every `NodeParamType::Enum` needs an explicit token list in
+    /// `valid_node_param_value`; a missing arm renders the panel control
+    /// normally and then drops the message at the WebSocket gate.
+    #[test]
+    fn residual_ingress_closes_both_discrete_vocabularies_and_barriers_each_route_slot() {
+        use crate::web::state::ResidualRouteSlotSnapshot;
+
+        for token in ["four", "eight", "sixteen", "thirty_two", "sixty_four"] {
+            assert!(
+                valid_node_param_value("residual", "block", &serde_json::json!(token)),
+                "block token {token} must be admitted"
+            );
+        }
+        for token in ["off", "coarse", "medium", "fine"] {
+            assert!(
+                valid_node_param_value("residual", "quantization", &serde_json::json!(token)),
+                "quantization token {token} must be admitted"
+            );
+        }
+        // Neighbouring, cross-vocabulary and mistyped tokens are refused.
+        for (param, token) in [
+            ("block", "off"),
+            ("block", "one_hundred_twenty_eight"),
+            ("block", "thirtytwo"),
+            ("quantization", "eight"),
+            ("quantization", "coarser"),
+        ] {
+            assert!(
+                !valid_node_param_value("residual", param, &serde_json::json!(token)),
+                "{param} must refuse {token}"
+            );
+        }
+        assert!(!valid_node_param_value(
+            "residual",
+            "block",
+            &serde_json::json!(1)
+        ));
+        // The shipped Displace vocabulary is closed the same way.
+        for token in ["transparent", "mirror", "wrap", "hold"] {
+            assert!(valid_node_param_value(
+                "displace",
+                "boundary",
+                &serde_json::json!(token)
+            ));
+        }
+        assert!(!valid_node_param_value(
+            "displace",
+            "boundary",
+            &serde_json::json!("clamp")
+        ));
+
+        // Continuous values are bounded by the descriptor table itself.
+        assert!(valid_node_param_value(
+            "residual",
+            "mix",
+            &serde_json::json!(1.0)
+        ));
+        assert!(!valid_node_param_value(
+            "residual",
+            "mix",
+            &serde_json::json!(1.0001)
+        ));
+        assert!(valid_node_param_value(
+            "residual",
+            "detail_gain",
+            &serde_json::json!(4.0)
+        ));
+        assert!(!valid_node_param_value(
+            "residual",
+            "detail_gain",
+            &serde_json::json!(-0.001)
+        ));
+        assert!(valid_node_param_value(
+            "residual",
+            "seed",
+            &serde_json::json!(u32::MAX)
+        ));
+        assert!(!valid_node_param_value(
+            "residual",
+            "seed",
+            &serde_json::json!(u64::from(u32::MAX) + 1)
+        ));
+        // Both routes belong to the ordered action and are refused on the
+        // coalescible value path before the descriptor lookup ever runs.
+        for param in ["structure_tap", "detail_tap"] {
+            assert!(!valid_node_param_value(
+                "residual",
+                param,
+                &serde_json::json!({"input": {"source": "one_below"}, "timing": "current_frame"})
+            ));
+        }
+
+        let route =
+            |input: CreativeImageSourceSnapshot, timing| CreativeImageTapSnapshot { input, timing };
+        let action = |scope: CreativeScopeSnapshot,
+                      node_id: &str,
+                      slot: ResidualRouteSlotSnapshot,
+                      route: CreativeImageTapSnapshot,
+                      revision: u64| {
+            WebAction::SetVisualNodeResidualRoute {
+                scope,
+                node_id: node_id.into(),
+                slot,
+                route,
+                composition_revision: revision,
+            }
+        };
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            assert!(valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::OneBelow,
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            // A zero or non-decimal node ID, a zero revision, and either
+            // output-only tombstone are all refused before the queue.
+            for hostile in ["0", "", "7a", " 7"] {
+                assert!(!valid_action(
+                    &action(
+                        CreativeScopeSnapshot::Master,
+                        hostile,
+                        slot,
+                        route(
+                            CreativeImageSourceSnapshot::OneBelow,
+                            crate::visual_rack::EdgeTiming::CurrentFrame
+                        ),
+                        7
+                    ),
+                    0
+                ));
+            }
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::OneBelow,
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    0
+                ),
+                0
+            ));
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::MissingSelectedLayer {
+                            saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                            stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                        },
+                        crate::visual_rack::EdgeTiming::PreviousFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::MissingGroupOutput {
+                            group_id: "9".into()
+                        },
+                        crate::visual_rack::EdgeTiming::PreviousFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            // Clean Program is previous-frame only, per slot.
+            assert!(!valid_action(
+                &action(
+                    CreativeScopeSnapshot::Master,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::CleanProgram,
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            // A group's rack may not read its own output on the current frame,
+            // but the identical route at N-1 is an admitted feedback edge.
+            let self_group = CreativeScopeSnapshot::Group {
+                group_id: "9".into(),
+            };
+            assert!(!valid_action(
+                &action(
+                    self_group.clone(),
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::GroupOutput {
+                            group_id: "9".into()
+                        },
+                        crate::visual_rack::EdgeTiming::CurrentFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+            assert!(valid_action(
+                &action(
+                    self_group,
+                    "3",
+                    slot,
+                    route(
+                        CreativeImageSourceSnapshot::GroupOutput {
+                            group_id: "9".into()
+                        },
+                        crate::visual_rack::EdgeTiming::PreviousFrame
+                    ),
+                    7
+                ),
+                0
+            ));
+        }
+
+        // The Displace route action now runs through the same prefilters
+        // instead of falling through the permissive default.
+        assert!(!valid_action(
+            &WebAction::SetVisualNodeDisplaceRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "0".into(),
+                route: route(
+                    CreativeImageSourceSnapshot::OneBelow,
+                    crate::visual_rack::EdgeTiming::CurrentFrame
+                ),
+                composition_revision: 7,
+            },
+            0
+        ));
+        assert!(valid_action(
+            &WebAction::SetVisualNodeDisplaceRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: "3".into(),
+                route: route(
+                    CreativeImageSourceSnapshot::OneBelow,
+                    crate::visual_rack::EdgeTiming::CurrentFrame
+                ),
                 composition_revision: 7,
             },
             0
