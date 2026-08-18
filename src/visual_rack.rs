@@ -1034,7 +1034,7 @@ impl NodeKindTag {
             Self::Grain => 8,
             Self::Mask => 9,
             Self::Displace => 10,
-            Self::Symmetry => 11,
+            Self::Symmetry => 12,
         }
     }
 
@@ -5218,13 +5218,16 @@ mod tests {
         assert!(budget.max_sampled_textures_in_pass <= MAX_SAMPLED_TEXTURES_PER_PASS);
     }
 
-    /// The Symmetry Field takes the next free append-only kind code. Every
+    /// The Symmetry Field takes append-only kind code 12. Code 11 belongs to
+    /// Residual Counterpoint, which was authored in parallel from the same
+    /// published SHA and landed first; a kind code enters every persisted
+    /// topology signature, so the two can never share one. Every
     /// historical code keeps its value and both frozen legacy rack signatures
     /// stay bit-identical, because `topology_signature` hashes only
     /// `(stable_id, kind code)` pairs.
     #[test]
-    fn symmetry_kind_code_is_eleven_and_append_only() {
-        assert_eq!(NodeKindTag::Symmetry.signature_code(), 11);
+    fn symmetry_kind_code_is_twelve_and_append_only() {
+        assert_eq!(NodeKindTag::Symmetry.signature_code(), 12);
         for (tag, code) in [
             (NodeKindTag::LegacyCanonical, 1_u8),
             (NodeKindTag::LegacyTemporal, 2),
@@ -5236,7 +5239,7 @@ mod tests {
             (NodeKindTag::Grain, 8),
             (NodeKindTag::Mask, 9),
             (NodeKindTag::Displace, 10),
-            (NodeKindTag::Symmetry, 11),
+            (NodeKindTag::Symmetry, 12),
         ] {
             assert_eq!(tag.signature_code(), code);
         }
