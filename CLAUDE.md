@@ -61,7 +61,7 @@ src/
 ├── program_recorder.rs  nonblocking CFR video/still publication and sidecar reports
 ├── stage_map.rs         venue endpoints/slices, monitor bindings, calibration tools
 ├── stage_health.rs      preview-only timing/resource/source health HUD
-├── proxy.rs             measured proxy recommendation and content-addressed cache plan
+├── proxy.rs             measured proxy recommendation, bounded decode/audio input contract, content-addressed cache plan
 ├── precision.rs         objective color metrics and precision/capability accounting
 ├── study.rs             closed data-only SSA Study schema and authority validation
 ├── patch/               YAML model, capture/apply, editor and file dialogs
@@ -2032,6 +2032,16 @@ a passing claim.
 - Procedural generation emits patches/manifests/preflight receipts only; MP4
   batch rendering, clip-statistics curation, and visual-driven audio DSP remain
   explicit deferred/research boundaries.
+- The proxy loop is still open. `proxy.rs` now carries the complete bounded
+  decode/audio input contract — `plan_proxy_input` is the one function that
+  decides what a proxy encode may consume, and its laws are owned by
+  `PROXY_ALGORITHM_VERSION`, so changing any of them must bump that version
+  and thereby change every cache key. But no encoder is integrated, no
+  artifact is produced, no decoder consults a cache, and the operator-facing
+  "proxy recommended" status remains unactionable until a worker tranche
+  lands behind this contract. The worker must answer from `plan_proxy_input`
+  and hold a `MediaSafetyPolicy` plan for the encode's lifetime; assessment
+  plus this contract is still not a proxy implementation.
 - The Symmetry Field's eight-texture single pass is a *floor* claim resting on
   the S2 receipt's enforced-cap argument, measured on one adapter and one
   backend. It is a capability claim only, not performance, bandwidth, or cache
