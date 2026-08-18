@@ -16,6 +16,9 @@ pub enum Action {
     ToggleFullscreen,
     ToggleOutputWindow,
     ToggleBlackout,
+    /// Ask the host to encode a proxy for the selected layer's verified
+    /// content identity. The host answers with HUD status, never a dialog.
+    CreateSelectedLayerProxy,
     Quit,
     None,
 }
@@ -47,6 +50,7 @@ pub fn map_key(key: PhysicalKey, state: ElementState, shift: bool) -> Action {
         PhysicalKey::Code(KeyCode::KeyF) => Action::ToggleFullscreen,
         PhysicalKey::Code(KeyCode::KeyO) => Action::ToggleOutputWindow,
         PhysicalKey::Code(KeyCode::KeyB) => Action::ToggleBlackout,
+        PhysicalKey::Code(KeyCode::KeyY) => Action::CreateSelectedLayerProxy,
         PhysicalKey::Code(KeyCode::Escape) => Action::Quit,
         _ => Action::None,
     }
@@ -65,6 +69,7 @@ pub fn apply_action(action: Action, uniforms: &mut EffectUniforms) -> ControlFlo
         Action::ToggleFullscreen => return ControlFlow::ToggleFullscreen,
         Action::ToggleOutputWindow => return ControlFlow::ToggleOutputWindow,
         Action::ToggleBlackout => return ControlFlow::ToggleBlackout,
+        Action::CreateSelectedLayerProxy => return ControlFlow::CreateSelectedLayerProxy,
         Action::Quit => return ControlFlow::Quit,
         Action::None => {}
     }
@@ -79,12 +84,40 @@ pub enum ControlFlow {
     ToggleFullscreen,
     ToggleOutputWindow,
     ToggleBlackout,
+    CreateSelectedLayerProxy,
     Quit,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn y_requests_a_selected_layer_proxy_and_release_is_inert() {
+        assert_eq!(
+            map_key(
+                PhysicalKey::Code(KeyCode::KeyY),
+                ElementState::Pressed,
+                false
+            ),
+            Action::CreateSelectedLayerProxy
+        );
+        assert_eq!(
+            map_key(
+                PhysicalKey::Code(KeyCode::KeyY),
+                ElementState::Released,
+                false
+            ),
+            Action::None
+        );
+        assert_eq!(
+            apply_action(
+                Action::CreateSelectedLayerProxy,
+                &mut EffectUniforms::default()
+            ),
+            ControlFlow::CreateSelectedLayerProxy
+        );
+    }
 
     #[test]
     fn m_is_the_media_freeze_shortcut_and_release_is_inert() {

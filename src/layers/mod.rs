@@ -319,6 +319,11 @@ pub struct Layer {
     /// this reference when present so moving or changing the resolved host
     /// file cannot silently weaken a `cos-sha256://` source contract.
     persisted_source_reference: Option<String>,
+    /// The proxy cache key (hex) backing this layer's decoder, when the
+    /// runtime `source_path` is a validated cache artifact rather than the
+    /// original. Persistence and export always use the retained content
+    /// reference above, so a proxy can never enter a patch or an export.
+    proxy_backing: Option<String>,
     pub filename: String,
     pub source: LayerSource,
     pub texture: wgpu::Texture,
@@ -482,6 +487,7 @@ impl Layer {
             layer_id: allocate_layer_id(),
             source_path,
             persisted_source_reference: None,
+            proxy_backing: None,
             filename,
             source: LayerSource::Video(decoder),
             texture,
@@ -565,6 +571,7 @@ impl Layer {
             layer_id: allocate_layer_id(),
             source_path,
             persisted_source_reference: None,
+            proxy_backing: None,
             filename,
             source: LayerSource::Still(StillImage::from_decoded(decoded)),
             texture,
@@ -660,6 +667,7 @@ impl Layer {
             layer_id: allocate_layer_id(),
             source_path,
             persisted_source_reference: None,
+            proxy_backing: None,
             filename,
             source: LayerSource::Spout(receiver),
             texture,
@@ -966,6 +974,9 @@ impl Layer {
         };
         self.width = width;
         self.height = height;
+        // A slot activation swaps in a freshly opened source, which is never
+        // proxy-backed; a stale backing claim must not survive the swap.
+        self.proxy_backing = None;
         self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
         self.effects.resolution = [width as f32, height as f32];
         self.source_frame_initialized = source_frame_initialized;
@@ -1014,6 +1025,16 @@ impl Layer {
     /// accessor performs no filesystem read or warm-path fingerprinting.
     pub fn content_identity_for_proxy(&self) -> Option<crate::media_source::ContentIdentity> {
         content_identity_for_proxy_reference(self.source_reference_for_persistence())
+    }
+
+    /// The proxy cache key (hex) whose validated artifact this layer's
+    /// decoder is reading, if any.
+    pub fn proxy_backing(&self) -> Option<&str> {
+        self.proxy_backing.as_deref()
+    }
+
+    pub(crate) fn set_proxy_backing(&mut self, backing: Option<String>) {
+        self.proxy_backing = backing;
     }
 
     pub fn is_video(&self) -> bool {
