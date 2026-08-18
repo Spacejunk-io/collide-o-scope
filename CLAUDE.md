@@ -2059,15 +2059,14 @@ a passing claim.
   rather than binding one donor by hand, so an offline render resolves exactly
   the Motion-subsystem donors a live one does. Any donor added to the block in
   future is bound in both paths by that single resolver.
-- An Advanced composition whose layers own **no image tap at all** cannot be
-  scheduled: `execution_order` breaks ties between equally-ready sibling scopes
-  by ascending stable id while `build_root_schedule` requires the composition's
-  back-to-front order, and export assigns ids front-to-back. A plain
-  single-donor Faraday transplant on a two-layer tapless stack reproduces it
-  with no collider present, so it is a pre-existing M4 defect that motion simply
-  had no labeled export case to surface before. Every labeled Advanced export
-  case therefore carries a rack node, whose tap retains the sibling and makes
-  the schedule legal. Repairing the tie-break is its own tranche.
+- An Advanced composition whose layers own no image tap at all schedules
+  normally. This bullet previously recorded the opposite as a standing
+  constraint; the tranche it deferred has landed, and the composite-rank
+  tie-break in "Advanced execution order" above is the binding statement.
+  `render_tapless_advanced_motion_pipeline` is the labeled export case that
+  could not be prepared before it, so the older claim that every labeled
+  Advanced case carries a rack node is also no longer true — do not add a node
+  to a fixture on that reasoning.
 - Physical MIDI, phone, audio-interface, Spout-host, and multi-monitor proof is
   separate from software tests. Gesture ingress is proven through the one
   normalized adapter and its four origins in software; a real tablet, phone
