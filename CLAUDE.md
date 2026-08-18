@@ -1427,6 +1427,21 @@ mislead browser tests.
   premultiplied-edge, temporal-feedback, LegacyExact-spatial, and 24/30/60
   temporal parity companions. Keep the adapter/backend, exact command, source
   manifest, and receipt hash with any claim.
+- `s2-eight-texture-floor-receipt.json` is a tracked artifact that the probe in
+  `tests/eight_texture_floor_probe.rs` regenerates in place. It is tracked
+  because `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS` and the Symmetry Field's
+  single-pass shape cite it by name as their justification; deleting it would
+  leave two source files pointing at evidence the repository does not carry.
+  A changed receipt after an opt-in run is therefore **a new measurement on new
+  hardware, not drift — commit it**. `claim_first_proven` is the frozen original
+  proof and never moves; `measured_at` is resolved from git at run time, so a
+  receipt always names the commit and branch that actually produced it, and
+  honestly reports `unknown` in a tree with no git metadata. The one consequence
+  to expect: running that opt-in probe dirties the working tree, so a gate whose
+  evidence claims a clean tree must be run before it or the receipt committed
+  after it. The probe commit `5a10b79` is reachable only through
+  `probe/s2-eight-texture-floor`; keep that branch, or the receipt's own
+  provenance and the `renderer/symmetry_field.rs` citation both dangle.
 - `cargo test` covers pure protocol, persistence, modulation, morph, temporal,
   transport, audio, Spout lifecycle helpers, and export-argument behavior.
 - `cargo test effects_audit -- --ignored` renders the labeled effect suite
