@@ -31,6 +31,7 @@ src/
 ├── media_safety.rs      Safe/Expert source planning, device bounds, reservations
 ├── media_source.rs      shared resolution, bounded SHA-256 fingerprinting, content references
 ├── spatial.rs           canonical authored transforms and packed GPU pass uniforms
+├── transform_gizmo.rs   preview-only direct manipulation of that same transform
 ├── motion.rs            canonical codec/lattice fields, Motion authoring, Field Collider, resource preflight
 ├── symmetry.rs          closed symmetry groups, 32-sector table, 1,024-byte uniform
 ├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
@@ -153,8 +154,17 @@ Position is normalized composition space; anchor is original-source UV. The
 forward order is crop/framing, independent scale, axis-directed shear,
 rotation, then position about the anchor. Rotation/shear is conjugated through
 output-aspect space so physical angles stay correct on non-square outputs.
-Changing anchor alone must remain visually inert. Sanitize all finite inputs,
-wrap angles, prevent crop collapse, and fail singular transforms to transparent.
+Changing anchor alone is visually inert exactly while the authored linear part
+is the identity — every Fit mode at scale `[1, 1]` with no rotation and no
+skew, because the fit factor cancels. The precise condition is
+`forward == diag(fit_size)`, and an anchor step `d` moves the sampled
+coordinate by exactly `(Identity - inverse * diag(fit_size)) * d`. Once a
+scale, rotation, or shear is authored the anchor is a genuine pivot, and moving
+a pivot moves the image; that is what a pivot is, not a defect. This was
+previously stated here without its condition, and the repository's only guard
+exercised the default transform, where it happens to hold unconditionally.
+Sanitize all finite inputs, wrap angles, prevent crop collapse, and fail
+singular transforms to transparent.
 
 `SpatialTransform::default()` is Stretch + Transparent + Linear identity. Its
 identity is special: `spatial_modes.w == 0` selects the exact historical shader
@@ -181,6 +191,155 @@ Discrete Fit/Edge/Sampling choices switch at the Morph midpoint and procedural
 generation preserves them while mutating continuous geometry through a separate
 deterministic RNG domain. Stable layer IDs are mandatory for remote transform
 edits; do not fall back to a stale position.
+
+### The preview transform gizmo
+
+`transform_gizmo.rs` is a **preview-only editing surface over the canonical
+`SpatialTransform`**. It introduces no editor-only transform, no second
+geometry, no parallel authored field, and no persisted state of any kind. A
+gizmo that could author something the browser numeric editor cannot author
+would be a defect, not a feature, so the vocabulary is closed and shared: every
+drag resolves to absolute values in the exact `param` strings
+`set_master_transform` / `set_layer_transform` already carry, and the host
+dispatches them as those very actions.
+
+Resource delta: **all zeros on every audience-facing surface.**
+
+| Item | Exact charge |
+|---|---:|
+| Render passes | 0 |
+| Sampled textures | 0 |
+| GPU buffers, bind groups, pipelines | 0 |
+| Persistent surfaces | 0 |
+| `PatchState` fields | 0 |
+| Snapshot fields | 0 |
+| New wire actions | 0 |
+| New modulation addresses | 0 |
+
+The gizmo paints into the editor window's own egui layer. It is not a
+composition step, so it charges nothing against the creative ledger and cannot
+appear in a ledger reconciliation.
+
+**Delegation, not reimplementation.** `apply_transform_gizmo_edits` sends real
+`SetMasterTransform` / `SetLayerTransform` actions through
+`handle_web_action_inner_with_feedback`. That single choice buys three separate
+laws at once, and each would be a defect if hand-rolled instead:
+
+- it reaches `apply_spatial_transform_edit`, the one authoring function the
+  browser numeric editor uses, so a gizmo edit and the identical numeric edit
+  are the same call with the same arguments — byte identity is structural;
+- it passes through `release_active_morph_for_manual_edit`, so a drag onto
+  Morph-owned state transfers ownership exactly as a numeric edit does instead
+  of authoring under an engaged A/B pair and snapping back;
+- it deliberately does **not** call `handle_web_action`, whose open-gesture
+  guard rejects edits while a `NativeManual` gesture is active. That guard keys
+  on the *gesture's* origin rather than the action's, so a dispatch through the
+  outer entry point would refuse the gizmo's own edits. This is the identical
+  seam the browser-gesture arm already takes.
+
+**One predicate for the whole leakage boundary.**
+`stage_map::native_controls_visible(output_on_main)` is the single source, and
+`show_editor_panel`, `show_native_recovery_strip`, `show_stage_editor_health`,
+`show_native_gesture_surface`, and `show_transform_gizmo` all answer from it —
+five copies of `!output_on_main` were four too many. `PreviewGizmoPermit`
+answers from the same predicate *and* requires
+`StageSurface::EditorPreview`, so folding both conditions into the token
+matters: a permit that checked only the surface would mint happily on a
+single-monitor audience output, because the surface argument at a preview call
+site is a constant.
+
+The permit is sealed inside a private submodule rather than merely private to
+the file. `stage_health::EditorPreviewPermit` proved the shape, but its barrier
+is module-scoped — that file's own `mod tests` could construct one. Nesting
+makes the gizmo's tests a *sibling* of the private field, so not even they can
+forge a token, and a source audit pins the single declaration and single
+construction. The existing permit is deliberately **not** reused: it is
+conjoined with `health_hud_enabled()`, and a gizmo must work with the HUD off.
+
+**Coordinate law.** `SpatialGpuUniforms::map_output_to_local` was promoted out
+of `#[cfg(test)]` and is now the crate's only inverse; `hit_test_local` is its
+fail-closed wrapper. `GizmoFrame` derives its forward map as the algebraic
+inverse of that matrix rather than as a second authored transform — two
+inverses that agree today would disagree the first time the forward order
+changes. Uniforms come from the production `SpatialTransform::gpu_uniforms`
+with the same dimension convention `EffectPassUniforms::for_target` uses: a
+layer's actual source size, or the output size twice for master.
+
+`PreviewPaneRect` composes the preview's own letterboxing explicitly, and its
+mapping is deliberately **unclamped** — a scale or rotate drag that leaves the
+image must keep tracking rather than freezing at the border. A singular or
+non-finite transform fails hit testing **closed**: `GizmoFrame::new` returns
+`None` and there are no handles at all. There is no identity fallback, because
+a grabbable handle over a transform that renders nothing is a control that lies
+about what it will do.
+
+Hit testing only ever *reads*. Nothing outside `GizmoDrag::update` and
+`nudge_edits` mutates a transform, so opening, hovering, and hit-testing leave
+`spatial_modes.w == 0` untouched and a patch nobody moved still renders through
+the exact historical sample.
+
+**The gizmo owns only its handles.** Translation is a point handle below the
+footprint, not the footprint body, and that is a boundary rather than a style
+choice: the preview surface is *already* the gesture-etch canvas, and an
+untransformed source covers the whole composition, so a body-sized translate
+target would have claimed every drag over the image and silently taken the etch
+surface away. A pointer that is not within `HANDLE_PICK_RADIUS_UV` of a handle
+reports no hit, and the host routes that drag to the etch stroke it always
+belonged to. Both share one `egui::Response`: two overlapping interactions on
+one rect would let egui's own resolution decide which control an operator
+grabbed, so the routing is written down here instead. An open drag keeps the
+pointer for its whole life; a new drag claims it only by starting on a handle.
+
+**Drag law.** Everything is captured at `Begin` — scope, handle, the authored
+transform, and the derived frame — and every subsequent delta reads that one
+immutable snapshot. Answering "where should this be, given where it started"
+rather than "how much has it moved since last frame" is what keeps a crop edge
+from chasing its own motion and a scale handle from compounding. Scale is the
+ratio of lever arms about the anchor and refuses an axis whose arm is zero
+rather than dividing; rotation is measured in physical space, so a quarter turn
+on a 16:9 output authors 90 degrees. A non-finite computation lands on the
+field's documented neutral value, never on a clamped extreme.
+
+**Modifiers and nudges.** Shift is the constraint law — axis lock for translate
+and anchor, uniform for scale, `ROTATE_SNAP_DEGREES` (15°) snapping for
+rotation, symmetric opposite edge for crop. Alt is the fine law for *every*
+handle uniformly, damping the gesture by `FINE_DRAG_FACTOR`; an operator
+holding Alt wants a finer version of the gesture they are making, not a
+different gesture. Arrow keys nudge position by `NUDGE_STEP` (1/128 output UV),
+Shift takes `NUDGE_COARSE_STEP` (1/16), Alt takes `NUDGE_FINE_STEP` (1/1024),
+and Alt wins when both are held. A nudge is a complete authored gesture and
+takes the ordinary manual-history boundary; it is refused outright while a drag
+owns the scope.
+
+**History and cancel.** One pointer drag is exactly one `NativeManual` entry,
+routed through the same `GestureHistoryRouter` the etch surface uses rather
+than a second open/close law written beside it — every intermediate `Move` is
+invisible, so a five-hundred-sample drag costs the bounded stack one
+checkpoint. Escape is consumed **only** while a drag is open, so it keeps its
+existing meaning everywhere else including quitting. Before the first committed
+value it cancels: the captured transform is restored and the gesture is
+abandoned. After a value has committed a cancel would be a lie — the program
+already moved — so the gesture closes normally and an ordinary undo runs.
+
+**Selection cannot retarget.** The scope is derived from the host's existing
+`selected_layer` and converted to a `StableLayerId` at `Begin` and nowhere
+else. `bump_layer_stack_revision` is the one barrier every topology edit
+crosses — add, remove, reorder, and patch apply all bump it — so it is the
+single place an open drag is abandoned. That is what stops a drag begun on one
+stack from delivering its remaining delta to whatever now occupies the vacated
+position.
+
+**Scope vocabulary.** Master and layer only. A group carries a
+`SpatialTransform` in the composition model but has **no interactive authoring
+action at all** — no web action, no native editor — so a group handle would
+author something no other controller can, which is precisely the defect this
+module exists to avoid. Adding one is a wire and protocol change, not a gizmo
+change.
+
+Because the authored result is an ordinary `SpatialTransform` edit, patch,
+Look, Morph, modulation, Dice, procedural generation, preset, recovery, and
+export close over it already. That is the entire point of forbidding an
+editor-only transform: S6 proves that closure rather than adding to it.
 
 ## Threading and backpressure
 
@@ -1649,7 +1808,12 @@ mislead browser tests.
 - `Ctrl+E` — patch parameter editor
 - `Ctrl+S` / `Ctrl+O` — save/load patch
 - `Ctrl+Shift+I` / `Ctrl+Shift+X` — import/export the bounded controller profile
-- `Escape` — close/quit as appropriate
+- Arrow keys — nudge the selected scope's transform position by `NUDGE_STEP`
+  (1/128 output UV); Shift takes the coarse 1/16 step, Alt the fine 1/1024 one,
+  and Alt wins when both are held. Refused while a gizmo drag owns the scope.
+- `Escape` — cancels an open transform-gizmo drag that has not committed a
+  value, undoes one that has, and otherwise keeps its existing close/quit
+  behavior
 
 ## Verification
 
@@ -1813,6 +1977,30 @@ mislead browser tests.
   carrier into the audience image, both inputs contributing, live/export
   identity parity, warm-allocation invariance, and byte-identical exact M4 when
   disabled — and `render_field_collider_pipeline` is the labeled export case.
+- Preview transform-gizmo tests must cover the pane/output/local round trip at
+  multiple aspect ratios and DPI scales including a non-square output, an
+  active crop, a nonzero shear and a letterboxed pane; the forward map agreeing
+  with the canonical inverse; anchor-only inertness proven exactly rather than
+  by example, with the non-inert cases matching the closed form; a singular and
+  a non-finite transform failing hit-testing closed with no identity fallback;
+  hit testing leaving `spatial_modes.w` at zero; handle pick priority; each
+  drag law with its Shift and Alt variants and the zero-lever-arm refusal;
+  every authored value landing inside the spatial contract with a non-finite
+  computation taking the neutral value; the bounded allocation-free edit set;
+  one drag as exactly one undo entry and a no-op drag as none; Escape
+  cancelling before the first commit and undoing after it, and consuming
+  nothing outside a drag; a topology bump aborting an open drag without
+  retargeting and a stale Move afterwards authoring nothing; the nudge step law
+  and its refusal under an open drag; the permit refused for every
+  audience-facing surface and for a single-monitor Output, agreeing with
+  `show_transform_gizmo` and with every other native-control predicate; and the
+  source audit pinning the permit's single sealed declaration and construction.
+  `render_native_gizmo_transform_pipeline` is the labeled export case: it
+  renders a gizmo-authored transform, its numerically-authored twin, and the
+  untouched identity, and the claim is that the first two are decoded-frame
+  identical while both differ from the third. The gizmo introduces no export
+  path, so the six pre-existing labeled cases must additionally be proven
+  `framemd5`-identical across the tranche by a same-branch A/B.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
@@ -1871,15 +2059,14 @@ a passing claim.
   rather than binding one donor by hand, so an offline render resolves exactly
   the Motion-subsystem donors a live one does. Any donor added to the block in
   future is bound in both paths by that single resolver.
-- An Advanced composition whose layers own **no image tap at all** cannot be
-  scheduled: `execution_order` breaks ties between equally-ready sibling scopes
-  by ascending stable id while `build_root_schedule` requires the composition's
-  back-to-front order, and export assigns ids front-to-back. A plain
-  single-donor Faraday transplant on a two-layer tapless stack reproduces it
-  with no collider present, so it is a pre-existing M4 defect that motion simply
-  had no labeled export case to surface before. Every labeled Advanced export
-  case therefore carries a rack node, whose tap retains the sibling and makes
-  the schedule legal. Repairing the tie-break is its own tranche.
+- An Advanced composition whose layers own no image tap at all schedules
+  normally. This bullet previously recorded the opposite as a standing
+  constraint; the tranche it deferred has landed, and the composite-rank
+  tie-break in "Advanced execution order" above is the binding statement.
+  `render_tapless_advanced_motion_pipeline` is the labeled export case that
+  could not be prepared before it, so the older claim that every labeled
+  Advanced case carries a rack node is also no longer true — do not add a node
+  to a fixture on that reasoning.
 - Physical MIDI, phone, audio-interface, Spout-host, and multi-monitor proof is
   separate from software tests. Gesture ingress is proven through the one
   normalized adapter and its four origins in software; a real tablet, phone
@@ -1893,6 +2080,18 @@ a passing claim.
   frozen resource table. The host runs the portable CPU reference every frame,
   so raising it toward the 2,100,000-cell ceiling belongs with a presenter that
   moves the per-cell work off that reference entirely.
+- The preview transform gizmo addresses master and layer scopes only. Groups
+  carry a `SpatialTransform` but have no interactive authoring action of any
+  kind, so a group handle would author what no other controller can; adding one
+  is a wire and protocol change.
+- The gizmo edits and displays the **authored base** transform, exactly as the
+  browser numeric fields do. A modulation route offsets a per-frame copy, so
+  while one is driving a transform the rendered image sits away from the
+  handles by exactly that offset. This is the same relationship the numeric
+  editor already has, not a gizmo defect.
+- Gizmo hit testing and painting are proven in software. A physical operator
+  dragging a handle on a real pointer or tablet is hardware proof and is not
+  transferable from those tests.
 - Upstream original code has no blanket MIT grant; `LICENSE` only covers the
   additions described there. Publication/distribution of the combined fork is
   conditional on the publisher having authorization for the original portions
