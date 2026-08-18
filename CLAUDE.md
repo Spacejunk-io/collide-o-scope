@@ -548,6 +548,41 @@ the shader uniform layout tests current when changing temporal uniforms.
 - The chain operates with sRGB decode, linear-light math, and sRGB encode.
 - Blackout occurs before audience-facing readback/blit consumers.
 
+### Advanced execution order
+
+An Advanced composition is scheduled by two topological sorts in
+`evaluated_composition.rs`. `execution_order` orders scopes; then
+`atomic_group_execution_order` collapses each group and its members into one
+task and re-sorts, and **its** output is the plan's `execution_order`. Both
+sorts break ties between equally-ready scopes by the **composite rank** —
+`BelowTopology::composite_rank`, the `(root_index, member_index)` pair
+`below_topology` already records — never by `VisualScopeId` ordering. The scope
+id remains the final tiebreak, so the sort stays total and deterministic.
+
+The rank is not cosmetic. `build_block_schedules` in `renderer/composition.rs`
+drains the composition's back-to-front stack as each scope renders, and only the
+first drain after a task may read that task's own output through
+`ScheduledSource::Ping`; every later one needs a `RetainedTap`. A composition
+whose layers own **no image tap** has no edges between siblings at all, so the
+tie-break alone decides the order — and before the rank landed, an ascending-id
+fallback disagreed with the composite order whenever ids ascended front-to-back.
+That is exactly what an export job produces, numbering layers `position + 1`, so
+a tapless Advanced composition could not be prepared offline at all: a plain
+two-layer Faraday transplant failed with *"executed before structural admission
+without a current retained tap."*
+
+Both sorts must keep the same rank. A group is ranked at its own root slot, so a
+collapsed group task sorts into exactly the slot its members occupy and the two
+sorts cannot disagree about where the block belongs. Ranking only one of them
+leaves the defect intact, because the second sort's output is the one that
+reaches the renderer.
+
+Changing the tie-break changes only which of several valid topological orders is
+chosen among genuinely independent scopes, and therefore only whether a drain
+reads `Ping` or an equivalent `RetainedTap`. It must not move a pixel: the six
+labeled export cases are decoded-frame identical across the change, verified by
+paired `framemd5`.
+
 ### Named two-input Displace
 
 `Displace` is a Collision Rack node that warps its carrier by a vector field
@@ -1449,6 +1484,13 @@ mislead browser tests.
   and `videos/audit.mp4`.
 - Export repeatability requires two independent renders and equal decoded
   `framemd5` sequences.
+- Advanced execution-order tests must cover a tapless two-layer stack whose ids
+  ascend front-to-back scheduling with an empty retained map, a tapless stack
+  containing a collapsed group whose members stay contiguous and back-to-front,
+  and — because the tie-break is shared scheduling for every Advanced
+  composition — paired `framemd5` equality across the change for every labeled
+  export case. `render_tapless_advanced_motion_pipeline` is the labeled export
+  case that could not be prepared before the composite rank landed.
 - Browser QA must include desktop and narrow viewports, touch/pointer release,
   multi-controller stale-topology rejection, token and foreign-Origin denial,
   direct layer FPS/effects, reorder, beat latch, input configurations,

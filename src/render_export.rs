@@ -16503,6 +16503,57 @@ mod effects_audit {
         output_path
     }
 
+    /// Two stacked clips, an ordinary single-donor Faraday transplant, and no
+    /// image tap anywhere.
+    ///
+    /// Before the composite-rank tie-break this composition could not be
+    /// prepared at all. `execution_order` ordered the two independent siblings
+    /// by ascending `StableLayerId`, export numbers layers `position + 1`
+    /// front-to-back, and `build_block_schedules` drains back-to-front — so the
+    /// second drain landed on a layer that owned no retained tap and
+    /// preparation failed with "executed before structural admission without a
+    /// current retained tap". It is the smallest composition that reproduces
+    /// the defect: one Motion effect to force an Advanced plan, and nothing
+    /// else at all.
+    ///
+    /// Every other labeled export case carries a rack node whose tap happened
+    /// to retain the sibling and hide this. This one deliberately carries none.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_tapless_advanced_motion_pipeline() {
+        use crate::patch::{FaradayConfig, MotionCarrierConfig, MotionConfig, MotionDonorConfig};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        let donor = patch.layers[0].clone();
+        patch.layers.push(donor);
+        patch.layers[1].effects.hue_shift = 200.0;
+
+        // No rack on either layer, so the composition owns no image tap and the
+        // schedule has nothing to retain.
+        assert!(patch.layers.iter().all(|layer| layer.rack.is_none()));
+
+        patch.layers[0].motion = Some(MotionConfig {
+            transplant: FaradayConfig {
+                amount: 0.85,
+                donor: MotionDonorConfig::Selected {
+                    saved_position: SavedLayerPosition::new(1).expect("layer 1 exists"),
+                },
+                carrier: MotionCarrierConfig::FirstSourceFrame,
+                refresh: 0.35,
+                decay: 0.9,
+                ..FaradayConfig::default()
+            },
+            ..MotionConfig::default()
+        });
+        render("tapless_advanced_motion", patch);
+    }
+
     /// Renders every effect through the real shader chain into labeled
     /// files under renders/, for objective pixel-level verification
     /// (ffprobe signalstats/entropy). Needs a GPU, ffmpeg on PATH, and
