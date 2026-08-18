@@ -950,6 +950,14 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
                 value.as_str(),
                 Some("gaussian" | "perlin" | "salt_pepper" | "blue")
             ),
+            // Displace's boundary law. Omitting it here dropped the panel's
+            // select at ingress even though `set_runtime_node_param` already
+            // accepted the value, so the authored law was unreachable from a
+            // browser. Every discrete node enum must appear in this allowlist.
+            "boundary" => matches!(
+                value.as_str(),
+                Some("transparent" | "mirror" | "wrap" | "hold")
+            ),
             _ => false,
         },
         NodeParamType::ImageTap => false,
@@ -2903,6 +2911,65 @@ mod tests {
         assert!(js.contains("['gesture_canvas', 'Gesture canvas (etched field)']"));
         assert!(js.contains("case 'gesture_canvas': return 'gesture_canvas';"));
         assert!(js.contains("input = { source: 'gesture_canvas' };"));
+    }
+
+    #[test]
+    fn discrete_node_enums_are_admitted_and_topology_fields_stay_barriered() {
+        // The panel renders Displace's Boundary as an ordinary coalescible
+        // parameter edit (static/app.js), so ingress must admit every authored
+        // value. A missing arm here silently drops the action before
+        // `set_runtime_node_param` ever sees it, leaving the authored law
+        // unreachable from a browser.
+        for value in ["transparent", "mirror", "wrap", "hold"] {
+            assert!(
+                valid_node_param_value("displace", "boundary", &serde_json::json!(value)),
+                "displace boundary {value} must be admitted at ingress"
+            );
+        }
+        for value in [
+            serde_json::json!("clamp"),
+            serde_json::json!("Transparent"),
+            serde_json::json!(""),
+            serde_json::json!(0),
+            serde_json::json!(true),
+            serde_json::json!(["mirror"]),
+        ] {
+            assert!(
+                !valid_node_param_value("displace", "boundary", &value),
+                "{value} is outside the closed boundary vocabulary"
+            );
+        }
+        // The vocabulary stays closed per kind: no other kind declares it.
+        assert!(!valid_node_param_value(
+            "grain",
+            "boundary",
+            &serde_json::json!("mirror")
+        ));
+        // The donor route rewrites the image dependency graph, so it remains a
+        // revision-protected barrier action and is refused on this path.
+        assert!(!valid_node_param_value(
+            "displace",
+            "donor_tap",
+            &serde_json::json!("one_below")
+        ));
+        // Both gains stay ordinary bounded floats.
+        for param in ["amount_x", "amount_y"] {
+            assert!(valid_node_param_value(
+                "displace",
+                param,
+                &serde_json::json!(-1.0)
+            ));
+            assert!(valid_node_param_value(
+                "displace",
+                param,
+                &serde_json::json!(1.0)
+            ));
+            assert!(!valid_node_param_value(
+                "displace",
+                param,
+                &serde_json::json!(1.5)
+            ));
+        }
     }
 
     #[test]
