@@ -20,9 +20,9 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    MotionConfig, MotionDonorConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
-    RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
-    TemporalResetPolicyConfig,
+    GestureCanvasConfig, MotionConfig, MotionDonorConfig, RefreshGardenConfig,
+    RefreshGardenMatteRouteConfig, RefreshGardenMotionRouteConfig, TemporalLoomConfig,
+    TemporalOriginalsConfig, TemporalResetPolicyConfig,
 };
 use crate::spatial::SpatialTransform;
 use crate::temporal::CollisionScoreLoopDriver;
@@ -1105,6 +1105,69 @@ pub struct MorphSlot {
     /// duplicate/zero IDs, invalid cursors, and malformed one-level topology.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composition: Option<CompositionTree>,
+    /// Authored S3b gesture state. Absence means this slot predates gesture
+    /// etching and therefore cannot claim any canvas value while the crossfader
+    /// moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture: Option<GestureMorphSnapshot>,
+}
+
+/// The gesture world one Morph slot owns.
+///
+/// The split here is the whole S3b Morph law. `canvas` holds the three authored
+/// continuous controls and interpolates like any other value. `track_checksum`
+/// is the canonical digest of the recording the slot was captured against — a
+/// *recorded track is topology, not a value*, so Morph holds only its identity,
+/// carries that identity from A after equality has been proven, and can never
+/// blend, rewrite, truncate, or reorder a single recorded event. Two slots
+/// captured against different recordings are two different pieces rather than
+/// two ends of a blend, exactly as two different Displace donors are.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GestureMorphSnapshot {
+    pub canvas: GestureCanvasConfig,
+    /// Empty means the slot was captured with nothing recorded.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub track_checksum: String,
+}
+
+impl GestureMorphSnapshot {
+    pub fn sanitized(&self) -> Self {
+        Self {
+            canvas: self.canvas.sanitized(),
+            track_checksum: self.track_checksum.clone(),
+        }
+    }
+}
+
+/// A recorded track is topology: two slots may only blend their canvas values
+/// when they name the exact same recording. This is the S3b analogue of
+/// `displace_route_matches`.
+fn gesture_track_matches(a: &GestureMorphSnapshot, b: &GestureMorphSnapshot) -> bool {
+    a.track_checksum == b.track_checksum
+}
+
+/// Blend only the authored canvas controls. The recorded track's identity is
+/// carried from A — A/B compatibility already proved it equal — and is never
+/// interpolated, so no morph position can synthesize a third recording that
+/// neither slot captured.
+fn interpolate_gesture(
+    a: &GestureMorphSnapshot,
+    b: &GestureMorphSnapshot,
+    weights: [f32; 2],
+) -> Option<GestureMorphSnapshot> {
+    if !gesture_track_matches(a, b) {
+        return None;
+    }
+    Some(GestureMorphSnapshot {
+        canvas: GestureCanvasConfig {
+            radius: blend_finite(a.canvas.radius, b.canvas.radius, weights),
+            strength: blend_finite(a.canvas.strength, b.canvas.strength, weights),
+            retention: blend_finite(a.canvas.retention, b.canvas.retention, weights),
+        }
+        .sanitized(),
+        track_checksum: a.track_checksum.clone(),
+    })
 }
 
 fn remapped_saved_position_after_move(
@@ -1371,8 +1434,25 @@ impl MorphSlot {
             master_rack: None,
             layer_racks: None,
             composition: None,
+            gesture: None,
         }
         .sanitized()
+    }
+
+    /// Attach the authored gesture world to an already-captured slot.
+    ///
+    /// `track_checksum` is the recording's canonical digest, never its events:
+    /// a Morph slot names a recording, it does not own one.
+    pub fn with_gesture(
+        mut self,
+        canvas: crate::gesture_canvas::GestureCanvasParams,
+        track_checksum: String,
+    ) -> Self {
+        self.gesture = Some(GestureMorphSnapshot {
+            canvas: GestureCanvasConfig::from_params(canvas).sanitized(),
+            track_checksum,
+        });
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1505,6 +1585,7 @@ impl MorphSlot {
             master_rack: self.master_rack.clone(),
             layer_racks: self.layer_racks.clone(),
             composition: self.composition.clone(),
+            gesture: self.gesture.as_ref().map(GestureMorphSnapshot::sanitized),
         }
     }
 
@@ -1679,6 +1760,10 @@ pub struct MorphSample {
     /// Present only when group membership/root topology and every group rack
     /// signature match. The sampled tree contains values, never new topology.
     pub composition: Option<CompositionTree>,
+    /// Present only when both slots captured a gesture world against the same
+    /// recording. It carries authored canvas values and the track's identity —
+    /// never any recorded event.
+    pub gesture: Option<GestureMorphSnapshot>,
 }
 
 impl MorphSample {
@@ -1801,6 +1886,7 @@ impl MorphSample {
         master_rack: &mut RuntimeVisualRack,
         layer_racks: &mut [RuntimeVisualRack],
         composition: &mut RuntimeComposition,
+        gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
     ) {
         self.apply_to_with_composition(
             master,
@@ -1815,6 +1901,19 @@ impl MorphSample {
         if let Some(motion) = self.master_motion {
             let layer_ids: Vec<_> = layers.iter().map(Layer::stable_layer_id).collect();
             *master_motion = motion.resolve_runtime(&layer_ids);
+        }
+        self.apply_gesture_to(gesture_canvas);
+    }
+
+    /// Write only the sampled authored canvas controls.
+    ///
+    /// There is deliberately no recorded-track destination here. A sample
+    /// carries a track's identity so ownership can be decided; it never
+    /// carries events, so no morph position can rewrite, truncate, or reorder
+    /// what the operator actually recorded.
+    pub fn apply_gesture_to(&self, canvas: &mut crate::gesture_canvas::GestureCanvasParams) {
+        if let Some(gesture) = &self.gesture {
+            *canvas = gesture.canvas.to_params();
         }
     }
 }
@@ -1959,6 +2058,20 @@ impl Morph {
         )
     }
 
+    /// Ownership of the authored canvas controls additionally requires that
+    /// both slots name the same recording. Two slots captured against
+    /// different tracks own nothing and stay directly editable.
+    pub(crate) fn controls_master_gesture(&self) -> bool {
+        matches!(
+            (&self.a, &self.b),
+            (Some(a), Some(b))
+                if match (&a.gesture, &b.gesture) {
+                    (Some(a), Some(b)) => gesture_track_matches(a, b),
+                    _ => false,
+                }
+        )
+    }
+
     pub fn clear(&mut self) {
         self.a = None;
         self.b = None;
@@ -2086,6 +2199,10 @@ impl Morph {
             master_rack,
             layer_racks,
             composition,
+            gesture: match (&a.gesture, &b.gesture) {
+                (Some(a), Some(b)) => interpolate_gesture(a, b, weights),
+                _ => None,
+            },
         })
     }
 
@@ -2181,6 +2298,7 @@ impl Morph {
         master_rack: &mut RuntimeVisualRack,
         layer_racks: &mut [RuntimeVisualRack],
         composition: &mut RuntimeComposition,
+        gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
     ) {
         if let Some(sample) = self.sample(t) {
             sample.apply_to_with_composition_and_motion(
@@ -2193,6 +2311,7 @@ impl Morph {
                 master_rack,
                 layer_racks,
                 composition,
+                gesture_canvas,
             );
         }
     }
@@ -4911,5 +5030,141 @@ glide:
             "strict apply must reject a Displace whose donor differs"
         );
         assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
+    }
+
+    fn gesture_slot(radius: f32, strength: f32, retention: f32, track: &str) -> MorphSlot {
+        let mut slot = slot(1.0, 0.0, 0.0);
+        slot.gesture = Some(GestureMorphSnapshot {
+            canvas: GestureCanvasConfig {
+                radius,
+                strength,
+                retention,
+            },
+            track_checksum: track.to_string(),
+        });
+        slot
+    }
+
+    /// A recorded track is topology, not a value. The canvas controls blend;
+    /// the recording is carried by identity from A and two slots naming
+    /// different recordings do not blend at all.
+    #[test]
+    fn morph_blends_gesture_canvas_values_only_on_an_exact_recorded_track_match() {
+        let digest = "a".repeat(64);
+        let morph = Morph {
+            a: Some(gesture_slot(0.2, 0.4, 0.8, &digest)),
+            b: Some(gesture_slot(0.6, 0.8, 0.4, &digest)),
+            ..Default::default()
+        };
+        assert!(morph.controls_master_gesture());
+
+        let midpoint = morph.sample(0.5).unwrap();
+        let gesture = midpoint.gesture.as_ref().expect("both slots own gesture");
+        close(gesture.canvas.radius, 0.4);
+        close(gesture.canvas.strength, 0.6);
+        close(gesture.canvas.retention, 0.6);
+        assert_eq!(
+            gesture.track_checksum, digest,
+            "the recording is carried, never blended"
+        );
+
+        // Endpoints are exact, and a sampled world writes only the authored
+        // canvas values into the live state.
+        for (position, expected) in [(0.0_f32, [0.2_f32, 0.4, 0.8]), (1.0, [0.6, 0.8, 0.4])] {
+            let sample = morph.sample(position).unwrap();
+            let mut canvas = crate::gesture_canvas::GestureCanvasParams::default();
+            sample.apply_gesture_to(&mut canvas);
+            close(canvas.radius, expected[0]);
+            close(canvas.strength, expected[1]);
+            close(canvas.retention, expected[2]);
+        }
+
+        // Two different recordings are two pieces, not two ends of a blend.
+        let rerouted = Morph {
+            a: Some(gesture_slot(0.2, 0.4, 0.8, &digest)),
+            b: Some(gesture_slot(0.6, 0.8, 0.4, &"b".repeat(64))),
+            ..Default::default()
+        };
+        assert!(!rerouted.controls_master_gesture());
+        assert!(rerouted.sample(0.5).unwrap().gesture.is_none());
+        let mut untouched = crate::gesture_canvas::GestureCanvasParams::default();
+        let before = untouched;
+        rerouted
+            .sample(0.5)
+            .unwrap()
+            .apply_gesture_to(&mut untouched);
+        assert_eq!(untouched, before);
+
+        // A legacy slot that predates gesture etching claims nothing.
+        let legacy = Morph {
+            a: Some(gesture_slot(0.2, 0.4, 0.8, &digest)),
+            b: Some(slot(1.0, 0.0, 0.0)),
+            ..Default::default()
+        };
+        assert!(!legacy.controls_master_gesture());
+        assert!(legacy.sample(0.5).unwrap().gesture.is_none());
+    }
+
+    /// The slot names a recording; it never owns one. Nothing in the Morph
+    /// snapshot can add, remove, retime, or reorder a recorded event, and the
+    /// section is additive so a legacy slot round-trips unchanged.
+    #[test]
+    fn a_gesture_morph_slot_carries_only_a_recording_identity_and_never_its_events() {
+        let digest = "c".repeat(64);
+        let slot = gesture_slot(0.3, 0.5, 0.7, &digest);
+        let value = serde_json::to_value(&slot).unwrap();
+        let gesture = value["gesture"].as_object().expect("gesture section");
+        let mut keys: Vec<_> = gesture.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["canvas", "track_checksum"],
+            "a Morph slot must carry a recording's identity and nothing else"
+        );
+        let canvas = gesture["canvas"].as_object().expect("canvas values");
+        let mut canvas_keys: Vec<_> = canvas.keys().map(String::as_str).collect();
+        canvas_keys.sort_unstable();
+        assert_eq!(canvas_keys, ["radius", "retention", "strength"]);
+        assert!(
+            !value.to_string().contains("events"),
+            "no recorded event may reach a Morph slot"
+        );
+
+        let restored: MorphSlot = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.gesture, slot.gesture);
+
+        // Absent is exactly the pre-gesture path.
+        let legacy = MorphSlot::default();
+        assert_eq!(legacy.gesture, None);
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("gesture").is_none());
+        assert_eq!(
+            serde_json::from_value::<MorphSlot>(legacy_json)
+                .unwrap()
+                .gesture,
+            None
+        );
+
+        // Sanitization runs on the section without touching the identity.
+        let hostile = MorphSlot {
+            gesture: Some(GestureMorphSnapshot {
+                canvas: GestureCanvasConfig {
+                    radius: f32::NAN,
+                    strength: 9.0,
+                    retention: -3.0,
+                },
+                track_checksum: digest.clone(),
+            }),
+            ..MorphSlot::default()
+        }
+        .sanitized();
+        let sanitized = hostile.gesture.expect("section retained");
+        close(
+            sanitized.canvas.radius,
+            GestureCanvasConfig::default().radius,
+        );
+        assert_eq!(sanitized.canvas.strength, 1.0);
+        assert_eq!(sanitized.canvas.retention, 0.0);
+        assert_eq!(sanitized.track_checksum, digest);
     }
 }

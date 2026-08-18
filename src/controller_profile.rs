@@ -386,6 +386,14 @@ pub enum ControlParameter {
     Downbeat,
     ClearMotionMemory,
     ClearTemporalMemory,
+    /// Gesture-field etching surface. A controller has no notion of a stroke,
+    /// so it drives four independent scalars and the stroke machine lives in
+    /// `gesture::GestureControlSurface`. Appended, never renumbered: MIDI
+    /// profiles and OSC paths both address these by their snake_case key.
+    GestureX,
+    GestureY,
+    GesturePressure,
+    GestureContact,
 }
 
 impl ControlParameter {
@@ -424,6 +432,10 @@ impl ControlParameter {
             Self::Downbeat => "downbeat",
             Self::ClearMotionMemory => "clear_motion_memory",
             Self::ClearTemporalMemory => "clear_temporal_memory",
+            Self::GestureX => "gesture_x",
+            Self::GestureY => "gesture_y",
+            Self::GesturePressure => "gesture_pressure",
+            Self::GestureContact => "gesture_contact",
         }
     }
 
@@ -462,6 +474,10 @@ impl ControlParameter {
             "downbeat" => Self::Downbeat,
             "clear_motion_memory" => Self::ClearMotionMemory,
             "clear_temporal_memory" => Self::ClearTemporalMemory,
+            "gesture_x" => Self::GestureX,
+            "gesture_y" => Self::GestureY,
+            "gesture_pressure" => Self::GesturePressure,
+            "gesture_contact" => Self::GestureContact,
             _ => return None,
         })
     }

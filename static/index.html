@@ -792,6 +792,33 @@
             </div>
           </div>
 
+          <div class="fx-group" id="gesture-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">GESTURE FIELD</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="gesture-authoring" role="region" aria-label="Gesture field etching">
+                <div class="param-row" data-gesture-canvas="radius" data-min="0" data-max="1" data-step="0.001">
+                  <label>Radius</label><input type="range"><span class="value">0.12</span>
+                </div>
+                <div class="param-row" data-gesture-canvas="strength" data-min="0" data-max="1" data-step="0.001">
+                  <label>Strength</label><input type="range"><span class="value">0.5</span>
+                </div>
+                <div class="param-row" data-gesture-canvas="retention" data-min="0" data-max="1" data-step="0.001">
+                  <label>Retention</label><input type="range"><span class="value">0.99</span>
+                </div>
+                <div class="temporal-command-row">
+                  <button type="button" id="gesture-record-toggle" aria-pressed="false">Arm recording</button>
+                </div>
+                <div class="audio-status" id="gesture-recording-state" role="status" aria-live="polite">Not recording</div>
+                <div class="audio-status gesture-telemetry" id="gesture-telemetry" aria-live="off">0 recorded event(s) · 0 live-only sample(s) · canvas 0×0 · gen 0</div>
+                <div class="audio-status" id="gesture-checksum" aria-live="off">No recorded track</div>
+                <div class="audio-status">Recording is explicit. While it is off a gesture etches this session only and is never added to the replayable track.</div>
+              </div>
+            </div>
+          </div>
+
           <div class="fx-group" id="audio-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
