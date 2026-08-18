@@ -239,6 +239,22 @@ pub enum StageRoute {
     },
 }
 
+/// The one predicate every editor-only native control answers from.
+///
+/// Single-monitor audience Output reuses the main window's already-proven
+/// swapchain, so while that is happening the main surface *is* the audience
+/// and every native control must disappear from it. A dedicated output has its
+/// own clean surface and may leave the controls on the preview.
+///
+/// This lives beside [`StageSurface`] because it is a leakage decision, not a
+/// window-management one, and it is a single function rather than four copies
+/// of `!output_on_main` so the RECOVERY strip, the patch editor, the health
+/// HUD, the native gesture surface, and the transform gizmo cannot drift into
+/// disagreeing about when the preview is safe to draw on.
+pub const fn native_controls_visible(output_on_main: bool) -> bool {
+    !output_on_main
+}
+
 /// Surfaces against which leakage policies are decided. Only a specifically
 /// selected physical endpoint may receive calibration paint.
 #[derive(Debug, Clone, PartialEq, Eq)]

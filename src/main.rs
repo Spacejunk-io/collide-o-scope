@@ -49,6 +49,7 @@ mod study;
 )]
 mod symmetry;
 mod temporal;
+mod transform_gizmo;
 mod transport;
 mod video;
 mod visual_rack;
@@ -574,21 +575,26 @@ fn proxy_assessment_status_from_observation(
     }
 }
 
+/// Every function below answers from `stage_map::native_controls_visible` and
+/// nothing else. They were four independent copies of `!output_on_main`; the
+/// transform gizmo is the fifth consumer, and five copies of a leakage
+/// boundary is four too many. Each name and arity is retained so the call
+/// sites stay byte-identical and no behavior change is representable here.
 const fn show_editor_panel(output_on_main: bool, editor_active: bool) -> bool {
-    editor_active && !output_on_main
+    editor_active && stage_map::native_controls_visible(output_on_main)
 }
 
 /// Single-monitor audience Output reuses the main swapchain, so every native
 /// control must disappear there just like the YAML editor does. A dedicated
 /// output has its own clean surface and may leave this strip on the preview.
 const fn show_native_recovery_strip(output_on_main: bool) -> bool {
-    !output_on_main
+    stage_map::native_controls_visible(output_on_main)
 }
 
 /// The editor-only health HUD follows the same no-leak boundary as every
 /// native control when the main swapchain temporarily is the audience output.
 const fn show_stage_editor_health(output_on_main: bool) -> bool {
-    !output_on_main
+    stage_map::native_controls_visible(output_on_main)
 }
 
 /// The native pointer gesture surface is drawn over the editor preview and is
@@ -596,7 +602,17 @@ const fn show_stage_editor_health(output_on_main: bool) -> bool {
 /// RECOVERY strip and the health HUD when the main swapchain is the audience
 /// output.
 const fn show_native_gesture_surface(output_on_main: bool) -> bool {
-    !output_on_main
+    stage_map::native_controls_visible(output_on_main)
+}
+
+/// The preview transform gizmo is a native control like every other one here.
+///
+/// It additionally requires a [`transform_gizmo::PreviewGizmoPermit`], which
+/// cannot be minted while `output_on_main` holds — so this predicate and the
+/// permit answer the same question from the same source, and the gizmo cannot
+/// be painted by satisfying only one of them.
+const fn show_transform_gizmo(output_on_main: bool) -> bool {
+    stage_map::native_controls_visible(output_on_main)
 }
 
 /// Stroke identities reserved for the host surfaces that have no stroke of
@@ -3541,6 +3557,25 @@ struct App {
     /// when the store refused the transaction, so a later `End` can never
     /// finish an entry that was never begun.
     gesture_history_open: Option<history::HistoryGestureId>,
+    /// The open preview transform-gizmo drag, if any.
+    ///
+    /// It carries its own captured scope, handle, and transform snapshot, so
+    /// nothing about an in-flight drag is re-read from live state. A topology
+    /// barrier aborts it rather than letting it land on a different program.
+    transform_gizmo_drag: Option<transform_gizmo::GizmoDrag>,
+    /// Routes the gizmo's pointer edges onto exactly one manual-history entry,
+    /// through the same tested router the etch surface uses rather than a
+    /// second open/close law written beside it.
+    transform_gizmo_history: history::GestureHistoryRouter,
+    /// Identity of the history entry a gizmo drag actually opened. `None` when
+    /// the store refused the transaction, so a later End cannot finish an entry
+    /// that was never begun.
+    transform_gizmo_history_open: Option<history::HistoryGestureId>,
+    /// The handle currently under the pointer, for painting only. It is
+    /// recomputed each frame and is never authored state.
+    transform_gizmo_hover: Option<transform_gizmo::GizmoHandle>,
+    /// Operator-facing gizmo diagnostics: a refused drag, an aborted gesture.
+    transform_gizmo_status: String,
     /// The one live gesture canvas. Its private staged snapshot is the frame
     /// transaction: an accepted frame commits, a rejected or abandoned frame
     /// discards, and a typed reset cause abandons whatever was open.
@@ -3944,6 +3979,11 @@ impl App {
             gesture_status: String::new(),
             gesture_history: history::GestureHistoryRouter::default(),
             gesture_history_open: None,
+            transform_gizmo_drag: None,
+            transform_gizmo_history: history::GestureHistoryRouter::default(),
+            transform_gizmo_history_open: None,
+            transform_gizmo_hover: None,
+            transform_gizmo_status: String::new(),
             gesture_canvas: gesture_canvas::GestureCanvasState::new(
                 default_gesture_canvas_grid(),
                 gesture_canvas::GestureCanvasParams::default(),
@@ -5245,6 +5285,12 @@ impl App {
         // already-latched captures bind itself to a later topology.
         self.quantized_actions
             .retain(|action| !matches!(action, web::state::WebAction::MorphCapture { .. }));
+        // This is the one barrier every topology edit crosses — add, remove,
+        // reorder, and patch apply all bump the revision — so it is the single
+        // place an open preview-gizmo drag is abandoned. Aborting here is what
+        // stops a drag that began on one stack from delivering its remaining
+        // delta to whatever now occupies that position.
+        self.abort_transform_gizmo_drag();
     }
 
     /// Turn live selected-layer matte edges into an explicit missing route
@@ -13255,6 +13301,348 @@ impl App {
         }
     }
 
+    // ---- Preview transform gizmo -----------------------------------------
+
+    /// The scope a gizmo drag would address right now.
+    ///
+    /// It reads the host's existing `selected_layer` — the same selection the
+    /// keyboard's Space already honors — rather than introducing a second
+    /// selection concept. The positional index is converted to a stable
+    /// identity here and nowhere else, so everything downstream carries the
+    /// identity and a reorder cannot slide a drag onto a different layer.
+    fn transform_gizmo_scope(&self) -> Option<transform_gizmo::GizmoScope> {
+        match self.selected_layer {
+            None => Some(transform_gizmo::GizmoScope::Master),
+            Some(index) => self
+                .layers
+                .get(index)
+                .map(|layer| transform_gizmo::GizmoScope::Layer(layer.stable_layer_id())),
+        }
+    }
+
+    /// Resolve one scope to its authored transform and the exact dimension
+    /// pair `EffectPassUniforms::for_target` uses for it.
+    ///
+    /// Master uses output/output; a layer uses its actual source size. Getting
+    /// this wrong would place handles on a transform nobody renders, so the
+    /// convention is read from the render path rather than restated.
+    fn transform_gizmo_frame(
+        &self,
+        scope: transform_gizmo::GizmoScope,
+    ) -> Option<transform_gizmo::GizmoFrame> {
+        let (width, height) = self.renderer.as_ref().map_or(
+            (FALLBACK_OUTPUT_WIDTH, FALLBACK_OUTPUT_HEIGHT),
+            |renderer| (renderer.output_width, renderer.output_height),
+        );
+        let output = (width, height);
+        match scope {
+            transform_gizmo::GizmoScope::Master => {
+                transform_gizmo::GizmoFrame::new(self.master_transform, output, output)
+            }
+            transform_gizmo::GizmoScope::Layer(layer_id) => {
+                let index = self.resolve_stable_layer_id(&layer_id.get().to_string())?;
+                let layer = self.layers.get(index)?;
+                transform_gizmo::GizmoFrame::new(
+                    layer.transform,
+                    (layer.width.max(1), layer.height.max(1)),
+                    output,
+                )
+            }
+        }
+    }
+
+    /// Apply one bounded edit set to a scope, reporting whether it authored.
+    ///
+    /// Every value travels as a real `SetMasterTransform` / `SetLayerTransform`
+    /// action through `handle_web_action_inner_with_feedback`. That is
+    /// deliberate and load-bearing in three separate ways:
+    ///
+    /// * it reaches `apply_spatial_transform_edit`, the one authoring function
+    ///   the browser numeric editor uses, so a gizmo edit and the identical
+    ///   numeric edit are the same call with the same arguments — byte
+    ///   identity is structural rather than something a test hopes for;
+    /// * it passes through `release_active_morph_for_manual_edit`, so a drag
+    ///   onto Morph-owned state transfers ownership exactly as a numeric edit
+    ///   does, instead of authoring under an engaged A/B pair and snapping back;
+    /// * it deliberately does not call `handle_web_action`, whose open-gesture
+    ///   guard rejects edits while a `NativeManual` gesture is active. That
+    ///   guard keys on the *gesture's* origin rather than the action's, so a
+    ///   dispatch through the outer entry point would refuse the gizmo's own
+    ///   edits. This is the identical seam the browser-gesture arm takes.
+    fn apply_transform_gizmo_edits(
+        &mut self,
+        scope: transform_gizmo::GizmoScope,
+        edits: transform_gizmo::GizmoEdits,
+    ) -> bool {
+        let mut authored = false;
+        for edit in edits.iter() {
+            let Some(number) = serde_json::Number::from_f64(f64::from(edit.value)) else {
+                // The edit set already sanitized every value, so a non-finite
+                // number cannot arrive here. It is dropped rather than
+                // unwrapped, because a panic on the render thread is a worse
+                // answer to an impossible case than doing nothing.
+                continue;
+            };
+            let action = match scope {
+                transform_gizmo::GizmoScope::Master => web::state::WebAction::SetMasterTransform {
+                    param: edit.param.as_str().to_string(),
+                    value: serde_json::Value::Number(number),
+                },
+                transform_gizmo::GizmoScope::Layer(layer_id) => {
+                    web::state::WebAction::SetLayerTransform {
+                        index: 0,
+                        layer_id: Some(layer_id.get().to_string()),
+                        param: edit.param.as_str().to_string(),
+                        value: serde_json::Value::Number(number),
+                    }
+                }
+            };
+            self.handle_web_action_inner_with_feedback(action);
+            authored = true;
+        }
+        authored
+    }
+
+    /// Dispatch one collected pointer edge.
+    fn apply_transform_gizmo_event(&mut self, event: transform_gizmo::GizmoPointerEvent) {
+        match event.phase {
+            transform_gizmo::GizmoPhase::Begin => self.begin_transform_gizmo_drag(event),
+            transform_gizmo::GizmoPhase::Move => {
+                let Some(drag) = self.transform_gizmo_drag else {
+                    return;
+                };
+                let edits = drag.update(event.output_uv, event.modifiers);
+                if edits.is_empty() {
+                    return;
+                }
+                if self.apply_transform_gizmo_edits(drag.scope(), edits) {
+                    if let Some(open) = self.transform_gizmo_drag.as_mut() {
+                        open.mark_committed();
+                    }
+                }
+            }
+            transform_gizmo::GizmoPhase::End => self.end_transform_gizmo_drag(),
+        }
+    }
+
+    fn begin_transform_gizmo_drag(&mut self, event: transform_gizmo::GizmoPointerEvent) {
+        if self.transform_gizmo_drag.is_some() {
+            return;
+        }
+        let Some(scope) = self.transform_gizmo_scope() else {
+            return;
+        };
+        let Some(frame) = self.transform_gizmo_frame(scope) else {
+            // A singular or non-finite transform renders nothing, so it offers
+            // no handle. There is deliberately no identity fallback: a
+            // grabbable control over pixels that will never appear would lie
+            // about what it is going to do.
+            self.transform_gizmo_status =
+                "Transform gizmo unavailable: the transform is not invertible".to_string();
+            return;
+        };
+        let Some((drag, _handle)) =
+            transform_gizmo::GizmoDrag::begin(scope, frame, event.output_uv)
+        else {
+            return;
+        };
+        // The router is what makes a five-hundred-sample drag exactly one undo
+        // entry: it opens here, and every intermediate Move is invisible to it.
+        let history::GestureHistoryStep::Open(id) = self.transform_gizmo_history.observe(
+            gesture::GestureOrigin::NativePointer,
+            gesture::GesturePhase::Begin,
+            GESTURE_NATIVE_STROKE,
+        ) else {
+            return;
+        };
+        let checkpoint = match self.history_checkpoint("Move transform", "transform_gizmo") {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                self.history_status = format!("Transform gizmo rejected before mutation: {error}");
+                let _ = self.transform_gizmo_history.abandon();
+                return;
+            }
+        };
+        let fingerprint = checkpoint.fingerprint();
+        match self.manual_history.begin_gesture(
+            id,
+            history::MutationOrigin::NativeManual,
+            checkpoint,
+        ) {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.transform_gizmo_history_open = Some(id);
+                self.history_gesture_begin = Some((id, fingerprint));
+            }
+            Ok(outcome) => {
+                self.history_status = format!("Transform gizmo history: {outcome:?}");
+                let _ = self.transform_gizmo_history.abandon();
+                return;
+            }
+            Err(error) => {
+                self.history_status = format!("Transform gizmo history could not open: {error}");
+                let _ = self.transform_gizmo_history.abandon();
+                return;
+            }
+        }
+        self.transform_gizmo_drag = Some(drag);
+        self.transform_gizmo_status.clear();
+    }
+
+    fn end_transform_gizmo_drag(&mut self) {
+        if self.transform_gizmo_drag.take().is_none() {
+            return;
+        }
+        if let history::GestureHistoryStep::Close(id) = self.transform_gizmo_history.observe(
+            gesture::GestureOrigin::NativePointer,
+            gesture::GesturePhase::End,
+            GESTURE_NATIVE_STROKE,
+        ) {
+            self.close_transform_gizmo_history(id);
+        }
+    }
+
+    fn close_transform_gizmo_history(&mut self, id: history::HistoryGestureId) {
+        if self.transform_gizmo_history_open.take() != Some(id) {
+            return;
+        }
+        let fingerprint = match self.capture_manual_history_world() {
+            Ok((_, canonical)) => history::fingerprint_canonical(&canonical),
+            Err(error) => {
+                self.history_status = format!("Transform gizmo capture failed: {error}");
+                return;
+            }
+        };
+        match self.manual_history.finish_gesture(id, fingerprint) {
+            Ok(history::HistoryRecordOutcome::Recorded) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("Transform gizmo {} committed", id.get());
+                self.append_recovery_checkpoint("transform_gizmo");
+            }
+            Ok(history::HistoryRecordOutcome::NoChange) => {
+                self.history_gesture_begin = None;
+                self.history_status = "Transform gizmo made no authored change".to_string();
+            }
+            Ok(outcome) => {
+                self.history_gesture_begin = None;
+                self.history_status = format!("Transform gizmo history: {outcome:?}");
+            }
+            Err(error) => {
+                self.history_status = format!("Transform gizmo could not finish: {error}");
+            }
+        }
+    }
+
+    /// Abandon an open drag without committing it.
+    ///
+    /// A topology or generation barrier replaced the authored world the open
+    /// checkpoint described, so the transaction is abandoned rather than
+    /// committed against a program that no longer exists. This is the same law
+    /// `clear_gesture_recording_state` applies to an open etch stroke, and it
+    /// is why a reorder mid-drag cannot deliver the remaining delta to whatever
+    /// now occupies the vacated position.
+    fn abort_transform_gizmo_drag(&mut self) {
+        let had_drag = self.transform_gizmo_drag.take().is_some();
+        if let Some(id) = self.transform_gizmo_history.abandon() {
+            if self.transform_gizmo_history_open.take() == Some(id) {
+                let _ = self.manual_history.cancel_gesture(id);
+                self.history_gesture_begin = None;
+            }
+        }
+        if had_drag {
+            self.transform_gizmo_status =
+                "Transform gizmo drag aborted: the layer stack changed".to_string();
+        }
+    }
+
+    /// Escape while a gizmo drag is open.
+    ///
+    /// Returns `true` when the gizmo consumed the key. Outside a drag it
+    /// consumes nothing at all, so Escape keeps its existing meaning
+    /// everywhere else in the application.
+    ///
+    /// Before the first committed value the drag is cancelled: the captured
+    /// transform is restored verbatim and the open history gesture is
+    /// abandoned, so nothing reaches the bounded stack. After a value has
+    /// committed, a cancel would be a lie — the program already moved — so the
+    /// gesture closes normally and an ordinary undo runs.
+    fn transform_gizmo_escape(&mut self) -> bool {
+        let Some(drag) = self.transform_gizmo_drag else {
+            return false;
+        };
+        match drag.cancel() {
+            transform_gizmo::GizmoCancel::Restore(transform) => {
+                self.restore_transform_gizmo_scope(drag.scope(), transform);
+                self.transform_gizmo_drag = None;
+                if let Some(id) = self.transform_gizmo_history.abandon() {
+                    if self.transform_gizmo_history_open.take() == Some(id) {
+                        let _ = self.manual_history.cancel_gesture(id);
+                        self.history_gesture_begin = None;
+                    }
+                }
+                self.transform_gizmo_status = "Transform gizmo drag cancelled".to_string();
+            }
+            transform_gizmo::GizmoCancel::UndoCommitted => {
+                self.end_transform_gizmo_drag();
+                self.restore_history_direction(false);
+                self.transform_gizmo_status =
+                    "Transform gizmo drag committed; undid the last gesture".to_string();
+            }
+        }
+        true
+    }
+
+    /// Put a captured transform back through the same authoring path an edit
+    /// takes, so a cancel cannot become a second way to write authored state.
+    fn restore_transform_gizmo_scope(
+        &mut self,
+        scope: transform_gizmo::GizmoScope,
+        transform: spatial::SpatialTransform,
+    ) {
+        let action = match scope {
+            transform_gizmo::GizmoScope::Master => {
+                web::state::WebAction::ApplyMasterTransform { transform }
+            }
+            transform_gizmo::GizmoScope::Layer(layer_id) => {
+                web::state::WebAction::ApplyLayerTransform {
+                    index: 0,
+                    layer_id: Some(layer_id.get().to_string()),
+                    transform,
+                }
+            }
+        };
+        self.handle_web_action_inner_with_feedback(action);
+    }
+
+    /// One keyboard nudge of the selected scope's position.
+    ///
+    /// A nudge is a complete authored gesture on its own, so it takes the
+    /// ordinary manual-history boundary rather than a drag's open/close
+    /// transaction. It is refused outright while a drag is open, because two
+    /// concurrent transactions on one scope would interleave.
+    fn apply_transform_gizmo_nudge(
+        &mut self,
+        nudge: transform_gizmo::GizmoNudge,
+        modifiers: transform_gizmo::GizmoModifiers,
+    ) -> bool {
+        if self.transform_gizmo_drag.is_some() {
+            return false;
+        }
+        let Some(scope) = self.transform_gizmo_scope() else {
+            return false;
+        };
+        let Some(frame) = self.transform_gizmo_frame(scope) else {
+            return false;
+        };
+        let edits = transform_gizmo::nudge_edits(frame.transform(), nudge, modifiers);
+        if edits.is_empty() {
+            return false;
+        }
+        self.apply_native_manual_action("Nudge transform", "transform_gizmo", |app| {
+            app.apply_transform_gizmo_edits(scope, edits);
+        });
+        true
+    }
+
     /// Arm or disarm recording. Disarming closes nothing: a stroke that was
     /// open when recording stopped stays explicitly incomplete in the track
     /// rather than gaining an `End` the operator never made.
@@ -17576,6 +17964,47 @@ impl ApplicationHandler for App {
                 }
 
                 let shift = self.modifiers.shift_key();
+
+                // The preview gizmo owns two keyboard laws, and both are
+                // deliberately scoped so that nothing outside a gizmo
+                // interaction changes meaning.
+                //
+                // Escape is consumed only while a drag is open. Everywhere
+                // else it keeps its existing behavior, including quitting.
+                // Arrow keys nudge only when they are unhandled today, so the
+                // established bindings are untouched.
+                if state == winit::event::ElementState::Pressed {
+                    if matches!(physical_key, PhysicalKey::Code(KeyCode::Escape))
+                        && self.transform_gizmo_escape()
+                    {
+                        return;
+                    }
+                    let nudge = match physical_key {
+                        PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                            Some(transform_gizmo::GizmoNudge::Left)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowRight) => {
+                            Some(transform_gizmo::GizmoNudge::Right)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowUp) => {
+                            Some(transform_gizmo::GizmoNudge::Up)
+                        }
+                        PhysicalKey::Code(KeyCode::ArrowDown) => {
+                            Some(transform_gizmo::GizmoNudge::Down)
+                        }
+                        _ => None,
+                    };
+                    if let Some(nudge) = nudge {
+                        let modifiers = transform_gizmo::GizmoModifiers {
+                            shift,
+                            alt: self.modifiers.alt_key(),
+                        };
+                        if self.apply_transform_gizmo_nudge(nudge, modifiers) {
+                            return;
+                        }
+                    }
+                }
+
                 let action = map_key(physical_key, state, shift);
 
                 if matches!(
@@ -17720,6 +18149,18 @@ impl ApplicationHandler for App {
                     };
                     let mut native_recovery_actions = Vec::new();
                     let mut native_gesture_samples = Vec::new();
+                    let mut transform_gizmo_events = Vec::new();
+                    // Resolved before the closure so the gizmo reads the same
+                    // authored state the rest of the frame does, and so the
+                    // closure needs no borrow of `self`. A scope whose
+                    // transform is not invertible resolves to `None` here and
+                    // therefore paints and hit-tests nothing at all.
+                    let transform_gizmo_frame = self
+                        .transform_gizmo_scope()
+                        .and_then(|scope| self.transform_gizmo_frame(scope));
+                    let mut transform_gizmo_hover_next = None;
+                    let transform_gizmo_active =
+                        self.transform_gizmo_drag.map(|drag| drag.handle());
 
                     let egui_context = self.egui_ctx.clone();
                     let stage_health_snapshot = self.stage_health_snapshot();
@@ -17793,23 +18234,112 @@ impl ApplicationHandler for App {
                                         })
                                         .inner;
                                     // The preview doubles as the native
-                                    // pointer/tablet gesture surface. It is a
-                                    // native control, so it disappears with
+                                    // pointer/tablet gesture surface and as
+                                    // the transform gizmo's surface. Both are
+                                    // native controls, so both disappear with
                                     // every other one when the main swapchain
                                     // is the audience output.
-                                    if show_native_gesture_surface(output_on_main) {
+                                    //
+                                    // They share one `interact`, and the
+                                    // sharing is the point: two overlapping
+                                    // interactions on the same rect would let
+                                    // egui's own resolution decide which
+                                    // control an operator grabbed. Routing one
+                                    // pointer explicitly keeps that decision
+                                    // here, where it is written down.
+                                    if show_native_gesture_surface(output_on_main)
+                                        || show_transform_gizmo(output_on_main)
+                                    {
                                         let rect = image.rect;
                                         let gesture_response = ui.interact(
                                             rect,
                                             ui.id().with("native_gesture_surface"),
                                             egui::Sense::drag(),
                                         );
-                                        collect_native_gesture_sample(
-                                            rect,
-                                            &gesture_response,
-                                            ui.ctx().pointer_latest_pos(),
-                                            &mut native_gesture_samples,
+                                        let pane = transform_gizmo::PreviewPaneRect::new(
+                                            [rect.min.x, rect.min.y],
+                                            [rect.width(), rect.height()],
                                         );
+                                        // An open drag keeps the pointer for
+                                        // its whole life; a new drag claims it
+                                        // only by starting on a handle.
+                                        let mut gizmo_owns_pointer =
+                                            transform_gizmo_active.is_some();
+                                        if show_transform_gizmo(output_on_main) {
+                                            if let (Some(frame), Some(permit)) = (
+                                                transform_gizmo_frame.as_ref(),
+                                                transform_gizmo::preview_gizmo_permit(
+                                                    &stage_map::StageSurface::EditorPreview,
+                                                    output_on_main,
+                                                ),
+                                            ) {
+                                                let pointer = gesture_response
+                                                    .interact_pointer_pos()
+                                                    .or_else(|| ui.ctx().pointer_latest_pos());
+                                                let output_uv = pointer.and_then(|pointer| {
+                                                    pane.output_uv([pointer.x, pointer.y])
+                                                });
+                                                // Hover is presentation only.
+                                                // Hit testing reads the
+                                                // transform and never writes
+                                                // it, so looking at a gizmo
+                                                // cannot move a patch off the
+                                                // exact legacy identity.
+                                                let hovered = output_uv
+                                                    .and_then(|uv| frame.hit_test(uv));
+                                                if gesture_response.drag_started()
+                                                    && hovered.is_some()
+                                                {
+                                                    gizmo_owns_pointer = true;
+                                                }
+                                                if gizmo_owns_pointer {
+                                                    let raw = ui.ctx().input(|i| i.modifiers);
+                                                    let modifiers =
+                                                        transform_gizmo::GizmoModifiers {
+                                                            shift: raw.shift,
+                                                            alt: raw.alt,
+                                                        };
+                                                    let phase = if gesture_response.drag_started() {
+                                                        Some(transform_gizmo::GizmoPhase::Begin)
+                                                    } else if gesture_response.drag_stopped() {
+                                                        Some(transform_gizmo::GizmoPhase::End)
+                                                    } else if gesture_response.dragged() {
+                                                        Some(transform_gizmo::GizmoPhase::Move)
+                                                    } else {
+                                                        None
+                                                    };
+                                                    if let (Some(phase), Some(output_uv)) =
+                                                        (phase, output_uv)
+                                                    {
+                                                        transform_gizmo_events.push(
+                                                            transform_gizmo::GizmoPointerEvent {
+                                                                phase,
+                                                                output_uv,
+                                                                modifiers,
+                                                            },
+                                                        );
+                                                    }
+                                                }
+                                                transform_gizmo_hover_next = hovered;
+                                                transform_gizmo::paint_transform_gizmo(
+                                                    ui.painter(),
+                                                    &permit,
+                                                    pane,
+                                                    frame,
+                                                    transform_gizmo_active.or(hovered),
+                                                );
+                                            }
+                                        }
+                                        if !gizmo_owns_pointer
+                                            && show_native_gesture_surface(output_on_main)
+                                        {
+                                            collect_native_gesture_sample(
+                                                rect,
+                                                &gesture_response,
+                                                ui.ctx().pointer_latest_pos(),
+                                                &mut native_gesture_samples,
+                                            );
+                                        }
                                     }
                                 }
                                 if show_stage_editor_health(output_on_main) {
@@ -17847,6 +18377,13 @@ impl ApplicationHandler for App {
                     // the same frame it was drawn in.
                     for sample in native_gesture_samples {
                         self.apply_native_gesture_sample(sample);
+                    }
+                    // Same deterministic local-last boundary: browser ingress
+                    // was drained first, so a physical operator's drag lands in
+                    // the frame it was made in.
+                    self.transform_gizmo_hover = transform_gizmo_hover_next;
+                    for event in transform_gizmo_events {
+                        self.apply_transform_gizmo_event(event);
                     }
 
                     // Controller transport is sampled before this frame's
@@ -25144,6 +25681,418 @@ mod app_state_tests {
         assert!(!app.morph.active());
         assert!(app.quantized_actions.is_empty());
         assert_ne!(app.visual_epoch, initial_epoch);
+    }
+
+    // ---- S6 preview transform gizmo --------------------------------------
+
+    /// Drive one gizmo drag end to end through the host's own dispatcher.
+    ///
+    /// It deliberately goes through `apply_transform_gizmo_event`, the same
+    /// entry point the egui frame calls, rather than poking the drag state
+    /// directly: the laws under test live in the host wiring, not in the
+    /// portable module that already has its own goldens.
+    fn drive_gizmo_drag(
+        app: &mut App,
+        grab: [f32; 2],
+        moves: &[[f32; 2]],
+        modifiers: transform_gizmo::GizmoModifiers,
+    ) {
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Begin,
+            output_uv: grab,
+            modifiers,
+        });
+        for step in moves {
+            app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+                phase: transform_gizmo::GizmoPhase::Move,
+                output_uv: *step,
+                modifiers,
+            });
+        }
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::End,
+            output_uv: moves.last().copied().unwrap_or(grab),
+            modifiers,
+        });
+    }
+
+    /// Where the master scope's move handle sits, in composition-output UV.
+    ///
+    /// Translation is a point handle, not the footprint body: the preview is
+    /// also the gesture-etch surface, and a body-sized target would claim every
+    /// drag over the image.
+    fn gizmo_move_handle(app: &App) -> [f32; 2] {
+        app.transform_gizmo_frame(transform_gizmo::GizmoScope::Master)
+            .expect("the master transform is renderable")
+            .handle_position(transform_gizmo::GizmoHandle::Translate)
+            .expect("the move handle is placed")
+    }
+
+    fn gizmo_test_app() -> App {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        // No selection means the master scope, which is the only scope an app
+        // fixture can reach without a real decoded media source.
+        app.selected_layer = None;
+        app
+    }
+
+    /// The delivery claim, in one fixture: a drag really moves the authored
+    /// transform, the identical numeric edit produces byte-identical authored
+    /// state, and a drag that moves nothing changes nothing.
+    ///
+    /// Byte identity here is structural rather than lucky — both paths reach
+    /// `apply_spatial_transform_edit` with the same param and the same value —
+    /// and that is exactly the property worth pinning, because the moment a
+    /// gizmo grows its own authoring branch this fixture fails.
+    #[test]
+    fn a_gizmo_drag_and_the_identical_numeric_edit_author_byte_identical_state() {
+        let mut app = gizmo_test_app();
+        let untouched = app.master_transform;
+        assert_eq!(untouched, spatial::SpatialTransform::default());
+
+        let grab = gizmo_move_handle(&app);
+        drive_gizmo_drag(
+            &mut app,
+            grab,
+            &[[grab[0] + 0.1, grab[1] - 0.05]],
+            transform_gizmo::GizmoModifiers::NONE,
+        );
+        let dragged = app.master_transform;
+        assert_ne!(
+            dragged, untouched,
+            "a drag must actually move the authored transform"
+        );
+
+        // The same values, authored the way the browser numeric editor does.
+        let mut numeric = gizmo_test_app();
+        for (param, value) in [
+            ("position_x", f64::from(dragged.position[0])),
+            ("position_y", f64::from(dragged.position[1])),
+        ] {
+            numeric.handle_web_action_inner_with_feedback(
+                web::state::WebAction::SetMasterTransform {
+                    param: param.to_string(),
+                    value: serde_json::json!(value),
+                },
+            );
+        }
+        assert_eq!(
+            numeric.master_transform, dragged,
+            "the gizmo must author exactly what the numeric path authors"
+        );
+
+        // A gesture that never moves the pointer authors nothing.
+        let mut still = gizmo_test_app();
+        let grab = gizmo_move_handle(&still);
+        drive_gizmo_drag(
+            &mut still,
+            grab,
+            &[grab],
+            transform_gizmo::GizmoModifiers::NONE,
+        );
+        assert_eq!(
+            still.master_transform, untouched,
+            "a no-op gesture must leave the authored transform byte-identical"
+        );
+    }
+
+    /// One drag is exactly one manual-history entry, no matter how many
+    /// intermediate moves it carried.
+    #[test]
+    fn one_gizmo_drag_is_exactly_one_undo_entry() {
+        let mut app = gizmo_test_app();
+        let before = app.manual_history.metrics().undo_depth;
+
+        let grab = gizmo_move_handle(&app);
+        let moves: Vec<[f32; 2]> = (1..=64)
+            .map(|step| [grab[0] + step as f32 * 0.002, grab[1]])
+            .collect();
+        drive_gizmo_drag(
+            &mut app,
+            grab,
+            &moves,
+            transform_gizmo::GizmoModifiers::NONE,
+        );
+
+        let metrics = app.manual_history.metrics();
+        assert!(
+            !metrics.gesture_open,
+            "the drag must close its own transaction"
+        );
+        assert_eq!(
+            metrics.undo_depth,
+            before + 1,
+            "sixty-four moves must cost the bounded stack exactly one entry"
+        );
+        assert!(app.transform_gizmo_drag.is_none());
+    }
+
+    /// A drag that authors nothing keeps the bounded stack untouched, so an
+    /// accidental click is not an undo step.
+    #[test]
+    fn a_gizmo_drag_that_authors_nothing_records_no_history_entry() {
+        let mut app = gizmo_test_app();
+        let before = app.manual_history.metrics().undo_depth;
+        let grab = gizmo_move_handle(&app);
+        drive_gizmo_drag(
+            &mut app,
+            grab,
+            &[grab],
+            transform_gizmo::GizmoModifiers::NONE,
+        );
+        assert_eq!(app.manual_history.metrics().undo_depth, before);
+    }
+
+    /// Escape's two meanings, and the difference between them is observable.
+    #[test]
+    fn escape_cancels_before_a_commit_and_undoes_after_one() {
+        // Before any commit: the captured transform is restored and nothing
+        // reaches the bounded stack.
+        let mut app = gizmo_test_app();
+        let untouched = app.master_transform;
+        let depth = app.manual_history.metrics().undo_depth;
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Begin,
+            output_uv: gizmo_move_handle(&app),
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        assert!(app.transform_gizmo_drag.is_some());
+        assert!(app.manual_history.metrics().gesture_open);
+        assert!(app.transform_gizmo_escape(), "Escape must be consumed");
+        assert!(app.transform_gizmo_drag.is_none());
+        assert!(!app.manual_history.metrics().gesture_open);
+        assert_eq!(app.manual_history.metrics().undo_depth, depth);
+        assert_eq!(app.master_transform, untouched);
+
+        // After a commit: the program already moved, so a cancel would be a
+        // lie. The gesture closes and an ordinary undo runs.
+        let mut app = gizmo_test_app();
+        let untouched = app.master_transform;
+        let grab = gizmo_move_handle(&app);
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Begin,
+            output_uv: grab,
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Move,
+            output_uv: [grab[0] + 0.15, grab[1] - 0.15],
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        assert_ne!(app.master_transform, untouched, "the drag must have moved");
+        assert!(app
+            .transform_gizmo_drag
+            .is_some_and(|drag| drag.has_committed()));
+        assert!(app.transform_gizmo_escape());
+        assert!(app.transform_gizmo_drag.is_none());
+        assert_eq!(
+            app.master_transform, untouched,
+            "an undo after a commit still returns the authored transform"
+        );
+
+        // Outside a drag the gizmo consumes nothing, so Escape keeps every
+        // other meaning it already had.
+        let mut idle = gizmo_test_app();
+        assert!(!idle.transform_gizmo_escape());
+    }
+
+    /// A topology edit mid-drag abandons the gesture instead of delivering the
+    /// remaining delta to whatever now occupies that position.
+    #[test]
+    fn a_topology_change_during_a_drag_aborts_it_without_retargeting() {
+        let mut app = gizmo_test_app();
+        let depth = app.manual_history.metrics().undo_depth;
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Begin,
+            output_uv: gizmo_move_handle(&app),
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        assert!(app.transform_gizmo_drag.is_some());
+        assert!(app.manual_history.metrics().gesture_open);
+
+        // Every topology edit — add, remove, reorder, patch apply — crosses
+        // this one barrier.
+        app.bump_layer_stack_revision();
+
+        assert!(app.transform_gizmo_drag.is_none(), "the drag must abort");
+        assert!(
+            !app.manual_history.metrics().gesture_open,
+            "the open checkpoint described a program that no longer exists"
+        );
+        assert_eq!(
+            app.manual_history.metrics().undo_depth,
+            depth,
+            "an aborted gesture is abandoned, not committed"
+        );
+        assert!(app.transform_gizmo_status.contains("aborted"));
+
+        // A stale Move after the abort authors nothing at all.
+        let after_abort = app.master_transform;
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Move,
+            output_uv: [0.9, 0.1],
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        assert_eq!(app.master_transform, after_abort);
+    }
+
+    /// Nudges take the ordinary manual-history boundary, and are refused while
+    /// a drag owns the scope.
+    #[test]
+    fn keyboard_nudges_follow_the_documented_law_and_yield_to_an_open_drag() {
+        let mut app = gizmo_test_app();
+        let depth = app.manual_history.metrics().undo_depth;
+        assert!(app.apply_transform_gizmo_nudge(
+            transform_gizmo::GizmoNudge::Right,
+            transform_gizmo::GizmoModifiers::NONE,
+        ));
+        assert!(
+            (app.master_transform.position[0] - transform_gizmo::NUDGE_STEP).abs() <= 1.0e-6,
+            "an unmodified nudge moves exactly one step"
+        );
+        assert_eq!(app.manual_history.metrics().undo_depth, depth + 1);
+
+        // Shift is the coarse step and Alt the fine one, both from the value
+        // the previous nudge left behind.
+        let before = app.master_transform.position[0];
+        app.apply_transform_gizmo_nudge(
+            transform_gizmo::GizmoNudge::Right,
+            transform_gizmo::GizmoModifiers {
+                shift: true,
+                alt: false,
+            },
+        );
+        assert!(
+            (app.master_transform.position[0] - before - transform_gizmo::NUDGE_COARSE_STEP).abs()
+                <= 1.0e-6
+        );
+
+        // An open drag owns the scope; a nudge into it is refused rather than
+        // interleaved with the drag's transaction.
+        app.apply_transform_gizmo_event(transform_gizmo::GizmoPointerEvent {
+            phase: transform_gizmo::GizmoPhase::Begin,
+            output_uv: gizmo_move_handle(&app),
+            modifiers: transform_gizmo::GizmoModifiers::NONE,
+        });
+        let held = app.master_transform;
+        assert!(!app.apply_transform_gizmo_nudge(
+            transform_gizmo::GizmoNudge::Left,
+            transform_gizmo::GizmoModifiers::NONE,
+        ));
+        assert_eq!(app.master_transform, held);
+    }
+
+    /// The gizmo cannot be painted on an audience surface, and single-monitor
+    /// Output removes it by the same predicate that removes every other native
+    /// control.
+    #[test]
+    fn the_gizmo_permit_and_the_native_control_predicate_agree() {
+        assert!(show_transform_gizmo(false));
+        assert!(!show_transform_gizmo(true));
+        // Every native control answers from one predicate, so they cannot
+        // drift into disagreeing about when the preview is safe to draw on.
+        assert_eq!(show_transform_gizmo(true), show_native_recovery_strip(true));
+        assert_eq!(
+            show_transform_gizmo(false),
+            show_native_recovery_strip(false)
+        );
+        assert_eq!(
+            show_transform_gizmo(true),
+            show_native_gesture_surface(true)
+        );
+        assert_eq!(show_transform_gizmo(true), show_stage_editor_health(true));
+        assert_eq!(show_transform_gizmo(true), show_editor_panel(true, true));
+
+        // And the permit refuses exactly the same cases.
+        assert!(transform_gizmo::preview_gizmo_permit(
+            &stage_map::StageSurface::EditorPreview,
+            false
+        )
+        .is_some());
+        assert!(transform_gizmo::preview_gizmo_permit(
+            &stage_map::StageSurface::EditorPreview,
+            true
+        )
+        .is_none());
+        for surface in [
+            stage_map::StageSurface::Composite,
+            stage_map::StageSurface::Audience,
+            stage_map::StageSurface::Spout,
+            stage_map::StageSurface::Record,
+            stage_map::StageSurface::Export,
+        ] {
+            assert!(transform_gizmo::preview_gizmo_permit(&surface, false).is_none());
+        }
+    }
+
+    /// A gizmo drag onto Morph-owned state transfers ownership exactly as a
+    /// numeric edit does.
+    ///
+    /// This is the load-bearing consequence of dispatching real transform
+    /// actions rather than mutating the field directly: `handle_web_action_inner`
+    /// runs `release_active_morph_for_manual_edit` first, so the engaged A/B
+    /// pair materializes and clears before the drag's first value lands. A
+    /// gizmo that wrote `self.master_transform` itself would author underneath
+    /// an engaged pair and snap back at the next materialization.
+    #[test]
+    fn a_gizmo_drag_releases_morph_ownership_before_authoring() {
+        let mut app = gizmo_test_app();
+        app.morph.a = Some(morph::MorphSlot {
+            master_transform: Some(spatial::SpatialTransform::default()),
+            ..morph::MorphSlot::default()
+        });
+        app.morph.b = Some(morph::MorphSlot {
+            master_transform: Some(spatial::SpatialTransform::default()),
+            ..morph::MorphSlot::default()
+        });
+        assert!(app.morph.active());
+        assert!(
+            app.morph.controls_master_transform(),
+            "the fixture must really own the master transform"
+        );
+
+        let grab = gizmo_move_handle(&app);
+        drive_gizmo_drag(
+            &mut app,
+            grab,
+            &[[grab[0] + 0.15, grab[1] - 0.1]],
+            transform_gizmo::GizmoModifiers::NONE,
+        );
+
+        assert!(
+            !app.morph.active(),
+            "the drag must transfer Morph ownership rather than author under it"
+        );
+        assert_ne!(app.master_transform, spatial::SpatialTransform::default());
+    }
+
+    /// A drag never activates the spatial path by being looked at, and the
+    /// master scope's frame is derived with the exact dimension convention the
+    /// render path uses.
+    #[test]
+    fn hovering_a_gizmo_leaves_a_legacy_patch_on_the_historical_sample() {
+        let app = gizmo_test_app();
+        let scope = app
+            .transform_gizmo_scope()
+            .expect("no selection resolves to the master scope");
+        assert_eq!(scope, transform_gizmo::GizmoScope::Master);
+        let frame = app
+            .transform_gizmo_frame(scope)
+            .expect("the default master transform is renderable");
+        assert!(
+            !frame.uniforms().is_spatially_active(),
+            "the fixture starts on the exact historical sample"
+        );
+        for probe in [[0.0, 0.0], [0.5, 0.5], [1.0, 1.0], [0.25, 0.75]] {
+            let _ = frame.hit_test(probe);
+        }
+        assert_eq!(app.master_transform, spatial::SpatialTransform::default());
+        assert!(!app
+            .transform_gizmo_frame(scope)
+            .expect("still renderable")
+            .uniforms()
+            .is_spatially_active());
     }
 
     #[test]

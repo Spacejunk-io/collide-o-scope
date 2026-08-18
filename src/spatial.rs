@@ -56,9 +56,19 @@ pub enum SamplingMode {
 /// Authored transform in normalized composition/source coordinates.
 ///
 /// Position zero means the composition center. Anchor is expressed in the
-/// original source UV rectangle. Changing only the anchor is therefore
-/// visually inert: it selects the pivot for later scale, rotation, and skew,
-/// rather than acting as an implicit translation.
+/// original source UV rectangle: it selects the pivot for later scale,
+/// rotation, and skew rather than acting as an implicit translation.
+///
+/// Changing only the anchor is visually inert exactly while the authored
+/// linear part is the identity — the whole `Stretch`/`Fit`/`Fill`/`Native`
+/// family at scale `[1, 1]` with no rotation and no skew, because the fit
+/// factor cancels. The precise condition is `forward == diag(fit_size)`; an
+/// anchor step `d` moves the sampled coordinate by exactly
+/// `(Identity - inverse * diag(fit_size)) * d`. Once a scale, rotation, or
+/// shear is authored the anchor is a genuine pivot, and moving a pivot moves
+/// the image — that is what a pivot is, not a defect. See
+/// `changing_only_anchor_is_inert_exactly_while_the_linear_part_is_identity`.
+///
 /// Positive rotation follows screen coordinates and therefore turns clockwise.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -329,8 +339,18 @@ impl SpatialGpuUniforms {
         }
     }
 
-    #[cfg(test)]
-    fn map_output_to_local(self, output_uv: [f32; 2]) -> [f32; 2] {
+    /// The canonical composition-output to cropped-source mapping.
+    ///
+    /// This is the same expression `sample_source` evaluates in
+    /// `effects.wgsl`, and it is the **only** inverse in the crate. Any
+    /// consumer that needs to reason about where a source pixel lands — the
+    /// preview transform gizmo, a future picker, a diagnostic — must call this
+    /// rather than rebuild the matrix from authored fields. Two inverses that
+    /// agree today would disagree the first time the forward order changes.
+    ///
+    /// It does not consult the valid flag: callers that must fail closed use
+    /// [`Self::hit_test_local`].
+    pub fn map_output_to_local(self, output_uv: [f32; 2]) -> [f32; 2] {
         [
             self.inverse_row_0[0] * output_uv[0]
                 + self.inverse_row_0[1] * output_uv[1]
@@ -339,6 +359,45 @@ impl SpatialGpuUniforms {
                 + self.inverse_row_1[1] * output_uv[1]
                 + self.inverse_row_1[2],
         ]
+    }
+
+    /// Whether the shader will sample this transform at all.
+    ///
+    /// False is the `invalid` case: a collapsed or singular transform, or a
+    /// zero dimension. The render path resolves it to transparent, so an
+    /// interactive consumer must refuse it rather than offer a control over
+    /// pixels that will never appear.
+    pub const fn is_spatially_valid(self) -> bool {
+        self.modes[2] == 1
+    }
+
+    /// Whether the active spatial path is selected.
+    ///
+    /// False means `spatial_modes.w == 0`: the exact historical full-frame
+    /// sample that legacy patches must keep. Reading this never changes it.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the exact-inactive-identity law is asserted by the spatial and gizmo goldens"
+        )
+    )]
+    pub const fn is_spatially_active(self) -> bool {
+        self.modes[3] == 1
+    }
+
+    /// Fail-closed [`Self::map_output_to_local`] for interactive consumers.
+    ///
+    /// `None` for an unrenderable transform or a non-finite result. There is
+    /// deliberately no identity fallback: handing back a usable coordinate for
+    /// a transform that renders nothing would let a control lie about what it
+    /// is about to do.
+    pub fn hit_test_local(self, output_uv: [f32; 2]) -> Option<[f32; 2]> {
+        if !self.is_spatially_valid() {
+            return None;
+        }
+        let local = self.map_output_to_local(output_uv);
+        (local[0].is_finite() && local[1].is_finite()).then_some(local)
     }
 }
 
@@ -613,6 +672,145 @@ mod tests {
         close(gpu.map_output_to_local([0.0, 0.0])[1], 0.0);
         close(gpu.map_output_to_local([1.0, 1.0])[0], 1.0);
         close(gpu.map_output_to_local([1.0, 1.0])[1], 1.0);
+    }
+
+    /// The anchor's inertness law, stated exactly rather than by example.
+    ///
+    /// `local = inverse * (output - target) + anchor_local`, and an anchor step
+    /// `d` moves `target` by `diag(fit_size) * d`, so the sampled coordinate
+    /// moves by exactly `(Identity - inverse * diag(fit_size)) * d` — a pure
+    /// translation of the mapping, independent of where it is sampled.
+    /// Inertness is therefore `forward == diag(fit_size)`, which the fit factor
+    /// makes true for every Fit mode at scale `[1, 1]` with no rotation and no
+    /// skew, and false as soon as a genuine linear part is authored.
+    ///
+    /// The weaker neighbour above only exercises the default transform, so it
+    /// would still pass if rotation silently started translating the source.
+    #[test]
+    fn changing_only_anchor_is_inert_exactly_while_the_linear_part_is_identity() {
+        const SOURCE: (u32, u32) = (640, 480);
+        const OUTPUT: (u32, u32) = (1920, 1080);
+        const STEP: [f32; 2] = [-0.35, 0.35];
+        let probes = [[0.0, 0.0], [0.25, 0.75], [0.5, 0.5], [1.0, 1.0]];
+
+        let displacement = |base: SpatialTransform| -> [f32; 2] {
+            let moved = SpatialTransform {
+                anchor: [base.anchor[0] + STEP[0], base.anchor[1] + STEP[1]],
+                ..base
+            };
+            let before = base.gpu_uniforms(SOURCE.0, SOURCE.1, OUTPUT.0, OUTPUT.1);
+            let after = moved.gpu_uniforms(SOURCE.0, SOURCE.1, OUTPUT.0, OUTPUT.1);
+            let mut observed = [0.0_f32; 2];
+            for (index, probe) in probes.into_iter().enumerate() {
+                let delta = [
+                    after.map_output_to_local(probe)[0] - before.map_output_to_local(probe)[0],
+                    after.map_output_to_local(probe)[1] - before.map_output_to_local(probe)[1],
+                ];
+                if index == 0 {
+                    observed = delta;
+                } else {
+                    // The predicted displacement is a pure translation, so
+                    // every probe must report the same delta.
+                    close(delta[0], observed[0]);
+                    close(delta[1], observed[1]);
+                }
+            }
+            observed
+        };
+
+        // Inert: every fit mode at the identity linear part. `Fit` matters —
+        // its fit_size is [0.75, 1.0] here, and it still cancels exactly.
+        for fit in [
+            FitMode::Stretch,
+            FitMode::Fit,
+            FitMode::Fill,
+            FitMode::Native,
+        ] {
+            let delta = displacement(SpatialTransform {
+                anchor: [0.5, 0.5],
+                fit,
+                ..SpatialTransform::default()
+            });
+            assert!(
+                delta[0].abs() <= 1.0e-5 && delta[1].abs() <= 1.0e-5,
+                "{fit:?} must keep an anchor-only change inert, saw {delta:?}"
+            );
+        }
+
+        // Not inert: a real linear part makes the anchor a genuine pivot, and
+        // the observed displacement must match the closed form exactly.
+        for base in [
+            SpatialTransform {
+                rotation_deg: 90.0,
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                scale: [2.0, 2.0],
+                ..SpatialTransform::default()
+            },
+            SpatialTransform {
+                skew_deg: 20.0,
+                ..SpatialTransform::default()
+            },
+        ] {
+            let observed = displacement(base);
+            assert!(
+                observed[0].abs() > 1.0e-3 || observed[1].abs() > 1.0e-3,
+                "an authored linear part must make the anchor a pivot, saw {observed:?}"
+            );
+            let gpu = base.gpu_uniforms(SOURCE.0, SOURCE.1, OUTPUT.0, OUTPUT.1);
+            // `(Identity - inverse * diag(fit_size)) * STEP`, with fit_size
+            // recovered from the mapping itself rather than restated: a unit
+            // anchor step scales by fit_size before the inverse sees it.
+            let fit_size = anchor_fit_size(base, SOURCE, OUTPUT);
+            let inverse = [
+                [gpu.inverse_row_0[0], gpu.inverse_row_0[1]],
+                [gpu.inverse_row_1[0], gpu.inverse_row_1[1]],
+            ];
+            let scaled = [STEP[0] * fit_size[0], STEP[1] * fit_size[1]];
+            let through = apply_2x2(inverse, scaled);
+            close(observed[0], STEP[0] - through[0]);
+            close(observed[1], STEP[1] - through[1]);
+        }
+    }
+
+    /// Recover the fit factor a transform applies, by measuring the target
+    /// displacement one unit of anchor produces. This keeps the test honest:
+    /// it re-derives the factor from `gpu_uniforms` instead of duplicating the
+    /// fit table the function under test owns.
+    fn anchor_fit_size(base: SpatialTransform, source: (u32, u32), output: (u32, u32)) -> [f32; 2] {
+        let step = 1.0_f32;
+        let mut fit = [0.0_f32; 2];
+        for axis in 0..2 {
+            let mut moved = base;
+            moved.anchor[axis] += step;
+            let before = base.gpu_uniforms(source.0, source.1, output.0, output.1);
+            let after = moved.gpu_uniforms(source.0, source.1, output.0, output.1);
+            // translate = anchor_local - inverse * target, so the change in
+            // `translate` isolates `anchor_local - inverse * diag(fit) * step`.
+            let inverse = [
+                [before.inverse_row_0[0], before.inverse_row_0[1]],
+                [before.inverse_row_1[0], before.inverse_row_1[1]],
+            ];
+            let translate_delta = [
+                after.inverse_row_0[2] - before.inverse_row_0[2],
+                after.inverse_row_1[2] - before.inverse_row_1[2],
+            ];
+            // translate_delta = step_local - inverse * diag(fit) * step_local,
+            // and step_local is `step` on this axis only.
+            let mut unit = [0.0_f32; 2];
+            unit[axis] = step;
+            let residual = [unit[0] - translate_delta[0], unit[1] - translate_delta[1]];
+            // residual = inverse * diag(fit) * unit, so undo the inverse.
+            let determinant = inverse[0][0] * inverse[1][1] - inverse[0][1] * inverse[1][0];
+            let forward = [
+                [inverse[1][1] / determinant, -inverse[0][1] / determinant],
+                [-inverse[1][0] / determinant, inverse[0][0] / determinant],
+            ];
+            let recovered = apply_2x2(forward, residual);
+            fit[axis] = recovered[axis] / step;
+        }
+        fit
     }
 
     #[test]

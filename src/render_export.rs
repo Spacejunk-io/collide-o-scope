@@ -16813,6 +16813,135 @@ mod effects_audit {
         output_path
     }
 
+    /// The S6 labeled export case: a transform authored by the preview gizmo,
+    /// rendered offline beside the identical transform authored numerically.
+    ///
+    /// Two files come out of this, and the claim is that they are decoded-frame
+    /// identical — `ffmpeg -i renders/audit_native_gizmo_transform.mp4 -f
+    /// framemd5 -` against the `_numeric` twin. That is the whole S6 pixel
+    /// claim: the gizmo introduces no geometry, so an offline render cannot
+    /// tell which surface authored the transform.
+    ///
+    /// It is also the case that proves the gizmo reaches the pixels at all —
+    /// the transform is a real rotation, scale, and translation well away from
+    /// the legacy identity, so a gizmo that silently authored nothing would
+    /// produce a frame identical to `base_patch` instead.
+    ///
+    /// There is deliberately no export-only gizmo path to exercise: the gizmo
+    /// exists only in the editor preview, and what crosses into a patch is an
+    /// ordinary `SpatialTransform`.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_native_gizmo_transform_pipeline() {
+        use crate::transform_gizmo::{
+            GizmoDrag, GizmoEdits, GizmoFrame, GizmoModifiers, GizmoScope,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        const OUTPUT: (u32, u32) = (320, 180);
+
+        // Author through the real drag law, exactly as the host would: grab a
+        // handle, move the pointer, take the absolute values it asks for.
+        let mut authored = SpatialTransform::default();
+        let apply = |edits: GizmoEdits, into: &mut SpatialTransform| {
+            for edit in edits.iter() {
+                assert!(
+                    crate::App::apply_spatial_transform_edit(
+                        into,
+                        edit.param.as_str(),
+                        &serde_json::json!(f64::from(edit.value)),
+                    ),
+                    "the gizmo vocabulary must be accepted by the one authoring function"
+                );
+            }
+        };
+
+        // A body drag, then a corner scale, then a rotation about the anchor.
+        let frame = GizmoFrame::new(authored, OUTPUT, OUTPUT).expect("identity is renderable");
+        let move_handle = frame
+            .handle_position(crate::transform_gizmo::GizmoHandle::Translate)
+            .expect("the move handle is placed");
+        let (translate, _) =
+            GizmoDrag::begin(GizmoScope::Master, frame, move_handle).expect("move handle hit");
+        apply(
+            translate.update(
+                [move_handle[0] + 0.15, move_handle[1] - 0.15],
+                GizmoModifiers::NONE,
+            ),
+            &mut authored,
+        );
+
+        let frame = GizmoFrame::new(authored, OUTPUT, OUTPUT).expect("still renderable");
+        let corner = frame
+            .handle_position(crate::transform_gizmo::GizmoHandle::Scale(
+                crate::transform_gizmo::ScaleCorner::BottomRight,
+            ))
+            .expect("the corner handle is placed");
+        let (scale, _) = GizmoDrag::begin(GizmoScope::Master, frame, corner).expect("corner hit");
+        apply(
+            scale.update([corner[0] - 0.18, corner[1] - 0.18], GizmoModifiers::NONE),
+            &mut authored,
+        );
+
+        let frame = GizmoFrame::new(authored, OUTPUT, OUTPUT).expect("still renderable");
+        let rotate_handle = frame
+            .handle_position(crate::transform_gizmo::GizmoHandle::Rotate)
+            .expect("the rotate handle is placed");
+        let (rotate, _) =
+            GizmoDrag::begin(GizmoScope::Master, frame, rotate_handle).expect("rotate hit");
+        let pivot = frame.anchor_output();
+        apply(
+            rotate.update([pivot[0] + 0.3, pivot[1] - 0.1], GizmoModifiers::NONE),
+            &mut authored,
+        );
+
+        assert_ne!(
+            authored,
+            SpatialTransform::default(),
+            "the drag sequence must leave the legacy identity, or this case proves nothing"
+        );
+
+        // The identical values, authored the way the browser numeric editor
+        // does: one absolute field at a time, through the same function.
+        let mut numeric = SpatialTransform::default();
+        for (param, value) in [
+            ("position_x", f64::from(authored.position[0])),
+            ("position_y", f64::from(authored.position[1])),
+            ("scale_x", f64::from(authored.scale[0])),
+            ("scale_y", f64::from(authored.scale[1])),
+            ("rotation_deg", f64::from(authored.rotation_deg)),
+        ] {
+            assert!(crate::App::apply_spatial_transform_edit(
+                &mut numeric,
+                param,
+                &serde_json::json!(value)
+            ));
+        }
+        assert_eq!(
+            numeric, authored,
+            "the two authoring surfaces must agree before a single frame renders"
+        );
+
+        let mut gizmo_patch = base_patch();
+        gizmo_patch.master_transform = authored;
+        render("native_gizmo_transform", gizmo_patch);
+
+        let mut numeric_patch = base_patch();
+        numeric_patch.master_transform = numeric;
+        render("native_gizmo_transform_numeric", numeric_patch);
+
+        // The untouched twin. Comparing against it is what makes the case
+        // discriminating rather than merely self-consistent: without it, a
+        // gizmo that authored nothing at all would still produce two identical
+        // files and look like a pass.
+        render("native_gizmo_transform_identity", base_patch());
+    }
+
     /// Two stacked clips, an ordinary single-donor Faraday transplant, and no
     /// image tap anywhere.
     ///
