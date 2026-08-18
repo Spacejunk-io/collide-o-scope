@@ -1285,6 +1285,10 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         // Deterministic OneBelow/current-frame donor at zero gain, matching the
         // image-mask variant law. The node is an exact bypass until authored.
         "displace" => Kind::Displace(visual_rack::RuntimeDisplaceParams::default()),
+        // Both slots start on the deterministic OneBelow/current-frame donor at
+        // zero mix, so an inserted node is an exact bypass that claims no image
+        // edge until the operator authors one.
+        "residual" => Kind::Residual(visual_rack::RuntimeResidualParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -1454,6 +1458,20 @@ fn set_runtime_node_param(
                     return Err(format!("{param} requires its ordered topology action"));
                 }
                 _ => return Err(format!("unsupported displace parameter {param}")),
+            },
+            Kind::Residual(params) => match param {
+                "mix" => params.mix = finite_json_f32(value)?,
+                "detail_gain" => params.detail_gain = finite_json_f32(value)?,
+                "block" => params.block = json_enum(value)?,
+                "quantization" => params.quantization = json_enum(value)?,
+                "seed" => params.seed = json_u32(value)?,
+                // Only the two routes rewrite the image dependency graph, so
+                // each owns the dedicated revision-protected ordered action
+                // that names its slot.
+                "structure_tap" | "detail_tap" => {
+                    return Err(format!("{param} requires its ordered topology action"));
+                }
+                _ => return Err(format!("unsupported residual parameter {param}")),
             },
         },
     }
@@ -3836,6 +3854,8 @@ impl App {
             input.resource_limits.max_texture_array_layers = limits.max_texture_array_layers;
             input.resource_limits.max_sampled_textures_per_shader_stage =
                 limits.max_sampled_textures_per_shader_stage;
+            input.resource_limits.min_uniform_buffer_offset_alignment =
+                limits.min_uniform_buffer_offset_alignment;
         }
         base.plan_composition(input)
             .map_err(|error| format!("creative graph preflight failed: {error}"))?;
@@ -3995,6 +4015,7 @@ impl App {
                 | WebAction::SetVisualNodeMaskVariant { .. }
                 | WebAction::SetVisualNodeRoute { .. }
                 | WebAction::SetVisualNodeDisplaceRoute { .. }
+                | WebAction::SetVisualNodeResidualRoute { .. }
                 | WebAction::SetCompositionGroupMatteRoute { .. }
                 | WebAction::SetCompositionGroupMatteParam { .. }
                 | WebAction::SetCompositionGroupParam { .. }
@@ -4265,6 +4286,47 @@ impl App {
                         staged,
                         true,
                         format!("Routed displace node {}", node_id.get()),
+                    )?;
+                }
+                WebAction::SetVisualNodeResidualRoute {
+                    scope,
+                    node_id,
+                    slot,
+                    route,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let tap = self.creative_route_from_snapshot(route, &staged.composition)?;
+                    let node = staged
+                        .rack_mut(scope)
+                        .and_then(|rack| rack.get_mut(node_id))
+                        .ok_or_else(|| format!("residual node {} is absent", node_id.get()))?;
+                    let visual_rack::RuntimeVisualNodeKind::Residual(params) = &mut node.kind
+                    else {
+                        return Err(format!("node {} is not a residual", node_id.get()));
+                    };
+                    // Exactly one named slot moves. The partner route, both
+                    // gains, both discrete laws and the seed keep their
+                    // authored values across a reroute.
+                    let named = params.route_mut(slot.slot()).ok_or_else(|| {
+                        format!("residual node {} has no such route slot", node_id.get())
+                    })?;
+                    *named = tap;
+                    normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!(
+                            "Routed residual node {} {} input",
+                            node_id.get(),
+                            slot.label()
+                        ),
                     )?;
                 }
                 WebAction::SetCompositionGroupMatteRoute {
@@ -6870,7 +6932,8 @@ impl App {
             | WebAction::MoveVisualNode { scope, .. }
             | WebAction::SetVisualNodeMaskVariant { scope, .. }
             | WebAction::SetVisualNodeRoute { scope, .. }
-            | WebAction::SetVisualNodeDisplaceRoute { scope, .. } => {
+            | WebAction::SetVisualNodeDisplaceRoute { scope, .. }
+            | WebAction::SetVisualNodeResidualRoute { scope, .. } => {
                 matches!(scope, CreativeScopeSnapshot::Master)
             }
             WebAction::Reroll {
@@ -14387,6 +14450,7 @@ impl App {
             | WebAction::SetVisualNodeMaskVariant { .. }
             | WebAction::SetVisualNodeRoute { .. }
             | WebAction::SetVisualNodeDisplaceRoute { .. }
+            | WebAction::SetVisualNodeResidualRoute { .. }
             | WebAction::SetCompositionGroupMatteRoute { .. }
             | WebAction::SetCompositionGroupMatteParam { .. }
             | WebAction::SetCompositionGroupParam { .. }
@@ -16849,6 +16913,10 @@ impl ApplicationHandler for App {
                         .resource_limits
                         .max_sampled_textures_per_shader_stage =
                         limits.max_sampled_textures_per_shader_stage;
+                    creative_input
+                        .resource_limits
+                        .min_uniform_buffer_offset_alignment =
+                        limits.min_uniform_buffer_offset_alignment;
                     let mut evaluated_creative =
                         match evaluated_frame.plan_composition(creative_input) {
                             Ok(plan) => Some(plan),
@@ -16917,6 +16985,10 @@ impl ApplicationHandler for App {
                             .resource_limits
                             .max_sampled_textures_per_shader_stage =
                             limits.max_sampled_textures_per_shader_stage;
+                        retry_input
+                            .resource_limits
+                            .min_uniform_buffer_offset_alignment =
+                            limits.min_uniform_buffer_offset_alignment;
                         evaluated_creative = match evaluated_frame.plan_composition(retry_input) {
                             Ok(plan) => Some(plan),
                             Err(error) => {
@@ -16999,6 +17071,10 @@ impl ApplicationHandler for App {
                                 .resource_limits
                                 .max_sampled_textures_per_shader_stage =
                                 limits.max_sampled_textures_per_shader_stage;
+                            cold_input
+                                .resource_limits
+                                .min_uniform_buffer_offset_alignment =
+                                limits.min_uniform_buffer_offset_alignment;
                             evaluated_creative = match evaluated_frame.plan_composition(cold_input)
                             {
                                 Ok(plan) => Some(plan),
@@ -20268,6 +20344,337 @@ mod app_state_tests {
             app.master_rack.get(grain_id).unwrap().kind,
             visual_rack::RuntimeVisualNodeKind::Grain(_)
         ));
+    }
+
+    #[test]
+    fn residual_browser_protocol_edits_values_and_barriers_each_route_slot_by_revision() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot,
+            ResidualRouteSlotSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "residual".into(),
+            composition_revision: app.composition_revision,
+        });
+        let node_id = app.master_rack.iter().next().unwrap().stable_id;
+        let params = |app: &App| match app.master_rack.get(node_id).unwrap().kind {
+            visual_rack::RuntimeVisualNodeKind::Residual(params) => params,
+            _ => panic!("inserted node must be a residual"),
+        };
+        // A newly inserted node is the deterministic exact-bypass default with
+        // both slots on the same neutral donor.
+        assert!(params(&app).is_exact_bypass());
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::OneBelow
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::OneBelow
+        );
+        assert_eq!(params(&app).block, visual_rack::ResidualBlock::Eight);
+        assert_eq!(
+            params(&app).quantization,
+            visual_rack::ResidualQuantization::Off
+        );
+        assert_eq!(params(&app).detail_gain, 1.0);
+
+        // Values, both discrete laws and the seed travel on the ordinary
+        // coalescible action.
+        let revision = app.composition_revision;
+        let set = |app: &mut App, param: &str, value: serde_json::Value| {
+            app.handle_web_action(WebAction::SetVisualNodeParam {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                node_kind: "residual".into(),
+                param: param.into(),
+                value,
+                composition_revision: revision,
+            });
+        };
+        set(&mut app, "mix", serde_json::json!(0.5));
+        set(&mut app, "detail_gain", serde_json::json!(2.5));
+        set(&mut app, "block", serde_json::json!("thirty_two"));
+        set(&mut app, "quantization", serde_json::json!("coarse"));
+        set(&mut app, "seed", serde_json::json!(0x00c0_ffee_u32));
+        assert_eq!(params(&app).mix, 0.5);
+        assert_eq!(params(&app).detail_gain, 2.5);
+        assert_eq!(params(&app).block, visual_rack::ResidualBlock::ThirtyTwo);
+        assert_eq!(
+            params(&app).quantization,
+            visual_rack::ResidualQuantization::Coarse
+        );
+        assert_eq!(params(&app).seed, 0x00c0_ffee);
+        assert!(!params(&app).is_exact_bypass());
+
+        // Hostile finite overshoot clamps and a non-finite value collapses to
+        // the neutral fallback, never to a clamped extreme.
+        set(&mut app, "mix", serde_json::json!(42.0));
+        assert_eq!(params(&app).mix, 1.0);
+        set(&mut app, "detail_gain", serde_json::json!(-9.0));
+        assert_eq!(params(&app).detail_gain, 0.0);
+        set(&mut app, "detail_gain", serde_json::json!(2.5));
+
+        // Neither route may be rewritten on the coalescible value path.
+        for param in ["structure_tap", "detail_tap"] {
+            set(&mut app, param, serde_json::json!("one_below"));
+        }
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "the structure route must reject the coalescible value path"
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "the detail route must reject the coalescible value path"
+        );
+
+        // Each slot reroutes independently and leaves its partner alone.
+        let clean_program = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::CleanProgram,
+            timing: visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let structure_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            slot: ResidualRouteSlotSnapshot::Structure,
+            route: clean_program.clone(),
+            composition_revision: structure_revision,
+        });
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::CleanProgram
+        );
+        assert_eq!(
+            params(&app).structure.timing,
+            visual_rack::EdgeTiming::PreviousFrame
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "rerouting one slot must never move its partner"
+        );
+        assert_ne!(
+            app.composition_revision, structure_revision,
+            "a route change is a topology barrier and advances the revision"
+        );
+        assert_eq!(params(&app).mix, 1.0, "a reroute preserves the values");
+        assert_eq!(params(&app).detail_gain, 2.5);
+        assert_eq!(params(&app).block, visual_rack::ResidualBlock::ThirtyTwo);
+        assert_eq!(
+            params(&app).quantization,
+            visual_rack::ResidualQuantization::Coarse
+        );
+        assert_eq!(params(&app).seed, 0x00c0_ffee);
+
+        let detail_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            slot: ResidualRouteSlotSnapshot::Detail,
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::AllBelow,
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            },
+            composition_revision: detail_revision,
+        });
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::AllBelow
+        );
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::CleanProgram,
+            "the structure route survives a detail reroute"
+        );
+
+        // A stale revision is rejected outright on either slot; both live
+        // routes are untouched.
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                slot,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                composition_revision: detail_revision,
+            });
+        }
+        assert_eq!(
+            params(&app).structure.source,
+            visual_rack::ResolvedImageSource::CleanProgram,
+            "a stale revision must never apply a reroute"
+        );
+        assert_eq!(
+            params(&app).detail.source,
+            visual_rack::ResolvedImageSource::AllBelow
+        );
+
+        // The route action is an ordered barrier that is never beat-latched
+        // and is always recognized as master-rack work.
+        let route_action = WebAction::SetVisualNodeResidualRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            slot: ResidualRouteSlotSnapshot::Structure,
+            route: clean_program,
+            composition_revision: app.composition_revision,
+        };
+        assert!(App::quantized_action_key(&route_action).is_none());
+        assert!(App::action_targets_master_rack(&route_action));
+
+        // Addressing a node of another kind is a typed refusal on either slot,
+        // not a silent rewrite of that node.
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 1,
+            node_kind: "grain".into(),
+            composition_revision: app.composition_revision,
+        });
+        let grain_id = app.master_rack.iter().nth(1).unwrap().stable_id;
+        for slot in [
+            ResidualRouteSlotSnapshot::Structure,
+            ResidualRouteSlotSnapshot::Detail,
+        ] {
+            app.handle_web_action(WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: grain_id.get().to_string(),
+                slot,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::OneBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                composition_revision: app.composition_revision,
+            });
+        }
+        assert!(matches!(
+            app.master_rack.get(grain_id).unwrap().kind,
+            visual_rack::RuntimeVisualNodeKind::Grain(_)
+        ));
+
+        // The published snapshot carries both routes and both diagnostics.
+        app.push_web_state();
+        let published = app.web_state.app.try_read().expect("published snapshot");
+        let node = published
+            .creative
+            .master_rack
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id.get().to_string())
+            .expect("the residual node is published");
+        assert_eq!(node.kind, "residual");
+        assert_eq!(
+            node.params["structure_tap"]["input"]["source"],
+            "clean_program"
+        );
+        assert_eq!(node.params["detail_tap"]["input"]["source"], "all_below");
+        assert_eq!(node.params["block"], "thirty_two");
+        assert_eq!(node.params["quantization"], "coarse");
+        assert_eq!(node.params["seed"], 0x00c0_ffee_u32);
+        assert_eq!(node.params["diagnostic"], "");
+    }
+
+    /// `ResetVisualProgram` replaces the master rack wholesale with the
+    /// synthetic legacy rack, so every reduced-resolution block-mean surface a
+    /// Residual node owned must be released with it. Nothing may survive the
+    /// swap, including a route edit already latched for a later downbeat.
+    #[test]
+    fn resetting_the_master_visual_program_releases_every_residual_mean_surface() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot,
+            ResidualRouteSlotSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "residual".into(),
+            composition_revision: app.composition_revision,
+        });
+        let node_id = app.master_rack.iter().next().unwrap().stable_id;
+        app.handle_web_action(WebAction::SetVisualNodeParam {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            node_kind: "residual".into(),
+            param: "mix".into(),
+            value: serde_json::json!(1.0),
+            composition_revision: app.composition_revision,
+        });
+
+        // A live Residual owns exactly two reduced-resolution surfaces and two
+        // reduced passes, on top of its single full-frame pass.
+        let live = app.master_rack.resource_budget().expect("live rack budget");
+        assert_eq!(live.reduced_resolution_surfaces, 2);
+        assert_eq!(live.reduced_resolution_passes, 2);
+        let live_signature = app.master_rack.topology_signature();
+
+        // Latch a route edit for a later downbeat and freeze the program, so
+        // the reset has to purge queued work as well as live topology.
+        app.quantized_actions
+            .push(WebAction::SetVisualNodeResidualRoute {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                slot: ResidualRouteSlotSnapshot::Detail,
+                route: CreativeImageTapSnapshot {
+                    input: CreativeImageSourceSnapshot::AllBelow,
+                    timing: visual_rack::EdgeTiming::CurrentFrame,
+                },
+                composition_revision: app.composition_revision,
+            });
+        app.quantized_actions.push(WebAction::SetLayerPaused {
+            index: 0,
+            layer_id: None,
+            paused: true,
+        });
+
+        app.handle_web_action(WebAction::ResetVisualProgram);
+
+        // No Residual node survives, so the reset rack declares no reduced
+        // pass and no reduced surface at all.
+        assert!(
+            !app.master_rack
+                .iter()
+                .any(|node| node.kind.tag() == visual_rack::NodeKindTag::Residual),
+            "the reset master rack must hold no residual node"
+        );
+        let reset = app
+            .master_rack
+            .resource_budget()
+            .expect("reset rack budget");
+        assert_eq!(reset.reduced_resolution_surfaces, 0);
+        assert_eq!(reset.reduced_resolution_passes, 0);
+        assert_ne!(
+            app.master_rack.topology_signature(),
+            live_signature,
+            "the executor must not be able to reuse a prepared segment whose \
+             mean surfaces belong to the discarded rack"
+        );
+
+        // The latched reroute is purged; unrelated latched transport survives.
+        assert!(
+            !app.quantized_actions
+                .iter()
+                .any(App::action_targets_master_rack),
+            "a latched master route edit must never resurrect a reset node"
+        );
+        assert!(app
+            .quantized_actions
+            .iter()
+            .any(|action| matches!(action, WebAction::SetLayerPaused { .. })));
     }
 
     #[test]

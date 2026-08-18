@@ -598,6 +598,100 @@ route, composition_revision }`. Snapshot params are
 same evaluated plan and the same rack shader; there is no export-only
 displacement path.
 
+### Named two-input Residual Counterpoint
+
+`Residual` is a Collision Rack node that recombines one route's large-scale
+structure with the carrier's detail measured against a second route.
+`NodeKindTag::Residual` holds append-only signature code 11; kind codes are
+never renumbered or reused.
+
+The recombination law, in linear premultiplied space:
+
+```text
+dc  = quantize(mean(structure))
+ac  = quantize(carrier_premultiplied - mean(detail))
+out = dc + detail_gain * ac
+```
+
+Authored state is `ResidualParams { algorithm_version, structure, detail,
+block, quantization, mix, detail_gain, seed }`. `mix` is
+`finite_clamp(v, 0.0, 0.0, 1.0)` and `detail_gain` is
+`finite_clamp(v, 1.0, 0.0, 4.0)`, so a non-finite input takes the neutral value
+rather than a clamped extreme. `ResidualBlock` is
+`Four | Eight | Sixteen | ThirtyTwo | SixtyFour` with codes 0…4, edges
+4/8/16/32/64 and `Eight` as the default. `ResidualQuantization` is
+`Off | Coarse | Medium | Fine` with codes 0…3 and levels 0/8/32/128; `Off`
+means exact identity, never a one-level collapse. A fixed `seed` shifts the
+quantization lattice per cell and is recalled, never re-drawn or interpolated.
+
+The node carries **two** authored route slots — slot 0 `structure`, slot 1
+`detail` — and both are read only through their reduced block means, never at
+full resolution. That is what keeps the recombination pass inside three
+simultaneously sampled textures: the carrier, `mean[0]` and `mean[1]`. A
+route's history age is exactly N or N-1 per slot, because `EdgeTiming` is
+`CurrentFrame | PreviousFrame` and nothing deeper is representable; the 24-deep
+clean-composite ring is a separate Temporal budget and is not reachable here.
+
+`ResidualParams::is_exact_bypass()` is `sanitized().mix == 0.0`, and the
+default is therefore an exact bypass. It is a real delegation: the planner
+collects no tap, the executor encodes no pass and allocates no mean surface,
+and the saved-patch dependency walk claims no edge. The admission predicate is
+character-identical in `collect_rack_taps`, `flush_segment`, and
+`collect_rack_dependencies`: enabled ∧ wet > 0 ∧ `!is_exact_bypass()`.
+
+Each mean cell is the premultiplied average of **four quadrant-centre loads**
+of its block — a bounded 4-tap estimator, not an exact box integral. Resource
+delta per active node, charged through the existing descriptor ledger:
+
+| Item | Exact charge |
+|---|---:|
+| Full-frame render passes | 1 |
+| Reduced-resolution passes | 2 |
+| Logical lookups/pixel | 3 |
+| Explicit texture operations/pixel | 12 |
+| Simultaneously sampled textures | 3 |
+| Cross-scope image taps | 2 |
+| New full-frame persistent surfaces | 0 |
+| Reduced-resolution surfaces | 2 |
+
+Block-mean bytes are charged through the byte-exact `ResidualResourcePlan`,
+never through `additional_rgba16_layers`, and meet the creative number only at
+the shared `MAX_CREATIVE_GPU_BYTES` cap where motion bytes join it. Every
+independent bound is its own typed rejection before any allocation: grid edge
+≤ 2,048, ≤ 2,100,000 cells per node, exactly 8 bytes per cell, exactly 2
+surfaces per node, ≤ 32 MiB per node, ≤ 64 MiB aggregate, ≤ 3 sampled
+textures, a 256-byte uniform stride, and ≤ 16 nominal active nodes. An
+over-budget grid is rejected with an actionable error, never silently clamped
+to a coarser one. `MAX_SAMPLED_TEXTURES_PER_PASS` stays 3.
+
+Routes, block, quantization and seed are stable authored topology. Morph
+interpolates `mix` and `detail_gain` only when both slots name the exact same
+pair of routes, switches `block` and `quantization` discretely at the midpoint,
+and carries slot A's `seed` verbatim. Dice and procedural generation mutate
+only `mix` and `detail_gain`, each node from its own stable RNG domain, and a
+generated mix that wakes a dormant edge records a transactional fallback.
+Modulation exposes only `mix` and `detail_gain`, under globally unique
+modulatable descriptor keys.
+
+The browser edits `mix`, `detail_gain`, `block`, `quantization` and `seed`
+through the ordinary coalescible parameter action. The two donors — the only
+fields that rewrite the image dependency graph — use the ordered,
+revision-protected `SetVisualNodeResidualRoute { scope, node_id, slot, route,
+composition_revision }`, which is priority, never coalesced and never latched
+into a Quantized batch. `slot` is a closed tagged vocabulary
+(`structure | detail`), not an index, so an unknown slot is a deserialization
+rejection rather than a positional fallback onto the partner input. Snapshot
+params are `{ structure_tap, detail_tap, block, quantization, mix,
+detail_gain, seed, diagnostic }`, and the diagnostic names the dead slot so a
+tombstone can never be read as belonging to the other route.
+
+Export consumes the same evaluated plan, the same two reduced block-mean
+passes and the same rack shader; there is no export-only recombination path.
+The `.motion.json` sidecar (schema 4) records, per admitted node, the scope,
+the discrete recombination law, the seed, and each slot's resolved or
+tombstoned route identity — stable identities only, never a host path or
+filesystem metadata.
+
 ## Patches and native parameter editor
 
 `PatchState::capture` includes master and layer state, stable source identity,
@@ -848,6 +942,25 @@ mislead browser tests.
   addresses, the uncoalesced revision-barriered browser route action, and a
   labeled export case. The two `renderer::rack::tests::gpu_displace_` fixtures
   carry the physical-GPU claim.
+- Residual Counterpoint tests must cover the append-only kind code 11 and the
+  two closed vocabularies, sanitize/exact-bypass laws including hostile
+  non-finite `mix`, the 1/2/3/12/3/2/2 descriptor ledger, the independent CPU
+  reference for the 4-tap block mean and the seeded lattice, constant-colour
+  (pure DC) and zero-mean (pure AC) fixtures, grid-border and non-divisible
+  dimensions, a transparent hostile-hidden-RGB donor decoding to exact zero,
+  `Off` as exact identity, fixed-seed stability with no leak into the route
+  table or the block grid, every independent resource limit rejected one unit
+  over with the byte cap proven to bind before the cell cap, per-slot planner
+  admission, self-cycle rejection with an admitted N-1 edge, per-slot
+  tombstones that never rebind after replacement, saved-patch
+  dormant-versus-woken edges, Morph both-slots route-match interpolation,
+  values-only Look/preset apply, Dice/generator value-only mutation,
+  `mix`/`detail_gain` modulation addresses, the uncoalesced
+  revision-barriered slot-naming browser route action, `ResetVisualProgram`
+  releasing every mean surface, bounded path-free export provenance per slot,
+  live/export payload parity at 24/30/60 fps, and a labeled export case. The
+  three `renderer::rack::tests::gpu_residual_` fixtures carry the
+  physical-GPU claim.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,

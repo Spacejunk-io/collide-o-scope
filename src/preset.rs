@@ -1149,6 +1149,100 @@ mod tests {
         ));
     }
 
+    /// Presets own no per-kind logic: `RackPreset::apply_to_runtime` delegates
+    /// to `crate::morph::apply_saved_rack_values_to_runtime`, so a node kind
+    /// missing its Morph arm makes the whole preset transaction refuse rather
+    /// than skip one node. This proves the Residual delegation end to end.
+    #[test]
+    fn rack_preset_copies_residual_values_but_preserves_both_donor_routes() {
+        use crate::visual_rack::{
+            ResidualBlock, ResidualQuantization, RuntimeResidualParams, RESIDUAL_DETAIL_SLOT,
+            RESIDUAL_STRUCTURE_SLOT,
+        };
+
+        let donor = layer_id(44);
+        let other_donor = layer_id(99);
+        let captured_structure = ResolvedImageTap {
+            source: ResolvedImageSource::SelectedLayer {
+                layer_id: donor,
+                saved_position: saved_position(3),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let mut source = RuntimeVisualRack::empty();
+        let node_id = source
+            .push(RuntimeVisualNodeKind::Residual(RuntimeResidualParams {
+                structure: captured_structure,
+                detail: ResolvedImageTap {
+                    source: ResolvedImageSource::OneBelow,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                block: ResidualBlock::ThirtyTwo,
+                quantization: ResidualQuantization::Coarse,
+                mix: 0.6,
+                detail_gain: 3.25,
+                seed: 8_675_309,
+                ..RuntimeResidualParams::default()
+            }))
+            .unwrap();
+        let preset =
+            RackPreset::capture_runtime(&source, |id| (id == donor).then(|| saved_position(3)))
+                .unwrap();
+
+        // The target holds different values on both slots and, critically, a
+        // different donor in each slot.
+        let live_structure = ResolvedImageTap {
+            source: ResolvedImageSource::SelectedLayer {
+                layer_id: other_donor,
+                saved_position: saved_position(8),
+                stage: LayerImageStage::PreLocalEffects,
+            },
+            timing: EdgeTiming::PreviousFrame,
+        };
+        let live_detail = ResolvedImageTap {
+            source: ResolvedImageSource::CleanProgram,
+            timing: EdgeTiming::PreviousFrame,
+        };
+        let mut target = source.clone();
+        let node = target.get_mut(node_id).unwrap();
+        node.enabled = false;
+        node.wet = 0.9;
+        node.blend = NodeBlend::Screen;
+        let RuntimeVisualNodeKind::Residual(params) = &mut node.kind else {
+            panic!("residual node")
+        };
+        params.structure = live_structure;
+        params.detail = live_detail;
+        params.block = ResidualBlock::Four;
+        params.quantization = ResidualQuantization::Fine;
+        params.mix = 0.05;
+        params.detail_gain = 0.5;
+        params.seed = 1;
+
+        preset.apply_to_runtime(&mut target).unwrap();
+        let node = target.get(node_id).unwrap();
+        assert!(node.enabled);
+        let RuntimeVisualNodeKind::Residual(params) = node.kind else {
+            panic!("residual node")
+        };
+        assert_eq!(params.mix, 0.6);
+        assert_eq!(params.detail_gain, 3.25);
+        assert_eq!(params.block, ResidualBlock::ThirtyTwo);
+        assert_eq!(params.quantization, ResidualQuantization::Coarse);
+        assert_eq!(params.seed, 8_675_309);
+        assert_eq!(
+            params.route(RESIDUAL_STRUCTURE_SLOT),
+            Some(live_structure),
+            "a preset must never retarget the live structure route"
+        );
+        assert_eq!(
+            params.route(RESIDUAL_DETAIL_SLOT),
+            Some(live_detail),
+            "a preset must never retarget the live detail route"
+        );
+    }
+
     #[test]
     fn topology_mismatch_rejects_without_partial_apply() {
         let mut saved = VisualRack::synthetic_legacy(LegacyRackScope::Layer);

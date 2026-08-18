@@ -30,7 +30,8 @@ use crate::renderer::motion::{
     MotionGpuScopeSpec, MotionRuntimeDiagnostic, MotionRuntimeMetrics,
 };
 use crate::renderer::rack::{
-    CollisionRackExecutor, RackGpuError, RackImageBindings, RackImageInput, RackSourceBinding,
+    CollisionRackExecutor, RackGpuError, RackImageBindings, RackImageInput, RackResidualMeans,
+    RackSourceBinding,
 };
 use crate::renderer::readback::{
     PreparedRgbaReadback, RecorderReadbackAdmission, RecorderReadbackAllocationSnapshot,
@@ -39,7 +40,9 @@ use crate::renderer::readback::{
     RecorderReadbackTag,
 };
 use crate::temporal::{TemporalFrameInput, TemporalResetCause, TemporalStateMetrics};
-use crate::visual_rack::{EdgeTiming, GroupId, MatteChannel, NodeId, VisualScopeId};
+use crate::visual_rack::{
+    EdgeTiming, GroupId, MatteChannel, NodeId, VisualScopeId, RACK_PRIMARY_ROUTE_SLOT,
+};
 
 pub(crate) const COMPOSITION_WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub(crate) const COMPOSITION_PRESENT_FORMAT: wgpu::TextureFormat =
@@ -385,7 +388,10 @@ struct PreparedRackSegment {
     /// Bind groups retain their texture views, so both committed N-1 read
     /// parities are prepared once and selected without allocating in encode.
     bindings: [RackImageBindings; 2],
-    tap_indices: Box<[(NodeId, crate::visual_rack::ResolvedImageTap, usize)]>,
+    /// Reduced block-mean surfaces for every active Residual node in this
+    /// segment, allocated once from the admitted plan and never in encode.
+    residual_means: RackResidualMeans,
+    tap_indices: Box<[(NodeId, u8, crate::visual_rack::ResolvedImageTap, usize)]>,
 }
 
 struct PreparedAdvanced {
@@ -2199,7 +2205,7 @@ impl PreparedAdvanced {
         let prelocal = self.rack_segments[prepared_index]
             .tap_indices
             .iter()
-            .find_map(|(_, _, tap_index)| {
+            .find_map(|(_, _, _, tap_index)| {
                 matches!(
                     self.taps[*tap_index].backing,
                     TapBacking::CurrentPreLocal { .. }
@@ -2210,11 +2216,11 @@ impl PreparedAdvanced {
             self.ensure_current_prelocal(encoder, tap_index)?;
         }
         for binding_index in 0..self.rack_segments[prepared_index].tap_indices.len() {
-            let (node_id, tap, tap_index) =
+            let (node_id, slot, tap, tap_index) =
                 self.rack_segments[prepared_index].tap_indices[binding_index];
             let valid = self.tap_ready(tap_index);
             let updated = self.rack_segments[prepared_index].bindings[self.tap_history_read_index]
-                .set_valid(node_id, tap, valid);
+                .set_valid(node_id, slot, tap, valid);
             debug_assert!(updated);
         }
         let report = self.rack.encode_at(
@@ -2223,6 +2229,7 @@ impl PreparedAdvanced {
             rack_plan,
             &self.ping_rack_source,
             &self.rack_segments[prepared_index].bindings[self.tap_history_read_index],
+            &self.rack_segments[prepared_index].residual_means,
             self.rack_segments[prepared_index].uniform_base_slot,
             plan.base().context().time_seconds,
         )?;
@@ -3033,6 +3040,10 @@ const fn bus_surface(bus: BusAssignment) -> HostSurface {
     }
 }
 
+/// Resolve one planned tap by its complete consumer identity. `RackNode`
+/// carries its route slot, so the first positional match is the exact route
+/// rather than whichever slot of a multi-route node happened to be collected
+/// first.
 fn tap_index_for_consumer(
     plan: &AdvancedCompositionPlan,
     consumer: ImageTapConsumer,
@@ -3068,21 +3079,28 @@ fn prepare_rack_segments(
             };
             let mut indices = Vec::new();
             for pass in rack_plan.passes() {
-                let Some(tap) = pass.kind.image_tap() else {
-                    continue;
-                };
-                let consumer = ImageTapConsumer::RackNode {
-                    scope,
-                    node_id: pass.node_id,
-                };
-                let Some(tap_index) = tap_index_for_consumer(plan, consumer) else {
-                    continue;
-                };
-                indices.push((pass.node_id, tap, tap_index));
+                // Every authored slot is bound independently. A single-route
+                // kind fills only the primary slot; a two-route kind reaches
+                // this loop twice and its donors can never alias.
+                for (index, tap) in pass.kind.image_taps().into_iter().enumerate() {
+                    let Some(tap) = tap else {
+                        continue;
+                    };
+                    let slot = u8::try_from(index).unwrap_or(RACK_PRIMARY_ROUTE_SLOT);
+                    let consumer = ImageTapConsumer::RackNode {
+                        scope,
+                        node_id: pass.node_id,
+                        slot,
+                    };
+                    let Some(tap_index) = tap_index_for_consumer(plan, consumer) else {
+                        continue;
+                    };
+                    indices.push((pass.node_id, slot, tap, tap_index));
+                }
             }
             let prelocal_donors = indices
                 .iter()
-                .filter_map(|(_, _, tap_index)| match taps[*tap_index].backing {
+                .filter_map(|(_, _, _, tap_index)| match taps[*tap_index].backing {
                     TapBacking::CurrentPreLocal { layer_id } => Some(layer_id),
                     _ => None,
                 })
@@ -3095,7 +3113,7 @@ fn prepare_rack_segments(
             let bindings = std::array::from_fn(|read_index| {
                 let inputs = indices
                     .iter()
-                    .map(|(node_id, tap, tap_index)| {
+                    .map(|(node_id, slot, tap, tap_index)| {
                         let view = match taps[*tap_index].backing {
                             TapBacking::Transparent => None,
                             _ => Some(prepared_tap_view(
@@ -3108,6 +3126,7 @@ fn prepare_rack_segments(
                         };
                         RackImageInput {
                             node_id: *node_id,
+                            slot: *slot,
                             tap: *tap,
                             view,
                         }
@@ -3116,9 +3135,10 @@ fn prepare_rack_segments(
                 rack.prepare_image_bindings(device, &inputs)
             });
             let [first, second] = bindings;
+            let residual_means = rack.prepare_residual_means(device, rack_plan)?;
             let uniform_base_slot = next_uniform_slot;
             next_uniform_slot = next_uniform_slot
-                .checked_add(rack_plan.passes().len().saturating_add(1))
+                .checked_add(rack_plan.uniform_slots())
                 .ok_or_else(|| {
                     CompositionGpuError::InvalidSchedule(
                         "rack uniform slot count overflowed during preparation".into(),
@@ -3129,6 +3149,7 @@ fn prepare_rack_segments(
                 segment_index: *segment_index,
                 uniform_base_slot,
                 bindings: [first?, second?],
+                residual_means,
                 tap_indices: indices.into_boxed_slice(),
             });
         }
@@ -3161,7 +3182,7 @@ fn rack_uniform_slot_count(plan: &AdvancedCompositionPlan) -> Result<usize, Comp
                 continue;
             };
             count = count
-                .checked_add(rack_plan.passes().len().saturating_add(1))
+                .checked_add(rack_plan.uniform_slots())
                 .ok_or_else(|| {
                     CompositionGpuError::InvalidSchedule(
                         "rack uniform slot count overflowed during planning".into(),

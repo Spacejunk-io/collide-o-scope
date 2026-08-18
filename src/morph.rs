@@ -28,7 +28,7 @@ use crate::spatial::SpatialTransform;
 use crate::temporal::CollisionScoreLoopDriver;
 use crate::visual_rack::{
     CellularParams, DigitalColorParams, DisplaceParams, EllipseMask, GrainParams, ImageMatte,
-    KeyParams, MaskParams, RectangleMask, RuntimeImageMatte, RuntimeMaskParams,
+    KeyParams, MaskParams, RectangleMask, ResidualParams, RuntimeImageMatte, RuntimeMaskParams,
     RuntimeVisualNodeKind, RuntimeVisualRack, SavedImageSource, ShiftParams, VisualNodeKind,
     VisualRack,
 };
@@ -1128,26 +1128,53 @@ fn remapped_saved_position_after_move(
         .unwrap_or(position)
 }
 
+/// Visit every authored saved image route a node owns, in slot order. The match
+/// is exhaustive so a new routed kind cannot be silently skipped, and a
+/// multi-slot kind yields every slot: rewriting one route of a pair and leaving
+/// its partner stale would desynchronize the two Morph endpoints and make the
+/// node's own route-equality gate refuse to interpolate.
+fn for_each_saved_node_route(
+    kind: &mut VisualNodeKind,
+    mut visit: impl FnMut(&mut crate::visual_rack::SavedImageTap),
+) {
+    match kind {
+        VisualNodeKind::Mask(MaskParams::Image(matte)) => visit(&mut matte.tap),
+        VisualNodeKind::Displace(params) => visit(&mut params.tap),
+        VisualNodeKind::Residual(params) => {
+            visit(&mut params.structure);
+            visit(&mut params.detail);
+        }
+        VisualNodeKind::LegacyCanonical
+        | VisualNodeKind::LegacyTemporal
+        | VisualNodeKind::Transform(_)
+        | VisualNodeKind::DigitalColor(_)
+        | VisualNodeKind::Key(_)
+        | VisualNodeKind::Cellular(_)
+        | VisualNodeKind::Shift(_)
+        | VisualNodeKind::Grain(_)
+        | VisualNodeKind::Mask(MaskParams::Rectangle(_) | MaskParams::Ellipse(_)) => {}
+    }
+}
+
 fn remap_saved_rack_routes_after_move(rack: &mut VisualRack, from: usize, to: usize) {
     let node_ids = rack.iter().map(|node| node.stable_id).collect::<Vec<_>>();
     for node_id in node_ids {
         let Some(node) = rack.get_mut(node_id) else {
             continue;
         };
-        let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
-            continue;
-        };
-        let SavedImageSource::SelectedLayer {
-            layer_position,
-            stage,
-        } = matte.tap.source
-        else {
-            continue;
-        };
-        matte.tap.source = SavedImageSource::SelectedLayer {
-            layer_position: remapped_saved_position_after_move(layer_position, from, to),
-            stage,
-        };
+        for_each_saved_node_route(&mut node.kind, |tap| {
+            let SavedImageSource::SelectedLayer {
+                layer_position,
+                stage,
+            } = tap.source
+            else {
+                return;
+            };
+            tap.source = SavedImageSource::SelectedLayer {
+                layer_position: remapped_saved_position_after_move(layer_position, from, to),
+                stage,
+            };
+        });
     }
 }
 
@@ -1157,36 +1184,35 @@ fn remap_saved_rack_routes_after_remove(rack: &mut VisualRack, removed: usize) {
         let Some(node) = rack.get_mut(node_id) else {
             continue;
         };
-        let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind else {
-            continue;
-        };
-        let SavedImageSource::SelectedLayer {
-            layer_position,
-            stage,
-        } = matte.tap.source
-        else {
-            continue;
-        };
-        let position_index = layer_position.get() as usize;
-        matte.tap.source = if position_index == removed {
-            SavedImageSource::MissingSelectedLayer {
-                saved_position: layer_position,
+        for_each_saved_node_route(&mut node.kind, |tap| {
+            let SavedImageSource::SelectedLayer {
+                layer_position,
                 stage,
-            }
-        } else if position_index > removed {
-            SavedImageSource::SelectedLayer {
-                layer_position: crate::performance::SavedLayerPosition::new(
-                    layer_position
-                        .get()
-                        .checked_sub(1)
-                        .expect("a position greater than the removed index is nonzero"),
-                )
-                .expect("decrementing a valid saved position remains valid"),
-                stage,
-            }
-        } else {
-            matte.tap.source
-        };
+            } = tap.source
+            else {
+                return;
+            };
+            let position_index = layer_position.get() as usize;
+            tap.source = if position_index == removed {
+                SavedImageSource::MissingSelectedLayer {
+                    saved_position: layer_position,
+                    stage,
+                }
+            } else if position_index > removed {
+                SavedImageSource::SelectedLayer {
+                    layer_position: crate::performance::SavedLayerPosition::new(
+                        layer_position
+                            .get()
+                            .checked_sub(1)
+                            .expect("a position greater than the removed index is nonzero"),
+                    )
+                    .expect("decrementing a valid saved position remains valid"),
+                    stage,
+                }
+            } else {
+                tap.source
+            };
+        });
     }
 }
 
@@ -2241,6 +2267,7 @@ fn saved_node_topology_matches(a: VisualNodeKind, b: VisualNodeKind) -> bool {
         ) => image_matte_route_matches(a, b),
         (VisualNodeKind::Mask(_), VisualNodeKind::Mask(_)) => false,
         (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => displace_route_matches(a, b),
+        (VisualNodeKind::Residual(a), VisualNodeKind::Residual(b)) => residual_route_matches(a, b),
         _ => true,
     }
 }
@@ -2253,6 +2280,14 @@ fn image_matte_route_matches(a: ImageMatte, b: ImageMatte) -> bool {
 /// Two different routes are different topology, not two ends of a blend.
 fn displace_route_matches(a: DisplaceParams, b: DisplaceParams) -> bool {
     a.tap == b.tap
+}
+
+/// Residual owns two authored routes and both are compared, slot by slot. A
+/// pair that agrees on structure but not on detail is still different topology:
+/// blending across a mismatched donor would recombine one snapshot's large
+/// scale with an image the other snapshot never named.
+fn residual_route_matches(a: ResidualParams, b: ResidualParams) -> bool {
+    a.routes() == b.routes()
 }
 
 fn interpolate_rack(
@@ -2314,6 +2349,9 @@ fn interpolate_node_kind(
         (VisualNodeKind::Displace(a), VisualNodeKind::Displace(b)) => {
             VisualNodeKind::Displace(interpolate_displace(a, b, weights, choose_b)?)
         }
+        (VisualNodeKind::Residual(a), VisualNodeKind::Residual(b)) => {
+            VisualNodeKind::Residual(interpolate_residual(a, b, weights, choose_b)?)
+        }
         _ => return None,
     })
 }
@@ -2335,6 +2373,44 @@ fn interpolate_displace(
         amount_x: blend_finite(a.amount_x, b.amount_x, weights),
         amount_y: blend_finite(a.amount_y, b.amount_y, weights),
         boundary: pick(a.boundary, b.boundary, choose_b),
+    })
+}
+
+/// `mix` and `detail_gain` blend continuously; the block vocabulary and the
+/// quantization law are discrete and switch at the midpoint like every other
+/// authored enum. Both routes are topology: A/B compatibility already proved
+/// the pair equal, so they are carried, never interpolated.
+///
+/// Each endpoint is normalized before the blend because `detail_gain` is
+/// neutral at one, not at zero: `blend_finite`'s hostile fallback would
+/// otherwise silence a gain that neither snapshot authored as silent.
+fn interpolate_residual(
+    a: ResidualParams,
+    b: ResidualParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> Option<ResidualParams> {
+    if !residual_route_matches(a, b) {
+        return None;
+    }
+    Some(ResidualParams {
+        algorithm_version: pick(a.algorithm_version, b.algorithm_version, choose_b),
+        structure: a.structure,
+        detail: a.detail,
+        block: pick(a.block, b.block, choose_b),
+        quantization: pick(a.quantization, b.quantization, choose_b),
+        mix: blend_finite(
+            finite_clamp(a.mix, 0.0, 0.0, 1.0),
+            finite_clamp(b.mix, 0.0, 0.0, 1.0),
+            weights,
+        ),
+        detail_gain: blend_finite(
+            finite_clamp(a.detail_gain, 1.0, 0.0, 4.0),
+            finite_clamp(b.detail_gain, 1.0, 0.0, 4.0),
+            weights,
+        ),
+        // Seed identity is an endpoint recall, never an interpolated RNG.
+        seed: pick(a.seed, b.seed, choose_b),
     })
 }
 
@@ -2621,6 +2697,10 @@ fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKi
             apply_saved_displace_values(value, live);
             true
         }
+        (VisualNodeKind::Residual(value), VisualNodeKind::Residual(live)) => {
+            apply_saved_residual_values(value, live);
+            true
+        }
         _ => false,
     }
 }
@@ -2635,6 +2715,23 @@ fn apply_saved_displace_values(sampled: DisplaceParams, live: &mut DisplaceParam
     live.amount_x = sampled.amount_x;
     live.amount_y = sampled.amount_y;
     live.boundary = sampled.boundary;
+}
+
+/// Values only. Both live donor routes are preserved so applying a Look or a
+/// preset can never silently retarget either half of a Residual recombination.
+/// The quantization seed is a captured value here, not routing topology, so it
+/// transfers exactly like the block and quantization laws.
+#[allow(
+    dead_code,
+    reason = "implementation detail of retained saved value application"
+)]
+fn apply_saved_residual_values(sampled: ResidualParams, live: &mut ResidualParams) {
+    live.algorithm_version = sampled.algorithm_version;
+    live.block = sampled.block;
+    live.quantization = sampled.quantization;
+    live.mix = sampled.mix;
+    live.detail_gain = sampled.detail_gain;
+    live.seed = sampled.seed;
 }
 
 #[allow(
@@ -2828,6 +2925,16 @@ fn apply_saved_node_kind_values_to_runtime(
             live.boundary = value.boundary;
             true
         }
+        (VisualNodeKind::Residual(value), RuntimeVisualNodeKind::Residual(live)) => {
+            // Values only; both live donor routes stay under topology control.
+            live.algorithm_version = value.algorithm_version;
+            live.block = value.block;
+            live.quantization = value.quantization;
+            live.mix = value.mix;
+            live.detail_gain = value.detail_gain;
+            live.seed = value.seed;
+            true
+        }
         _ => false,
     }
 }
@@ -2859,6 +2966,12 @@ fn runtime_racks_share_strict_topology(a: &RuntimeVisualRack, b: &RuntimeVisualR
             ) => a.tap == b.tap && a.channel == b.channel && a.invert == b.invert,
             (RuntimeVisualNodeKind::Displace(a), RuntimeVisualNodeKind::Displace(b)) => {
                 a.tap == b.tap
+            }
+            // Both authored routes are compared slot by slot: a Look whose
+            // structure route agrees but whose detail route does not is a
+            // different recombination, not a values-only difference.
+            (RuntimeVisualNodeKind::Residual(a), RuntimeVisualNodeKind::Residual(b)) => {
+                a.routes() == b.routes()
             }
             _ => true,
         })
@@ -2928,6 +3041,16 @@ fn apply_runtime_node_kind_values(
             live.amount_x = value.amount_x;
             live.amount_y = value.amount_y;
             live.boundary = value.boundary;
+            true
+        }
+        (RuntimeVisualNodeKind::Residual(value), RuntimeVisualNodeKind::Residual(live)) => {
+            // Values only; both live donor routes stay under topology control.
+            live.algorithm_version = value.algorithm_version;
+            live.block = value.block;
+            live.quantization = value.quantization;
+            live.mix = value.mix;
+            live.detail_gain = value.detail_gain;
+            live.seed = value.seed;
             true
         }
         _ => false,
@@ -4911,5 +5034,321 @@ glide:
             "strict apply must reject a Displace whose donor differs"
         );
         assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
+    }
+
+    fn residual_rack(params: ResidualParams) -> VisualRack {
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Residual(params)).unwrap();
+        rack
+    }
+
+    /// The single saved Residual node of a fixture rack.
+    fn residual_of(rack: &VisualRack) -> ResidualParams {
+        let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        params
+    }
+
+    #[test]
+    fn morph_interpolates_residual_values_only_when_both_route_slots_match() {
+        use crate::visual_rack::{ResidualBlock, ResidualQuantization};
+
+        // `displace_tap` is a plain saved layer route and carries no kind of
+        // its own; both Residual slots are built from it at distinct positions.
+        let structure = displace_tap(3);
+        let detail = displace_tap(5);
+        let a = residual_rack(ResidualParams {
+            structure,
+            detail,
+            block: ResidualBlock::Four,
+            quantization: ResidualQuantization::Off,
+            mix: 0.0,
+            detail_gain: 0.0,
+            seed: 11,
+            ..ResidualParams::default()
+        });
+        let b = residual_rack(ResidualParams {
+            structure,
+            detail,
+            block: ResidualBlock::SixtyFour,
+            quantization: ResidualQuantization::Fine,
+            mix: 1.0,
+            detail_gain: 4.0,
+            seed: 97,
+            ..ResidualParams::default()
+        });
+
+        // Midpoint: both continuous values blend, both discrete laws switch at
+        // the midpoint, both routes are carried, and the seed is recalled from
+        // an endpoint rather than mixed into a third unauthored lattice.
+        let sampled = interpolate_rack(&a, &b, [0.5, 0.5], true).expect("both route slots match");
+        let params = residual_of(&sampled);
+        assert!((params.mix - 0.5).abs() <= 1.0e-6);
+        assert!((params.detail_gain - 2.0).abs() <= 1.0e-6);
+        assert_eq!(params.block, ResidualBlock::SixtyFour);
+        assert_eq!(params.quantization, ResidualQuantization::Fine);
+        assert_eq!(params.structure, structure);
+        assert_eq!(params.detail, detail);
+        assert_eq!(
+            params.seed, 97,
+            "a seed is an endpoint recall, never an interpolated RNG"
+        );
+
+        // Endpoints are exact on the continuous values, the two discrete laws,
+        // and the seed.
+        for (weights, choose_b, expected_mix, expected_gain, expected_block, expected_seed) in [
+            (
+                [1.0_f32, 0.0_f32],
+                false,
+                0.0_f32,
+                0.0_f32,
+                ResidualBlock::Four,
+                11_u32,
+            ),
+            ([0.0, 1.0], true, 1.0, 4.0, ResidualBlock::SixtyFour, 97),
+        ] {
+            let sampled = interpolate_rack(&a, &b, weights, choose_b).unwrap();
+            let params = residual_of(&sampled);
+            assert_eq!(params.mix, expected_mix);
+            assert_eq!(params.detail_gain, expected_gain);
+            assert_eq!(params.block, expected_block);
+            assert_eq!(params.seed, expected_seed);
+        }
+
+        // A different structure route alone is different topology.
+        let restructured = residual_rack(ResidualParams {
+            structure: displace_tap(4),
+            ..residual_of(&b)
+        });
+        assert!(interpolate_rack(&a, &restructured, [0.5, 0.5], false).is_none());
+
+        // And so is a different detail route alone. A one-slot route predicate
+        // would agree on `structure` and blend two unrelated recombinations.
+        let redetailed = residual_rack(ResidualParams {
+            detail: displace_tap(6),
+            ..residual_of(&b)
+        });
+        assert!(
+            interpolate_rack(&a, &redetailed, [0.5, 0.5], false).is_none(),
+            "the detail slot must join the route-equality gate"
+        );
+
+        // A retimed edge on the same layer is a different route on either slot.
+        for retimed in [
+            residual_rack(ResidualParams {
+                structure: crate::visual_rack::SavedImageTap {
+                    timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+                    ..structure
+                },
+                ..residual_of(&b)
+            }),
+            residual_rack(ResidualParams {
+                detail: crate::visual_rack::SavedImageTap {
+                    timing: crate::visual_rack::EdgeTiming::PreviousFrame,
+                    ..detail
+                },
+                ..residual_of(&b)
+            }),
+        ] {
+            assert!(interpolate_rack(&a, &retimed, [0.5, 0.5], false).is_none());
+        }
+
+        // The same saved-topology gate also guards the saved values-only apply,
+        // where no interpolator re-check exists to catch a mismatch later.
+        let mut mismatched = redetailed.clone();
+        assert!(
+            !apply_rack_values(&a, &mut mismatched),
+            "a mismatched detail route must be refused, not silently accepted"
+        );
+        let mut matching = b.clone();
+        assert!(apply_rack_values(&a, &mut matching));
+        let applied = residual_of(&matching);
+        assert_eq!(applied.mix, 0.0);
+        assert_eq!(applied.detail_gain, 0.0);
+        assert_eq!(applied.block, ResidualBlock::Four);
+        assert_eq!(applied.quantization, ResidualQuantization::Off);
+        assert_eq!(applied.seed, 11);
+        assert_eq!(applied.structure, structure);
+        assert_eq!(applied.detail, detail);
+    }
+
+    #[test]
+    fn applying_residual_values_never_retargets_either_live_donor_route() {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams,
+        };
+
+        let sampled = residual_rack(ResidualParams {
+            structure: displace_tap(3),
+            detail: displace_tap(5),
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.75,
+            detail_gain: 2.5,
+            seed: 4242,
+            ..ResidualParams::default()
+        });
+
+        // Saved-to-runtime apply (Look, preset) copies values only. Both live
+        // routes are deliberately unlike the captured ones.
+        let live_structure = ResolvedImageTap {
+            source: ResolvedImageSource::OneBelow,
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let live_detail = ResolvedImageTap {
+            source: ResolvedImageSource::CleanProgram,
+            timing: EdgeTiming::PreviousFrame,
+        };
+        let mut live = sampled.resolve_routes(|_| None, |_| false);
+        let node_id = live.iter().next().unwrap().stable_id;
+        let RuntimeVisualNodeKind::Residual(params) = &mut live.get_mut(node_id).unwrap().kind
+        else {
+            panic!("residual node")
+        };
+        *params = RuntimeResidualParams {
+            structure: live_structure,
+            detail: live_detail,
+            ..RuntimeResidualParams::default()
+        };
+
+        assert!(apply_saved_rack_values_to_runtime(&sampled, &mut live));
+        let RuntimeVisualNodeKind::Residual(params) = live.get(node_id).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(params.mix, 0.75);
+        assert_eq!(params.detail_gain, 2.5);
+        assert_eq!(params.block, ResidualBlock::Sixteen);
+        assert_eq!(params.quantization, ResidualQuantization::Medium);
+        assert_eq!(params.seed, 4242);
+        assert_eq!(
+            [params.structure, params.detail],
+            [live_structure, live_detail],
+            "value transfer must never rewrite either live donor route"
+        );
+
+        // The strict runtime-to-runtime path instead refuses a mismatch, and it
+        // must do so for either slot independently.
+        for slot in [
+            crate::visual_rack::RESIDUAL_STRUCTURE_SLOT,
+            crate::visual_rack::RESIDUAL_DETAIL_SLOT,
+        ] {
+            let mut other = live.clone();
+            let RuntimeVisualNodeKind::Residual(params) = &mut other.get_mut(node_id).unwrap().kind
+            else {
+                panic!("residual node")
+            };
+            *params.route_mut(slot).expect("both slots name a route") = ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::PreviousFrame,
+            };
+            let mut target = live.clone();
+            assert!(
+                !apply_runtime_rack_values_strict(&other, &mut target),
+                "strict apply must reject a Residual whose slot {slot} donor differs"
+            );
+        }
+        let mut target = live.clone();
+        assert!(apply_runtime_rack_values_strict(&live.clone(), &mut target));
+        let RuntimeVisualNodeKind::Residual(params) = target.get(node_id).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(
+            [params.structure, params.detail],
+            [live_structure, live_detail]
+        );
+    }
+
+    #[test]
+    fn layer_stack_remaps_keep_both_residual_route_slots_aligned() {
+        use crate::image_routing::LayerImageStage;
+        use crate::performance::SavedLayerPosition;
+        use crate::visual_rack::{EdgeTiming, GroupId, SavedImageTap};
+
+        let layer_tap = |position: u32| SavedImageTap {
+            source: SavedImageSource::SelectedLayer {
+                layer_position: SavedLayerPosition::new(position).unwrap(),
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let group_tap = SavedImageTap {
+            source: SavedImageSource::GroupOutput {
+                group_id: GroupId::new(91).unwrap(),
+            },
+            timing: EdgeTiming::PreviousFrame,
+        };
+
+        let residual_at = |rack: &VisualRack, index: usize| {
+            let VisualNodeKind::Residual(params) = rack.iter().nth(index).unwrap().kind else {
+                panic!("residual node")
+            };
+            params
+        };
+        let slot_with = |mix: f32| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Residual(ResidualParams {
+                structure: layer_tap(0),
+                detail: layer_tap(2),
+                mix,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+            rack.push(VisualNodeKind::Residual(ResidualParams {
+                structure: layer_tap(1),
+                detail: group_tap,
+                mix,
+                ..ResidualParams::default()
+            }))
+            .unwrap();
+            MorphSlot {
+                master_rack: Some(rack),
+                ..MorphSlot::default()
+            }
+        };
+        let mut morph = Morph {
+            a: Some(slot_with(0.25)),
+            b: Some(slot_with(0.75)),
+            ..Default::default()
+        };
+
+        // Moving position 0 to 2 pushes the old 2 down to 1. Each slot follows
+        // its own saved position; a one-slot remap would leave `detail` stale.
+        morph.remap_layers_after_move(0, 2);
+        for slot in [morph.a.as_ref().unwrap(), morph.b.as_ref().unwrap()] {
+            let rack = slot.master_rack.as_ref().unwrap();
+            assert_eq!(residual_at(rack, 0).structure, layer_tap(2));
+            assert_eq!(residual_at(rack, 0).detail, layer_tap(1));
+            assert_eq!(residual_at(rack, 1).structure, layer_tap(0));
+            assert_eq!(
+                residual_at(rack, 1).detail,
+                group_tap,
+                "layer permutations must never rewrite stable group identities"
+            );
+        }
+
+        // Removing position 1 decrements the structure slot and tombstones the
+        // detail slot, independently and without rebinding either.
+        morph.remap_layers_after_remove(1);
+        for slot in [morph.a.as_ref().unwrap(), morph.b.as_ref().unwrap()] {
+            let rack = slot.master_rack.as_ref().unwrap();
+            assert_eq!(residual_at(rack, 0).structure, layer_tap(1));
+            assert_eq!(
+                residual_at(rack, 0).detail.source,
+                SavedImageSource::MissingSelectedLayer {
+                    saved_position: SavedLayerPosition::new(1).unwrap(),
+                    stage: LayerImageStage::PostLocalEffects,
+                }
+            );
+            assert_eq!(residual_at(rack, 1).structure, layer_tap(0));
+            assert_eq!(residual_at(rack, 1).detail, group_tap);
+        }
+
+        // Both endpoints moved identically, so the pair is still route-equal and
+        // Morph keeps sampling the rack instead of silently dropping it.
+        let sampled = morph.sample(0.5).unwrap();
+        let rack = sampled.master_rack.as_ref().expect("rack still morphs");
+        assert!((residual_at(rack, 0).mix - 0.5).abs() <= 1.0e-6);
     }
 }

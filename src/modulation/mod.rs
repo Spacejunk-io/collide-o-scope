@@ -1287,6 +1287,14 @@ fn apply_stable_node_offset(
             "amount_y" => Some(&mut value.amount_y),
             _ => None,
         },
+        // Residual exposes its wet authority and its detail gain and nothing
+        // else: both routes, both discrete laws, and the quantization seed are
+        // topology and have no modulatable address.
+        RuntimeVisualNodeKind::Residual(value) => match descriptor.key {
+            "mix" => Some(&mut value.mix),
+            "detail_gain" => Some(&mut value.detail_gain),
+            _ => None,
+        },
     };
     if let Some(slot) = slot {
         if matches!(
@@ -4373,6 +4381,8 @@ mod tests {
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(
                 RuntimeImageMatte::resolve_routes(ImageMatte::default(), &mut |_| None, &|_| false),
             )),
+            RuntimeVisualNodeKind::Displace(crate::visual_rack::RuntimeDisplaceParams::default()),
+            RuntimeVisualNodeKind::Residual(crate::visual_rack::RuntimeResidualParams::default()),
         ];
         let empty_composition =
             RuntimeComposition::try_from_parts(Vec::new(), Vec::new(), Some(1), 0.5).unwrap();
@@ -4803,5 +4813,166 @@ mod tests {
             };
             assert!(!parameter.is_valid_for_kind(NodeKindTag::Displace));
         }
+    }
+
+    #[test]
+    fn residual_exposes_stable_addresses_for_its_mix_and_detail_gain_under_unique_wire_keys() {
+        use crate::visual_rack::{
+            EdgeTiming, ResidualBlock, ResidualQuantization, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams, RuntimeVisualNodeKind, RuntimeVisualRack,
+        };
+
+        let authored = RuntimeResidualParams {
+            structure: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            detail: ResolvedImageTap {
+                source: ResolvedImageSource::AllBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            block: ResidualBlock::Sixteen,
+            quantization: ResidualQuantization::Medium,
+            mix: 0.25,
+            detail_gain: 2.0,
+            seed: 0x00c0_ffee,
+            ..RuntimeResidualParams::default()
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::Residual(authored))
+            .unwrap();
+
+        let mut book = StableModAddressBook::default();
+        book.add_rack(StableModScope::Master, &rack).unwrap();
+
+        // Exactly one address per continuous value, plus the shared wet. Both
+        // routes, both discrete laws and the seed register nothing.
+        let keys: Vec<_> = book
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                StableModTarget::Node { parameter, .. } => match parameter {
+                    StableNodeParameter::Wet => Some("wet"),
+                    StableNodeParameter::Descriptor {
+                        descriptor_index, ..
+                    } => NODE_PARAM_DESCRIPTORS
+                        .get(usize::from(*descriptor_index))
+                        .map(|descriptor| descriptor.key),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, vec!["wet", "mix", "detail_gain"]);
+
+        let address_of = |key: &str| {
+            book.targets
+                .iter()
+                .position(|target| {
+                    matches!(
+                        target,
+                        StableModTarget::Node {
+                            parameter: StableNodeParameter::Descriptor { descriptor_index, .. },
+                            ..
+                        } if NODE_PARAM_DESCRIPTORS[usize::from(*descriptor_index)].key == key
+                    )
+                })
+                .map(|index| StableModAddress(index as u16))
+                .unwrap()
+        };
+        let mut offsets = vec![0.0_f32; book.targets.len()];
+        offsets[address_of("mix").index()] = 0.5;
+        offsets[address_of("detail_gain").index()] = 9.0;
+        let frame = StableModulationFrame { offsets };
+
+        let mut modulated = rack.clone();
+        apply_stable_rack_modulation(&book, &frame, StableModScope::Master, &mut modulated);
+        let RuntimeVisualNodeKind::Residual(params) = modulated.get(node_id).unwrap().kind else {
+            panic!("residual node")
+        };
+        assert!((params.mix - 0.75).abs() < 1e-5);
+        assert_eq!(
+            params.detail_gain, 4.0,
+            "offsets clamp into the declared gain domain"
+        );
+        assert_eq!(
+            params.routes(),
+            authored.routes(),
+            "modulation never touches either donor route"
+        );
+        assert_eq!(
+            (params.block, params.quantization),
+            (authored.block, authored.quantization)
+        );
+        assert_eq!(
+            params.seed, authored.seed,
+            "modulation never touches the quantization seed"
+        );
+
+        // Both routes, both discrete laws and the seed have no modulatable
+        // address at all.
+        for key in [
+            "structure_tap",
+            "detail_tap",
+            "block",
+            "quantization",
+            "seed",
+        ] {
+            let index = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .position(|descriptor| {
+                    descriptor.kind == NodeKindTag::Residual && descriptor.key == key
+                })
+                .unwrap();
+            let parameter = StableNodeParameter::Descriptor {
+                descriptor_index: index as u16,
+                component: StableModComponent::Scalar,
+            };
+            assert!(!parameter.is_valid_for_kind(NodeKindTag::Residual));
+        }
+
+        // The real cross-resolution hazard: `StableNodeParameter::parse` binds
+        // the FIRST modulatable row with a matching key, `same_wire_parameter`
+        // compares keys rather than indices, and `runtime_node_supports_
+        // descriptor` returns true for every non-Mask kind. Both Residual wire
+        // keys are therefore globally unique among modulatable rows, so no
+        // route authored for another kind can resolve onto this one.
+        for key in ["mix", "detail_gain"] {
+            let owners: Vec<_> = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .filter(|descriptor| descriptor.key == key && descriptor.modulatable)
+                .map(|descriptor| descriptor.kind)
+                .collect();
+            assert_eq!(
+                owners,
+                vec![NodeKindTag::Residual],
+                "modulatable wire key {key} must be owned by Residual alone"
+            );
+            let parsed = StableNodeParameter::parse(key).expect("a modulatable key parses");
+            assert!(parsed.is_valid_for_kind(NodeKindTag::Residual));
+            for other in [
+                NodeKindTag::Cellular,
+                NodeKindTag::Shift,
+                NodeKindTag::Grain,
+                NodeKindTag::DigitalColor,
+                NodeKindTag::Key,
+                NodeKindTag::Transform,
+                NodeKindTag::Mask,
+                NodeKindTag::Displace,
+            ] {
+                assert!(
+                    !parsed.is_valid_for_kind(other),
+                    "{key} must not cross-resolve onto {other:?}"
+                );
+            }
+        }
+
+        // A shared key such as `amount` still aliases across its own kinds, and
+        // that aliasing must never reach Residual.
+        let shared = StableNodeParameter::parse("amount").expect("a shared key parses");
+        assert!(!shared.is_valid_for_kind(NodeKindTag::Residual));
+        let mix = StableNodeParameter::parse("mix").unwrap();
+        assert!(!mix.same_wire_parameter(shared));
+        assert!(mix.same_wire_parameter(StableNodeParameter::parse("mix").unwrap()));
     }
 }

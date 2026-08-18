@@ -40,7 +40,8 @@ use crate::temporal::{
 use crate::visual_rack::{
     EdgeTiming, GroupId, ImageDependency, ImageDependencyGraph, ImageGraphMode, ImageOrderingEdge,
     LegacyRackScope, MaskParams, NodeId, RuntimeImageMatte, RuntimeVisualRack, SavedImageSource,
-    SavedImageTap, VisualNodeKind, VisualRack, VisualScopeId,
+    SavedImageTap, VisualNodeKind, VisualRack, VisualScopeId, RACK_PRIMARY_ROUTE_SLOT,
+    RESIDUAL_DETAIL_SLOT, RESIDUAL_ROUTE_SLOTS, RESIDUAL_STRUCTURE_SLOT,
 };
 
 // --- Helpers for serde defaults ---
@@ -3289,6 +3290,10 @@ fn runtime_group_visual_topology_matches(sampled: &RuntimeGroup, live: &RuntimeG
                             crate::visual_rack::RuntimeVisualNodeKind::Displace(sampled),
                             crate::visual_rack::RuntimeVisualNodeKind::Displace(live),
                         ) => sampled.tap == live.tap,
+                        (
+                            crate::visual_rack::RuntimeVisualNodeKind::Residual(sampled),
+                            crate::visual_rack::RuntimeVisualNodeKind::Residual(live),
+                        ) => sampled.routes() == live.routes(),
                         _ => true,
                     }
             })
@@ -3444,12 +3449,26 @@ fn collect_rack_dependencies(
     for node in rack.iter().filter(|node| node.enabled && node.wet > 0.0) {
         // Mirror the live planner's admission predicate exactly: a node that
         // cannot collect a tap at frame time must not claim a saved edge here.
-        let tap = match node.kind {
-            VisualNodeKind::Mask(MaskParams::Image(matte)) if matte.amount > 0.0 => matte.tap,
-            VisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => displace.tap,
+        // Slot-ordered, so a multi-route kind claims every slot it will bind.
+        let mut routes: [Option<SavedImageTap>; RESIDUAL_ROUTE_SLOTS] =
+            [None; RESIDUAL_ROUTE_SLOTS];
+        match node.kind {
+            VisualNodeKind::Mask(MaskParams::Image(matte)) if matte.amount > 0.0 => {
+                routes[usize::from(RACK_PRIMARY_ROUTE_SLOT)] = Some(matte.tap);
+            }
+            VisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => {
+                routes[usize::from(RACK_PRIMARY_ROUTE_SLOT)] = Some(displace.tap);
+            }
+            VisualNodeKind::Residual(residual) if !residual.is_exact_bypass() => {
+                let [structure, detail] = residual.routes();
+                routes[usize::from(RESIDUAL_STRUCTURE_SLOT)] = Some(structure);
+                routes[usize::from(RESIDUAL_DETAIL_SLOT)] = Some(detail);
+            }
             _ => continue,
-        };
-        collect_saved_tap_dependency(tap, consumer, below, dependencies, ordering_edges)?;
+        }
+        for tap in routes.into_iter().flatten() {
+            collect_saved_tap_dependency(tap, consumer, below, dependencies, ordering_edges)?;
+        }
     }
     Ok(())
 }
@@ -7187,6 +7206,213 @@ routings:
         patch_with(previous_frame)
             .validate_creative_persistence()
             .unwrap();
+    }
+
+    #[test]
+    fn saved_residual_edges_are_dormant_at_zero_mix_and_cycle_per_slot_when_woken() {
+        use crate::visual_rack::{ResidualParams, RESIDUAL_DETAIL_SLOT, RESIDUAL_STRUCTURE_SLOT};
+
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let self_source = SavedImageSource::GroupOutput { group_id };
+        let residual_rack = |params: ResidualParams| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Residual(params)).unwrap();
+            rack
+        };
+        // Both slots are inert `OneBelow` until one of them is pointed at the
+        // owning group's own output.
+        let self_route = |slot: u8, timing: EdgeTiming, mix: f32| {
+            let mut params = ResidualParams {
+                mix,
+                ..ResidualParams::default()
+            };
+            *params.route_mut(slot).expect("both slots name a route") = SavedImageTap {
+                source: self_source,
+                timing,
+            };
+            params
+        };
+        let patch_with = |rack: VisualRack| {
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            patch
+        };
+
+        for slot in [RESIDUAL_STRUCTURE_SLOT, RESIDUAL_DETAIL_SLOT] {
+            // Dormant forms claim no saved edge, so a self route round trips.
+            let mut disabled = residual_rack(self_route(slot, EdgeTiming::CurrentFrame, 0.5));
+            let disabled_id = disabled.iter().next().unwrap().stable_id;
+            disabled.get_mut(disabled_id).unwrap().enabled = false;
+            let mut zero_wet = residual_rack(self_route(slot, EdgeTiming::CurrentFrame, 0.5));
+            let zero_wet_id = zero_wet.iter().next().unwrap().stable_id;
+            zero_wet.get_mut(zero_wet_id).unwrap().wet = 0.0;
+            let zero_mix = residual_rack(self_route(slot, EdgeTiming::CurrentFrame, 0.0));
+
+            for dormant in [disabled, zero_wet, zero_mix] {
+                let mut patch = patch_with(dormant);
+                patch.validate_creative_persistence().unwrap();
+                let yaml = serde_yaml::to_string(&patch).unwrap();
+                let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+                let composition = restored.composition.unwrap();
+                let rack = &composition.group(group_id).unwrap().rack;
+                assert!(matches!(
+                    rack.iter().next().unwrap().kind,
+                    VisualNodeKind::Residual(_)
+                ));
+            }
+
+            // Waking the mix wakes the saved edge on whichever slot carries the
+            // self route, and the same-frame cycle is rejected at load rather
+            // than reaching the planner.
+            let error = patch_with(residual_rack(self_route(
+                slot,
+                EdgeTiming::CurrentFrame,
+                0.25,
+            )))
+            .validate_creative_persistence()
+            .expect_err("a woken same-frame Residual self route must be rejected");
+            assert!(
+                error.contains("cycle") || error.contains("graph"),
+                "unexpected saved-edge rejection for slot {slot}: {error}"
+            );
+
+            // The identical route at N-1 is a legitimate saved feedback edge.
+            patch_with(residual_rack(self_route(
+                slot,
+                EdgeTiming::PreviousFrame,
+                0.25,
+            )))
+            .validate_creative_persistence()
+            .unwrap();
+        }
+    }
+
+    /// A group-scope Look is refused whole when any node's routing topology
+    /// differs. Without the Residual arm the `_ => true` default would accept a
+    /// mismatched pair and then copy values across two different recombinations.
+    #[test]
+    fn group_look_refuses_a_residual_whose_structure_or_detail_route_differs() {
+        use crate::visual_rack::{
+            EdgeTiming as RackEdgeTiming, ResolvedImageSource, ResolvedImageTap,
+            RuntimeResidualParams, RuntimeVisualNodeKind, RESIDUAL_DETAIL_SLOT,
+            RESIDUAL_STRUCTURE_SLOT,
+        };
+
+        let group_id = GroupId::new(9).unwrap();
+        let routed = |source: ResolvedImageSource| ResolvedImageTap {
+            source,
+            timing: RackEdgeTiming::CurrentFrame,
+        };
+        let base = RuntimeResidualParams {
+            structure: routed(ResolvedImageSource::OneBelow),
+            detail: routed(ResolvedImageSource::CleanProgram),
+            mix: 0.5,
+            ..RuntimeResidualParams::default()
+        };
+        let group_with = |params: RuntimeResidualParams| {
+            let mut group = empty_runtime_group_with_matte(group_id, None);
+            group
+                .rack
+                .push(RuntimeVisualNodeKind::Residual(params))
+                .unwrap();
+            group
+        };
+
+        let sampled = group_with(base);
+        let mut live = group_with(base);
+        assert!(
+            runtime_group_visual_topology_matches(&sampled, &live),
+            "an identical pair of routes is Look-compatible"
+        );
+        assert!(apply_runtime_group_look_values(&sampled, &mut live));
+
+        for slot in [RESIDUAL_STRUCTURE_SLOT, RESIDUAL_DETAIL_SLOT] {
+            let mut rerouted = base;
+            *rerouted.route_mut(slot).expect("both slots name a route") =
+                routed(ResolvedImageSource::AllBelow);
+            let mut live = group_with(rerouted);
+            let before = live.clone();
+            assert!(
+                !runtime_group_visual_topology_matches(&sampled, &live),
+                "slot {slot} must join the group Look routing gate"
+            );
+            assert!(!apply_runtime_group_look_values(&sampled, &mut live));
+            assert_eq!(live.rack, before.rack, "a refused Look changes nothing");
+        }
+    }
+
+    /// A pre-Residual patch has no `residual` node kind anywhere, and adding
+    /// the kind must leave that YAML byte-identical on the way back out. The
+    /// node's own absent fields default through `#[serde(default)]` to the
+    /// exact bypass, so a legacy visual path is unchanged.
+    #[test]
+    fn a_legacy_patch_without_any_residual_section_round_trips_unchanged() {
+        use crate::visual_rack::{ResidualBlock, ResidualParams, ResidualQuantization};
+
+        let mut patch = minimal_patch(1);
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Grain(
+            crate::visual_rack::GrainParams::default(),
+        ))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+        patch.visual_schema_version = 1;
+        patch.validate_creative_persistence().unwrap();
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(
+            !yaml.contains("residual"),
+            "a patch with no Residual node must not gain a residual section"
+        );
+        let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&restored).unwrap(),
+            yaml,
+            "a legacy patch must round trip byte for byte"
+        );
+        assert_eq!(
+            restored.layers[0].rack.as_ref().unwrap().iter().count(),
+            patch.layers[0].rack.as_ref().unwrap().iter().count()
+        );
+
+        // An authored Residual node whose params section is entirely absent
+        // deserializes through the patch's own YAML reader to the exact-bypass
+        // default, so it claims no edge and renders the pre-Residual path.
+        let rack_yaml =
+            "nodes:\n- stable_id: 3\n  kind:\n    kind: residual\n    params: {}\nnext_node_id: 4\n";
+        let rack: VisualRack = serde_yaml::from_str(rack_yaml).unwrap();
+        let VisualNodeKind::Residual(params) = rack.iter().next().unwrap().kind else {
+            panic!("residual node")
+        };
+        assert_eq!(params, ResidualParams::default());
+        assert_eq!(params.mix, 0.0);
+        assert_eq!(params.detail_gain, 1.0);
+        assert_eq!(params.block, ResidualBlock::Eight);
+        assert_eq!(params.quantization, ResidualQuantization::Off);
+        assert_eq!(params.seed, 0);
+        assert!(
+            params.is_exact_bypass(),
+            "an absent residual section must be an exact bypass"
+        );
+
+        // That dormant node claims no saved image edge, so a patch carrying it
+        // validates and round trips exactly like the legacy one.
+        let mut with_dormant = minimal_patch(1);
+        with_dormant.layers[0].rack = Some(rack);
+        with_dormant.visual_schema_version = 1;
+        with_dormant.validate_creative_persistence().unwrap();
+        let dormant_yaml = serde_yaml::to_string(&with_dormant).unwrap();
+        let restored = serde_yaml::from_str::<PatchState>(&dormant_yaml).unwrap();
+        assert_eq!(serde_yaml::to_string(&restored).unwrap(), dormant_yaml);
     }
 
     #[test]
