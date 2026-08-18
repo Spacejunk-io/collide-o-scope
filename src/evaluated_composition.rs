@@ -2180,6 +2180,7 @@ fn flush_segment(
         let is_image_consumer = matches!(
             node.kind,
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(_))
+                | RuntimeVisualNodeKind::Displace(_)
         );
         if is_image_consumer {
             compile_segment_nodes(
@@ -2295,6 +2296,12 @@ fn collect_rack_taps(
         let tap = match node.kind {
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) if matte.amount > 0.0 => {
                 matte.tap
+            }
+            // A Displace whose two amounts are both zero is an exact bypass:
+            // it encodes no pass, so it must not claim a cross-scope donor,
+            // a dependency edge, or a binding slot either.
+            RuntimeVisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => {
+                displace.tap
             }
             _ => continue,
         };
@@ -3595,6 +3602,23 @@ mod tests {
         .unwrap()
     }
 
+    fn push_displace(
+        rack: &mut RuntimeVisualRack,
+        source: ResolvedImageSource,
+        timing: EdgeTiming,
+        amount_x: f32,
+    ) -> NodeId {
+        rack.push(RuntimeVisualNodeKind::Displace(
+            crate::visual_rack::RuntimeDisplaceParams {
+                tap: ResolvedImageTap { source, timing },
+                amount_x,
+                amount_y: 0.0,
+                boundary: crate::visual_rack::DisplaceBoundary::Wrap,
+            },
+        ))
+        .unwrap()
+    }
+
     fn plan(
         base: &EvaluatedFramePlan,
         composition: &RuntimeComposition,
@@ -4843,6 +4867,216 @@ mod tests {
                 .below_topology()
                 .prefix_contains(master_prefix, producer));
         }
+    }
+
+    fn displace_tap_for(plan: &AdvancedCompositionPlan, node: NodeId) -> Option<&PlannedImageTap> {
+        plan.image_taps().iter().find(|tap| {
+            matches!(
+                tap.consumer,
+                ImageTapConsumer::RackNode { node_id, .. } if node_id == node
+            )
+        })
+    }
+
+    #[test]
+    fn displace_collects_its_donor_only_while_enabled_wet_and_nonzero() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let donor = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+
+        // Exact-default Displace: no tap, no dependency, no binding slot.
+        let mut racks = legacy_racks(&[1, 2]);
+        let node = push_displace(&mut racks[1].1, donor, EdgeTiming::CurrentFrame, 0.0);
+        let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        assert!(
+            displace_tap_for(&compiled, node).is_none(),
+            "a zero-gain Displace must not claim a cross-scope donor"
+        );
+
+        // Either axis alone wakes the same authored route.
+        for (amount_x, amount_y) in [(0.5_f32, 0.0_f32), (0.0, -0.5)] {
+            let mut racks = legacy_racks(&[1, 2]);
+            let node = racks[1]
+                .1
+                .push(RuntimeVisualNodeKind::Displace(
+                    crate::visual_rack::RuntimeDisplaceParams {
+                        tap: ResolvedImageTap {
+                            source: donor,
+                            timing: EdgeTiming::CurrentFrame,
+                        },
+                        amount_x,
+                        amount_y,
+                        boundary: crate::visual_rack::DisplaceBoundary::Wrap,
+                    },
+                ))
+                .unwrap();
+            let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+            let tap = displace_tap_for(&compiled, node)
+                .expect("a live Displace collects exactly one donor tap");
+            assert_eq!(
+                tap.resolved,
+                PlannedImageSource::SelectedLayer {
+                    layer_id: layer_id(1),
+                    stage: LayerImageStage::PostLocalEffects,
+                }
+            );
+        }
+
+        // Disabled and zero-wet nodes stay dormant even with live gains.
+        let mutations: [fn(&mut RuntimeVisualNode); 2] =
+            [|node| node.enabled = false, |node| node.wet = 0.0];
+        for mutate in mutations {
+            let mut racks = legacy_racks(&[1, 2]);
+            let node = push_displace(&mut racks[1].1, donor, EdgeTiming::CurrentFrame, 0.75);
+            mutate(racks[1].1.get_mut(node).unwrap());
+            let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+            assert!(displace_tap_for(&compiled, node).is_none());
+        }
+    }
+
+    #[test]
+    fn displace_self_route_cycles_on_the_current_frame_but_n_minus_one_is_admitted() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let own_output = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(2),
+            saved_position: SavedLayerPosition::new(1).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+
+        // A layer whose Displace reads its own post-local output this frame.
+        let mut racks = legacy_racks(&[1, 2]);
+        push_displace(&mut racks[1].1, own_output, EdgeTiming::CurrentFrame, 0.5);
+        let Err(error) = plan(&base, &composition, &master, &racks) else {
+            panic!("a current-frame self route must be rejected before allocation");
+        };
+        // The image dependency graph rejects it before scope ordering runs, and
+        // names the offending scope rather than failing anonymously.
+        assert!(
+            matches!(
+                error,
+                CompositionPlanError::ImageGraph(ImageGraphError::CurrentCycle { ref scopes })
+                    if scopes.as_slice() == [VisualScopeId::Layer(layer_id(2))]
+            ),
+            "unexpected rejection for a Displace self route: {error:?}"
+        );
+
+        // The identical route at N-1 is a legitimate feedback edge.
+        let mut racks = legacy_racks(&[1, 2]);
+        push_displace(&mut racks[1].1, own_output, EdgeTiming::PreviousFrame, 0.5);
+        let compiled = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        assert_eq!(compiled.graph().previous_taps, 1);
+
+        // A zero-gain self route collects nothing, so it cannot cycle at all.
+        let mut racks = legacy_racks(&[1, 2]);
+        push_displace(&mut racks[1].1, own_output, EdgeTiming::CurrentFrame, 0.0);
+        assert!(plan(&base, &composition, &master, &racks).is_ok());
+    }
+
+    #[test]
+    fn displace_removal_leaves_a_tombstone_that_never_rebinds_after_replacement() {
+        let frame = base(&[1, 2], &[]);
+        let replaced_frame = base(&[3, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let saved = SavedLayerPosition::new(0).unwrap();
+
+        let mut racks = legacy_racks(&[1, 2]);
+        let node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::SelectedLayer {
+                layer_id: layer_id(1),
+                saved_position: saved,
+                stage: LayerImageStage::PostLocalEffects,
+            },
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let compiled = advanced(plan(&frame, &composition, &master, &racks).unwrap());
+        assert!(matches!(
+            displace_tap_for(&compiled, node).unwrap().resolved,
+            PlannedImageSource::SelectedLayer { .. }
+        ));
+
+        // Deleting the donor tombstones the route. A different layer later
+        // occupying that saved position must not inherit it.
+        racks[1].1.mark_layer_output_missing(layer_id(1));
+        let replaced_composition = legacy_composition(&[3, 2]);
+        let mut replaced_racks = legacy_racks(&[3, 2]);
+        let slot = replaced_racks
+            .iter_mut()
+            .find(|(id, _)| *id == layer_id(2))
+            .expect("layer 2 survives the replacement");
+        slot.1 = racks[1].1.clone();
+        let compiled = advanced(
+            plan(
+                &replaced_frame,
+                &replaced_composition,
+                &master,
+                &replaced_racks,
+            )
+            .unwrap(),
+        );
+        let tap = displace_tap_for(&compiled, node)
+            .expect("a missing donor still reports a diagnostic tap");
+        assert_eq!(tap.resolved, PlannedImageSource::Transparent);
+        assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::MissingSelectedLayer {
+                saved_position, ..
+            } if *saved_position == saved
+        )));
+    }
+
+    #[test]
+    fn reordering_the_stack_never_slides_a_displace_donor_onto_another_layer() {
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let donor = ResolvedImageSource::SelectedLayer {
+            layer_id: layer_id(1),
+            saved_position: SavedLayerPosition::new(0).unwrap(),
+            stage: LayerImageStage::PostLocalEffects,
+        };
+        let consumer_rack = |amount_x| {
+            let mut rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            let node = push_displace(&mut rack, donor, EdgeTiming::CurrentFrame, amount_x);
+            (rack, node)
+        };
+
+        // The same authored route, evaluated under two different stack orders.
+        let (rack, node) = consumer_rack(0.5);
+        let mut forward = legacy_racks(&[1, 2]);
+        forward[1].1 = rack.clone();
+        let mut reversed = legacy_racks(&[1, 2]);
+        reversed[1].1 = rack;
+
+        for (frame, composition, racks) in [
+            (base(&[1, 2], &[]), legacy_composition(&[1, 2]), &forward),
+            (base(&[2, 1], &[]), legacy_composition(&[2, 1]), &reversed),
+        ] {
+            let compiled = advanced(plan(&frame, &composition, &master, racks).unwrap());
+            let tap = displace_tap_for(&compiled, node).expect("the donor survives reorder");
+            assert_eq!(
+                tap.resolved,
+                PlannedImageSource::SelectedLayer {
+                    layer_id: layer_id(1),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                "a stable-ID donor must follow its layer, never a stack position"
+            );
+        }
+
+        // Moving the node inside its own rack is likewise route-inert.
+        let (mut rack, node) = consumer_rack(0.5);
+        let before = rack.get(node).unwrap().kind;
+        rack.move_node(node, 0, LegacyRackScope::Layer).unwrap();
+        assert_eq!(rack.iter().next().unwrap().stable_id, node);
+        assert_eq!(rack.get(node).unwrap().kind, before);
     }
 
     #[test]

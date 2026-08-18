@@ -680,6 +680,88 @@ impl GrainParams {
     }
 }
 
+/// Boundary law for carrier coordinates pushed outside the source domain by a
+/// Displace vector. `Transparent` is the authored default and the only law that
+/// removes coverage; the other three keep the sample opaque by remapping.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplaceBoundary {
+    #[default]
+    Transparent,
+    Mirror,
+    Wrap,
+    Hold,
+}
+
+impl DisplaceBoundary {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Transparent => 0,
+            Self::Mirror => 1,
+            Self::Wrap => 2,
+            Self::Hold => 3,
+        }
+    }
+}
+
+/// Authored state of the named two-input Displace node. The donor is a stable
+/// image tap under the generic tap laws; the amounts are independent finite UV
+/// gains; the boundary is stable authored topology rather than a morphable
+/// value. Neutral donor encoding is `RG = 0.5`, so a transparent or missing
+/// donor is exact zero displacement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DisplaceParams {
+    pub tap: SavedImageTap,
+    pub amount_x: f32,
+    pub amount_y: f32,
+    pub boundary: DisplaceBoundary,
+}
+
+impl DisplaceParams {
+    fn sanitized(self) -> Self {
+        Self {
+            tap: self.tap,
+            amount_x: finite_clamp(self.amount_x, 0.0, -1.0, 1.0),
+            amount_y: finite_clamp(self.amount_y, 0.0, -1.0, 1.0),
+            boundary: self.boundary,
+        }
+    }
+
+    /// Zero gain on both axes is an authored no-op. The planner then collects
+    /// no donor and the executor encodes no pass, so an exact-default Displace
+    /// delegates before allocating or encoding anything. Hostile non-finite
+    /// input sanitizes to zero and is therefore also an exact bypass.
+    pub fn is_exact_bypass(self) -> bool {
+        let sanitized = self.sanitized();
+        sanitized.amount_x == 0.0 && sanitized.amount_y == 0.0
+    }
+
+    pub const fn selected_layer_position(self) -> Option<SavedLayerPosition> {
+        self.tap.selected_layer_position()
+    }
+
+    pub const fn referenced_group(self) -> Option<GroupId> {
+        self.tap.referenced_group()
+    }
+
+    /// Preserve a deleted group identity explicitly so a future group at the
+    /// same root position cannot inherit this donor route.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "saved displace invalidation supports patch/editor migrations"
+        )
+    )]
+    pub fn mark_group_output_missing(&mut self, removed: GroupId) {
+        if self.tap.source == (SavedImageSource::GroupOutput { group_id: removed }) {
+            self.tap.source = SavedImageSource::MissingGroupOutput { group_id: removed };
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RectangleMask {
@@ -794,6 +876,7 @@ pub enum VisualNodeKind {
     Shift(ShiftParams),
     Grain(GrainParams),
     Mask(MaskParams),
+    Displace(DisplaceParams),
 }
 
 impl VisualNodeKind {
@@ -808,6 +891,7 @@ impl VisualNodeKind {
             Self::Shift(_) => NodeKindTag::Shift,
             Self::Grain(_) => NodeKindTag::Grain,
             Self::Mask(_) => NodeKindTag::Mask,
+            Self::Displace(_) => NodeKindTag::Displace,
         }
     }
 
@@ -820,6 +904,7 @@ impl VisualNodeKind {
             Self::Shift(value) => Self::Shift(value.sanitized()),
             Self::Grain(value) => Self::Grain(value.sanitized()),
             Self::Mask(value) => Self::Mask(value.sanitized()),
+            Self::Displace(value) => Self::Displace(value.sanitized()),
             marker => marker,
         }
     }
@@ -911,9 +996,13 @@ pub enum NodeKindTag {
     Shift,
     Grain,
     Mask,
+    Displace,
 }
 
 impl NodeKindTag {
+    /// Permanent append-only kind codes. A code identifies a node kind inside
+    /// every persisted topology signature, so an existing entry must never be
+    /// renumbered or reused; new kinds only append.
     const fn signature_code(self) -> u8 {
         match self {
             Self::LegacyCanonical => 1,
@@ -925,6 +1014,7 @@ impl NodeKindTag {
             Self::Shift => 7,
             Self::Grain => 8,
             Self::Mask => 9,
+            Self::Displace => 10,
         }
     }
 }
@@ -950,7 +1040,7 @@ pub struct NodeKindDescriptor {
     pub budget: NodeResourceBudget,
 }
 
-pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 9] = [
+pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 10] = [
     NodeKindDescriptor {
         tag: NodeKindTag::LegacyCanonical,
         key: "legacy_canonical",
@@ -1069,6 +1159,21 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 9] = [
             // masks use only the source portion; the descriptor is worst-case.
             logical_texture_lookups_per_pixel: 2,
             texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS + 1,
+            sampled_textures_in_pass: 2,
+            cross_input_taps: 1,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::Displace,
+        key: "displace",
+        title: "Displace",
+        budget: NodeResourceBudget {
+            full_frame_passes: 1,
+            // Dry carrier, displaced carrier, and the donor vector field. The
+            // donor is filtered manually in premultiplied space like the two
+            // carrier lookups, so all three cost four explicit loads each.
+            logical_texture_lookups_per_pixel: 3,
+            texture_samples_per_pixel: PREMULTIPLIED_BILINEAR_TEXTURE_OPS * 3,
             sampled_textures_in_pass: 2,
             cross_input_taps: 1,
         },
@@ -1432,6 +1537,29 @@ pub const NODE_PARAM_DESCRIPTORS: &[NodeParamDescriptor] = &[
     float_param!(Mask, "image_amount", 0.0, 1.0, 1.0),
     float_param!(Mask, "image_threshold", 0.0, 1.0, 0.5),
     float_param!(Mask, "image_softness", 0.0, 0.5, 0.1),
+    // Displace exposes exactly two continuous values. The donor route and the
+    // boundary law are stable authored topology: present in the registry so
+    // every consumer can enumerate them, but neither modulatable nor diced.
+    NodeParamDescriptor {
+        kind: NodeKindTag::Displace,
+        key: "donor_tap",
+        value_type: NodeParamType::ImageTap,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    float_param!(Displace, "amount_x", -1.0, 1.0, 0.0),
+    float_param!(Displace, "amount_y", -1.0, 1.0, 0.0),
+    NodeParamDescriptor {
+        kind: NodeKindTag::Displace,
+        key: "boundary",
+        value_type: NodeParamType::Enum,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1865,6 +1993,7 @@ impl VisualRack {
     pub fn referenced_group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
         self.nodes.iter().filter_map(|node| match node.kind {
             VisualNodeKind::Mask(mask) => mask.image_tap()?.referenced_group(),
+            VisualNodeKind::Displace(displace) => displace.referenced_group(),
             _ => None,
         })
     }
@@ -1872,6 +2001,7 @@ impl VisualRack {
     pub fn selected_layer_positions(&self) -> impl Iterator<Item = SavedLayerPosition> + '_ {
         self.nodes.iter().filter_map(|node| match node.kind {
             VisualNodeKind::Mask(MaskParams::Image(matte)) => matte.selected_layer_position(),
+            VisualNodeKind::Displace(displace) => displace.selected_layer_position(),
             _ => None,
         })
     }
@@ -1885,8 +2015,14 @@ impl VisualRack {
     )]
     pub fn mark_group_output_missing(&mut self, removed: GroupId) {
         for node in &mut self.nodes {
-            if let VisualNodeKind::Mask(MaskParams::Image(matte)) = &mut node.kind {
-                matte.mark_group_output_missing(removed);
+            match &mut node.kind {
+                VisualNodeKind::Mask(MaskParams::Image(matte)) => {
+                    matte.mark_group_output_missing(removed);
+                }
+                VisualNodeKind::Displace(displace) => {
+                    displace.mark_group_output_missing(removed);
+                }
+                _ => {}
             }
         }
     }
@@ -2093,6 +2229,93 @@ impl RuntimeImageMatte {
     }
 }
 
+/// Route-resolved Displace state. The saved position survives only inside the
+/// resolved tap's missing-source provenance; live routing is by stable ID.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuntimeDisplaceParams {
+    pub tap: ResolvedImageTap,
+    pub amount_x: f32,
+    pub amount_y: f32,
+    pub boundary: DisplaceBoundary,
+}
+
+impl Default for RuntimeDisplaceParams {
+    fn default() -> Self {
+        Self {
+            tap: ResolvedImageTap {
+                source: ResolvedImageSource::OneBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount_x: 0.0,
+            amount_y: 0.0,
+            boundary: DisplaceBoundary::Transparent,
+        }
+    }
+}
+
+impl RuntimeDisplaceParams {
+    pub fn resolve_routes(
+        saved: DisplaceParams,
+        layer_at_position: &mut impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+        group_exists: &impl Fn(GroupId) -> bool,
+    ) -> Self {
+        let saved = saved.sanitized();
+        Self {
+            tap: saved.tap.to_runtime(layer_at_position, group_exists),
+            amount_x: saved.amount_x,
+            amount_y: saved.amount_y,
+            boundary: saved.boundary,
+        }
+    }
+
+    pub fn capture_routes(
+        self,
+        position_of_layer: &mut impl FnMut(StableLayerId) -> Option<SavedLayerPosition>,
+    ) -> DisplaceParams {
+        DisplaceParams {
+            tap: self.tap.to_saved(position_of_layer),
+            amount_x: self.amount_x,
+            amount_y: self.amount_y,
+            boundary: self.boundary,
+        }
+        .sanitized()
+    }
+
+    pub(crate) fn sanitized(self) -> Self {
+        Self {
+            tap: self.tap,
+            amount_x: finite_clamp(self.amount_x, 0.0, -1.0, 1.0),
+            amount_y: finite_clamp(self.amount_y, 0.0, -1.0, 1.0),
+            boundary: self.boundary,
+        }
+    }
+
+    /// Mirror of [`DisplaceParams::is_exact_bypass`] for the live model.
+    pub fn is_exact_bypass(self) -> bool {
+        let sanitized = self.sanitized();
+        sanitized.amount_x == 0.0 && sanitized.amount_y == 0.0
+    }
+
+    pub const fn selected_layer_id(self) -> Option<StableLayerId> {
+        match self.tap.source {
+            ResolvedImageSource::SelectedLayer { layer_id, .. } => Some(layer_id),
+            _ => None,
+        }
+    }
+
+    pub const fn referenced_group(self) -> Option<GroupId> {
+        self.tap.referenced_group()
+    }
+
+    pub fn mark_layer_output_missing(&mut self, removed: StableLayerId) {
+        self.tap.mark_layer_missing(removed);
+    }
+
+    pub fn mark_group_output_missing(&mut self, removed: GroupId) {
+        self.tap.mark_group_missing(removed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RuntimeMaskParams {
     Rectangle(RectangleMask),
@@ -2155,6 +2378,7 @@ pub enum RuntimeVisualNodeKind {
     Shift(ShiftParams),
     Grain(GrainParams),
     Mask(RuntimeMaskParams),
+    Displace(RuntimeDisplaceParams),
 }
 
 impl RuntimeVisualNodeKind {
@@ -2169,6 +2393,7 @@ impl RuntimeVisualNodeKind {
             Self::Shift(_) => NodeKindTag::Shift,
             Self::Grain(_) => NodeKindTag::Grain,
             Self::Mask(_) => NodeKindTag::Mask,
+            Self::Displace(_) => NodeKindTag::Displace,
         }
     }
 
@@ -2191,6 +2416,9 @@ impl RuntimeVisualNodeKind {
                 layer_at_position,
                 group_exists,
             )),
+            VisualNodeKind::Displace(value) => Self::Displace(
+                RuntimeDisplaceParams::resolve_routes(value, layer_at_position, group_exists),
+            ),
         }
     }
 
@@ -2208,6 +2436,9 @@ impl RuntimeVisualNodeKind {
             Self::Shift(value) => VisualNodeKind::Shift(value.sanitized()),
             Self::Grain(value) => VisualNodeKind::Grain(value.sanitized()),
             Self::Mask(value) => VisualNodeKind::Mask(value.capture(position_of_layer)),
+            Self::Displace(value) => {
+                VisualNodeKind::Displace(value.capture_routes(position_of_layer))
+            }
         }
     }
 
@@ -2220,6 +2451,7 @@ impl RuntimeVisualNodeKind {
             Self::Shift(value) => Self::Shift(value.sanitized()),
             Self::Grain(value) => Self::Grain(value.sanitized()),
             Self::Mask(value) => Self::Mask(value.sanitized()),
+            Self::Displace(value) => Self::Displace(value.sanitized()),
             marker => marker,
         }
     }
@@ -2674,6 +2906,7 @@ impl RuntimeVisualRack {
     pub fn referenced_group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
         self.nodes.iter().filter_map(|node| match node.kind {
             RuntimeVisualNodeKind::Mask(mask) => mask.image_tap()?.referenced_group(),
+            RuntimeVisualNodeKind::Displace(displace) => displace.referenced_group(),
             _ => None,
         })
     }
@@ -2683,22 +2916,35 @@ impl RuntimeVisualRack {
             RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
                 matte.selected_layer_id()
             }
+            RuntimeVisualNodeKind::Displace(displace) => displace.selected_layer_id(),
             _ => None,
         })
     }
 
     pub fn mark_layer_output_missing(&mut self, removed: StableLayerId) {
         for node in &mut self.nodes {
-            if let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = &mut node.kind {
-                matte.tap.mark_layer_missing(removed);
+            match &mut node.kind {
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
+                    matte.tap.mark_layer_missing(removed);
+                }
+                RuntimeVisualNodeKind::Displace(displace) => {
+                    displace.mark_layer_output_missing(removed);
+                }
+                _ => {}
             }
         }
     }
 
     pub fn mark_group_output_missing(&mut self, removed: GroupId) {
         for node in &mut self.nodes {
-            if let RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) = &mut node.kind {
-                matte.tap.mark_group_missing(removed);
+            match &mut node.kind {
+                RuntimeVisualNodeKind::Mask(RuntimeMaskParams::Image(matte)) => {
+                    matte.tap.mark_group_missing(removed);
+                }
+                RuntimeVisualNodeKind::Displace(displace) => {
+                    displace.mark_group_output_missing(removed);
+                }
+                _ => {}
             }
         }
     }
@@ -3509,8 +3755,9 @@ mod tests {
             .iter()
             .map(|value| value.key)
             .collect();
-        assert_eq!(tags.len(), 9);
-        assert_eq!(keys.len(), 9);
+        assert_eq!(tags.len(), NODE_KIND_DESCRIPTORS.len());
+        assert_eq!(keys.len(), NODE_KIND_DESCRIPTORS.len());
+        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 10);
         for descriptor in NODE_KIND_DESCRIPTORS {
             assert!(descriptor.budget.full_frame_passes > 0);
             assert!(descriptor.budget.logical_texture_lookups_per_pixel > 0);
@@ -4338,5 +4585,304 @@ mod tests {
                 timing: EdgeTiming::PreviousFrame,
             }
         );
+    }
+
+    #[test]
+    fn displace_kind_code_is_ten_and_append_only() {
+        assert_eq!(NodeKindTag::Displace.signature_code(), 10);
+        // Every historical code keeps its value; Displace only appends.
+        for (tag, code) in [
+            (NodeKindTag::LegacyCanonical, 1_u8),
+            (NodeKindTag::LegacyTemporal, 2),
+            (NodeKindTag::Transform, 3),
+            (NodeKindTag::DigitalColor, 4),
+            (NodeKindTag::Key, 5),
+            (NodeKindTag::Cellular, 6),
+            (NodeKindTag::Shift, 7),
+            (NodeKindTag::Grain, 8),
+            (NodeKindTag::Mask, 9),
+            (NodeKindTag::Displace, 10),
+        ] {
+            assert_eq!(tag.signature_code(), code);
+        }
+        let codes: BTreeSet<_> = NODE_KIND_DESCRIPTORS
+            .iter()
+            .map(|descriptor| descriptor.tag.signature_code())
+            .collect();
+        assert_eq!(codes.len(), NODE_KIND_DESCRIPTORS.len());
+        assert_eq!(node_kind_descriptor(NodeKindTag::Displace).key, "displace");
+
+        // Adding the kind must not disturb the frozen legacy rack signatures.
+        assert_eq!(
+            VisualRack::synthetic_legacy(LegacyRackScope::Layer).topology_signature(),
+            LEGACY_LAYER_RACK_SIGNATURE
+        );
+        assert_eq!(
+            VisualRack::synthetic_legacy(LegacyRackScope::Master).topology_signature(),
+            LEGACY_MASTER_RACK_SIGNATURE
+        );
+    }
+
+    #[test]
+    fn displace_defaults_sanitize_and_declare_exact_bypass() {
+        let default = DisplaceParams::default();
+        assert_eq!(default.tap, SavedImageTap::default());
+        assert_eq!(default.tap.source, SavedImageSource::OneBelow);
+        assert_eq!(default.tap.timing, EdgeTiming::CurrentFrame);
+        assert_eq!(default.amount_x, 0.0);
+        assert_eq!(default.amount_y, 0.0);
+        assert_eq!(default.boundary, DisplaceBoundary::Transparent);
+        assert!(default.is_exact_bypass());
+
+        // Non-finite input takes the neutral fallback rather than a clamped
+        // extreme, so hostile values collapse to an exact bypass, never to a
+        // full-scale displacement.
+        let hostile = DisplaceParams {
+            amount_x: f32::NAN,
+            amount_y: f32::NEG_INFINITY,
+            ..DisplaceParams::default()
+        }
+        .sanitized();
+        assert_eq!(hostile.amount_x, 0.0);
+        assert_eq!(hostile.amount_y, 0.0);
+        assert!(hostile.is_exact_bypass());
+        assert!(DisplaceParams {
+            amount_x: f32::INFINITY,
+            amount_y: f32::NAN,
+            ..DisplaceParams::default()
+        }
+        .is_exact_bypass());
+
+        // Finite overshoot clamps into the ±1 UV domain and stays live.
+        let overshoot = DisplaceParams {
+            amount_x: 12.0,
+            amount_y: -12.0,
+            ..DisplaceParams::default()
+        }
+        .sanitized();
+        assert_eq!(overshoot.amount_x, 1.0);
+        assert_eq!(overshoot.amount_y, -1.0);
+        assert!(!overshoot.is_exact_bypass());
+
+        // The runtime twin follows the identical law.
+        let runtime = RuntimeDisplaceParams::default();
+        assert!(runtime.is_exact_bypass());
+        assert_eq!(runtime.tap.source, ResolvedImageSource::OneBelow);
+        assert_eq!(runtime.boundary, DisplaceBoundary::Transparent);
+        assert_eq!(
+            RuntimeDisplaceParams {
+                amount_x: 9.0,
+                ..RuntimeDisplaceParams::default()
+            }
+            .sanitized()
+            .amount_x,
+            1.0
+        );
+    }
+
+    #[test]
+    fn displace_serde_round_trips_and_defaults_every_absent_field() {
+        let authored = DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::SelectedLayer {
+                    layer_position: saved_position(4),
+                    stage: LayerImageStage::PostLocalEffects,
+                },
+                timing: EdgeTiming::PreviousFrame,
+            },
+            amount_x: 0.5,
+            amount_y: -0.25,
+            boundary: DisplaceBoundary::Mirror,
+        };
+        let json = serde_json::to_string(&authored).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DisplaceParams>(&json).unwrap(),
+            authored
+        );
+
+        // An empty object is the exact default: absent fields never fabricate
+        // a gain, a boundary, or a donor.
+        assert_eq!(
+            serde_json::from_str::<DisplaceParams>("{}").unwrap(),
+            DisplaceParams::default()
+        );
+
+        // The node round trips through the bounded rack deserializer.
+        let node = r#"{"nodes":[{"stable_id":3,"kind":{"kind":"displace","params":{"amount_x":0.5,"boundary":"wrap"}}}],"next_node_id":4}"#;
+        let rack: VisualRack = serde_json::from_str(node).unwrap();
+        let VisualNodeKind::Displace(params) = rack.iter().next().unwrap().kind else {
+            panic!("displace node must survive deserialization");
+        };
+        assert_eq!(params.amount_x, 0.5);
+        assert_eq!(params.amount_y, 0.0);
+        assert_eq!(params.boundary, DisplaceBoundary::Wrap);
+        assert_eq!(params.tap, SavedImageTap::default());
+
+        // Hostile out-of-range values sanitize during deserialization.
+        let hostile = r#"{"nodes":[{"stable_id":3,"kind":{"kind":"displace","params":{"amount_x":50,"amount_y":-50}}}],"next_node_id":4}"#;
+        let rack: VisualRack = serde_json::from_str(hostile).unwrap();
+        let VisualNodeKind::Displace(params) = rack.iter().next().unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!((params.amount_x, params.amount_y), (1.0, -1.0));
+
+        // An unknown boundary is a closed-vocabulary rejection, not a default.
+        assert!(serde_json::from_str::<DisplaceParams>(r#"{"boundary":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn displace_routes_are_visible_to_every_saved_and_runtime_accessor() {
+        let group = GroupId::new(21).unwrap();
+        let mut saved = VisualRack::empty();
+        saved
+            .push(VisualNodeKind::Displace(DisplaceParams {
+                tap: SavedImageTap {
+                    source: SavedImageSource::SelectedLayer {
+                        layer_position: saved_position(6),
+                        stage: LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                amount_x: 0.5,
+                ..DisplaceParams::default()
+            }))
+            .unwrap();
+        let group_node = saved
+            .push(VisualNodeKind::Displace(DisplaceParams {
+                tap: SavedImageTap {
+                    source: SavedImageSource::GroupOutput { group_id: group },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                amount_y: 0.5,
+                ..DisplaceParams::default()
+            }))
+            .unwrap();
+        assert_eq!(
+            saved.selected_layer_positions().collect::<Vec<_>>(),
+            vec![saved_position(6)]
+        );
+        assert_eq!(
+            saved.referenced_group_ids().collect::<Vec<_>>(),
+            vec![group]
+        );
+
+        // Deleting the group leaves a tombstone that never rebinds.
+        saved.mark_group_output_missing(group);
+        let VisualNodeKind::Displace(params) = saved.get(group_node).unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!(
+            params.tap.source,
+            SavedImageSource::MissingGroupOutput { group_id: group }
+        );
+        assert_eq!(
+            saved.referenced_group_ids().collect::<Vec<_>>(),
+            vec![group],
+            "a tombstone still names its saved identity"
+        );
+
+        // Resolution binds the live donor; the vacated position never retargets.
+        let live = live_id(77);
+        let mut runtime = saved.resolve_routes(
+            |position| (position == saved_position(6)).then_some(live),
+            |_| false,
+        );
+        assert_eq!(runtime.selected_layer_ids().collect::<Vec<_>>(), vec![live]);
+        runtime.mark_layer_output_missing(live);
+        assert!(runtime.selected_layer_ids().next().is_none());
+        let RuntimeVisualNodeKind::Displace(params) = runtime.iter().next().unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!(
+            params.tap.source,
+            ResolvedImageSource::MissingSelectedLayer {
+                saved_position: saved_position(6),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+
+        // Capture preserves the missing identity rather than inventing a donor.
+        let recaptured = runtime.capture_routes(|_| None).unwrap();
+        let VisualNodeKind::Displace(params) = recaptured.iter().next().unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!(
+            params.tap.source,
+            SavedImageSource::MissingSelectedLayer {
+                saved_position: saved_position(6),
+                stage: LayerImageStage::PostLocalEffects,
+            }
+        );
+        assert_eq!(params.amount_x, 0.5, "route capture preserves the gains");
+    }
+
+    #[test]
+    fn displace_exposes_only_two_modulatable_dice_eligible_parameters() {
+        let descriptors: Vec<_> = NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == NodeKindTag::Displace)
+            .collect();
+        assert_eq!(descriptors.len(), 4);
+
+        let continuous: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.modulatable)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(continuous, vec!["amount_x", "amount_y"]);
+        let diceable: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.dice_eligible)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(diceable, vec!["amount_x", "amount_y"]);
+
+        for descriptor in &descriptors {
+            match descriptor.key {
+                "amount_x" | "amount_y" => {
+                    assert_eq!(descriptor.range, Some([-1.0, 1.0]));
+                    assert_eq!(descriptor.default, Some(0.0));
+                    assert_eq!(descriptor.value_type, NodeParamType::Float);
+                }
+                // Route and boundary are stable authored topology: enumerable
+                // but never modulatable, never diced, and never ranged.
+                "donor_tap" => {
+                    assert_eq!(descriptor.value_type, NodeParamType::ImageTap);
+                    assert!(descriptor.range.is_none());
+                }
+                "boundary" => {
+                    assert_eq!(descriptor.value_type, NodeParamType::Enum);
+                    assert!(descriptor.range.is_none());
+                }
+                other => panic!("unexpected displace parameter {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn displace_nodes_stay_inside_the_rack_lookup_and_pass_ceilings() {
+        let mut rack = VisualRack::empty();
+        for _ in 0..MAX_NODES_PER_RACK {
+            rack.push(VisualNodeKind::Displace(DisplaceParams {
+                amount_x: 0.5,
+                ..DisplaceParams::default()
+            }))
+            .unwrap();
+        }
+        let budget = rack.resource_budget().unwrap();
+        assert_eq!(budget.full_frame_passes, MAX_NODES_PER_RACK as u32);
+        assert_eq!(
+            budget.logical_texture_lookups_per_pixel,
+            3 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(
+            budget.texture_samples_per_pixel,
+            12 * MAX_NODES_PER_RACK as u32
+        );
+        assert_eq!(budget.max_sampled_textures_in_pass, 2);
+        assert_eq!(budget.cross_input_taps, MAX_NODES_PER_RACK as u32);
+        assert!(budget.logical_texture_lookups_per_pixel <= MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK);
+        assert!(budget.texture_samples_per_pixel <= MAX_TEXTURE_SAMPLES_PER_RACK);
+        assert!(budget.max_sampled_textures_in_pass <= MAX_SAMPLED_TEXTURES_PER_PASS);
     }
 }

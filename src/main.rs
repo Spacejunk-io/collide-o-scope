@@ -1282,6 +1282,9 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         "mask" => Kind::Mask(visual_rack::RuntimeMaskParams::Rectangle(
             visual_rack::RectangleMask::default(),
         )),
+        // Deterministic OneBelow/current-frame donor at zero gain, matching the
+        // image-mask variant law. The node is an exact bypass until authored.
+        "displace" => Kind::Displace(visual_rack::RuntimeDisplaceParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -1440,6 +1443,17 @@ fn set_runtime_node_param(
                     return Err(format!("{param} requires its ordered topology action"));
                 }
                 _ => return Err(format!("unsupported image mask parameter {param}")),
+            },
+            Kind::Displace(params) => match param {
+                "amount_x" => params.amount_x = finite_json_f32(value)?,
+                "amount_y" => params.amount_y = finite_json_f32(value)?,
+                "boundary" => params.boundary = json_enum(value)?,
+                // Only the donor route rewrites the image dependency graph, so
+                // it alone owns a dedicated revision-protected ordered action.
+                "donor_tap" => {
+                    return Err(format!("{param} requires its ordered topology action"));
+                }
+                _ => return Err(format!("unsupported displace parameter {param}")),
             },
         },
     }
@@ -3980,6 +3994,7 @@ impl App {
                 | WebAction::MoveVisualNode { .. }
                 | WebAction::SetVisualNodeMaskVariant { .. }
                 | WebAction::SetVisualNodeRoute { .. }
+                | WebAction::SetVisualNodeDisplaceRoute { .. }
                 | WebAction::SetCompositionGroupMatteRoute { .. }
                 | WebAction::SetCompositionGroupMatteParam { .. }
                 | WebAction::SetCompositionGroupParam { .. }
@@ -4218,6 +4233,38 @@ impl App {
                         staged,
                         true,
                         format!("Routed image mask node {}", node_id.get()),
+                    )?;
+                }
+                WebAction::SetVisualNodeDisplaceRoute {
+                    scope,
+                    node_id,
+                    route,
+                    composition_revision,
+                } => {
+                    self.creative_revision_matches(*composition_revision)?;
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    let mut staged = self.staged_creative_graph();
+                    let tap = self.creative_route_from_snapshot(route, &staged.composition)?;
+                    let node = staged
+                        .rack_mut(scope)
+                        .and_then(|rack| rack.get_mut(node_id))
+                        .ok_or_else(|| format!("displace node {} is absent", node_id.get()))?;
+                    let visual_rack::RuntimeVisualNodeKind::Displace(params) = &mut node.kind
+                    else {
+                        return Err(format!("node {} is not a displace", node_id.get()));
+                    };
+                    // Only the donor moves. The gains and the boundary law keep
+                    // their authored values across a reroute.
+                    params.tap = tap;
+                    normalize_runtime_rack(staged.rack_mut(scope).expect("scope remains present"))?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        true,
+                        format!("Routed displace node {}", node_id.get()),
                     )?;
                 }
                 WebAction::SetCompositionGroupMatteRoute {
@@ -6822,7 +6869,8 @@ impl App {
             | WebAction::RemoveVisualNode { scope, .. }
             | WebAction::MoveVisualNode { scope, .. }
             | WebAction::SetVisualNodeMaskVariant { scope, .. }
-            | WebAction::SetVisualNodeRoute { scope, .. } => {
+            | WebAction::SetVisualNodeRoute { scope, .. }
+            | WebAction::SetVisualNodeDisplaceRoute { scope, .. } => {
                 matches!(scope, CreativeScopeSnapshot::Master)
             }
             WebAction::Reroll {
@@ -14338,6 +14386,7 @@ impl App {
             | WebAction::MoveVisualNode { .. }
             | WebAction::SetVisualNodeMaskVariant { .. }
             | WebAction::SetVisualNodeRoute { .. }
+            | WebAction::SetVisualNodeDisplaceRoute { .. }
             | WebAction::SetCompositionGroupMatteRoute { .. }
             | WebAction::SetCompositionGroupMatteParam { .. }
             | WebAction::SetCompositionGroupParam { .. }
@@ -20079,6 +20128,146 @@ mod app_state_tests {
             creative_commit_impact(true, false, true),
             CreativeCommitImpact::TopologyOrStack
         );
+    }
+
+    #[test]
+    fn displace_browser_protocol_edits_values_and_barriers_its_route_by_revision() {
+        use web::state::{
+            CreativeImageSourceSnapshot, CreativeImageTapSnapshot, CreativeScopeSnapshot, WebAction,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        app.master_rack = RuntimeVisualRack::empty();
+
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 0,
+            node_kind: "displace".into(),
+            composition_revision: app.composition_revision,
+        });
+        let node_id = app.master_rack.iter().next().unwrap().stable_id;
+        let params = |app: &App| match app.master_rack.get(node_id).unwrap().kind {
+            visual_rack::RuntimeVisualNodeKind::Displace(params) => params,
+            _ => panic!("inserted node must be a displace"),
+        };
+        // A newly inserted node is the deterministic exact-bypass default.
+        assert!(params(&app).is_exact_bypass());
+        assert_eq!(
+            params(&app).tap.source,
+            visual_rack::ResolvedImageSource::OneBelow
+        );
+        assert_eq!(
+            params(&app).boundary,
+            visual_rack::DisplaceBoundary::Transparent
+        );
+
+        // Gains and the boundary travel on the ordinary coalescible action.
+        let revision = app.composition_revision;
+        let set = |app: &mut App, param: &str, value: serde_json::Value| {
+            app.handle_web_action(WebAction::SetVisualNodeParam {
+                scope: CreativeScopeSnapshot::Master,
+                node_id: node_id.get().to_string(),
+                node_kind: "displace".into(),
+                param: param.into(),
+                value,
+                composition_revision: revision,
+            });
+        };
+        set(&mut app, "amount_x", serde_json::json!(0.5));
+        set(&mut app, "amount_y", serde_json::json!(-0.25));
+        set(&mut app, "boundary", serde_json::json!("wrap"));
+        assert_eq!(params(&app).amount_x, 0.5);
+        assert_eq!(params(&app).amount_y, -0.25);
+        assert_eq!(params(&app).boundary, visual_rack::DisplaceBoundary::Wrap);
+        assert!(!params(&app).is_exact_bypass());
+
+        // Hostile values clamp instead of escaping the ±1 UV domain, and the
+        // route is refused on the value path.
+        set(&mut app, "amount_x", serde_json::json!(42.0));
+        assert_eq!(params(&app).amount_x, 1.0);
+        set(&mut app, "donor_tap", serde_json::json!("one_below"));
+        assert_eq!(
+            params(&app).tap.source,
+            visual_rack::ResolvedImageSource::OneBelow,
+            "the donor route must reject the coalescible value path"
+        );
+
+        // The dedicated ordered action reroutes without disturbing the values.
+        let clean_program = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::CleanProgram,
+            timing: visual_rack::EdgeTiming::PreviousFrame,
+        };
+        let route_revision = app.composition_revision;
+        app.handle_web_action(WebAction::SetVisualNodeDisplaceRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: clean_program.clone(),
+            composition_revision: route_revision,
+        });
+        assert_eq!(
+            params(&app).tap.source,
+            visual_rack::ResolvedImageSource::CleanProgram
+        );
+        assert_eq!(
+            params(&app).tap.timing,
+            visual_rack::EdgeTiming::PreviousFrame
+        );
+        assert_eq!(params(&app).amount_x, 1.0, "a reroute preserves the gains");
+        assert_eq!(params(&app).amount_y, -0.25);
+        assert_eq!(params(&app).boundary, visual_rack::DisplaceBoundary::Wrap);
+        assert_ne!(
+            app.composition_revision, route_revision,
+            "a route change is a topology barrier and advances the revision"
+        );
+
+        // A stale revision is rejected outright; the live route is untouched.
+        app.handle_web_action(WebAction::SetVisualNodeDisplaceRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::OneBelow,
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            },
+            composition_revision: route_revision,
+        });
+        assert_eq!(
+            params(&app).tap.source,
+            visual_rack::ResolvedImageSource::CleanProgram,
+            "a stale revision must never apply a reroute"
+        );
+
+        // The route action is an ordered barrier and is never coalesced.
+        let route_action = WebAction::SetVisualNodeDisplaceRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: node_id.get().to_string(),
+            route: clean_program,
+            composition_revision: app.composition_revision,
+        };
+        assert!(App::quantized_action_key(&route_action).is_none());
+        assert!(App::action_targets_master_rack(&route_action));
+
+        // Addressing a node of another kind is a typed refusal, not a silent
+        // rewrite of that node.
+        app.handle_web_action(WebAction::InsertVisualNode {
+            scope: CreativeScopeSnapshot::Master,
+            index: 1,
+            node_kind: "grain".into(),
+            composition_revision: app.composition_revision,
+        });
+        let grain_id = app.master_rack.iter().nth(1).unwrap().stable_id;
+        app.handle_web_action(WebAction::SetVisualNodeDisplaceRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: grain_id.get().to_string(),
+            route: CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::OneBelow,
+                timing: visual_rack::EdgeTiming::CurrentFrame,
+            },
+            composition_revision: app.composition_revision,
+        });
+        assert!(matches!(
+            app.master_rack.get(grain_id).unwrap().kind,
+            visual_rack::RuntimeVisualNodeKind::Grain(_)
+        ));
     }
 
     #[test]

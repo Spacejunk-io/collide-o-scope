@@ -3285,6 +3285,10 @@ fn runtime_group_visual_topology_matches(sampled: &RuntimeGroup, live: &RuntimeG
                             crate::visual_rack::RuntimeVisualNodeKind::Mask(sampled),
                             crate::visual_rack::RuntimeVisualNodeKind::Mask(live),
                         ) => std::mem::discriminant(&sampled) == std::mem::discriminant(&live),
+                        (
+                            crate::visual_rack::RuntimeVisualNodeKind::Displace(sampled),
+                            crate::visual_rack::RuntimeVisualNodeKind::Displace(live),
+                        ) => sampled.tap == live.tap,
                         _ => true,
                     }
             })
@@ -3438,17 +3442,14 @@ fn collect_rack_dependencies(
     ordering_edges: &mut Vec<ImageOrderingEdge>,
 ) -> Result<(), String> {
     for node in rack.iter().filter(|node| node.enabled && node.wet > 0.0) {
-        if let VisualNodeKind::Mask(MaskParams::Image(matte)) = node.kind {
-            if matte.amount > 0.0 {
-                collect_saved_tap_dependency(
-                    matte.tap,
-                    consumer,
-                    below,
-                    dependencies,
-                    ordering_edges,
-                )?;
-            }
-        }
+        // Mirror the live planner's admission predicate exactly: a node that
+        // cannot collect a tap at frame time must not claim a saved edge here.
+        let tap = match node.kind {
+            VisualNodeKind::Mask(MaskParams::Image(matte)) if matte.amount > 0.0 => matte.tap,
+            VisualNodeKind::Displace(displace) if !displace.is_exact_bypass() => displace.tap,
+            _ => continue,
+        };
+        collect_saved_tap_dependency(tap, consumer, below, dependencies, ordering_edges)?;
     }
     Ok(())
 }
@@ -7089,6 +7090,103 @@ routings:
         let restored = round_trip(zero_layer_matte);
         assert!(restored.layers[0].matte.enabled);
         assert_eq!(restored.layers[0].matte.amount, 0.0);
+    }
+
+    #[test]
+    fn saved_displace_edges_are_dormant_at_zero_gain_and_cycle_when_woken() {
+        use crate::visual_rack::{DisplaceBoundary, DisplaceParams};
+
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let self_source = SavedImageSource::GroupOutput { group_id };
+        let displace_rack = |params: DisplaceParams| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Displace(params)).unwrap();
+            rack
+        };
+        let self_route = DisplaceParams {
+            tap: SavedImageTap {
+                source: self_source,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            boundary: DisplaceBoundary::Wrap,
+            ..DisplaceParams::default()
+        };
+        let patch_with = |rack: VisualRack| {
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            patch
+        };
+
+        // Dormant forms claim no saved edge, so a self route round trips.
+        let mut disabled = displace_rack(DisplaceParams {
+            amount_x: 0.5,
+            ..self_route
+        });
+        let disabled_id = disabled.iter().next().unwrap().stable_id;
+        disabled.get_mut(disabled_id).unwrap().enabled = false;
+        let mut zero_wet = displace_rack(DisplaceParams {
+            amount_x: 0.5,
+            ..self_route
+        });
+        let zero_wet_id = zero_wet.iter().next().unwrap().stable_id;
+        zero_wet.get_mut(zero_wet_id).unwrap().wet = 0.0;
+        let zero_gain = displace_rack(self_route);
+
+        for dormant in [disabled, zero_wet, zero_gain] {
+            let mut patch = patch_with(dormant);
+            patch.validate_creative_persistence().unwrap();
+            let yaml = serde_yaml::to_string(&patch).unwrap();
+            let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+            let composition = restored.composition.unwrap();
+            let rack = &composition.group(group_id).unwrap().rack;
+            assert!(matches!(
+                rack.iter().next().unwrap().kind,
+                VisualNodeKind::Displace(_)
+            ));
+        }
+
+        // Waking either gain wakes the saved edge, and the same-frame self
+        // route is then rejected at load rather than reaching the planner.
+        for params in [
+            DisplaceParams {
+                amount_x: 0.25,
+                ..self_route
+            },
+            DisplaceParams {
+                amount_y: -0.25,
+                ..self_route
+            },
+        ] {
+            let error = patch_with(displace_rack(params))
+                .validate_creative_persistence()
+                .expect_err("a woken same-frame Displace self route must be rejected");
+            assert!(
+                error.contains("cycle") || error.contains("graph"),
+                "unexpected saved-edge rejection: {error}"
+            );
+        }
+
+        // The identical route at N-1 is a legitimate saved feedback edge.
+        let previous_frame = displace_rack(DisplaceParams {
+            tap: SavedImageTap {
+                source: self_source,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            amount_x: 0.25,
+            ..self_route
+        });
+        patch_with(previous_frame)
+            .validate_creative_persistence()
+            .unwrap();
     }
 
     #[test]

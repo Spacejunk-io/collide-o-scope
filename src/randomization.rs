@@ -1280,6 +1280,16 @@ pub(crate) fn mutate_runtime_rack_values(
                         mutate_linear(0.1, value.softness, 0.0, 0.5, amount * 0.1, &mut rng);
                 }
             },
+            RuntimeVisualNodeKind::Displace(value) => {
+                // Donor route and boundary law are stable authored topology.
+                // Dice may move only the two continuous gains. Each node draws
+                // from its own stable domain, so appending this arm cannot
+                // perturb any previously authored node's stream.
+                value.amount_x =
+                    mutate_linear(0.0, value.amount_x, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.amount_y =
+                    mutate_linear(0.0, value.amount_y, -1.0, 1.0, amount * 0.2, &mut rng);
+            }
         }
     }
 }
@@ -2030,5 +2040,82 @@ mod tests {
             without_new_values.group(group_id).unwrap().transform,
             after_group.transform
         );
+    }
+
+    #[test]
+    fn dice_moves_displace_gains_only_and_never_its_route_or_boundary() {
+        use crate::visual_rack::{
+            DisplaceBoundary, EdgeTiming, ResolvedImageSource, ResolvedImageTap,
+            RuntimeDisplaceParams,
+        };
+
+        let authored = RuntimeDisplaceParams {
+            tap: ResolvedImageTap {
+                source: ResolvedImageSource::CleanProgram,
+                timing: EdgeTiming::PreviousFrame,
+            },
+            amount_x: 0.4,
+            amount_y: -0.4,
+            boundary: DisplaceBoundary::Mirror,
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::Displace(authored))
+            .unwrap();
+        let grain_id = rack
+            .push(RuntimeVisualNodeKind::Grain(
+                crate::visual_rack::GrainParams::default(),
+            ))
+            .unwrap();
+        let baseline = rack.clone();
+
+        let params_of = |rack: &RuntimeVisualRack| match rack.get(node_id).unwrap().kind {
+            RuntimeVisualNodeKind::Displace(params) => params,
+            _ => panic!("displace node"),
+        };
+        let grain_of = |rack: &RuntimeVisualRack| match rack.get(grain_id).unwrap().kind {
+            RuntimeVisualNodeKind::Grain(params) => params,
+            _ => panic!("grain node"),
+        };
+
+        let mut diced = rack.clone();
+        mutate_runtime_rack_values(&mut diced, 1.0, 7, 11, DiceRackScope::Master);
+        let after = params_of(&diced);
+        assert_eq!(after.tap, authored.tap, "Dice never reroutes a donor");
+        assert_eq!(
+            after.boundary, authored.boundary,
+            "the boundary law is stable authored topology"
+        );
+        assert!(
+            after.amount_x != authored.amount_x || after.amount_y != authored.amount_y,
+            "Dice must actually move at least one gain at full amount"
+        );
+        assert!((-1.0..=1.0).contains(&after.amount_x));
+        assert!((-1.0..=1.0).contains(&after.amount_y));
+
+        // Determinism: the same seed/stream reproduces the same gains.
+        let mut repeated = rack.clone();
+        mutate_runtime_rack_values(&mut repeated, 1.0, 7, 11, DiceRackScope::Master);
+        assert_eq!(params_of(&repeated), after);
+
+        // Zero amount is an exact no-op across the whole rack.
+        let mut untouched = rack.clone();
+        mutate_runtime_rack_values(&mut untouched, 0.0, 7, 11, DiceRackScope::Master);
+        assert_eq!(untouched, baseline);
+
+        // A neighbouring node draws from its own stable domain, so appending
+        // Displace cannot perturb an older kind's stream.
+        let mut without_displace = RuntimeVisualRack::empty();
+        without_displace
+            .push(RuntimeVisualNodeKind::Displace(authored))
+            .unwrap();
+        let solo_grain = without_displace
+            .push(RuntimeVisualNodeKind::Grain(
+                crate::visual_rack::GrainParams::default(),
+            ))
+            .unwrap();
+        assert_eq!(solo_grain, grain_id);
+        mutate_runtime_rack_values(&mut without_displace, 1.0, 7, 11, DiceRackScope::Master);
+        assert_eq!(grain_of(&without_displace), grain_of(&diced));
     }
 }

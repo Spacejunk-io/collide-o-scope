@@ -400,6 +400,7 @@ const CREATIVE_NODE_INFO = Object.freeze({
   shift: { label: 'Shift' },
   grain: { label: 'Grain' },
   mask: { label: 'Mask' },
+  displace: { label: 'Displace' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -483,6 +484,11 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     floatDef('image_amount', 'Image amount', 0, 1, 0.001),
     floatDef('image_threshold', 'Image threshold', 0, 1, 0.001),
     floatDef('image_softness', 'Image softness', 0, 0.5, 0.001),
+  ],
+  displace: [
+    floatDef('amount_x', 'Amount X', -1, 1, 0.001),
+    floatDef('amount_y', 'Amount Y', -1, 1, 0.001),
+    enumDef('boundary', 'Boundary', [['transparent', 'Transparent'], ['mirror', 'Mirror'], ['wrap', 'Wrap'], ['hold', 'Hold']]),
   ],
 });
 
@@ -723,9 +729,13 @@ function renderCreativeRack() {
     ].map((def) => creativeControlHtml(def, creativeNodeValue(node, def.key))).join('');
     const params = marker ? '' : creativeNodeVisibleDefs(node).map((def) => creativeControlHtml(def, creativeNodeValue(node, def.key))).join('');
     const maskVariant = node.kind === 'mask' ? `<label class="creative-control creative-control-wide"><span>Mask kind</span><select class="creative-mask-variant">${creativeOptionHtml([['rectangle', 'Rectangle'], ['ellipse', 'Ellipse'], ['image', 'Image donor']], node.params?.variant || 'rectangle')}</select><output></output></label>` : '';
+    // Displace routes a donor vector field, not a matte, so it reuses the
+    // shared editor in field-only mode: no channel and no invert.
     const imageRoute = node.kind === 'mask' && node.params?.variant === 'image'
       ? creativeRouteEditorHtml(node.params.image_tap, node.params.image_channel, node.params.image_invert)
-      : '';
+      : node.kind === 'displace'
+        ? creativeRouteEditorHtml(node.params?.donor_tap, 'alpha', false, true)
+        : '';
     const nodeDiagnostic = node.params?.diagnostic
       ? `<div class="creative-node-diagnostic">${escapeHtml(node.params.diagnostic)}</div>`
       : '';
@@ -748,9 +758,16 @@ function renderCreativeRack() {
       action: 'set_visual_node_mask_variant', scope: creativeScopeWire(), node_id: String(node.node_id), variant: event.currentTarget.value, composition_revision: compositionRevision,
     }, 'Changing mask kind…'));
     const routeEditor = card.querySelector('.creative-route-editor');
-    if (routeEditor) wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
-      action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
-    }, 'Preflighting image route…'), creativeScopeWire().scope === 'group' ? creativeScopeWire().group_id : '');
+    const selfGroupId = creativeScopeWire().scope === 'group' ? creativeScopeWire().group_id : '';
+    if (routeEditor && node.kind === 'displace') {
+      wireCreativeRouteEditor(routeEditor, (route) => creativeSend({
+        action: 'set_visual_node_displace_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, composition_revision: compositionRevision,
+      }, 'Preflighting displace donor…'), selfGroupId);
+    } else if (routeEditor) {
+      wireCreativeRouteEditor(routeEditor, (route, channel, invert) => creativeSend({
+        action: 'set_visual_node_route', scope: creativeScopeWire(), node_id: String(node.node_id), route, channel, invert, composition_revision: compositionRevision,
+      }, 'Preflighting image route…'), selfGroupId);
+    }
   });
 }
 
@@ -935,7 +952,11 @@ function syncCreativeRenderedValues() {
 function creativeRackStructure(rack) {
   return (rack?.nodes || []).map((node) => ({
     id: String(node.node_id), kind: node.kind, variant: node.params?.variant || '',
-    route: node.params?.variant === 'image' ? node.params.image_tap : null,
+    // A Displace donor is structural for the same reason an image-mask route
+    // is: changing it must rebuild the card's route editor, not just sync values.
+    route: node.kind === 'displace'
+      ? node.params?.donor_tap || null
+      : (node.params?.variant === 'image' ? node.params.image_tap : null),
     channel: node.params?.image_channel || '', invert: !!node.params?.image_invert,
   }));
 }

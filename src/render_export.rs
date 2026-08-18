@@ -13975,6 +13975,46 @@ mod effects_audit {
         render("selective_vhs_bypass", patch);
     }
 
+    /// Two stacked clips where the upper layer's Displace reads the lower
+    /// layer's post-local image as its vector field. This is the labeled
+    /// export case for the shared node implementation: the offline renderer
+    /// consumes the same evaluated plan and the same rack shader, with no
+    /// export-only displacement path.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_displace_two_input_pipeline() {
+        use crate::visual_rack::{
+            DisplaceBoundary, DisplaceParams, EdgeTiming, LegacyRackScope, SavedImageSource,
+            SavedImageTap, VisualNodeKind, VisualRack,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        let donor = patch.layers[0].clone();
+        patch.layers.push(donor);
+
+        // Layer 0 is the upper scope; it displaces itself by the layer below.
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Displace(DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::OneBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount_x: 0.35,
+            amount_y: -0.2,
+            boundary: DisplaceBoundary::Wrap,
+        }))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+        patch.layers[0].effects.hue_shift = 90.0;
+        render("displace_two_input", patch);
+    }
+
     #[test]
     #[ignore = "renders the full effects audit matrix; run explicitly"]
     fn render_effects_matrix() {

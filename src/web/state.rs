@@ -440,16 +440,7 @@ impl CreativeImageTapSnapshot {
 
 impl CreativeMatteSnapshot {
     pub fn from_runtime(matte: crate::visual_rack::RuntimeImageMatte) -> Self {
-        let diagnostic = match matte.tap.source {
-            crate::visual_rack::ResolvedImageSource::MissingSelectedLayer {
-                saved_position,
-                ..
-            } => format!("missing saved layer {}", saved_position.get()),
-            crate::visual_rack::ResolvedImageSource::MissingGroupOutput(group_id) => {
-                format!("missing group output {}", group_id.get())
-            }
-            _ => String::new(),
-        };
+        let diagnostic = creative_route_diagnostic(matte.tap.source);
         Self {
             route: CreativeImageTapSnapshot::from_runtime(matte.tap),
             channel: creative_channel_key(matte.channel).into(),
@@ -522,6 +513,29 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "image_threshold": value.threshold,
             "image_softness": value.softness,
         }),
+        RuntimeVisualNodeKind::Displace(value) => serde_json::json!({
+            "donor_tap": CreativeImageTapSnapshot::from_runtime(value.tap),
+            "amount_x": value.amount_x,
+            "amount_y": value.amount_y,
+            "boundary": value.boundary,
+            "diagnostic": creative_route_diagnostic(value.tap.source),
+        }),
+    }
+}
+
+/// Operator-facing text for a route that resolves to nothing. Empty means the
+/// route is live; a retained tombstone always names its saved provenance.
+fn creative_route_diagnostic(source: crate::visual_rack::ResolvedImageSource) -> String {
+    match source {
+        crate::visual_rack::ResolvedImageSource::MissingSelectedLayer {
+            saved_position, ..
+        } => {
+            format!("missing saved layer {}", saved_position.get())
+        }
+        crate::visual_rack::ResolvedImageSource::MissingGroupOutput(group_id) => {
+            format!("missing group output {}", group_id.get())
+        }
+        _ => String::new(),
     }
 }
 
@@ -3122,6 +3136,17 @@ pub enum WebAction {
         invert: bool,
         composition_revision: u64,
     },
+    /// Reroute a Displace node's donor. The route is the only Displace field
+    /// that rewrites the image dependency graph, so it is an ordered,
+    /// revision-protected, uncoalesced barrier of its own. The two gains and
+    /// the boundary law travel on the ordinary coalescible parameter action.
+    #[serde(rename = "set_visual_node_displace_route")]
+    SetVisualNodeDisplaceRoute {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        route: CreativeImageTapSnapshot,
+        composition_revision: u64,
+    },
     /// Enable/disable or reroute the separate group matte. `None` disables it;
     /// numeric matte values remain untouched and use the coalescible action.
     #[serde(rename = "set_composition_group_matte_route")]
@@ -4096,6 +4121,7 @@ impl WebAction {
             | Self::MoveVisualNode { .. }
             | Self::SetVisualNodeMaskVariant { .. }
             | Self::SetVisualNodeRoute { .. }
+            | Self::SetVisualNodeDisplaceRoute { .. }
             | Self::SetCompositionGroupMatteRoute { .. }
             | Self::CreateCompositionGroup { .. }
             | Self::RemoveCompositionGroup { .. }
@@ -8252,5 +8278,106 @@ mod protocol_tests {
         assert!(js.contains("if (activeHistoryGestures.size) return false;"));
         assert!(html.contains("Browser messages cannot invent OSC addresses"));
         assert!(!js.contains("action: 'dispatch_osc_json'"));
+    }
+
+    #[test]
+    fn displace_route_action_is_an_uncoalesced_ordered_barrier() {
+        let route = CreativeImageTapSnapshot {
+            input: CreativeImageSourceSnapshot::OneBelow,
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let action = WebAction::SetVisualNodeDisplaceRoute {
+            scope: CreativeScopeSnapshot::Master,
+            node_id: "7".into(),
+            route: route.clone(),
+            composition_revision: 12,
+        };
+
+        // Topology edits are ordered, revision-protected barriers and must
+        // never coalesce behind a later absolute value.
+        assert!(action.is_priority());
+        assert!(action.coalesce_key().is_none());
+
+        // The wire name is explicit and the payload round trips exactly.
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["action"], "set_visual_node_displace_route");
+        assert_eq!(value["composition_revision"], 12);
+        assert_eq!(value["input"], serde_json::Value::Null);
+        let WebAction::SetVisualNodeDisplaceRoute {
+            scope: decoded_scope,
+            node_id: decoded_node,
+            route: decoded_route,
+            composition_revision: decoded_revision,
+        } = serde_json::from_value::<WebAction>(value).unwrap()
+        else {
+            panic!("the displace route action must decode to its own variant");
+        };
+        assert_eq!(decoded_scope, CreativeScopeSnapshot::Master);
+        assert_eq!(decoded_node, "7");
+        assert_eq!(decoded_route, route);
+        assert_eq!(decoded_revision, 12);
+
+        // The well-formed message is accepted...
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_displace_route","scope":{"scope":"master"},"node_id":"7","route":{"input":{"source":"one_below"},"timing":"current_frame"},"composition_revision":1}"#
+        )
+        .is_ok());
+        // ...the revision is mandatory, so a route edit can never arrive
+        // unbarriered...
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_displace_route","scope":{"scope":"master"},"node_id":"7","route":{"input":{"source":"one_below"},"timing":"current_frame"}}"#
+        )
+        .is_err());
+        // ...and an unknown donor token is a closed-vocabulary rejection
+        // rather than a defaulted route.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_visual_node_displace_route","scope":{"scope":"master"},"node_id":"7","route":{"input":{"source":"teleport"},"timing":"current_frame"},"composition_revision":1}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn displace_snapshot_publishes_its_route_gains_boundary_and_diagnostic() {
+        use crate::visual_rack::{
+            DisplaceBoundary, ResolvedImageSource, ResolvedImageTap, RuntimeDisplaceParams,
+            RuntimeVisualNodeKind,
+        };
+
+        let live = creative_node_params(RuntimeVisualNodeKind::Displace(RuntimeDisplaceParams {
+            tap: ResolvedImageTap {
+                source: ResolvedImageSource::OneBelow,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount_x: 0.25,
+            amount_y: -0.75,
+            boundary: DisplaceBoundary::Mirror,
+        }));
+        assert_eq!(live["amount_x"], 0.25);
+        assert_eq!(live["amount_y"], -0.75);
+        assert_eq!(live["boundary"], "mirror");
+        assert_eq!(live["donor_tap"]["input"]["source"], "one_below");
+        assert_eq!(live["donor_tap"]["timing"], "current_frame");
+        assert_eq!(
+            live["diagnostic"], "",
+            "a live route reports no diagnostic text"
+        );
+
+        // A retained tombstone names its saved provenance instead of rebinding.
+        let missing =
+            creative_node_params(RuntimeVisualNodeKind::Displace(RuntimeDisplaceParams {
+                tap: ResolvedImageTap {
+                    source: ResolvedImageSource::MissingSelectedLayer {
+                        saved_position: crate::performance::SavedLayerPosition::new(4).unwrap(),
+                        stage: crate::image_routing::LayerImageStage::PostLocalEffects,
+                    },
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                ..RuntimeDisplaceParams::default()
+            }));
+        assert_eq!(missing["diagnostic"], "missing saved layer 4");
+        assert_eq!(
+            missing["donor_tap"]["input"]["source"],
+            "missing_selected_layer"
+        );
     }
 }
