@@ -996,7 +996,8 @@ the committed 24-layer ring, with the cursor taken through
 pass. The 24 single-layer views stay unexposed: a second writer would corrupt
 the ring the temporal pass is mid-frame reading. Guard every age against the
 valid count exactly as `temporal_originals.wgsl` does. **A new RGBA16F
-full-frame history ring is prohibited** (~398 MiB at 1080p) absent an explicit
+full-frame history ring is prohibited** (398.1 MB — 379.7 MiB — at 1080p,
+`1920 × 1080 × 8 × 24` bytes) absent an explicit
 product decision. An unbound source — a lost donor, an unmaterialized age, a
 missing binding — falls back to the **carrier**, not to transparent, so a
 missing donor changes nothing and the cost stays donor-state independent.
@@ -1833,10 +1834,16 @@ mislead browser tests.
 ## Verification
 
 - The release gate is `cargo fmt --all -- --check`, both JavaScript syntax
-  checks, `cargo check --locked --all-targets`, strict all-feature Clippy, and
-  the single-threaded locked all-target/all-feature test matrix. A publication
-  claim additionally requires Linux, macOS, and Windows CI success for the
-  exact published commit SHA; an older green run is not transferable evidence.
+  checks, `cargo check --locked --all-targets`,
+  `cargo test --locked --all-targets -- --test-threads=1`, and
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` — the
+  exact commands, so prose and gate cannot drift. (`Cargo.toml` declares no
+  `[features]`, so `--all-features` is a no-op wherever it appears; the test
+  step carries no such flag and never has.) A publication claim additionally
+  requires Linux, macOS, and Windows CI success for the exact published
+  commit SHA; an older green run is not transferable evidence, and CI
+  installs `stable` fresh — verify the local toolchain matches it before
+  claiming a gate.
 - Physical-GPU proofs are opt-in and therefore separate from ordinary CI.
   StageMap uses the five `renderer::stage_map::tests::physical_gpu_` fixtures.
   M6 precision uses

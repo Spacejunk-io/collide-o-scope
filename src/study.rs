@@ -28,6 +28,21 @@ pub const STUDY_MAX_AUTHOR_BYTES: usize = 80;
 pub const STUDY_MAX_DESCRIPTION_BYTES: usize = 512;
 pub const STUDY_MAX_LICENSE_ID_BYTES: usize = 64;
 pub const STUDY_MAX_LICENSE_NOTICE_BYTES: usize = 1024;
+/// Upper bound on `LoadHistoryColor { age }`, validated as `1..=24` with age
+/// 0 rejected. **The meaning of an age is deliberately undocumented and must
+/// be decided before any evaluator lands**: the committed clean-history ring
+/// derives `SYMMETRY_MAX_HISTORY_AGE = TEMPORAL_HISTORY_LEN - 1 = 23`, valid
+/// `0..=23`, where age 0 is the virtual current image and `1..=23` address
+/// stored layers — so the two vocabularies do not span the same set. Either
+/// a Study age maps to ring age `age - 1` (making age 1 duplicate
+/// `LoadCurrentColor`), or this cap was set to the ring *length* where it
+/// meant the ring *max age* and is one too large. Those are different fixes,
+/// the choice is a compatibility decision under the exact-equality ABI gate
+/// below, and an evaluator that picks silently would freeze the wrong one.
+/// The validator bounds the authored age only; an evaluator must
+/// additionally guard against the valid-sample count exactly as
+/// `temporal_originals.wgsl` does, or a young program reads unwritten
+/// texture content.
 pub const STUDY_MAX_HISTORY_AGE: u8 = 24;
 pub const STUDY_MAX_AUDIO_BANDS: u8 = 8;
 pub const STUDY_MAX_FINITE_VALUE: f32 = 65_504.0;
@@ -53,6 +68,15 @@ pub const DATA_ONLY_STUDY_AUTHORITY: StudyAuthority = StudyAuthority {
     host_mutation: false,
 };
 
+/// The ABI gate is **exact equality, not a compatibility window**: validation
+/// rejects any document whose version is not exactly
+/// `{ STUDY_ABI_MAJOR, STUDY_ABI_MINOR }`, with no forward or backward
+/// tolerance. Consequence: adding even one purely additive opcode and
+/// honestly bumping the minor version instantly invalidates every previously
+/// published document, while leaving the version alone silently redefines
+/// what the current version means. There is no third option in this code, so
+/// if the instruction set must grow, the versioning law has to be designed
+/// before the opcode is written — a compatibility decision, not a coding one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StudyAbiVersion {
@@ -172,6 +196,11 @@ pub enum StudyInstruction {
         dst: StudyRegister,
         age: u8,
     },
+    /// Loads a `Vector2`, which in ABI 1.0 is a **dead-end type**: no opcode
+    /// converts a Vector2 to a Scalar or a Color, and `OutputColor` requires
+    /// a Color, so any Study declaring `MotionFieldRead` performs provably
+    /// dead computation. Recorded rather than "fixed": adding a conversion
+    /// opcode is an ABI change gated by the exact-equality version law.
     LoadMotionVector {
         dst: StudyRegister,
     },
@@ -182,6 +211,11 @@ pub enum StudyInstruction {
     LoadBeatPhase {
         dst: StudyRegister,
     },
+    /// Carries only a `domain`; **no seed field exists anywhere in the
+    /// document**, so the determinism law the plan requires is currently
+    /// undefined rather than merely unimplemented. What a domain is hashed
+    /// with — and against what stable identity — is an ABI decision that
+    /// must be designed before any evaluator gives this opcode a value.
     LoadDeterministicRandom {
         dst: StudyRegister,
         domain: u32,
@@ -255,6 +289,13 @@ impl StudyInstruction {
         }
     }
 
+    /// The capability an instruction consumes. This match is deliberately
+    /// exhaustive with no wildcard: `destination()` and the validator both
+    /// force an arm for every new opcode, and this — the authority boundary —
+    /// must force one too. A wildcard here was the exact mechanism by which
+    /// a future `Load*` opcode could read a host input while the canonical
+    /// capability law silently derived "none declared, none required";
+    /// authority that depends on someone remembering is not a boundary.
     fn capability(&self) -> Option<StudyCapability> {
         match self {
             Self::LoadCurrentColor { .. } => Some(StudyCapability::CurrentColor),
@@ -263,7 +304,16 @@ impl StudyInstruction {
             Self::LoadAudioBand { .. } => Some(StudyCapability::AudioFeatures),
             Self::LoadBeatPhase { .. } => Some(StudyCapability::BeatPhase),
             Self::LoadDeterministicRandom { .. } => Some(StudyCapability::DeterministicRandom),
-            _ => None,
+            Self::ConstantScalar { .. }
+            | Self::ConstantVector2 { .. }
+            | Self::ConstantColor { .. }
+            | Self::Add { .. }
+            | Self::Subtract { .. }
+            | Self::Multiply { .. }
+            | Self::Mix { .. }
+            | Self::Clamp01 { .. }
+            | Self::HueRotate { .. }
+            | Self::OutputColor { .. } => None,
         }
     }
 }
@@ -764,6 +814,106 @@ mod tests {
 
     fn register(value: u8) -> StudyRegister {
         StudyRegister::new(value).unwrap()
+    }
+
+    /// Pins the complete opcode-to-capability table, one sample per opcode.
+    /// The compiler now refuses a new opcode with no `capability()` arm; this
+    /// test makes the *value* of every arm a reviewed fact as well, so an
+    /// authority change can never ride in as an incidental diff.
+    #[test]
+    fn every_opcode_declares_its_capability_explicitly() {
+        let dst = register(0);
+        let table: [(StudyInstruction, Option<StudyCapability>); 16] = [
+            (
+                StudyInstruction::LoadCurrentColor { dst },
+                Some(StudyCapability::CurrentColor),
+            ),
+            (
+                StudyInstruction::LoadHistoryColor { dst, age: 1 },
+                Some(StudyCapability::HistoryRead),
+            ),
+            (
+                StudyInstruction::LoadMotionVector { dst },
+                Some(StudyCapability::MotionFieldRead),
+            ),
+            (
+                StudyInstruction::LoadAudioBand { dst, band: 0 },
+                Some(StudyCapability::AudioFeatures),
+            ),
+            (
+                StudyInstruction::LoadBeatPhase { dst },
+                Some(StudyCapability::BeatPhase),
+            ),
+            (
+                StudyInstruction::LoadDeterministicRandom { dst, domain: 0 },
+                Some(StudyCapability::DeterministicRandom),
+            ),
+            (StudyInstruction::ConstantScalar { dst, value: 0.0 }, None),
+            (
+                StudyInstruction::ConstantVector2 {
+                    dst,
+                    value: [0.0, 0.0],
+                },
+                None,
+            ),
+            (
+                StudyInstruction::ConstantColor {
+                    dst,
+                    value: [0.0; 4],
+                },
+                None,
+            ),
+            (
+                StudyInstruction::Add {
+                    dst,
+                    left: dst,
+                    right: dst,
+                },
+                None,
+            ),
+            (
+                StudyInstruction::Subtract {
+                    dst,
+                    left: dst,
+                    right: dst,
+                },
+                None,
+            ),
+            (
+                StudyInstruction::Multiply {
+                    dst,
+                    left: dst,
+                    right: dst,
+                },
+                None,
+            ),
+            (
+                StudyInstruction::Mix {
+                    dst,
+                    a: dst,
+                    b: dst,
+                    amount: dst,
+                },
+                None,
+            ),
+            (StudyInstruction::Clamp01 { dst, input: dst }, None),
+            (
+                StudyInstruction::HueRotate {
+                    dst,
+                    color: dst,
+                    turns: dst,
+                },
+                None,
+            ),
+            (StudyInstruction::OutputColor { color: dst }, None),
+        ];
+        for (instruction, expected) in table {
+            assert_eq!(
+                instruction.capability(),
+                expected,
+                "capability table changed for {instruction:?}"
+            );
+        }
     }
 
     fn valid_document() -> StudyDocument {
