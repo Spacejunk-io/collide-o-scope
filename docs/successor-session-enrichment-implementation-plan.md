@@ -326,8 +326,8 @@ pairs for both motion donors—eight sampled textures and no texture sampler.
 Use custom premultiplied bilinear loads: dry carrier 4 + processed source 4 +
 vector/gate 2 = at most ten texture operations. Reuse the existing committed
 Compat8 clean-history ring; a new RGBA16F history ring is prohibited unless a
-later product/resource decision explicitly admits its roughly 398 MiB 1080p
-cost.
+later product/resource decision explicitly admits its 398.1 MB (379.7 MiB)
+1080p cost.
 
 The evaluator must flush an ordinary rack segment, emit one dedicated
 `SymmetryField` step at the authored position, and then resume segmentation.

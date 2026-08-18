@@ -49,7 +49,9 @@
 //! Symmetry Field adds nothing to the composition's warm surface ledger.
 //!
 //! The clean-history ring is likewise **borrowed, never duplicated**. A new
-//! RGBA16F full-frame history ring would cost roughly 398 MiB at 1080p; the
+//! RGBA16F full-frame history ring would cost 398.1 MB (379.7 MiB) at 1080p
+//! — `1920 × 1080 × 8 × 24` bytes = 398,131,200, a decimal-vs-binary unit
+//! distinction three documents previously blurred; the
 //! committed Compat8 ring (`composition_host.rs:1208`, 24 layers of
 //! `Rgba8UnormSrgb`, already charged as
 //! `ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS = 25`) is bound through its single
