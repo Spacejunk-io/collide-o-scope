@@ -3,8 +3,11 @@ Enriched successor-session prompt for §7 of
 laws S1–S6 established and the traps they cost time on. Everything above the
 horizontal rule is context a successor should read once; the prompt proper
 begins below it, and the appendix records the places this project's own
-documentation has been wrong — including three found while writing this page,
-one of which was actively contradicting shipped code.
+documentation has been wrong — including several found while writing this page,
+one of which was actively contradicting shipped code, and three of which were
+this page's own first draft. It was revised after S6's CI failed on all three
+platforms; that failure is recorded there too, because its lesson is the most
+immediately useful thing here.
 
 Written after S6 landed. **§7 is not shaped like S1–S6, and that is the single
 most important sentence here.** The previous six tranches each asked for one
@@ -150,6 +153,23 @@ vcvars prints a harmless `'vswhere.exe' is not recognized` line to stderr;
 ignore it. Never `2>&1` a native command in PowerShell 5.1 — every stderr line
 becomes a false ErrorRecord and `$?` goes false on a successful build.
 
+**Run the gate on the toolchain CI uses, not the one you happen to have.**
+*(New, and it cost S6 three red CI runs after a green local gate.)* The workflow
+does `rustup toolchain install stable`, so CI tracks whatever stable is *today*;
+that host's default was pinned older. rustc 1.97 added
+`float_literal_f32_fallback` (rust#154024), which fires on a bare float literal
+inferred through an `f32: From<f64>` fallback — for example `1.5` passed to
+`egui::Stroke::new`, whose width is `impl Into<f32>`. It is a *warning* under
+`cargo check` and `cargo test` and an *error* under clippy's `-D warnings`, so
+steps 4 and 5 pass and step 6 fails, on all three platforms at once, with
+nothing wrong in the code. Neither run was lying: the compilers differed.
+
+Before claiming a gate, run `rustc --version` and compare it to the version the
+workflow log prints. If they differ, `rustup toolchain install <ci-version>` and
+re-run with `RUSTUP_TOOLCHAIN` set. A new stable can add a lint at any time, so
+this is not a one-off — it is the same class of error as "a local run is not
+cross-platform evidence", one level lower down.
+
 **Run `cargo fmt --all` before the gate, not after.** There is no
 `rustfmt.toml`, so stock defaults are the contract and step 1 fails loudly on
 whitespace you never considered. Note also that rustfmt will reflow string
@@ -192,11 +212,27 @@ S7 — Evidence-gated precision and scale runtimes, per §7 of
 `docs/successor-session-enrichment-implementation-plan.md`, with
 `docs/precision-and-scale.md` as the binding design record.
 
-Branch from `feat/web-control-panel`'s newest three-platform-green tip. S6 is
-pushed as `feat/native-preview-transform` at `69ce2f1` and is not yet merged;
-because it is a linear descendant of `c99e043`, branch from it directly if it
-has not landed — there is nothing to merge. Land **exactly one** tranche in one
-commit carrying its resource-delta table.
+Branch from `feat/web-control-panel`'s newest tip that has three-platform CI
+green. Two cautions, because the obvious reading of that instruction is
+circular and the obvious shortcut goes stale.
+
+First, **check CI yourself**; do not inherit this page's word for it. S6 was
+written on a host with no `gh` installed, so its CI was never inspected from
+there — and it subsequently failed on all three platforms on a compiler newer
+than that host's. If `gh` is unavailable to you too, read the runs in the web UI
+before branching. "Assume green" is how this exact page's predecessor was wrong.
+
+Second, the state recorded here is a snapshot with a short life. At the time of
+writing, S6 is pushed as `feat/native-preview-transform` and is **not** merged,
+and it is a linear descendant of `c99e043`. If that is still true, branching
+from it directly is correct and needs no merge. But every prior tranche landed
+as a GitHub *merge* commit, so the moment S6 lands the same way,
+`feat/web-control-panel` moves ahead of it and branching from
+`feat/native-preview-transform` would silently omit whatever landed alongside.
+**Re-derive the topology with `git log` before you branch**, rather than
+trusting the three places this document asserts it.
+
+Land **exactly one** tranche in one commit carrying its resource-delta table.
 
 ### What §7 actually is
 
@@ -205,11 +241,11 @@ reading the code rather than the plan, and it is the first thing to act on:
 
 | Sub-tranche | State in code today | Landable now? | Gate, and who opens it |
 |---|---|---|---|
-| **Content-addressed proxy** | `src/proxy.rs` is a complete, *pure* planner: cache key, preflight, assessment, eviction ordering. It performs **zero** filesystem mutation and spawns **zero** processes. `main.rs` already consumes it and publishes an operator-facing recommendation the operator cannot act on. | **Yes — this is the tranche**, but its first commit is the *definition*, not the worker. | No external gate: local filesystem plus the ffmpeg CLI, both of which this repo already does elsewhere. §7's own ordering clause is the gate, and it is unmet — see below. |
-| **Study execution** | `src/study.rs` is a complete validated data ABI — 16 opcodes, 64 registers, 256 instructions, 6 capabilities — with `validate()`, serde, and **no evaluator whatsoever**. Nothing in the crate consumes `study::` at all. | **Codeable, but fails the delivery gate alone.** See below. | A product decision about what a Study is *for*. |
-| **Hardware / zero-copy / Syphon / NDI / capture** | `src/precision.rs` has a complete typed capability evaluator with five `Deferred` reasons and **nothing behind it**. No feature flag, no trait object, no stub. | **No.** | `SdkOrLicenseRequired` needs a purchase and a legal decision; `NetworkPolicyRequired` needs an authorization; `PlatformUnsupported` needs hardware. None is an engineering task. |
-| **Bounded mesh warp** | **A working mesh pipeline already exists and is easy to miss.** `StageMeshVertex { source_uv, output_uv }` (`stage_map.rs:838`), `StageSlicePlan.vertices/indices` (`:846`), convexity and winding validation, `solve_homography` (`:948`), plus a real GPU path: `mesh_buffer_bytes` accounting (`renderer/stage_map.rs:404`), `STAGE_VERTEX_ATTRIBUTES` (`:473`), and `draw_indexed` with `Uint16` indices. Caps are `MAX_POLYGON_VERTICES = 8`, `MAX_SLICES_PER_ENDPOINT = 64`, `MAX_STAGE_SLICES = 256`. | **No — and emphatically not greenfield.** | The evidence table in `docs/precision-and-scale.md` requires "a demonstrated venue requirement". That is an operator fact, not a coding one. |
-| **Experimental full-16 history** | The committed ring is `TEMPORAL_HISTORY_LEN = 24` on the Compat8 path. | **No.** | A measurement plus an explicit product decision, because the surfaces do not fit the accepted budget. See the corrected arithmetic in the appendix. |
+| **Content-addressed proxy** | `src/proxy.rs` is a complete, *pure* planner: cache key, preflight, assessment, eviction ordering. It performs **zero** filesystem mutation and spawns **zero** processes. `main.rs` already consumes it and publishes an operator-facing recommendation the operator cannot act on. | **Yes — this is the tranche**, but its first commit is the *definition*, not the worker. | Two gates, both openable here. §7's own ordering clause is unmet — see below. And **no FFV1 encode exists anywhere in this repo**: `ProxyFormat::Ffv1Matroska` says of itself that it is "a cache-key vocabulary only; its presence does not claim an encoder is installed" (`proxy.rs:42`), and every actual ffmpeg invocation is `libx264` (`program_recorder.rs:885`, `render_export.rs:2999`). Confirm the installed ffmpeg supports FFV1 in Matroska before planning on it. |
+| **Study execution and distribution** | `src/study.rs` is a complete validated data ABI — sixteen `StudyInstruction` variants, `STUDY_MAX_REGISTERS = 64`, `STUDY_MAX_INSTRUCTIONS = 256`, six `StudyCapability` variants — with `validate()`, serde, and **no evaluator whatsoever**. Nothing in the crate references `study::` at all. (Beware two unrelated sixteens: the opcode *count* is not a constant, while `STUDY_MAX_CAPABILITIES` **is** 16 and is unreachable, since only six capabilities exist and they must be unique.) | **Codeable, but fails the delivery gate alone.** See below. | A product decision about what a Study is *for*. |
+| **Hardware / zero-copy / Syphon / NDI / capture** | `src/precision.rs` has a complete typed capability evaluator with five `Deferred` reasons and **nothing behind it**. No feature flag, no trait object, no stub. `CapabilityDecision::Available` appears once in the repo — the return statement — and has never executed. | **Mixed, and the plan's blanket "no" is too coarse.** | Read the evaluator's actual order (`precision.rs:592`). Only **NDI** needs a purchase *and* a network authorization. **Syphon** is genuinely platform-gated. For **hardware decode, zero-copy, and capture** on a supported platform the blocking reason is `BackendNotIntegrated` — which is purely an engineering task, and a large one. It is out of scope for a single tranche, not barred by an external gate. |
+| **Bounded mesh warp** | **A working mesh pipeline already exists and is easy to miss.** `StageMeshVertex { source_uv, output_uv }` (`stage_map.rs:838`), `StageSlicePlan.vertices/indices` (`:846`), convexity and winding validation, and `solve_homography` (`:948`) — but note only `PerspectiveQuad` carries a projective map; `Polygon` slices set `output_to_source: None` and interpolate per triangle, which is load-bearing for a warp design. Plus a real GPU path: `mesh_buffer_bytes` accounting (`renderer/stage_map.rs:404`), `STAGE_VERTEX_ATTRIBUTES` (`:473`), and `draw_indexed` with `Uint16` indices. Caps are `MAX_POLYGON_VERTICES = 8`, `MAX_SLICES_PER_ENDPOINT = 64`, `MAX_STAGE_SLICES = 256`. | **No — and emphatically not greenfield.** | The evidence table in `docs/precision-and-scale.md` requires "a demonstrated venue requirement". That is an operator fact, not a coding one. |
+| **Experimental full-16 history** | The committed ring is 24 `Rgba8UnormSrgb` layers (`TEMPORAL_HISTORY_LEN`, `HOST_PRESENT_FORMAT`), and the *charged* temporal allocation is **25** surfaces — 24 clean-history layers plus one recursive-feedback image. **The byte-exact budget comparison already exists**, correctly labelled, at `docs/precision-and-scale.md:18-25`. | **No.** | A representative-workload measurement plus an explicit product decision. The arithmetic is already done; what is missing is evidence of a documented gain. |
 
 **Do not attempt more than one of these.** The plan's own dependency section is
 explicit that adjacent tranches must not be merged merely because they share an
@@ -301,9 +337,14 @@ Four things are easy to get wrong here and each is a real defect:
   shareable artifact in this repo.
 - **Assessment is not implementation, and neither is a worker with no reader.**
   §7 says "never call assessment alone a proxy implementation". The mirror-image
-  trap is a worker that publishes artifacts nothing ever opens. State plainly in
-  the commit whether the decoder consults the cache, and if this tranche stops
-  short of that, say so as a boundary rather than implying the loop is closed.
+  trap is a worker that publishes artifacts nothing ever opens — and note that
+  this is the *same* no-consumer failure used above to reject a Study evaluator,
+  one level further down the pipeline. Do not let this tranche hide behind it.
+  A cache writer whose artifacts no decoder opens has not completed the sentence
+  the operator is being shown; it has only moved the incompleteness. Either the
+  decoder consults the cache in this tranche, or the commit states in plain words
+  that the loop is still open and the operator's recommendation is still
+  unactionable. The delivery gate below is written against the first of those.
 
 LRU eviction receipts and decoder A/B telemetry are named in §7 and belong here.
 Both are measurements, so both must be honest about sample counts the way the
@@ -330,17 +371,28 @@ a coding decision:
   injection, which `StudyAuthority` marks permanently false, and the distinction
   must be argued explicitly in the commit rather than assumed. Anything that
   generates or concatenates shader text is forbidden outright.
-- **The history-age convention, which currently disagrees with itself.** Study
-  validates `LoadHistoryColor { age }` as `1..=STUDY_MAX_HISTORY_AGE` where that
-  constant is **24**, rejecting age 0. The committed ring uses
+- **The history-age convention, which two subsystems currently state
+  differently.** Study validates `LoadHistoryColor { age }` as
+  `1..=STUDY_MAX_HISTORY_AGE`, a restated literal **24**, rejecting age 0
+  (`study.rs:31,318`). The committed ring derives
   `SYMMETRY_MAX_HISTORY_AGE = TEMPORAL_HISTORY_LEN - 1` = **23**, valid `0..=23`,
-  where 0 means the current frame. Both are internally consistent and they are
-  off by one relative to each other: Study's age is 1-based, the ring's is
-  0-based, and they span the same 24 layers. An evaluator must map Study age
-  `a` to ring age `a - 1`. A direct index is wrong at every age and reads out of
-  bounds at 24. Reconcile this in the commit — and note it is exactly the
-  "audit every resolver" law: two subsystems already name the same ring with
-  different conventions.
+  where **age 0 is the virtual current image and `1..=23` address stored ring
+  layers** (`symmetry.rs:98,781`). So the two do *not* span the same set: the
+  ring offers 1 current + 23 stored, Study offers 24 addresses whose meaning is
+  undocumented — `LoadHistoryColor` has no doc comment and neither does the
+  constant.
+
+  There are two defensible readings and the evidence does not choose between
+  them. Either Study age is offset by one and an evaluator must map `a` to ring
+  age `a - 1` — in which case Study age 1 resolves to the current frame and
+  merely duplicates `LoadCurrentColor` — or `STUDY_MAX_HISTORY_AGE` was set to
+  the ring *length* where it meant the ring *max age*, and the fix is that the
+  cap is one too large. Those are different fixes. **Decide it explicitly and
+  document it on the opcode**, rather than picking one silently in an
+  evaluator; and note that no out-of-bounds read is currently reachable, because
+  `history_age_is_in_domain` and the shader's layer clamp both guard it. This
+  is the "audit every resolver" law in its documentation form: two subsystems
+  already name the same ring, and only one of them says what it means.
 - **What a reference evaluator is allowed to claim.** The plan asks for
   "deterministic CPU reference fixtures". A reference evaluator with no live
   consumer is a conformance artifact and must be labelled one. It is not
@@ -384,6 +436,30 @@ much of the ring has actually been written, so an evaluator must additionally
 guard every age against the valid-sample count exactly as `temporal_originals.wgsl`
 already does, or a young program will read unwritten texture content.
 
+### The half of §7 this page nearly dropped: Study *distribution*
+
+§7's fifth heading is "Study execution **and distribution**", and the
+distribution half is the one clause in the whole section that is explicitly
+about overclaiming authority — which makes omitting it the most ironic mistake
+available here. It reads: "Marketplace, binary plugin, signing, sandbox,
+update, and license-distribution systems are separate governance/security
+projects and must not be inferred from the data ABI."
+
+That is not hypothetical. `study.rs` already carries `StudyLicenseNotice` and
+`StudyPublicationBoundary::StudyDataOnlyDoesNotLicenseHost`, and that boundary
+exists precisely so a Study's own licence cannot be read as licensing the host.
+It connects directly to the standing constraint at the end of CLAUDE.md: the
+upstream original code carries no blanket MIT grant, and the fork's LICENSE
+covers only the additions described there. A "Study marketplace", a signing
+scheme, or an update channel would each be a distribution system layered on top
+of an unresolved upstream licensing question.
+
+Nothing here is a coding task, and that is the point. The deliverable, if this
+is touched at all, is keeping the boundary legible: the ABI grants no authority,
+the licence notice covers the Study data only, and none of it characterises or
+implies a licence for the host. Do not let a schema field, a `license_id`
+string, or a validated document be described as a distribution capability.
+
 ### The three you must not walk through
 
 For each of these the deliverable is a sharpened, typed, tested **boundary** —
@@ -396,6 +472,24 @@ itself. That arm has never executed.** `CapabilityEvidence` is six naked bools
 with no `impl` block, no probe, and no producer; its only callers are test
 fixtures typing literals. The evaluator in `src/precision.rs` is already
 correct; leave its decisions alone.
+
+But be precise about *which* gate blocks *what*, because §7's prose reads as one
+blanket deferral and the evaluator does not. Its order is: NDI checks SDK
+licence then network policy; mesh warp checks the venue requirement; then
+`platform_supported`; then `backend_integrated`; then `interoperability_proven`.
+So only NDI is barred by a purchase and an authorization, and only Syphon is
+squarely platform-gated. Hardware decode, zero-copy decode, and capture input on
+a supported platform stop at **`BackendNotIntegrated`** — a reason no external
+party can open and no cheque can buy. That is engineering work, and calling it
+"deferred" without saying so is its own small overclaim. It is out of scope for
+one tranche because it is *large*, not because it is *blocked*; §7 additionally
+requires platform-specific resource accounting and lifecycle/reset tests for
+each, which is a whole milestone rather than a sub-tranche.
+
+The honest deliverable if this area is touched at all is a `CapabilityEvidence`
+**producer** — real probes that turn adapter queries, SDK presence, and policy
+into those six bools, replacing test fixtures typing literals. That is
+buildable, it is testable, and it moves nothing to `Available` by itself.
 If anything is done here at all, it is making the `Deferred` reasons more
 actionable: what exact evidence, from whom, at what cost. NDI additionally
 requires *both* an SDK/licence authorization and a network-policy
@@ -423,10 +517,28 @@ renderer grows — the same order S6's spatial contract was frozen in, and the
 reason its gizmo could be preview-only with a zero resource delta.
 
 **Experimental full-16 history** — gated on a measurement and a product
-decision, and the arithmetic is in the appendix below because the number in
-CLAUDE.md is mislabelled. Whatever else happens, it may not change the settled
-Advanced RGBA16F-working / Compat8-history default, and it must remain an
-explicit precision path rather than a new default.
+decision, and the first thing to know is that **the arithmetic is already done
+and you should not redo it.** `docs/precision-and-scale.md:18-25` carries the
+byte-exact fixture: 25 temporal surfaces at 207,360,000 bytes (197.753906 MiB)
+settled, 414,720,000 bytes (395.507812 MiB) under the Full-16 candidate, an
+exact increase of **207,360,000 bytes (197.753906 MiB)**, and an exact fixture
+total moving from 324.328125 MiB to 522.082031 MiB. The count is 25, not 24 —
+24 clean-history layers *plus one recursive-feedback image* — and the candidate
+upgrades all of them.
+
+Do not confuse that with the `~398 MiB` figure in CLAUDE.md and elsewhere. That
+one is a different statement in a different section for a different purpose: it
+is the Symmetry Field's argument against allocating a *second* full-frame ring,
+it is a gross 24-layer cost rather than a delta, and its unit is mislabelled
+(see the appendix). It is not the budget input, and nothing about the full-16
+decision turns on it.
+
+So what is missing here is not a calculation. It is "representative temporal
+workloads demonstrate a documented gain" — a measurement nobody has taken, on
+hardware, against a product decision about whether ~198 MiB of additional
+temporal residency is worth it. Whatever else happens, this may not change the
+settled Advanced RGBA16F-working / Compat8-history default, and it must remain
+an explicit precision path rather than a new default.
 
 ### Verification ladder
 
@@ -514,7 +626,7 @@ worse bug than one that never ran.
 
 ---
 
-## Appendix — S6 landed, and the corrections it forced
+## Appendix — S6 landed, then failed CI, and the corrections both forced
 
 Landed as `69ce2f1` on `feat/native-preview-transform`, a single linear commit
 on top of `c99e043`, pushed and not yet merged. Local six-step gate green:
@@ -538,28 +650,32 @@ statements are now corrected and both halves are proven. The lesson is in the
 carried-forward list above: a documented invariant that disagrees with the code
 is not automatically a code defect.
 
-**A correction this page forces on CLAUDE.md, relevant to §7.** The full-16
-history section of CLAUDE.md states that a new RGBA16F full-frame history ring
-would be "~398 MiB at 1080p". The arithmetic is
-`1920 × 1080 × 8 bytes × 24 layers = 398,131,200 bytes`, which is **398.1 MB
-decimal, or 379.7 MiB binary**. The numeral 398 is correct and the unit is not.
-It is a five-percent error and it sits directly under the one sub-tranche whose
-entire gate is whether those surfaces fit an accepted device budget — so if the
-full-16 decision is ever taken to a real budget comparison, fix the unit first.
-
-It is also repeated in four places — `CLAUDE.md:986`,
+**A unit error in the `~398 MiB` figure — narrower than this page first
+claimed.** The number appears in four places: `CLAUDE.md:986`,
 `docs/successor-session-enrichment-implementation-plan.md:329`,
-`src/renderer/symmetry_field.rs:52`, and the untracked root `MASTER_PLAN.md:256`
-— so a correction has to be a sweep, not an edit. It is additionally a *gross*
-cost quoted where a *delta* is implied.
+`src/renderer/symmetry_field.rs:52`, and the untracked root `MASTER_PLAN.md:256`.
+The arithmetic behind it is `1920 × 1080 × 8 bytes × 24 layers = 398,131,200
+bytes`, which is **398.1 MB decimal, or 379.7 MiB binary** — the numeral is
+right and the unit is not.
 
-This one was flagged rather than fixed, while the stale constraint below was
-fixed rather than flagged, and the distinction is deliberate: the unit is
-imprecise but not misleading — the numeral is right and the prohibition it
-supports is unaffected — whereas the constraint bullet asserted the opposite of
-shipped behaviour and would have misdirected this very session. Correct a
-document when it is wrong about what the code does; leave a precision nit to the
-tranche that has a reason to care.
+That is the whole of the defect, and this page's first draft built far too much
+on it. It claimed the sentence lived in "the full-16 history section" and that
+the full-16 gate turns on it. Both are wrong. The sentence sits inside **the
+dedicated Symmetry Field** section and argues against allocating a *second*
+full-frame ring; it is a gross cost, not a delta. The actual full-16 budget
+comparison already exists, byte-exact and correctly labelled, in the very
+document §7 names as binding — `docs/precision-and-scale.md:18-25` — and it uses
+**25** temporal surfaces (24 clean-history layers plus one recursive-feedback
+image), giving 414,720,000 bytes / 395.507812 MiB for the candidate and an exact
+increase of 207,360,000 bytes / 197.753906 MiB. Nothing about the full-16
+decision depends on the mislabelled figure.
+
+The failure that produced that draft is worth more than the correction: the page
+computed a number itself instead of opening the design record it had just
+declared binding, and it named one site of a figure that appears in four. Those
+are its own "audit every resolver" and "confirm the count of sites" laws, broken
+on the same page that states them. Fix the unit as a sweep if you touch it; do
+not treat it as a blocker.
 
 **A stale constraint this page found and corrected.** CLAUDE.md's
 Known-constraints list still carried the S5-era bullet asserting that an
@@ -583,6 +699,21 @@ command carries no `--all-features`. They are equivalent because `Cargo.toml`
 declares no `[features]`, so the flag is a no-op wherever it appears — but the
 two should be made to say the same thing by whichever tranche next touches the
 Verification section, so that nobody re-derives this.
+
+**S6 was green locally and red on all three CI platforms, and both were
+correct.** After S6 was pushed, every platform failed at the clippy step on
+`float_literal_f32_fallback` — a lint rustc 1.97 added, firing on two bare `1.5`
+literals passed to `egui::Stroke::new`, whose width parameter is
+`impl Into<f32>`. The authoring host defaulted to rustc 1.96.1; CI installs
+`stable` fresh. The fix was to reproduce it first by installing 1.97.1 locally,
+then type the width as a named `f32` constant, then re-run all six gate steps on
+*that* toolchain (1256 / 0 / 87, clippy clean) and again on 1.96.1.
+
+Two things are worth carrying. The lint is a warning under `check` and `test`
+and an error only under clippy's `-D warnings`, so a partial gate would have
+looked fine — this is why the gate is six steps and why running a subset proves
+nothing. And a green local gate is not evidence about CI unless the compiler
+matches; the carried-forward list above now says so explicitly.
 
 **Where this document was wrong in its own first draft, and why that is worth
 keeping.** The landability table originally said of the mesh warp: "Nothing
