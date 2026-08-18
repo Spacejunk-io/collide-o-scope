@@ -923,6 +923,115 @@ mod tests {
     }
 
     #[test]
+    fn a_field_collider_block_round_trips_through_the_checksummed_journal() {
+        use crate::patch::{
+            FaradayConfig, FieldColliderConfig, FieldColliderModeConfig, MotionBoundaryModeConfig,
+            MotionConfig, MotionDonorConfig,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        let collider = FieldColliderConfig {
+            enabled: true,
+            mode: FieldColliderModeConfig::Projection,
+            boundary: MotionBoundaryModeConfig::Wrap,
+            input_a: MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            },
+            // A retained tombstone must survive the journal as a tombstone.
+            input_b: MotionDonorConfig::Missing {
+                saved_position: SavedLayerPosition::new(4).unwrap(),
+            },
+            ..FieldColliderConfig::default()
+        };
+        let motion = MotionConfig {
+            transplant: FaradayConfig {
+                amount: 0.6,
+                ..FaradayConfig::default()
+            },
+            collider,
+            ..MotionConfig::default()
+        };
+
+        let mut carrier: PatchState = serde_yaml::from_str(
+            "master:
+  random_seed: 83
+layers:
+  - filename: collider.mov
+",
+        )
+        .unwrap();
+        carrier.layers[0].motion = Some(motion);
+
+        let path = TempJournal::new("field-collider");
+        let mut journal = RecoveryJournal::open(&path.0).unwrap();
+        let receipt = journal.append_patch(&carrier).unwrap();
+        assert!(receipt.payload_bytes > 0);
+
+        let reopened = RecoveryJournal::open(&path.0).unwrap();
+        assert_eq!(
+            reopened.latest_valid().tail_status,
+            RecoveryTailStatus::Clean
+        );
+        assert!(!reopened.latest_valid().has_bad_tail());
+        let latest = reopened.latest_valid().latest.as_ref().unwrap();
+        assert_eq!(seed(latest), 83);
+
+        let restored = latest.patch.layers[0]
+            .motion
+            .expect("the journal payload carries the collider block");
+        assert_eq!(restored.collider, collider);
+        assert!(restored.collider.enabled);
+        assert_eq!(restored.collider.mode, FieldColliderModeConfig::Projection);
+        assert_eq!(restored.collider.boundary, MotionBoundaryModeConfig::Wrap);
+        // The tombstone is still a tombstone and still names its saved position.
+        assert_eq!(
+            restored.collider.input_b,
+            MotionDonorConfig::Missing {
+                saved_position: SavedLayerPosition::new(4).unwrap()
+            }
+        );
+
+        // Authored topology only. No derived vector, no transient pair, no gate
+        // parity, no process-lifetime identity, and no filesystem metadata.
+        let payload = String::from_utf8(latest.payload.clone()).unwrap();
+        assert!(payload.contains("collider"));
+        assert!(!payload.contains("layer_id"));
+        assert!(!payload.contains("derived"));
+        assert!(!payload.contains("transient"));
+        assert!(!payload.contains("velocity"));
+        assert!(!payload.contains("texture"));
+        assert!(!payload.contains("modified"));
+        assert!(!payload.contains(std::env::temp_dir().to_string_lossy().as_ref()));
+
+        // A patch with no collider section at all still loads: absent is
+        // exactly the pre-collider path.
+        let mut legacy: PatchState = serde_yaml::from_str(
+            "master:
+  random_seed: 84
+layers:
+  - filename: legacy.mov
+",
+        )
+        .unwrap();
+        legacy.layers[0].motion = Some(MotionConfig::default());
+        let legacy_path = TempJournal::new("field-collider-legacy");
+        let mut legacy_journal = RecoveryJournal::open(&legacy_path.0).unwrap();
+        legacy_journal.append_patch(&legacy).unwrap();
+        let legacy_payload = String::from_utf8(
+            RecoveryJournal::open(&legacy_path.0)
+                .unwrap()
+                .latest_valid()
+                .latest
+                .as_ref()
+                .unwrap()
+                .payload
+                .clone(),
+        )
+        .unwrap();
+        assert!(!legacy_payload.contains("collider"));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn a_recorded_gesture_track_round_trips_through_the_journal_and_still_validates() {
         use crate::gesture::{

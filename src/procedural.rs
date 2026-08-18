@@ -3180,6 +3180,77 @@ impl Drop for PatchCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dice_the_generator_and_modulation_all_preserve_the_collider_block_exactly() {
+        use crate::patch::{
+            FieldColliderConfig, FieldColliderModeConfig, MotionBoundaryModeConfig, MotionConfig,
+            MotionDonorConfig,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        let authored = FieldColliderConfig {
+            enabled: true,
+            mode: FieldColliderModeConfig::Curl,
+            boundary: MotionBoundaryModeConfig::Mirror,
+            input_a: MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(1).unwrap(),
+            },
+            input_b: MotionDonorConfig::Selected {
+                saved_position: SavedLayerPosition::new(3).unwrap(),
+            },
+            ..FieldColliderConfig::default()
+        };
+        let anchor = MotionConfig {
+            collider: authored,
+            ..MotionConfig::default()
+        };
+
+        // Version 1 adds no collider-only continuous control, so the bounded
+        // generator has nothing to move. Every temperature, every seed, every
+        // owner domain, with and without Faraday included, must leave the block
+        // bit-identical — including both saved donor positions.
+        for temperature in [0.0_f32, 0.25, 0.5, 1.0] {
+            for seed in [0_u64, 1, 0xDEAD_BEEF, u64::MAX] {
+                for include_faraday in [false, true] {
+                    let mut mutated = anchor;
+                    mutate_motion_config(
+                        &anchor,
+                        &mut mutated,
+                        temperature,
+                        seed,
+                        3,
+                        0x5151_5151,
+                        include_faraday,
+                    );
+                    assert_eq!(
+                        mutated.collider, authored,
+                        "the generator moved the collider block at t={temperature} seed={seed}"
+                    );
+                }
+            }
+        }
+
+        // Modulation exposes no collider address at all: the block is closed
+        // authored topology, and `target_range` must not recognise any of it.
+        for name in [
+            "collider",
+            "collider_mode",
+            "collider_enabled",
+            "collider_boundary",
+            "collider_input_a",
+            "collider_input_b",
+            "layer1_collider",
+            "layer1_collider_mode",
+            "layer1_collider_enabled",
+            "layer1_collider_boundary",
+        ] {
+            assert!(
+                crate::modulation::target_range(name).is_none(),
+                "modulation must expose no address for {name}"
+            );
+        }
+    }
     use crate::patch::{EffectsConfig, LayerConfig};
 
     fn anchor() -> PatchState {

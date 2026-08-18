@@ -2511,6 +2511,104 @@ pub enum MotionDonorSnapshot {
     Missing { saved_position: u32 },
 }
 
+/// The addressed Field Collider input, as a closed named token.
+///
+/// A token rather than an index, following the Residual slot precedent: an
+/// unknown slot is a deserialization rejection instead of a positional fallback
+/// onto the partner input.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldColliderInputSnapshot {
+    #[default]
+    A,
+    B,
+}
+
+impl FieldColliderInputSnapshot {
+    pub const fn to_runtime(self) -> crate::motion::FieldColliderInput {
+        match self {
+            Self::A => crate::motion::FieldColliderInput::A,
+            Self::B => crate::motion::FieldColliderInput::B,
+        }
+    }
+}
+
+/// Browser view of the Field Collider block.
+///
+/// Both inputs are published through the established [`MotionDonorSnapshot`]
+/// vocabulary, preserving their Selected/Missing tombstone semantics — there is
+/// deliberately no parallel donor encoding for the collider. `diagnostic` is
+/// the engine's typed admission answer rendered for the operator; `admitted`
+/// says whether the derived field actually owns the carrier this frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldColliderSnapshot {
+    pub algorithm_version: u16,
+    pub enabled: bool,
+    pub mode: String,
+    pub boundary: String,
+    pub input_a: MotionDonorSnapshot,
+    pub input_b: MotionDonorSnapshot,
+    #[serde(default)]
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diagnostic: String,
+}
+
+impl Default for FieldColliderSnapshot {
+    fn default() -> Self {
+        Self::from_params(crate::motion::FieldColliderParams::default())
+    }
+}
+
+impl FieldColliderSnapshot {
+    pub fn from_params(params: crate::motion::FieldColliderParams) -> Self {
+        use crate::motion::{FieldColliderMode, MotionBoundaryMode};
+        let params = params.sanitized();
+        let mode = match params.mode {
+            FieldColliderMode::Sum => "sum",
+            FieldColliderMode::Difference => "difference",
+            FieldColliderMode::Curl => "curl",
+            FieldColliderMode::Projection => "projection",
+            FieldColliderMode::CollisionBoundary => "collision_boundary",
+        };
+        let boundary = match params.boundary {
+            MotionBoundaryMode::Transparent => "transparent",
+            MotionBoundaryMode::Mirror => "mirror",
+            MotionBoundaryMode::Wrap => "wrap",
+            MotionBoundaryMode::Hold => "hold",
+        };
+        Self {
+            algorithm_version: params.algorithm_version,
+            enabled: params.enabled,
+            mode: mode.into(),
+            boundary: boundary.into(),
+            input_a: motion_donor_snapshot(params.input_a),
+            input_b: motion_donor_snapshot(params.input_b),
+            admitted: false,
+            diagnostic: String::new(),
+        }
+    }
+}
+
+/// The one runtime-to-wire donor mapping. Every collider slot and the Faraday
+/// transplant share it, so a tombstone is published identically everywhere.
+fn motion_donor_snapshot(donor: crate::motion::MotionDonor) -> MotionDonorSnapshot {
+    use crate::motion::MotionDonor;
+    match donor {
+        MotionDonor::None => MotionDonorSnapshot::None,
+        MotionDonor::Selected {
+            layer_id,
+            saved_position,
+        } => MotionDonorSnapshot::Selected {
+            layer_id: layer_id.get().to_string(),
+            saved_position: saved_position.get(),
+        },
+        MotionDonor::Missing { saved_position } => MotionDonorSnapshot::Missing {
+            saved_position: saved_position.get(),
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FaradayMotionSnapshot {
     pub amount: f32,
@@ -2603,6 +2701,11 @@ pub struct MotionSnapshot {
     pub lattice_quality: String,
     pub transplant: FaradayMotionSnapshot,
     pub shutter: CurvedShutterSnapshot,
+    /// Additive: an older client that never reads this key sees exactly the
+    /// pre-collider snapshot, and a snapshot written without it still
+    /// deserializes to the disabled default.
+    #[serde(default)]
+    pub collider: FieldColliderSnapshot,
     #[serde(default)]
     pub telemetry: MotionTelemetrySnapshot,
 }
@@ -2616,8 +2719,7 @@ impl Default for MotionSnapshot {
 impl MotionSnapshot {
     pub fn from_params(params: crate::motion::MotionParams) -> Self {
         use crate::motion::{
-            CurvedShutterQuality, MotionCarrier, MotionDonor, MotionFieldSource,
-            MotionLatticeQuality,
+            CurvedShutterQuality, MotionCarrier, MotionFieldSource, MotionLatticeQuality,
         };
         let params = params.sanitized();
         let field_source = match params.field_source {
@@ -2630,19 +2732,7 @@ impl MotionSnapshot {
             MotionLatticeQuality::Live => "live",
             MotionLatticeQuality::High => "high",
         };
-        let donor = match params.transplant.donor {
-            MotionDonor::None => MotionDonorSnapshot::None,
-            MotionDonor::Selected {
-                layer_id,
-                saved_position,
-            } => MotionDonorSnapshot::Selected {
-                layer_id: layer_id.get().to_string(),
-                saved_position: saved_position.get(),
-            },
-            MotionDonor::Missing { saved_position } => MotionDonorSnapshot::Missing {
-                saved_position: saved_position.get(),
-            },
-        };
+        let donor = motion_donor_snapshot(params.transplant.donor);
         let carrier = match params.transplant.carrier {
             MotionCarrier::Transparent => "transparent",
             MotionCarrier::Black => "black",
@@ -2676,6 +2766,7 @@ impl MotionSnapshot {
                 quality: quality.into(),
                 sample_count: params.shutter.quality.sample_count(),
             },
+            collider: FieldColliderSnapshot::from_params(params.collider),
             telemetry: MotionTelemetrySnapshot::default(),
         }
     }
@@ -4009,6 +4100,24 @@ pub enum WebAction {
         donor_layer_id: Option<String>,
         layer_stack_revision: u64,
     },
+    /// Select or clear one of a Field Collider's two fixed inputs.
+    ///
+    /// Rewiring an input rewrites the collider's motion-field request, so this
+    /// is an ordered, revision-protected, uncoalesced barrier exactly like
+    /// [`WebAction::SetMotionDonor`], and it is refused inside a `Quantized`
+    /// batch. The addressed slot travels as a closed named token rather than an
+    /// index, so an unknown slot is a deserialization rejection instead of a
+    /// positional fallback onto the partner input. `enabled`, `mode`, and
+    /// `boundary` are values and travel on the ordinary coalescible
+    /// [`WebAction::SetMotion`].
+    #[serde(rename = "set_motion_collider_input")]
+    SetMotionColliderInput {
+        layer_id: String,
+        input: FieldColliderInputSnapshot,
+        #[serde(default)]
+        donor_layer_id: Option<String>,
+        layer_stack_revision: u64,
+    },
     /// Clear all lattice/transplant carrier history at one ordered engine
     /// boundary while leaving authored Motion values untouched.
     #[serde(rename = "clear_motion_memory")]
@@ -4407,6 +4516,7 @@ impl WebAction {
             | Self::ClearTemporalEventTrack
             | Self::SetGestureRecording { .. }
             | Self::SetMotionDonor { .. }
+            | Self::SetMotionColliderInput { .. }
             | Self::ClearMotionMemory
             | Self::SetLayerPaused { .. }
             | Self::SetLayerVisibility { .. }
@@ -5572,6 +5682,150 @@ mod protocol_tests {
         assert!(matches!(queue[3], WebAction::TriggerCollisionScore));
         assert!(matches!(queue[4], WebAction::TriggerRefreshGarden));
         assert!(matches!(queue[5], WebAction::ClearTemporalEventTrack));
+    }
+
+    #[test]
+    fn the_collider_input_action_is_an_uncoalesced_ordered_slot_named_barrier() {
+        let action = WebAction::SetMotionColliderInput {
+            layer_id: "9".into(),
+            input: FieldColliderInputSnapshot::B,
+            donor_layer_id: Some("4".into()),
+            layer_stack_revision: 12,
+        };
+        // Ordered barrier: it reserves priority admission and has NO coalesce
+        // key at all, which is what makes the bounded queue treat it as a
+        // barrier rather than replacing an older pending edit.
+        assert!(action.is_priority());
+        assert!(action.coalesce_key().is_none());
+
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["action"], "set_motion_collider_input");
+        assert_eq!(value["layer_stack_revision"], 12);
+        // The addressed slot is a closed NAMED token, never an index.
+        assert_eq!(value["input"], "b");
+        let WebAction::SetMotionColliderInput {
+            layer_id,
+            input,
+            donor_layer_id,
+            layer_stack_revision,
+        } = serde_json::from_value::<WebAction>(value).unwrap()
+        else {
+            panic!("the collider input action must decode to its own variant");
+        };
+        assert_eq!(layer_id, "9");
+        assert_eq!(input, FieldColliderInputSnapshot::B);
+        assert_eq!(input.to_runtime(), crate::motion::FieldColliderInput::B);
+        assert_eq!(donor_layer_id.as_deref(), Some("4"));
+        assert_eq!(layer_stack_revision, 12);
+
+        // Clearing a slot omits the donor entirely.
+        let cleared = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_motion_collider_input","layer_id":"9","input":"a","layer_stack_revision":3}"#,
+        )
+        .unwrap();
+        let WebAction::SetMotionColliderInput {
+            input,
+            donor_layer_id,
+            ..
+        } = cleared
+        else {
+            panic!("a cleared slot is still the collider action");
+        };
+        assert_eq!(input, FieldColliderInputSnapshot::A);
+        assert_eq!(donor_layer_id, None);
+
+        // An unknown slot token is a deserialization rejection, never a
+        // positional fallback onto the partner input.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_motion_collider_input","layer_id":"9","input":"c","layer_stack_revision":3}"#,
+        )
+        .is_err());
+        // The revision is mandatory, so a reroute can never arrive unbarriered.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_motion_collider_input","layer_id":"9","input":"a"}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_collider_snapshot_is_additive_and_publishes_both_slots_as_motion_donors() {
+        // Absent is exactly the pre-collider snapshot.
+        let defaults = FieldColliderSnapshot::default();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.mode, "sum");
+        assert_eq!(defaults.boundary, "transparent");
+        assert_eq!(defaults.input_a, MotionDonorSnapshot::None);
+        assert_eq!(defaults.input_b, MotionDonorSnapshot::None);
+        assert!(!defaults.admitted);
+        assert!(defaults.diagnostic.is_empty());
+        assert_eq!(MotionSnapshot::default().collider, defaults);
+
+        let json = serde_json::to_string(&MotionSnapshot::default()).unwrap();
+        let mut without: serde_json::Value = serde_json::from_str(&json).unwrap();
+        without.as_object_mut().unwrap().remove("collider");
+        let restored: MotionSnapshot = serde_json::from_value(without).unwrap();
+        assert_eq!(restored.collider, defaults);
+
+        let first = crate::image_routing::StableLayerId::new(31).unwrap();
+        let snapshot = MotionSnapshot::from_params(crate::motion::MotionParams {
+            collider: crate::motion::FieldColliderParams {
+                enabled: true,
+                mode: crate::motion::FieldColliderMode::CollisionBoundary,
+                boundary: crate::motion::MotionBoundaryMode::Hold,
+                input_a: crate::motion::MotionDonor::Selected {
+                    layer_id: first,
+                    saved_position: SavedLayerPosition::new(2).unwrap(),
+                },
+                input_b: crate::motion::MotionDonor::Missing {
+                    saved_position: SavedLayerPosition::new(5).unwrap(),
+                },
+                ..crate::motion::FieldColliderParams::default()
+            },
+            ..crate::motion::MotionParams::default()
+        });
+        assert!(snapshot.collider.enabled);
+        assert_eq!(snapshot.collider.mode, "collision_boundary");
+        assert_eq!(snapshot.collider.boundary, "hold");
+        // Both slots ride the established donor vocabulary, preserving their
+        // Selected/Missing tombstone semantics. There is no parallel encoding.
+        assert_eq!(
+            snapshot.collider.input_a,
+            MotionDonorSnapshot::Selected {
+                layer_id: "31".into(),
+                saved_position: 2,
+            }
+        );
+        assert_eq!(
+            snapshot.collider.input_b,
+            MotionDonorSnapshot::Missing { saved_position: 5 }
+        );
+        // A tombstone is published as a tombstone and never as a selection.
+        let wire = serde_json::to_value(&snapshot.collider).unwrap();
+        assert_eq!(wire["input_b"]["kind"], "missing");
+        assert!(wire["input_b"].get("layer_id").is_none());
+    }
+
+    #[test]
+    fn the_collider_barrier_is_never_quantizable_in_the_panel_or_the_engine() {
+        // The panel's quantizable set is a hand-maintained literal; a topology
+        // barrier must never appear in it.
+        let js = include_str!("../../static/app.js");
+        let start = js.find("const QUANTIZABLE_ACTIONS").unwrap();
+        let end = js[start..].find("]);").unwrap() + start;
+        let quantizable = &js[start..end];
+        assert!(!quantizable.contains("set_motion_collider_input"));
+        assert!(!quantizable.contains("set_motion_donor"));
+        assert!(!quantizable.contains("set_motion"));
+
+        // The panel does send it, with its slot token and the current revision.
+        assert!(js.contains("action: 'set_motion_collider_input'"));
+        assert!(js.contains("motion-collider-select"));
+        assert!(js.contains("collider_enabled"));
+        assert!(js.contains("collider_mode"));
+        assert!(js.contains("collider_boundary"));
+        // Accessible names survive for both slots.
+        assert!(js.contains("Field Collider input A"));
+        assert!(js.contains("Field Collider input B"));
     }
 
     #[test]
@@ -8540,6 +8794,7 @@ mod protocol_tests {
                 shutter_sample_count: 8,
             }],
             scopes_truncated: true,
+            field_collider: None,
         };
         let snapshot = ExportMotionSnapshot::from_export(&metadata, &["fallback".into()]);
         assert_eq!(snapshot.accepted_frame, Some(12));
@@ -8594,6 +8849,7 @@ mod protocol_tests {
                 shutter_sample_count: crate::motion::CurvedShutterQuality::Live.sample_count(),
             }],
             scopes_truncated: false,
+            field_collider: None,
         };
         let snapshot = ExportMotionSnapshot::from_export(&metadata, &[]);
         let scope = &snapshot.scopes[0];

@@ -31,7 +31,7 @@ src/
 ├── media_safety.rs      Safe/Expert source planning, device bounds, reservations
 ├── media_source.rs      shared resolution, bounded SHA-256 fingerprinting, content references
 ├── spatial.rs           canonical authored transforms and packed GPU pass uniforms
-├── motion.rs            canonical codec/lattice fields, Motion authoring, resource preflight
+├── motion.rs            canonical codec/lattice fields, Motion authoring, Field Collider, resource preflight
 ├── symmetry.rs          closed symmetry groups, 32-sector table, 1,024-byte uniform
 ├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
@@ -75,6 +75,7 @@ src/
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
+    ├── motion_collide.wgsl two-pass Field Collider map and recombination
     ├── gesture_etch.wgsl one ordered etch sample per pass plus the donor present
     └── temporal*.wgsl   legacy Temporal plus Loom/Atlas/Garden/Score
 ```
@@ -882,6 +883,208 @@ frame against both a stationary field and an unarmed slot while the live and
 export layer-identity schemes stay byte-identical and warm frames still allocate
 nothing.
 
+### The Field Collider
+
+`Field Collider` recombines **two** primitive motion fields into one derived
+field and hands that field to the existing Faraday transplant to advect its
+carrier. It is a **Motion-subsystem block, not a Collision Rack node**: it takes
+no `NodeKindTag` code, occupies no rack segment, appears in no image dependency
+graph, and claims no image tap. `FIELD_COLLIDER_ALGORITHM_VERSION` is 1 and
+append-only.
+
+**Two closed vocabularies.** `FieldColliderMode` has permanent codes 0…4: `Sum`
+0, `Difference` 1, `Curl` 2, `Projection` 3, `CollisionBoundary` 4.
+`MotionBoundaryMode` is `Transparent | Mirror | Wrap | Hold` with codes 0…3 —
+**the same frozen numbering `DisplaceBoundary` and `SymmetryBoundary` already
+carry**. §5 lists those four names in the order "transparent, hold, mirror,
+wrap"; that listing is prose enumerating the vocabulary, not a code assignment.
+Motion deliberately does **not** differ: minting a fourth incompatible boundary
+table so that `1` meant Mirror for an image and Hold for a field would be a
+persistence and shader hazard for no authored benefit. One boundary numbering
+serves the whole program. `Transparent` is the default and the only law that
+removes a lookup; a non-finite coordinate is removed by **every** law, including
+the three that otherwise always produce a sample, because `clamp`, `fract`, and
+the triangular map are all meaningless on NaN.
+
+**The recombination law.** For validated recipient-local `a` and `b`, with
+`d = a - b`, `m = (a + b) / 2`, and `eps = 1e-12`: Sum is `a + b`; Difference is
+`d`; Curl is `(-d.y, d.x)`; Projection is zero when `dot(b,b) <= eps` and
+`b * dot(a,b) / dot(b,b)` otherwise; CollisionBoundary is `m` when
+`dot(d,d) <= eps` and `m - d * dot(m,d) / dot(d,d)` otherwise. After the
+per-mode formula and **before** gating, every component clamps to the canonical
+Motion velocity range — exactly the interval `pack_velocity` encodes and
+`unpack_velocity` recovers, so no mode can emit a velocity the frozen M4 field
+contract cannot represent. `clamp_motion_velocity` clamps without quantizing:
+the derived surface is `Rg16Float`, so applying the 16-bit lattice on the CPU
+side would make the reference disagree with the shader by construction.
+
+Confidence and visibility are **componentwise minima**. The Faraday gate then
+applies threshold/softness/occlusion exactly once, downstream, in
+`motion_apply.wgsl` and `motion_refresh.wgsl`; the collider never pre-applies
+it. Any missing, aliased, out-of-range, non-finite, or singular-transform input
+yields the **exact invalid/zero sample** — it never reuses the surviving input
+and never reuses a prior derived field, because either would present an
+observation the collider did not make.
+
+**Admission is one predicate.** `MotionParams::collider_admission(is_master)` is
+the whole law, and the planner-collect, executor-encode, and dependency-walk
+sites all call *that function* rather than three hand-copied predicates that can
+drift apart — the S1–S4 three-site discipline satisfied by construction.
+Authored inertness is reported before any environmental fault, so a disabled
+block never accuses its scope of a problem it does not have. `enabled = false`
+is exact M4 and delegates before any admission or allocation. Enabling **parks**
+the single-donor transplant recipe rather than ambiguously running both: the
+authored donor, amount, carrier, confidence, refresh, decay, and occlusion are
+all retained verbatim, and disabling resumes them exactly because nothing was
+ever erased. `FieldColliderDiagnostic` is typed and telemetry-safe —
+`InputMissing`/`InputUnselected` name their slot, plus `AliasedInputs`,
+`MasterRecipient`, `NoActiveTransplant`, `InputFieldUnavailable`, and
+`SingularTransform` — and carries authored identity only, never a host path.
+
+**Both inputs demand honest primitive fields.** Each names its donor through the
+established `required_as_donor` flag, so a donor whose own Motion is exactly
+zero still yields a field, and each resolves through
+`EvaluatedMotionScopePlan::admitted_field_slot` so the collider observes the
+same field motion rendering wrote. Input A may equal the recipient and input B
+may equal the recipient — a layer colliding its own field against another's is
+authored topology, not a cycle — but **A and B may never alias each other**.
+Slot identity is route identity: A and B are named fields, never a list, so
+clearing A can never slide B's donor into its place.
+
+**Two low-resolution passes inside the unchanged three-texture ceiling.** Pass 1
+binds A's and B's vector parities (two sampled textures) and writes
+`[a.xy, b.xy]` into one transient `Rgba16Float` pair surface, mapping each
+vector by `linear(inverse(R) · D)` — translation excluded. Pass 2 binds that
+pair plus both gates (three sampled textures) and writes the transactional
+`Rg16Float` derived vector and `Rg8Unorm` derived gate. Coordinates map by
+`uD = inverse(D) · R · uR` and the boundary applies **independently** to each
+input's vector and gate lookup, so one input leaving its extent never silences
+the other. Because the split does both maps, the derived field is already
+recipient-local and indexed in composition output UV, so the Faraday advection
+pass consumes it under **identity** transforms — a collider recipient has no
+`donor_scope` to read, and reading one would be a category error rather than a
+missing scope.
+
+The uniform is exactly 144 bytes — two 64-byte `MotionTransformGpu` records plus
+one 16-byte mode/status lane — with a compile-time
+`const _: () = assert!(size_of::<ColliderGpuUniforms>() == 144)`. The two
+admitted status bits are independent, so one input's singular transform closes
+only its own lane.
+
+**Eight prebuilt parity bind groups, exactly one bound per pass.** The two
+inputs are independent fields whose committed ping/pong parities are selected
+separately, so all four `[A parity][B parity]` combinations are prebuilt for
+each pass — four plus four, never one shared table — mirroring S4's motion-group
+split. A warm frame binds one per pass and creates nothing.
+
+Resource delta per admitted collider, charged through
+`FieldColliderResourcePlan`:
+
+| Item | Bytes/cell |
+|---|---:|
+| Derived vector parity (two `Rg16Float`) | 8 |
+| Derived gate parity (two `Rg8Unorm`) | 4 |
+| Transient mapped pair (one `Rgba16Float`) | 8 |
+| **Collider-specific total** | **20** |
+
+| Item | Exact charge |
+|---|---:|
+| Low-resolution passes | 2 |
+| Nearest lookups | 5 |
+| Simultaneously sampled textures | 3 |
+| Prebuilt bind groups per collider | 8 (4 map + 4 collide) |
+| Bind groups bound per pass | 1 |
+| New full-frame persistent surfaces | 0 |
+| Uniform bytes | 144 |
+
+`MOTION_MAX_ACTIVE_COLLIDERS` is 1, matching the single admitted transplant.
+Both primitive input fields and the sole carrier stay separately and honestly
+accounted through the M4 ledger; only these three surfaces are new, and
+resource admission precedes every allocation. Derived attachments are internal
+executor values: `CodecMotionProduct`, the live codec field cache, and export
+codec acquisition describe **primitive** acquisition only and are never extended
+to carry them.
+
+**Transactional in the established shape.** Staging order is primitive →
+derived → carrier, and all three commit or discard together with the
+prior/current spatial state. Program Freeze stages nothing and derives nothing —
+the last committed derived field is what the carrier keeps reading. Media Freeze
+does advance the program, so it re-derives transactionally from committed
+primitive observations. A frame with an unmaterialized input still *derives*,
+writing the exact zero sample, so a derived parity can never hold a stale field
+from an earlier topology. Reset invalidates every derived parity and the pending
+recipe **without reallocating**: the surfaces and the eight prebuilt groups
+survive, only the published validity does not.
+
+**Closure.** Persistence stores strict version, mode, boundary, and two saved
+donor identities, serialized through the existing `MotionDonorConfig` and
+published through the existing `MotionDonorSnapshot` — there is no parallel
+donor encoding. Both slots recompute their saved positions independently at
+capture, both survive `MotionConfig::sanitized` with their Selected-versus-
+Missing intent intact, and a `Missing` tombstone never rebinds after reorder,
+removal, replacement, Morph, or patch load. The two collider donors are remapped
+on the Motion-subsystem path the transplant donor already travels —
+`remap_motion_collider_inputs_after_move`/`_after_remove` beside
+`remap_motion_donor_after_move` in `morph.rs`, and `motion_donors_mut` in
+`main.rs` for the runtime `preserve_motion_donor_after_remove` /
+`refresh_motion_donor_saved_position` pair — never the `saved_node_*` /
+`remap_saved_*` visual-rack walkers, which match on `VisualNodeKind` and would
+never see a Motion-block donor.
+
+Version 1 adds no collider-only continuous control, so Dice, the procedural
+generator, and modulation preserve the block **exactly** and it has no
+modulatable address of any kind. Morph chooses the entire discrete block as one
+endpoint recall at the midpoint rather than picking field by field: a per-field
+pick would be identical only by accident and would start synthesizing third
+configurations the instant v2 adds a field whose meaning depends on the mode or
+on which pair of donors is armed. Look carries the recipe — enabled, mode,
+boundary — while both inputs stay live topology. An omitted patch section is
+exactly the pre-collider path, and a declared version other than 1 is rejected
+at deserialize time rather than migrated.
+
+Browser topology uses the ordered, revision-protected, uncoalesced barrier
+`SetMotionColliderInput { layer_id, input, donor_layer_id,
+layer_stack_revision }`, forbidden inside `Quantized` batches. `input` is a
+closed named token (`"a"` | `"b"`), following the Residual slot precedent, so an
+unknown slot is a deserialization rejection rather than a positional fallback
+onto the partner input. The aliasing law is answered by the engine, which is the
+only side that knows both current values; the edit is refused rather than
+silently clearing the partner. `enabled`, `mode`, and `boundary` are values and
+travel on the ordinary coalescible `set_motion`.
+
+Export consumes the same evaluated plan, the same two passes, and the same
+`motion_collide.wgsl`; there is no export-only collider path. The
+`.motion.json` sidecar is at schema version 5, whose one additive
+`field_collider` section records — only after an accepted frame — the authored
+identity of **both** slots by name, the admitted output slot, the typed
+diagnostic, the byte-exact budget, and the discrete law. Both slots are emitted
+always and never compacted, so a retained tombstone is recorded as a tombstone
+rather than re-resolved against whatever now occupies the vacated position.
+Vectors, pair texels, gate parities, raw codec records, host paths, and
+filesystem metadata never enter it.
+
+What is proven and what is not: the two closed vocabularies and their frozen
+codes, every mode against its analytic definition, the clamp into the canonical
+velocity range, componentwise gate minima, the exact zero sample under every
+hostile input, all four boundary laws including NaN removal, the complete
+admission law with alias/missing/unselected/master/no-transplant refusals, the
+20-byte ledger with one-byte-over rejection on every independent bound and the
+one-collider cap, the 144-byte compile-time assertion, the coordinate-versus-
+vector transform law, the transactional commit/discard/freeze/reset lifecycle, a
+checksummed recovery-journal round trip, and the full
+patch/Morph/modulation/Dice/generator/preset/browser/native/export closure are
+covered by ordinary CPU tests. The pixel claims —
+`production_field_collider_derived_field_reaches_the_pixels` in
+`renderer::composition::tests`, which proves the derived field advects the
+carrier and reaches the audience image, that both inputs demonstrably
+contribute, that a missing input is byte-identical to the neutral pair, that
+live and export layer identities render the same authored patch identically, and
+that a disabled collider is byte-identical to exact M4 — plus
+`render_field_collider_pipeline` as the labeled export case, are opt-in
+`#[ignore]` fixtures measured on one adapter (AMD Radeon RX 6950 XT / Vulkan
+26.7.1). Cross-platform portability rests on hosted three-platform CI, not on
+that adapter.
+
 ### Named two-input Residual Counterpoint
 
 `Residual` is a Collision Rack node that recombines one route's large-scale
@@ -1545,6 +1748,29 @@ mislead browser tests.
   `renderer::composition::tests::gpu_a_recorded_gesture_reaches_the_image_through_a_routed_displace_donor`
   carry the physical-GPU claim; `render_gesture_field_etching_pipeline` and
   `render_gesture_canvas_displace_donor_pipeline` are the labeled export cases.
+- Field Collider tests must cover the two closed vocabularies and the boundary
+  codes shared with `DisplaceBoundary`/`SymmetryBoundary`, every mode against
+  its analytic definition including both degenerate guards, the clamp into the
+  canonical `pack_velocity`/`unpack_velocity` range, componentwise confidence
+  and visibility minima with no pre-gating, the exact zero sample for a
+  missing/NaN/out-of-range/aliased input that never reuses its partner, all four
+  boundary laws with NaN removed by every one of them, the complete admission
+  law refusing alias/missing/unselected/master/no-transplant and permitting an
+  input that names its own recipient, both inputs admitted at exactly zero
+  Motion through `required_as_donor` and resolved through
+  `admitted_field_slot`, the exact 20-byte/cell ledger with one-unit-over
+  rejection on every independent bound and the one-collider cap, the 144-byte
+  compile-time uniform assertion, the coordinate-versus-vector transform law
+  with translation excluded from vectors and a singular pair yielding no map,
+  the transactional commit/discard/Program-Freeze/reset lifecycle with no stale
+  derived field, a checksummed recovery-journal PatchState round trip carrying
+  no pixels or paths, per-slot export provenance, and the full
+  patch/Look/Morph/modulation/Dice/generator/browser closure. The
+  `renderer::composition::tests::production_field_collider_derived_field_reaches_the_pixels`
+  fixture carries the physical-GPU claim — the derived field advecting the
+  carrier into the audience image, both inputs contributing, live/export
+  identity parity, warm-allocation invariance, and byte-identical exact M4 when
+  disabled — and `render_field_collider_pipeline` is the labeled export case.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
@@ -1587,6 +1813,31 @@ a passing claim.
 - A master-scope Symmetry Field counts as a global step for the canonical
   reordering law, so it disables selective-VHS bypass authoring
   (`AmbiguousMasterBypass`) exactly as any other non-marker master node does.
+- The Field Collider is a Motion-subsystem block and deliberately takes no
+  `NodeKindTag` code. Its `MotionBoundaryMode` reuses the frozen
+  `Transparent = 0, Mirror = 1, Wrap = 2, Hold = 3` numbering rather than
+  minting a motion-specific table; §5 of the enrichment plan lists those names
+  in a different textual order, which is prose, not a code assignment.
+- Version 1 of the Field Collider adds no collider-only continuous control, so
+  it has no modulatable address and Dice, the generator, and modulation preserve
+  the block exactly. A control added in a later version would need its own
+  address, its own Morph law, and a revisit of the endpoint-exact block pick.
+- Only one Field Collider is admitted per composition, matching the single
+  admitted Faraday transplant it advects. A second would need its own derived
+  slot range and a second entry in the byte ledger.
+- `resolved_export_motion` now delegates to `MotionConfig::resolve_runtime`
+  rather than binding one donor by hand, so an offline render resolves exactly
+  the Motion-subsystem donors a live one does. Any donor added to the block in
+  future is bound in both paths by that single resolver.
+- An Advanced composition whose layers own **no image tap at all** cannot be
+  scheduled: `execution_order` breaks ties between equally-ready sibling scopes
+  by ascending stable id while `build_root_schedule` requires the composition's
+  back-to-front order, and export assigns ids front-to-back. A plain
+  single-donor Faraday transplant on a two-layer tapless stack reproduces it
+  with no collider present, so it is a pre-existing M4 defect that motion simply
+  had no labeled export case to surface before. Every labeled Advanced export
+  case therefore carries a rack node, whose tap retains the sibling and makes
+  the schedule legal. Repairing the tie-break is its own tranche.
 - Physical MIDI, phone, audio-interface, Spout-host, and multi-monitor proof is
   separate from software tests. Gesture ingress is proven through the one
   normalized adapter and its four origins in software; a real tablet, phone

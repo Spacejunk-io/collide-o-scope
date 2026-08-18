@@ -1359,7 +1359,10 @@ fn apply_motion_param(
     param: &str,
     value: &serde_json::Value,
 ) -> Result<MotionEditImpact, String> {
-    use motion::{CurvedShutterQuality, MotionCarrier, MotionFieldSource, MotionLatticeQuality};
+    use motion::{
+        CurvedShutterQuality, FieldColliderMode, MotionBoundaryMode, MotionCarrier,
+        MotionFieldSource, MotionLatticeQuality,
+    };
 
     let before = *params;
     match param {
@@ -1436,13 +1439,48 @@ fn apply_motion_param(
                 }
             };
         }
+        "collider_enabled" if !is_master => {
+            params.collider.enabled = value
+                .as_bool()
+                .ok_or_else(|| "motion collider_enabled must be a boolean".to_string())?;
+        }
+        "collider_mode" if !is_master => {
+            params.collider.mode = match value.as_str() {
+                Some("sum") => FieldColliderMode::Sum,
+                Some("difference") => FieldColliderMode::Difference,
+                Some("curl") => FieldColliderMode::Curl,
+                Some("projection") => FieldColliderMode::Projection,
+                Some("collision_boundary") => FieldColliderMode::CollisionBoundary,
+                _ => {
+                    return Err("motion collider_mode must be sum, difference, curl,                                 projection, or collision_boundary"
+                        .into())
+                }
+            };
+        }
+        "collider_boundary" if !is_master => {
+            params.collider.boundary = match value.as_str() {
+                Some("transparent") => MotionBoundaryMode::Transparent,
+                Some("mirror") => MotionBoundaryMode::Mirror,
+                Some("wrap") => MotionBoundaryMode::Wrap,
+                Some("hold") => MotionBoundaryMode::Hold,
+                _ => {
+                    return Err(
+                        "motion collider_boundary must be transparent, mirror, wrap, or hold"
+                            .into(),
+                    )
+                }
+            };
+        }
         "transplant_amount"
         | "confidence_threshold"
         | "confidence_softness"
         | "refresh"
         | "decay"
         | "occlusion"
-        | "carrier" => return Err(format!("motion parameter {param} is layer-only")),
+        | "carrier"
+        | "collider_enabled"
+        | "collider_mode"
+        | "collider_boundary" => return Err(format!("motion parameter {param} is layer-only")),
         _ => return Err(format!("unsupported motion parameter {param}")),
     }
     *params = params.sanitized();
@@ -1451,6 +1489,11 @@ fn apply_motion_param(
     }
     let topology = match param {
         "field_source" | "lattice_quality" | "shutter_quality" | "carrier" => true,
+        // Every collider field rewrites which motion field the carrier is
+        // advected from, or which donors must be admitted a primitive field.
+        // All three therefore invalidate motion memory rather than being a
+        // values-only edit.
+        "collider_enabled" | "collider_mode" | "collider_boundary" => true,
         "shutter_angle" => before.shutter.is_exact_zero() != params.shutter.is_exact_zero(),
         "transplant_amount" => {
             (before.transplant.amount == 0.0) != (params.transplant.amount == 0.0)
@@ -2069,16 +2112,34 @@ fn selected_layer_after_remove(
     })
 }
 
+/// Every Motion-subsystem donor a scope owns, in a fixed order.
+///
+/// A Field Collider donor is a Motion-block donor, not a visual-rack route: the
+/// `saved_node_*` / `remap_saved_*` walkers match on `VisualNodeKind` and never
+/// see one. Routing all three through this single accessor is what keeps the
+/// collider's two inputs on exactly the path the transplant donor already
+/// travels, so a reorder, a removal, or a replacement can never treat them
+/// differently from each other or from the transplant.
+fn motion_donors_mut(params: &mut motion::MotionParams) -> [&mut motion::MotionDonor; 3] {
+    [
+        &mut params.transplant.donor,
+        &mut params.collider.input_a,
+        &mut params.collider.input_b,
+    ]
+}
+
 fn preserve_motion_donor_after_remove(
     params: &mut motion::MotionParams,
     removed_id: image_routing::StableLayerId,
     saved_position: performance::SavedLayerPosition,
 ) {
-    if matches!(
-        params.transplant.donor,
-        motion::MotionDonor::Selected { layer_id, .. } if layer_id == removed_id
-    ) {
-        params.transplant.donor = motion::MotionDonor::Missing { saved_position };
+    for donor in motion_donors_mut(params) {
+        if matches!(
+            *donor,
+            motion::MotionDonor::Selected { layer_id, .. } if layer_id == removed_id
+        ) {
+            *donor = motion::MotionDonor::Missing { saved_position };
+        }
     }
 }
 
@@ -2089,22 +2150,24 @@ fn refresh_motion_donor_saved_position(
         performance::SavedLayerPosition,
     )],
 ) {
-    let motion::MotionDonor::Selected {
-        layer_id,
-        saved_position,
-    } = params.transplant.donor
-    else {
-        return;
-    };
-    params.transplant.donor = positions
-        .iter()
-        .find_map(|(candidate, position)| {
-            (*candidate == layer_id).then_some(motion::MotionDonor::Selected {
-                layer_id,
-                saved_position: *position,
+    for donor in motion_donors_mut(params) {
+        let motion::MotionDonor::Selected {
+            layer_id,
+            saved_position,
+        } = *donor
+        else {
+            continue;
+        };
+        *donor = positions
+            .iter()
+            .find_map(|(candidate, position)| {
+                (*candidate == layer_id).then_some(motion::MotionDonor::Selected {
+                    layer_id,
+                    saved_position: *position,
+                })
             })
-        })
-        .unwrap_or(motion::MotionDonor::Missing { saved_position });
+            .unwrap_or(motion::MotionDonor::Missing { saved_position });
+    }
 }
 
 /// Resolve a transform action solely by its process-stable layer identity.
@@ -9245,6 +9308,7 @@ impl App {
         if matches!(
             action,
             web::state::WebAction::SetMotionDonor { .. }
+                | web::state::WebAction::SetMotionColliderInput { .. }
                 | web::state::WebAction::SetRefreshGardenMatteRoute { .. }
                 | web::state::WebAction::SetRefreshGardenMotionRoute { .. }
                 | web::state::WebAction::ClearMotionMemory
@@ -11233,6 +11297,7 @@ impl App {
             action,
             WebAction::SetMotion { .. }
                 | WebAction::SetMotionDonor { .. }
+                | WebAction::SetMotionColliderInput { .. }
                 | WebAction::ClearMotionMemory
         ) {
             return false;
@@ -11329,6 +11394,105 @@ impl App {
                     (
                         impact,
                         format!("Updated layer {} Faraday donor", recipient_id.get()),
+                    )
+                }
+                WebAction::SetMotionColliderInput {
+                    layer_id,
+                    input,
+                    donor_layer_id,
+                    layer_stack_revision,
+                } => {
+                    if *layer_stack_revision == 0
+                        || *layer_stack_revision != self.layer_stack_revision
+                    {
+                        return Err(format!(
+                            "motion collider edit revision {} is stale; current layer revision \
+                             is {}",
+                            layer_stack_revision, self.layer_stack_revision
+                        ));
+                    }
+                    let recipient_id = parse_nonzero_decimal(layer_id)
+                        .and_then(image_routing::StableLayerId::new)
+                        .ok_or_else(|| {
+                            "motion collider recipient layer ID is malformed".to_string()
+                        })?;
+                    let input = input.to_runtime();
+                    let donor = match donor_layer_id.as_deref() {
+                        None => motion::MotionDonor::None,
+                        Some(value) => {
+                            let donor_id = parse_nonzero_decimal(value)
+                                .and_then(image_routing::StableLayerId::new)
+                                .ok_or_else(|| {
+                                    "motion collider donor layer ID is malformed".to_string()
+                                })?;
+                            let saved_position =
+                                self.creative_saved_position(donor_id).ok_or_else(|| {
+                                    format!(
+                                        "motion collider donor layer {} is absent",
+                                        donor_id.get()
+                                    )
+                                })?;
+                            motion::MotionDonor::Selected {
+                                layer_id: donor_id,
+                                saved_position,
+                            }
+                        }
+                    };
+                    let recipient = candidate
+                        .layers
+                        .iter_mut()
+                        .find(|layer| layer.layer_id == recipient_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "motion collider recipient layer {} is absent",
+                                recipient_id.get()
+                            )
+                        })?;
+                    // A collider input may name its own recipient — a layer
+                    // colliding its own field against another's is authored,
+                    // not a cycle. The two inputs may never name each other's
+                    // layer, though, so the partner slot is consulted here,
+                    // where both current values are known. Refusing the edit is
+                    // deliberate: silently clearing the partner would delete a
+                    // route the operator never touched.
+                    let partner = match input {
+                        motion::FieldColliderInput::A => recipient.motion.collider.input_b,
+                        motion::FieldColliderInput::B => recipient.motion.collider.input_a,
+                    };
+                    if let (
+                        motion::MotionDonor::Selected {
+                            layer_id: chosen, ..
+                        },
+                        motion::MotionDonor::Selected {
+                            layer_id: existing, ..
+                        },
+                    ) = (donor, partner)
+                    {
+                        if chosen == existing {
+                            return Err(format!(
+                                "field collider input {input} cannot name layer {}, which input \
+                                 {} already names",
+                                chosen.get(),
+                                match input {
+                                    motion::FieldColliderInput::A => motion::FieldColliderInput::B,
+                                    motion::FieldColliderInput::B => motion::FieldColliderInput::A,
+                                }
+                            ));
+                        }
+                    }
+                    let slot = recipient.motion.collider.input_mut(input);
+                    let impact = if *slot == donor {
+                        MotionEditImpact::NoChange
+                    } else {
+                        *slot = donor;
+                        MotionEditImpact::MemoryTopology
+                    };
+                    (
+                        impact,
+                        format!(
+                            "Updated layer {} Field Collider input {input}",
+                            recipient_id.get()
+                        ),
                     )
                 }
                 WebAction::ClearMotionMemory => unreachable!("handled before staging"),
@@ -15114,6 +15278,7 @@ impl App {
             }
             WebAction::SetMotion { .. }
             | WebAction::SetMotionDonor { .. }
+            | WebAction::SetMotionColliderInput { .. }
             | WebAction::ClearMotionMemory => {
                 unreachable!("motion actions are handled transactionally before this match")
             }

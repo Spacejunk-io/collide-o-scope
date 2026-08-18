@@ -1223,6 +1223,19 @@ fn valid_motion_edit(scope: &MotionScopeSnapshot, param: &str, value: &serde_jso
                 value.as_str(),
                 Some("transparent" | "black" | "first_source_frame")
             ),
+            // Field Collider values. The two donors are topology and travel on
+            // the separate revision-protected barrier; these three are ordinary
+            // coalescible values. Layer scope only, because a collider needs a
+            // Faraday carrier and the master owns none.
+            "collider_enabled" => value.is_boolean(),
+            "collider_mode" => matches!(
+                value.as_str(),
+                Some("sum" | "difference" | "curl" | "projection" | "collision_boundary")
+            ),
+            "collider_boundary" => matches!(
+                value.as_str(),
+                Some("transparent" | "mirror" | "wrap" | "hold")
+            ),
             _ => false,
         }
 }
@@ -1420,6 +1433,7 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     | WebAction::GestureSample { .. }
                     | WebAction::SetGestureRecording { .. }
                     | WebAction::SetMotionDonor { .. }
+                    | WebAction::SetMotionColliderInput { .. }
                     | WebAction::ClearMotionMemory
                     | WebAction::SetVisualNodeDisplaceRoute { .. }
                     | WebAction::SetVisualNodeSymmetryRoute { .. }
@@ -1838,6 +1852,24 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     .as_deref()
                     .is_none_or(valid_required_stable_id)
                 && donor_layer_id.as_deref() != Some(layer_id.as_str())
+                && *layer_stack_revision != 0
+        }
+        WebAction::SetMotionColliderInput {
+            layer_id,
+            donor_layer_id,
+            layer_stack_revision,
+            ..
+        } => {
+            // Deliberately no self-donation refusal here, unlike the Faraday
+            // donor above: a collider input MAY name its own recipient. The one
+            // aliasing law — A and B may never name the same layer — depends on
+            // the partner slot's current value and is therefore answered by the
+            // engine, which is the only side that knows it. `input` needs no
+            // check: an unknown token never deserializes into the closed enum.
+            valid_required_stable_id(layer_id)
+                && donor_layer_id
+                    .as_deref()
+                    .is_none_or(valid_required_stable_id)
                 && *layer_stack_revision != 0
         }
         WebAction::ClearMotionMemory => true,

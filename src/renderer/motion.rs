@@ -10,7 +10,7 @@ use bytemuck::Zeroable;
 use crate::visual_rack::PREMULTIPLIED_BILINEAR_TEXTURE_OPS;
 use crate::{
     evaluated_frame::evaluated_composition::{
-        AdvancedMotionPlan, MotionFieldAttachment, MotionPlanDiagnostic,
+        AdvancedMotionPlan, EvaluatedFieldColliderPlan, MotionFieldAttachment, MotionPlanDiagnostic,
     },
     motion::{
         CurvedShutterParams, MotionCarrier, MotionField, MotionFieldOrigin, MotionGrid,
@@ -26,6 +26,11 @@ pub(crate) const MOTION_GATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::
 pub(crate) const MOTION_LUMA_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 pub(crate) const MOTION_CARRIER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 pub(crate) const MOTION_GARDEN_SIGNAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
+/// The Field Collider's transient mapped pair. One RGBA16Float surface carries
+/// both inputs' recipient-local vectors as `[a.xy, b.xy]`, which is what keeps
+/// pass 2 inside the unchanged three-sampled-texture ceiling.
+pub(crate) const MOTION_COLLIDER_PAIR_FORMAT: wgpu::TextureFormat =
+    wgpu::TextureFormat::Rgba16Float;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MotionGpuFieldSpec {
@@ -62,6 +67,10 @@ pub(crate) struct MotionGpuScopeSpec {
     pub scope: VisualScopeId,
     pub render_field_slot: u8,
     pub uses_carrier: bool,
+    /// This scope's carrier is advected from the DERIVED collided field rather
+    /// than from a primitive donor. `render_field_slot` is then unused, because
+    /// a collider recipient substitutes no single donor.
+    pub derived_collider: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -276,6 +285,10 @@ struct MotionFieldBindings {
 
 struct MotionScopeBindings {
     render_field_slot: u8,
+    /// See [`MotionGpuScopeSpec::derived_collider`]. When set, `apply` and
+    /// `refresh` below were built from the collider's derived vector/gate
+    /// parities, and the parity index at encode is the collider's own.
+    derived_collider: bool,
     /// For each field parity: current pixels, carrier parity 0, carrier parity
     /// 1. Carrier entries exist only for the one admitted transplant.
     apply: [Vec<wgpu::BindGroup>; 2],
@@ -453,6 +466,10 @@ impl MotionGpuField {
 /// `None`, therefore creates neither low-resolution surfaces nor a carrier.
 pub(crate) struct MotionGpuResources {
     fields: Vec<MotionGpuField>,
+    /// The one admitted Field Collider. `None` is exact M4: no derived surface
+    /// is allocated, no pass is encoded, and the carrier is advected from a
+    /// single primitive donor exactly as before.
+    collider: Option<MotionColliderGpu>,
     carriers: Option<[MotionTexture; 2]>,
     garden_signal: Option<MotionTexture>,
     garden_signal_bindings: Option<[wgpu::BindGroup; 2]>,
@@ -470,16 +487,269 @@ pub(crate) struct MotionGpuResources {
     memory_generation: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Field Collider v1 — GPU
+// ---------------------------------------------------------------------------
+
+/// The frozen two-pass collider uniform: two 64-byte [`MotionTransformGpu`]
+/// records plus one 16-byte mode/status lane.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct ColliderGpuUniforms {
+    input_a: MotionTransformGpu,
+    input_b: MotionTransformGpu,
+    /// `x` mode code, `y` boundary code, `z` per-input admitted bits, `w` zero.
+    modes: [u32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<ColliderGpuUniforms>() == 144);
+
+/// Bit 0 of the status lane: input A's transform is finite and nonsingular and
+/// its committed parity is materialized.
+const COLLIDER_INPUT_A_ADMITTED: u32 = 1;
+/// Bit 1 of the status lane: the same for input B.
+const COLLIDER_INPUT_B_ADMITTED: u32 = 2;
+
+/// The status-lane bit for one collider input, by slot index.
+const fn collider_input_admitted_bit(index: usize) -> u32 {
+    if index == 0 {
+        COLLIDER_INPUT_A_ADMITTED
+    } else {
+        COLLIDER_INPUT_B_ADMITTED
+    }
+}
+
+/// Transactional ping/pong publication for the derived collided field.
+///
+/// This mirrors [`MotionMemoryState`] in shape and in law, but deliberately
+/// does not reuse it: the derived field has no luma cadence, no codec upload,
+/// and no persistent carrier, and threading a fourth meaning through those
+/// gates would make each one ambiguous.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ColliderMemorySnapshot {
+    index: u8,
+    valid: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ColliderMemoryState {
+    committed: ColliderMemorySnapshot,
+    staged: Option<ColliderMemorySnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColliderMemoryStage {
+    write_index: u8,
+    render_index: u8,
+    render_valid: bool,
+    /// False under Program Freeze: nothing is staged and nothing is derived.
+    derives: bool,
+}
+
+impl ColliderMemoryState {
+    /// `inputs_valid` means both primitive inputs have a materialized committed
+    /// parity this frame. A frame that derives from an unmaterialized input
+    /// still *derives* — it writes the exact zero sample — so the derived
+    /// parity can never hold a stale field from an earlier topology.
+    fn stage(&mut self, program_advances: bool, inputs_valid: bool) -> ColliderMemoryStage {
+        assert!(self.staged.is_none(), "collider frame already staged");
+        let before = self.committed;
+        let write_index = before.index ^ 1;
+        let mut after = before;
+        // Program Freeze is a literal hold: no derivation, no staged state, and
+        // the last committed derived field is what the carrier keeps reading.
+        // Media Freeze is NOT this branch — it advances the program, so it
+        // re-derives transactionally from committed primitive observations.
+        if program_advances {
+            after.index = write_index;
+            after.valid = inputs_valid;
+            self.staged = Some(after);
+        }
+        ColliderMemoryStage {
+            write_index,
+            render_index: after.index,
+            render_valid: after.valid,
+            derives: program_advances,
+        }
+    }
+
+    fn commit(&mut self) {
+        if let Some(after) = self.staged.take() {
+            self.committed = after;
+        }
+    }
+
+    fn discard(&mut self) {
+        self.staged = None;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Every prebuilt collider bind group, one pair of parity tables per pass.
+struct ColliderBindings {
+    /// `[input A parity][input B parity]` for pass 1.
+    map: [[wgpu::BindGroup; 2]; 2],
+    /// `[input A parity][input B parity]` for pass 2's two gate lookups.
+    collide: [[wgpu::BindGroup; 2]; 2],
+}
+
+/// The complete collider-specific GPU working set: one transient mapped pair,
+/// one derived vector ping/pong, and one derived gate ping/pong. Exactly the
+/// twenty bytes per cell the ledger publishes, and no persistent full-frame
+/// surface at all.
+struct MotionColliderGpu {
+    plan: EvaluatedFieldColliderPlan,
+    pair: MotionTexture,
+    vectors: [MotionTexture; 2],
+    gates: [MotionTexture; 2],
+    uniform: wgpu::Buffer,
+    /// Prebuilt for every `[input A parity][input B parity]` combination.
+    /// Four groups per pass, **eight prebuilt in total, exactly one bound per
+    /// pass** — the same split S4 makes for its motion pair, and for the same
+    /// reason: the two inputs are independent fields whose committed parities
+    /// are chosen separately, so prebuilding every combination is what keeps a
+    /// warm frame from rebuilding a bind group on a ping/pong swap.
+    bindings: Option<ColliderBindings>,
+    /// The committed `[input A parity, input B parity]` this frame selects.
+    /// The two inputs are independent fields and are deliberately never
+    /// required to agree, which is exactly why all four combinations exist.
+    map_parities: [usize; 2],
+    memory: ColliderMemoryState,
+    frame_stage: Option<ColliderMemoryStage>,
+}
+
+impl MotionColliderGpu {
+    fn new(device: &wgpu::Device, plan: EvaluatedFieldColliderPlan) -> Self {
+        let dimensions = [plan.output_grid.width, plan.output_grid.height];
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC;
+        Self {
+            plan,
+            pair: MotionTexture::new(
+                device,
+                "Field Collider transient mapped pair RGBA16Float",
+                dimensions,
+                MOTION_COLLIDER_PAIR_FORMAT,
+                usage,
+            ),
+            vectors: std::array::from_fn(|_| {
+                MotionTexture::new(
+                    device,
+                    "Field Collider derived vector RG16Float parity",
+                    dimensions,
+                    MOTION_VECTOR_FORMAT,
+                    usage,
+                )
+            }),
+            gates: std::array::from_fn(|_| {
+                MotionTexture::new(
+                    device,
+                    "Field Collider derived gate RG8 parity",
+                    dimensions,
+                    MOTION_GATE_FORMAT,
+                    usage,
+                )
+            }),
+            uniform: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Field Collider 144-byte uniform"),
+                size: std::mem::size_of::<ColliderGpuUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            bindings: None,
+            map_parities: [0, 0],
+            memory: ColliderMemoryState::default(),
+            frame_stage: None,
+        }
+    }
+
+    /// Build all eight parity bind groups once. Called from
+    /// `prepare_composition_bindings`, never from a warm frame.
+    fn prepare_bindings(
+        &mut self,
+        device: &wgpu::Device,
+        pipelines: &MotionPipelines,
+        input_a: &MotionGpuField,
+        input_b: &MotionGpuField,
+    ) {
+        let map = std::array::from_fn(|a| {
+            std::array::from_fn(|b| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Field Collider map bind group"),
+                    layout: &pipelines.collider_map_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&input_a.vectors[a].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&input_b.vectors[b].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&pipelines.nearest_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.uniform.as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+        });
+        let collide = std::array::from_fn(|a| {
+            std::array::from_fn(|b| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Field Collider recombination bind group"),
+                    layout: &pipelines.collider_collide_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&self.pair.view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&input_a.gates[a].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&input_b.gates[b].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&pipelines.nearest_sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.uniform.as_entire_binding(),
+                        },
+                    ],
+                })
+            })
+        });
+        self.bindings = Some(ColliderBindings { map, collide });
+    }
+}
+
 struct MotionPipelines {
     luma: wgpu::RenderPipeline,
     lattice: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     refresh: wgpu::RenderPipeline,
     garden_signal: wgpu::RenderPipeline,
+    collider_map: wgpu::RenderPipeline,
+    collider_collide: wgpu::RenderPipeline,
     luma_layout: wgpu::BindGroupLayout,
     lattice_layout: wgpu::BindGroupLayout,
     image_layout: wgpu::BindGroupLayout,
     garden_signal_layout: wgpu::BindGroupLayout,
+    collider_map_layout: wgpu::BindGroupLayout,
+    collider_collide_layout: wgpu::BindGroupLayout,
     linear_sampler: wgpu::Sampler,
     nearest_sampler: wgpu::Sampler,
 }
@@ -537,6 +807,33 @@ impl MotionPipelines {
                     nonfiltering_sampler_entry(2),
                 ],
             });
+        // Pass 1 samples two textures; pass 2 samples three. Neither exceeds
+        // the unchanged three-sampled-texture ceiling.
+        let collider_map_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Field Collider map BGL"),
+                entries: &[
+                    sampled_texture_entry(0),
+                    sampled_texture_entry(1),
+                    nonfiltering_sampler_entry(2),
+                    uniform_entry(3),
+                ],
+            });
+        let collider_collide_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Field Collider recombination BGL"),
+                entries: &[
+                    sampled_texture_entry(0),
+                    sampled_texture_entry(1),
+                    sampled_texture_entry(2),
+                    nonfiltering_sampler_entry(3),
+                    uniform_entry(4),
+                ],
+            });
+        let collider_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Field Collider shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_collide.wgsl").into()),
+        });
         let luma_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Motion luma shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_luma.wgsl").into()),
@@ -594,16 +891,36 @@ impl MotionPipelines {
             &garden_signal_module,
             &[MOTION_GARDEN_SIGNAL_FORMAT],
         );
+        let collider_map = create_motion_pipeline_with_entry(
+            device,
+            "Field Collider map pipeline",
+            &collider_map_layout,
+            &collider_module,
+            "fs_map",
+            &[MOTION_COLLIDER_PAIR_FORMAT],
+        );
+        let collider_collide = create_motion_pipeline_with_entry(
+            device,
+            "Field Collider recombination pipeline",
+            &collider_collide_layout,
+            &collider_module,
+            "fs_collide",
+            &[MOTION_VECTOR_FORMAT, MOTION_GATE_FORMAT],
+        );
         Self {
             luma,
             lattice,
             apply,
             refresh,
             garden_signal,
+            collider_map,
+            collider_collide,
             luma_layout,
             lattice_layout,
             image_layout,
             garden_signal_layout,
+            collider_map_layout,
+            collider_collide_layout,
             linear_sampler,
             nearest_sampler,
         }
@@ -661,6 +978,27 @@ fn create_motion_pipeline(
     module: &wgpu::ShaderModule,
     target_formats: &[wgpu::TextureFormat],
 ) -> wgpu::RenderPipeline {
+    create_motion_pipeline_with_entry(
+        device,
+        label,
+        bind_group_layout,
+        module,
+        "fs_main",
+        target_formats,
+    )
+}
+
+/// The Field Collider is one module with two fragment entry points, so the
+/// shared helper above delegates here rather than every motion pass paying for
+/// an entry-point parameter it never varies.
+fn create_motion_pipeline_with_entry(
+    device: &wgpu::Device,
+    label: &'static str,
+    bind_group_layout: &wgpu::BindGroupLayout,
+    module: &wgpu::ShaderModule,
+    fragment_entry: &'static str,
+    target_formats: &[wgpu::TextureFormat],
+) -> wgpu::RenderPipeline {
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &[Some(bind_group_layout)],
@@ -688,7 +1026,7 @@ fn create_motion_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             targets: &targets,
             compilation_options: Default::default(),
         }),
@@ -701,11 +1039,15 @@ fn create_motion_pipeline(
 }
 
 impl MotionGpuResources {
+    /// Resource admission precedes every allocation below: `collider` is the
+    /// planner's already-admitted decision, so an exact-M4 or refused block
+    /// reaches here as `None` and no derived surface is created at all.
     pub(crate) fn prepare(
         device: &wgpu::Device,
         plan: MotionResourcePlan,
         field_specs: &[MotionGpuFieldSpec],
         output_dimensions: [u32; 2],
+        collider: Option<EvaluatedFieldColliderPlan>,
     ) -> Result<Option<Self>, MotionGpuError> {
         if plan == MotionResourcePlan::default() {
             return if field_specs.is_empty() {
@@ -832,8 +1174,28 @@ impl MotionGpuResources {
                 })
             })
         });
+        // The derived surfaces are the LAST thing allocated, after every
+        // primitive field and the carrier have been admitted and reconciled
+        // against the plan. A collider whose named input slots do not exist is
+        // a planner/renderer disagreement and is refused by name rather than
+        // silently degraded, exactly as an admitted Symmetry motion slot is.
+        let collider = match collider {
+            Some(plan) => {
+                for slot in [plan.input_a_slot, plan.input_b_slot] {
+                    if fields.get(usize::from(slot)).is_none() {
+                        return Err(MotionGpuError::FieldIndex(usize::from(slot)));
+                    }
+                }
+                if plan.input_a_slot == plan.input_b_slot {
+                    return Err(MotionGpuError::ResourcePlanMismatch);
+                }
+                Some(MotionColliderGpu::new(device, plan))
+            }
+            None => None,
+        };
         Ok(Some(Self {
             fields,
+            collider,
             carriers,
             garden_signal,
             garden_signal_bindings,
@@ -1043,13 +1405,65 @@ impl MotionGpuResources {
             return Err(MotionGpuError::ResourcePlanMismatch);
         }
 
+        // Eight prebuilt parity bind groups, built exactly once here. A warm
+        // frame binds one of them per pass and creates nothing.
+        if let Some(mut collider) = self.collider.take() {
+            let (a_slot, b_slot) = (
+                usize::from(collider.plan.input_a_slot),
+                usize::from(collider.plan.input_b_slot),
+            );
+            let result = match (a_slot < self.fields.len(), b_slot < self.fields.len()) {
+                (true, true) => {
+                    // Two disjoint immutable borrows of one Vec need the split,
+                    // and the planner already guarantees the slots differ.
+                    let (low, high) = if a_slot < b_slot {
+                        (a_slot, b_slot)
+                    } else {
+                        (b_slot, a_slot)
+                    };
+                    let (head, tail) = self.fields.split_at(high);
+                    let (first, second) = (&head[low], &tail[0]);
+                    let (input_a, input_b) = if a_slot < b_slot {
+                        (first, second)
+                    } else {
+                        (second, first)
+                    };
+                    collider.prepare_bindings(device, &self.pipelines, input_a, input_b);
+                    Ok(())
+                }
+                _ => Err(MotionGpuError::FieldIndex(a_slot.max(b_slot))),
+            };
+            self.collider = Some(collider);
+            result?;
+        }
+
         for spec in scope_specs {
             if self.scopes.contains_key(&spec.scope) {
                 return Err(MotionGpuError::DuplicateScope(spec.scope));
             }
-            let field = self.fields.get(usize::from(spec.render_field_slot)).ok_or(
-                MotionGpuError::FieldIndex(usize::from(spec.render_field_slot)),
-            )?;
+            // THE delivery seam. A collider recipient's advection pass binds
+            // the derived collided vector/gate pair; every other scope binds
+            // its primitive field exactly as before. Nothing downstream
+            // changes, which is precisely why the collided field reaches the
+            // audience image and the export through the established path.
+            let (vector_views, gate_views) = if spec.derived_collider {
+                let collider = self
+                    .collider
+                    .as_ref()
+                    .ok_or(MotionGpuError::ResourcePlanMismatch)?;
+                (
+                    [&collider.vectors[0].view, &collider.vectors[1].view],
+                    [&collider.gates[0].view, &collider.gates[1].view],
+                )
+            } else {
+                let field = self.fields.get(usize::from(spec.render_field_slot)).ok_or(
+                    MotionGpuError::FieldIndex(usize::from(spec.render_field_slot)),
+                )?;
+                (
+                    [&field.vectors[0].view, &field.vectors[1].view],
+                    [&field.gates[0].view, &field.gates[1].view],
+                )
+            };
             let apply_uniform = fixed_uniform_buffer(
                 device,
                 queue,
@@ -1075,8 +1489,8 @@ impl MotionGpuResources {
                             device,
                             &self.pipelines,
                             carrier,
-                            &field.vectors[field_parity].view,
-                            &field.gates[field_parity].view,
+                            vector_views[field_parity],
+                            gate_views[field_parity],
                             &apply_uniform,
                             "Motion prepared apply BG",
                         )
@@ -1089,7 +1503,7 @@ impl MotionGpuResources {
                     &self.pipelines,
                     current,
                     advected,
-                    &field.gates[field_parity].view,
+                    gate_views[field_parity],
                     &refresh_uniform,
                     "Motion prepared refresh BG",
                 )
@@ -1098,6 +1512,7 @@ impl MotionGpuResources {
                 spec.scope,
                 MotionScopeBindings {
                     render_field_slot: spec.render_field_slot,
+                    derived_collider: spec.derived_collider,
                     apply,
                     refresh,
                     apply_uniform,
@@ -1140,6 +1555,10 @@ impl MotionGpuResources {
             .fields
             .iter()
             .any(|field| field.frame_stage.is_some() || field.staged_field.is_some())
+            || self
+                .collider
+                .as_ref()
+                .is_some_and(|collider| collider.frame_stage.is_some())
             || self.carrier_stage.is_some()
             || self
                 .scopes
@@ -1261,7 +1680,142 @@ impl MotionGpuResources {
             );
             self.carrier_stage = self.program_advances.then_some(stage);
         }
+        self.stage_collider(queue, plan)?;
         self.write_scope_uniforms(queue, plan, temporal.delta_seconds)?;
+        Ok(())
+    }
+
+    /// Stage the derived collided field and publish its 144-byte uniform.
+    ///
+    /// Staging order is primitive -> derived -> carrier: every primitive field
+    /// has already staged above, the carrier stages after, and all three commit
+    /// or discard together with the prior/current spatial state. Program Freeze
+    /// stages nothing here, because `program_advances` is already false.
+    fn stage_collider(
+        &mut self,
+        queue: &wgpu::Queue,
+        plan: &AdvancedMotionPlan,
+    ) -> Result<(), MotionGpuError> {
+        let Some(collider) = self.collider.as_mut() else {
+            return Ok(());
+        };
+        if collider.frame_stage.is_some() {
+            return Err(MotionGpuError::FrameAlreadyStaged);
+        }
+        let collider_plan = collider.plan;
+        let recipient = plan
+            .scope(collider_plan.recipient_scope)
+            .ok_or(MotionGpuError::MissingScope(collider_plan.recipient_scope))?;
+        // Both inputs are read through their COMMITTED parity, the same index
+        // motion rendering itself wrote — `MotionMemoryStage::render_field_index`
+        // — so the collider observes exactly the fields the frame published.
+        let mut parities = [0_usize, 0];
+        let mut inputs_valid = true;
+        let mut modes_z = 0_u32;
+        for (index, slot) in [collider_plan.input_a_slot, collider_plan.input_b_slot]
+            .into_iter()
+            .enumerate()
+        {
+            let field = self
+                .fields
+                .get(usize::from(slot))
+                .ok_or(MotionGpuError::FieldIndex(usize::from(slot)))?;
+            match field.frame_stage {
+                Some(stage) => {
+                    parities[index] = usize::from(stage.render_field_index);
+                    if stage.render_field_valid {
+                        modes_z |= collider_input_admitted_bit(index);
+                    } else {
+                        // An unmaterialized parity is an honest zero, never a
+                        // stale or unrelated field.
+                        inputs_valid = false;
+                    }
+                }
+                None => {
+                    // Program Freeze: nothing is staged anywhere this frame.
+                    inputs_valid = false;
+                }
+            }
+        }
+        // Each input's transform is derived independently, so a singular one
+        // closes only its own admitted bit and the other input still maps.
+        let transforms = [collider_plan.input_a_scope, collider_plan.input_b_scope]
+            .map(|scope| plan.scope(scope).map(|input| input.spatial));
+        let mut uniforms = ColliderGpuUniforms {
+            input_a: MotionTransformGpu::identity(),
+            input_b: MotionTransformGpu::identity(),
+            modes: [
+                collider_plan.mode.code(),
+                collider_plan.boundary.code(),
+                modes_z,
+                0,
+            ],
+        };
+        for (index, spatial) in transforms.into_iter().enumerate() {
+            let resolved =
+                spatial.and_then(|donor| MotionTransformGpu::between(donor, recipient.spatial));
+            match resolved {
+                Some(transform) => {
+                    if index == 0 {
+                        uniforms.input_a = transform;
+                    } else {
+                        uniforms.input_b = transform;
+                    }
+                }
+                None => {
+                    // A non-finite or singular transform yields the exact
+                    // invalid sample; it never falls back to identity pixels.
+                    uniforms.modes[2] &= !collider_input_admitted_bit(index);
+                    inputs_valid = false;
+                }
+            }
+        }
+        collider.frame_stage = Some(collider.memory.stage(self.program_advances, inputs_valid));
+        collider.map_parities = parities;
+        queue.write_buffer(&collider.uniform, 0, bytemuck::bytes_of(&uniforms));
+        Ok(())
+    }
+
+    /// Encode the collider's two low-resolution passes.
+    ///
+    /// Called before every scope's advection pass, so the derived field the
+    /// carrier reads is this frame's, not last frame's.
+    pub(crate) fn encode_collider(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(), MotionGpuError> {
+        let Some(collider) = &self.collider else {
+            return Ok(());
+        };
+        let Some(stage) = collider.frame_stage else {
+            return Ok(());
+        };
+        if !stage.derives {
+            // Program Freeze holds the last committed derived field.
+            return Ok(());
+        }
+        let bindings = collider
+            .bindings
+            .as_ref()
+            .ok_or(MotionGpuError::BindingsNotPrepared)?;
+        let [a, b] = collider.map_parities;
+        let write = usize::from(stage.write_index);
+        encode_single_target_pass(
+            encoder,
+            "Field Collider map A/B into recipient-local pair",
+            &self.pipelines.collider_map,
+            &bindings.map[a][b],
+            &collider.pair.view,
+            None,
+        );
+        encode_dual_target_pass(
+            encoder,
+            "Field Collider recombination",
+            &self.pipelines.collider_collide,
+            &bindings.collide[a][b],
+            &collider.vectors[write].view,
+            &collider.gates[write].view,
+        );
         Ok(())
     }
 
@@ -1284,24 +1838,43 @@ impl MotionGpuResources {
                 }
                 return Err(MotionGpuError::MissingScope(scope.scope));
             };
-            let donor = if scope.transplant_admitted {
-                scope
-                    .donor_scope
-                    .and_then(|donor| plan.scope(donor))
-                    .ok_or(MotionGpuError::MissingScope(scope.scope))?
+            // A collider recipient substitutes no single donor: the derived
+            // field is ALREADY recipient-local and is indexed in composition
+            // output UV, because the collider's own two passes did both maps.
+            // Both transforms are therefore exactly identity here, and reading
+            // `donor_scope` — which a collider recipient legitimately does not
+            // have — would be a category error rather than a missing scope.
+            let transform = if scope.collider_admitted {
+                Some(MotionTransformGpu::identity())
             } else {
-                scope
+                let donor = if scope.transplant_admitted {
+                    scope
+                        .donor_scope
+                        .and_then(|donor| plan.scope(donor))
+                        .ok_or(MotionGpuError::MissingScope(scope.scope))?
+                } else {
+                    scope
+                };
+                MotionTransformGpu::between(donor.spatial, scope.spatial)
             };
-            let transform = MotionTransformGpu::between(donor.spatial, scope.spatial);
             if transform.is_none() {
                 self.runtime_diagnostics
                     .push(MotionRuntimeDiagnostic::InvalidTransform { scope: scope.scope });
             }
             let faraday = scope.params.transplant;
             let shutter = scope.params.shutter;
-            let field_valid = self.fields[usize::from(render_field_slot)]
-                .frame_stage
-                .is_some_and(|stage| stage.render_field_valid);
+            // A collider recipient's validity is the DERIVED field's, not any
+            // primitive field's.
+            let field_valid = if scope.collider_admitted {
+                self.collider
+                    .as_ref()
+                    .and_then(|collider| collider.frame_stage)
+                    .is_some_and(|stage| stage.render_valid)
+            } else {
+                self.fields[usize::from(render_field_slot)]
+                    .frame_stage
+                    .is_some_and(|stage| stage.render_field_valid)
+            };
             let bindings = self
                 .scopes
                 .get_mut(&scope.scope)
@@ -1455,18 +2028,33 @@ impl MotionGpuResources {
         let Some(bindings) = self.scopes.get(&scope_id) else {
             return Ok(());
         };
-        let field = &self.fields[usize::from(bindings.render_field_slot)];
-        let field_stage = field.frame_stage.ok_or(MotionGpuError::FrameNotStaged)?;
+        // A collider recipient advects from the DERIVED field: its parity and
+        // its validity are the collider's own, not any primitive field's.
+        let (render_field_index, render_field_valid) = if bindings.derived_collider {
+            let collider = self
+                .collider
+                .as_ref()
+                .ok_or(MotionGpuError::ResourcePlanMismatch)?;
+            let stage = collider.frame_stage.ok_or(MotionGpuError::FrameNotStaged)?;
+            (usize::from(stage.render_index), stage.render_valid)
+        } else {
+            let field = &self.fields[usize::from(bindings.render_field_slot)];
+            let stage = field.frame_stage.ok_or(MotionGpuError::FrameNotStaged)?;
+            (
+                usize::from(stage.render_field_index),
+                stage.render_field_valid,
+            )
+        };
         let faraday_active = scope.transplant_admitted;
         let shutter_active = !scope.params.shutter.is_exact_zero();
         let carrier_stage = self.carrier_stage;
-        if !field_stage.render_field_valid {
+        if !render_field_valid {
             if shutter_active {
                 encode_single_target_pass(
                     encoder,
                     "Motion transform-only curved shutter",
                     &self.pipelines.apply,
-                    &bindings.apply[usize::from(field_stage.render_field_index)][0],
+                    &bindings.apply[render_field_index][0],
                     advected_view,
                     None,
                 );
@@ -1482,7 +2070,7 @@ impl MotionGpuResources {
             }
             return Ok(());
         }
-        let field_parity = usize::from(field_stage.render_field_index);
+        let field_parity = render_field_index;
         let carrier_source = if faraday_active {
             let stage = carrier_stage.ok_or(MotionGpuError::FrameNotStaged)?;
             if stage.carrier_read_valid {
@@ -1582,6 +2170,10 @@ impl MotionGpuResources {
 
     pub(crate) fn commit_frame(&mut self) {
         let accepted_motion_stage = self.fields.iter().any(|field| field.frame_stage.is_some())
+            || self
+                .collider
+                .as_ref()
+                .is_some_and(|collider| collider.frame_stage.is_some())
             || self.carrier_stage.is_some()
             || self
                 .scopes
@@ -1593,6 +2185,13 @@ impl MotionGpuResources {
                 if let Some(accepted) = field.staged_field.take() {
                     field.committed_field = accepted;
                 }
+            }
+        }
+        // Primitive, derived, and carrier state commit together with the
+        // prior/current spatial memory: one accepted frame, one transaction.
+        if let Some(collider) = self.collider.as_mut() {
+            if collider.frame_stage.take().is_some() {
+                collider.memory.commit();
             }
         }
         if self.carrier_stage.take().is_some() {
@@ -1612,6 +2211,12 @@ impl MotionGpuResources {
             field.frame_stage = None;
             field.staged_field = None;
             field.memory.discard();
+        }
+        // A discarded frame leaves no visible change on either side of the
+        // derived field: the committed parity the carrier reads is untouched.
+        if let Some(collider) = self.collider.as_mut() {
+            collider.frame_stage = None;
+            collider.memory.discard();
         }
         self.carrier_stage = None;
         self.carrier_memory.discard();
@@ -1706,6 +2311,14 @@ impl MotionGpuResources {
             field.frame_stage = None;
             field.committed_field = None;
             field.staged_field = None;
+        }
+        // Reset invalidates EVERY derived parity and the pending recipe
+        // without reallocating: the surfaces and the eight prebuilt bind groups
+        // survive, only the published validity does not.
+        if let Some(collider) = self.collider.as_mut() {
+            collider.memory.reset();
+            collider.frame_stage = None;
+            collider.map_parities = [0, 0];
         }
         self.carrier_memory.reset();
         self.carrier_stage = None;
@@ -1810,8 +2423,28 @@ fn encode_lattice_pass(
     vectors: &wgpu::TextureView,
     gates: &wgpu::TextureView,
 ) {
+    encode_dual_target_pass(
+        encoder,
+        "Motion deterministic lattice",
+        pipeline,
+        bind_group,
+        vectors,
+        gates,
+    );
+}
+
+/// One pass writing a paired vector/gate target. The lattice and the Field
+/// Collider's recombination pass share the exact same attachment shape.
+fn encode_dual_target_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &'static str,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    vectors: &wgpu::TextureView,
+    gates: &wgpu::TextureView,
+) {
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Motion deterministic lattice"),
+        label: Some(label),
         color_attachments: &[
             Some(wgpu::RenderPassColorAttachment {
                 view: vectors,
@@ -2508,6 +3141,86 @@ mod tests {
     };
 
     #[test]
+    fn the_collider_uniform_is_exactly_one_hundred_and_forty_four_bytes() {
+        // Two 64-byte MotionTransformGpu records plus one 16-byte mode/status
+        // lane. The compile-time assertion beside the type is the real guard;
+        // this restates it where a layout change is most likely to be noticed.
+        assert_eq!(std::mem::size_of::<ColliderGpuUniforms>(), 144);
+        assert_eq!(std::mem::size_of::<MotionTransformGpu>(), 64);
+        assert_eq!(std::mem::size_of::<ColliderGpuUniforms>(), 64 + 64 + 16);
+        // The two status bits are distinct and independent, so one input's
+        // singular transform can never close the other's lane.
+        assert_eq!(COLLIDER_INPUT_A_ADMITTED, 1);
+        assert_eq!(COLLIDER_INPUT_B_ADMITTED, 2);
+        assert_eq!(collider_input_admitted_bit(0), COLLIDER_INPUT_A_ADMITTED);
+        assert_eq!(collider_input_admitted_bit(1), COLLIDER_INPUT_B_ADMITTED);
+        assert_eq!(
+            COLLIDER_INPUT_A_ADMITTED & COLLIDER_INPUT_B_ADMITTED,
+            0,
+            "the two admitted bits must be independent"
+        );
+        // The transient pair is one RGBA16Float surface; the derived pair
+        // reuses the frozen primitive formats.
+        assert_eq!(
+            MOTION_COLLIDER_PAIR_FORMAT,
+            wgpu::TextureFormat::Rgba16Float
+        );
+        assert_eq!(MOTION_VECTOR_FORMAT, wgpu::TextureFormat::Rg16Float);
+        assert_eq!(MOTION_GATE_FORMAT, wgpu::TextureFormat::Rg8Unorm);
+    }
+
+    #[test]
+    fn the_derived_collider_field_commits_discards_freezes_and_resets_transactionally() {
+        let mut memory = ColliderMemoryState::default();
+        assert_eq!(memory.committed, ColliderMemorySnapshot::default());
+
+        // An accepted frame swaps parity and publishes validity.
+        let staged = memory.stage(true, true);
+        assert!(staged.derives);
+        assert_eq!(staged.write_index, 1);
+        assert_eq!(staged.render_index, 1);
+        assert!(staged.render_valid);
+        memory.commit();
+        assert_eq!(memory.committed.index, 1);
+        assert!(memory.committed.valid);
+
+        // A DISCARDED frame leaves no visible change on either side: the
+        // committed parity the carrier reads is untouched.
+        let discarded = memory.stage(true, true);
+        assert_eq!(discarded.write_index, 0);
+        memory.discard();
+        assert_eq!(memory.committed.index, 1);
+        assert!(memory.committed.valid);
+        assert_eq!(memory.staged, None);
+
+        // Program Freeze stages NOTHING and derives nothing: the last committed
+        // derived field is what the carrier keeps reading.
+        let frozen = memory.stage(false, true);
+        assert!(!frozen.derives);
+        assert_eq!(frozen.render_index, 1, "a frozen frame holds its parity");
+        assert!(frozen.render_valid);
+        assert_eq!(memory.staged, None);
+        memory.commit();
+        assert_eq!(memory.committed.index, 1);
+
+        // An unmaterialized input still DERIVES — writing the exact zero sample
+        // — so the derived parity can never hold a stale field from an earlier
+        // topology.
+        let invalid = memory.stage(true, false);
+        assert!(invalid.derives);
+        assert!(!invalid.render_valid);
+        memory.commit();
+        assert!(!memory.committed.valid);
+
+        // Reset invalidates every derived parity and the pending recipe.
+        memory.stage(true, true);
+        memory.reset();
+        assert_eq!(memory.committed, ColliderMemorySnapshot::default());
+        assert_eq!(memory.staged, None);
+        assert!(!memory.committed.valid);
+    }
+
+    #[test]
     fn gpu_adapter_consumes_the_canonical_grid_and_budget() {
         let grid = MotionGrid::for_source([7_680, 4_320], MotionLatticeQuality::High).unwrap();
         assert_eq!([grid.width, grid.height], [1_920, 1_080]);
@@ -2609,6 +3322,73 @@ mod tests {
             ..donor
         };
         assert_eq!(MotionTransformGpu::between(invalid, recipient), None);
+    }
+
+    #[test]
+    fn the_collider_maps_coordinates_with_translation_and_vectors_without_it() {
+        // The two maps the 144-byte collider uniform carries are exactly the
+        // section-5 law: a coordinate goes donor-local -> composition ->
+        // recipient-local and IS moved by translation; a vector goes through
+        // the 2x2 linear part alone and is NEVER moved by it.
+        let recipient = SpatialTransform::default().gpu_uniforms(1_920, 1_080, 1_920, 1_080);
+        let near = SpatialTransform {
+            position: [0.25, -0.125],
+            scale: [0.5, 0.5],
+            ..SpatialTransform::default()
+        }
+        .gpu_uniforms(1_920, 1_080, 1_920, 1_080);
+        let far = SpatialTransform {
+            position: [0.4, -0.3],
+            scale: [0.5, 0.5],
+            ..SpatialTransform::default()
+        }
+        .gpu_uniforms(1_920, 1_080, 1_920, 1_080);
+
+        let near_map = MotionTransformGpu::between(near, recipient).expect("nonsingular");
+        let far_map = MotionTransformGpu::between(far, recipient).expect("nonsingular");
+
+        // The fixture must really translate, or it proves nothing.
+        let near_translation = [
+            near_map.output_to_donor_row_0[2],
+            near_map.output_to_donor_row_1[2],
+        ];
+        let far_translation = [
+            far_map.output_to_donor_row_0[2],
+            far_map.output_to_donor_row_1[2],
+        ];
+        assert_ne!(
+            near_translation, far_translation,
+            "a translated donor must map coordinates differently"
+        );
+
+        // The vector rows are bit-identical across that translation, and their
+        // two trailing lanes are structurally zero: the shader dots only `.xy`,
+        // so a translation column has nowhere to reach a velocity from.
+        assert_eq!(
+            near_map.donor_to_recipient_row_0,
+            far_map.donor_to_recipient_row_0
+        );
+        assert_eq!(
+            near_map.donor_to_recipient_row_1,
+            far_map.donor_to_recipient_row_1
+        );
+        assert_eq!(near_map.donor_to_recipient_row_0[2], 0.0);
+        assert_eq!(near_map.donor_to_recipient_row_0[3], 0.0);
+        assert_eq!(near_map.donor_to_recipient_row_1[2], 0.0);
+        assert_eq!(near_map.donor_to_recipient_row_1[3], 0.0);
+        // A stationary donor stays exactly stationary however far it moved.
+        assert_eq!(near_map.map_vector([0.0, 0.0]), [0.0, 0.0]);
+        assert_eq!(far_map.map_vector([0.0, 0.0]), [0.0, 0.0]);
+
+        // A singular donor yields no map at all, so the collider closes that
+        // input's admitted bit and emits the exact invalid sample instead of
+        // falling back to identity pixels.
+        let singular = SpatialGpuUniforms {
+            inverse_row_0: [0.0, 0.0, 0.0, 0.0],
+            inverse_row_1: [0.0, 0.0, 0.0, 0.0],
+            ..near
+        };
+        assert_eq!(MotionTransformGpu::between(singular, recipient), None);
     }
 
     fn map_spatial_sample(sample: MotionSpatialSampleGpu, uv: [f32; 2]) -> [f32; 2] {
@@ -2935,6 +3715,7 @@ mod tests {
                     required_as_garden_signal: false,
                 }],
                 dimensions,
+                None,
             )
             .unwrap()
             .unwrap();
@@ -3420,6 +4201,7 @@ mod tests {
                 required_as_garden_signal: true,
             }],
             dimensions,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -3488,7 +4270,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.active_field_slots, 0);
         assert_eq!(plan.persistent_carriers, 1);
-        let mut resources = MotionGpuResources::prepare(&device, plan, &[], dimensions)
+        let mut resources = MotionGpuResources::prepare(&device, plan, &[], dimensions, None)
             .unwrap()
             .unwrap();
 
