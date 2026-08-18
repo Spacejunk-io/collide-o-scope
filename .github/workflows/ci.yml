@@ -57,8 +57,29 @@ jobs:
 
       - name: Install Linux native prerequisites
         if: runner.os == 'Linux'
+        timeout-minutes: 10
         run: |
-          sudo apt-get update
+          set -euo pipefail
+          # Fail fast on a stalled Ubuntu mirror instead of hanging: a prior run
+          # sat ~45 min in `apt-get update` before the job was cancelled. Bound
+          # each connection and retry a few times, matching the FFmpeg fetch
+          # steps' existing network-retry convention.
+          sudo tee /etc/apt/apt.conf.d/80-ci-timeouts >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
+          for attempt in 1 2 3; do
+            if sudo timeout 240 apt-get update; then
+              break
+            elif [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-get update failed after 3 attempts" >&2
+              exit 1
+            else
+              echo "::warning::apt-get update attempt $attempt failed; retrying" >&2
+              sleep "$((attempt * 10))"
+            fi
+          done
           sudo apt-get install --yes --no-install-recommends \
             build-essential \
             clang \
