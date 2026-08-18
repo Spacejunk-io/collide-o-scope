@@ -190,6 +190,7 @@ function connect() {
         syncControllerRuntime(msg.controller_runtime);
         syncOscRuntime(msg.osc_runtime);
         syncTemporal(msg.temporal);
+        syncGesture(msg.gesture);
         syncMasterMotion(msg.master_motion);
         syncSpout(msg.spout);
         syncRemote(msg.remote_url);
@@ -581,6 +582,7 @@ function creativeRouteToken(route) {
     case 'missing_group_output': return `missing-group:${input.group_id}`;
     case 'all_below': return 'all_below';
     case 'clean_program': return 'clean_program';
+    case 'gesture_canvas': return 'gesture_canvas';
     default: return 'one_below';
   }
 }
@@ -590,6 +592,7 @@ function creativeRouteOptions(route) {
     ['one_below', 'One below'],
     ['all_below', 'All below'],
     ['clean_program', 'Clean program (N−1)'],
+    ['gesture_canvas', 'Gesture canvas (etched field)'],
   ];
   for (const layer of latestLayers) {
     const id = String(layer.layer_id);
@@ -616,6 +619,10 @@ function creativeRouteFromToken(token, timing) {
     input = { source: 'all_below' };
   } else if (token === 'clean_program') {
     input = { source: 'clean_program' };
+  } else if (token === 'gesture_canvas') {
+    // The etched field is a master-scope singleton: no ID, no saved position,
+    // and no scope ordering, so both timings are authorable.
+    input = { source: 'gesture_canvas' };
   } else {
     input = { source: 'one_below' };
   }
@@ -2047,6 +2054,105 @@ function syncTemporal(t) {
     const staged = telemetry.frame_staged ? ' · staged' : '';
     const resetText = telemetry.last_reset ? ` · reset ${telemetry.last_reset}` : '';
     telemetryEl.textContent = `History ${valid}/${capacity} · ${carrier} · ${hold} · tick ${ticks} · Score ${scoreState} · event ${ordinal} · ${track}${staged}${resetText}`;
+  }
+}
+
+// --- Gesture field etching ---
+//
+// The honesty law on the panel: `recorded_events` and `live_only_events` are
+// published as separate fields and are rendered as separate sentences, so an
+// unrecorded live gesture is never displayed as replayable. Only the armed
+// state is announced; the per-frame counters live outside the live region.
+
+const GESTURE_CANVAS_DEFAULTS = { radius: 0.12, strength: 0.5, retention: 0.99 };
+let gestureRecording = false;
+
+document.querySelectorAll('.param-row[data-gesture-canvas]').forEach((row) => {
+  const param = row.dataset.gestureCanvas;
+  const min = parseFloat(row.dataset.min);
+  const max = parseFloat(row.dataset.max);
+  const step = parseFloat(row.dataset.step);
+  const slider = row.querySelector('input[type="range"]');
+  const valueEl = row.querySelector('.value');
+  if (!slider || !valueEl) return;
+  slider.min = min;
+  slider.max = max;
+  slider.step = step;
+  const fallback = GESTURE_CANVAS_DEFAULTS[param] ?? min;
+  slider.value = fallback;
+  slider.addEventListener('input', () => {
+    const value = parseFloat(slider.value);
+    valueEl.textContent = formatValue(value, min, max, step);
+    sendAction({ action: 'set_gesture_canvas', param, value });
+  });
+  resetRangeOnDoubleActivation(slider, fallback);
+});
+
+document.getElementById('gesture-record-toggle')?.addEventListener('click', () => {
+  sendAction({
+    action: 'set_gesture_recording',
+    enabled: !gestureRecording,
+    layer_stack_revision: layerStackRevision,
+  });
+});
+
+function syncGesture(gesture) {
+  const g = gesture || {};
+  const canvas = g.canvas || {};
+  gestureRecording = Boolean(g.recording);
+
+  for (const param of ['radius', 'strength', 'retention']) {
+    const value = canvas[param];
+    if (value === undefined || value === null) continue;
+    const row = document.querySelector(`.param-row[data-gesture-canvas="${param}"]`);
+    if (!row) continue;
+    const slider = row.querySelector('input[type="range"]');
+    const valueEl = row.querySelector('.value');
+    if (!slider || !valueEl || !canSync(slider)) continue;
+    slider.value = value;
+    valueEl.textContent = formatValue(
+      value,
+      parseFloat(row.dataset.min),
+      parseFloat(row.dataset.max),
+      parseFloat(row.dataset.step)
+    );
+  }
+
+  const toggle = document.getElementById('gesture-record-toggle');
+  if (toggle) {
+    toggle.textContent = gestureRecording ? 'Disarm recording' : 'Arm recording';
+    toggle.setAttribute('aria-pressed', gestureRecording ? 'true' : 'false');
+  }
+
+  const open = Number(g.open_strokes) || 0;
+  const stateEl = document.getElementById('gesture-recording-state');
+  if (stateEl) {
+    const armed = gestureRecording ? 'Recording' : 'Not recording';
+    const incomplete = open > 0 ? ` · ${open} open stroke(s), track explicitly incomplete` : '';
+    const status = g.status ? ` · ${g.status}` : '';
+    stateEl.textContent = `${armed}${incomplete}${status}`;
+  }
+
+  const telemetryEl = document.getElementById('gesture-telemetry');
+  if (telemetryEl) {
+    const recorded = Number(g.recorded_events) || 0;
+    const liveOnly = Number(g.live_only_events) || 0;
+    const truncated = g.truncated ? ' (capped)' : '';
+    const width = Number(canvas.grid_width) || 0;
+    const height = Number(canvas.grid_height) || 0;
+    const generation = Number(canvas.generation) || 0;
+    telemetryEl.textContent =
+      `${recorded} recorded event(s)${truncated} · ${liveOnly} live-only sample(s) · ` +
+      `canvas ${width}×${height} · gen ${generation}`;
+  }
+
+  const checksumEl = document.getElementById('gesture-checksum');
+  if (checksumEl) {
+    // An empty track publishes no digest, so the panel says so instead of
+    // rendering an empty field that could read as a verified recording.
+    checksumEl.textContent = g.checksum
+      ? `Recorded track ${String(g.checksum).slice(0, 16)}… · replayable`
+      : 'No recorded track';
   }
 }
 
@@ -4642,6 +4748,9 @@ const MOD_TARGETS = [
   ['motion_shutter_phase', 'Motion Shutter Phase'],
   ['motion_shutter_curvature', 'Motion Shutter Curvature'],
   ['motion_shutter_chromatic_lag', 'Motion Shutter Chroma Lag'],
+  ['gesture_radius', 'Gesture Radius'],
+  ['gesture_strength', 'Gesture Strength'],
+  ['gesture_retention', 'Gesture Retention'],
   ['morph', 'Morph'],
 ];
 const MASTER_MOD_TARGETS = MOD_TARGETS.slice();

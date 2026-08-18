@@ -61,6 +61,14 @@ pub struct CompositionPlanInput<'a> {
     /// Omitted motion retains the literal pre-M4 exact path. Live and export
     /// provide the same immutable values through `with_motion`.
     pub motion: Option<MotionPlanInput<'a>>,
+    /// Whether this session has an admitted gesture canvas.
+    ///
+    /// `false` is the pre-gesture default: a route to the canvas resolves to a
+    /// transparent field with a named diagnostic, exactly as a missing donor
+    /// does, and never silently rebinds to a layer or a group. The canvas is a
+    /// master-scope singleton, so this is a bare admission fact rather than an
+    /// identity — there is nothing to name and no position to preserve.
+    pub gesture_canvas_admitted: bool,
 }
 
 impl<'a> CompositionPlanInput<'a> {
@@ -77,7 +85,16 @@ impl<'a> CompositionPlanInput<'a> {
             program_history_initialized: false,
             resource_limits: CreativeResourceLimits::default(),
             motion: None,
+            gesture_canvas_admitted: false,
         }
+    }
+
+    /// Declare whether an admitted gesture canvas backs this frame. Live and
+    /// export must supply the same fact so a routed donor plans identically on
+    /// both sides.
+    pub const fn with_gesture_canvas(mut self, admitted: bool) -> Self {
+        self.gesture_canvas_admitted = admitted;
+        self
     }
 
     /// Route authored mattes through the unified stable-ID composition graph.
@@ -460,6 +477,13 @@ pub enum PlannedImageSource {
     /// Exact root/group-local prefix, ordered back-to-front.
     AllBelow(CompositePrefix),
     ProgramHistory,
+    /// The etched gesture field, presented as a premultiplied donor image.
+    ///
+    /// It is a *producer with no scope*: nothing in the composition graph makes
+    /// it, so it contributes no dependency, no ordering edge, and no retained
+    /// tap surface. That is what keeps a same-frame route to it from ever
+    /// closing a cycle, including from the master scope that owns it.
+    GestureCanvas,
     Transparent,
 }
 
@@ -516,6 +540,12 @@ pub enum CompositionPlanDiagnostic {
         consumer: ImageTapConsumer,
     },
     ProgramHistoryUninitialized {
+        consumer: ImageTapConsumer,
+    },
+    /// A route named the gesture canvas but no canvas is admitted. The tap
+    /// resolves transparent and stays visible as this diagnostic; it is never
+    /// repointed at some other producer.
+    GestureCanvasUnavailable {
         consumer: ImageTapConsumer,
     },
     RefreshGardenMatteNotSelected,
@@ -1529,6 +1559,7 @@ impl<'a> Planner<'a> {
         };
 
         let below = below_topology(self.input.composition)?;
+        let gesture_canvas_admitted = self.input.gesture_canvas_admitted;
         let mut taps = Vec::new();
         let mut diagnostics = Vec::new();
         let mut dependencies = Vec::new();
@@ -1550,6 +1581,7 @@ impl<'a> Planner<'a> {
                 self.racks[&layer.stable_id],
                 &below,
                 &known_scopes,
+                gesture_canvas_admitted,
                 &mut taps,
                 &mut diagnostics,
                 &mut dependencies,
@@ -1567,6 +1599,7 @@ impl<'a> Planner<'a> {
                     },
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1589,6 +1622,7 @@ impl<'a> Planner<'a> {
                     &runtime.rack,
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1601,6 +1635,7 @@ impl<'a> Planner<'a> {
                         PlannedImageTapOrigin::Rack(matte.tap),
                         &below,
                         &known_scopes,
+                        gesture_canvas_admitted,
                         &mut taps,
                         &mut diagnostics,
                         &mut dependencies,
@@ -1615,6 +1650,7 @@ impl<'a> Planner<'a> {
             self.input.master_rack,
             &below,
             &known_scopes,
+            gesture_canvas_admitted,
             &mut taps,
             &mut diagnostics,
             &mut dependencies,
@@ -1643,6 +1679,7 @@ impl<'a> Planner<'a> {
                     }),
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -1663,6 +1700,7 @@ impl<'a> Planner<'a> {
                     }),
                     &below,
                     &known_scopes,
+                    gesture_canvas_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -2283,6 +2321,7 @@ fn collect_rack_taps(
     rack: &RuntimeVisualRack,
     below: &BelowTopology,
     known_scopes: &BTreeSet<VisualScopeId>,
+    gesture_canvas_admitted: bool,
     taps: &mut Vec<PlannedImageTap>,
     diagnostics: &mut Vec<CompositionPlanDiagnostic>,
     dependencies: &mut Vec<ImageDependency>,
@@ -2313,6 +2352,7 @@ fn collect_rack_taps(
             PlannedImageTapOrigin::Rack(tap),
             below,
             known_scopes,
+            gesture_canvas_admitted,
             taps,
             diagnostics,
             dependencies,
@@ -2329,6 +2369,7 @@ fn collect_tap(
     origin: PlannedImageTapOrigin,
     below: &BelowTopology,
     known_scopes: &BTreeSet<VisualScopeId>,
+    gesture_canvas_admitted: bool,
     taps: &mut Vec<PlannedImageTap>,
     diagnostics: &mut Vec<CompositionPlanDiagnostic>,
     dependencies: &mut Vec<ImageDependency>,
@@ -2459,6 +2500,19 @@ fn collect_tap(
             current_edge = Some(VisualScopeId::Program);
             PlannedImageSource::Scope(VisualScopeId::Program)
         }
+        // The canvas is etched outside the composition graph, so it is a
+        // producer with no scope: no `dependency_producer`, no `current_edge`,
+        // and therefore no ordering constraint and no cycle. It also has no
+        // N-1 parity — a frame-committed singleton has one image — so both
+        // timings read the same committed field rather than quietly claiming a
+        // history pair nothing writes.
+        TapRouteSource::GestureCanvas if gesture_canvas_admitted => {
+            PlannedImageSource::GestureCanvas
+        }
+        TapRouteSource::GestureCanvas => {
+            diagnostics.push(CompositionPlanDiagnostic::GestureCanvasUnavailable { consumer });
+            PlannedImageSource::Transparent
+        }
     };
     if let Some(producer) = dependency_producer {
         dependencies.push(ImageDependency {
@@ -2496,6 +2550,7 @@ enum TapRouteSource {
     CleanProgram,
     ProgramHistory,
     ProgramHistoryUninitialized,
+    GestureCanvas,
 }
 
 impl From<ResolvedImageSource> for TapRouteSource {
@@ -2512,6 +2567,7 @@ impl From<ResolvedImageSource> for TapRouteSource {
             ResolvedImageSource::GroupOutput(group_id) => Self::GroupOutput(group_id),
             ResolvedImageSource::MissingGroupOutput(group_id) => Self::MissingGroupOutput(group_id),
             ResolvedImageSource::CleanProgram => Self::CleanProgram,
+            ResolvedImageSource::GestureCanvas => Self::GestureCanvas,
         }
     }
 }
@@ -2894,7 +2950,14 @@ fn resource_preflight(
         let needs_staging = tap.origin.timing() == EdgeTiming::PreviousFrame
             && !matches!(
                 tap.resolved,
-                PlannedImageSource::ProgramHistory | PlannedImageSource::Transparent
+                PlannedImageSource::ProgramHistory
+                    // The gesture canvas is a frame-committed singleton with
+                    // one image and no N-1 parity, so an N-1 route to it stages
+                    // nothing. The executor allocates nothing for it either;
+                    // charging a parity pair here would put the declared and
+                    // actual ledgers permanently one apart.
+                    | PlannedImageSource::GestureCanvas
+                    | PlannedImageSource::Transparent
             );
         count
             .checked_add(u32::from(needs_staging))
@@ -3370,6 +3433,8 @@ fn hash_source(mut hash: u64, source: &PlannedImageSource) -> u64 {
         }
         PlannedImageSource::ProgramHistory => hash_value(hash, 4),
         PlannedImageSource::Transparent => hash_value(hash, 5),
+        // Append-only, exactly like the node kind codes: 6 is SelectedLayer.
+        PlannedImageSource::GestureCanvas => hash_value(hash, 7),
     }
 }
 
@@ -4977,6 +5042,145 @@ mod tests {
         let mut racks = legacy_racks(&[1, 2]);
         push_displace(&mut racks[1].1, own_output, EdgeTiming::CurrentFrame, 0.0);
         assert!(plan(&base, &composition, &master, &racks).is_ok());
+    }
+
+    fn plan_with_gesture_canvas(
+        base: &EvaluatedFramePlan,
+        composition: &RuntimeComposition,
+        master: &RuntimeVisualRack,
+        racks: &[(StableLayerId, RuntimeVisualRack)],
+        admitted: bool,
+    ) -> Result<EvaluatedCompositionPlan, CompositionPlanError> {
+        EvaluatedCompositionPlan::evaluate(
+            base,
+            CompositionPlanInput::new(composition, master, racks).with_gesture_canvas(admitted),
+        )
+    }
+
+    #[test]
+    fn a_gesture_canvas_donor_plans_outside_scope_ordering_and_charges_no_tap_surface() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+
+        // Baseline: the same topology, advanced for the same reason, but with
+        // no image route at all.
+        let mut bare_master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        bare_master
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..DigitalColorParams::default()
+            }))
+            .unwrap();
+        let bare = advanced(
+            plan_with_gesture_canvas(
+                &base,
+                &composition,
+                &bare_master,
+                &legacy_racks(&[1, 2]),
+                true,
+            )
+            .unwrap(),
+        );
+
+        // Every scope routes a same-frame donor at the canvas at once —
+        // including the master, which is the scope that owns it and would be
+        // the self-cycle if the canvas were an ordinary producer.
+        let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let master_node = push_displace(
+            &mut master,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let mut racks = legacy_racks(&[1, 2]);
+        let lower_node = push_displace(
+            &mut racks[0].1,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let upper_node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::PreviousFrame,
+            -0.25,
+        );
+        let compiled =
+            advanced(plan_with_gesture_canvas(&base, &composition, &master, &racks, true).unwrap());
+
+        for node in [master_node, lower_node, upper_node] {
+            let tap = displace_tap_for(&compiled, node).expect("the canvas donor is admitted");
+            assert_eq!(tap.resolved, PlannedImageSource::GestureCanvas);
+        }
+        assert!(!compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::GestureCanvasUnavailable { .. }
+        )));
+
+        // A producer with no scope claims no dependency at either timing, so it
+        // takes part in no ordering and cannot close a cycle.
+        assert_eq!(compiled.graph().current_taps, 0);
+        assert_eq!(compiled.graph().previous_taps, 0);
+        assert_eq!(
+            compiled.graph().current_topological_order,
+            bare.graph().current_topological_order
+        );
+
+        // The canvas surface is charged once, by `GestureCanvasPlan`. Routing
+        // to it must not also claim a retained tap surface in the composition
+        // ledger, which `validate_actual_surface_ledger` reconciles exactly.
+        assert_eq!(
+            compiled.resources().rgba16_surface_layers,
+            bare.resources().rgba16_surface_layers,
+            "a canvas route must not add a retained tap surface"
+        );
+        assert_eq!(
+            compiled.resources().creative_bytes,
+            bare.resources().creative_bytes
+        );
+    }
+
+    #[test]
+    fn an_unadmitted_gesture_canvas_route_is_transparent_and_named_rather_than_rebound() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        let node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::GestureCanvas,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+
+        let compiled = advanced(
+            plan_with_gesture_canvas(&base, &composition, &master, &racks, false).unwrap(),
+        );
+        let tap = displace_tap_for(&compiled, node)
+            .expect("an unavailable canvas still reports a diagnostic tap");
+        assert_eq!(
+            tap.resolved,
+            PlannedImageSource::Transparent,
+            "an unadmitted canvas resolves transparent, exactly as a missing donor does"
+        );
+        assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::GestureCanvasUnavailable { consumer }
+                if matches!(consumer, ImageTapConsumer::RackNode { node_id, .. } if *node_id == node)
+        )));
+        // It is never quietly repointed at the layer below, a group, or the
+        // program: that is the whole reason the diagnostic exists.
+        assert_eq!(compiled.graph().current_taps, 0);
+        assert_eq!(compiled.graph().previous_taps, 0);
+
+        // Admission is the only difference. The identical rack, planned with a
+        // canvas, resolves to the field.
+        let admitted =
+            advanced(plan_with_gesture_canvas(&base, &composition, &master, &racks, true).unwrap());
+        assert_eq!(
+            displace_tap_for(&admitted, node).unwrap().resolved,
+            PlannedImageSource::GestureCanvas
+        );
     }
 
     #[test]

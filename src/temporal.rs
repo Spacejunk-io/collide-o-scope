@@ -1424,7 +1424,10 @@ pub(crate) fn temporal_read_snapshot(
     }
 }
 
-fn sanitize_delta(delta_seconds: f32) -> f32 {
+/// The one hostile-dt law. It is shared with the gesture recorder so both
+/// reference-tick clocks treat a non-finite or negative frame delta the same
+/// way; there is deliberately no second copy of this rule.
+pub(crate) fn sanitize_delta(delta_seconds: f32) -> f32 {
     if delta_seconds.is_finite() {
         delta_seconds.max(0.0)
     } else {

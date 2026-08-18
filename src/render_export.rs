@@ -125,6 +125,14 @@ pub struct ExportConfig {
     /// This is runtime performance data, never inferred from wall time or
     /// serialized into the authored patch.
     pub(crate) temporal_event_track: crate::temporal::TemporalEventTrack,
+    /// The recorded gesture performance this job replays, carried as the
+    /// portable sidecar document so the recording's canonical checksum travels
+    /// with its own event stream.
+    ///
+    /// `None` is the pre-gesture path: nothing is replayed, no gesture sidecar
+    /// is published, and the honesty law holds by construction because an
+    /// unrecorded live gesture never reaches this field.
+    pub(crate) gesture_track: Option<crate::gesture::GestureTrackDocument>,
 }
 
 /// Closed offline Curved Shutter sample policy. The explicit variants name
@@ -786,6 +794,13 @@ fn remove_started_output(progress: &ExportProgress, output_path: Option<&str>) -
     if let Err(error) = remove_partial_path(&sidecar, "motion sidecar") {
         errors.push(error);
     }
+    // The gesture sidecar is cleanup-coupled to the video exactly as the motion
+    // report is: a cancelled or failed render must never leave a recording
+    // receipt standing next to a deleted output.
+    let gesture = gesture_sidecar_path(path);
+    if let Err(error) = remove_partial_path(&gesture, "gesture sidecar") {
+        errors.push(error);
+    }
     (!errors.is_empty()).then(|| errors.join("; "))
 }
 
@@ -840,13 +855,69 @@ fn motion_sidecar_path(output_path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
-fn motion_sidecar_temp_path(sidecar: &std::path::Path) -> std::path::PathBuf {
+/// The gesture sidecar sits beside the rendered video exactly as the motion
+/// report does. Its name is derived from the output path; nothing about that
+/// path enters the file.
+fn gesture_sidecar_path(output_path: &str) -> std::path::PathBuf {
+    let mut path = std::ffi::OsString::from(output_path);
+    path.push(".gesture.json");
+    std::path::PathBuf::from(path)
+}
+
+/// Publish the replayed gesture recording beside its render.
+///
+/// The commit is the staged no-replace transaction `src/procedural.rs` uses for
+/// generated pieces: write a private temporary sibling with `create_new`, sync
+/// it, then rename it into place *without* replacement, so two jobs racing for
+/// the same destination fail closed instead of one silently overwriting the
+/// other's receipt. The payload is the frozen six-field
+/// `GestureTrackDocument`; `to_json_bytes` revalidates the whole stream and
+/// re-derives its canonical checksum before a byte is staged. No operational
+/// path, directory, timestamp, host name, or other filesystem metadata enters
+/// the document.
+fn write_gesture_sidecar_noreplace(
+    output_path: &str,
+    document: &crate::gesture::GestureTrackDocument,
+) -> Result<(), String> {
+    let bytes = document
+        .to_json_bytes()
+        .map_err(|error| format!("serialize export gesture sidecar: {error}"))?;
+    let sidecar_path = gesture_sidecar_path(output_path);
+    if sidecar_path.exists() {
+        return Err(format!(
+            "refusing to overwrite export gesture sidecar '{}'",
+            sidecar_path.display()
+        ));
+    }
+    let temp_path = sidecar_temp_path(&sidecar_path);
+    if let Err(error) = crate::procedural::write_new_file(&temp_path, &bytes) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("stage export gesture sidecar: {error}"));
+    }
+    if let Err(error) = crate::procedural::rename_noreplace(&temp_path, &sidecar_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "commit export gesture sidecar '{}': {error}",
+            sidecar_path.display()
+        ));
+    }
+    crate::procedural::sync_parent(&sidecar_path).map_err(|error| {
+        format!(
+            "export gesture sidecar committed at '{}', but synchronizing its parent directory failed: {error}",
+            sidecar_path.display()
+        )
+    })
+}
+
+/// Private staging sibling for one sidecar publication. Shared by the motion
+/// report and the gesture recording so both stage the same way.
+fn sidecar_temp_path(sidecar: &std::path::Path) -> std::path::PathBuf {
     let parent = sidecar
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."));
     let mut file_name = sidecar
         .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new("motion.json"))
+        .unwrap_or_else(|| std::ffi::OsStr::new("sidecar.json"))
         .to_os_string();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -914,7 +985,7 @@ fn write_motion_sidecar_atomic(
         ));
     }
     let sidecar_path = motion_sidecar_path(output_path);
-    let temp_path = motion_sidecar_temp_path(&sidecar_path);
+    let temp_path = sidecar_temp_path(&sidecar_path);
     let write_result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -1086,6 +1157,13 @@ fn start_encoder_supervisor(
             supervisor_progress
                 .output_started
                 .store(true, Ordering::Release);
+            // ffmpeg runs with `-y`, so spawning it is the moment this job takes
+            // ownership of the destination name. Retiring a previous run's
+            // gesture receipt here — and only here — is what lets the strictly
+            // no-replace commit below stay strictly no-replace: a re-export
+            // replaces its own stale receipt, while a second job racing for the
+            // same destination still fails closed at the rename.
+            let _ = remove_partial_path(&gesture_sidecar_path(&output_path), "gesture sidecar");
 
             let Some(stdin) = child.stdin.take() else {
                 let _ = force_reap_ffmpeg(&mut child);
@@ -2627,6 +2705,10 @@ struct ExportFrameMorphWorld {
     master_motion: crate::motion::MotionParams,
     ntsc: crate::ntsc::NtscParams,
     temporal: crate::effects::params::TemporalParams,
+    /// Authored gesture-canvas controls only. A Morph slot names a recording;
+    /// it never owns one, so no morph position can add, remove, retime, or
+    /// rewrite a recorded gesture event offline any more than it can live.
+    gesture_canvas: crate::gesture_canvas::GestureCanvasParams,
     layer_bases: Vec<ExportFrameLayerBase>,
     layer_motion: Vec<crate::motion::MotionParams>,
     morph_overrides: Vec<ExportMorphOverrides>,
@@ -2694,6 +2776,10 @@ fn apply_export_morph_world(
     world.ntsc = sample.ntsc.to_params();
     world.temporal =
         resolved_export_morph_temporal(sample.temporal, &world.creative_graph.layer_ids);
+    // Values only, and only when both slots name the same recording. The
+    // route-match law lives in `MorphSample::apply_gesture_to`, shared with
+    // live, so offline cannot interpolate across two different performances.
+    sample.apply_gesture_to(&mut world.gesture_canvas);
     for sampled in &sample.layers {
         if let Some((position, _)) = layers
             .iter()
@@ -3489,7 +3575,13 @@ fn plan_export_composition_inner(
         .transpose()?;
     let mut input =
         CompositionPlanInput::new(&graph.composition, &graph.master_rack, &graph.layer_racks)
-            .with_layer_mattes(layer_mattes, program_history_initialized);
+            .with_layer_mattes(layer_mattes, program_history_initialized)
+            // Every offline job admits exactly one gesture canvas through
+            // `export_gesture_canvas` before the first frame is planned, and a
+            // refused admission aborts the job outright. The offline planner
+            // therefore always sees an admitted canvas, which is what keeps a
+            // routed donor planning identically live and offline.
+            .with_gesture_canvas(true);
     input.resource_limits = resource_limits;
     if let (Some(motion), Some((master, layers))) = (motion, planned_motion.as_ref()) {
         input = input.with_motion(*master, layers, motion.limits);
@@ -3613,12 +3705,85 @@ fn export_ntsc_reference_frame(frame_num: u64, fps: u32, paused: bool) -> usize 
     }
 }
 
-fn export_temporal_reference_tick(frame_num: u64, fps: u32) -> u64 {
+pub(crate) fn export_temporal_reference_tick(frame_num: u64, fps: u32) -> u64 {
     let fps = u64::from(fps.max(1));
     frame_num
         .saturating_mul(crate::effects::params::TEMPORAL_REFERENCE_FPS as u64)
         .saturating_add(fps / 2)
         / fps
+}
+
+/// Decode the recorded gesture performance this job will replay.
+///
+/// `GestureTrackDocument::decode` is the single acceptance path: it revalidates
+/// the whole stream through the same validator that governs live ingest and
+/// then re-derives the canonical checksum over the portable event stream and
+/// compares it against the digest the recording declares. A mismatch is
+/// therefore an actionable export error raised *before* the first frame is
+/// rendered, never a silent re-render of a performance nobody authored.
+fn export_recorded_gesture_track(
+    document: Option<&crate::gesture::GestureTrackDocument>,
+) -> Result<crate::gesture::GestureTrack, String> {
+    let Some(document) = document else {
+        // The pre-gesture path. Nothing is replayed and nothing is published.
+        return Ok(crate::gesture::GestureTrack::default());
+    };
+    document
+        .decode()
+        .map_err(|error| format!("recorded gesture track rejected before rendering: {error}"))
+}
+
+/// Admit and build the one gesture canvas an offline job owns.
+///
+/// The grid is derived from the export output through the same host law the
+/// live preview uses, so the two sessions etch the same lattice, and the
+/// authored controls come from the patch. Every frozen limit is checked by
+/// `GestureCanvasPlan::preflight` before a cell is allocated.
+fn export_gesture_canvas(
+    patch: &PatchState,
+    width: u32,
+    height: u32,
+    limits: crate::gesture_canvas::GestureCanvasLimits,
+) -> Result<crate::gesture_canvas::GestureCanvasState, String> {
+    let grid = crate::gesture_canvas_host_grid(width, height);
+    let request = crate::gesture_canvas::GestureCanvasRequest::new(grid)
+        .with_decay_ticks(crate::gesture::MAX_GESTURE_DECAY_TICKS);
+    crate::gesture_canvas::GestureCanvasPlan::preflight(&[request], limits)
+        .map_err(|error| format!("export gesture canvas rejected: {error}"))?;
+    let params = patch.gesture_canvas.unwrap_or_default().to_params();
+    crate::gesture_canvas::GestureCanvasState::new(grid, params)
+        .map_err(|error| format!("export gesture canvas rejected: {error}"))
+}
+
+/// Stage one offline gesture-canvas frame.
+///
+/// The 30 Hz address is `export_temporal_reference_tick(frame_num, fps)` — the
+/// same rounded rational map the recorded temporal event track replays on and
+/// the same address the live accepted-frame accumulator produces. Wall time
+/// never reaches the replay cursor, the decay clock, or the field. A frozen
+/// program holds rather than accumulating catch-up debt, exactly as live.
+fn stage_export_gesture_canvas_frame(
+    canvas: &mut crate::gesture_canvas::GestureCanvasState,
+    replay: &mut crate::gesture::GestureReplay<'_>,
+    frame_num: u64,
+    fps: u32,
+    program_advances: bool,
+    evaluated_params: crate::gesture_canvas::GestureCanvasParams,
+) -> Result<crate::gesture_canvas::GestureCanvasFramePlan, String> {
+    // An abandoned frame is a discarded frame. Offline every early exit breaks
+    // out of the render loop, but discarding first keeps the transaction law
+    // total rather than relying on that.
+    canvas.discard_staged();
+    let reference_tick = export_temporal_reference_tick(frame_num, fps);
+    let events = replay.events_due(u32::try_from(reference_tick).unwrap_or(u32::MAX));
+    canvas
+        .stage_frame(crate::gesture_canvas::GestureCanvasFrameInput {
+            reference_tick,
+            program_advances,
+            events,
+            evaluated_params: Some(evaluated_params),
+        })
+        .map_err(|error| format!("export gesture canvas frame refused: {error}"))
 }
 
 fn export_selective_topology_signature(plan: &SelectiveNtscPlan) -> u64 {
@@ -4387,6 +4552,48 @@ fn run_export(
             "The live temporal event track reached its bounded cap; export replays the retained prefix only.",
         );
     }
+
+    // --- Recorded gesture performance, same 30 Hz timeline as Temporal ---
+    // The checksum is verified here, before the first frame is rendered: a
+    // tampered or corrupted recording aborts the job with a named error rather
+    // than silently re-rendering a performance nobody authored.
+    let recorded_gesture_track = export_recorded_gesture_track(config.gesture_track.as_ref())?;
+    let mut recorded_gesture_replay = recorded_gesture_track.replay();
+    if recorded_gesture_track.truncated() {
+        progress.record_warning(
+            "The live gesture track reached its bounded cap; export replays the retained prefix only.",
+        );
+    }
+    if !recorded_gesture_track.is_complete() {
+        progress.record_warning(
+            "The recorded gesture track has unclosed strokes; export replays it exactly as recorded and never closes them.",
+        );
+    }
+    let base_gesture_canvas = patch.gesture_canvas.unwrap_or_default().to_params();
+    let gesture_canvas_limits = crate::gesture_canvas::GestureCanvasLimits::device(
+        max_dimension,
+        raw_device_limits.min_uniform_buffer_offset_alignment,
+    );
+    let mut gesture_canvas = export_gesture_canvas(patch, w, h, gesture_canvas_limits)?;
+    // The device half of that same admitted canvas. It is built once, before
+    // the first frame is planned, from the identical request the CPU reference
+    // was admitted under, so the offline session binds exactly the surface the
+    // live session binds and `encode_staged_frame` is the one shared seam.
+    let mut gesture_canvas_gpu =
+        match crate::renderer::gesture_canvas::GestureCanvasResources::prepare(
+            &device,
+            &queue,
+            &[
+                crate::gesture_canvas::GestureCanvasRequest::new(gesture_canvas.grid())
+                    .with_decay_ticks(crate::gesture::MAX_GESTURE_DECAY_TICKS),
+            ],
+            gesture_canvas_limits,
+        ) {
+            Ok(resources) => Some(resources),
+            Err(error) => {
+                return Err(format!("export gesture canvas rejected: {error}"));
+            }
+        };
     if base_temporal.originals.score.enabled {
         match base_temporal.originals.score.trigger {
             crate::temporal::CollisionScoreTrigger::Manual
@@ -4529,6 +4736,7 @@ fn run_export(
             master_motion: base_master_motion,
             ntsc: base_ntsc.clone(),
             temporal: base_temporal,
+            gesture_canvas: base_gesture_canvas,
             layer_bases: layers.iter().map(ExportFrameLayerBase::from).collect(),
             layer_motion: base_layer_motion.clone(),
             morph_overrides: vec![ExportMorphOverrides::default(); layers.len()],
@@ -4620,6 +4828,7 @@ fn run_export(
             master_motion: frame_master_motion,
             ntsc: frame_ntsc,
             temporal: frame_temporal,
+            gesture_canvas: frame_gesture_canvas_base,
             layer_bases: mut frame_layer_bases,
             layer_motion: frame_layer_motion,
             morph_overrides,
@@ -4815,6 +5024,25 @@ fn run_export(
         )
         .with_audio_energy(mod_matrix.audio.level);
 
+        // The gesture canvas opens its transaction here, on the same frame-
+        // indexed 30 Hz address the recorded temporal track replays on. The
+        // evaluated controls are the one architectural law's frame-local copy:
+        // Morph materialized them above, modulation offsets a copy here, and
+        // the authored patch values are never written as a side effect.
+        let frame_gesture_canvas =
+            modulation_frame.modulate_gesture_canvas(&frame_gesture_canvas_base);
+        if let Err(error) = stage_export_gesture_canvas_frame(
+            &mut gesture_canvas,
+            &mut recorded_gesture_replay,
+            frame_num,
+            config.fps,
+            temporal_input.freeze.program_advances(),
+            frame_gesture_canvas,
+        ) {
+            write_error = Some(error);
+            break;
+        }
+
         // Live and export cross the same post-morph boundary here. From this
         // point onward one immutable evaluator owns render, transport, source,
         // transform, blend, and temporal values for the complete frame.
@@ -4988,6 +5216,20 @@ fn run_export(
                 let executor = composition_gpu
                     .as_mut()
                     .expect("advanced export executor was initialized above");
+                // The same binding law as live: the presented donor of the one
+                // admitted offline canvas, published before prepare so the tap
+                // bind groups are built against it exactly once. An absent
+                // canvas is the exact pre-gesture path.
+                executor.bind_gesture_canvas(match gesture_canvas_gpu.as_ref() {
+                    Some(resources) => match resources.presented_view() {
+                        Some(view) => crate::renderer::composition::GestureCanvasBinding::bound(
+                            view.clone(),
+                            1,
+                        ),
+                        None => crate::renderer::composition::GestureCanvasBinding::default(),
+                    },
+                    None => crate::renderer::composition::GestureCanvasBinding::default(),
+                });
                 match executor.prepare(&device, &queue, &evaluated_composition, &source_descriptors)
                 {
                     Ok(CompositionPreparedKind::Advanced { .. }) => {}
@@ -5270,6 +5512,7 @@ fn run_export(
             Ok(pixels) => pixels,
             Err(error) => {
                 temporal_state.discard_staged();
+                gesture_canvas.discard_staged();
                 if advanced_history_staged {
                     if let Some(executor) = composition_gpu.as_mut() {
                         executor.discard_frame_history();
@@ -5296,6 +5539,7 @@ fn run_export(
         // Write to ffmpeg
         if let Err(error) = ffmpeg_stdin.write_all(&pixels) {
             temporal_state.discard_staged();
+            gesture_canvas.discard_staged();
             if advanced_history_staged {
                 if let Some(executor) = composition_gpu.as_mut() {
                     executor.discard_frame_history();
@@ -5311,6 +5555,7 @@ fn run_export(
         }
         if write_error.is_some() {
             temporal_state.discard_staged();
+            gesture_canvas.discard_staged();
             if advanced_history_staged {
                 if let Some(executor) = composition_gpu.as_mut() {
                     executor.discard_frame_history();
@@ -5319,6 +5564,30 @@ fn run_export(
             break;
         }
         temporal_state.commit_staged();
+        // An accepted frame commits the etch; every other exit above discarded
+        // it, so a frame that never reached ffmpeg leaves no visible change.
+        //
+        // The device half is published here, at the acceptance decision and
+        // before the CPU commit closes the transaction — byte for byte the
+        // live ordering, which is what makes a canvas route read the same N-1
+        // field in both sessions.
+        if let Some(resources) = gesture_canvas_gpu.as_mut() {
+            let mut gesture_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Export gesture canvas frame"),
+                });
+            match resources.encode_staged_frame(&queue, &mut gesture_encoder, 0, &gesture_canvas) {
+                Ok(_) => {
+                    queue.submit(std::iter::once(gesture_encoder.finish()));
+                }
+                Err(error) => {
+                    gesture_canvas.discard_staged();
+                    write_error = Some(format!("export gesture canvas device update: {error}"));
+                    break;
+                }
+            }
+        }
+        gesture_canvas.commit_staged();
         if advanced_history_staged {
             if let Some(executor) = composition_gpu.as_mut() {
                 executor.commit_frame_history();
@@ -5349,6 +5618,10 @@ fn run_export(
             None => gpu_error,
         });
     }
+    // Several earlier failures break out of the render loop before reaching the
+    // acceptance decision. An abandoned frame is a discarded frame, so the
+    // canvas ends the job on committed truth or on nothing at all.
+    gesture_canvas.discard_staged();
 
     // Tell the supervisor this is an intentional end-of-input before closing
     // stdin. A panic/unwind that drops stdin without this flag is a failure.
@@ -5434,6 +5707,15 @@ fn run_export(
     check_cancelled(progress)?;
     let sidecar = motion_sidecar.finish(progress.warnings());
     write_motion_sidecar_atomic(&config.output_path, &sidecar)?;
+    // A job that replayed a recording publishes it beside the render. An
+    // export with no recorded gesture writes no sidecar at all, so the
+    // pre-gesture output pair stays byte-identical and an unrecorded live
+    // gesture is never implied replayable by a file that does not exist.
+    if let Some(document) = config.gesture_track.as_ref() {
+        if !document.events.is_empty() {
+            write_gesture_sidecar_noreplace(&config.output_path, document)?;
+        }
+    }
     // A cancellation that wins immediately after atomic sidecar publication
     // still owns terminal cleanup; `finalize_export_worker` removes both the
     // video and its paired report.
@@ -6979,6 +7261,7 @@ mod tests {
             shutter_samples: ExportShutterSamples::Authored,
             media_safety_policy: MediaSafetyPolicy::default(),
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
+            gesture_track: None,
         }
     }
 
@@ -9164,6 +9447,583 @@ layers:
         assert!(!output.exists());
         assert!(!sidecar_path.exists());
         std::fs::remove_dir(&directory).unwrap();
+    }
+
+    /// One recorded two-stroke performance, addressed on the 30 Hz timeline the
+    /// live host records on. It is built through `GestureTrack::record_accepted`
+    /// rather than assembled by hand, so the fixture is exactly the shape a live
+    /// session produces.
+    pub(super) fn recorded_gesture_fixture() -> crate::gesture::GestureTrack {
+        use crate::gesture::{GestureEvent, GestureMode, GesturePhase, GestureTrack};
+
+        /// One authored point of the fixture. A named record rather than a
+        /// six-wide tuple so the stroke, phase, and mode stay readable.
+        struct Point {
+            tick: u64,
+            stroke: u8,
+            phase: GesturePhase,
+            mode: GestureMode,
+            position: [f32; 2],
+            direction: [f32; 2],
+        }
+
+        let mut track = GestureTrack::default();
+        let points = [
+            Point {
+                tick: 11,
+                stroke: 0,
+                phase: GesturePhase::Begin,
+                mode: GestureMode::Push,
+                position: [0.30, 0.50],
+                direction: [1.0, 0.0],
+            },
+            Point {
+                tick: 12,
+                stroke: 1,
+                phase: GesturePhase::Begin,
+                mode: GestureMode::Curl,
+                position: [0.70, 0.30],
+                direction: [0.0, 1.0],
+            },
+            Point {
+                tick: 13,
+                stroke: 0,
+                phase: GesturePhase::Move,
+                mode: GestureMode::Push,
+                position: [0.42, 0.51],
+                direction: [1.0, 0.1],
+            },
+            Point {
+                tick: 16,
+                stroke: 1,
+                phase: GesturePhase::Move,
+                mode: GestureMode::Curl,
+                position: [0.68, 0.44],
+                direction: [-0.2, 1.0],
+            },
+            Point {
+                tick: 20,
+                stroke: 0,
+                phase: GesturePhase::Move,
+                mode: GestureMode::Push,
+                position: [0.55, 0.53],
+                direction: [1.0, 0.2],
+            },
+            Point {
+                tick: 27,
+                stroke: 0,
+                phase: GesturePhase::End,
+                mode: GestureMode::Push,
+                position: [0.66, 0.56],
+                direction: [1.0, 0.25],
+            },
+            Point {
+                tick: 31,
+                stroke: 1,
+                phase: GesturePhase::End,
+                mode: GestureMode::Curl,
+                position: [0.66, 0.58],
+                direction: [-0.4, 1.0],
+            },
+        ];
+        for point in points {
+            let event = GestureEvent::quantized(
+                point.stroke,
+                point.phase,
+                point.mode,
+                point.position,
+                0.8,
+                point.direction,
+            );
+            assert!(
+                track.record_accepted(point.tick, event).unwrap(),
+                "the fixture must fit inside the bounded track"
+            );
+        }
+        assert!(track.is_complete());
+        track
+    }
+
+    fn gesture_fixture_canvas(
+        params: crate::gesture_canvas::GestureCanvasParams,
+    ) -> crate::gesture_canvas::GestureCanvasState {
+        let grid = crate::gesture_canvas_host_grid(320, 180);
+        crate::gesture_canvas::GestureCanvasState::new(grid, params).unwrap()
+    }
+
+    #[test]
+    fn a_recorded_gesture_sidecar_round_trips_and_carries_no_path_or_filesystem_metadata() {
+        let unique = format!(
+            "collide-o-scope-gesture-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("artifact.mp4");
+        std::fs::write(&output, b"accepted-video").unwrap();
+        let output_string = output.to_string_lossy().into_owned();
+
+        let track = recorded_gesture_fixture();
+        let document = crate::gesture::GestureTrackDocument::capture(&track);
+        write_gesture_sidecar_noreplace(&output_string, &document).unwrap();
+
+        let sidecar_path = gesture_sidecar_path(&output_string);
+        assert_eq!(
+            sidecar_path.file_name().unwrap(),
+            "artifact.mp4.gesture.json"
+        );
+        let bytes = std::fs::read(&sidecar_path).unwrap();
+        assert!(bytes.len() <= crate::gesture::MAX_GESTURE_SERIALIZED_BYTES);
+
+        // The frozen six-field sidecar, and nothing else.
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut keys = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "checksum",
+                "event_count",
+                "events",
+                "origin_tick",
+                "truncated",
+                "version"
+            ]
+        );
+        assert_eq!(
+            json["version"],
+            u64::from(crate::gesture::GESTURE_ALGORITHM_VERSION)
+        );
+        assert_eq!(json["origin_tick"], 11);
+        assert_eq!(json["event_count"], 7);
+        assert_eq!(json["truncated"], false);
+
+        // Operational paths and filesystem metadata never enter the payload.
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        for forbidden in [
+            unique.as_str(),
+            "artifact.mp4",
+            ".mp4",
+            "renders",
+            "Temp",
+            "temp",
+            "path",
+            "directory",
+            "modified",
+            "created",
+            "accessed",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "gesture sidecar must not carry {forbidden}: {text}"
+            );
+        }
+
+        // Round trip: the bytes decode to the identical document, the identical
+        // track, and the identical canonical digest.
+        let restored = crate::gesture::GestureTrackDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(restored, document);
+        let restored_track = restored.decode().unwrap();
+        assert_eq!(restored_track, track);
+        assert_eq!(restored_track.checksum_hex(), track.checksum_hex());
+        assert_eq!(restored.checksum, track.checksum_hex());
+
+        // The commit is no-replace: a second publication refuses rather than
+        // overwriting a receipt another job already owns.
+        let second = write_gesture_sidecar_noreplace(&output_string, &document).unwrap_err();
+        assert!(
+            second.contains("refusing to overwrite"),
+            "unexpected error: {second}"
+        );
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), bytes);
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".gesture.json.tmp-")
+        }));
+
+        // Cleanup-coupled: the receipt is removed with the video it describes.
+        let progress = ExportProgress::new();
+        progress.output_started.store(true, Ordering::Release);
+        assert_eq!(remove_started_output(&progress, Some(&output_string)), None);
+        assert!(!output.exists());
+        assert!(!sidecar_path.exists());
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_re_export_retires_its_own_stale_gesture_receipt_while_the_commit_stays_no_replace() {
+        let unique = format!(
+            "collide-o-scope-gesture-reexport-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("artifact.mp4");
+        let output_string = output.to_string_lossy().into_owned();
+        let sidecar_path = gesture_sidecar_path(&output_string);
+
+        let document = crate::gesture::GestureTrackDocument::capture(&recorded_gesture_fixture());
+        write_gesture_sidecar_noreplace(&output_string, &document).unwrap();
+        let first = std::fs::read(&sidecar_path).unwrap();
+
+        // Without retirement the commit refuses, which is the whole point of the
+        // no-replace transaction: nothing silently overwrites a standing receipt.
+        assert!(write_gesture_sidecar_noreplace(&output_string, &document).is_err());
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), first);
+
+        // A re-export claims the destination name when it spawns ffmpeg with
+        // `-y`, and retiring the previous run's receipt at that moment is what
+        // lets the same job publish again.
+        remove_partial_path(&sidecar_path, "gesture sidecar").unwrap();
+        assert!(!sidecar_path.exists());
+        write_gesture_sidecar_noreplace(&output_string, &document).unwrap();
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), first);
+
+        // Retiring a receipt that was never written is not an error, so an
+        // ordinary first export is unaffected.
+        std::fs::remove_file(&sidecar_path).unwrap();
+        remove_partial_path(&sidecar_path, "gesture sidecar").unwrap();
+
+        // The retirement lives at the output claim, not at the commit.
+        let source = include_str!("render_export.rs");
+        let claim = source
+            .split_once(".output_started\n                .store(true, Ordering::Release);")
+            .expect("the encoder supervisor claims the output name")
+            .1;
+        assert!(
+            claim[..800].contains(
+                "remove_partial_path(&gesture_sidecar_path(&output_path), \"gesture sidecar\")"
+            ),
+            "a re-export must retire its own stale gesture receipt when it claims the output"
+        );
+
+        std::fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_gesture_checksum_mismatch_is_an_actionable_export_error_before_any_frame_renders() {
+        let track = recorded_gesture_fixture();
+        let document = crate::gesture::GestureTrackDocument::capture(&track);
+        assert_eq!(
+            export_recorded_gesture_track(Some(&document)).unwrap(),
+            track
+        );
+
+        // A silently edited but still well-formed stream. The digest is the only
+        // thing that can catch it, and it must, before any frame renders.
+        let mut tampered = document.clone();
+        tampered.events[2].x = tampered.events[2].x.wrapping_add(1);
+        let error = export_recorded_gesture_track(Some(&tampered)).unwrap_err();
+        assert!(
+            error.starts_with("recorded gesture track rejected before rendering"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("checksum"), "unexpected error: {error}");
+
+        // A declared digest that no longer describes its own events.
+        let mut restamped = document.clone();
+        restamped.checksum = "0".repeat(64);
+        let error = export_recorded_gesture_track(Some(&restamped)).unwrap_err();
+        assert!(error.contains("checksum"), "unexpected error: {error}");
+
+        // An ill-formed stream is refused on its own terms rather than repaired.
+        // `decode` runs the shared validator before it compares digests, so the
+        // orphaned Move is named as a stream fault rather than as a checksum
+        // mismatch.
+        let mut orphaned = document.clone();
+        orphaned.events.remove(0);
+        orphaned.event_count -= 1;
+        let error = export_recorded_gesture_track(Some(&orphaned)).unwrap_err();
+        assert!(
+            error.starts_with("recorded gesture track rejected before rendering"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_lowercase().contains("stroke"),
+            "unexpected error: {error}"
+        );
+
+        // A declared count that disagrees with the stream never reaches the
+        // renderer either.
+        let mut miscounted = document.clone();
+        miscounted.event_count = miscounted.event_count.saturating_add(1);
+        assert!(export_recorded_gesture_track(Some(&miscounted)).is_err());
+    }
+
+    #[test]
+    fn an_absent_gesture_track_replays_nothing_and_publishes_no_sidecar() {
+        // The pre-gesture path. Nothing decodes, nothing etches, nothing is
+        // written, and no unrecorded live gesture is implied replayable by a
+        // file that does not exist.
+        let empty = export_recorded_gesture_track(None).unwrap();
+        assert!(empty.events().is_empty());
+        assert!(!empty.truncated());
+        assert_eq!(empty, crate::gesture::GestureTrack::default());
+
+        let params = crate::gesture_canvas::GestureCanvasParams::default();
+        let mut canvas = gesture_fixture_canvas(params);
+        let before = canvas.field().cells().to_vec();
+        let mut replay = empty.replay();
+        for frame in 0..90u64 {
+            let plan = stage_export_gesture_canvas_frame(
+                &mut canvas,
+                &mut replay,
+                frame,
+                30,
+                true,
+                params,
+            )
+            .unwrap();
+            assert_eq!(plan.applied_samples, 0);
+            canvas.commit_staged();
+        }
+        assert_eq!(canvas.field().cells(), before.as_slice());
+
+        assert!(config(1.0).gesture_track.is_none());
+        let source = include_str!("render_export.rs");
+        let publication = source
+            .split_once("write_motion_sidecar_atomic(&config.output_path, &sidecar)?;")
+            .expect("the motion sidecar publication anchors the gesture one")
+            .1;
+        let publication = &publication[..500];
+        assert!(
+            publication.contains("if let Some(document) = config.gesture_track.as_ref()"),
+            "the gesture sidecar must be published only for a job that carries a recording"
+        );
+        assert!(
+            publication.contains("if !document.events.is_empty()"),
+            "an empty recording must publish no sidecar at all"
+        );
+    }
+
+    /// The offline job must build the device half of its canvas from the same
+    /// admitted request the CPU reference was admitted under, bind its
+    /// presented donor *before* the executor prepares tap bind groups, and
+    /// publish each accepted transaction at the same acceptance decision the
+    /// live loop publishes at. Any one of those three in the wrong place is a
+    /// silently different offline image rather than an error, so the ordering
+    /// is asserted here rather than left to reading.
+    #[test]
+    fn the_offline_job_builds_binds_and_publishes_its_gesture_canvas_in_the_live_order() {
+        let source = include_str!("render_export.rs");
+        let start = source
+            .find("let mut gesture_canvas = export_gesture_canvas(")
+            .expect("the offline canvas is built before the render loop");
+        let build = &source[start..start + 1_200];
+        assert!(
+            build.contains("GestureCanvasResources::prepare("),
+            "the offline job must build the device half of its admitted canvas"
+        );
+        assert!(
+            build.contains("gesture_canvas_limits"),
+            "the device half must be admitted under the same limits as the CPU reference"
+        );
+
+        let bind = source
+            .find("executor.bind_gesture_canvas(")
+            .expect("the offline executor binds the presented canvas");
+        let prepare = source[bind..]
+            .find("executor.prepare(&device, &queue, &evaluated_composition")
+            .expect("the offline executor prepares after binding");
+        assert!(
+            prepare > 0,
+            "the canvas must be bound before prepare builds the tap bind groups"
+        );
+
+        let commit = source
+            .find("gesture_canvas.commit_staged();")
+            .expect("the offline acceptance decision commits the canvas");
+        let publish = source[..commit]
+            .rfind("encode_staged_frame(&queue, &mut gesture_encoder, 0, &gesture_canvas)")
+            .expect("the offline job publishes the staged transaction");
+        assert!(
+            source[publish..commit].len() < 500,
+            "the device publication must sit at the acceptance decision, immediately before the CPU commit"
+        );
+        assert!(
+            source[..publish].contains("temporal_state.commit_staged();"),
+            "publication belongs after the frame reached ffmpeg, not before it"
+        );
+    }
+
+    #[test]
+    fn live_and_export_gesture_canvases_read_back_the_same_field_at_24_30_and_60_fps() {
+        use crate::gesture_canvas::{GestureCanvasFrameInput, GestureCanvasParams};
+
+        let track = recorded_gesture_fixture();
+        let params = GestureCanvasParams {
+            radius: 0.28,
+            strength: 0.8,
+            retention: 0.94,
+        };
+
+        for fps in [24u32, 30, 60] {
+            let frames = u64::from(fps) * 2;
+
+            // Offline: the production helper, addressed purely by frame index.
+            let mut export_canvas = gesture_fixture_canvas(params);
+            let mut export_replay = track.replay();
+            for frame in 0..frames {
+                stage_export_gesture_canvas_frame(
+                    &mut export_canvas,
+                    &mut export_replay,
+                    frame,
+                    fps,
+                    true,
+                    params,
+                )
+                .unwrap();
+                export_canvas.commit_staged();
+            }
+
+            // Live: the accepted-frame accumulator the host records on. The two
+            // derivations are independent and must produce the same addresses,
+            // and therefore the same field, cell for cell.
+            let mut live_canvas = gesture_fixture_canvas(params);
+            let mut live_replay = track.replay();
+            let mut recorder = crate::gesture::GestureEventRecorder::default();
+            for _ in 0..frames {
+                let reference_tick = recorder.reference_tick();
+                let events =
+                    live_replay.events_due(u32::try_from(reference_tick).unwrap_or(u32::MAX));
+                live_canvas
+                    .stage_frame(GestureCanvasFrameInput {
+                        reference_tick,
+                        program_advances: true,
+                        events,
+                        evaluated_params: Some(params),
+                    })
+                    .unwrap();
+                live_canvas.commit_staged();
+                recorder.record_accepted(1.0 / fps as f32, &[]);
+            }
+
+            assert_eq!(
+                export_canvas.field().cells(),
+                live_canvas.field().cells(),
+                "live and export gesture fields must agree at {fps} fps"
+            );
+            assert_eq!(export_canvas.last_tick(), live_canvas.last_tick());
+            assert!(
+                export_canvas
+                    .field()
+                    .cells()
+                    .iter()
+                    .any(|cell| cell.coverage > 0.0),
+                "the {fps} fps fixture must actually etch something"
+            );
+
+            // Frame index alone determines the field: a second identical run is
+            // byte-identical, so nothing wall-clock reached the replay.
+            let mut repeat_canvas = gesture_fixture_canvas(params);
+            let mut repeat_replay = track.replay();
+            for frame in 0..frames {
+                stage_export_gesture_canvas_frame(
+                    &mut repeat_canvas,
+                    &mut repeat_replay,
+                    frame,
+                    fps,
+                    true,
+                    params,
+                )
+                .unwrap();
+                repeat_canvas.commit_staged();
+            }
+            assert_eq!(repeat_canvas.field().cells(), export_canvas.field().cells());
+        }
+    }
+
+    #[test]
+    fn an_export_frame_that_never_reaches_ffmpeg_leaves_the_gesture_canvas_unchanged() {
+        use crate::gesture_canvas::GestureCanvasParams;
+
+        let track = recorded_gesture_fixture();
+        let params = GestureCanvasParams {
+            radius: 0.3,
+            strength: 0.9,
+            retention: 0.9,
+        };
+        let mut canvas = gesture_fixture_canvas(params);
+        let mut replay = track.replay();
+        for frame in 0..20u64 {
+            stage_export_gesture_canvas_frame(&mut canvas, &mut replay, frame, 30, true, params)
+                .unwrap();
+            canvas.commit_staged();
+        }
+        let committed = canvas.field().cells().to_vec();
+        let committed_generation = canvas.generation();
+        let committed_tick = canvas.last_tick();
+
+        // A staged-then-discarded frame is invisible.
+        stage_export_gesture_canvas_frame(&mut canvas, &mut replay, 20, 30, true, params).unwrap();
+        canvas.discard_staged();
+        assert_eq!(canvas.field().cells(), committed.as_slice());
+        assert_eq!(canvas.generation(), committed_generation);
+        assert_eq!(canvas.last_tick(), committed_tick);
+
+        // A program-frozen frame holds and never bills the frozen ticks as decay.
+        for frame in 21..400u64 {
+            let plan = stage_export_gesture_canvas_frame(
+                &mut canvas,
+                &mut replay,
+                frame,
+                30,
+                false,
+                params,
+            )
+            .unwrap();
+            assert!(plan.held);
+            assert!(plan.is_exact_bypass());
+            canvas.commit_staged();
+        }
+        assert_eq!(canvas.field().cells(), committed.as_slice());
+        assert_eq!(canvas.last_tick(), committed_tick);
+
+        // Every early export exit breaks out of the render loop, and the loop is
+        // followed by an unconditional discard, so no frame can leak a staged
+        // transaction into the finished job.
+        let source = include_str!("render_export.rs");
+        let staged = source
+            .split_once("if let Err(error) = stage_export_gesture_canvas_frame(")
+            .expect("the export frame loop stages the gesture canvas")
+            .1;
+        let decision = staged
+            .split_once("temporal_state.commit_staged();")
+            .expect("the acceptance decision follows staging")
+            .0;
+        assert_eq!(
+            decision.matches("gesture_canvas.discard_staged();").count(),
+            3,
+            "every temporal discard site must discard the gesture canvas too"
+        );
+        assert!(
+            !decision.contains("Instant::now()"),
+            "wall time must never reach the offline gesture canvas"
+        );
+        let after_loop = staged
+            .split_once("if let Some(gpu_error) = take_export_gpu_errors(&frame_gpu_errors) {")
+            .expect("the render loop ends before the encoder is finished")
+            .1;
+        assert!(
+            after_loop[..600].contains("gesture_canvas.discard_staged();"),
+            "an abandoned frame must be discarded after the render loop"
+        );
     }
 
     fn map_spatial_uv(uniforms: SpatialGpuUniforms, uv: [f32; 2]) -> [f32; 2] {
@@ -11543,6 +12403,7 @@ layers:
             master_rack: None,
             layer_racks: None,
             composition: None,
+            gesture: None,
             // Gate fixture: these downstream worlds are deliberately present
             // in both Morph slots but explicitly disabled/no-op.
             ntsc: MorphNtscSnapshot::capture(&crate::ntsc::NtscParams::default()),
@@ -13804,6 +14665,8 @@ layers:
             temporal: None,
             morph: None,
             scenes: crate::performance::Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         };
         let output = std::env::temp_dir().join(format!(
             "collideoscope-live-cancel-{}-{}.mp4",
@@ -13827,6 +14690,7 @@ layers:
             shutter_samples: ExportShutterSamples::Authored,
             media_safety_policy: MediaSafetyPolicy::default(),
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
+            gesture_track: None,
         };
         let mut job = ExportJob::start(patch, config, "videos");
 
@@ -13919,10 +14783,23 @@ mod effects_audit {
             temporal: Some(TemporalConfig::default()),
             morph: None,
             scenes: crate::performance::Scenes::default(),
+            gesture_track: None,
+            gesture_canvas: None,
         }
     }
 
     fn render(label: &str, patch: PatchState) {
+        render_with_gesture(label, patch, None);
+    }
+
+    /// The one labeled-render helper. A recorded gesture performance is carried
+    /// by value exactly as the live host hands it over, and the committed output
+    /// path is returned so a case can inspect the sidecar it published.
+    fn render_with_gesture(
+        label: &str,
+        patch: PatchState,
+        gesture_track: Option<crate::gesture::GestureTrackDocument>,
+    ) -> String {
         let config = ExportConfig {
             width: 320,
             height: 180,
@@ -13937,13 +14814,16 @@ mod effects_audit {
             shutter_samples: ExportShutterSamples::Authored,
             media_safety_policy: MediaSafetyPolicy::default(),
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
+            gesture_track,
         };
+        let output_path = config.output_path.clone();
         let job = ExportJob::start(patch, config, "videos");
         while !job.is_done() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let err = job.progress.error.lock().unwrap().clone();
         assert!(err.is_empty(), "{label}: export failed: {err}");
+        output_path
     }
 
     /// Renders every effect through the real shader chain into labeled
@@ -14013,6 +14893,104 @@ mod effects_audit {
         patch.layers[0].rack = Some(rack);
         patch.layers[0].effects.hue_shift = 90.0;
         render("displace_two_input", patch);
+    }
+
+    /// S3b's labeled export case. It is the one that renders a job carrying a
+    /// recorded gesture performance end to end: the track's canonical checksum
+    /// is verified before the first frame, the events replay on the offline 30 Hz
+    /// frame-index timeline, and the recording is published beside the video as
+    /// the frozen six-field sidecar. The authored canvas controls travel in the
+    /// patch, so the case also proves the pre-render admission of the offline
+    /// canvas against the frozen resource table.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_gesture_field_etching_pipeline() {
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        patch.gesture_canvas = Some(crate::patch::GestureCanvasConfig {
+            radius: 0.3,
+            strength: 0.85,
+            retention: 0.92,
+        });
+        patch.master.hue_shift = 120.0;
+
+        let track = super::tests::recorded_gesture_fixture();
+        let document = crate::gesture::GestureTrackDocument::capture(&track);
+        let output = render_with_gesture("gesture_field_etching", patch, Some(document.clone()));
+
+        let sidecar_path = gesture_sidecar_path(&output);
+        let bytes = std::fs::read(&sidecar_path).expect("the labeled case publishes its sidecar");
+        let restored = crate::gesture::GestureTrackDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(restored, document);
+        assert_eq!(restored.decode().unwrap(), track);
+    }
+
+    /// The labeled case this stage exists for: a recorded gesture performance
+    /// routed as the donor of a Displace node over a live portrait, rendered
+    /// end to end through the real export path.
+    ///
+    /// It follows `render_displace_two_input_pipeline` exactly — the same node,
+    /// the same authored gains, the same offline executor — and changes only
+    /// the one thing this stage added: the donor route is
+    /// `SavedImageSource::GestureCanvas` rather than another layer. The
+    /// previous stage could not write this case because nothing sampled the
+    /// etched field; the canvas is now built, etched on the offline 30 Hz
+    /// timeline, and presented as an ordinary image tap, so it can.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_gesture_canvas_displace_donor_pipeline() {
+        use crate::visual_rack::{
+            DisplaceBoundary, DisplaceParams, EdgeTiming, LegacyRackScope, SavedImageSource,
+            SavedImageTap, VisualNodeKind, VisualRack,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        // A wide, strong, long-retaining etch, so the recorded stroke is
+        // legible in the rendered frames rather than a sub-pixel nudge.
+        patch.gesture_canvas = Some(crate::patch::GestureCanvasConfig {
+            radius: 0.45,
+            strength: 1.0,
+            retention: 0.995,
+        });
+
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Displace(DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::GestureCanvas,
+                timing: EdgeTiming::CurrentFrame,
+            },
+            amount_x: 0.4,
+            amount_y: 0.4,
+            boundary: DisplaceBoundary::Mirror,
+        }))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+
+        let track = super::tests::recorded_gesture_fixture();
+        let document = crate::gesture::GestureTrackDocument::capture(&track);
+        let output = render_with_gesture(
+            "gesture_canvas_displace_donor",
+            patch,
+            Some(document.clone()),
+        );
+
+        // The recording is still published beside its render, so the labeled
+        // artifact carries the exact performance that warped it.
+        let sidecar_path = gesture_sidecar_path(&output);
+        let bytes = std::fs::read(&sidecar_path).expect("the labeled case publishes its sidecar");
+        let restored = crate::gesture::GestureTrackDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(restored.decode().unwrap(), track);
     }
 
     #[test]
