@@ -1416,6 +1416,74 @@ the discrete recombination law, the seed, and each slot's resolved or
 tombstoned route identity — stable identities only, never a host path or
 filesystem metadata.
 
+### The Study rack node
+
+`Study` is the data-only Study ABI's authored audience surface: a Collision
+Rack node holding append-only signature code 13, lifted — like the Symmetry
+Field — into its own dedicated pass because it binds the committed
+clean-history D2 array and owns its own uniform layout
+(`occupies_dedicated_pass` is true for exactly these two kinds).
+
+**Content-addressed by construction.** `VisualNodeKind` is `Copy`, so
+`StudyRackParams` carries only `document_digest: Option<[u8; 32]>` — the
+same canonical digest `CompiledStudy` derives. Documents live in the bounded
+host `StudyProgramLibrary` (16 documents, hard cap, typed refusal, never an
+eviction) and travel with patches in the `studies` section, carried whole
+like the gesture track, so a patch stays self-contained and the distribution
+question never opens. An unresolved digest — no document in the library —
+plans an inert pass with `program: None`: byte-identical to no node at all,
+never a fallback onto another document.
+
+**Resolution is plan-visible identity.** The planner resolves the digest
+against `CompositionPlanInput::with_studies` at plan time and the encoded
+program rides the evaluated plan, so live and export execute the identical
+instruction stream. Node id, digest, resolvedness, and instruction count
+hash into the advanced topology signature; assigning a document — or a
+library insert that resolves a previously missing digest — re-prepares the
+renderer and re-uploads the program arena.
+
+**Frame inputs.** `FramePlanContext` carries `study_audio_bands` and
+`study_beat_phase`, sampled from the same immutable frame facts the
+modulation matrix consumed (live) or from the export's own audio evaluation
+and beat clock (offline). Ring validity and the write cursor come from
+`temporal_history_read_cursor` at encode. The node's wet/blend apply through
+the engine-wide node law, composed from the one canonical `blend.wgsl`
+kernel.
+
+**The admission budget.** The descriptor declares eight logical lookups per
+pixel: the carrier load plus up to seven `LoadHistoryColor` loads
+(`LoadCurrentColor` reads the already-loaded carrier register and costs
+nothing). A valid document exceeding that stays valid ABI but is refused at
+plan time by name (`StudyLoadBudget`) — the over-budget Residual-grid law,
+never a silent clamp.
+
+Resource delta per active node, charged through the dedicated-pass ledger
+(`StudyFieldResourcePlan`, re-derived from emitted steps):
+
+| Item | Exact charge |
+|---|---:|
+| Render passes | 1 |
+| Logical lookups/pixel | ≤ 8 (declared admission budget) |
+| Simultaneously sampled textures | 2 |
+| Samplers | 0 |
+| Uniform bytes | 8,256 (64 frame + 8,192 program) |
+| Cross-scope image taps | 0 |
+| New full-frame persistent surfaces | 0 |
+
+**Closure.** Version 1 has no continuous authored value and no routes, the
+Field Collider precedent: no modulatable address, Dice and the generator
+preserve the node exactly (its common wet dices like every node's), Morph
+recalls the pair as one discrete endpoint at the midpoint, and Look/preset
+value application leaves the digest untouched. The browser assigns,
+replaces, or clears the document through the coalescible
+`set_visual_node_study_document { scope, node_id, document }` — the engine
+validates and compiles into the library and the node keeps only the digest,
+in one action, so neither can exist without the other. A malformed document
+is a typed refusal; panel JSON parse errors stay client-side in a polite
+status region. Export resolves the same digests from the patch's own
+`studies` section through `ExportCreativeGraph`; there is no export-only
+Study path, and `render_study_field_pipeline` is the labeled export case.
+
 ## Gesture-field etching
 
 A gesture is an ordered stream of quantized events addressed on the 30 Hz
@@ -2134,9 +2202,18 @@ mislead browser tests.
   claim: the interpreter matches the CPU reference across every opcode at
   2e-5 with the R1 guard observably discriminating a young ring from a
   committed one, and a study swap is two writes into fixed buffers with a
-  deterministic re-render. The whole chain stays behind a scoped dead-code
-  allow until a Study gains an authored audience surface — a product
-  decision, not a renderer one.
+  deterministic re-render. The authored surface (S11) adds: the hex-digest
+  serde and exact-default-bypass laws, the planner's flush-lift-resume with
+  a kind-only dormant position, the re-derived dedicated ledger, digest
+  resolution and the identity hash as plan-visible topology, the
+  `StudyLoadBudget` refusal at nine loads with eight admitted exactly, the
+  patch `studies` round trip and digest walk, the Morph midpoint endpoint
+  recall, and the coalescible document action with its panel wiring. The
+  pixels claim is
+  `production_study_field_reaches_the_pixels_and_unresolved_digests_are_inert`
+  (resolved reaches the audience image; an unresolved digest is
+  byte-identical to no node; warm frames allocate nothing), and
+  `render_study_field_pipeline` is the labeled export case.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,

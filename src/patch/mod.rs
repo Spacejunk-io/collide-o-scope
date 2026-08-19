@@ -364,6 +364,44 @@ pub struct PatchState {
     /// the pre-gesture path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gesture_canvas: Option<GestureCanvasConfig>,
+    /// Every Study document any rack node in this patch references, carried
+    /// whole so the patch stays self-contained — the gesture-track precedent.
+    /// Each document validates through its own strict deserializer and ABI
+    /// gate on load; an absent section is exactly the pre-study path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub studies: Vec<crate::study::StudyDocument>,
+}
+
+impl PatchState {
+    /// Every distinct Study digest any rack in this patch references, in
+    /// digest order. The walk is saved-form only — master rack, layer racks,
+    /// group racks — and never consults the host library.
+    pub fn referenced_study_digests(&self) -> Vec<[u8; 32]> {
+        let mut digests = std::collections::BTreeSet::new();
+        let mut visit = |rack: &VisualRack| {
+            for node in rack.iter() {
+                if let crate::visual_rack::VisualNodeKind::Study(params) = node.kind {
+                    if let Some(digest) = params.document_digest {
+                        digests.insert(digest);
+                    }
+                }
+            }
+        };
+        if let Some(rack) = &self.master_rack {
+            visit(rack);
+        }
+        for layer in &self.layers {
+            if let Some(rack) = &layer.rack {
+                visit(rack);
+            }
+        }
+        if let Some(composition) = &self.composition {
+            for group in composition.groups() {
+                visit(&group.rack);
+            }
+        }
+        digests.into_iter().collect()
+    }
 }
 
 impl<'de> Deserialize<'de> for PatchState {
@@ -403,6 +441,8 @@ impl<'de> Deserialize<'de> for PatchState {
             gesture_track: Option<crate::gesture::GestureTrackDocument>,
             #[serde(default)]
             gesture_canvas: Option<GestureCanvasConfig>,
+            #[serde(default)]
+            studies: Vec<crate::study::StudyDocument>,
         }
 
         let raw = RawPatchState::deserialize(deserializer)?;
@@ -423,6 +463,7 @@ impl<'de> Deserialize<'de> for PatchState {
             scenes: raw.scenes,
             gesture_track: raw.gesture_track,
             gesture_canvas: raw.gesture_canvas.map(GestureCanvasConfig::sanitized),
+            studies: raw.studies,
         };
         patch
             .validate_creative_persistence()
@@ -4574,6 +4615,7 @@ impl PatchState {
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         }
     }
 
@@ -5142,6 +5184,60 @@ impl PatchState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_studies_section_round_trips_and_the_digest_walk_finds_every_rack() {
+        use crate::study::{
+            StudyAbiVersion, StudyCapability, StudyInstruction, StudyLicenseNotice, StudyMetadata,
+            StudyPublicationBoundary, StudyRegister, STUDY_SCHEMA_VERSION,
+        };
+        let register = |value: u8| StudyRegister::new(value).unwrap();
+        let document = crate::study::StudyDocument {
+            schema_version: STUDY_SCHEMA_VERSION,
+            abi: StudyAbiVersion::default(),
+            metadata: StudyMetadata {
+                name: "Patch fixture".into(),
+                author: "Patch tests".into(),
+                description: String::new(),
+                license: StudyLicenseNotice {
+                    identifier: "CC0-1.0".into(),
+                    notice: String::new(),
+                    publication_boundary: StudyPublicationBoundary::StudyDataOnlyDoesNotLicenseHost,
+                },
+            },
+            capabilities: vec![StudyCapability::CurrentColor],
+            instructions: vec![
+                StudyInstruction::LoadCurrentColor { dst: register(0) },
+                StudyInstruction::OutputColor { color: register(0) },
+            ],
+        };
+        let compiled = crate::study_eval::CompiledStudy::compile(&document).unwrap();
+        let digest = *compiled.canonical_digest();
+
+        let mut patch = minimal_patch(1);
+        let mut rack = VisualRack::synthetic_legacy(crate::visual_rack::LegacyRackScope::Master);
+        rack.push(crate::visual_rack::VisualNodeKind::Study(
+            crate::visual_rack::StudyRackParams {
+                document_digest: Some(digest),
+            },
+        ))
+        .unwrap();
+        patch.master_rack = Some(rack);
+        patch.studies = vec![document.clone()];
+
+        assert_eq!(patch.referenced_study_digests(), vec![digest]);
+
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(yaml.contains("studies:"));
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.studies, vec![document]);
+        assert_eq!(restored.referenced_study_digests(), vec![digest]);
+
+        // An empty section stays off the page entirely — the pre-study path
+        // is byte-identical.
+        let bare = minimal_patch(1);
+        assert!(!serde_yaml::to_string(&bare).unwrap().contains("studies:"));
+    }
+
     fn saved_layer(
         filename: &str,
         opacity: f32,
@@ -5434,6 +5530,7 @@ mod tests {
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         };
         let mut master = EffectUniforms {
             brightness: -0.4,
@@ -5749,6 +5846,7 @@ scenes:
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -5838,6 +5936,7 @@ scenes:
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -7228,6 +7327,7 @@ routings:
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         }
     }
 

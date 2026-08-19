@@ -1603,6 +1603,9 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         // zero mix, so an inserted node is an exact bypass that claims no image
         // edge until the operator authors one.
         "residual" => Kind::Residual(visual_rack::RuntimeResidualParams::default()),
+        // No document, no pass: an inserted Study is an exact bypass until a
+        // validated document is assigned through its dedicated action.
+        "study" => Kind::Study(visual_rack::StudyRackParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -1845,6 +1848,14 @@ fn set_runtime_node_param(
                 }
                 _ => return Err(format!("unsupported residual parameter {param}")),
             },
+            // The document digest is the node's whole authored surface and it
+            // is assigned only by the dedicated study-document action, which
+            // validates and stores the document before naming it here.
+            Kind::Study(_) => {
+                return Err(format!(
+                    "unsupported study parameter {param}; assign the document through                      set_visual_node_study_document"
+                ));
+            }
         },
     }
     normalize_runtime_rack(rack)
@@ -3458,6 +3469,11 @@ struct App {
     /// The single hot-adoption worker, spawned on the first encode completion
     /// that finds a live layer to adopt into. One-slot queue, refuse-busy.
     proxy_adoption_worker: Option<proxy_worker::ProxyAdoptionWorker>,
+    /// The bounded host Study library: validated documents keyed by their
+    /// canonical digest, compiled and GPU-encoded once at insert. Nodes
+    /// reference documents by digest; patches carry the referenced documents
+    /// in their own `studies` section.
+    study_library: study_eval::StudyProgramLibrary,
     /// Session-local, bounded per-identity notes: encode progress, readiness,
     /// refusals. Keyed by source SHA-256 so they survive patch reloads.
     proxy_feedback: std::collections::HashMap<String, String>,
@@ -3965,6 +3981,7 @@ impl App {
             proxy_store_error: None,
             proxy_encode_worker: None,
             proxy_adoption_worker: None,
+            study_library: study_eval::StudyProgramLibrary::default(),
             proxy_feedback: std::collections::HashMap::new(),
             proxy_ab_baseline_micros: std::collections::HashMap::new(),
             layer_stack_revision: 1,
@@ -4330,7 +4347,11 @@ impl App {
         let modulation = self.mod_matrix.frame(self.layers.len());
         let base = EvaluatedFramePlan::evaluate(
             &modulation,
-            FramePlanContext::new(width, height, self.program_clock.elapsed.as_secs_f32()),
+            {
+                let (bands, beat) = self.study_frame_inputs();
+                FramePlanContext::new(width, height, self.program_clock.elapsed.as_secs_f32())
+                    .with_study_inputs(bands, beat)
+            },
             MasterFrameInput {
                 effects: master_effects,
                 transform: master_transform,
@@ -4386,7 +4407,8 @@ impl App {
             &staged.layer_racks,
         )
         .with_layer_mattes(&mattes, false)
-        .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0);
+        .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+        .with_studies(&self.study_library);
         let motion_limits = self.renderer.as_ref().map_or_else(
             || motion::MotionDeviceLimits::new(u32::MAX, u64::MAX),
             |renderer| {
@@ -4569,6 +4591,7 @@ impl App {
         if !matches!(
             action,
             WebAction::SetVisualNodeParam { .. }
+                | WebAction::SetVisualNodeStudyDocument { .. }
                 | WebAction::InsertVisualNode { .. }
                 | WebAction::RemoveVisualNode { .. }
                 | WebAction::MoveVisualNode { .. }
@@ -4620,6 +4643,50 @@ impl App {
                         staged,
                         false,
                         format!("Updated {node_kind} node {} {param}", node_id.get()),
+                    )?;
+                }
+                WebAction::SetVisualNodeStudyDocument {
+                    scope,
+                    node_id,
+                    document,
+                } => {
+                    let scope = parse_creative_scope(scope)
+                        .ok_or_else(|| "creative scope is malformed".to_string())?;
+                    let node_id =
+                        parse_node_id(node_id).ok_or_else(|| "node ID is malformed".to_string())?;
+                    // Validate and store first: the document enters the
+                    // bounded library under its own canonical digest, and the
+                    // node keeps only that digest. A malformed or over-cap
+                    // document is a typed refusal before any graph edit.
+                    let digest = if document.is_null() {
+                        None
+                    } else {
+                        let document: study::StudyDocument =
+                            serde_json::from_value(document.clone())
+                                .map_err(|error| format!("study document is malformed: {error}"))?;
+                        Some(
+                            self.study_library
+                                .insert(document)
+                                .map_err(|error| error.to_string())?,
+                        )
+                    };
+                    let mut staged = self.staged_creative_graph();
+                    let Some(rack) = staged.rack_mut(scope) else {
+                        return Ok(());
+                    };
+                    let Some(node) = rack.get_mut(node_id) else {
+                        return Ok(());
+                    };
+                    let visual_rack::RuntimeVisualNodeKind::Study(params) = &mut node.kind else {
+                        return Err("node is not a Study".to_string());
+                    };
+                    params.document_digest = digest;
+                    normalize_runtime_rack(rack)?;
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated study node {} document", node_id.get()),
                     )?;
                 }
                 WebAction::InsertVisualNode {
@@ -5792,6 +5859,19 @@ impl App {
         // written out and silently changing every canonical patch hash.
         let canvas = patch::GestureCanvasConfig::from_params(self.gesture_canvas.params());
         captured.gesture_canvas = (!canvas.is_default()).then_some(canvas);
+        // Carry exactly the Study documents the captured racks reference —
+        // whole, deduplicated, in digest order — so the patch is
+        // self-contained. A referenced digest the library no longer holds is
+        // captured as the digest alone and surfaces as an unresolved
+        // diagnostic on load rather than silently rebinding.
+        captured.studies = {
+            let digests = captured.referenced_study_digests();
+            digests
+                .iter()
+                .filter_map(|digest| self.study_library.get(digest))
+                .map(|entry| entry.document.clone())
+                .collect()
+        };
         Ok(captured)
     }
 
@@ -6882,6 +6962,29 @@ impl App {
                     .join("; ")
             ));
         }
+        // Every carried Study document must validate and compile, and the
+        // bounded library must have room, before anything live changes — a
+        // corrupt or over-cap section rejects the snapshot whole, like any
+        // other corrupt input.
+        let mut incoming_study_digests = std::collections::BTreeSet::new();
+        for document in &patch.studies {
+            let compiled = study_eval::CompiledStudy::compile(document)
+                .map_err(|error| format!("study document rejected: {error}"))?;
+            let digest = *compiled.canonical_digest();
+            if !self.study_library.contains(&digest) {
+                incoming_study_digests.insert(digest);
+            }
+        }
+        if self.study_library.len() + incoming_study_digests.len()
+            > study_eval::STUDY_LIBRARY_MAX_DOCUMENTS
+        {
+            return Err(format!(
+                "snapshot carries {} new study document(s) but the library holds {} of {}",
+                incoming_study_digests.len(),
+                self.study_library.len(),
+                study_eval::STUDY_LIBRARY_MAX_DOCUMENTS
+            ));
+        }
         let patch_dir = patch_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
@@ -7151,6 +7254,11 @@ impl App {
         // Strictly after the barrier that cleared the retired program's
         // recorder, so a restored track cannot be wiped by its own load.
         self.restore_gesture_track_from_patch(&patch);
+        // Validated above, so these inserts cannot fail except idempotently;
+        // referenced digests now resolve on the next frame's plan.
+        for document in &patch.studies {
+            let _ = self.study_library.insert(document.clone());
+        }
 
         // Patch recall stores the requested CPAL device. If a stream is still
         // open for another preference, stop it now; the frame pump reopens
@@ -16334,6 +16442,7 @@ impl App {
                 );
             }
             WebAction::SetVisualNodeParam { .. }
+            | WebAction::SetVisualNodeStudyDocument { .. }
             | WebAction::InsertVisualNode { .. }
             | WebAction::RemoveVisualNode { .. }
             | WebAction::MoveVisualNode { .. }
@@ -16575,6 +16684,15 @@ impl App {
             "content identity verified ({}…) — proxy encode running",
             &identity.sha256[..8.min(identity.sha256.len())]
         )
+    }
+
+    /// This frame's Study inputs: the matrix's already-pumped audio bands
+    /// and the beat clock's fractional phase — the same immutable facts the
+    /// modulation sample consumed, so a Study and a routed control observe
+    /// one frame.
+    fn study_frame_inputs(&self) -> ([f32; 8], f32) {
+        let beat = self.mod_matrix.clock.beat(std::time::Instant::now());
+        (self.mod_matrix.audio.bands, (beat.fract().abs()) as f32)
     }
 
     /// Keep the "before" half of the decoder A/B, bounded like the feedback
@@ -19441,7 +19559,11 @@ impl ApplicationHandler for App {
                         .is_some_and(|executor| executor.program_history_initialized());
                     let mut evaluated_frame = EvaluatedFramePlan::evaluate(
                         &modulation_frame,
-                        FramePlanContext::new(frame_output_width, frame_output_height, elapsed),
+                        {
+                            let (bands, beat) = self.study_frame_inputs();
+                            FramePlanContext::new(frame_output_width, frame_output_height, elapsed)
+                                .with_study_inputs(bands, beat)
+                        },
                         MasterFrameInput {
                             effects: &self.master_effects,
                             transform: &self.master_transform,
@@ -19507,6 +19629,7 @@ impl ApplicationHandler for App {
                             advanced_program_history_initialized,
                         )
                         .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+                        .with_studies(&self.study_library)
                         .with_motion(
                             evaluated_master_motion,
                             &evaluated_layer_motion,
@@ -19580,6 +19703,7 @@ impl ApplicationHandler for App {
                                 advanced_program_history_initialized,
                             )
                             .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+                            .with_studies(&self.study_library)
                             .with_motion(
                                 evaluated_master_motion,
                                 &evaluated_layer_motion,
@@ -19667,6 +19791,7 @@ impl ApplicationHandler for App {
                                 )
                                 .with_layer_mattes(&authored_layer_mattes, false)
                                 .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+                                .with_studies(&self.study_library)
                                 .with_motion(
                                     evaluated_master_motion,
                                     &evaluated_layer_motion,

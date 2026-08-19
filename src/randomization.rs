@@ -1353,6 +1353,10 @@ pub(crate) fn mutate_runtime_rack_values(
                 value.detail_gain =
                     mutate_linear(1.0, value.detail_gain, 0.0, 4.0, amount * 0.2, &mut rng);
             }
+            // Dice preserves a Study exactly: the digest names a validated
+            // document and there is no continuous value to move. The node's
+            // common wet was already diced above like every other node's.
+            RuntimeVisualNodeKind::Study(_) => {}
         }
     }
 }

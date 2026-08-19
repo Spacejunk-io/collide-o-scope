@@ -1,22 +1,25 @@
 //! The fixed-pipeline Study interpreter executor.
 //!
-//! One shader (`study_interpreter.wgsl`), compiled once at construction and
-//! never generated: a compiled Study arrives as a bounded uniform
-//! instruction buffer and the fragment stage walks it. Swapping studies is
-//! two `write_buffer` calls into fixed-size buffers — no reallocation, no
+//! One shader (the canonical `blend.wgsl` kernel plus
+//! `study_interpreter.wgsl`), compiled once at construction and never
+//! generated: a compiled Study arrives as a bounded uniform instruction
+//! buffer and the fragment stage walks it. Swapping studies is two
+//! `write_buffer` calls into fixed-stride arena slots — no reallocation, no
 //! pipeline change, no layout change. Two sampled textures (carrier and the
 //! committed clean-history D2 array), no sampler; every lookup is a
-//! `textureLoad`, inside the ordinary three-texture rack ceiling.
-//!
-//! The executor lands with the S10b interpreter tranche one step ahead of an
-//! authored audience surface — where a Study plugs into the composition
-//! (rack node kind, master slot) is a product decision the operator has not
-//! yet opened, exactly the browser-surface pattern. Until that tranche its
-//! only callers are the CPU-agreement fixtures below, and this allow is
-//! scoped to that window.
-#![allow(dead_code)]
+//! `textureLoad`, inside the ordinary three-texture rack ceiling. The final
+//! wet/blend law is the engine-wide `apply_node_law` shape, byte-shared
+//! through the one blend kernel.
 
-use crate::study_eval::{CompiledStudy, StudyFrameContext, StudyGpuOp, STUDY_GPU_MAX_INSTRUCTIONS};
+use crate::evaluated_frame::evaluated_composition::EvaluatedStudyPlan;
+#[cfg(test)]
+use crate::study_eval::CompiledStudy;
+use crate::study_eval::{StudyFrameContext, StudyGpuOp, STUDY_GPU_MAX_INSTRUCTIONS};
+use crate::visual_rack::NodeBlend;
+
+const STUDY_FRAME_UNIFORM_BYTES: u64 = 64;
+const STUDY_PROGRAM_UNIFORM_BYTES: u64 =
+    (std::mem::size_of::<StudyGpuOp>() * STUDY_GPU_MAX_INSTRUCTIONS) as u64;
 
 /// The frame uniform block, mirrored field for field by
 /// `StudyFrameUniforms` in the shader (bands as two vec4s).
@@ -29,7 +32,12 @@ pub struct StudyGpuFrameUniforms {
     pub valid_history: u32,
     pub write_index: u32,
     pub history_len: u32,
-    pub _pad: [u32; 3],
+    /// Renderer-owned node wet, applied by the engine-wide node law after
+    /// the interpreter output — never an authored Study value.
+    pub wet: f32,
+    /// The node's frozen `NodeBlend::code()`.
+    pub blend_mode: u32,
+    pub _pad: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<StudyGpuFrameUniforms>() == 64);
@@ -39,12 +47,33 @@ impl StudyGpuFrameUniforms {
     /// Build the block from the same context the CPU reference consumes,
     /// applying the identical input sanitation (non-finite lands on the
     /// documented neutral, bands and phase clamp to `0..=1`) so the two
-    /// halves observe the same numbers.
+    /// halves observe the same numbers. Wet 1 and Normal blend make the node
+    /// law the identity over the interpreter output, which is what the
+    /// CPU-agreement fixtures compare against.
+    #[cfg(test)]
     pub fn from_context(
         frame: &StudyFrameContext,
         compiled: &CompiledStudy,
         write_index: u32,
         history_len: u32,
+    ) -> Self {
+        Self::from_parts(
+            frame,
+            compiled.instruction_count(),
+            write_index,
+            history_len,
+            1.0,
+            NodeBlend::Normal,
+        )
+    }
+
+    pub fn from_parts(
+        frame: &StudyFrameContext,
+        instruction_count: u32,
+        write_index: u32,
+        history_len: u32,
+        wet: f32,
+        blend: NodeBlend,
     ) -> Self {
         let sanitize = |value: f32| {
             if value.is_finite() {
@@ -56,11 +85,13 @@ impl StudyGpuFrameUniforms {
         Self {
             audio_bands: frame.audio_bands.map(sanitize),
             beat_phase: sanitize(frame.beat_phase),
-            instruction_count: compiled.instruction_count(),
+            instruction_count,
             valid_history: frame.valid_history,
             write_index,
             history_len,
-            _pad: [0; 3],
+            wet: sanitize(wet),
+            blend_mode: blend.code(),
+            _pad: 0,
         }
     }
 }
@@ -68,28 +99,45 @@ impl StudyGpuFrameUniforms {
 pub struct StudyGpuExecutor {
     pipeline: wgpu::RenderPipeline,
     bind_layout: wgpu::BindGroupLayout,
-    frame_buffer: wgpu::Buffer,
-    program_buffer: wgpu::Buffer,
+    frame_arena: wgpu::Buffer,
+    program_arena: wgpu::Buffer,
+    frame_stride: u32,
+    program_stride: u32,
+    slots: u32,
 }
 
 impl StudyGpuExecutor {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    /// One inert-plan predicate for the planner-emitted step: disabled, dry,
+    /// or unresolved (no digest, or a digest the library did not hold at
+    /// plan time) encodes nothing and the carrier passes through untouched.
+    pub fn is_inert(plan: &EvaluatedStudyPlan) -> bool {
+        !plan.enabled || plan.wet <= 0.0 || plan.program.is_none()
+    }
+
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, slots: u32) -> Self {
+        let slots = slots.max(1);
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(1);
+        let align_up = |value: u64| -> u64 { value.div_ceil(u64::from(align)) * u64::from(align) };
+        let frame_stride = align_up(STUDY_FRAME_UNIFORM_BYTES) as u32;
+        let program_stride = align_up(STUDY_PROGRAM_UNIFORM_BYTES) as u32;
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Study interpreter bind layout"),
             entries: &[
                 texture_entry(0, wgpu::TextureViewDimension::D2),
                 texture_entry(1, wgpu::TextureViewDimension::D2Array),
-                uniform_entry(2, std::mem::size_of::<StudyGpuFrameUniforms>() as u64),
-                uniform_entry(
-                    3,
-                    (std::mem::size_of::<StudyGpuOp>() * STUDY_GPU_MAX_INSTRUCTIONS) as u64,
-                ),
+                uniform_entry(2, STUDY_FRAME_UNIFORM_BYTES, true),
+                uniform_entry(3, STUDY_PROGRAM_UNIFORM_BYTES, true),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Study interpreter shader"),
             source: wgpu::ShaderSource::Wgsl(
-                include_str!("../shaders/study_interpreter.wgsl").into(),
+                format!(
+                    "{}\n{}",
+                    include_str!("../shaders/blend.wgsl"),
+                    include_str!("../shaders/study_interpreter.wgsl"),
+                )
+                .into(),
             ),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -124,37 +172,49 @@ impl StudyGpuExecutor {
             multiview_mask: None,
             cache: None,
         });
-        let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Study interpreter frame uniforms"),
-            size: std::mem::size_of::<StudyGpuFrameUniforms>() as u64,
+        let frame_arena = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Study interpreter frame arena"),
+            size: u64::from(frame_stride) * u64::from(slots),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let program_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Study interpreter program"),
-            size: (std::mem::size_of::<StudyGpuOp>() * STUDY_GPU_MAX_INSTRUCTIONS) as u64,
+        let program_arena = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Study interpreter program arena"),
+            size: u64::from(program_stride) * u64::from(slots),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         Self {
             pipeline,
             bind_layout,
-            frame_buffer,
-            program_buffer,
+            frame_arena,
+            program_arena,
+            frame_stride,
+            program_stride,
+            slots,
         }
     }
 
-    /// Upload a compiled study and its frame block. Fixed-size buffers: a
-    /// study swap is exactly these two writes.
-    pub fn upload(
-        &self,
-        queue: &wgpu::Queue,
-        program: &[StudyGpuOp],
-        frame: &StudyGpuFrameUniforms,
-    ) {
+    /// Upload one slot's encoded program. Topology-fixed: written at
+    /// prepare, untouched per frame.
+    pub fn write_program(&self, queue: &wgpu::Queue, slot: u32, program: &[StudyGpuOp]) {
+        debug_assert!(slot < self.slots);
         debug_assert_eq!(program.len(), STUDY_GPU_MAX_INSTRUCTIONS);
-        queue.write_buffer(&self.program_buffer, 0, bytemuck::cast_slice(program));
-        queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(frame));
+        queue.write_buffer(
+            &self.program_arena,
+            u64::from(slot) * u64::from(self.program_stride),
+            bytemuck::cast_slice(program),
+        );
+    }
+
+    /// Upload one slot's frame block. Written once per encoded frame.
+    pub fn write_frame(&self, queue: &wgpu::Queue, slot: u32, frame: &StudyGpuFrameUniforms) {
+        debug_assert!(slot < self.slots);
+        queue.write_buffer(
+            &self.frame_arena,
+            u64::from(slot) * u64::from(self.frame_stride),
+            bytemuck::bytes_of(frame),
+        );
     }
 
     /// Bind the carrier and the committed history array. Callers cache the
@@ -179,23 +239,33 @@ impl StudyGpuExecutor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.frame_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.frame_arena,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(STUDY_FRAME_UNIFORM_BYTES),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: self.program_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.program_arena,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(STUDY_PROGRAM_UNIFORM_BYTES),
+                    }),
                 },
             ],
         })
     }
 
-    /// Encode exactly one fullscreen pass into `target`.
-    pub fn encode_pass(
+    /// Encode exactly one fullscreen pass for `slot` into `target`.
+    pub fn encode_at(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         bind_group: &wgpu::BindGroup,
         target: &wgpu::TextureView,
+        slot: u32,
     ) {
+        debug_assert!(slot < self.slots);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Study interpreter pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -211,7 +281,11 @@ impl StudyGpuExecutor {
             ..Default::default()
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_bind_group(
+            0,
+            bind_group,
+            &[slot * self.frame_stride, slot * self.program_stride],
+        );
         pass.draw(0..3, 0..1);
     }
 }
@@ -232,13 +306,13 @@ fn texture_entry(
     }
 }
 
-fn uniform_entry(binding: u32, min_size: u64) -> wgpu::BindGroupLayoutEntry {
+fn uniform_entry(binding: u32, min_size: u64, dynamic: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
+            has_dynamic_offset: dynamic,
             min_binding_size: std::num::NonZeroU64::new(min_size),
         },
         count: None,
@@ -343,6 +417,7 @@ mod tests {
         queue: &wgpu::Queue,
         executor: &StudyGpuExecutor,
         bind_group: &wgpu::BindGroup,
+        slot: u32,
     ) -> Vec<[f32; 4]> {
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Study fixture target"),
@@ -367,7 +442,7 @@ mod tests {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        executor.encode_pass(&mut encoder, bind_group, &view);
+        executor.encode_at(&mut encoder, bind_group, &view, slot);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target,
@@ -458,7 +533,9 @@ mod tests {
     /// The S10b agreement claim: the fixed interpreter renders the
     /// every-opcode document pixel-identical (2e-5) to the CPU reference,
     /// with the R1 guard clamping a deep history age against a young ring
-    /// and the resolved randomness observably contributing.
+    /// and the resolved randomness observably contributing. Wet 1 with
+    /// Normal blend makes the node law the identity, so the comparison is
+    /// against the pure interpreter output.
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn gpu_study_interpreter_matches_the_cpu_reference_across_every_opcode() {
@@ -466,7 +543,7 @@ mod tests {
             panic!("GPU adapter required");
         };
         let compiled = crate::study_eval::CompiledStudy::compile(&every_opcode_document()).unwrap();
-        let executor = StudyGpuExecutor::new(&device, wgpu::TextureFormat::Rgba32Float);
+        let executor = StudyGpuExecutor::new(&device, wgpu::TextureFormat::Rgba32Float, 1);
 
         let carrier = float_texture(&device, &queue, 1, |_, x, y| carrier_pixel(x, y));
         let history = float_texture(&device, &queue, HISTORY_LEN, |layer, _, _| {
@@ -485,13 +562,14 @@ mod tests {
         frame.valid_history = 5;
         let write_index = 17;
 
-        executor.upload(
+        executor.write_program(&queue, 0, &compiled.encode_gpu_program());
+        executor.write_frame(
             &queue,
-            &compiled.encode_gpu_program(),
+            0,
             &StudyGpuFrameUniforms::from_context(&frame, &compiled, write_index, HISTORY_LEN),
         );
         let bind_group = executor.create_bind_group(&device, &carrier_view, &history_view);
-        let gpu = render_and_read(&device, &queue, &executor, &bind_group);
+        let gpu = render_and_read(&device, &queue, &executor, &bind_group, 0);
         let cpu = cpu_reference(&compiled, &frame, write_index);
         assert_agreement(&gpu, &cpu, "every-opcode document");
 
@@ -499,27 +577,28 @@ mod tests {
         // the image (the guard was doing work), and both halves track it.
         let mut committed = frame;
         committed.valid_history = HISTORY_LEN;
-        executor.upload(
+        executor.write_frame(
             &queue,
-            &compiled.encode_gpu_program(),
+            0,
             &StudyGpuFrameUniforms::from_context(&committed, &compiled, write_index, HISTORY_LEN),
         );
-        let gpu_committed = render_and_read(&device, &queue, &executor, &bind_group);
+        let gpu_committed = render_and_read(&device, &queue, &executor, &bind_group, 0);
         let cpu_committed = cpu_reference(&compiled, &committed, write_index);
         assert_agreement(&gpu_committed, &cpu_committed, "committed ring");
         assert_ne!(gpu, gpu_committed, "the history guard must be observable");
     }
 
     /// A study swap is two buffer writes: the same executor and the same
-    /// bind group render a second document correctly, and re-rendering it is
-    /// byte-identical.
+    /// bind group render a second document correctly in a second arena slot,
+    /// and re-rendering it is byte-identical. The wet law is also proven
+    /// against the CPU-composed mix at wet 0.5.
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn gpu_study_swap_is_two_writes_into_fixed_buffers_and_stays_deterministic() {
         let Some((device, queue)) = acquire_device() else {
             panic!("GPU adapter required");
         };
-        let executor = StudyGpuExecutor::new(&device, wgpu::TextureFormat::Rgba32Float);
+        let executor = StudyGpuExecutor::new(&device, wgpu::TextureFormat::Rgba32Float, 2);
         let carrier = float_texture(&device, &queue, 1, |_, x, y| carrier_pixel(x, y));
         let history = float_texture(&device, &queue, HISTORY_LEN, |layer, _, _| {
             history_layer_color(layer)
@@ -573,21 +652,70 @@ mod tests {
         frame.valid_history = HISTORY_LEN;
         let write_index = 3;
 
-        executor.upload(
+        executor.write_program(&queue, 1, &second.encode_gpu_program());
+        executor.write_frame(
             &queue,
-            &second.encode_gpu_program(),
+            1,
             &StudyGpuFrameUniforms::from_context(&frame, &second, write_index, HISTORY_LEN),
         );
-        let first_render = render_and_read(&device, &queue, &executor, &bind_group);
+        let first_render = render_and_read(&device, &queue, &executor, &bind_group, 1);
         assert_agreement(
             &first_render,
             &cpu_reference(&second, &frame, write_index),
             "swapped document",
         );
-        let second_render = render_and_read(&device, &queue, &executor, &bind_group);
+        let second_render = render_and_read(&device, &queue, &executor, &bind_group, 1);
         assert_eq!(
             first_render, second_render,
             "re-rendering the same program must be deterministic"
         );
+
+        // Wet 0.5 with Normal blend must land exactly on the engine node
+        // law's straight-alpha mix of carrier and study output.
+        executor.write_frame(
+            &queue,
+            1,
+            &StudyGpuFrameUniforms::from_parts(
+                &frame,
+                second.instruction_count(),
+                write_index,
+                HISTORY_LEN,
+                0.5,
+                NodeBlend::Normal,
+            ),
+        );
+        let half_wet = render_and_read(&device, &queue, &executor, &bind_group, 1);
+        let dry: Vec<[f32; 4]> = (0..SIZE)
+            .flat_map(|y| (0..SIZE).map(move |x| carrier_pixel(x, y)))
+            .collect();
+        let study = cpu_reference(&second, &frame, write_index);
+        for (index, observed) in half_wet.iter().enumerate() {
+            let d = dry[index];
+            let s = study[index];
+            // apply_node_law at Normal blend: processed replaces, then the
+            // wet mix interpolates premultiplied color and alpha.
+            let alpha = d[3].clamp(0.0, 1.0) * 0.5 + s[3].clamp(0.0, 1.0) * 0.5;
+            let expected: [f32; 4] = std::array::from_fn(|channel| {
+                if channel == 3 {
+                    alpha
+                } else {
+                    let premultiplied = d[channel].clamp(0.0, 1.0) * d[3].clamp(0.0, 1.0) * 0.5
+                        + s[channel] * s[3] * 0.5;
+                    if alpha <= 1.0e-6 {
+                        0.0
+                    } else {
+                        premultiplied / alpha
+                    }
+                }
+            });
+            for channel in 0..4 {
+                assert!(
+                    (observed[channel] - expected[channel]).abs() < 2.0e-5,
+                    "wet law: pixel {index} channel {channel}: gpu {} vs cpu {}",
+                    observed[channel],
+                    expected[channel]
+                );
+            }
+        }
     }
 }

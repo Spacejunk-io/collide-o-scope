@@ -1231,6 +1231,7 @@ fn saved_node_image_taps_mut(
         | VisualNodeKind::Cellular(_)
         | VisualNodeKind::Shift(_)
         | VisualNodeKind::Grain(_)
+        | VisualNodeKind::Study(_)
         | VisualNodeKind::Mask(MaskParams::Rectangle(_) | MaskParams::Ellipse(_)) => [None, None],
     }
 }
@@ -1256,6 +1257,7 @@ fn saved_node_motion_donors_mut(
         | VisualNodeKind::Grain(_)
         | VisualNodeKind::Mask(_)
         | VisualNodeKind::Residual(_)
+        | VisualNodeKind::Study(_)
         | VisualNodeKind::Displace(_) => [None, None],
     }
 }
@@ -2621,6 +2623,13 @@ fn interpolate_node_kind(
         (VisualNodeKind::Residual(a), VisualNodeKind::Residual(b)) => {
             VisualNodeKind::Residual(interpolate_residual(a, b, weights, choose_b)?)
         }
+        // A Study has no continuous value: the digest names a whole validated
+        // document, so the pair is one discrete endpoint choice at the
+        // midpoint — the Field Collider whole-block law. No position can
+        // synthesize a third document neither slot captured.
+        (VisualNodeKind::Study(a), VisualNodeKind::Study(b)) => {
+            VisualNodeKind::Study(pick(a, b, choose_b))
+        }
         _ => return None,
     })
 }
@@ -3685,6 +3694,26 @@ mod tests {
             ..Default::default()
         }];
         slot
+    }
+
+    #[test]
+    fn a_study_pair_is_one_discrete_endpoint_choice_at_the_midpoint() {
+        use crate::visual_rack::{StudyRackParams, VisualNodeKind};
+        let a = VisualNodeKind::Study(StudyRackParams {
+            document_digest: Some([0x11; 32]),
+        });
+        let b = VisualNodeKind::Study(StudyRackParams {
+            document_digest: Some([0x22; 32]),
+        });
+        // Before the midpoint the A document holds; after it, B — no
+        // position can synthesize a third document neither slot captured.
+        let early = interpolate_node_kind(a, b, [0.75, 0.25], false).unwrap();
+        assert_eq!(early, a);
+        let late = interpolate_node_kind(a, b, [0.25, 0.75], true).unwrap();
+        assert_eq!(late, b);
+        // Equal documents are trivially carried.
+        let same = interpolate_node_kind(a, a, [0.5, 0.5], true).unwrap();
+        assert_eq!(same, a);
     }
 
     #[test]
