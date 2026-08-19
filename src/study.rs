@@ -28,22 +28,22 @@ pub const STUDY_MAX_AUTHOR_BYTES: usize = 80;
 pub const STUDY_MAX_DESCRIPTION_BYTES: usize = 512;
 pub const STUDY_MAX_LICENSE_ID_BYTES: usize = 64;
 pub const STUDY_MAX_LICENSE_NOTICE_BYTES: usize = 1024;
-/// Upper bound on `LoadHistoryColor { age }`, validated as `1..=24` with age
-/// 0 rejected. **The meaning of an age is deliberately undocumented and must
-/// be decided before any evaluator lands**: the committed clean-history ring
-/// derives `SYMMETRY_MAX_HISTORY_AGE = TEMPORAL_HISTORY_LEN - 1 = 23`, valid
-/// `0..=23`, where age 0 is the virtual current image and `1..=23` address
-/// stored layers — so the two vocabularies do not span the same set. Either
-/// a Study age maps to ring age `age - 1` (making age 1 duplicate
-/// `LoadCurrentColor`), or this cap was set to the ring *length* where it
-/// meant the ring *max age* and is one too large. Those are different fixes,
-/// the choice is a compatibility decision under the exact-equality ABI gate
-/// below, and an evaluator that picks silently would freeze the wrong one.
-/// The validator bounds the authored age only; an evaluator must
-/// additionally guard against the valid-sample count exactly as
-/// `temporal_originals.wgsl` does, or a young program reads unwritten
-/// texture content.
-pub const STUDY_MAX_HISTORY_AGE: u8 = 24;
+/// Upper bound on `LoadHistoryColor { age }`, validated as `1..=23` with age
+/// 0 rejected. **Ruled by the operator (R1, 2026-08-19): a Study age
+/// addresses the committed clean-history ring's stored layer directly** —
+/// age N is ring age N, so the cap is the ring's max age, derived from
+/// `TEMPORAL_HISTORY_LEN - 1` exactly as `SYMMETRY_MAX_HISTORY_AGE` derives
+/// it rather than restated as a literal. The previous literal `24` was the
+/// ring *length* set where the ring *max age* was meant; it was narrowed
+/// while no evaluator had ever given a document pixels, the only moment the
+/// exact-equality ABI gate below makes that cheap. `LoadCurrentColor`
+/// remains the only spelling of "now" — one meaning, one spelling — and the
+/// alternative (age 1 duplicating it via an `age - 1` mapping) was
+/// deliberately rejected. The validator bounds the authored age only; an
+/// evaluator must additionally guard every age against the valid-sample
+/// count exactly as `temporal_originals.wgsl` does, or a young program
+/// reads unwritten texture content.
+pub const STUDY_MAX_HISTORY_AGE: u8 = (crate::temporal::TEMPORAL_HISTORY_LEN - 1) as u8;
 pub const STUDY_MAX_AUDIO_BANDS: u8 = 8;
 pub const STUDY_MAX_FINITE_VALUE: f32 = 65_504.0;
 
@@ -71,12 +71,16 @@ pub const DATA_ONLY_STUDY_AUTHORITY: StudyAuthority = StudyAuthority {
 /// The ABI gate is **exact equality, not a compatibility window**: validation
 /// rejects any document whose version is not exactly
 /// `{ STUDY_ABI_MAJOR, STUDY_ABI_MINOR }`, with no forward or backward
-/// tolerance. Consequence: adding even one purely additive opcode and
-/// honestly bumping the minor version instantly invalidates every previously
-/// published document, while leaving the version alone silently redefines
-/// what the current version means. There is no third option in this code, so
-/// if the instruction set must grow, the versioning law has to be designed
-/// before the opcode is written — a compatibility decision, not a coding one.
+/// tolerance. **Ruled by the operator (R3, 2026-08-19): exact equality
+/// stands until the first evaluator lands. The commit that lands it freezes
+/// the ABI as 1.0 with the R1 history-age and R2 determinism rulings baked
+/// in, makes opcode codes append-only (the `NodeKindTag` discipline), and —
+/// in that same commit, never earlier — widens this gate to a backward
+/// window on minor only: accept `major == STUDY_ABI_MAJOR && minor <=
+/// STUDY_ABI_MINOR`.** An evaluator that executes 1.N can execute 1.0 by
+/// construction when growth is append-only; a major bump stays a hard
+/// break. Until then, adding an opcode remains forbidden by this gate
+/// exactly as before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StudyAbiVersion {
@@ -211,11 +215,19 @@ pub enum StudyInstruction {
     LoadBeatPhase {
         dst: StudyRegister,
     },
-    /// Carries only a `domain`; **no seed field exists anywhere in the
-    /// document**, so the determinism law the plan requires is currently
-    /// undefined rather than merely unimplemented. What a domain is hashed
-    /// with — and against what stable identity — is an ABI decision that
-    /// must be designed before any evaluator gives this opcode a value.
+    /// Carries only a `domain`; no seed field exists anywhere in the
+    /// document. **Ruled by the operator (R2, 2026-08-19): the value is a
+    /// domain-separated SplitMix64-style counter hash over (the Study ABI
+    /// version, the document's canonical content digest, `domain`) — one
+    /// constant per document, frame-independent.** Same document, same
+    /// value, live and offline, forever; two domains can never perturb each
+    /// other; nothing process-lifetime and no wall time may enter the hash
+    /// (the Symmetry sector-table law). Time-varying noise is deliberately
+    /// out of this opcode's meaning — that is what the LFO, audio, and beat
+    /// sources are for — and an animated variant would be a future opcode
+    /// under the R3 versioning law, never a redefinition of this one. The
+    /// evaluator implements this ruling; until it lands the opcode remains
+    /// valid, capability-gated data.
     LoadDeterministicRandom {
         dst: StudyRegister,
         domain: u32,
@@ -1071,6 +1083,29 @@ mod tests {
             document.validate(),
             Err(StudyError::NonFiniteOrUnboundedConstant)
         );
+    }
+
+    #[test]
+    fn the_history_age_cap_is_the_ring_max_age_by_the_operator_ruling() {
+        // R1: a Study age addresses the committed ring's stored layer
+        // directly, so the cap derives from the ring and 23 is the last
+        // valid age — 24, the old ring-length literal, is rejected.
+        assert_eq!(STUDY_MAX_HISTORY_AGE, 23);
+        let mut document = valid_document();
+        document.capabilities = vec![StudyCapability::HistoryRead];
+        document.instructions = vec![
+            StudyInstruction::LoadHistoryColor {
+                dst: register(0),
+                age: STUDY_MAX_HISTORY_AGE,
+            },
+            StudyInstruction::OutputColor { color: register(0) },
+        ];
+        document.validate().unwrap();
+        document.instructions[0] = StudyInstruction::LoadHistoryColor {
+            dst: register(0),
+            age: 24,
+        };
+        assert_eq!(document.validate(), Err(StudyError::HistoryAge(24)));
     }
 
     #[test]
