@@ -2145,6 +2145,27 @@ select:focus-visible,
 .layer-source-status.active { color: var(--accent); }
 .layer-source-status.error { color: #e65a5a; }
 
+.layer-proxy-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0 8px 5px;
+}
+.layer-proxy-btn {
+  cursor: pointer;
+  padding: 0 7px;
+  font-size: 9px;
+}
+.layer-proxy-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.layer-proxy-btn:disabled { cursor: default; opacity: 0.55; }
+.layer-proxy-status {
+  color: var(--text-dim);
+  font-size: 9px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.layer-proxy-status.active { color: var(--accent); }
+
 /* === BLACKOUT + BEAT LIGHT === */
 
 .blackout-btn {

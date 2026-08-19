@@ -3179,6 +3179,16 @@ pub struct LayerSnapshot {
     /// Explicitly tells the performer how non-file sources behave in export.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub offline_export_policy: String,
+    /// First eight hex characters of the proxy cache key while a validated
+    /// artifact backs this layer's decoder — the same prefix the native HUD
+    /// shows. Empty when the layer is un-proxied. Never a path.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy_backing_prefix: String,
+    /// The session's latest proxy lifecycle/refusal note for this layer's
+    /// identity (requested, running, ready/adopting, adopted, refused …) —
+    /// the same note the native HUD appends. Keys and byte counts only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub proxy_note: String,
     /// Prepared sources, true per-clip transport, and matte routing owned by
     /// this persistent visual layer identity.
     #[serde(default)]
@@ -4122,6 +4132,18 @@ pub enum WebAction {
     /// boundary while leaving authored Motion values untouched.
     #[serde(rename = "clear_motion_memory")]
     ClearMotionMemory,
+    /// Ask the engine to encode (and, on completion, hot-adopt) a proxy for
+    /// one layer's verified content identity — the browser twin of the
+    /// native Y key. The stable ID is mandatory and authoritative: there is
+    /// no positional fallback, and a vanished ID is a safe no-op. Every
+    /// refusal the Y key enforces (no verified identity, not a video,
+    /// already backed, busy worker, unavailable cache) is answered by the
+    /// same engine function and surfaces in the layer's `proxy_note`, so
+    /// the browser cannot bypass the content-identity ladder. Priority,
+    /// never coalesced, never quantized — a request is an event, not an
+    /// absolute value.
+    #[serde(rename = "request_layer_proxy")]
+    RequestLayerProxy { layer_id: String },
     /// Enable/disable the Spout output sender
     #[serde(rename = "set_spout")]
     SetSpout { enabled: bool },
@@ -4517,6 +4539,7 @@ impl WebAction {
             | Self::SetGestureRecording { .. }
             | Self::SetMotionDonor { .. }
             | Self::SetMotionColliderInput { .. }
+            | Self::RequestLayerProxy { .. }
             | Self::ClearMotionMemory
             | Self::SetLayerPaused { .. }
             | Self::SetLayerVisibility { .. }
@@ -6380,9 +6403,15 @@ mod protocol_tests {
             source_sequence: 0,
             source_error: String::new(),
             offline_export_policy: String::new(),
+            proxy_backing_prefix: String::new(),
+            proxy_note: String::new(),
             performance: LayerPerformanceSnapshot::default(),
         };
         let mut value = serde_json::to_value(current).unwrap();
+        // Empty proxy state stays off the wire entirely rather than shipping
+        // two empty strings on every un-proxied layer.
+        assert!(value.get("proxy_backing_prefix").is_none());
+        assert!(value.get("proxy_note").is_none());
         value.as_object_mut().unwrap().remove("bypass_master_fx");
         value.as_object_mut().unwrap().remove("reroll_on_loop");
         value.as_object_mut().unwrap().remove("transform");
@@ -6394,6 +6423,36 @@ mod protocol_tests {
         assert!(!legacy.reroll_on_loop);
         assert_eq!(legacy.transform, SpatialTransform::default());
         assert_eq!(legacy.performance, LayerPerformanceSnapshot::default());
+        assert!(legacy.proxy_backing_prefix.is_empty());
+        assert!(legacy.proxy_note.is_empty());
+    }
+
+    #[test]
+    fn proxy_browser_surface_is_id_addressed_priority_and_never_quantizable() {
+        // Wire shape: the stable ID is mandatory — there is no positional
+        // field for this action at all, so a fallback cannot exist.
+        let action: WebAction =
+            serde_json::from_str(r#"{"action":"request_layer_proxy","layer_id":"42"}"#).unwrap();
+        assert!(matches!(&action, WebAction::RequestLayerProxy { layer_id } if layer_id == "42"));
+        assert!(serde_json::from_str::<WebAction>(r#"{"action":"request_layer_proxy"}"#).is_err());
+        // A request is an event, not an absolute value: priority admission,
+        // never coalesced with a later request.
+        assert!(action.is_priority());
+        assert_eq!(action.coalesce_key(), None);
+
+        // The panel's hand-maintained quantizable set must not contain it.
+        let js = include_str!("../../static/app.js");
+        let start = js.find("const QUANTIZABLE_ACTIONS").unwrap();
+        let end = js[start..].find("]);").unwrap() + start;
+        assert!(!js[start..end].contains("request_layer_proxy"));
+        // The panel sends it stable-ID-only with an accessible affordance,
+        // and the status region mirrors the engine-owned note.
+        assert!(js.contains("action: 'request_layer_proxy'"));
+        assert!(js.contains("layer-proxy-btn"));
+        assert!(js.contains("Encode proxy for layer"));
+        assert!(js.contains("currentStableLayerId(card, layer, index)"));
+        assert!(js.contains("layer-proxy-status"));
+        assert!(js.contains("proxy_backing_prefix"));
     }
 
     #[test]

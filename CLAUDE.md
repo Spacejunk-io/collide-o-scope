@@ -1807,6 +1807,19 @@ limits and reservation totals so the visible rationale remains authoritative.
 Do not publish or invent a portable free-VRAM figure. Switching to Safe changes
 future allocations only.
 
+Per-layer proxy state is additive in the layer snapshot:
+`proxy_backing_prefix` carries the HUD's eight-character cache-key prefix
+while a validated artifact backs the decoder (never a path), and `proxy_note`
+carries the engine's session lifecycle/refusal note. Both stay off the wire
+when empty. The layer card's Encode proxy control sends
+`request_layer_proxy { layer_id }` — priority, never coalesced, never
+quantized, stable-ID-only with no positional field at all; a vanished ID is a
+safe no-op. Every refusal the native Y key enforces is answered by the same
+engine ladder (`request_proxy_for_layer`) and surfaces in `proxy_note`, so
+the browser cannot bypass the content-identity contract, and a request is an
+operational event: it records no manual history and survives an Apply Look
+unfiltered.
+
 Live NTSC diagnostics remain path-specific. For both the global and selective
 paths, `attempted` counts admission decisions, `accepted` counts admitted work,
 `skipped` counts only healthy Busy backpressure, and `unavailable` separately
@@ -2124,10 +2137,11 @@ a passing claim.
   adoption closed the former reapply-the-patch edge: an encode completion
   captures per-layer claims, the adoption worker prepares a playhead-seeded
   decoder off the render thread, and the drain installs it only after every
-  claim re-validates (see the threading section). The remaining edges: only
-  sources with a verified `cos-sha256` identity can be proxied, because the
-  key is content-addressed; and the browser panel has no proxy surface —
-  request and status are native (Y key + stage-health HUD). A host killed
+  claim re-validates (see the threading section). The browser surface closed
+  the former native-only edge: the layer card's Encode proxy control drives
+  the same engine ladder the Y key uses (see the web section). The remaining
+  edge: only sources with a verified `cos-sha256` identity can be proxied,
+  because the key is content-addressed. A host killed
   mid-encode may orphan one ffmpeg process bounded by its own completion;
   the staged file it writes is recovery residue, never an artifact. The
   Unix CI FFmpeg build carries `--disable-programs`, so end-to-end encode
