@@ -2376,6 +2376,61 @@ mod tests {
             "an adoption is a source-resource change and must advance the epoch"
         );
 
+        // The slot dance: switching to a second clip clears the live claim,
+        // but the claim travels with the displaced source it describes, so
+        // an A->B->A reactivation from the prepared pool restores a truthful
+        // `proxy_backing` instead of a cleared one.
+        use crate::performance::ClipSlotId;
+        let fresh_decoder = ThreadedDecoder::open_with_media_policy(
+            source.to_str().unwrap(),
+            &policy,
+            MediaDeviceLimits::none(),
+        )
+        .unwrap();
+        let (fresh_width, fresh_height, fresh_fps) =
+            (fresh_decoder.width, fresh_decoder.height, fresh_decoder.fps);
+        let fresh = LayerSourceActivation::stage(
+            &device,
+            &queue,
+            source.to_string_lossy().into_owned(),
+            None,
+            "clip-b.mp4".to_owned(),
+            crate::layers::LayerSource::Video(fresh_decoder),
+            fresh_width,
+            fresh_height,
+            fresh_fps,
+            0,
+            &vec![0_u8; (fresh_width * fresh_height * 4) as usize],
+        )
+        .unwrap();
+        let mut slot_b = layer.active_clip_config().clone();
+        slot_b.id = ClipSlotId::new(2).unwrap();
+        slot_b.filename = "clip-b.mp4".to_owned();
+        let displaced_artifact = layer.commit_prepared_source(
+            fresh,
+            &slot_b,
+            NormalizedTime::clamped(0.0),
+            Instant::now(),
+        );
+        assert!(
+            layer.proxy_backing().is_none(),
+            "a freshly opened clip switch is not proxy-backed"
+        );
+        let displaced_slot = displaced_artifact.slot.clone();
+        let displaced_start = displaced_artifact.start_position;
+        let clip_b_back = layer.commit_prepared_source(
+            displaced_artifact.activation,
+            &displaced_slot,
+            displaced_start,
+            Instant::now(),
+        );
+        drop(clip_b_back);
+        assert_eq!(
+            layer.proxy_backing(),
+            Some(key.to_hex().as_str()),
+            "a reactivated displaced artifact restores its truthful claim"
+        );
+
         // Decoder drop signals its worker without joining, so the artifact
         // handle closes asynchronously; Windows refuses to remove a
         // directory holding an open file. Bound the wait rather than racing.
