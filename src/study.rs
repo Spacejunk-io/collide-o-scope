@@ -68,19 +68,17 @@ pub const DATA_ONLY_STUDY_AUTHORITY: StudyAuthority = StudyAuthority {
     host_mutation: false,
 };
 
-/// The ABI gate is **exact equality, not a compatibility window**: validation
-/// rejects any document whose version is not exactly
-/// `{ STUDY_ABI_MAJOR, STUDY_ABI_MINOR }`, with no forward or backward
-/// tolerance. **Ruled by the operator (R3, 2026-08-19): exact equality
-/// stands until the first evaluator lands. The commit that lands it freezes
-/// the ABI as 1.0 with the R1 history-age and R2 determinism rulings baked
-/// in, makes opcode codes append-only (the `NodeKindTag` discipline), and —
-/// in that same commit, never earlier — widens this gate to a backward
-/// window on minor only: accept `major == STUDY_ABI_MAJOR && minor <=
-/// STUDY_ABI_MINOR`.** An evaluator that executes 1.N can execute 1.0 by
-/// construction when growth is append-only; a major bump stays a hard
-/// break. Until then, adding an opcode remains forbidden by this gate
-/// exactly as before.
+/// The ABI gate is a **backward window on minor only**, per the operator's
+/// R3 ruling (2026-08-19): validation accepts `major == STUDY_ABI_MAJOR &&
+/// minor <= STUDY_ABI_MINOR` and rejects everything else. The window landed
+/// with the CPU reference evaluator (`study_eval.rs`), the commit R3 named:
+/// that evaluator freezes the ABI as 1.0 with the R1 history-age and R2
+/// determinism rulings baked in, and opcode codes are append-only from here
+/// (the `NodeKindTag` discipline — new opcodes append with a minor bump,
+/// and nothing is ever renumbered or reused). An evaluator that executes
+/// 1.N can execute 1.0 by construction when growth is append-only; a major
+/// bump stays a hard break. Behaviorally the window equals the previous
+/// exact-equality gate until the first minor bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StudyAbiVersion {
@@ -344,12 +342,7 @@ impl StudyDocument {
         if self.schema_version != STUDY_SCHEMA_VERSION {
             return Err(StudyError::UnsupportedSchemaVersion(self.schema_version));
         }
-        if self.abi
-            != (StudyAbiVersion {
-                major: STUDY_ABI_MAJOR,
-                minor: STUDY_ABI_MINOR,
-            })
-        {
+        if self.abi.major != STUDY_ABI_MAJOR || self.abi.minor > STUDY_ABI_MINOR {
             return Err(StudyError::UnsupportedAbi(self.abi));
         }
         validate_metadata(&self.metadata)?;
@@ -1027,6 +1020,35 @@ mod tests {
             wrong_abi.validate(),
             Err(StudyError::UnsupportedAbi(_))
         ));
+    }
+
+    #[test]
+    fn the_abi_gate_is_a_backward_minor_window_by_the_operator_ruling() {
+        // R3: accept major == current && minor <= current; reject a newer
+        // minor (forward) and any other major (both directions hard).
+        let mut document = valid_document();
+        document.validate().unwrap();
+        document.abi.minor = STUDY_ABI_MINOR + 1;
+        assert!(matches!(
+            document.validate(),
+            Err(StudyError::UnsupportedAbi(_))
+        ));
+        document.abi = StudyAbiVersion {
+            major: STUDY_ABI_MAJOR + 1,
+            minor: 0,
+        };
+        assert!(matches!(
+            document.validate(),
+            Err(StudyError::UnsupportedAbi(_))
+        ));
+        // The backward half of the window is vacuous until the first minor
+        // bump; this assertion is the shape that will begin admitting 1.0
+        // documents the day 1.1 exists.
+        document.abi = StudyAbiVersion {
+            major: STUDY_ABI_MAJOR,
+            minor: STUDY_ABI_MINOR,
+        };
+        document.validate().unwrap();
     }
 
     #[test]

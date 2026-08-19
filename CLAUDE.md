@@ -65,6 +65,7 @@ src/
 ├── proxy_worker.rs      bounded FFV1/Matroska encode worker, sealed atomic cache, consumption
 ├── precision.rs         objective color metrics and precision/capability accounting
 ├── study.rs             closed data-only SSA Study schema and authority validation
+├── study_eval.rs        pure CPU reference evaluator: R1 history guard, R2 randomness, rack hue law
 ├── patch/               YAML model, capture/apply, editor and file dialogs
 ├── procedural.rs        deterministic v7 typed patch walk, manifests/preflight, capture worker
 ├── render_export.rs     deterministic shared executor, motion report, optional audio mux
@@ -2111,6 +2112,18 @@ mislead browser tests.
   cache hit under the same key. Windows fsync law: `FlushFileBuffers`
   demands writable handles for both the staging file and the parent
   directory; do not "fix" a publish failure by dropping either sync.
+- Study evaluator tests are all hosted CPU: every arithmetic opcode against
+  analytic expectations, the rack hue law with its exact HSL fixtures, the
+  R1 validity guard mirroring `temporal_originals.wgsl` (nothing committed →
+  the virtual current image, deep requests clamped to the oldest valid
+  layer), the R2 randomness as a document constant with independent domains
+  and frame-context invariance, the bound law discriminated from an
+  unbounded evaluator, frame-input sanitization to documented neutrals,
+  Vector2 evaluated honestly as the recorded dead end, compile-time
+  required-age listing, compile-refuses-invalid, and the R3 backward-minor
+  window (newer minor and other majors rejected). The WGSL interpreter,
+  when it lands, is checked against this reference and retires the module's
+  scoped dead-code allow.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
