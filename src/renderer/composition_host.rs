@@ -472,6 +472,9 @@ pub(crate) struct CompositionHost {
     _temporal_history_texture: wgpu::Texture,
     temporal_history_view: wgpu::TextureView,
     temporal_history_layer_views: Box<[wgpu::TextureView]>,
+    /// Storage of the 25-layer temporal class. `Compat8` in every production
+    /// host; `Rgba16Float` only under the measurement-only Gate 6 candidate.
+    temporal_history_storage: crate::precision::SurfaceStorage,
     _temporal_feedback_texture: wgpu::Texture,
     temporal_feedback_view: wgpu::TextureView,
     temporal_feedback_copy_group: wgpu::BindGroup,
@@ -711,6 +714,7 @@ fn create_temporal_originals_uniform(
 fn validate_host_resource_plan(
     dimensions: [u32; 2],
     capacities: HostCapacities,
+    history_storage: crate::precision::SurfaceStorage,
 ) -> Result<(), CompositionHostError> {
     let resources = capacities.resources;
     if resources.output_size != dimensions {
@@ -734,12 +738,16 @@ fn validate_host_resource_plan(
         });
     }
     let pixels = u64::from(dimensions[0]).saturating_mul(u64::from(dimensions[1]));
+    // The `compat8_surface_layers` class is the temporal-history class: 25
+    // layers at the host's history storage width. The settled path stores
+    // them Compat8 at 4 bytes; the evaluation-only Full-16 constructor
+    // widens exactly this class to 8 and the plan must charge the truth.
     let calculated_bytes = pixels
         .checked_mul(8)
         .and_then(|bytes| bytes.checked_mul(u64::from(resources.rgba16_surface_layers)))
         .and_then(|rgba16| {
             pixels
-                .checked_mul(4)
+                .checked_mul(history_storage.bytes_per_pixel())
                 .and_then(|bytes| bytes.checked_mul(u64::from(resources.compat8_surface_layers)))
                 .and_then(|compat8| rgba16.checked_add(compat8))
         })
@@ -761,11 +769,45 @@ fn validate_host_resource_plan(
 }
 
 impl CompositionHost {
+    /// The production constructor: the settled
+    /// `AdvancedWorking16HistoryCompat8` path, byte-identical to what it has
+    /// always built. Every live and export executor comes through here.
     pub fn new(
         device: &wgpu::Device,
         dimensions: [u32; 2],
         capacities: HostCapacities,
     ) -> Result<Self, CompositionHostError> {
+        Self::new_with_history_storage(
+            device,
+            dimensions,
+            capacities,
+            crate::precision::SurfaceStorage::Compat8,
+        )
+    }
+
+    /// The Gate 6 evaluation constructor. `history_storage` selects the
+    /// storage of exactly the 25-layer temporal class — the 24-layer clean
+    /// history ring and the recursive feedback image — leaving working,
+    /// present, and every other surface untouched. `Compat8` is the settled
+    /// default; `Rgba16Float` is the `ExperimentalFull16History` candidate,
+    /// which is **measurement-only**: no production call site constructs it,
+    /// no wire action or patch field selects it, and the settled default does
+    /// not move. Because the ring and feedback are written exclusively by
+    /// render passes (the no-dither conversion pipeline) and read exclusively
+    /// by `textureLoad`/`textureSample`, both storages present identical
+    /// *linear* values to every consumer — sRGB8 encodes on write and decodes
+    /// on read, f16 carries linear directly — so the candidate changes
+    /// quantization, never value domain, and no consumer shader changes.
+    pub fn new_with_history_storage(
+        device: &wgpu::Device,
+        dimensions: [u32; 2],
+        capacities: HostCapacities,
+        history_storage: crate::precision::SurfaceStorage,
+    ) -> Result<Self, CompositionHostError> {
+        let history_format = match history_storage {
+            crate::precision::SurfaceStorage::Compat8 => HOST_PRESENT_FORMAT,
+            crate::precision::SurfaceStorage::Rgba16Float => HOST_WORKING_FORMAT,
+        };
         if dimensions.contains(&0) {
             return Err(CompositionHostError::ZeroDimensions(dimensions));
         }
@@ -788,7 +830,7 @@ impl CompositionHost {
                 });
             }
         }
-        validate_host_resource_plan(dimensions, capacities)?;
+        validate_host_resource_plan(dimensions, capacities, history_storage)?;
 
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
@@ -1070,6 +1112,11 @@ impl CompositionHost {
             HOST_WORKING_FORMAT,
             &counters,
         );
+        // The no-dither history conversion pipeline targets the temporal
+        // class's own storage. Under the settled Compat8 path this is the
+        // byte-identical sRGB8 target it has always been; under the Full-16
+        // candidate the same shader writes linear f16, so the only change is
+        // quantization at the target.
         let compat8_copy_pipeline = create_pipeline(
             device,
             "Advanced composition no-dither Compat8 copy pipeline",
@@ -1077,7 +1124,7 @@ impl CompositionHost {
             &vertex,
             &host,
             "fs_copy",
-            HOST_PRESENT_FORMAT,
+            history_format,
             &counters,
         );
         let present_pipeline = create_pipeline(
@@ -1215,7 +1262,7 @@ impl CompositionHost {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: HOST_PRESENT_FORMAT,
+            format: history_format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
@@ -1246,7 +1293,7 @@ impl CompositionHost {
             device,
             dimensions,
             "Advanced composition Compat8 temporal feedback",
-            HOST_PRESENT_FORMAT,
+            history_format,
             &counters,
         );
         let temporal_feedback_copy_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1333,6 +1380,7 @@ impl CompositionHost {
             routed_garden_uniform_buffer,
             routed_garden_uniform_group,
             _temporal_history_texture: temporal_history_texture,
+            temporal_history_storage: history_storage,
             temporal_history_view,
             temporal_history_layer_views,
             _temporal_feedback_texture: temporal_feedback_texture,
@@ -2073,6 +2121,20 @@ impl CompositionHost {
         &self.temporal_history_view
     }
 
+    /// Which storage the 25-layer temporal class was built with. Production
+    /// hosts always answer `Compat8`; only the measurement-only Gate 6
+    /// constructor answers `Rgba16Float`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "storage inspection is exposed for the Gate 6 measurement fixtures"
+        )
+    )]
+    pub fn temporal_history_storage(&self) -> crate::precision::SurfaceStorage {
+        self.temporal_history_storage
+    }
+
     /// The clean-history read cursor a consumer must use to turn an age into a
     /// layer, derived through `temporal::temporal_read_snapshot` exactly as the
     /// temporal pass derives its own uniform.
@@ -2383,6 +2445,19 @@ mod tests {
                 ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS,
             ),
         }
+    }
+
+    /// The Gate 6 candidate's plan: the same topology with the 25-layer
+    /// temporal class charged at 8 bytes per pixel instead of 4. The
+    /// candidate must declare the truth to `validate_host_resource_plan`,
+    /// which computes the class width from the requested history storage.
+    fn full16_capacities(dimensions: [u32; 2]) -> HostCapacities {
+        let pixels = u64::from(dimensions[0]) * u64::from(dimensions[1]);
+        let mut capacities = capacities(dimensions, false);
+        capacities.resources.creative_bytes = pixels
+            * (u64::from(capacities.resources.rgba16_surface_layers) * 8
+                + u64::from(ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS) * 8);
+        capacities
     }
 
     fn assert_near(actual: [f32; 4], expected: [f32; 4]) {
@@ -3339,7 +3414,11 @@ mod tests {
         underreported.resources.creative_bytes -=
             u64::from(dimensions[0]) * u64::from(dimensions[1]) * 4;
         assert!(matches!(
-            validate_host_resource_plan(dimensions, underreported),
+            validate_host_resource_plan(
+                dimensions,
+                underreported,
+                crate::precision::SurfaceStorage::Compat8
+            ),
             Err(CompositionHostError::ResourcePlanUnderreports {
                 planned_compat8: 24,
                 required_compat8: ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS,
@@ -3348,7 +3427,12 @@ mod tests {
         ));
 
         let admitted = capacities(dimensions, true);
-        assert!(validate_host_resource_plan(dimensions, admitted).is_ok());
+        assert!(validate_host_resource_plan(
+            dimensions,
+            admitted,
+            crate::precision::SurfaceStorage::Compat8
+        )
+        .is_ok());
         assert!(admitted.resources.creative_bytes < MAX_CREATIVE_GPU_BYTES);
     }
 
@@ -4473,6 +4557,425 @@ mod tests {
         });
         println!(
             "M6_GPU_RECEIPT={}",
+            serde_json::to_string_pretty(&receipt).unwrap()
+        );
+    }
+
+    #[test]
+    fn full16_history_plan_charges_eight_bytes_per_temporal_pixel_and_discriminates() {
+        use crate::precision::SurfaceStorage;
+
+        let dimensions = [64_u32, 36];
+        let pixels = u64::from(dimensions[0]) * u64::from(dimensions[1]);
+
+        // The settled plan validates under Compat8 exactly as it always has,
+        // and is refused under the candidate storage — the widths genuinely
+        // discriminate rather than both passing a looser check.
+        assert!(validate_host_resource_plan(
+            dimensions,
+            capacities(dimensions, false),
+            SurfaceStorage::Compat8,
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_host_resource_plan(
+                dimensions,
+                capacities(dimensions, false),
+                SurfaceStorage::Rgba16Float,
+            ),
+            Err(CompositionHostError::ResourcePlanBytes { .. })
+        ));
+
+        // The candidate plan validates only under the candidate storage.
+        assert!(validate_host_resource_plan(
+            dimensions,
+            full16_capacities(dimensions),
+            SurfaceStorage::Rgba16Float,
+        )
+        .is_ok());
+        assert!(matches!(
+            validate_host_resource_plan(
+                dimensions,
+                full16_capacities(dimensions),
+                SurfaceStorage::Compat8,
+            ),
+            Err(CompositionHostError::ResourcePlanBytes { .. })
+        ));
+
+        // One byte under the exact total is refused, the ledger's own law.
+        let mut under = full16_capacities(dimensions);
+        under.resources.creative_bytes -= 1;
+        assert!(matches!(
+            validate_host_resource_plan(dimensions, under, SurfaceStorage::Rgba16Float),
+            Err(CompositionHostError::ResourcePlanBytes { .. })
+        ));
+
+        // The exact increase is the documented candidate delta: 25 temporal
+        // surfaces widening from 4 to 8 bytes per pixel.
+        let settled = capacities(dimensions, false).resources.creative_bytes;
+        let candidate = full16_capacities(dimensions).resources.creative_bytes;
+        assert_eq!(
+            candidate - settled,
+            pixels * u64::from(ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS) * 4
+        );
+    }
+
+    /// Gate 6's measurement, through the real composition host on the
+    /// production device request: the `ExperimentalFull16History` candidate
+    /// against the settled path on two temporal lanes, each judged against an
+    /// analytic f32 reference no candidate output ever touches, with the
+    /// verdict written into the tracked receipt
+    /// `docs/evidence/full16-history-candidate-receipt.json` (regenerated in
+    /// place — a changed receipt after an opt-in run is a new measurement on
+    /// new hardware, not drift; commit it). The candidate is measurement-only:
+    /// no production call site constructs it and the settled default does not
+    /// move, which the M6 receipt's pinned output SHAs prove across this
+    /// tranche.
+    #[test]
+    #[ignore = "requires a physical GPU adapter; emits the Gate 6 Full-16 history candidate receipt"]
+    fn gpu_full16_history_candidate_measures_temporal_gain_and_writes_the_receipt() {
+        use crate::precision::{
+            measure_precision, ArtisticGainAssessment, LinearRgbaFixture, ObjectiveGainVerdict,
+            PrecisionResourceDelta, SurfaceStorage,
+        };
+
+        const TEMPORAL_FRAMES: u32 = 12;
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("physical GPU adapter for the Full-16 candidate receipt");
+        let adapter_info = adapter.get_info();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Gate 6 Full-16 history candidate receipt"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .expect("GPU device for the Full-16 candidate receipt");
+        let dimensions = [192_u32, 108];
+        let pixels = u64::from(dimensions[0]) * u64::from(dimensions[1]);
+
+        let settled = CompositionHost::new(&device, dimensions, capacities(dimensions, false))
+            .expect("settled host");
+        let candidate = CompositionHost::new_with_history_storage(
+            &device,
+            dimensions,
+            full16_capacities(dimensions),
+            SurfaceStorage::Rgba16Float,
+        )
+        .expect("Full-16 candidate host");
+        assert_eq!(settled.temporal_history_storage(), SurfaceStorage::Compat8);
+        assert_eq!(
+            candidate.temporal_history_storage(),
+            SurfaceStorage::Rgba16Float
+        );
+
+        // The M6 temporal workload, verbatim: a moving pulse over a gradient,
+        // feedback 0.50, and the analytic max/decay reference.
+        let temporal_params = TemporalParams {
+            feedback: 0.50,
+            ..TemporalParams::default()
+        };
+        let temporal_frame = |frame: u32| {
+            (0..dimensions[1])
+                .flat_map(|y| {
+                    (0..dimensions[0]).map(move |x| {
+                        let xn = x as f32 / (dimensions[0] - 1) as f32;
+                        let yn = y as f32 / (dimensions[1] - 1) as f32;
+                        let center = (frame * 17) % dimensions[0];
+                        let distance = x.abs_diff(center);
+                        let pulse = match distance {
+                            0 => 0.48,
+                            1 => 0.27,
+                            2 => 0.09,
+                            _ => 0.0,
+                        };
+                        let micro = ((x * 5 + y * 7 + frame * 3) % 11) as f32 * 0.000_09;
+                        [
+                            (0.008 + xn * 0.16 + yn * 0.011 + pulse + micro).min(0.95),
+                            (0.011 + xn * 0.09 + yn * 0.017 + pulse * 0.42 + micro).min(0.95),
+                            (0.006 + xn * 0.05 + yn * 0.023 + pulse * 0.18 + micro).min(0.95),
+                            1.0,
+                        ]
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut feedback_reference = Vec::new();
+        for frame in 0..TEMPORAL_FRAMES {
+            let current = temporal_frame(frame);
+            feedback_reference = if frame == 0 {
+                current
+            } else {
+                current
+                    .into_iter()
+                    .zip(feedback_reference)
+                    .map(|(current, previous)| {
+                        [
+                            current[0].max(previous[0] * temporal_params.feedback),
+                            current[1].max(previous[1] * temporal_params.feedback),
+                            current[2].max(previous[2] * temporal_params.feedback),
+                            current[3],
+                        ]
+                    })
+                    .collect()
+            };
+        }
+        let feedback_reference_fixture =
+            LinearRgbaFixture::try_from_samples(feedback_reference).unwrap();
+        let frame_input = TemporalFrameInput::legacy(1.0 / 30.0, true);
+        let timing = HostFrameTiming::from_temporal_input(frame_input);
+
+        // One f16 readback target serves every lane on both hosts.
+        let readback_target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Gate 6 candidate readback target"),
+            size: wgpu::Extent3d {
+                width: dimensions[0],
+                height: dimensions[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HOST_WORKING_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let readback_view = readback_target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let run_lanes = |host: &CompositionHost| {
+            let current = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Gate 6 lane clean input"),
+                size: wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: HOST_WORKING_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let current_view = current.create_view(&wgpu::TextureViewDescriptor::default());
+            let output = host.surface(HostSurface::Pong);
+            let input = host.prepare_temporal_input(&device, &current_view, output.view);
+
+            // Lane 1 — feedback recursion. The recursive member of the
+            // temporal class re-quantizes every frame on the settled path.
+            host.reset_temporal();
+            for frame in 0..TEMPORAL_FRAMES {
+                let bytes = advanced_fixture_bytes(&temporal_frame(frame));
+                upload_texture_bytes(&queue, &current, dimensions, 8, &bytes);
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Gate 6 feedback lane frame"),
+                });
+                host.encode_temporal(
+                    &queue,
+                    &mut encoder,
+                    &input,
+                    &current,
+                    output.texture,
+                    output.view,
+                    &temporal_params,
+                    timing,
+                );
+                queue.submit(std::iter::once(encoder.finish()));
+                device
+                    .poll(wgpu::PollType::wait_indefinitely())
+                    .expect("feedback lane wait");
+                host.commit_temporal_frame();
+            }
+            let feedback_output = read_texture_bytes(
+                &device,
+                &queue,
+                output.texture,
+                dimensions,
+                8,
+                "Gate 6 feedback lane readback",
+            );
+            let feedback_metrics = measure_precision(
+                &feedback_reference_fixture,
+                &LinearRgbaFixture::try_from_samples(advanced_linear_samples(&feedback_output))
+                    .unwrap(),
+            )
+            .unwrap();
+
+            // Lane 2 — clean-history storage fidelity: what one committed
+            // ring layer returns against the exact frame it recorded, through
+            // the production conversion pipeline in both directions.
+            let ring_frame = temporal_frame(0);
+            upload_texture_bytes(
+                &queue,
+                &current,
+                dimensions,
+                8,
+                &advanced_fixture_bytes(&ring_frame),
+            );
+            let ring_layer_view =
+                host._temporal_history_texture
+                    .create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("Gate 6 ring lane layer 0"),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        base_array_layer: 0,
+                        array_layer_count: Some(1),
+                        ..Default::default()
+                    });
+            let ring_write_source = host.prepare_copy_source(&device, &current_view);
+            let ring_read_source = host.prepare_copy_source(&device, &ring_layer_view);
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Gate 6 ring lane"),
+            });
+            {
+                let mut pass =
+                    begin_replace_pass(&mut encoder, "Gate 6 ring record", &ring_layer_view);
+                pass.set_pipeline(&host.compat8_copy_pipeline);
+                pass.set_bind_group(0, &ring_write_source.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            {
+                let mut pass =
+                    begin_replace_pass(&mut encoder, "Gate 6 ring readout", &readback_view);
+                pass.set_pipeline(&host.copy_pipeline);
+                pass.set_bind_group(0, &ring_read_source.bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            queue.submit(std::iter::once(encoder.finish()));
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("ring lane wait");
+            let ring_output = read_texture_bytes(
+                &device,
+                &queue,
+                &readback_target,
+                dimensions,
+                8,
+                "Gate 6 ring lane readback",
+            );
+            let ring_metrics = measure_precision(
+                &LinearRgbaFixture::try_from_samples(ring_frame).unwrap(),
+                &LinearRgbaFixture::try_from_samples(advanced_linear_samples(&ring_output))
+                    .unwrap(),
+            )
+            .unwrap();
+            (feedback_metrics, ring_metrics)
+        };
+
+        let (settled_feedback, settled_ring) = run_lanes(&settled);
+        let (candidate_feedback, candidate_ring) = run_lanes(&candidate);
+
+        // The exact candidate cost at this fixture size: 25 temporal
+        // surfaces widening from 4 to 8 bytes per pixel.
+        let delta = PrecisionResourceDelta {
+            additional_bytes: pixels * u64::from(ADVANCED_TEMPORAL_COMPAT8_SURFACE_LAYERS) * 4,
+            released_bytes: 0,
+        };
+        let feedback_assessment =
+            ArtisticGainAssessment::compare(settled_feedback, candidate_feedback, delta).unwrap();
+        let ring_assessment =
+            ArtisticGainAssessment::compare(settled_ring, candidate_ring, delta).unwrap();
+
+        // Storage fidelity must improve — f16 is denser than sRGB8 across
+        // the whole in-gamut range — and the recursive lane must not regress.
+        assert!(
+            candidate_ring.rmse < settled_ring.rmse,
+            "Full-16 ring storage did not reduce objective error: settled={settled_ring:?}, candidate={candidate_ring:?}"
+        );
+        assert!(
+            candidate_feedback.rmse <= settled_feedback.rmse,
+            "Full-16 feedback recursion regressed: settled={settled_feedback:?}, candidate={candidate_feedback:?}"
+        );
+
+        let verdict_str = |verdict: ObjectiveGainVerdict| match verdict {
+            ObjectiveGainVerdict::NoMeasuredGain => "no measured gain",
+            ObjectiveGainVerdict::MeasuredObjectiveGain => "measured objective gain",
+            ObjectiveGainVerdict::ResourceOrMetricTradeoff => "resource or metric tradeoff",
+            ObjectiveGainVerdict::ObjectiveRegression => "objective regression",
+        };
+        let metric_json = |measurement: crate::precision::PrecisionMeasurement| {
+            serde_json::json!({
+                "rmse": measurement.rmse,
+                "max_absolute_error": measurement.max_absolute_error,
+                "clamped_channel_events": measurement.clamped_channel_events,
+                "reference_gradient_events": measurement.reference_gradient_events,
+                "retained_gradient_events": measurement.retained_gradient_events,
+            })
+        };
+        let assessment_json = |assessment: &ArtisticGainAssessment| {
+            serde_json::json!({
+                "verdict": verdict_str(assessment.verdict),
+                "rmse_reduction": assessment.rmse_reduction,
+                "max_error_reduction": assessment.max_error_reduction,
+                "clamped_events_avoided": assessment.clamped_events_avoided,
+                "gradients_recovered": assessment.gradients_recovered,
+            })
+        };
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+        let receipt = serde_json::json!({
+            "schema": "collide-o-scope-full16-history-candidate-receipt/1",
+            "command": "cargo test --locked gpu_full16_history_candidate_measures_temporal_gain_and_writes_the_receipt -- --ignored --nocapture",
+            "measured_at": {
+                "commit": git(&["rev-parse", "HEAD"]),
+                "branch": git(&["rev-parse", "--abbrev-ref", "HEAD"]),
+                // A dirty tree names its parent commit; say so rather than
+                // implying the named commit alone produced the numbers.
+                "tree": match git(&["status", "--porcelain"]).as_str() {
+                    "unknown" => "unknown",
+                    "" => "clean",
+                    _ => "dirty",
+                },
+            },
+            "adapter": {
+                "name": adapter_info.name,
+                "backend": format!("{:?}", adapter_info.backend),
+                "device_type": format!("{:?}", adapter_info.device_type),
+                "driver": adapter_info.driver,
+                "driver_info": adapter_info.driver_info,
+            },
+            "scope": "ExperimentalFull16History remains evaluation-only: the candidate host is constructed by this fixture alone, presentation and dither are unchanged, and the settled AdvancedWorking16HistoryCompat8 default does not move (pinned by the M6 receipt's output SHAs).",
+            "dimensions": dimensions,
+            "resource_delta": {
+                "fixture_additional_bytes": delta.additional_bytes,
+                "documented_1080p_additional_bytes": 207_360_000_u64,
+                "documented_1080p_additional_mib": "197.753906",
+                "surfaces": "all 25 temporal surfaces (24-layer clean-history ring plus recursive feedback) widen from 4 to 8 bytes per pixel; no other surface changes",
+            },
+            "feedback_recursion": {
+                "frames": TEMPORAL_FRAMES,
+                "feedback": temporal_params.feedback,
+                "workload": "production feedback shader over a moving pulse; analytic f32 max/decay reference",
+                "settled_compat8_history": metric_json(settled_feedback),
+                "full16_history_candidate": metric_json(candidate_feedback),
+                "assessment": assessment_json(&feedback_assessment),
+            },
+            "clean_history_storage_fidelity": {
+                "workload": "one frame recorded into ring layer 0 through the production no-dither conversion pipeline and read back through the production copy pipeline; reference is the exact f32 frame",
+                "settled_compat8_history": metric_json(settled_ring),
+                "full16_history_candidate": metric_json(candidate_ring),
+                "assessment": assessment_json(&ring_assessment),
+            },
+        });
+        std::fs::write(
+            "docs/evidence/full16-history-candidate-receipt.json",
+            format!("{}\n", serde_json::to_string_pretty(&receipt).unwrap()),
+        )
+        .expect("write the Full-16 candidate receipt");
+        println!(
+            "FULL16_CANDIDATE_RECEIPT={}",
             serde_json::to_string_pretty(&receipt).unwrap()
         );
     }

@@ -44,6 +44,7 @@ src/
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
 ├── renderer/study.rs    fixed-pipeline Study interpreter executor, two textures, no sampler
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
+├── video/hw_decode.rs   evaluation-only D3D11VA session and the interop probe seam
 ├── video/threaded.rs    request decoder, codec motion, telemetry, latest-only mailbox
 ├── layers/mod.rs        video/Spout layer sources, texture upload, frame pacer
 ├── effects/params.rs    effect and temporal parameters/normalization
@@ -1898,6 +1899,26 @@ the browser cannot bypass the content-identity contract, and a request is an
 operational event: it records no manual history and survives an Apply Look
 unfiltered.
 
+Host-session proxy settings are authored, not fixed. `set_proxy_settings
+{ scale, frame_rate, include_audio }` is an ordinary immediate coalescible
+host action (`host:proxy-settings`, never quantized, never priority — the
+`set_media_safety_mode` shape), validated at the server gate and at the
+handler by `ProxySettings::authored`, the one authoring door, which always
+stamps this build's schema and algorithm versions so a wire tuple can never
+smuggle a foreign version into a cache key. The engine holds exactly one
+authored owner (`App::proxy_settings`); the HUD assessment, the patch-load
+consultation, the encode request, and the hot-adoption job all answer from
+it — pinned by a source audit on `ProxySettings::default()` — so the
+program can never encode under one settings tuple and consult under
+another. `AppSnapshot::proxy_settings` publishes only the three operator
+choices. Each tuple is its own content-addressed cache key by design: a
+change governs future encodes and consultations, touches no live
+proxy-backed layer and no published artifact, and a load consults the
+cache under the current session tuple only. Like the media-safety mode,
+the value is process-local, absent from patches, and a new process starts
+at the default; an operator-facing summary reports every installed tuple
+and every typed refusal, which leaves the authored owner untouched.
+
 Live NTSC diagnostics remain path-specific. For both the global and selective
 paths, `attempted` counts admission decisions, `accepted` counts admitted work,
 `skipped` counts only healthy Busy backpressure, and `unavailable` separately
@@ -1969,7 +1990,24 @@ mislead browser tests.
   `gpu_precision_receipt_measures_real_still_and_temporal_workloads` plus its
   premultiplied-edge, temporal-feedback, LegacyExact-spatial, and 24/30/60
   temporal parity companions. Keep the adapter/backend, exact command, source
-  manifest, and receipt hash with any claim.
+  manifest, and receipt hash with any claim. The Gate 6 Full-16 history
+  candidate uses
+  `gpu_full16_history_candidate_measures_temporal_gain_and_writes_the_receipt`,
+  which regenerates the tracked
+  `docs/evidence/full16-history-candidate-receipt.json` in place — the
+  S2-receipt law applies: a changed receipt after an opt-in run is a new
+  measurement, commit it. The hosted
+  `full16_history_plan_charges_eight_bytes_per_temporal_pixel_and_discriminates`
+  pins the candidate plan's 8-byte temporal class against the settled 4-byte
+  one in both directions with one-byte-under rejection. The Gate 4 hardware
+  decode backend uses
+  `hw_decode_interop_probe_measures_agreement_and_writes_the_receipt`
+  (Windows, a real D3D11VA device, `videos/audit.mp4`), which regenerates
+  the tracked `docs/evidence/hw-decode-interop-receipt.json` in place under
+  the same S2-receipt law; the hosted
+  `the_production_probe_defers_every_capability_with_its_actionable_reason`
+  pins the per-platform progression, including hardware decode stopping at
+  exactly `EvaluationRequired(InteroperabilityProof)` on Windows.
 - `s2-eight-texture-floor-receipt.json` is a tracked artifact that the probe in
   `tests/eight_texture_floor_probe.rs` regenerates in place. It is tracked
   because `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS` and the Symmetry Field's
@@ -2149,6 +2187,13 @@ mislead browser tests.
   atomic publish law with the prior artifact readable until replacement and
   the seal following the artifact; mid-file corruption refused by the seal
   and discarded; eviction following the pure plan with a path-free receipt;
+  the advisory cross-session recency record — the mid-write reproduction
+  recovered beside a healthy sealed cache with the prior record applied in
+  full, cross-session eviction order surviving a reopen and reaching the
+  pure preflight, every hostile record shape (torn, wrong version, unknown
+  field, malformed or duplicate key, oversized) discarded whole without
+  refusing the cache, ghost rows resurrecting nothing and never advancing
+  the counter, and removals rewriting the record;
   foreign files counted but never touched; the contract-derived argv; garbage
   bytes failing decoded-identity validation; mutated/unreadable sources
   refused before any encode; the Y-key mapping; hot adoption's
@@ -2265,7 +2310,16 @@ a passing claim.
   fingerprints the source through the same bounded machinery (mint mode),
   lands the identity behind claim guards, and — the operator's S9 ruling —
   enters it into persistence, so the next patch capture emits the content
-  reference exactly as generation would have. Spout layers still cannot be
+  reference exactly as generation would have. Settings beyond the default
+  are now authored host-session state through the one-owner law in the web
+  section: each tuple keys its own cache entry, a load consults under the
+  current session tuple only, and the default tuple remains the process
+  start. Eviction recency survives sessions through the cache directory's
+  single advisory `recency.json`, written by the artifact publication's own
+  staged atomic replace: it orders eviction and nothing else, a missing or
+  hostile record degrades whole to session-local order, a row naming an
+  absent key resurrects nothing, and no record can refuse the cache or
+  bypass a seal — consumption re-hashes regardless. Spout layers still cannot be
   proxied (no file bytes exist), which is a category fact rather than an
   edge. A host killed
   mid-encode may orphan one ffmpeg process bounded by its own completion;
@@ -2273,6 +2327,36 @@ a passing claim.
   Unix CI FFmpeg build carries `--disable-programs`, so end-to-end encode
   fixtures are opt-in like `effects_audit` and hosted CI proves the
   CLI-free cache half only.
+- Hardware decode now has a backend in the tree, and it is
+  **evaluation-only**: `video::hw_decode` is a Windows/D3D11VA session that
+  decodes through FFmpeg's library hwaccel path and downloads every hardware
+  surface for comparison. It is constructed by the opt-in interop probe
+  alone — no production decode path, no wire action, no toggle. Landing it
+  moved the capability to exactly
+  `EvaluationRequired(InteroperabilityProof)` on Windows through the
+  module's own `backend_integrated` seam, and deliberately no further: the
+  tracked interop receipt is evidence for the operator's next decision, not
+  a runtime fact, so `Available`, live usage, and zero-copy are separate
+  operator-decided tranches. `hardware_decode_active` stays false because
+  `EvaluationRequired` is not `Available`. Export determinism is a standing
+  boundary for any future live tranche: the offline renderer keeps its
+  synchronous software decoders unless per-adapter bit-exactness is proven —
+  "the same patch exports differently on different GPUs" is never an
+  acceptable trade.
+- `ExperimentalFull16History` now has an implemented render path, but it is
+  **measurement-only**: `CompositionHost::new_with_history_storage` widens
+  exactly the 25-layer temporal class (ring plus feedback) to RGBA16Float, is
+  constructed by the Gate 6 receipt fixture alone, and has no wire action, no
+  patch field, no env toggle, and no production call site. The settled
+  `AdvancedWorking16HistoryCompat8` default has not moved — the production
+  `CompositionHost::new` delegates with `Compat8` and the M6 receipt's pinned
+  output SHAs prove byte identity. Because the ring and feedback are written
+  only by render passes and read only by texture loads, both storages present
+  identical linear values to every consumer; the candidate changes
+  quantization, never value domain, and no consumer shader changed. The
+  Symmetry-Field section's prohibition on a *new* RGBA16F full-frame history
+  ring is untouched: the candidate widens the existing ring under the
+  documented budget, it does not add a second one.
 - The Symmetry Field's eight-texture single pass is a *floor* claim resting on
   the S2 receipt's enforced-cap argument, measured on one adapter and one
   backend. It is a capability claim only, not performance, bandwidth, or cache

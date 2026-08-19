@@ -1,0 +1,33 @@
+{
+  "agreement": {
+    "comparison": "raw decoded 4:2:0 planes, hardware download (NV12, de-interleaved) against software decode (yuv420p), no format conversion in between",
+    "differing_samples": 0,
+    "max_chroma_delta": 0,
+    "max_luma_delta": 0,
+    "total_samples": 24883200
+  },
+  "command": "cargo test --locked hw_decode_interop_probe_measures_agreement_and_writes_the_receipt -- --ignored --nocapture",
+  "frames": {
+    "hardware_decoded": 72,
+    "software_fallback_in_hardware_session": 0,
+    "software_reference": 72
+  },
+  "hardware_download_wall_ns_per_frame": 1726069,
+  "host": {
+    "arch": "x86_64",
+    "avcodec_version": 4070502,
+    "avformat_version": 4066406,
+    "backend": "D3D11VA via FFmpeg av_hwdevice_ctx_create on the default adapter",
+    "os": "windows"
+  },
+  "measured_at": {
+    "branch": "feat/proxy-authored-settings",
+    "commit": "1d25517d2d098d00dae9b5899f9e2378807c2bd0",
+    "tree": "dirty"
+  },
+  "schema": "collide-o-scope-hw-decode-interop-receipt/1",
+  "scope": "evaluation-only: the session is constructed by this probe alone; the capability stops at EvaluationRequired, hardware_decode_active stays false, and live usage plus zero-copy remain separate operator-decided tranches",
+  "software_wall_ns_per_frame": 500412,
+  "source": "videos/audit.mp4 (untracked local clip; identity travels via frame counts and agreement, not bytes)",
+  "timing_scope": "fixture-local wall time; the hardware loop downloads every frame to system memory, which a live integration would avoid — smoke evidence only"
+}

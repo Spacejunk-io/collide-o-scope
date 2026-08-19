@@ -1168,6 +1168,12 @@ pub struct AppSnapshot {
     /// existing layer.
     #[serde(default = "default_new_layer_fit")]
     pub new_layer_fit: FitMode,
+    /// Host-session authored proxy settings: the exact tuple future proxy
+    /// encodes and cache consultations use. Each tuple is its own
+    /// content-addressed cache key by design, patches never own this value,
+    /// and changing it rewrites no live layer and invalidates no artifact.
+    #[serde(default)]
+    pub proxy_settings: ProxySettingsSnapshot,
     pub layers: Vec<LayerSnapshot>,
     /// Prepared cross-layer scene bank and its current staging state. This is
     /// additive so an older engine/panel pair continues to deserialize an
@@ -1294,6 +1300,7 @@ impl Default for AppSnapshot {
             ntsc: NtscSnapshot::default(),
             media_safety: MediaSafetySnapshot::default(),
             new_layer_fit: default_new_layer_fit(),
+            proxy_settings: ProxySettingsSnapshot::default(),
             layers: Vec::new(),
             performance: PerformanceSnapshot::default(),
             layer_stack_revision: 0,
@@ -1638,6 +1645,48 @@ impl MediaSafetySnapshot {
             portable_vram_budget_available: policy.portable_vram_budget_available,
             rationale,
             status,
+        }
+    }
+}
+
+/// Browser-facing view of the host-session authored proxy settings. Only the
+/// three operator choices cross the wire; the schema and algorithm versions
+/// are always the engine's own constants and are deliberately not published,
+/// so a client can never echo a foreign version back into a cache key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxySettingsSnapshot {
+    #[serde(default = "default_proxy_scale")]
+    pub scale: crate::proxy::ProxyScale,
+    #[serde(default = "default_proxy_frame_rate")]
+    pub frame_rate: crate::proxy::ProxyFrameRate,
+    #[serde(default = "default_proxy_include_audio")]
+    pub include_audio: bool,
+}
+
+const fn default_proxy_scale() -> crate::proxy::ProxyScale {
+    crate::proxy::ProxyScale::Half
+}
+
+const fn default_proxy_frame_rate() -> crate::proxy::ProxyFrameRate {
+    crate::proxy::ProxyFrameRate::Source
+}
+
+const fn default_proxy_include_audio() -> bool {
+    true
+}
+
+impl Default for ProxySettingsSnapshot {
+    fn default() -> Self {
+        Self::from_settings(crate::proxy::ProxySettings::default())
+    }
+}
+
+impl ProxySettingsSnapshot {
+    pub fn from_settings(settings: crate::proxy::ProxySettings) -> Self {
+        Self {
+            scale: settings.scale,
+            frame_rate: settings.frame_rate,
+            include_audio: settings.include_audio,
         }
     }
 }
@@ -3842,6 +3891,18 @@ pub enum WebAction {
     /// file, still, and Spout layers. Patches never own this value.
     #[serde(rename = "set_new_layer_fit")]
     SetNewLayerFit { fit: FitMode },
+    /// Change the host-session proxy settings for future encodes and cache
+    /// consultations. The action always carries the complete tuple; the
+    /// engine validates it and installs it into the single authored owner.
+    /// Each tuple is its own content-addressed cache key by design, patches
+    /// never own this value, and no live layer or published artifact is
+    /// rewritten by a change.
+    #[serde(rename = "set_proxy_settings")]
+    SetProxySettings {
+        scale: crate::proxy::ProxyScale,
+        frame_rate: crate::proxy::ProxyFrameRate,
+        include_audio: bool,
+    },
     /// Deterministically choose a new stochastic pattern and optionally make
     /// bounded visual-control variations. Every press is an ordered barrier.
     #[serde(rename = "reroll")]
@@ -4430,6 +4491,7 @@ impl WebAction {
             Self::SetMediaFrozen { .. } => Some("media:frozen".into()),
             Self::SetMediaSafetyMode { .. } => Some("media:safety-mode".into()),
             Self::SetNewLayerFit { .. } => Some("host:new-layer-fit".into()),
+            Self::SetProxySettings { .. } => Some("host:proxy-settings".into()),
             Self::SetLayerRerollOnLoop {
                 index, layer_id, ..
             } => Some(format!(
@@ -8200,6 +8262,81 @@ mod protocol_tests {
     }
 
     #[test]
+    fn proxy_settings_action_is_a_strict_coalesced_ordinary_host_action() {
+        // The action always carries the complete tuple; both frame-rate forms
+        // parse through the engine's own closed vocabularies.
+        let source: WebAction = serde_json::from_str(
+            r#"{"action":"set_proxy_settings","scale":"quarter","frame_rate":"source","include_audio":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            source,
+            WebAction::SetProxySettings {
+                scale: crate::proxy::ProxyScale::Quarter,
+                frame_rate: crate::proxy::ProxyFrameRate::Source,
+                include_audio: false,
+            }
+        ));
+        let fixed: WebAction = serde_json::from_str(
+            r#"{"action":"set_proxy_settings","scale":"original","frame_rate":{"fixed":{"numerator":30,"denominator":1}},"include_audio":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            fixed,
+            WebAction::SetProxySettings {
+                scale: crate::proxy::ProxyScale::Original,
+                frame_rate: crate::proxy::ProxyFrameRate::Fixed {
+                    numerator: 30,
+                    denominator: 1,
+                },
+                include_audio: true,
+            }
+        ));
+
+        // An unknown scale token is a deserialization rejection, never a
+        // fallback onto a neighbouring choice; a partial tuple is refused.
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_proxy_settings","scale":"eighth","frame_rate":"source","include_audio":true}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<WebAction>(
+            r#"{"action":"set_proxy_settings","scale":"half"}"#
+        )
+        .is_err());
+
+        // Ordinary host preference: coalesced under one key (newest tuple
+        // wins), no admission priority.
+        assert_eq!(
+            source.coalesce_key().as_deref(),
+            Some("host:proxy-settings")
+        );
+        assert!(!source.is_priority());
+    }
+
+    #[test]
+    fn proxy_settings_snapshot_is_additive_and_mirrors_the_engine_default() {
+        // An older snapshot without the field restores the exact default
+        // tuple, so legacy clients and snapshots stay compatible.
+        let mut app_value = serde_json::to_value(AppSnapshot::default()).unwrap();
+        app_value.as_object_mut().unwrap().remove("proxy_settings");
+        let restored: AppSnapshot = serde_json::from_value(app_value).unwrap();
+        assert_eq!(restored.proxy_settings, ProxySettingsSnapshot::default());
+        assert_eq!(
+            restored.proxy_settings,
+            ProxySettingsSnapshot::from_settings(crate::proxy::ProxySettings::default())
+        );
+
+        // Only the three operator choices cross the wire — the schema and
+        // algorithm versions stay engine-internal.
+        let wire = serde_json::to_value(ProxySettingsSnapshot::default()).unwrap();
+        let object = wire.as_object().unwrap();
+        assert_eq!(object.len(), 3);
+        assert_eq!(object["scale"], "half");
+        assert_eq!(object["frame_rate"], "source");
+        assert_eq!(object["include_audio"], true);
+    }
+
+    #[test]
     fn media_safety_and_ntsc_metrics_default_old_snapshots_without_raising_limits() {
         let mut app_value = serde_json::to_value(AppSnapshot::default()).unwrap();
         app_value.as_object_mut().unwrap().remove("media_safety");
@@ -8272,6 +8409,38 @@ mod protocol_tests {
         assert!(js.contains("skipped"));
         assert!(js.contains("unavailable"));
         assert!(js.contains("stale"));
+    }
+
+    #[test]
+    fn proxy_settings_static_contract_is_accessible_and_authoritative() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+
+        assert!(html.contains("aria-labelledby=\"proxy-settings-title\""));
+        assert!(html.contains("id=\"proxy-settings-title\""));
+        assert!(html.contains("for=\"proxy-scale\""));
+        assert!(html.contains("id=\"proxy-scale\""));
+        assert!(html.contains("for=\"proxy-frame-rate\""));
+        assert!(html.contains("id=\"proxy-frame-rate\""));
+        assert!(html.contains("for=\"proxy-include-audio\""));
+        assert!(html.contains("id=\"proxy-include-audio\""));
+        assert!(html.contains("id=\"proxy-settings-help\""));
+
+        assert!(js.contains("syncProxySettings(msg.proxy_settings)"));
+        assert!(js.contains("action: 'set_proxy_settings'"));
+        // A fixed rate another controller authored outside the presets is
+        // represented honestly rather than snapped to the nearest preset.
+        assert!(js.contains("data-authored-elsewhere"));
+
+        // A host policy is never client-quantizable.
+        let quantizable = js
+            .split("const QUANTIZABLE_ACTIONS")
+            .nth(1)
+            .expect("panel declares its quantizable set")
+            .split("]);")
+            .next()
+            .expect("quantizable set is closed");
+        assert!(!quantizable.contains("set_proxy_settings"));
     }
 
     #[test]

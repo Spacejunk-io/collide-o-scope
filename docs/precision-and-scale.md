@@ -24,6 +24,49 @@ The production minimum proof uses 1,920 × 1,080 = 2,073,600 pixels, eight RGBA1
 | Exact fixture total | 340,082,688 bytes (324.328125 MiB) | 547,442,688 bytes (522.082031 MiB) |
 | Exact increase | — | 207,360,000 bytes (197.753906 MiB) |
 
+### Full-16 history candidate measurement
+
+The Gate 6 commission opened the missing half of the candidate row above: an
+experimental render path to measure. `CompositionHost::new_with_history_storage`
+widens exactly the 25-layer temporal class — the 24-layer clean-history ring
+and the recursive feedback image — to RGBA16Float, leaving working, present,
+dither, and every consumer shader untouched. Because the class is written only
+by render passes (the no-dither conversion pipeline) and read only by texture
+loads, both storages present identical *linear* values to every consumer:
+sRGB8 encodes on write and decodes on read, f16 carries linear directly, so
+the candidate changes quantization, never value domain. The path is
+**measurement-only**: it is constructed by the receipt fixture alone, has no
+wire action, no patch field, and no production call site, and the settled
+`AdvancedWorking16HistoryCompat8` default has not moved — the production
+constructor delegates with Compat8 and the M6 receipt's pinned output SHAs
+hold across the change.
+
+The measurement lives in the tracked
+[`full16-history-candidate-receipt.json`](evidence/full16-history-candidate-receipt.json),
+regenerated in place by the opt-in fixture on the receipt adapter
+(AMD Radeon RX 6950 XT / Vulkan, 192×108, production device request). Two
+lanes, each against an analytic f32 reference no candidate output touches:
+
+| Lane | Metric | Settled Compat8 history | Full-16 candidate |
+| --- | --- | ---: | ---: |
+| Clean-history storage fidelity | RMSE | 0.0005051289 | 0.0000147806 |
+| | Max absolute error | 0.0037157834 | 0.0001202226 |
+| | Retained gradients | 10,312 / 11,506 | 11,506 / 11,506 |
+| Feedback recursion (12 frames) | RMSE | 0.0000903414 | 0.0000216753 |
+| | Max absolute error | 0.0030384660 | 0.0003659725 |
+| | Retained gradients | 11,949 / 11,949 | 11,949 / 11,949 |
+
+The documented result: a measured objective gain at a measured cost — the
+`ArtisticGainAssessment` verdict is "resource or metric tradeoff" on both
+lanes, its exact phrase for improvement that is not free. Ring storage error
+falls roughly 34× and the settled ring demonstrably loses 1,194 of 11,506
+real reference gradients to 8-bit quantization that the candidate retains in
+full; accumulated feedback error falls roughly 4×. The cost is the exact
+delta in the candidate table above: +207,360,000 bytes (197.753906 MiB) at
+1080p, all 25 temporal surfaces, nothing else. Whether that trade is worth
+paying live remains a product decision this measurement now informs; the
+candidate stays evaluation-only until it is made.
+
 Eight is the minimum executor topology, not a universal constant: accepted N-1 Program history, rack/image taps, and other planned surfaces increase the creative allocation explicitly. `CompositionAllocationSnapshot` reports accepted creative and motion bytes; selective NTSC reports two RGBA8 scratch textures plus its current staging capacity only after allocation; composition staging and readback report their actual capacities. `RuntimeResourceLedger::reconcile` uses checked arithmetic across creative, motion, NTSC, staging, and readback, requires planned creative bytes to equal the physical allocation snapshot, and has an exact proof that a cap one byte below the computed total is rejected.
 
 Advanced premultiplied bilinear lookups are four explicit shader texture loads. Descriptor admission charges all four operations while retaining separate frozen limits of 32 logical lookups per rack and 1,024 per frame; explicit shader-operation limits are 128 and 4,096. An eight-node worst-case Advanced rack is accepted at exactly 32 logical lookups and 128 shader operations. A frame at exactly 1,024 logical lookups is accepted and 1,025 is rejected; 86 LegacyCanonical-only racks are also rejected at 1,032. The accounting neither disguises four loads as one sample nor grants Legacy/mixed plans four times the former logical budget.
@@ -93,7 +136,7 @@ The plan's ordering clause — an FFV1/Matroska worker only after defining bound
 
 ### The cache worker
 
-`src/proxy_worker.rs` executes the contract. The Y key requests an encode for the selected layer's verified content identity; the single worker thread re-fingerprints the source (a post-verification byte change is refused, never encoded under a stale digest), probes and plans through `plan_proxy_input`, holds a `MediaSafetyPolicy` reservation for the encode's lifetime, and babysits one ffmpeg child under the plan's absolute deadline, a staging-size kill at the per-artifact cap, bounded captured output, and a caller-owned cancel flag. The staged artifact's decoded identity is validated before publication — container, codec, geometry, stream layout, and a decoded first frame — and its exact bytes are then sealed by a SHA-256 sidecar published *after* the artifact, so a crash between the two renames leaves an unsealed artifact that recovery removes rather than serves. Consumption re-hashes the artifact against its seal before every adoption, so corruption anywhere in the file is refused and discarded, not just corruption a first-frame decode would notice; the job's own cache-hit path performs the same check, so a corrupt artifact can never be reported as already cached. Eviction follows the pure preflight's `(last-used ordinal, key)` order and returns a path-free receipt. The directory is the index — a scan rebuilds it, so there is no metadata file to corrupt — and last-used ordinals are session-local with the key order breaking ties deterministically.
+`src/proxy_worker.rs` executes the contract. The Y key requests an encode for the selected layer's verified content identity; the single worker thread re-fingerprints the source (a post-verification byte change is refused, never encoded under a stale digest), probes and plans through `plan_proxy_input`, holds a `MediaSafetyPolicy` reservation for the encode's lifetime, and babysits one ffmpeg child under the plan's absolute deadline, a staging-size kill at the per-artifact cap, bounded captured output, and a caller-owned cancel flag. The staged artifact's decoded identity is validated before publication — container, codec, geometry, stream layout, and a decoded first frame — and its exact bytes are then sealed by a SHA-256 sidecar published *after* the artifact, so a crash between the two renames leaves an unsealed artifact that recovery removes rather than serves. Consumption re-hashes the artifact against its seal before every adoption, so corruption anywhere in the file is refused and discarded, not just corruption a first-frame decode would notice; the job's own cache-hit path performs the same check, so a corrupt artifact can never be reported as already cached. Eviction follows the pure preflight's `(last-used ordinal, key)` order and returns a path-free receipt. The directory is the index — a scan rebuilds it — and last-used ordinals now survive sessions through the store's one advisory metadata file, `recency.json`, written by the same staged atomic replace the artifact publication uses on every touch, publication, eviction, and discard. Advisory means exactly that: a valid record seeds ordinals for directory-backed keys only (a row naming an absent key resurrects nothing), while a missing, torn, oversized, wrong-version, or otherwise hostile record is discarded whole and eviction order degrades to the old session-local behavior with the key order breaking ties deterministically. The record can never refuse the cache and never bypasses a seal — consumption re-hashes regardless of how an entry was ordered — and a recency write failure is soft, degrading a future session's eviction order and nothing else.
 
 Patch load consults the cache for content-referenced video sources: a validated artifact backs the decoder while the layer keeps the original's identity, so a proxy can never enter a patch, an export, Dice, or a Morph — export's digest-gated hint rejects the artifact path and re-resolves the original by content. The HUD layer status reports the whole lifecycle (requested, running, ready, refused, active), and once a proxy is active it reports the measured decode p95 beside the p95 recorded when the encode was requested — the decoder A/B, honest about being a session-local before/after rather than a controlled experiment.
 
@@ -133,6 +176,8 @@ The scale capability evaluator starts from evidence, not platform assumptions. W
 
 An integrated backend without proof yields `EvaluationRequired`; missing platform/backend/policy evidence yields a typed `Deferred` reason. This prevents a schema, menu item, or compile flag from being reported as a working external-video or venue feature.
 
-`probe_capability_evidence` is the one production source of evidence, and `scale_capability_decision` the one predicate built on it; before it landed, the only constructors of `CapabilityEvidence` were test fixtures typing literals. The probe answers `platform_supported` from the compile target (the platform API a backend would integrate against exists; Syphon is macOS-only by definition) and reports every other field honestly false: no backend is integrated anywhere in this tree, no authorization store exists, no interoperability receipt exists, and no venue requirement has been recorded. The probe therefore moves nothing to `Available` — a test pins each capability's exact deferred reason per platform, so an accidental flip cannot ship silently, and only NDI's reasons name a purchase or an authorization; hardware decode, zero-copy, and capture stop at `BackendNotIntegrated`, which is engineering, not an external gate.
+`probe_capability_evidence` is the one production source of evidence, and `scale_capability_decision` the one predicate built on it; before it landed, the only constructors of `CapabilityEvidence` were test fixtures typing literals. The probe answers `platform_supported` from the compile target (the platform API a backend would integrate against exists; Syphon is macOS-only by definition), answers `backend_integrated` from the backend's own module where one exists, and reports every other field honestly false: no authorization store exists, no runtime proof store exists, and no venue requirement has been recorded. The probe still moves nothing to `Available` — a test pins each capability's exact decision per platform, so an accidental flip cannot ship silently, and only NDI's reasons name a purchase or an authorization.
+
+The Gate 4 commission opened the first backend. `video::hw_decode` is an evaluation-only D3D11VA hardware decode session (Windows only): it decodes through FFmpeg's library hwaccel path — never the CLI — and downloads every hardware surface to system memory, which is the point for an evaluation session, because the opt-in interoperability probe compares those downloaded pixels frame-for-frame against the pure software decode of the same stream through one shared RGBA conversion, and regenerates the tracked [`hw-decode-interop-receipt.json`](evidence/hw-decode-interop-receipt.json) in place. Landing the backend flipped `backend_integrated` for hardware decode on Windows through the module's own `hardware_decode_backend_exists_on_this_platform` — the tree change that integrated it is the same change that flipped it — so the capability now stops at exactly `EvaluationRequired(InteroperabilityProof)` there, the demanded progression, and deliberately no further: the committed receipt is evidence for the operator's next decision, not a runtime fact about any host, so `Available`, live usage, and zero-copy remain separate operator-decided tranches. Zero-copy and capture still stop at `BackendNotIntegrated` (downloading frames is not a zero-copy path), and `hardware_decode_active` stays false everywhere because `EvaluationRequired` is not `Available` — the claims seam keeps telling the truth with no edit.
 
 The chain has a live consumer: the decoder telemetry's `hardware_decode_active` / `zero_copy_active` claims — published into every proxy playback observation and the HUD status line — are now derived through the evaluator instead of typed as literals. A capability that is not `Available` cannot be active, so the claims are theorems today and start telling the truth the moment a backend lands, with no edit at that seam.

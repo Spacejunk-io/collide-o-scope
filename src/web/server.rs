@@ -1421,6 +1421,7 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 inner.as_ref(),
                 WebAction::SetMediaSafetyMode { .. }
                     | WebAction::SetNewLayerFit { .. }
+                    | WebAction::SetProxySettings { .. }
                     | WebAction::ClearTemporalMemory
                     | WebAction::TriggerCollisionScore
                     | WebAction::TriggerRefreshGarden
@@ -1468,6 +1469,14 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             }
             crate::controller_profile::ControllerProfileAction::Export {} => true,
         },
+        // Same predicate the engine's authoring door applies; refusing an
+        // invalid fixed frame rate here keeps the queue free of tuples the
+        // engine would only refuse at the handler.
+        WebAction::SetProxySettings {
+            scale,
+            frame_rate,
+            include_audio,
+        } => crate::proxy::ProxySettings::authored(*scale, *frame_rate, *include_audio).is_ok(),
         WebAction::SetVisualNodeParam {
             scope,
             node_id,
@@ -2673,6 +2682,47 @@ mod tests {
         assert!(!valid_action(
             &WebAction::Quantized {
                 inner: Box::new(direct_fit),
+            },
+            0,
+        ));
+
+        // Proxy settings are a host policy, not a creative control: valid
+        // directly, refused inside a Quantized wrapper, and an invalid fixed
+        // frame rate is refused at the gate with the engine's own predicate.
+        let direct_proxy_settings = WebAction::SetProxySettings {
+            scale: crate::proxy::ProxyScale::Quarter,
+            frame_rate: crate::proxy::ProxyFrameRate::Fixed {
+                numerator: 30,
+                denominator: 1,
+            },
+            include_audio: false,
+        };
+        assert!(valid_action(&direct_proxy_settings, 0));
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(direct_proxy_settings),
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::SetProxySettings {
+                scale: crate::proxy::ProxyScale::Half,
+                frame_rate: crate::proxy::ProxyFrameRate::Fixed {
+                    numerator: 0,
+                    denominator: 1,
+                },
+                include_audio: true,
+            },
+            0,
+        ));
+        assert!(!valid_action(
+            &WebAction::SetProxySettings {
+                scale: crate::proxy::ProxyScale::Half,
+                frame_rate: crate::proxy::ProxyFrameRate::Fixed {
+                    numerator: 241,
+                    denominator: 1,
+                },
+                include_audio: true,
             },
             0,
         ));

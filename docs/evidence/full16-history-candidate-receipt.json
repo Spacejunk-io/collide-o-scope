@@ -1,0 +1,77 @@
+{
+  "adapter": {
+    "backend": "Vulkan",
+    "device_type": "DiscreteGpu",
+    "driver": "AMD proprietary driver",
+    "driver_info": "26.7.1 (AMD proprietary shader compiler)",
+    "name": "AMD Radeon RX 6950 XT"
+  },
+  "clean_history_storage_fidelity": {
+    "assessment": {
+      "clamped_events_avoided": 0,
+      "gradients_recovered": 1194,
+      "max_error_reduction": 0.0035955607891082764,
+      "rmse_reduction": 0.0004903482481315854,
+      "verdict": "resource or metric tradeoff"
+    },
+    "full16_history_candidate": {
+      "clamped_channel_events": 0,
+      "max_absolute_error": 0.00012022256851196289,
+      "reference_gradient_events": 11506,
+      "retained_gradient_events": 11506,
+      "rmse": 0.000014780648193362485
+    },
+    "settled_compat8_history": {
+      "clamped_channel_events": 0,
+      "max_absolute_error": 0.0037157833576202393,
+      "reference_gradient_events": 11506,
+      "retained_gradient_events": 10312,
+      "rmse": 0.0005051288963249479
+    },
+    "workload": "one frame recorded into ring layer 0 through the production no-dither conversion pipeline and read back through the production copy pipeline; reference is the exact f32 frame"
+  },
+  "command": "cargo test --locked gpu_full16_history_candidate_measures_temporal_gain_and_writes_the_receipt -- --ignored --nocapture",
+  "dimensions": [
+    192,
+    108
+  ],
+  "feedback_recursion": {
+    "assessment": {
+      "clamped_events_avoided": 0,
+      "gradients_recovered": 0,
+      "max_error_reduction": 0.0026724934577941895,
+      "rmse_reduction": 0.00006866611596052864,
+      "verdict": "resource or metric tradeoff"
+    },
+    "feedback": 0.5,
+    "frames": 12,
+    "full16_history_candidate": {
+      "clamped_channel_events": 0,
+      "max_absolute_error": 0.00036597251892089844,
+      "reference_gradient_events": 11949,
+      "retained_gradient_events": 11949,
+      "rmse": 0.000021675280171683398
+    },
+    "settled_compat8_history": {
+      "clamped_channel_events": 0,
+      "max_absolute_error": 0.003038465976715088,
+      "reference_gradient_events": 11949,
+      "retained_gradient_events": 11949,
+      "rmse": 0.00009034139613221204
+    },
+    "workload": "production feedback shader over a moving pulse; analytic f32 max/decay reference"
+  },
+  "measured_at": {
+    "branch": "feat/proxy-authored-settings",
+    "commit": "124f7cf03d90ce91dd8b70aa04f8cda0f5e72875",
+    "tree": "dirty"
+  },
+  "resource_delta": {
+    "documented_1080p_additional_bytes": 207360000,
+    "documented_1080p_additional_mib": "197.753906",
+    "fixture_additional_bytes": 2073600,
+    "surfaces": "all 25 temporal surfaces (24-layer clean-history ring plus recursive feedback) widen from 4 to 8 bytes per pixel; no other surface changes"
+  },
+  "schema": "collide-o-scope-full16-history-candidate-receipt/1",
+  "scope": "ExperimentalFull16History remains evaluation-only: the candidate host is constructed by this fixture alone, presentation and dither are unchanged, and the settled AdvancedWorking16HistoryCompat8 default does not move (pinned by the M6 receipt's output SHAs)."
+}

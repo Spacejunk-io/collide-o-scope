@@ -1,6 +1,7 @@
 pub mod codec_motion;
 pub mod codec_motion_sequence;
 pub mod decoder;
+pub mod hw_decode;
 pub mod indexed;
 pub mod still;
 pub mod threaded;

@@ -2090,6 +2090,25 @@ select:focus-visible,
   margin-top: 0;
 }
 
+.proxy-settings > #proxy-settings-title {
+  grid-column: 1 / -1;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.proxy-settings .toggle-label {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
 .ntsc-metrics {
   line-height: 1.35;
   font-variant-numeric: tabular-nums;
