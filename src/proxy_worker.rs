@@ -690,6 +690,53 @@ pub struct ProxyEncodeJob {
     pub settings: ProxySettings,
 }
 
+/// One live layer's claim on a pending identity mint, captured on the render
+/// thread at request time. The drain re-validates the stable ID and epoch
+/// before the minted identity is landed on the layer — a stale claim is
+/// discarded by name, never applied to whatever now occupies the position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyMintClaim {
+    pub layer_id: StableLayerId,
+    pub source_resource_epoch: u64,
+}
+
+/// How a submitted request establishes the content identity the cache key
+/// requires. `Verified` is the established path: the layer's retained
+/// `cos-sha256` reference, re-fingerprinted by the job so a post-verification
+/// byte change refuses. `Mint` closes the former identity edge: the worker
+/// fingerprints the source through the same bounded `FingerprintSession`
+/// machinery, reports the minted identity with its claim, and then proceeds
+/// into the ordinary encode — which re-fingerprints again, so the
+/// mint-to-encode window carries the same byte-change refusal the verified
+/// path has always had.
+pub enum ProxyIdentityMode {
+    Verified(ContentIdentity),
+    Mint(ProxyMintClaim),
+}
+
+/// What the render thread submits. The worker resolves the identity mode
+/// first and then runs the unchanged [`run_proxy_encode_job`], so the two
+/// modes share one encode, one refusal ladder, and one publication law.
+pub struct ProxyEncodeRequest {
+    pub source_path: PathBuf,
+    pub settings: ProxySettings,
+    pub identity: ProxyIdentityMode,
+}
+
+/// Fingerprint a source to mint its verified content identity, under the
+/// same bounded limits and cancellation every other fingerprint uses.
+pub fn mint_source_identity(
+    source_path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<ContentIdentity, ProxyWorkerError> {
+    let mut fingerprints =
+        FingerprintSession::with_cancel(FingerprintLimits::default(), Some(Arc::clone(cancel)))
+            .map_err(|error| ProxyWorkerError::SourceUnreadable(error.to_string()))?;
+    fingerprints
+        .fingerprint(source_path)
+        .map_err(|error| ProxyWorkerError::SourceUnreadable(error.to_string()))
+}
+
 /// What a completed encode produced. Keys, byte counts, and the receipt —
 /// deliberately no path and no filesystem metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -955,6 +1002,21 @@ fn read_bounded(pipe: Option<impl Read>, limit: usize) -> Vec<u8> {
 /// once per frame.
 #[derive(Debug, Clone)]
 pub enum ProxyWorkerEvent {
+    /// A mint-mode request fingerprinted its source. The claim rides along so
+    /// the render thread can land the identity on the requesting layer behind
+    /// the same staleness guards adoption uses; the encode proceeds either
+    /// way, and an unlanded identity simply leaves no layer for the
+    /// completion to adopt into.
+    IdentityMinted {
+        claim: ProxyMintClaim,
+        identity: ContentIdentity,
+    },
+    /// A mint-mode request could not fingerprint its source; nothing was
+    /// encoded. Keyed by the layer because no identity exists to key by.
+    MintFailed {
+        layer_id: StableLayerId,
+        error: String,
+    },
     Started {
         identity: ContentIdentity,
         key: ProxyCacheKey,
@@ -972,7 +1034,7 @@ pub enum ProxyWorkerEvent {
 /// The single encode worker: one thread, a one-slot job queue with a
 /// drop-new refusal while busy, and a nonblocking event channel back.
 pub struct ProxyEncodeWorker {
-    jobs: mpsc::SyncSender<ProxyEncodeJob>,
+    jobs: mpsc::SyncSender<ProxyEncodeRequest>,
     events: mpsc::Receiver<ProxyWorkerEvent>,
     cancel: Arc<AtomicBool>,
 }
@@ -983,13 +1045,47 @@ impl ProxyEncodeWorker {
         limits: ProxyCacheLimits,
         media_policy: MediaSafetyPolicy,
     ) -> Self {
-        let (job_sender, job_receiver) = mpsc::sync_channel::<ProxyEncodeJob>(1);
+        let (job_sender, job_receiver) = mpsc::sync_channel::<ProxyEncodeRequest>(1);
         let (event_sender, event_receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         let builder = std::thread::Builder::new().name("proxy-encode".to_owned());
         let spawned = builder.spawn(move || {
-            while let Ok(job) = job_receiver.recv() {
+            while let Ok(request) = job_receiver.recv() {
+                let ProxyEncodeRequest {
+                    source_path,
+                    settings,
+                    identity,
+                } = request;
+                // Resolve the identity mode first: verified requests carry
+                // theirs; mint requests fingerprint the source and report
+                // the minted identity with its claim before any encode.
+                let identity = match identity {
+                    ProxyIdentityMode::Verified(identity) => identity,
+                    ProxyIdentityMode::Mint(claim) => {
+                        match mint_source_identity(&source_path, &worker_cancel) {
+                            Ok(minted) => {
+                                let _ = event_sender.send(ProxyWorkerEvent::IdentityMinted {
+                                    claim,
+                                    identity: minted.clone(),
+                                });
+                                minted
+                            }
+                            Err(error) => {
+                                let _ = event_sender.send(ProxyWorkerEvent::MintFailed {
+                                    layer_id: claim.layer_id,
+                                    error: error.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let job = ProxyEncodeJob {
+                    source_path,
+                    identity,
+                    settings,
+                };
                 let key = match ProxyCacheKey::derive(&job.identity, job.settings) {
                     Ok(key) => key,
                     Err(error) => {
@@ -1030,10 +1126,10 @@ impl ProxyEncodeWorker {
         }
     }
 
-    /// Submit a job; a busy worker refuses rather than queueing a backlog.
-    pub fn submit(&self, job: ProxyEncodeJob) -> Result<(), &'static str> {
+    /// Submit a request; a busy worker refuses rather than queueing a backlog.
+    pub fn submit(&self, request: ProxyEncodeRequest) -> Result<(), &'static str> {
         self.jobs
-            .try_send(job)
+            .try_send(request)
             .map_err(|_| "a proxy encode is already running")
     }
 
@@ -2445,5 +2541,188 @@ mod tests {
                 Err(error) => panic!("temp root cleanup failed: {error}"),
             }
         }
+    }
+
+    fn drain_worker_until(
+        worker: &ProxyEncodeWorker,
+        deadline: Duration,
+        done: impl Fn(&[ProxyWorkerEvent]) -> bool,
+    ) -> Vec<ProxyWorkerEvent> {
+        let started = Instant::now();
+        let mut events = Vec::new();
+        loop {
+            events.extend(worker.drain_events());
+            if done(&events) {
+                return events;
+            }
+            assert!(
+                started.elapsed() < deadline,
+                "worker did not settle within {deadline:?}; events so far: {}",
+                events.len()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn mint_source_identity_matches_the_fingerprint_law_and_refuses_unreadable_sources() {
+        let root = temp_root("mint-law");
+        let source = root.join("bytes.bin");
+        std::fs::write(&source, b"the exact bytes the identity must pin").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let minted = mint_source_identity(&source, &cancel).unwrap();
+        assert_eq!(minted, fingerprint_of(&source));
+        assert_eq!(minted.byte_len, 37);
+
+        let missing = mint_source_identity(&root.join("absent.mp4"), &cancel);
+        assert!(matches!(
+            missing,
+            Err(ProxyWorkerError::SourceUnreadable(_))
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_mint_request_reports_its_minted_identity_with_the_claim_before_any_encode_outcome() {
+        let root = temp_root("mint-flow");
+        let source = root.join("not-media.bin");
+        std::fs::write(&source, vec![0x3C_u8; 4_096]).unwrap();
+        let expected = fingerprint_of(&source);
+        let (store, _) = ProxyCacheStore::open(root.join("cache")).unwrap();
+        let worker = ProxyEncodeWorker::spawn(
+            Arc::new(Mutex::new(store)),
+            ProxyCacheLimits::default(),
+            MediaSafetyPolicy::safe(),
+        );
+        let claim = ProxyMintClaim {
+            layer_id: StableLayerId::new(31).unwrap(),
+            source_resource_epoch: 6,
+        };
+        worker
+            .submit(ProxyEncodeRequest {
+                source_path: source,
+                settings: ProxySettings::default(),
+                identity: ProxyIdentityMode::Mint(claim),
+            })
+            .unwrap();
+        // Non-media bytes fingerprint fine and then refuse at the probe, so
+        // the ordered story is: minted (with the claim passed through
+        // verbatim), started under the minted identity's key, failed typed.
+        let events = drain_worker_until(&worker, Duration::from_secs(15), |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProxyWorkerEvent::Failed { .. }))
+        });
+        assert!(matches!(
+            &events[0],
+            ProxyWorkerEvent::IdentityMinted { claim: reported, identity }
+                if *reported == claim && *identity == expected
+        ));
+        assert!(matches!(
+            &events[1],
+            ProxyWorkerEvent::Started { identity, .. } if *identity == expected
+        ));
+        assert!(matches!(
+            &events[2],
+            ProxyWorkerEvent::Failed { identity, .. } if *identity == expected
+        ));
+
+        // An unreadable source is one job-level mint refusal keyed by the
+        // layer, and nothing is started under a fabricated identity.
+        worker
+            .submit(ProxyEncodeRequest {
+                source_path: root.join("vanished.mp4"),
+                settings: ProxySettings::default(),
+                identity: ProxyIdentityMode::Mint(claim),
+            })
+            .unwrap();
+        let events = drain_worker_until(&worker, Duration::from_secs(15), |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProxyWorkerEvent::MintFailed { .. }))
+        });
+        assert!(matches!(
+            events.last().unwrap(),
+            ProxyWorkerEvent::MintFailed { layer_id, .. }
+                if *layer_id == claim.layer_id
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, ProxyWorkerEvent::Started { .. })));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The mint delivery fixture: a real source with no retained identity
+    /// walks mint -> encode -> publication under the minted identity, and a
+    /// second request for the same bytes is a cache hit under the same key.
+    /// Requires the ffmpeg CLI on PATH (opt-in like effects_audit).
+    #[test]
+    #[ignore]
+    fn proxy_identity_mint_end_to_end_encodes_and_hits_the_cache_under_the_minted_key() {
+        let root = temp_root("mint-e2e");
+        let source = root.join("clip.mp4");
+        generate_test_source(&source, false);
+        let expected = fingerprint_of(&source);
+        let (store, _) = ProxyCacheStore::open(root.join("cache")).unwrap();
+        let store = Arc::new(Mutex::new(store));
+        let worker = ProxyEncodeWorker::spawn(
+            Arc::clone(&store),
+            ProxyCacheLimits::default(),
+            MediaSafetyPolicy::safe(),
+        );
+        let claim = ProxyMintClaim {
+            layer_id: StableLayerId::new(9).unwrap(),
+            source_resource_epoch: 2,
+        };
+        worker
+            .submit(ProxyEncodeRequest {
+                source_path: source.clone(),
+                settings: ProxySettings::default(),
+                identity: ProxyIdentityMode::Mint(claim),
+            })
+            .unwrap();
+        let events = drain_worker_until(&worker, Duration::from_secs(60), |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProxyWorkerEvent::Finished { .. }))
+        });
+        assert!(matches!(
+            &events[0],
+            ProxyWorkerEvent::IdentityMinted { claim: reported, identity }
+                if *reported == claim && *identity == expected
+        ));
+        let Some(ProxyWorkerEvent::Finished { identity, outcome }) = events.last() else {
+            panic!("expected a finished encode");
+        };
+        assert_eq!(*identity, expected);
+        assert!(!outcome.already_cached);
+        let expected_key = ProxyCacheKey::derive(&expected, ProxySettings::default()).unwrap();
+        assert_eq!(outcome.key, expected_key);
+        assert!(lock_store(&store).contains(expected_key));
+
+        // Same bytes again: the mint resolves the same identity and the job
+        // reports a cache hit rather than a re-encode.
+        worker
+            .submit(ProxyEncodeRequest {
+                source_path: source,
+                settings: ProxySettings::default(),
+                identity: ProxyIdentityMode::Mint(claim),
+            })
+            .unwrap();
+        let events = drain_worker_until(&worker, Duration::from_secs(60), |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProxyWorkerEvent::Finished { .. }))
+        });
+        let Some(ProxyWorkerEvent::Finished { outcome, .. }) = events.last() else {
+            panic!("expected a finished cache hit");
+        };
+        assert!(outcome.already_cached);
+        assert_eq!(outcome.key, expected_key);
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

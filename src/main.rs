@@ -16465,36 +16465,43 @@ impl App {
             self.note_proxy_feedback(feedback_key, note);
             return;
         }
-        let Some(identity) = layer.content_identity_for_proxy() else {
-            self.note_proxy_feedback(
-                feedback_key,
-                "proxy encode refused: this layer has no verified content identity; load it \
-                 through a content-referenced (cos-sha256) patch first"
-                    .to_owned(),
-            );
-            return;
-        };
-        let source_path = std::path::PathBuf::from(&layer.source_path);
-        if let Some(telemetry) = layer.video_telemetry() {
-            self.proxy_ab_baseline_micros.insert(
+        // A layer with a retained content reference takes the verified path.
+        // One without takes the mint path — the request itself verifies the
+        // identity through the same bounded fingerprint machinery, off the
+        // render thread, closing the former refusal. The minted identity
+        // enters persistence when its claim re-validates at the drain
+        // (operator ruling, S9): the next patch capture emits the content
+        // reference, exactly as generation would have recorded it.
+        let identity = layer.content_identity_for_proxy();
+        let baseline = match (&identity, layer.video_telemetry()) {
+            (Some(identity), Some(telemetry)) => Some((
                 identity.sha256.clone(),
                 duration_micros_u32(telemetry.decode_p95_duration),
-            );
-            if self.proxy_ab_baseline_micros.len() > 64 {
-                if let Some(first) = self.proxy_ab_baseline_micros.keys().min().cloned() {
-                    self.proxy_ab_baseline_micros.remove(&first);
-                }
-            }
+            )),
+            // A mint request captures its baseline at the drain instead,
+            // once the identity exists to key it by.
+            _ => None,
+        };
+        let identity_mode = match &identity {
+            Some(identity) => proxy_worker::ProxyIdentityMode::Verified(identity.clone()),
+            None => proxy_worker::ProxyIdentityMode::Mint(proxy_worker::ProxyMintClaim {
+                layer_id: layer.stable_layer_id(),
+                source_resource_epoch: layer.source_resource_epoch(),
+            }),
+        };
+        let source_path = std::path::PathBuf::from(&layer.source_path);
+        let note_key = identity
+            .as_ref()
+            .map_or(feedback_key, |identity| identity.sha256.clone());
+        if let Some((sha256, micros)) = baseline {
+            self.record_proxy_ab_baseline(sha256, micros);
         }
         let Some(store) = self.ensure_proxy_store() else {
             let error = self
                 .proxy_store_error
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned());
-            self.note_proxy_feedback(
-                identity.sha256.clone(),
-                format!("proxy cache unavailable: {error}"),
-            );
+            self.note_proxy_feedback(note_key, format!("proxy cache unavailable: {error}"));
             return;
         };
         if self.proxy_encode_worker.is_none() {
@@ -16504,21 +16511,81 @@ impl App {
                 self.media_safety_policy.clone(),
             ));
         }
-        let job = proxy_worker::ProxyEncodeJob {
+        let minting = identity.is_none();
+        let request = proxy_worker::ProxyEncodeRequest {
             source_path,
-            identity: identity.clone(),
             settings: proxy::ProxySettings::default(),
+            identity: identity_mode,
         };
         let submitted = self
             .proxy_encode_worker
             .as_ref()
             .expect("worker was just ensured")
-            .submit(job);
+            .submit(request);
         let note = match submitted {
+            Ok(()) if minting => "verifying content identity — proxy encode to follow".to_owned(),
             Ok(()) => "proxy encode requested".to_owned(),
             Err(refusal) => format!("proxy encode refused: {refusal}"),
         };
-        self.note_proxy_feedback(identity.sha256, note);
+        self.note_proxy_feedback(note_key, note);
+    }
+
+    /// The render-thread half of an identity mint: every part of the claim
+    /// is re-validated against the live layer before the minted identity
+    /// enters persistence — a stale epoch, vanished ID, already-identified,
+    /// or already-backed layer is discarded with a named reason, never
+    /// applied to whatever now occupies the position. The encode continues
+    /// regardless; an unlanded identity simply leaves no layer for the
+    /// completion to adopt into. Landing the identity is the operator's S9
+    /// persistence ruling: the next patch capture emits the content
+    /// reference, exactly as generation would have recorded it.
+    fn install_minted_identity(
+        &mut self,
+        claim: proxy_worker::ProxyMintClaim,
+        identity: &media_source::ContentIdentity,
+    ) -> String {
+        let baseline = {
+            let Some(layer) = self
+                .layers
+                .iter_mut()
+                .find(|layer| layer.stable_layer_id() == claim.layer_id)
+            else {
+                return "content identity discarded: the layer is gone".to_owned();
+            };
+            if layer.source_resource_epoch() != claim.source_resource_epoch {
+                return "content identity discarded: the layer's source changed while verifying"
+                    .to_owned();
+            }
+            if !layer.is_video() || layer.proxy_backing().is_some() {
+                return "content identity discarded: the layer no longer qualifies".to_owned();
+            }
+            if layer.content_identity_for_proxy().is_some() {
+                return "content identity discarded: the layer already carries one".to_owned();
+            }
+            layer.set_persisted_source_reference(Some(identity.source_reference()));
+            layer
+                .video_telemetry()
+                .map(|telemetry| duration_micros_u32(telemetry.decode_p95_duration))
+        };
+        if let Some(micros) = baseline {
+            self.record_proxy_ab_baseline(identity.sha256.clone(), micros);
+        }
+        format!(
+            "content identity verified ({}…) — proxy encode running",
+            &identity.sha256[..8.min(identity.sha256.len())]
+        )
+    }
+
+    /// Keep the "before" half of the decoder A/B, bounded like the feedback
+    /// map it accompanies.
+    fn record_proxy_ab_baseline(&mut self, sha256: String, decode_p95_micros: u32) {
+        self.proxy_ab_baseline_micros
+            .insert(sha256, decode_p95_micros);
+        if self.proxy_ab_baseline_micros.len() > 64 {
+            if let Some(first) = self.proxy_ab_baseline_micros.keys().min().cloned() {
+                self.proxy_ab_baseline_micros.remove(&first);
+            }
+        }
     }
 
     /// Drain worker completions nonblockingly, once per frame.
@@ -16529,6 +16596,20 @@ impl App {
         };
         for event in events {
             match event {
+                proxy_worker::ProxyWorkerEvent::IdentityMinted { claim, identity } => {
+                    let note = self.install_minted_identity(claim, &identity);
+                    self.note_proxy_feedback(identity.sha256, note);
+                }
+                proxy_worker::ProxyWorkerEvent::MintFailed { layer_id, error } => {
+                    // Keyed as the identity-less layer's feedback key, so the
+                    // refusal lands on the card that asked.
+                    self.note_proxy_feedback(
+                        format!("layer:{layer_id:?}"),
+                        format!(
+                            "proxy encode refused: content identity could not be verified: {error}"
+                        ),
+                    );
+                }
                 proxy_worker::ProxyWorkerEvent::Started { identity, key } => {
                     let key = key.to_hex();
                     let note = format!("proxy encode running ({}…)", &key[..8]);
