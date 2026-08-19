@@ -23,7 +23,7 @@ use crate::patch::{
     FieldColliderConfig, FlowShapingConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig,
     ProceduralFieldConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
     RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
-    TemporalResetPolicyConfig, TemporalRigConfig,
+    TemporalResetPolicyConfig, TemporalRigConfig, TimeDisplaceMapConfig,
 };
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{
@@ -573,6 +573,10 @@ pub struct MorphTemporalSnapshot {
     pub slitscan: f32,
     pub slit_axis: f32,
     pub slit_angle: f32,
+    /// B12 discrete laws: the time-displace map and interpolation toggle
+    /// recall an endpoint at the morph midpoint, never a synthesized third.
+    pub slit_map: TimeDisplaceMapConfig,
+    pub slit_interp: bool,
     pub key_mode: f32,
     pub key_threshold: f32,
     pub key_softness: f32,
@@ -600,6 +604,8 @@ impl MorphTemporalSnapshot {
             slitscan: value.slitscan,
             slit_axis: value.slit_axis,
             slit_angle: value.slit_angle,
+            slit_map: TimeDisplaceMapConfig::from_runtime(value.slit_map),
+            slit_interp: value.slit_interp,
             key_mode: value.key_mode,
             key_threshold: value.key_threshold,
             key_softness: value.key_softness,
@@ -618,6 +624,8 @@ impl MorphTemporalSnapshot {
             slitscan: finite_clamp(self.slitscan, 0.0, 0.0, 1.0),
             slit_axis: finite_clamp(self.slit_axis, 0.0, 0.0, 1.0),
             slit_angle: finite_clamp(self.slit_angle, 0.0, -180.0, 180.0),
+            slit_map: self.slit_map,
+            slit_interp: self.slit_interp,
             key_mode: discrete_f32(self.key_mode, 0.0, 4.0),
             key_threshold: finite_clamp(self.key_threshold, 0.1, 0.0, 1.0),
             key_softness: finite_clamp(self.key_softness, 0.03, 0.0, 0.5),
@@ -636,6 +644,8 @@ impl MorphTemporalSnapshot {
             slitscan: clean.slitscan,
             slit_axis: clean.slit_axis,
             slit_angle: clean.slit_angle,
+            slit_map: clean.slit_map.to_runtime(),
+            slit_interp: clean.slit_interp,
             key_mode: clean.key_mode,
             key_threshold: clean.key_threshold,
             key_softness: clean.key_softness,
@@ -655,6 +665,12 @@ impl MorphTemporalSnapshot {
             slitscan: blend_finite(a.slitscan, b.slitscan, weights),
             slit_axis: pick_finite(a.slit_axis, b.slit_axis, choose_b),
             slit_angle: blend_wrapped_degrees(a.slit_angle, b.slit_angle, weights),
+            slit_map: if choose_b { b.slit_map } else { a.slit_map },
+            slit_interp: if choose_b {
+                b.slit_interp
+            } else {
+                a.slit_interp
+            },
             key_mode: pick_finite(a.key_mode, b.key_mode, choose_b),
             key_threshold: blend_finite(a.key_threshold, b.key_threshold, weights),
             key_softness: blend_finite(a.key_softness, b.key_softness, weights),
@@ -4142,6 +4158,46 @@ mod tests {
             MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).rig,
             b.rig.sanitized()
         );
+    }
+
+    #[test]
+    fn time_displace_map_and_interp_recall_an_endpoint_at_the_midpoint() {
+        let a = MorphTemporalSnapshot {
+            slitscan: 0.2,
+            slit_map: TimeDisplaceMapConfig::Radial,
+            slit_interp: false,
+            ..MorphTemporalSnapshot::default()
+        };
+        let b = MorphTemporalSnapshot {
+            slitscan: 0.8,
+            slit_map: TimeDisplaceMapConfig::Sweep,
+            slit_interp: true,
+            ..MorphTemporalSnapshot::default()
+        };
+
+        // The continuous depth blends; the two B12 discrete laws recall an
+        // endpoint at the midpoint, never a synthesized third configuration.
+        let quarter = MorphTemporalSnapshot::interpolate(&a, &b, [0.75, 0.25], false);
+        assert!((quarter.slitscan - 0.35).abs() < 1.0e-6);
+        assert_eq!(quarter.slit_map, TimeDisplaceMapConfig::Radial);
+        assert!(!quarter.slit_interp);
+        let past = MorphTemporalSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
+        assert_eq!(past.slit_map, TimeDisplaceMapConfig::Sweep);
+        assert!(past.slit_interp);
+
+        // The capture/to_params pair carries both laws exactly.
+        let params = crate::effects::params::TemporalParams {
+            slitscan: 0.5,
+            slit_map: crate::effects::params::TimeDisplaceMap::TbcRamp,
+            slit_interp: true,
+            ..crate::effects::params::TemporalParams::default()
+        };
+        let restored = MorphTemporalSnapshot::capture(&params).to_params();
+        assert_eq!(
+            restored.slit_map,
+            crate::effects::params::TimeDisplaceMap::TbcRamp
+        );
+        assert!(restored.slit_interp);
     }
 
     #[test]

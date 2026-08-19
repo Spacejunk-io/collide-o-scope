@@ -708,6 +708,17 @@
               <div class="param-row" data-temporal="slit_angle" data-min="-180" data-max="180" data-step="1">
                 <label>Slit Angle</label><input type="range"><span class="value">0°</span>
               </div>
+              <div class="param-row select-row" data-temporal="slit_map">
+                <label>Time Map</label>
+                <select aria-label="Slit-scan time-displace map">
+                  <option value="ramp">Ramp</option><option value="brightness">Brightness</option>
+                  <option value="radial">Radial</option><option value="tbc_ramp">TBC Ramp</option>
+                  <option value="sweep">Sweep</option>
+                </select>
+              </div>
+              <div class="param-row toggle-row" data-temporal="slit_interp">
+                <label>Time Interp</label><label class="toggle"><input type="checkbox" aria-label="Slit-scan time interpolation"><span class="toggle-slider"></span></label>
+              </div>
               <div class="param-row select-row" data-temporal="key_mode">
                 <label>History Key</label>
                 <select aria-label="Temporal history key mode">

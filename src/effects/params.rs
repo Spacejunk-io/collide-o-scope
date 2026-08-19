@@ -10,7 +10,7 @@ pub const TEMPORAL_REFERENCE_FPS: f32 = 30.0;
 pub use crate::temporal::{
     CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, RefreshGardenGate,
     RefreshGardenParams, TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
-    TemporalTopology,
+    TemporalTopology, TimeDisplaceMap,
 };
 
 /// Temporal (frame-history) effect parameters: feedback trails and
@@ -25,6 +25,14 @@ pub struct TemporalParams {
     pub slit_angle: f32,
     /// Legacy 0/1 axis retained for old patches and protocol clients.
     pub slit_axis: f32,
+    /// B12: how slit-scan turns image position into a history age. `Ramp` is
+    /// the exact existing angle path; any other map (or `slit_interp`)
+    /// selects the bounded additive originals pipeline.
+    pub slit_map: TimeDisplaceMap,
+    /// B12: linear interpolation between adjacent ring layers. Off is the
+    /// exact banded prior path (floor law); on costs at most one extra
+    /// history load per pixel.
+    pub slit_interp: bool,
     /// 0=off, 1=keep motion, 2=keep stillness, 3=keep brightening,
     /// 4=keep darkening. The mask compares the clean current program with a
     /// frame from the fixed-rate history ring.
@@ -243,6 +251,8 @@ impl Default for TemporalParams {
             slitscan: 0.0,
             slit_angle: 0.0,
             slit_axis: 0.0,
+            slit_map: TimeDisplaceMap::Ramp,
+            slit_interp: false,
             key_mode: 0.0,
             key_threshold: 0.1,
             key_softness: 0.03,
@@ -301,6 +311,8 @@ impl TemporalParams {
             slitscan: finite_or(self.slitscan, 0.0).clamp(0.0, 1.0),
             slit_angle: finite_or(self.slit_angle, 0.0).clamp(-180.0, 180.0),
             slit_axis: finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0),
+            slit_map: self.slit_map,
+            slit_interp: self.slit_interp,
             key_mode: finite_or(self.key_mode, 0.0).round().clamp(0.0, 4.0),
             key_threshold: finite_or(self.key_threshold, 0.1).clamp(0.0, 1.0),
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
@@ -308,6 +320,15 @@ impl TemporalParams {
             originals: self.originals.sanitized(),
             rig: self.rig.for_frame_scale(frame_scale),
         }
+    }
+
+    /// True when the B12 time-displace state departs from the exact legacy
+    /// slit-scan path: an authored non-`Ramp` map or the interpolation
+    /// toggle, under an active slit-scan. This selects the bounded additive
+    /// originals pipeline; the frozen legacy shader keeps the Ramp/floor
+    /// path untouched.
+    pub(crate) fn time_displace_active(&self) -> bool {
+        self.slitscan > 0.0 && (self.slit_map != TimeDisplaceMap::Ramp || self.slit_interp)
     }
 
     /// The clamped tick fraction the shader uses to mix the rig's nonlinear
@@ -371,6 +392,7 @@ mod temporal_tests {
             key_softness: 0.04,
             key_history: 7.0,
             originals: TemporalOriginalsParams::default(),
+            ..TemporalParams::default()
         };
         let half = params.for_frame_delta(1.0 / 60.0);
 
@@ -415,6 +437,30 @@ mod temporal_tests {
     }
 
     #[test]
+    fn time_displace_activity_requires_slitscan_and_a_non_default_path() {
+        let mut params = TemporalParams::default();
+        assert!(!params.time_displace_active());
+        params.slit_map = TimeDisplaceMap::Brightness;
+        assert!(
+            !params.time_displace_active(),
+            "no slit-scan means no displacement to run"
+        );
+        params.slitscan = 0.4;
+        assert!(params.time_displace_active());
+        params.slit_map = TimeDisplaceMap::Ramp;
+        assert!(
+            !params.time_displace_active(),
+            "Ramp with the floor law is the exact legacy path"
+        );
+        params.slit_interp = true;
+        assert!(params.time_displace_active());
+        // The frame-delta law carries both discrete choices through unchanged.
+        let frame = params.for_frame_delta(1.0 / 60.0);
+        assert_eq!(frame.slit_map, TimeDisplaceMap::Ramp);
+        assert!(frame.slit_interp);
+    }
+
+    #[test]
     fn invalid_values_are_sanitized() {
         let params = TemporalParams {
             feedback: f32::NAN,
@@ -429,6 +475,7 @@ mod temporal_tests {
             key_history: 999.0,
             originals: TemporalOriginalsParams::default(),
             rig: FeedbackRigParams::default(),
+            ..TemporalParams::default()
         };
         let normalized = params.for_frame_delta(f32::NAN);
 

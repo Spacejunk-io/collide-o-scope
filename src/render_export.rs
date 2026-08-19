@@ -17637,6 +17637,57 @@ mod effects_audit {
         );
     }
 
+    /// B12's labeled export case: slit-scan under a non-default time-displace
+    /// map, rendered through the real export path. The case renders a `_ramp`
+    /// twin — identical patch, default Ramp map with the floor law — and
+    /// asserts the decoded frames differ: the map demonstrably reaches the
+    /// pixels, and the authored default remains the exact prior program. The
+    /// `_repeat` render proves the Sweep map's reference-tick clock replays
+    /// deterministically offline.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_time_displace_pipeline() {
+        use crate::effects::params::{TemporalParams, TimeDisplaceMap};
+        use crate::patch::TemporalConfig;
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let temporal = |map: TimeDisplaceMap, interp: bool| {
+            TemporalConfig::from_params(&TemporalParams {
+                slitscan: 0.85,
+                slit_map: map,
+                slit_interp: interp,
+                ..TemporalParams::default()
+            })
+        };
+        let mut displaced = base_patch();
+        displaced.temporal = Some(temporal(TimeDisplaceMap::Sweep, true));
+        let displaced_temporal = displaced.temporal.clone();
+        render("time_displace", displaced);
+        let mut ramp = base_patch();
+        ramp.temporal = Some(temporal(TimeDisplaceMap::Ramp, false));
+        render("time_displace_ramp", ramp);
+        assert_ne!(
+            decoded_framemd5("renders/audit_time_displace.mp4"),
+            decoded_framemd5("renders/audit_time_displace_ramp.mp4"),
+            "an authored time-displace map must change the decoded frames"
+        );
+        render("time_displace_repeat", {
+            let mut repeat = base_patch();
+            repeat.temporal = displaced_temporal;
+            repeat
+        });
+        assert_eq!(
+            decoded_framemd5("renders/audit_time_displace.mp4"),
+            decoded_framemd5("renders/audit_time_displace_repeat.mp4"),
+            "the swept displacement must replay deterministically"
+        );
+    }
+
     /// Three stacked clips where the upper layer's Residual Counterpoint node
     /// recombines the middle layer's large-scale structure with its own detail
     /// measured against the bottom layer. This is the labeled export case for

@@ -9192,6 +9192,11 @@ impl App {
             "slit_angle" | "loom_angle" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (-180.0..=180.0).contains(&number)),
+            "slit_map" => matches!(
+                value.as_str(),
+                Some("ramp" | "brightness" | "radial" | "tbc_ramp" | "sweep")
+            ),
+            "slit_interp" => value.is_boolean(),
             "key_mode" => value.as_u64().is_some_and(|number| number <= 4),
             "key_threshold" | "loom_amount" | "loom_depth" | "atlas_amount" | "atlas_collision"
             | "garden_amount" | "garden_threshold" | "garden_decay" => value
@@ -15817,6 +15822,21 @@ impl App {
                             if angle.is_finite() {
                                 p.slit_angle = angle.clamp(-180.0, 180.0);
                             }
+                        }
+                    }
+                    "slit_map" => {
+                        p.slit_map = match value.as_str() {
+                            Some("brightness") => temporal::TimeDisplaceMap::Brightness,
+                            Some("radial") => temporal::TimeDisplaceMap::Radial,
+                            Some("tbc_ramp") => temporal::TimeDisplaceMap::TbcRamp,
+                            Some("sweep") => temporal::TimeDisplaceMap::Sweep,
+                            Some("ramp") => temporal::TimeDisplaceMap::Ramp,
+                            _ => p.slit_map,
+                        };
+                    }
+                    "slit_interp" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.slit_interp = flag;
                         }
                     }
                     "key_mode" => {

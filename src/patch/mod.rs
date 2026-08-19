@@ -11,7 +11,7 @@ use crate::composition::{
 use crate::effects::params::{
     CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, FeedbackRigParams,
     FeedbackShape, RefreshGardenGate, RefreshGardenParams, TemporalInterpolation,
-    TemporalLoomParams, TemporalOriginalsParams, TemporalParams, TemporalTopology,
+    TemporalLoomParams, TemporalOriginalsParams, TemporalParams, TemporalTopology, TimeDisplaceMap,
 };
 use crate::effects::EffectUniforms;
 use crate::image_routing::{
@@ -546,6 +546,14 @@ pub struct TemporalConfig {
     /// Arbitrary angle added after the original row/column-only format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slit_angle: Option<f32>,
+    /// Additive B12 time-displace map. Skipped at the default `Ramp` so
+    /// earlier patches keep their bytes and canonical hashes.
+    #[serde(default, skip_serializing_if = "TimeDisplaceMapConfig::is_default")]
+    pub slit_map: TimeDisplaceMapConfig,
+    /// Additive B12 interpolation toggle. Skipped at the default `false`,
+    /// which is the exact banded prior path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slit_interp: bool,
     #[serde(default)]
     pub key_mode: u32,
     #[serde(default = "default_temporal_key_threshold")]
@@ -562,6 +570,44 @@ pub struct TemporalConfig {
     /// their bytes and canonical hashes.
     #[serde(default, skip_serializing_if = "TemporalRigConfig::is_default")]
     pub rig: TemporalRigConfig,
+}
+
+/// Stable serialized vocabulary for the B12 time-displace map.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeDisplaceMapConfig {
+    #[default]
+    Ramp,
+    Brightness,
+    Radial,
+    TbcRamp,
+    Sweep,
+}
+
+impl TimeDisplaceMapConfig {
+    pub fn from_runtime(value: TimeDisplaceMap) -> Self {
+        match value {
+            TimeDisplaceMap::Ramp => Self::Ramp,
+            TimeDisplaceMap::Brightness => Self::Brightness,
+            TimeDisplaceMap::Radial => Self::Radial,
+            TimeDisplaceMap::TbcRamp => Self::TbcRamp,
+            TimeDisplaceMap::Sweep => Self::Sweep,
+        }
+    }
+
+    pub fn to_runtime(self) -> TimeDisplaceMap {
+        match self {
+            Self::Ramp => TimeDisplaceMap::Ramp,
+            Self::Brightness => TimeDisplaceMap::Brightness,
+            Self::Radial => TimeDisplaceMap::Radial,
+            Self::TbcRamp => TimeDisplaceMap::TbcRamp,
+            Self::Sweep => TimeDisplaceMap::Sweep,
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Stable serialized vocabulary for the B3 feedback-rig waveshaper.
@@ -1384,6 +1430,8 @@ impl TemporalConfig {
             slitscan: p.slitscan,
             slit_axis: p.slit_axis,
             slit_angle: Some(p.slit_angle),
+            slit_map: TimeDisplaceMapConfig::from_runtime(p.slit_map),
+            slit_interp: p.slit_interp,
             key_mode: p.key_mode as u32,
             key_threshold: p.key_threshold,
             key_softness: p.key_softness,
@@ -1438,6 +1486,8 @@ impl TemporalConfig {
                 .map(|angle| finite_or(angle, 0.0).clamp(-180.0, 180.0))
                 .unwrap_or_else(|| finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0) * 90.0),
             slit_axis: finite_or(self.slit_axis, 0.0).clamp(0.0, 1.0),
+            slit_map: self.slit_map.to_runtime(),
+            slit_interp: self.slit_interp,
             key_mode: self.key_mode.min(4) as f32,
             key_threshold: finite_or(self.key_threshold, 0.1).clamp(0.0, 1.0),
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
@@ -6725,6 +6775,48 @@ scenes:
     }
 
     #[test]
+    fn time_displace_map_round_trips_and_an_absent_section_is_the_prior_path() {
+        // A default temporal block serializes without either B12 field, so
+        // every pre-B12 patch keeps its bytes and canonical hashes.
+        let default_yaml = serde_yaml::to_string(&TemporalConfig::default()).unwrap();
+        assert!(!default_yaml.contains("slit_map"));
+        assert!(!default_yaml.contains("slit_interp"));
+        let absent: TemporalConfig = serde_yaml::from_str("slitscan: 0.5\n").unwrap();
+        assert_eq!(absent.slit_map, TimeDisplaceMapConfig::Ramp);
+        assert!(!absent.slit_interp);
+        let runtime = absent.to_params();
+        assert_eq!(runtime.slit_map, TimeDisplaceMap::Ramp);
+        assert!(!runtime.slit_interp);
+        assert!(!runtime.time_displace_active());
+
+        // Every non-default map round trips whole, with the toggle.
+        for (map, token) in [
+            (TimeDisplaceMap::Brightness, "brightness"),
+            (TimeDisplaceMap::Radial, "radial"),
+            (TimeDisplaceMap::TbcRamp, "tbc_ramp"),
+            (TimeDisplaceMap::Sweep, "sweep"),
+        ] {
+            let params = TemporalParams {
+                slitscan: 0.5,
+                slit_map: map,
+                slit_interp: true,
+                ..TemporalParams::default()
+            };
+            let yaml = serde_yaml::to_string(&TemporalConfig::from_params(&params)).unwrap();
+            assert!(yaml.contains(&format!("slit_map: {token}")), "{yaml}");
+            assert!(yaml.contains("slit_interp: true"));
+            let restored: TemporalConfig = serde_yaml::from_str(&yaml).unwrap();
+            let runtime = restored.to_params();
+            assert_eq!(runtime.slit_map, map);
+            assert!(runtime.slit_interp);
+            assert!(runtime.time_displace_active());
+        }
+
+        // An unknown map token is rejected rather than silently defaulted.
+        assert!(serde_yaml::from_str::<TemporalConfig>("slit_map: melt\n").is_err());
+    }
+
+    #[test]
     fn flow_shaping_config_round_trips_and_an_absent_section_is_the_prior_path() {
         // A default motion block serializes without the shaping section.
         let default_yaml = serde_yaml::to_string(&MotionConfig::default()).unwrap();
@@ -7292,6 +7384,7 @@ scenes:
             key_history: 4.0,
             originals: Default::default(),
             rig: Default::default(),
+            ..TemporalParams::default()
         };
 
         let patch = PatchState::capture(

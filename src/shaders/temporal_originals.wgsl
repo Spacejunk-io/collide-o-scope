@@ -54,9 +54,45 @@ struct TemporalOriginalsUniforms {
 
 const TAU: f32 = 6.28318530717958647692;
 
+// B12 fixed law: scanlines per TBC-failure sawtooth period.
+const TIME_DISPLACE_TBC_LINES: f32 = 8.0;
+
 fn wrap_layer(idx: f32) -> i32 {
     let n = u.history_len;
     return i32(((idx % n) + n) % n);
+}
+
+// ---------------------------------------------------------------------------
+// B12 time-displace maps. CPU reference: `temporal::time_displace_coord`,
+// followed expression for expression. Map codes are permanent: 0 Ramp,
+// 1 Brightness, 2 Radial, 3 TbcRamp, 4 Sweep. Ramp is the exact legacy
+// slit-scan coordinate; the map code and interpolation flag ride the two
+// reserved loom_geometry lanes and the sweep phase rides the reserved
+// atlas_values lane, all zero for a default patch.
+// ---------------------------------------------------------------------------
+
+fn time_displace_coord(uv: vec2f, covered_luma_in: f32) -> f32 {
+    let map_code = u32(originals.loom_geometry.z);
+    if map_code == 1u {
+        // The picture times itself: bright things lag dark ones.
+        return clamp(covered_luma_in, 0.0, 1.0);
+    }
+    if map_code == 2u {
+        // Time pushed out from the centre, aspect-correct.
+        let centered = vec2f((uv.x - 0.5) * originals.loom_geometry.y, uv.y - 0.5);
+        return clamp(length(centered) * 1.6, 0.0, 1.0);
+    }
+    if map_code == 3u {
+        // Per-scanline failure ramp: a sawtooth over each 8-line group.
+        let height = f32(textureDimensions(current_tex).y);
+        let line_phase = clamp(uv.y, 0.0, 1.0) * height / TIME_DISPLACE_TBC_LINES;
+        return clamp(unit_fraction(line_phase), 0.0, 1.0);
+    }
+    if map_code == 4u {
+        // Wrapped horizontal ramp travelling on the 30 Hz reference clock.
+        return clamp(unit_fraction(uv.x - originals.atlas_values.z), 0.0, 1.0);
+    }
+    return clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,16 +438,23 @@ fn legacy_originals(uv: vec2f) -> vec4f {
     var color = current;
     let garden_amount = originals.garden_values.x;
 
-    // Frozen legacy slit-scan arithmetic/order.
+    // Frozen legacy slit-scan arithmetic/order, generalized by the B12
+    // time-displace map. Ramp with interpolation off routes through
+    // `history_age_sample` with the identical layer arithmetic, so the
+    // default path stays pixel-exact; interpolation costs at most one extra
+    // history load per pixel and the depth still clamps against the
+    // valid-history counter exactly as History Key does.
     if u.slitscan > 0.001 && u.valid_history > 0.5 {
-        let coord = clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
+        let coord = time_displace_coord(uv, covered_luma(current));
         let max_depth = max(u.valid_history - 1.0, 0.0);
         let requested_depth = coord * u.slitscan * (u.history_len - 1.0);
         let depth = min(requested_depth, max_depth);
-        if requested_depth >= 1.0 && max_depth >= 1.0 {
-            let layer = wrap_layer(u.write_index - floor(depth));
-            let hist = textureSample(history_tex, samp, uv, layer);
-            color = hist;
+        if originals.loom_geometry.w > 0.5 {
+            let lower = history_age_sample(current, uv, u32(floor(depth)));
+            let upper = history_age_sample(current, uv, u32(ceil(depth)));
+            color = mix(lower, upper, fract(depth));
+        } else if requested_depth >= 1.0 && max_depth >= 1.0 {
+            color = history_age_sample(current, uv, u32(floor(depth)));
         }
     }
 
@@ -629,14 +672,19 @@ fn advanced_originals(uv: vec2f) -> vec4f {
     var color = current;
     let garden_amount = originals.garden_values.x;
 
+    // The premultiplied twin of the legacy block above; `current` is already
+    // premultiplied here, so its covered luma is a direct dot product.
     if u.slitscan > 0.001 && u.valid_history > 0.5 {
-        let coord = clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
+        let coord = time_displace_coord(uv, dot(current.rgb, vec3f(0.2126, 0.7152, 0.0722)));
         let max_depth = max(u.valid_history - 1.0, 0.0);
         let requested_depth = coord * u.slitscan * (u.history_len - 1.0);
         let depth = min(requested_depth, max_depth);
-        if requested_depth >= 1.0 && max_depth >= 1.0 {
-            let layer = wrap_layer(u.write_index - floor(depth));
-            color = premultiply_originals(textureSample(history_tex, samp, uv, layer));
+        if originals.loom_geometry.w > 0.5 {
+            let lower = advanced_history_age_sample(current, uv, u32(floor(depth)));
+            let upper = advanced_history_age_sample(current, uv, u32(ceil(depth)));
+            color = mix(lower, upper, fract(depth));
+        } else if requested_depth >= 1.0 && max_depth >= 1.0 {
+            color = advanced_history_age_sample(current, uv, u32(floor(depth)));
         }
     }
 

@@ -53,6 +53,107 @@ impl TemporalTopology {
     }
 }
 
+/// The B12 time-displace map: how slit-scan turns image position into a
+/// clean-history age. `Ramp` is the exact existing angle path and the default.
+/// The map vocabulary is derived from BENDR (MIT, © 2026 Steve Blythe), a
+/// browser circuit-bent video processor; every law here is a rewrite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimeDisplaceMap {
+    /// The existing angled ramp along `slit_direction`. Exact legacy path.
+    #[default]
+    Ramp,
+    /// The picture times itself: bright things lag dark ones.
+    Brightness,
+    /// Time pushed out from the centre, aspect-correct.
+    Radial,
+    /// A per-scanline failure ramp — exactly what a time-base corrector does
+    /// when it fails: a sawtooth over each 8-scanline group.
+    TbcRamp,
+    /// A wrapped horizontal ramp travelling across the frame on the 30 Hz
+    /// reference clock; the fixed period is
+    /// [`TIME_DISPLACE_SWEEP_PERIOD_TICKS`].
+    Sweep,
+}
+
+impl TimeDisplaceMap {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn gpu_code(self) -> u32 {
+        match self {
+            Self::Ramp => 0,
+            Self::Brightness => 1,
+            Self::Radial => 2,
+            Self::TbcRamp => 3,
+            Self::Sweep => 4,
+        }
+    }
+
+    pub const ALL: [Self; 5] = [
+        Self::Ramp,
+        Self::Brightness,
+        Self::Radial,
+        Self::TbcRamp,
+        Self::Sweep,
+    ];
+}
+
+/// Scanlines per TBC-failure sawtooth period. Fixed law, not an authored
+/// control: the 8-line group is the physical vocabulary of a failing
+/// time-base corrector, matching the derived BENDR mechanism.
+pub(crate) const TIME_DISPLACE_TBC_LINES: f32 = 8.0;
+
+/// Reference ticks per full Sweep crossing. Fixed law: 600 ticks is 20
+/// seconds at the 30 Hz reference, BENDR's map-drift rate (0.05 cycles per
+/// second) expressed on our reference clock.
+pub(crate) const TIME_DISPLACE_SWEEP_PERIOD_TICKS: u64 = 600;
+
+/// Deterministic Sweep phase for one accepted frame, derived from the same
+/// accumulated reference ticks the rig's noise epoch uses. Program Freeze
+/// holds the tick count, so the sweep holds; export accumulates the same
+/// ticks from frame-indexed time, so live and offline agree structurally.
+pub(crate) fn time_displace_sweep_phase(total_reference_ticks: u64) -> f32 {
+    (total_reference_ticks % TIME_DISPLACE_SWEEP_PERIOD_TICKS) as f32
+        / TIME_DISPLACE_SWEEP_PERIOD_TICKS as f32
+}
+
+/// CPU reference for the B12 time-displace coordinate law, mirrored by the
+/// slit-scan blocks of `temporal_originals.wgsl` expression for expression.
+/// `uv` is the output coordinate, `slit_direction` the aspect-corrected
+/// normalized scan direction, `aspect` the output aspect ratio,
+/// `covered_luma` the current sample's alpha-covered luma, `frame_height`
+/// the output height in scanlines, and `sweep_phase` the deterministic
+/// phase from [`time_displace_sweep_phase`]. The return is the normalized
+/// history coordinate in `[0, 1]`; depth clamping against the valid-history
+/// counter stays in the caller, exactly as the legacy slit-scan law.
+pub(crate) fn time_displace_coord(
+    map: TimeDisplaceMap,
+    uv: [f32; 2],
+    slit_direction: [f32; 2],
+    aspect: f32,
+    covered_luma: f32,
+    frame_height: f32,
+    sweep_phase: f32,
+) -> f32 {
+    match map {
+        TimeDisplaceMap::Ramp => {
+            ((uv[0] - 0.5) * slit_direction[0] + (uv[1] - 0.5) * slit_direction[1] + 0.5)
+                .clamp(0.0, 1.0)
+        }
+        TimeDisplaceMap::Brightness => covered_luma.clamp(0.0, 1.0),
+        TimeDisplaceMap::Radial => {
+            let centered = [(uv[0] - 0.5) * aspect, uv[1] - 0.5];
+            ((centered[0] * centered[0] + centered[1] * centered[1]).sqrt() * 1.6).clamp(0.0, 1.0)
+        }
+        TimeDisplaceMap::TbcRamp => {
+            let line_phase = uv[1].clamp(0.0, 1.0) * frame_height / TIME_DISPLACE_TBC_LINES;
+            (line_phase - line_phase.floor()).clamp(0.0, 1.0)
+        }
+        TimeDisplaceMap::Sweep => {
+            let travelled = uv[0] - sweep_phase;
+            (travelled - travelled.floor()).clamp(0.0, 1.0)
+        }
+    }
+}
+
 impl TemporalInterpolation {
     pub(crate) const fn gpu_code(self) -> u32 {
         match self {
@@ -1155,6 +1256,10 @@ pub(crate) struct TemporalOriginalsGpuUniforms {
 const _: () = assert!(std::mem::size_of::<TemporalOriginalsGpuUniforms>() == 128);
 
 impl TemporalOriginalsGpuUniforms {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one private builder with every frame fact named beats a second struct"
+    )]
     fn for_frame(
         params: TemporalOriginalsParams,
         score: CollisionScoreState,
@@ -1163,10 +1268,23 @@ impl TemporalOriginalsGpuUniforms {
         audio_energy: f32,
         audio_onset: bool,
         force_garden_refresh: bool,
+        time_displace_map: TimeDisplaceMap,
+        time_displace_interp: bool,
+        total_reference_ticks: u64,
     ) -> Self {
         let params = score_effective_originals(params, score);
         let aspect = dimensions[0].max(1) as f32 / dimensions[1].max(1) as f32;
         let ordinal = score.event_ordinal;
+        // B12 lanes ride the two reserved loom_geometry slots plus one
+        // reserved atlas_values slot. A default map keeps all three at zero,
+        // so pre-B12 uniform bytes are unchanged; the sweep phase is only
+        // populated when Sweep is authored, so a default patch's uniforms do
+        // not vary with the tick counter.
+        let sweep_phase = if time_displace_map == TimeDisplaceMap::Sweep {
+            time_displace_sweep_phase(total_reference_ticks)
+        } else {
+            0.0
+        };
         Self {
             loom_values: [
                 params.loom.amount,
@@ -1174,14 +1292,24 @@ impl TemporalOriginalsGpuUniforms {
                 params.loom.phase,
                 params.loom.scale,
             ],
-            loom_geometry: [params.loom.angle.to_radians(), aspect, 0.0, 0.0],
+            loom_geometry: [
+                params.loom.angle.to_radians(),
+                aspect,
+                time_displace_map.gpu_code() as f32,
+                f32::from(time_displace_interp),
+            ],
             loom_modes: [
                 params.loom.topology.gpu_code(),
                 params.loom.interpolation.gpu_code(),
                 u32::from(params.loom.folds),
                 u32::from(params.loom.quantization),
             ],
-            atlas_values: [params.atlas.amount, params.atlas.collision, 0.0, 0.0],
+            atlas_values: [
+                params.atlas.amount,
+                params.atlas.collision,
+                sweep_phase,
+                0.0,
+            ],
             atlas_modes: [
                 params.atlas.seed,
                 u32::from(params.atlas.territories),
@@ -1443,6 +1571,9 @@ impl TemporalState {
                     input.audio_energy,
                     false,
                     false,
+                    frame_params.slit_map,
+                    frame_params.slit_interp,
+                    before.total_reference_ticks,
                 ),
                 rig_uniforms: TemporalRigGpuUniforms::for_frame(
                     frame_params.rig,
@@ -1451,7 +1582,8 @@ impl TemporalState {
                     before.total_reference_ticks,
                 ),
                 legacy_shader_active: frame_params.is_active(),
-                originals_shader_active: !frame_params.originals.is_zero(),
+                originals_shader_active: !frame_params.originals.is_zero()
+                    || frame_params.time_displace_active(),
                 history_write_target: None,
                 observation_ticks: 0,
                 score_events_consumed: 0,
@@ -1500,6 +1632,9 @@ impl TemporalState {
                 input.audio_energy,
                 input.events.audio_onset_events > 0,
                 garden_force_refresh,
+                frame_params.slit_map,
+                frame_params.slit_interp,
+                before.total_reference_ticks,
             ),
             rig_uniforms: TemporalRigGpuUniforms::for_frame(
                 frame_params.rig,
@@ -1508,7 +1643,8 @@ impl TemporalState {
                 before.total_reference_ticks,
             ),
             legacy_shader_active: frame_params.is_active(),
-            originals_shader_active: !frame_params.originals.is_zero(),
+            originals_shader_active: !frame_params.originals.is_zero()
+                || frame_params.time_displace_active(),
             history_write_target,
             observation_ticks,
             score_events_consumed,
@@ -1985,6 +2121,7 @@ mod tests {
             key_history: 1.0,
             originals: TemporalOriginalsParams::default(),
             rig: FeedbackRigParams::default(),
+            ..TemporalParams::default()
         };
         let plan =
             TemporalState::default().stage_frame(&params, running(1.0 / 30.0), [1_920, 1_080]);
@@ -2261,6 +2398,9 @@ mod tests {
             0.0,
             false,
             false,
+            TimeDisplaceMap::Ramp,
+            false,
+            0,
         );
         assert_eq!(std::mem::size_of::<TemporalOriginalsGpuUniforms>(), 128);
         assert_eq!(
@@ -2839,7 +2979,30 @@ mod tests {
             0,
             "no feedback sample precedes the rig helper block"
         );
-        assert_eq!(legacy_originals.matches("textureSample(").count(), 12);
+        // B12 re-counted this: the legacy slit block's inline history sample
+        // now routes through `history_age_sample`, so one inline occurrence
+        // left and no new sampling text arrived. The interpolation path's
+        // extra load reuses the same helper.
+        assert_eq!(legacy_originals.matches("textureSample(").count(), 11);
+        // B12 time-displace maps: one shared coordinate helper serves both
+        // variants, the map/interp lanes ride the reserved loom_geometry
+        // slots, and both slit blocks keep the valid-history depth clamp.
+        assert!(originals.contains("fn time_displace_coord"));
+        assert!(originals.contains("const TIME_DISPLACE_TBC_LINES: f32 = 8.0;"));
+        assert_eq!(
+            originals
+                .matches("if originals.loom_geometry.w > 0.5 {")
+                .count(),
+            2,
+            "both variants carry the interpolation toggle"
+        );
+        assert_eq!(
+            originals
+                .matches("let max_depth = max(u.valid_history - 1.0, 0.0);")
+                .count(),
+            4,
+            "slit-scan and Loom keep the valid-history clamp in both variants"
+        );
         // Both shaders bind the rig at the same third fixed slot.
         assert!(legacy.contains("@group(1) @binding(2) var<uniform> rig"));
         assert!(originals.contains("@group(1) @binding(2) var<uniform> rig"));
@@ -2853,6 +3016,208 @@ mod tests {
             .find("return textureSample(history_tex")
             .expect("history sample");
         assert!(guard < history_sample);
+    }
+
+    #[test]
+    fn time_displace_map_codes_are_permanent_and_closed() {
+        let expected: [(TimeDisplaceMap, u32); 5] = [
+            (TimeDisplaceMap::Ramp, 0),
+            (TimeDisplaceMap::Brightness, 1),
+            (TimeDisplaceMap::Radial, 2),
+            (TimeDisplaceMap::TbcRamp, 3),
+            (TimeDisplaceMap::Sweep, 4),
+        ];
+        assert_eq!(TimeDisplaceMap::ALL.len(), expected.len());
+        for (index, (map, code)) in expected.into_iter().enumerate() {
+            assert_eq!(TimeDisplaceMap::ALL[index], map);
+            assert_eq!(map.gpu_code(), code, "{map:?}");
+        }
+        assert_eq!(TimeDisplaceMap::default(), TimeDisplaceMap::Ramp);
+    }
+
+    #[test]
+    fn time_displace_coord_matches_the_analytic_map_laws() {
+        let close = |a: f32, b: f32| assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
+        let aspect = 16.0 / 9.0;
+        let coord = |map, uv: [f32; 2], luma: f32, phase: f32| {
+            time_displace_coord(map, uv, [0.6, 0.4], aspect, luma, 1_080.0, phase)
+        };
+
+        // Ramp is the exact legacy expression on the slit direction.
+        close(coord(TimeDisplaceMap::Ramp, [0.3, 0.8], 0.0, 0.0), 0.5);
+        close(
+            coord(TimeDisplaceMap::Ramp, [1.0, 1.0], 0.0, 0.0),
+            (0.5f32 * 0.6 + 0.5 * 0.4 + 0.5).clamp(0.0, 1.0),
+        );
+        // Brightness passes the alpha-covered luma through, clamped: bright
+        // things lag dark ones.
+        close(
+            coord(TimeDisplaceMap::Brightness, [0.1, 0.9], 0.37, 0.0),
+            0.37,
+        );
+        close(
+            coord(TimeDisplaceMap::Brightness, [0.1, 0.9], 4.0, 0.0),
+            1.0,
+        );
+        // Radial is aspect-correct distance from the centre, reach 1.6.
+        close(coord(TimeDisplaceMap::Radial, [0.5, 0.5], 1.0, 0.0), 0.0);
+        close(coord(TimeDisplaceMap::Radial, [0.5, 0.75], 0.0, 0.0), 0.4);
+        close(
+            coord(TimeDisplaceMap::Radial, [0.75, 0.5], 0.0, 0.0),
+            0.25 * aspect * 1.6,
+        );
+        close(coord(TimeDisplaceMap::Radial, [1.0, 1.0], 0.0, 0.0), 1.0);
+        // TbcRamp is a sawtooth over each 8-scanline group, constant in x.
+        close(
+            coord(TimeDisplaceMap::TbcRamp, [0.1, 4.0 / 1_080.0], 0.0, 0.0),
+            0.5,
+        );
+        close(
+            coord(TimeDisplaceMap::TbcRamp, [0.9, 4.0 / 1_080.0], 0.0, 0.0),
+            0.5,
+        );
+        close(
+            coord(TimeDisplaceMap::TbcRamp, [0.5, 10.0 / 1_080.0], 0.0, 0.0),
+            0.25,
+        );
+        // Sweep is the wrapped horizontal ramp travelling by phase.
+        close(coord(TimeDisplaceMap::Sweep, [0.25, 0.5], 0.0, 0.0), 0.25);
+        close(coord(TimeDisplaceMap::Sweep, [0.25, 0.5], 0.0, 0.5), 0.75);
+        close(coord(TimeDisplaceMap::Sweep, [0.9, 0.5], 0.0, 0.15), 0.75);
+
+        // Hostile inputs stay inside the normalized coordinate for every map.
+        for map in TimeDisplaceMap::ALL {
+            for uv in [[-4.0, 9.0], [0.0, 1.0], [7.5, -0.25]] {
+                let value = coord(map, uv, 123.0, 0.99);
+                assert!((0.0..=1.0).contains(&value), "{map:?} {uv:?} -> {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn time_displace_sweep_phase_is_deterministic_on_the_reference_clock() {
+        assert_eq!(time_displace_sweep_phase(0), 0.0);
+        assert_eq!(time_displace_sweep_phase(150), 0.25);
+        assert_eq!(time_displace_sweep_phase(600), 0.0);
+        assert_eq!(time_displace_sweep_phase(624), 0.04);
+        // The same tick count always yields the same phase: freeze holds it.
+        assert_eq!(
+            time_displace_sweep_phase(1_234_567),
+            time_displace_sweep_phase(1_234_567)
+        );
+    }
+
+    /// The unwritten-history guard, on the exact depth expressions the two
+    /// slit blocks execute: every produced age stays strictly inside the
+    /// valid-history counter, for both the banded floor law and the
+    /// interpolated pair, at every map coordinate.
+    #[test]
+    fn time_displace_depth_clamps_against_the_valid_history_counter() {
+        fn shader_depth_ages(
+            coord: f32,
+            slitscan: f32,
+            valid_history: u32,
+            interp: bool,
+        ) -> Vec<u32> {
+            if valid_history == 0 {
+                // The whole block is gated on `u.valid_history > 0.5`.
+                return Vec::new();
+            }
+            let max_depth = (valid_history as f32 - 1.0).max(0.0);
+            let requested = coord * slitscan * (TEMPORAL_HISTORY_LEN as f32 - 1.0);
+            let depth = requested.min(max_depth);
+            if interp {
+                vec![depth.floor() as u32, depth.ceil() as u32]
+            } else if requested >= 1.0 && max_depth >= 1.0 {
+                vec![depth.floor() as u32]
+            } else {
+                Vec::new()
+            }
+        }
+
+        for valid_history in 0..=TEMPORAL_HISTORY_LEN {
+            for step in 0..=20 {
+                let coord = step as f32 / 20.0;
+                for slitscan in [0.05, 0.5, 1.0] {
+                    for interp in [false, true] {
+                        for age in shader_depth_ages(coord, slitscan, valid_history, interp) {
+                            assert!(
+                                age < valid_history.max(1),
+                                "age {age} escaped valid {valid_history} \
+                                 (coord {coord}, slitscan {slitscan}, interp {interp})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn time_displace_selects_the_originals_shader_only_off_the_exact_ramp_path() {
+        let plan_for = |map, interp, slitscan| {
+            let params = TemporalParams {
+                slitscan,
+                slit_map: map,
+                slit_interp: interp,
+                ..TemporalParams::default()
+            };
+            TemporalState::default().stage_frame(&params, running(1.0 / 30.0), [1_920, 1_080])
+        };
+
+        // The authored default keeps the frozen legacy shader byte for byte.
+        let default_plan = plan_for(TimeDisplaceMap::Ramp, false, 0.5);
+        assert!(default_plan.legacy_shader_active);
+        assert!(!default_plan.originals_shader_active);
+        assert_eq!(default_plan.originals_uniforms.loom_geometry[2], 0.0);
+        assert_eq!(default_plan.originals_uniforms.loom_geometry[3], 0.0);
+        assert_eq!(default_plan.originals_uniforms.atlas_values[2], 0.0);
+
+        // A non-default map or the interpolation toggle selects the bounded
+        // additive originals pipeline and rides the reserved lanes.
+        let radial = plan_for(TimeDisplaceMap::Radial, false, 0.5);
+        assert!(radial.originals_shader_active);
+        assert_eq!(radial.originals_uniforms.loom_geometry[2], 2.0);
+        assert_eq!(radial.originals_uniforms.loom_geometry[3], 0.0);
+        let interpolated = plan_for(TimeDisplaceMap::Ramp, true, 0.5);
+        assert!(interpolated.originals_shader_active);
+        assert_eq!(interpolated.originals_uniforms.loom_geometry[2], 0.0);
+        assert_eq!(interpolated.originals_uniforms.loom_geometry[3], 1.0);
+
+        // With slit-scan off there is no time displacement to run.
+        let dormant = plan_for(TimeDisplaceMap::Sweep, true, 0.0);
+        assert!(!dormant.originals_shader_active);
+
+        // Sweep populates its phase lane from the accumulated reference
+        // ticks; every other map leaves the lane at zero even as ticks
+        // advance, so a default patch's uniform bytes never vary with time.
+        let mut state = TemporalState::default();
+        let sweep_params = TemporalParams {
+            slitscan: 0.5,
+            slit_map: TimeDisplaceMap::Sweep,
+            ..TemporalParams::default()
+        };
+        let ramp_params = TemporalParams {
+            slitscan: 0.5,
+            ..TemporalParams::default()
+        };
+        for _ in 0..150 {
+            state.stage_frame(&ramp_params, running(1.0 / 30.0), [1_920, 1_080]);
+            state.commit_staged();
+        }
+        let ticks = state.metrics().total_reference_ticks;
+        assert!(
+            ticks > 100,
+            "reference ticks must have accumulated: {ticks}"
+        );
+        let sweep_plan = state.stage_frame(&sweep_params, running(1.0 / 30.0), [1_920, 1_080]);
+        assert_eq!(
+            sweep_plan.originals_uniforms.atlas_values[2],
+            time_displace_sweep_phase(ticks)
+        );
+        state.discard_staged();
+        let ramp_plan = state.stage_frame(&ramp_params, running(1.0 / 30.0), [1_920, 1_080]);
+        assert_eq!(ramp_plan.originals_uniforms.atlas_values[2], 0.0);
     }
 
     #[test]
