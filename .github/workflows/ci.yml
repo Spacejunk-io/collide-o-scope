@@ -57,7 +57,7 @@ jobs:
 
       - name: Install Linux native prerequisites
         if: runner.os == 'Linux'
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           # Fail fast on a stalled Ubuntu mirror instead of hanging: a prior run
@@ -80,14 +80,29 @@ jobs:
               sleep "$((attempt * 10))"
             fi
           done
-          sudo apt-get install --yes --no-install-recommends \
-            build-essential \
-            clang \
-            curl \
-            libasound2-dev \
-            libclang-dev \
-            pkg-config \
-            xz-utils
+          # The install needs the identical stall bound: a mirror once dribbled
+          # the 28.8 MB libclang download for ten minutes without tripping
+          # Acquire::http::Timeout (which catches dead connections, not slow
+          # ones) and the whole step timed out with no retry. A killed attempt
+          # leaves partial downloads that the next attempt reuses or refetches.
+          for attempt in 1 2 3; do
+            if sudo timeout 240 apt-get install --yes --no-install-recommends \
+              build-essential \
+              clang \
+              curl \
+              libasound2-dev \
+              libclang-dev \
+              pkg-config \
+              xz-utils; then
+              break
+            elif [ "$attempt" -eq 3 ]; then
+              echo "::error::apt-get install failed after 3 attempts" >&2
+              exit 1
+            else
+              echo "::warning::apt-get install attempt $attempt failed; retrying" >&2
+              sleep "$((attempt * 10))"
+            fi
+          done
 
       - name: Verify macOS native prerequisites
         if: runner.os == 'macOS'
