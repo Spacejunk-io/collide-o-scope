@@ -54,6 +54,13 @@ impl SourceTap {
 pub struct FramePlanContext {
     pub output_size: [u32; 2],
     pub time_seconds: f32,
+    /// Per-frame Study inputs, sampled from the same immutable frame sample
+    /// the modulation matrix consumed (live) or derived from the frame index
+    /// (export: audio is zero like every live source, beat comes from the
+    /// export beat clock). Neutral zeros for callers with no Study in
+    /// flight, so every existing constructor site keeps its exact meaning.
+    pub study_audio_bands: [f32; 8],
+    pub study_beat_phase: f32,
 }
 
 impl FramePlanContext {
@@ -65,7 +72,25 @@ impl FramePlanContext {
             } else {
                 0.0
             },
+            study_audio_bands: [0.0; 8],
+            study_beat_phase: 0.0,
         }
+    }
+
+    /// Attach the frame's Study inputs, sanitized exactly as the CPU
+    /// reference sanitizes them: non-finite lands on the documented neutral
+    /// zero, everything clamps into `0..=1`.
+    pub fn with_study_inputs(mut self, audio_bands: [f32; 8], beat_phase: f32) -> Self {
+        let sanitize = |value: f32| {
+            if value.is_finite() {
+                value.clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        };
+        self.study_audio_bands = audio_bands.map(sanitize);
+        self.study_beat_phase = sanitize(beat_phase);
+        self
     }
 }
 

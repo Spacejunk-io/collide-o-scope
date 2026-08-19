@@ -636,6 +636,14 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "seed": value.seed,
             "diagnostic": creative_two_slot_route_diagnostic(value.structure.source, value.detail.source),
         }),
+        // The digest is the node's whole authored surface; the document body
+        // never rides the snapshot (it is bounded at a megabyte and the
+        // snapshot broadcasts every frame). The panel reads the summary the
+        // host publishes beside the racks.
+        RuntimeVisualNodeKind::Study(value) => serde_json::json!({
+            "document_digest": value.digest_hex(),
+            "study_exact_bypass": value.is_exact_bypass(),
+        }),
     }
 }
 
@@ -3494,6 +3502,20 @@ pub enum WebAction {
         route: CreativeImageTapSnapshot,
         composition_revision: u64,
     },
+    /// Assign, replace, or clear (`document: null`) a Study node's document.
+    /// The engine validates and compiles the document into the bounded host
+    /// library and the node keeps only the canonical digest — one action, so
+    /// a document can never land in the library without its node or vice
+    /// versa. Coalesced per node (an absolute value: the newest paste wins),
+    /// never quantized, and no route is involved: a Study reads only its
+    /// carrier and the master ring, so this is not a dependency-graph edit.
+    #[serde(rename = "set_visual_node_study_document")]
+    SetVisualNodeStudyDocument {
+        scope: CreativeScopeSnapshot,
+        node_id: String,
+        #[serde(default)]
+        document: serde_json::Value,
+    },
     /// Enable/disable or reroute the separate group matte. `None` disables it;
     /// numeric matte values remain untouched and use the coalescible action.
     #[serde(rename = "set_composition_group_matte_route")]
@@ -4325,6 +4347,10 @@ impl WebAction {
                 ..
             } => Some(format!(
                 "creative:{}:node:{node_id}:{param}",
+                Self::creative_scope_key(scope)
+            )),
+            Self::SetVisualNodeStudyDocument { scope, node_id, .. } => Some(format!(
+                "creative:{}:node:{node_id}:study_document",
                 Self::creative_scope_key(scope)
             )),
             Self::SetCompositionGroupParam {
@@ -6425,6 +6451,42 @@ mod protocol_tests {
         assert_eq!(legacy.performance, LayerPerformanceSnapshot::default());
         assert!(legacy.proxy_backing_prefix.is_empty());
         assert!(legacy.proxy_note.is_empty());
+    }
+
+    #[test]
+    fn study_document_action_is_engine_validated_coalescible_and_panel_wired() {
+        // Wire shape: document is an arbitrary JSON value (null clears); the
+        // engine, not the panel, owns validation and compilation.
+        let action: WebAction = serde_json::from_str(
+            r#"{"action":"set_visual_node_study_document","scope":{"scope":"master"},"node_id":"4","document":null}"#,
+        )
+        .unwrap();
+        let WebAction::SetVisualNodeStudyDocument {
+            node_id, document, ..
+        } = &action
+        else {
+            panic!("expected the study document action");
+        };
+        assert_eq!(node_id, "4");
+        assert!(document.is_null());
+        // An absolute value per node: coalescible, so the newest paste wins,
+        // and never quantized.
+        assert_eq!(
+            action.coalesce_key().as_deref(),
+            Some("creative:master:node:4:study_document")
+        );
+
+        let js = include_str!("../../static/app.js");
+        let start = js.find("const QUANTIZABLE_ACTIONS").unwrap();
+        let end = js[start..].find("]);").unwrap() + start;
+        assert!(!js[start..end].contains("set_visual_node_study_document"));
+        // The panel pastes a document into the node card and can clear it;
+        // parse failures stay client-side in a polite status region.
+        assert!(js.contains("action: 'set_visual_node_study_document'"));
+        assert!(js.contains("creative-study-document"));
+        assert!(js.contains("Assign study document"));
+        assert!(js.contains("creative-study-error"));
+        assert!(js.contains("document: null"));
     }
 
     #[test]

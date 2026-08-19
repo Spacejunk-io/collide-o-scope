@@ -74,6 +74,12 @@ pub struct CompositionPlanInput<'a> {
     /// master-scope singleton, so this is a bare admission fact rather than an
     /// identity — there is nothing to name and no position to preserve.
     pub gesture_canvas_admitted: bool,
+    /// The host Study library. A Study node's digest resolves here at plan
+    /// time; `None` (the default) or an absent digest plans an inert pass
+    /// with the diagnostic surfaced host-side, never a fallback onto another
+    /// document. Live and export supply the same library so both sides
+    /// resolve identically.
+    pub studies: Option<&'a crate::study_eval::StudyProgramLibrary>,
 }
 
 impl<'a> CompositionPlanInput<'a> {
@@ -91,7 +97,17 @@ impl<'a> CompositionPlanInput<'a> {
             resource_limits: CreativeResourceLimits::default(),
             motion: None,
             gesture_canvas_admitted: false,
+            studies: None,
         }
+    }
+
+    /// Attach the host Study library for digest resolution.
+    pub const fn with_studies(
+        mut self,
+        studies: &'a crate::study_eval::StudyProgramLibrary,
+    ) -> Self {
+        self.studies = Some(studies);
+        self
     }
 
     /// Declare whether an admitted gesture canvas backs this frame. Live and
@@ -298,6 +314,11 @@ pub enum EvaluatedScopeStep {
     /// ordinary rack segment: the segmenter flushes what came before, emits
     /// this step, and resumes segmentation behind it.
     SymmetryField { plan: EvaluatedSymmetryFieldPlan },
+    /// One dedicated Study interpreter pass, at its exact authored rack
+    /// position — the same lift as the Symmetry Field: it binds the
+    /// committed clean-history array and owns its own uniform layout, so it
+    /// can never share an ordinary rack segment.
+    StudyField { plan: EvaluatedStudyPlan },
     /// Stateful master-only boundary in its exact authored position.
     LegacyTemporal { params: TemporalParams },
     /// Group matte is post-transform/rack and pre-opacity/admission.
@@ -322,6 +343,7 @@ impl EvaluatedScopeStep {
             // A dedicated step is still one authored node, so it reports its
             // own kind rather than hiding behind a segment.
             Self::SymmetryField { .. } => Some(NodeKindTag::Symmetry),
+            Self::StudyField { .. } => Some(NodeKindTag::Study),
             Self::MaterializeSpatial { .. }
             | Self::CollisionRack { .. }
             | Self::GroupMatte { .. } => None,
@@ -853,6 +875,140 @@ fn symmetry_field_resource_plan(
 /// `SymmetryGpuUniforms`' compile-time size assertion.
 const SYMMETRY_UNIFORM_BYTES: u32 = 1_024;
 
+/// The evaluated payload of one dedicated Study interpreter pass. The digest
+/// is opaque authored identity: the renderer resolves it against the host
+/// Study library at prepare, and an unresolved digest is an inert pass with
+/// a named diagnostic, never a fallback onto another document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvaluatedStudyPlan {
+    pub node_id: NodeId,
+    pub enabled: bool,
+    pub wet: f32,
+    pub blend: NodeBlend,
+    pub params: crate::visual_rack::StudyRackParams,
+    /// The digest-resolved, GPU-encoded program, fixed at plan time so live
+    /// and export execute the identical instruction stream. `None` — no
+    /// digest authored, or the digest is absent from the library — is an
+    /// inert pass.
+    pub program: Option<Box<[crate::study_eval::StudyGpuOp]>>,
+    /// The resolved document's live instruction count; zero when unresolved.
+    pub instruction_count: u32,
+    pub resources: StudyFieldResourcePlan,
+}
+
+/// The dedicated Study pass's ledger, the `SymmetryFieldResourcePlan` shape:
+/// per-pixel terms are declarative (the rack ledger already charges the
+/// authored node once), and the simultaneous-binding count is what this plan
+/// gates on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StudyFieldResourcePlan {
+    pub full_frame_passes: u32,
+    pub logical_texture_lookups_per_pixel: u32,
+    pub texture_operations_per_pixel: u32,
+    pub max_sampled_textures_in_pass: u32,
+    pub uniform_bytes: u32,
+}
+
+/// The table for `passes` dedicated Study steps, every term read from the
+/// frozen node descriptor so the step's table and the rack ledger can never
+/// disagree about one node's cost.
+fn study_field_resource_plan(passes: u32) -> Result<StudyFieldResourcePlan, CompositionPlanError> {
+    if passes == 0 {
+        return Ok(StudyFieldResourcePlan::default());
+    }
+    let descriptor = crate::visual_rack::node_kind_descriptor(NodeKindTag::Study).budget;
+    let scale = |per_pass: u8| {
+        u32::from(per_pass)
+            .checked_mul(passes)
+            .ok_or(CompositionPlanError::Resource(
+                ResourcePreflightError::ArithmeticOverflow,
+            ))
+    };
+    Ok(StudyFieldResourcePlan {
+        full_frame_passes: scale(descriptor.full_frame_passes)?,
+        logical_texture_lookups_per_pixel: scale(descriptor.logical_texture_lookups_per_pixel)?,
+        texture_operations_per_pixel: scale(descriptor.texture_samples_per_pixel)?,
+        max_sampled_textures_in_pass: u32::from(descriptor.sampled_textures_in_pass),
+        uniform_bytes: STUDY_FIELD_UNIFORM_BYTES.checked_mul(passes).ok_or(
+            CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow),
+        )?,
+    })
+}
+
+/// One pass's uniform charge: the 64-byte frame block plus the 8,192-byte
+/// bounded instruction buffer, both compile-time asserted in
+/// `renderer/study.rs`.
+const STUDY_FIELD_UNIFORM_BYTES: u32 = 64 + 8_192;
+
+/// Plan-visible Study identity: every emitted step's node, digest, and
+/// resolution state. This feeds the advanced topology signature, so a
+/// document assignment — or a library insert that resolves a previously
+/// missing digest — re-prepares the renderer and re-uploads the program
+/// arena; without it the executor would keep serving a stale program.
+fn study_identity_hash(
+    layers: &[EvaluatedLayerScopePlan],
+    groups: &[EvaluatedGroupScopePlan],
+    master: &EvaluatedMasterScopePlan,
+) -> u64 {
+    let mut hash = FNV_OFFSET;
+    let mut tally = |execution: &EvaluatedScopeExecution| {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::StudyField { plan } = step else {
+                continue;
+            };
+            hash = hash_value(hash, 0x5354_5544_5949_4400); // "STUDYID"
+            hash = hash_value(hash, plan.node_id.get());
+            match plan.params.document_digest {
+                None => hash = hash_value(hash, 0),
+                Some(digest) => {
+                    hash = hash_value(hash, 1);
+                    for chunk in digest.chunks_exact(8) {
+                        let word = u64::from_le_bytes(chunk.try_into().expect("eight-byte chunks"));
+                        hash = hash_value(hash, word);
+                    }
+                }
+            }
+            hash = hash_value(hash, u64::from(plan.program.is_some()));
+            hash = hash_value(hash, u64::from(plan.instruction_count));
+        }
+    };
+    for layer in layers {
+        tally(&layer.execution);
+    }
+    for group in groups {
+        tally(&group.execution);
+    }
+    tally(&master.execution);
+    hash
+}
+
+/// Count the dedicated Study steps the segmenter actually emitted.
+fn count_study_field_steps(
+    layers: &[EvaluatedLayerScopePlan],
+    groups: &[EvaluatedGroupScopePlan],
+    master: &EvaluatedMasterScopePlan,
+) -> Result<u32, CompositionPlanError> {
+    let mut count = 0_u32;
+    let mut tally = |execution: &EvaluatedScopeExecution| -> Result<(), CompositionPlanError> {
+        for step in execution.steps() {
+            if matches!(step, EvaluatedScopeStep::StudyField { .. }) {
+                count = count.checked_add(1).ok_or(CompositionPlanError::Resource(
+                    ResourcePreflightError::ArithmeticOverflow,
+                ))?;
+            }
+        }
+        Ok(())
+    };
+    for layer in layers {
+        tally(&layer.execution)?;
+    }
+    for group in groups {
+        tally(&group.execution)?;
+    }
+    tally(&master.execution)?;
+    Ok(count)
+}
+
 /// Admit the dedicated pass's simultaneous-binding count.
 ///
 /// Two independent ceilings, both required. The first is this project's own
@@ -867,7 +1023,22 @@ fn validate_symmetry_field_textures(
     symmetry_field: SymmetryFieldResourcePlan,
     limits: CreativeResourceLimits,
 ) -> Result<(), CompositionPlanError> {
-    let requested = symmetry_field.max_sampled_textures_in_pass;
+    validate_dedicated_sampled_textures(symmetry_field.max_sampled_textures_in_pass, limits)
+}
+
+fn validate_study_field_textures(
+    study_field: StudyFieldResourcePlan,
+    limits: CreativeResourceLimits,
+) -> Result<(), CompositionPlanError> {
+    validate_dedicated_sampled_textures(study_field.max_sampled_textures_in_pass, limits)
+}
+
+/// One predicate for every dedicated pass's simultaneous-binding admission,
+/// so the Symmetry and Study validators cannot drift apart.
+fn validate_dedicated_sampled_textures(
+    requested: u32,
+    limits: CreativeResourceLimits,
+) -> Result<(), CompositionPlanError> {
     if requested > crate::visual_rack::MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS {
         return Err(CompositionPlanError::Resource(
             ResourcePreflightError::SampledTextureLimit {
@@ -1101,6 +1272,14 @@ pub struct AdvancedCompositionPlan {
         )
     )]
     symmetry_field_resources: SymmetryFieldResourcePlan,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated Study ledger is consumed by tests and future preflight surfaces"
+        )
+    )]
+    study_field_resources: StudyFieldResourcePlan,
     topology_signature: u64,
 }
 
@@ -1214,6 +1393,17 @@ impl AdvancedCompositionPlan {
     )]
     pub const fn symmetry_field_resources(&self) -> SymmetryFieldResourcePlan {
         self.symmetry_field_resources
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated Study ledger is consumed by tests and future preflight surfaces"
+        )
+    )]
+    pub const fn study_field_resources(&self) -> StudyFieldResourcePlan {
+        self.study_field_resources
     }
 
     pub const fn topology_signature(&self) -> u64 {
@@ -1395,6 +1585,15 @@ pub enum CompositionPlanError {
     DuplicateBaseLayerId(StableLayerId),
     DuplicateLayerRack(StableLayerId),
     MissingLayerRack(StableLayerId),
+    /// A resolved Study document performs more per-pixel texture loads than
+    /// the node's declared admission budget. The document stays valid ABI;
+    /// it simply cannot be admitted under the current resource ceiling —
+    /// the over-budget Residual-grid law, never a silent clamp.
+    StudyLoadBudget {
+        node: NodeId,
+        loads: u32,
+        limit: u32,
+    },
     UnknownLayerRack(StableLayerId),
     DuplicateLayerMotion(StableLayerId),
     MissingLayerMotion(StableLayerId),
@@ -1476,6 +1675,13 @@ impl fmt::Display for CompositionPlanError {
                     formatter,
                     "layer rack input repeats stable layer {}",
                     id.get()
+                )
+            }
+            Self::StudyLoadBudget { node, loads, limit } => {
+                write!(
+                    formatter,
+                    "study node {} performs {loads} per-pixel texture loads; the admission budget is {limit}",
+                    node.get()
                 )
             }
             Self::MissingLayerRack(id) => {
@@ -1764,6 +1970,7 @@ impl<'a> Planner<'a> {
                 },
                 output,
                 &motion,
+                self.input.studies,
             )?;
             let legacy_matte = legacy_mattes
                 .get(base_layer_index)
@@ -1808,6 +2015,7 @@ impl<'a> Planner<'a> {
                 },
                 output,
                 &motion,
+                self.input.studies,
             )?;
             if let Some(matte) = group.matte {
                 let EvaluatedScopeExecution::Ordered { steps } = &mut execution else {
@@ -1926,6 +2134,7 @@ impl<'a> Planner<'a> {
                 },
                 output,
                 &motion,
+                self.input.studies,
             )?,
             canonical_layers: canonical_layers.into_boxed_slice(),
             canonical_bypass_layers: canonical_bypass_layers.into_boxed_slice(),
@@ -2147,6 +2356,13 @@ impl<'a> Planner<'a> {
             &group_plans,
             &master,
         )?)?;
+        let study_field_resources = study_field_resource_plan(count_study_field_steps(
+            &layer_plans,
+            &group_plans,
+            &master,
+        )?)?;
+        validate_study_field_textures(study_field_resources, self.input.resource_limits)?;
+        let study_identity = study_identity_hash(&layer_plans, &group_plans, &master);
         let (resources, residual_resources) = resource_preflight(
             output,
             self.input,
@@ -2169,6 +2385,8 @@ impl<'a> Planner<'a> {
             &motion,
             refresh_garden_signal,
             symmetry_field_resources,
+            study_field_resources,
+            study_identity,
             residual_resources,
         );
 
@@ -2191,6 +2409,7 @@ impl<'a> Planner<'a> {
                 refresh_garden_signal,
                 refresh_garden_resources,
                 symmetry_field_resources,
+                study_field_resources,
                 topology_signature,
             },
         )))
@@ -2772,6 +2991,7 @@ fn compile_scope_execution(
     host: ScopeHostPayload,
     output: [u32; 2],
     motion: &EvaluatedMotionPlan,
+    studies: Option<&crate::study_eval::StudyProgramLibrary>,
 ) -> Result<EvaluatedScopeExecution, CompositionPlanError> {
     rack.validate_for_scope(legacy_scope)
         .map_err(|error| CompositionPlanError::Rack { scope, error })?;
@@ -2801,6 +3021,7 @@ fn compile_scope_execution(
                     scope,
                     output,
                     motion,
+                    studies,
                 )?;
                 let application =
                     if legacy_scope == LegacyRackScope::Master && first_global_node.is_some() {
@@ -2824,6 +3045,7 @@ fn compile_scope_execution(
                     scope,
                     output,
                     motion,
+                    studies,
                 )?;
                 steps.push(EvaluatedScopeStep::LegacyTemporal {
                     params: host.temporal.ok_or(CompositionPlanError::Internal(
@@ -2844,6 +3066,7 @@ fn compile_scope_execution(
         scope,
         output,
         motion,
+        studies,
     )?;
     Ok(EvaluatedScopeExecution::Ordered {
         steps: steps.into_boxed_slice(),
@@ -2857,6 +3080,7 @@ fn flush_segment(
     scope: VisualScopeId,
     output: [u32; 2],
     motion: &EvaluatedMotionPlan,
+    studies: Option<&crate::study_eval::StudyProgramLibrary>,
 ) -> Result<(), CompositionPlanError> {
     if pending.is_empty() {
         return Ok(());
@@ -2867,6 +3091,50 @@ fn flush_segment(
         // executor's uniform-slot reservation must not move when a gain
         // crosses zero. The value-gated predicate lives in `collect_rack_taps`
         // and its saved-patch twin, never here.
+        if let RuntimeVisualNodeKind::Study(params) = node.kind {
+            // Same dedicated lift as the Symmetry arm below, same kind-only
+            // reasoning: segment indices and uniform-slot reservations must
+            // not move when a value crosses zero.
+            compile_segment_nodes(
+                std::mem::take(&mut ordinary),
+                steps,
+                segment_index,
+                scope,
+                output,
+            )?;
+            let resolved = params
+                .document_digest
+                .and_then(|digest| studies.and_then(|library| library.get(&digest)));
+            if let Some(entry) = resolved {
+                let loads = 1 + entry.compiled.history_load_count();
+                let limit = u32::from(
+                    crate::visual_rack::node_kind_descriptor(NodeKindTag::Study)
+                        .budget
+                        .logical_texture_lookups_per_pixel,
+                );
+                if loads > limit {
+                    return Err(CompositionPlanError::StudyLoadBudget {
+                        node: node.stable_id,
+                        loads,
+                        limit,
+                    });
+                }
+            }
+            steps.push(EvaluatedScopeStep::StudyField {
+                plan: EvaluatedStudyPlan {
+                    node_id: node.stable_id,
+                    enabled: node.enabled,
+                    wet: node.wet,
+                    blend: node.blend,
+                    params: params.sanitized(),
+                    program: resolved.map(|entry| entry.program.clone()),
+                    instruction_count: resolved
+                        .map_or(0, |entry| entry.compiled.instruction_count()),
+                    resources: study_field_resource_plan(1)?,
+                },
+            });
+            continue;
+        }
         if let RuntimeVisualNodeKind::Symmetry(params) = node.kind {
             // A dedicated eight-texture pass owns its own bind layout, so it is
             // lifted out of segmentation entirely rather than isolated into a
@@ -4030,6 +4298,8 @@ fn advanced_topology_signature(
     motion: &EvaluatedMotionPlan,
     refresh_garden_signal: EvaluatedRefreshGardenSignalPlan,
     symmetry_field: SymmetryFieldResourcePlan,
+    study_field: StudyFieldResourcePlan,
+    study_identity: u64,
     residual: ResidualResourcePlan,
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4144_5641_4e43_4544);
@@ -4123,6 +4393,14 @@ fn advanced_topology_signature(
         hash = hash_value(hash, u64::from(symmetry_field.full_frame_passes));
         hash = hash_value(hash, u64::from(symmetry_field.max_sampled_textures_in_pass));
         hash = hash_value(hash, u64::from(symmetry_field.uniform_bytes));
+    }
+    if study_field.full_frame_passes > 0 {
+        // Append-only domain tag: "STUDYFLD".
+        hash = hash_value(hash, 0x5354_5544_5946_4c44);
+        hash = hash_value(hash, u64::from(study_field.full_frame_passes));
+        hash = hash_value(hash, u64::from(study_field.max_sampled_textures_in_pass));
+        hash = hash_value(hash, u64::from(study_field.uniform_bytes));
+        hash = hash_value(hash, study_identity);
     }
     // The reduced block-mean grid is plan-visible resource topology: its
     // dimensions come from the authored block vocabulary, which the rack
@@ -7708,6 +7986,185 @@ mod tests {
         EvaluatedCompositionPlan::evaluate(base, input)
     }
 
+    fn plan_with_studies_at_device_floor(
+        base: &EvaluatedFramePlan,
+        composition: &RuntimeComposition,
+        master: &RuntimeVisualRack,
+        racks: &[(StableLayerId, RuntimeVisualRack)],
+        studies: &crate::study_eval::StudyProgramLibrary,
+    ) -> Result<EvaluatedCompositionPlan, CompositionPlanError> {
+        let mut input = CompositionPlanInput::new(composition, master, racks).with_studies(studies);
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        EvaluatedCompositionPlan::evaluate(base, input)
+    }
+
+    /// The Study lift follows the Symmetry shape exactly: flush before, one
+    /// dedicated step at the authored position, segmentation resumes behind
+    /// it — and the digest resolves against the supplied library at plan
+    /// time, never against the ambient host.
+    #[test]
+    fn a_study_flushes_its_segment_resolves_its_digest_and_charges_the_ledger() {
+        use crate::study::{StudyCapability, StudyInstruction};
+        use crate::study_eval::tests::{document, register};
+
+        let mut library = crate::study_eval::StudyProgramLibrary::default();
+        let digest = library
+            .insert(document(
+                vec![StudyCapability::CurrentColor],
+                vec![
+                    StudyInstruction::LoadCurrentColor { dst: register(0) },
+                    StudyInstruction::OutputColor { color: register(0) },
+                ],
+            ))
+            .unwrap();
+
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let node = racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::Study(
+                crate::visual_rack::StudyRackParams {
+                    document_digest: Some(digest),
+                },
+            ))
+            .unwrap();
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+
+        let compiled = advanced(
+            plan_with_studies_at_device_floor(&base, &composition, &master, &racks, &library)
+                .unwrap(),
+        );
+        let steps = layer_plan(&compiled, 2).execution.steps();
+        assert!(matches!(
+            steps[2],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 0,
+                ..
+            }
+        ));
+        let EvaluatedScopeStep::StudyField { plan: field } = &steps[3] else {
+            panic!("a Study must own a dedicated step, not a rack segment");
+        };
+        assert_eq!(field.node_id, node);
+        assert_eq!(field.params.document_digest, Some(digest));
+        assert!(field.program.is_some(), "the digest must resolve");
+        assert_eq!(field.instruction_count, 2);
+        assert!(matches!(
+            steps[4],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 1,
+                ..
+            }
+        ));
+        assert_eq!(steps[3].node_kind_tag(), Some(NodeKindTag::Study));
+
+        // The ledger re-derives from the emitted step: one pass, two
+        // simultaneous bindings, the 64 + 8,192 uniform bytes.
+        let resources = compiled.study_field_resources();
+        assert_eq!(resources.full_frame_passes, 1);
+        assert_eq!(resources.max_sampled_textures_in_pass, 2);
+        assert_eq!(resources.uniform_bytes, 8_256);
+
+        // Without the library the same authored graph plans an inert pass —
+        // program None, never a fallback onto another document — and the
+        // topology signature differs, so the renderer re-prepares (and
+        // re-uploads the program arena) the moment the digest resolves.
+        let unresolved =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        let unresolved_steps = layer_plan(&unresolved, 2).execution.steps();
+        let EvaluatedScopeStep::StudyField { plan: inert } = &unresolved_steps[3] else {
+            panic!("the dedicated position is kind-only and survives resolution failure");
+        };
+        assert!(inert.program.is_none());
+        assert_eq!(inert.instruction_count, 0);
+        assert_ne!(
+            compiled.topology_signature(),
+            unresolved.topology_signature(),
+            "digest resolution is plan-visible identity"
+        );
+
+        // The admission budget is a plan-time refusal by name: a valid
+        // document with eight history loads (nine loads with the carrier)
+        // exceeds the declared eight-lookup budget, while seven admit.
+        let heavy_document = |history_loads: u8| {
+            let mut instructions: Vec<StudyInstruction> = (0..history_loads)
+                .map(|slot| StudyInstruction::LoadHistoryColor {
+                    dst: register(slot),
+                    age: slot + 1,
+                })
+                .collect();
+            let mut accumulated = register(0);
+            for slot in 1..history_loads {
+                let dst = register(32 + slot);
+                instructions.push(StudyInstruction::Add {
+                    dst,
+                    left: accumulated,
+                    right: register(slot),
+                });
+                accumulated = dst;
+            }
+            instructions.push(StudyInstruction::OutputColor { color: accumulated });
+            document(vec![StudyCapability::HistoryRead], instructions)
+        };
+        let mut heavy_library = crate::study_eval::StudyProgramLibrary::default();
+        let heavy = heavy_library.insert(heavy_document(8)).unwrap();
+        let mut heavy_racks = legacy_racks(&[1, 2]);
+        heavy_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::Study(
+                crate::visual_rack::StudyRackParams {
+                    document_digest: Some(heavy),
+                },
+            ))
+            .unwrap();
+        let refused = plan_with_studies_at_device_floor(
+            &base,
+            &composition,
+            &master,
+            &heavy_racks,
+            &heavy_library,
+        );
+        assert!(matches!(
+            refused,
+            Err(CompositionPlanError::StudyLoadBudget {
+                loads: 9,
+                limit: 8,
+                ..
+            })
+        ));
+        let seven = heavy_library.insert(heavy_document(7)).unwrap();
+        let mut admitted_racks = legacy_racks(&[1, 2]);
+        admitted_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::Study(
+                crate::visual_rack::StudyRackParams {
+                    document_digest: Some(seven),
+                },
+            ))
+            .unwrap();
+        plan_with_studies_at_device_floor(
+            &base,
+            &composition,
+            &master,
+            &admitted_racks,
+            &heavy_library,
+        )
+        .expect("seven history loads plus the carrier fill the budget exactly");
+    }
+
     fn plan_with_motion_at_device_floor(
         base: &EvaluatedFramePlan,
         composition: &RuntimeComposition,
@@ -7930,8 +8387,10 @@ mod tests {
             2,
             "the ordinary rack clamp must stay at exactly its two established sites"
         );
+        // Both dedicated kinds (Symmetry, Study) delegate to the one shared
+        // predicate, so the clamp law is asserted where it actually lives.
         let dedicated = implementation
-            .split_once("fn validate_symmetry_field_textures(")
+            .split_once("fn validate_dedicated_sampled_textures(")
             .expect("the dedicated admission check exists")
             .1;
         let dedicated = &dedicated[..dedicated.find("\n}\n").expect("its body is bounded")];

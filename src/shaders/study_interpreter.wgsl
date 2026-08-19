@@ -27,9 +27,11 @@ struct StudyFrameUniforms {
     valid_history: u32,
     write_index: u32,
     history_len: u32,
+    // Renderer-owned node wet and the frozen NodeBlend code; the engine-wide
+    // node law below applies them after the interpreter output.
+    wet: f32,
+    blend_mode: u32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 };
 
 // One encoded instruction. words.x carries the opcode in its low 16 bits and
@@ -156,6 +158,30 @@ fn hue_rotate(color: vec4f, turns: f32) -> vec4f {
     return vec4f(rgb, color.a);
 }
 
+// The engine-wide node wet/blend law, identical in shape to
+// `rack_node.wgsl:apply_node_law` and `symmetry_field.wgsl:
+// sym_apply_field_law`; `blend_rgb` comes from the one canonical blend
+// kernel this shader is composed with.
+fn study_apply_field_law(dry: vec4f, processed: vec4f) -> vec4f {
+    let wet = clamp(frame.wet, 0.0, 1.0);
+    if wet <= 0.0 { return dry; }
+    var result: vec4f;
+    if frame.blend_mode == BLEND_ALPHA_CUT {
+        result = vec4f(dry.rgb, dry.a * (1.0 - clamp(processed.a, 0.0, 1.0)));
+    } else {
+        result = vec4f(
+            blend_rgb(frame.blend_mode, clamp(dry.rgb, vec3f(0.0), vec3f(1.0)),
+                clamp(processed.rgb, vec3f(0.0), vec3f(1.0))),
+            clamp(processed.a, 0.0, 1.0),
+        );
+    }
+    if wet >= 1.0 { return result; }
+    let alpha = mix(clamp(dry.a, 0.0, 1.0), result.a, wet);
+    let premultiplied = mix(dry.rgb * clamp(dry.a, 0.0, 1.0), result.rgb * result.a, wet);
+    if alpha <= BLEND_EPSILON { return vec4f(0.0); }
+    return vec4f(premultiplied / alpha, alpha);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let pixel = vec2i(in.position.xy);
@@ -221,5 +247,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
             default: {}
         }
     }
-    return output;
+    return study_apply_field_law(current, output);
 }

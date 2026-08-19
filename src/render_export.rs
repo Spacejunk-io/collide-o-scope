@@ -3137,6 +3137,10 @@ struct ExportCreativeGraph {
     layer_racks: Vec<(StableLayerId, RuntimeVisualRack)>,
     composition: RuntimeComposition,
     address_book: crate::modulation::StableModAddressBook,
+    /// The job's Study library, built once from the patch's own `studies`
+    /// section so live and export resolve every digest identically. A
+    /// document that fails validation aborts the job before the first frame.
+    studies: crate::study_eval::StudyProgramLibrary,
 }
 
 fn export_saved_position(position: usize) -> Result<SavedLayerPosition, String> {
@@ -3209,12 +3213,19 @@ fn resolve_export_creative_graph(patch: &PatchState) -> Result<ExportCreativeGra
         &composition,
     )
     .map_err(|error| format!("resolve export stable modulation: {error}"))?;
+    let mut studies = crate::study_eval::StudyProgramLibrary::default();
+    for document in &patch.studies {
+        studies
+            .insert(document.clone())
+            .map_err(|error| format!("export study document rejected: {error}"))?;
+    }
     Ok(ExportCreativeGraph {
         layer_ids: layer_ids.into_boxed_slice(),
         master_rack,
         layer_racks,
         composition,
         address_book,
+        studies,
     })
 }
 
@@ -4282,7 +4293,8 @@ fn plan_export_composition_inner(
             // refused admission aborts the job outright. The offline planner
             // therefore always sees an admitted canvas, which is what keeps a
             // routed donor planning identically live and offline.
-            .with_gesture_canvas(true);
+            .with_gesture_canvas(true)
+            .with_studies(&graph.studies);
     input.resource_limits = resource_limits;
     if let (Some(motion), Some((master, layers))) = (motion, planned_motion.as_ref()) {
         input = input.with_motion(*master, layers, motion.limits);
@@ -5471,7 +5483,8 @@ fn run_export(
                     &candidate,
                     &layers,
                     &modulation_frame,
-                    FramePlanContext::new(w, h, time),
+                    FramePlanContext::new(w, h, time)
+                        .with_study_inputs(mod_matrix.audio.bands, (beat.fract().abs()) as f32),
                 );
                 plan_export_composition_with_motion(
                     &evaluated,
@@ -5751,7 +5764,8 @@ fn run_export(
         let mut evaluated_frame =
             EvaluatedFramePlan::evaluate(
                 &modulation_frame,
-                FramePlanContext::new(w, h, time),
+                FramePlanContext::new(w, h, time)
+                    .with_study_inputs(mod_matrix.audio.bands, (beat.fract().abs()) as f32),
                 MasterFrameInput {
                     effects: &frame_master,
                     transform: &frame_master_transform,
@@ -8597,6 +8611,7 @@ layers:
             StableModAddressBook::from_composition(&master_rack, &layer_racks, &composition)
                 .unwrap();
         let graph = ExportCreativeGraph {
+            studies: crate::study_eval::StudyProgramLibrary::default(),
             layer_ids: ids.to_vec().into_boxed_slice(),
             master_rack,
             layer_racks,
@@ -16743,6 +16758,7 @@ layers:
             scenes: crate::performance::Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         };
         let output = std::env::temp_dir().join(format!(
             "collideoscope-live-cancel-{}-{}.mp4",
@@ -16861,6 +16877,7 @@ mod effects_audit {
             scenes: crate::performance::Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         }
     }
 
@@ -17224,6 +17241,97 @@ mod effects_audit {
         .unwrap();
         patch.layers[0].rack = Some(rack);
         render("symmetry_field", patch);
+    }
+
+    /// One clip whose layer rack carries a Study reading the carrier, the
+    /// clean-history ring, the beat phase, and its deterministic randomness,
+    /// hue-rotating a history mix over the live image.
+    ///
+    /// This is the labeled export case for the Study authored surface: the
+    /// offline renderer resolves the same digest against the patch's own
+    /// `studies` section, builds the same evaluated plan, and runs the same
+    /// fixed `study_interpreter.wgsl`. There is no export-only Study path.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_study_field_pipeline() {
+        use crate::study::{
+            StudyAbiVersion, StudyCapability, StudyInstruction, StudyLicenseNotice, StudyMetadata,
+            StudyPublicationBoundary, StudyRegister, STUDY_SCHEMA_VERSION,
+        };
+        use crate::visual_rack::{LegacyRackScope, VisualNodeKind, VisualRack};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let register = |value: u8| StudyRegister::new(value).unwrap();
+        let document = crate::study::StudyDocument {
+            schema_version: STUDY_SCHEMA_VERSION,
+            abi: StudyAbiVersion::default(),
+            metadata: StudyMetadata {
+                name: "Audit study".into(),
+                author: "effects_audit".into(),
+                description: "History mix hue-rotated by beat and randomness".into(),
+                license: StudyLicenseNotice {
+                    identifier: "CC0-1.0".into(),
+                    notice: String::new(),
+                    publication_boundary: StudyPublicationBoundary::StudyDataOnlyDoesNotLicenseHost,
+                },
+            },
+            capabilities: vec![
+                StudyCapability::CurrentColor,
+                StudyCapability::HistoryRead,
+                StudyCapability::BeatPhase,
+                StudyCapability::DeterministicRandom,
+            ],
+            instructions: vec![
+                StudyInstruction::LoadCurrentColor { dst: register(0) },
+                StudyInstruction::LoadHistoryColor {
+                    dst: register(1),
+                    age: 6,
+                },
+                StudyInstruction::LoadBeatPhase { dst: register(2) },
+                StudyInstruction::LoadDeterministicRandom {
+                    dst: register(3),
+                    domain: 5,
+                },
+                StudyInstruction::ConstantScalar {
+                    dst: register(4),
+                    value: 0.5,
+                },
+                StudyInstruction::Mix {
+                    dst: register(5),
+                    a: register(0),
+                    b: register(1),
+                    amount: register(4),
+                },
+                StudyInstruction::Multiply {
+                    dst: register(6),
+                    left: register(2),
+                    right: register(3),
+                },
+                StudyInstruction::HueRotate {
+                    dst: register(7),
+                    color: register(5),
+                    turns: register(6),
+                },
+                StudyInstruction::OutputColor { color: register(7) },
+            ],
+        };
+        let compiled = crate::study_eval::CompiledStudy::compile(&document).unwrap();
+        let digest = *compiled.canonical_digest();
+
+        let mut patch = base_patch();
+        let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        rack.push(VisualNodeKind::Study(crate::visual_rack::StudyRackParams {
+            document_digest: Some(digest),
+        }))
+        .unwrap();
+        patch.layers[0].rack = Some(rack);
+        patch.studies = vec![document];
+        render("study_field", patch);
     }
 
     /// Two stacked clips whose upper layer's Faraday carrier is advected by a

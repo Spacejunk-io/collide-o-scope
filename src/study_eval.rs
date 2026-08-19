@@ -22,13 +22,12 @@
 //!   validator already imposes on constants, applied uniformly so no
 //!   instruction chain can escape the representable range the ABI promises.
 
-// The S10b interpreter consumes this module (`renderer/study.rs` encodes
-// compiled studies for the fixed WGSL interpreter and its fixtures prove
-// CPU/GPU agreement), but the whole chain stays unreachable from the frame
-// loop until a Study gains an authored audience surface — where it plugs
-// into the composition is a product decision the operator has not yet
-// opened. This allow is scoped to exactly that window and comes out with
-// the authored-surface tranche.
+// Production executes Studies through the GPU twin (`renderer/study.rs`);
+// this module's CPU evaluation half — `evaluate_pixel` and its private
+// helpers — is the independent reference the agreement fixtures check that
+// twin against, and is deliberately consumed only by tests, exactly as the
+// gesture canvas CPU reference is. The compile/encode/library half is live
+// production code.
 #![allow(dead_code)]
 
 use bytemuck::Zeroable;
@@ -490,6 +489,65 @@ pub fn consumes(document: &StudyDocument, capability: StudyCapability) -> bool {
     document.capabilities.contains(&capability)
 }
 
+/// The bounded host Study library. Rack nodes carry only a document's
+/// canonical digest (the kind enum is `Copy`); the documents themselves live
+/// here, compiled and GPU-encoded once at insert, and travel with patches in
+/// the `studies` section so a patch stays self-contained. The bound is a
+/// hard cap with a typed refusal, never an eviction — a document an authored
+/// node references must not vanish under the operator's feet.
+pub const STUDY_LIBRARY_MAX_DOCUMENTS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StudyLibraryEntry {
+    pub digest: [u8; 32],
+    pub document: StudyDocument,
+    pub compiled: CompiledStudy,
+    pub program: Box<[StudyGpuOp]>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StudyProgramLibrary {
+    entries: Vec<StudyLibraryEntry>,
+}
+
+impl StudyProgramLibrary {
+    /// Validate, compile, encode, and store one document, keyed by its own
+    /// canonical digest. Idempotent for identical content; refuses past the
+    /// cap rather than evicting.
+    pub fn insert(&mut self, document: StudyDocument) -> Result<[u8; 32], StudyError> {
+        let compiled = CompiledStudy::compile(&document)?;
+        let digest = *compiled.canonical_digest();
+        if let Some(existing) = self.entries.iter().position(|entry| entry.digest == digest) {
+            return Ok(self.entries[existing].digest);
+        }
+        if self.entries.len() >= STUDY_LIBRARY_MAX_DOCUMENTS {
+            return Err(StudyError::Serialization(format!(
+                "study library is full ({STUDY_LIBRARY_MAX_DOCUMENTS} documents)"
+            )));
+        }
+        let program = compiled.encode_gpu_program().into_boxed_slice();
+        self.entries.push(StudyLibraryEntry {
+            digest,
+            document,
+            compiled,
+            program,
+        });
+        Ok(digest)
+    }
+
+    pub fn get(&self, digest: &[u8; 32]) -> Option<&StudyLibraryEntry> {
+        self.entries.iter().find(|entry| entry.digest == *digest)
+    }
+
+    pub fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.get(digest).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 // --- The frozen GPU instruction encoding -----------------------------------
 
 /// GPU opcode numbering, append-only exactly like `NodeKindTag` codes:
@@ -606,6 +664,17 @@ impl CompiledStudy {
     /// The number of live instructions the shader must walk.
     pub fn instruction_count(&self) -> u32 {
         self.instructions.len() as u32
+    }
+
+    /// How many per-pixel texture loads this document performs beyond the
+    /// pass's own carrier load: one per `LoadHistoryColor` instruction.
+    /// `LoadCurrentColor` reads the already-loaded carrier register and
+    /// costs nothing.
+    pub fn history_load_count(&self) -> u32 {
+        self.instructions
+            .iter()
+            .filter(|instruction| matches!(instruction, StudyInstruction::LoadHistoryColor { .. }))
+            .count() as u32
     }
 }
 

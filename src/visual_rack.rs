@@ -1560,6 +1560,76 @@ impl MaskParams {
     }
 }
 
+/// The data-only Study rack node's authored state: a content-addressed
+/// reference to a validated Study document. `VisualNodeKind` is `Copy` and a
+/// document is heap content, so the node carries only the 32-byte canonical
+/// digest — the same identity `CompiledStudy::canonical_digest` derives —
+/// while documents themselves live in the bounded host Study library and
+/// travel with patches in their own `studies` section. A digest whose
+/// document is absent from the library is a named diagnostic and an inert
+/// pass, never a fallback onto another document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StudyRackParams {
+    pub document_digest: Option<[u8; 32]>,
+}
+
+impl StudyRackParams {
+    pub const fn sanitized(self) -> Self {
+        self
+    }
+
+    /// No document, no pass: the planner emits no dedicated step and the
+    /// executor encodes nothing — a real delegation, not a cosmetic one.
+    pub const fn is_exact_bypass(self) -> bool {
+        self.document_digest.is_none()
+    }
+
+    pub fn digest_hex(&self) -> Option<String> {
+        self.document_digest
+            .map(|digest| digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+
+    pub fn parse_digest_hex(hex: &str) -> Option<[u8; 32]> {
+        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut digest = [0_u8; 32];
+        for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let text = std::str::from_utf8(chunk).ok()?;
+            digest[index] = u8::from_str_radix(text, 16).ok()?;
+        }
+        Some(digest)
+    }
+}
+
+impl Serialize for StudyRackParams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("StudyRackParams", 1)?;
+        state.serialize_field("document_digest", &self.digest_hex())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for StudyRackParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            document_digest: Option<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let document_digest = match raw.document_digest {
+            None => None,
+            Some(hex) => Some(StudyRackParams::parse_digest_hex(&hex).ok_or_else(|| {
+                serde::de::Error::custom("study document digest must be 64 hex characters")
+            })?),
+        };
+        Ok(Self { document_digest })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum VisualNodeKind {
@@ -1582,6 +1652,10 @@ pub enum VisualNodeKind {
     /// planner splits it into its own dedicated step.
     Symmetry(SymmetryParams),
     Residual(ResidualParams),
+    /// The data-only Study interpreter, a dedicated pass like the Symmetry
+    /// Field: the fixed rack layout cannot bind the clean-history array, so
+    /// the planner lifts it into its own step.
+    Study(StudyRackParams),
 }
 
 impl VisualNodeKind {
@@ -1599,6 +1673,7 @@ impl VisualNodeKind {
             Self::Displace(_) => NodeKindTag::Displace,
             Self::Symmetry(_) => NodeKindTag::Symmetry,
             Self::Residual(_) => NodeKindTag::Residual,
+            Self::Study(_) => NodeKindTag::Study,
         }
     }
 
@@ -1708,6 +1783,7 @@ pub enum NodeKindTag {
     Displace,
     Symmetry,
     Residual,
+    Study,
 }
 
 impl NodeKindTag {
@@ -1728,6 +1804,7 @@ impl NodeKindTag {
             Self::Displace => 10,
             Self::Residual => 11,
             Self::Symmetry => 12,
+            Self::Study => 13,
         }
     }
 
@@ -1738,7 +1815,10 @@ impl NodeKindTag {
     /// ceilings are independent and neither may be raised to admit the other.
     pub const fn occupies_dedicated_pass(self) -> bool {
         match self {
-            Self::Symmetry => true,
+            // The Study interpreter binds the clean-history D2 array beside
+            // its carrier and owns its own uniform layout, so like Symmetry
+            // it cannot ride an ordinary rack segment.
+            Self::Symmetry | Self::Study => true,
             Self::LegacyCanonical
             | Self::LegacyTemporal
             | Self::Transform
@@ -1787,7 +1867,7 @@ pub struct NodeKindDescriptor {
     pub budget: NodeResourceBudget,
 }
 
-pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 12] = [
+pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 13] = [
     NodeKindDescriptor {
         tag: NodeKindTag::LegacyCanonical,
         key: "legacy_canonical",
@@ -1990,6 +2070,32 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 12] = [
             // The Symmetry Field is one full-output dedicated pass. It owns no
             // reduced block grid and no persistent sub-frame surface, so both
             // reduced-resolution ledgers stay at zero.
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::Study,
+        key: "study",
+        title: "Study",
+        budget: NodeResourceBudget {
+            full_frame_passes: 1,
+            // The declared admission budget, not the ABI worst case: one
+            // carrier load plus up to seven history loads, each a single
+            // textureLoad with no bilinear expansion. LoadCurrentColor reads
+            // the already-loaded carrier register and costs nothing. A valid
+            // document whose history loads exceed this budget stays valid
+            // ABI but is refused at plan time by name — the over-budget
+            // Residual-grid law, never a silent clamp.
+            logical_texture_lookups_per_pixel: 8,
+            texture_samples_per_pixel: 8,
+            // Carrier plus the committed clean-history D2 array; two
+            // simultaneous bindings in one dedicated pass, no sampler.
+            sampled_textures_in_pass: 2,
+            // A Study reads only its carrier and the master ring: no image
+            // taps, no donors, no routes — the whole tombstone/route surface
+            // is structurally absent in ABI 1.0.
+            cross_input_taps: 0,
             reduced_resolution_passes: 0,
             reduced_resolution_surfaces: 0,
         },
@@ -3621,6 +3727,7 @@ pub enum RuntimeVisualNodeKind {
     Displace(RuntimeDisplaceParams),
     Symmetry(RuntimeSymmetryParams),
     Residual(RuntimeResidualParams),
+    Study(StudyRackParams),
 }
 
 impl RuntimeVisualNodeKind {
@@ -3638,6 +3745,7 @@ impl RuntimeVisualNodeKind {
             Self::Displace(_) => NodeKindTag::Displace,
             Self::Symmetry(_) => NodeKindTag::Symmetry,
             Self::Residual(_) => NodeKindTag::Residual,
+            Self::Study(_) => NodeKindTag::Study,
         }
     }
 
@@ -3669,6 +3777,9 @@ impl RuntimeVisualNodeKind {
             VisualNodeKind::Residual(value) => Self::Residual(
                 RuntimeResidualParams::resolve_routes(value, layer_at_position, group_exists),
             ),
+            // A Study owns no routes: the digest is opaque authored identity
+            // and resolves against the host library at prepare, not here.
+            VisualNodeKind::Study(value) => Self::Study(value.sanitized()),
         }
     }
 
@@ -3695,6 +3806,7 @@ impl RuntimeVisualNodeKind {
             Self::Residual(value) => {
                 VisualNodeKind::Residual(value.capture_routes(position_of_layer))
             }
+            Self::Study(value) => VisualNodeKind::Study(value.sanitized()),
         }
     }
 
@@ -5112,6 +5224,41 @@ mod tests {
     }
 
     #[test]
+    fn study_params_serialize_as_hex_reject_hostile_digests_and_default_to_bypass() {
+        // Default: no document, exact bypass — a real delegation.
+        let default = StudyRackParams::default();
+        assert!(default.is_exact_bypass());
+        assert_eq!(default.digest_hex(), None);
+
+        // Round trip through the hex form the patch carries.
+        let digest = [0xab_u8; 32];
+        let params = StudyRackParams {
+            document_digest: Some(digest),
+        };
+        assert!(!params.is_exact_bypass());
+        let yaml = serde_yaml::to_string(&params).unwrap();
+        assert!(yaml.contains(&"ab".repeat(32)));
+        let restored: StudyRackParams = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored, params);
+
+        // Hostile digests are rejections, not truncations or fallbacks.
+        for hostile in [
+            "\"zz\"",
+            &format!("\"{}\"", "ab".repeat(31)),
+            &format!("\"{}\"", "ab".repeat(33)),
+        ] {
+            let doc = format!("document_digest: {hostile}");
+            assert!(serde_yaml::from_str::<StudyRackParams>(&doc).is_err());
+        }
+        // Unknown fields are rejected like every bounded section.
+        assert!(serde_yaml::from_str::<StudyRackParams>(
+            "document_digest: null
+extra: 1"
+        )
+        .is_err());
+    }
+
+    #[test]
     fn descriptor_registry_is_complete_unique_and_budgeted() {
         let tags: BTreeSet<_> = NODE_KIND_DESCRIPTORS
             .iter()
@@ -5124,9 +5271,9 @@ mod tests {
         assert_eq!(tags.len(), NODE_KIND_DESCRIPTORS.len());
         assert_eq!(keys.len(), NODE_KIND_DESCRIPTORS.len());
         // Ten historical kinds through Displace (code 10), plus Residual
-        // Counterpoint (11) and the Symmetry Field (12). Kind codes are
-        // append-only, so this count only ever grows.
-        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 12);
+        // Counterpoint (11), the Symmetry Field (12) and the Study (13).
+        // Kind codes are append-only, so this count only ever grows.
+        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 13);
         for descriptor in NODE_KIND_DESCRIPTORS {
             assert!(descriptor.budget.full_frame_passes > 0);
             assert!(descriptor.budget.logical_texture_lookups_per_pixel > 0);
@@ -6395,6 +6542,7 @@ mod tests {
             (NodeKindTag::Mask, 9),
             (NodeKindTag::Displace, 10),
             (NodeKindTag::Symmetry, 12),
+            (NodeKindTag::Study, 13),
         ] {
             assert_eq!(tag.signature_code(), code);
         }
@@ -6409,13 +6557,14 @@ mod tests {
             "Symmetry Field"
         );
 
-        // Exactly one kind is lifted into a dedicated pass today.
+        // Two kinds are lifted into dedicated passes: the Symmetry Field's
+        // eight-texture fold and the Study interpreter's history-array pass.
         let dedicated: Vec<_> = NODE_KIND_DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.tag.occupies_dedicated_pass())
             .map(|descriptor| descriptor.tag)
             .collect();
-        assert_eq!(dedicated, vec![NodeKindTag::Symmetry]);
+        assert_eq!(dedicated, vec![NodeKindTag::Symmetry, NodeKindTag::Study]);
 
         assert_eq!(
             VisualRack::synthetic_legacy(LegacyRackScope::Layer).topology_signature(),

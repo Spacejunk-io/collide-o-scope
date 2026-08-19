@@ -1325,6 +1325,10 @@ fn apply_stable_node_offset(
             "detail_gain" => Some(&mut value.detail_gain),
             _ => None,
         },
+        // A Study exposes no modulatable address of any kind (the Field
+        // Collider v1 precedent): its document digest is opaque authored
+        // topology and its inputs arrive through the Study's own opcodes.
+        RuntimeVisualNodeKind::Study(_) => None,
     };
     if let Some(slot) = slot {
         if matches!(

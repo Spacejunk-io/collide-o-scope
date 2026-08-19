@@ -415,6 +415,16 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
         RuntimeVisualNodeKind::Residual(value) => {
             RackPassKind::Residual(sanitize_runtime_residual(value))
         }
+        // The Study interpreter binds the clean-history array and owns its
+        // own uniform layout, so like Symmetry it is never encodable as an
+        // ordinary rack pass; the planner lifts it into a dedicated step and
+        // reaching this arm is a planner error, reported by name.
+        RuntimeVisualNodeKind::Study(_) => {
+            return Err(RackCompileError::DedicatedPassNode {
+                node_id: node.stable_id,
+                tag: node.kind.tag(),
+            });
+        }
     };
     Ok(RackPassDescriptor {
         node_id: node.stable_id,

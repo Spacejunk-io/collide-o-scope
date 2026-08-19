@@ -404,6 +404,7 @@ const CREATIVE_NODE_INFO = Object.freeze({
   displace: { label: 'Displace' },
   symmetry: { label: 'Symmetry Field' },
   residual: { label: 'Residual' },
+  study: { label: 'Study' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -526,6 +527,11 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     enumDef('block', 'Block', [['four', '4 px'], ['eight', '8 px'], ['sixteen', '16 px'], ['thirty_two', '32 px'], ['sixty_four', '64 px']]),
     enumDef('quantization', 'Quantization', [['off', 'Off'], ['coarse', 'Coarse'], ['medium', 'Medium'], ['fine', 'Fine']]),
     uintDef('seed', 'Seed'),
+  ],
+  // A Study's whole authored surface is its document digest, assigned by the
+  // dedicated document action rather than a generic parameter row; the card
+  // renders its own paste surface.
+  study: [
   ],
 });
 
@@ -831,13 +837,31 @@ function renderCreativeRack() {
     const nodeDiagnostic = node.params?.diagnostic
       ? `<div class="creative-node-diagnostic">${escapeHtml(node.params.diagnostic)}</div>`
       : '';
+    // The Study's whole authored surface is its document digest. The panel
+    // pastes a document; the engine validates, compiles it into the bounded
+    // host library, and the node keeps only the canonical digest.
+    const studyEditor = node.kind === 'study'
+      ? `<div class="creative-study-editor">
+          <div class="creative-node-diagnostic creative-study-state">${node.params?.document_digest
+            ? `Document ${escapeHtml(String(node.params.document_digest).slice(0, 8))}… assigned`
+            : 'No document assigned · exact bypass until one is.'}</div>
+          <label class="creative-control creative-control-wide"><span>Study document (JSON)</span>
+            <textarea class="creative-study-document" rows="6" spellcheck="false" aria-label="Study document JSON"></textarea>
+          </label>
+          <div class="creative-route-row">
+            <button class="creative-study-apply" type="button" aria-label="Assign study document">Assign document</button>
+            <button class="creative-study-clear" type="button" ${node.params?.document_digest ? '' : 'disabled'} aria-label="Clear study document">Clear</button>
+          </div>
+          <div class="creative-node-diagnostic creative-study-error" role="status" aria-live="polite"></div>
+        </div>`
+      : '';
     card.innerHTML = `<div class="creative-node-head">
       <span class="creative-node-title">${escapeHtml(info.label)}</span>
       <span class="creative-node-id">#${escapeHtml(node.node_id)}</span>
       <button class="creative-node-up" type="button" ${index === 0 ? 'disabled' : ''} aria-label="Move ${escapeHtml(info.label)} earlier">↑</button>
       <button class="creative-node-down" type="button" ${index + 1 === nodes.length ? 'disabled' : ''} aria-label="Move ${escapeHtml(info.label)} later">↓</button>
       <button class="creative-node-remove" type="button" ${marker ? 'disabled title="Legacy execution markers are immutable"' : ''} aria-label="Remove ${escapeHtml(info.label)}">×</button>
-    </div><div class="creative-node-controls">${common}${maskVariant}${params}${imageRoute}</div>${nodeDiagnostic}${marker ? '<div class="creative-node-diagnostic">Frozen compatibility marker · values are supplied by the established engine path.</div>' : ''}`;
+    </div><div class="creative-node-controls">${common}${maskVariant}${params}${imageRoute}${studyEditor}</div>${nodeDiagnostic}${marker ? '<div class="creative-node-diagnostic">Frozen compatibility marker · values are supplied by the established engine path.</div>' : ''}`;
     creativeRackNodes.appendChild(card);
     card.querySelector('.creative-node-up')?.addEventListener('click', () => creativeSend({ action: 'move_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), to: index - 1, composition_revision: compositionRevision }, 'Moving rack node…'));
     card.querySelector('.creative-node-down')?.addEventListener('click', () => creativeSend({ action: 'move_visual_node', scope: creativeScopeWire(), node_id: String(node.node_id), to: index + 1, composition_revision: compositionRevision }, 'Moving rack node…'));
@@ -849,6 +873,26 @@ function renderCreativeRack() {
     card.querySelector('.creative-mask-variant')?.addEventListener('change', (event) => creativeSend({
       action: 'set_visual_node_mask_variant', scope: creativeScopeWire(), node_id: String(node.node_id), variant: event.currentTarget.value, composition_revision: compositionRevision,
     }, 'Changing mask kind…'));
+    card.querySelector('.creative-study-apply')?.addEventListener('click', () => {
+      const textarea = card.querySelector('.creative-study-document');
+      const error = card.querySelector('.creative-study-error');
+      let parsed;
+      try {
+        parsed = JSON.parse(textarea.value);
+      } catch (parseError) {
+        if (error) error.textContent = `Document is not valid JSON: ${parseError.message}`;
+        return;
+      }
+      if (error) error.textContent = '';
+      creativeSend({
+        action: 'set_visual_node_study_document', scope: creativeScopeWire(),
+        node_id: String(node.node_id), document: parsed,
+      }, 'Compiling study document…');
+    });
+    card.querySelector('.creative-study-clear')?.addEventListener('click', () => creativeSend({
+      action: 'set_visual_node_study_document', scope: creativeScopeWire(),
+      node_id: String(node.node_id), document: null,
+    }, 'Clearing study document…'));
     // A node may own more than one route, so every editor in the card is wired
     // to the action naming its own slot. Binding only the first would leave a
     // second select silently submitting nothing.

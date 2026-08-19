@@ -12,7 +12,7 @@ use crate::composition::{BusAssignment, RuntimeRootItem};
 use crate::evaluated_frame::evaluated_composition::{
     AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
     EvaluatedRefreshGardenSignalPlan, EvaluatedScopeExecution, EvaluatedScopeStep,
-    EvaluatedSymmetryFieldPlan, ImageTapConsumer, LegacyCanonicalApplication,
+    EvaluatedStudyPlan, EvaluatedSymmetryFieldPlan, ImageTapConsumer, LegacyCanonicalApplication,
     MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
 };
 use crate::image_routing::{LayerImageStage, StableLayerId};
@@ -40,6 +40,7 @@ use crate::renderer::readback::{
     RecorderReadbackReadiness, RecorderReadbackRequest, RecorderReadbackReservation,
     RecorderReadbackTag,
 };
+use crate::renderer::study::{StudyGpuExecutor, StudyGpuFrameUniforms};
 use crate::renderer::symmetry_field::{
     SymmetryFieldBindings, SymmetryFieldExecutor, SymmetryFieldGpuError, SymmetryFieldInput,
     SymmetryFieldMotionBindings, SymmetryFieldMotionInput, SymmetryHistoryCursor,
@@ -425,6 +426,16 @@ struct PreparedRackSegment {
 /// segment's, because slot index is route identity here: `tap_indices` records
 /// which image slot each admitted route occupies, and a readiness flip on one
 /// slot can never move the other slot's donor.
+/// One prepared dedicated Study pass: the arena slot its program occupies
+/// and its bind group over (Ping carrier, committed history array). No taps,
+/// no motion, no donors — the whole binding set is topology-fixed.
+struct PreparedStudyField {
+    scope: VisualScopeId,
+    node_id: NodeId,
+    uniform_slot: u32,
+    bind_group: wgpu::BindGroup,
+}
+
 struct PreparedSymmetryField {
     scope: VisualScopeId,
     node_id: NodeId,
@@ -461,6 +472,8 @@ struct PreparedAdvanced {
     /// output-sized surface, so an absent executor costs nothing.
     symmetry: Option<SymmetryFieldExecutor>,
     symmetry_fields: Vec<PreparedSymmetryField>,
+    study: Option<StudyGpuExecutor>,
+    study_fields: Vec<PreparedStudyField>,
     motion: Option<MotionGpuResources>,
     taps: Box<[PreparedTap]>,
     /// Current-frame PreLocal donors are independently materialized and
@@ -1602,6 +1615,25 @@ impl PreparedAdvanced {
                 )?,
                 None => Vec::new(),
             };
+            let study_slot_count = study_field_step_count(plan);
+            let study = (study_slot_count > 0).then(|| {
+                StudyGpuExecutor::new(
+                    device,
+                    crate::renderer::composition_host::HOST_WORKING_FORMAT,
+                    study_slot_count as u32,
+                )
+            });
+            let study_fields = match &study {
+                Some(executor) => prepare_study_fields(
+                    device,
+                    queue,
+                    plan,
+                    executor,
+                    ping.view,
+                    host.temporal_history_view(),
+                ),
+                None => Vec::new(),
+            };
             let retained_scope_sources = retained_scope_sources(plan, &taps);
             let (root_schedule, member_schedules) =
                 build_block_schedules(plan, &retained_scope_sources)?;
@@ -1707,6 +1739,8 @@ impl PreparedAdvanced {
                 rack,
                 symmetry,
                 symmetry_fields,
+                study,
+                study_fields,
                 motion,
                 taps: taps.into_boxed_slice(),
                 prelocal_surfaces,
@@ -2090,6 +2124,7 @@ impl PreparedAdvanced {
                 EvaluatedScopeStep::CollisionRack { .. }
                 | EvaluatedScopeStep::LegacyTemporal { .. }
                 | EvaluatedScopeStep::SymmetryField { .. }
+                | EvaluatedScopeStep::StudyField { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => continue,
             };
             self.host
@@ -2385,6 +2420,9 @@ impl PreparedAdvanced {
                 EvaluatedScopeStep::SymmetryField { plan: field } => {
                     self.execute_symmetry_field(queue, encoder, plan, scope, field)?;
                 }
+                EvaluatedScopeStep::StudyField { plan: field } => {
+                    self.execute_study_field(queue, encoder, plan, scope, field)?;
+                }
                 EvaluatedScopeStep::LegacyTemporal { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(format!(
@@ -2497,6 +2535,69 @@ impl PreparedAdvanced {
             },
             plan.base().context().time_seconds,
         )?;
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Pong).texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        Ok(())
+    }
+
+    /// Encode one dedicated Study interpreter step. Same contract as every
+    /// ordered step: carrier out of Ping, result back in Ping via the Pong
+    /// scratch. An inert plan — disabled, dry, or unresolved digest — is a
+    /// real delegation: nothing is encoded and nothing is copied.
+    fn execute_study_field(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        scope: VisualScopeId,
+        field: &EvaluatedStudyPlan,
+    ) -> Result<(), CompositionGpuError> {
+        if StudyGpuExecutor::is_inert(field) {
+            return Ok(());
+        }
+        let prepared = self
+            .study_fields
+            .iter()
+            .find(|prepared| prepared.scope == scope && prepared.node_id == field.node_id)
+            .ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "Study node {} in {scope:?} was not prepared",
+                    field.node_id.get()
+                ))
+            })?;
+        let executor = self.study.as_ref().ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(
+                "a Study step was planned without its dedicated executor".into(),
+            )
+        })?;
+        // Frame inputs: audio and beat from the shared frame-plan context
+        // (the same immutable sample live, frame-derived offline), ring
+        // validity from the committed cursor the temporal pass consumes.
+        let (history_write, history_valid) = self.host.temporal_history_read_cursor();
+        let context = plan.base().context();
+        let frame = StudyGpuFrameUniforms::from_parts(
+            &crate::study_eval::StudyFrameContext {
+                audio_bands: context.study_audio_bands,
+                beat_phase: context.study_beat_phase,
+                valid_history: history_valid,
+            },
+            field.instruction_count,
+            history_write,
+            crate::temporal::TEMPORAL_HISTORY_LEN,
+            field.wet,
+            field.blend,
+        );
+        executor.write_frame(queue, prepared.uniform_slot, &frame);
+        executor.encode_at(
+            encoder,
+            &prepared.bind_group,
+            self.host.surface(HostSurface::Pong).view,
+            prepared.uniform_slot,
+        );
         copy_texture(
             encoder,
             self.host.surface(HostSurface::Pong).texture,
@@ -2673,6 +2774,9 @@ impl PreparedAdvanced {
                     )?,
                     EvaluatedScopeStep::SymmetryField { plan: field } => {
                         self.execute_symmetry_field(queue, encoder, plan, scope, field)?;
+                    }
+                    EvaluatedScopeStep::StudyField { plan: field } => {
+                        self.execute_study_field(queue, encoder, plan, scope, field)?;
                     }
                     EvaluatedScopeStep::GroupMatte { .. } => {
                         self.execute_group_matte(encoder, plan, group_id)?;
@@ -2964,6 +3068,9 @@ impl PreparedAdvanced {
                         VisualScopeId::Master,
                         field,
                     )?;
+                }
+                EvaluatedScopeStep::StudyField { plan: field } => {
+                    self.execute_study_field(queue, encoder, plan, VisualScopeId::Master, field)?;
                 }
                 EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(
@@ -3403,6 +3510,65 @@ const fn bus_surface(bus: BusAssignment) -> HostSurface {
 /// One dynamic-offset uniform slot per dedicated step the frame can encode
 /// before a single queue submit. Counted from the EMITTED steps, exactly as the
 /// planner's own dedicated ledger is, so the arena can never be short.
+fn study_field_step_count(plan: &AdvancedCompositionPlan) -> usize {
+    let mut count = 0;
+    let mut tally = |execution: &EvaluatedScopeExecution| {
+        count += execution
+            .steps()
+            .iter()
+            .filter(|step| matches!(step, EvaluatedScopeStep::StudyField { .. }))
+            .count();
+    };
+    for layer in plan.layers() {
+        tally(&layer.execution);
+    }
+    for group in plan.groups() {
+        tally(&group.execution);
+    }
+    tally(&plan.master().execution);
+    count
+}
+
+/// Assign every planned Study step an arena slot in deterministic
+/// layers-then-groups-then-master step order, upload each resolved program
+/// once, and build the topology-fixed bind group. Inert steps still own
+/// their slot so slot numbering never depends on frame-local values.
+fn prepare_study_fields(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &AdvancedCompositionPlan,
+    executor: &StudyGpuExecutor,
+    carrier: &wgpu::TextureView,
+    history: &wgpu::TextureView,
+) -> Vec<PreparedStudyField> {
+    let mut prepared = Vec::new();
+    let mut visit = |scope: VisualScopeId, execution: &EvaluatedScopeExecution| {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::StudyField { plan: field } = step else {
+                continue;
+            };
+            let uniform_slot = prepared.len() as u32;
+            if let Some(program) = &field.program {
+                executor.write_program(queue, uniform_slot, program);
+            }
+            prepared.push(PreparedStudyField {
+                scope,
+                node_id: field.node_id,
+                uniform_slot,
+                bind_group: executor.create_bind_group(device, carrier, history),
+            });
+        }
+    };
+    for layer in plan.layers() {
+        visit(VisualScopeId::Layer(layer.stable_id), &layer.execution);
+    }
+    for group in plan.groups() {
+        visit(VisualScopeId::Group(group.id), &group.execution);
+    }
+    visit(VisualScopeId::Master, &plan.master().execution);
+    prepared
+}
+
 fn symmetry_field_step_count(plan: &AdvancedCompositionPlan) -> usize {
     let mut count = 0;
     let mut tally = |execution: &EvaluatedScopeExecution| {
@@ -6045,6 +6211,131 @@ mod tests {
     /// `max_sampled_textures_per_shader_stage` is the fixed rack layout's three,
     /// while production reads the real device. Without this the dedicated pass
     /// is correctly refused before a GPU is ever reached.
+    #[derive(Clone, Copy, PartialEq)]
+    enum StudyFixtureMode {
+        Resolved,
+        Unresolved,
+        NoNode,
+    }
+
+    fn study_layer_fixture(
+        dimensions: [u32; 2],
+        mode: StudyFixtureMode,
+    ) -> EvaluatedCompositionPlan {
+        use crate::study::{StudyCapability, StudyInstruction};
+        use crate::study_eval::tests::{document, register};
+
+        let mut library = crate::study_eval::StudyProgramLibrary::default();
+        let digest = library
+            .insert(document(
+                vec![StudyCapability::CurrentColor],
+                vec![
+                    StudyInstruction::LoadCurrentColor { dst: register(0) },
+                    StudyInstruction::ConstantScalar {
+                        dst: register(1),
+                        value: 1.0 / 3.0,
+                    },
+                    StudyInstruction::HueRotate {
+                        dst: register(2),
+                        color: register(0),
+                        turns: register(1),
+                    },
+                    StudyInstruction::OutputColor { color: register(2) },
+                ],
+            ))
+            .unwrap();
+
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::A,
+            }],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::empty();
+        if mode != StudyFixtureMode::NoNode {
+            layer_rack
+                .push(RuntimeVisualNodeKind::Study(
+                    crate::visual_rack::StudyRackParams {
+                        document_digest: Some(digest),
+                    },
+                ))
+                .unwrap();
+        }
+        let racks = vec![(stable_layer(1), layer_rack)];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        );
+        if mode == StudyFixtureMode::Resolved {
+            input = input.with_studies(&library);
+        }
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        let plan = EvaluatedCompositionPlan::evaluate(&base, input).unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("a Study node forces an Advanced plan");
+        };
+        assert_eq!(
+            study_field_step_count(advanced),
+            usize::from(mode != StudyFixtureMode::NoNode),
+        );
+        plan
+    }
+
+    /// The pixels claim for the authored surface: a resolved Study observably
+    /// transforms the audience image through the full composition path, an
+    /// unresolved digest is byte-identical to no node at all (inert, never a
+    /// fallback), and warm frames allocate nothing.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_study_field_reaches_the_pixels_and_unresolved_digests_are_inert() {
+        let gpu = GpuHarness::new();
+        let dimensions = [8, 8];
+        let source = gpu.source(dimensions, [0, 200, 255, 255], "Study layer source");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let render_mode = |mode: StudyFixtureMode| {
+            let plan = study_layer_fixture(dimensions, mode);
+            let mut executor =
+                CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+            executor
+                .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+                .unwrap();
+            let warmed = executor.allocation_snapshot();
+            let first = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+            assert_eq!(
+                executor.allocation_snapshot(),
+                warmed,
+                "a warmed Study frame must allocate nothing"
+            );
+            executor.reset_history();
+            let second = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+            assert_eq!(first, second, "the Study pass is deterministic");
+            first
+        };
+        let active = render_mode(StudyFixtureMode::Resolved);
+        let unresolved = render_mode(StudyFixtureMode::Unresolved);
+        let control = render_mode(StudyFixtureMode::NoNode);
+        assert_ne!(
+            active, control,
+            "a resolved document must reach the audience pixels"
+        );
+        assert_eq!(
+            unresolved, control,
+            "an unresolved digest is inert — never a fallback onto another document"
+        );
+        assert!(active.iter().flatten().all(|value| value.is_finite()));
+    }
+
     fn symmetry_field_layer_fixture(
         dimensions: [u32; 2],
         dedicated: bool,

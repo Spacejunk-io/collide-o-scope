@@ -3297,6 +3297,7 @@ mod tests {
             scenes: crate::performance::Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
+            studies: Vec::new(),
         }
     }
 
