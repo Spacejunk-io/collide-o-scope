@@ -32,7 +32,7 @@ src/
 ├── media_source.rs      shared resolution, bounded SHA-256 fingerprinting, content references
 ├── spatial.rs           canonical authored transforms and packed GPU pass uniforms
 ├── transform_gizmo.rs   preview-only direct manipulation of that same transform
-├── motion.rs            canonical codec/lattice fields, Motion authoring, Field Collider, resource preflight
+├── motion.rs            canonical codec/lattice/procedural fields, Motion authoring, Field Collider, resource preflight
 ├── symmetry.rs          closed symmetry groups, 32-sector table, 1,024-byte uniform
 ├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
@@ -69,7 +69,7 @@ src/
 ├── study.rs             closed data-only SSA Study schema and authority validation
 ├── study_eval.rs        pure CPU reference evaluator: R1 history guard, R2 randomness, rack hue law
 ├── patch/               YAML model, capture/apply, editor and file dialogs
-├── procedural.rs        deterministic v7 typed patch walk, manifests/preflight, capture worker
+├── procedural.rs        deterministic v8 typed patch walk, manifests/preflight, capture worker
 ├── render_export.rs     deterministic shared executor, motion report, optional audio mux
 ├── web/                 panel server, protocol snapshots/actions, embedded assets
 ├── input/keyboard.rs    key-to-action mapping
@@ -1323,6 +1323,86 @@ that a disabled collider is byte-identical to exact M4 — plus
 26.7.1). Cross-platform portability rests on hosted three-platform CI, not on
 that adapter.
 
+### B2 procedural motion fields
+
+`MotionFieldSource` gained one arm: `Procedural(ProceduralFieldKind)`, a
+deterministic synthetic field computed by `motion_procedural.wgsl` and defined
+by the CPU reference `motion::procedural_field_sample` — the law the shader
+follows expression for expression. `ProceduralFieldKind` is a closed vocabulary
+with permanent append-only codes: `Curl` 0, `Radial` 1, `Spiral` 2, `Contour`
+3, `Chroma` 4, `Weave` 5. Wire/patch/sidecar tokens come from the one
+`ProceduralFieldKind::source_key` table (`procedural_curl` … `procedural_weave`)
+so no stringify site can disagree.
+
+**The field laws.** All six share `freq = 1 + scale * 15` cycles across the
+frame, `phase = program_time * rate` in turns, and the
+`PROCEDURAL_FIELD_MAX_SPEED = 8` UV/s amplitude — one eighth of the canonical
+±64 ceiling, and every component still passes `clamp_motion_velocity`. Curl is
+the analytic curl of a three-octave sinusoidal stream function (the frozen
+`CURL_OCTAVES` constants), divergence-free by construction. Radial pulses
+outward on `cos(TAU * (freq * r - phase))`; Spiral pitches the same ring 45°;
+Weave is orthogonal sinusoidal shear. Contour and Chroma observe the
+recipient's image as **covered premultiplied linear RGBA** — the exact
+`covered_source_linear` quantity, so hostile RGB behind zero coverage steers
+nothing by arithmetic — flowing along luma isolines (perpendicular to a
+central-difference gradient one field cell out) and along the phase-rotated YIQ
+chroma pair respectively. The four pure kinds bind a 1×1 defined-zero neutral
+their shader never reads and report fully open gates; Contour and Chroma report
+an honest gradient/saturation confidence so flat content contributes nothing.
+
+**A procedural field is a primitive field.** It flows through
+`admitted_field_slot`, is eligible as a Collider input and a donor via
+`required_as_donor`, and writes the existing `Rg16Float`/`Rg8Unorm` parity
+pair. The ledger delta is one low-resolution pass and **zero bytes**: no luma
+ping-pong is charged (the `luma_bytes` predicate never matches a procedural
+origin) and no new surface exists. The origin carries its kind because Contour
+and Chroma bind the scope's image while the pure kinds bind nothing —
+`MotionFieldOrigin::signature_code` (0–3 frozen, kinds at 4–9) feeds the
+topology signature so a kind change re-prepares rather than reusing stale bind
+groups. Publication is the codec-upload law: a freshly synthesized parity every
+program-advancing frame, valid from the first. Synthesis is derived from
+program time, not acquired from media, so Media Freeze and a paused layer hold
+decoders while the field keeps advancing; Program Freeze holds it exactly as it
+holds everything. The pass's only time input is the shared frame-plan context
+(`FramePlanContext::time_seconds`), never wall time, so Pause holds the field
+still and export parity is structural.
+
+**Authored scalars.** `ProceduralFieldParams { scale, rate }` are scope state
+like the shutter's: they persist and modulate whether or not the current source
+is procedural, so switching kinds never erases them. `scale` is unit-clamped
+(neutral 0.5); `rate` clamps to ±2 turns/second (neutral 0.25); non-finite
+input takes the neutral, never a clamped extreme.
+
+**Closure.** Patch: the `procedural` block is skip-serialized at default, so
+every pre-B2 patch keeps its bytes and canonical hash; hostile scalars sanitize
+on load and unknown fields are rejected. Wire: the kind rides the existing
+`field_source` value (MemoryTopology impact); `field_scale`/`field_rate` are
+ordinary coalescible values at both scopes (ValuesOnly). Modulation adds
+exactly two continuous addresses per scope — `motion_field_scale` `[0,1]` and
+`motion_field_rate` `[-2,2]`, master and `layerN_` — appended to the end of
+`LAYER_TARGET_SUFFIXES` (58, 59) so every compiled suffix index is stable; the
+kind itself is discrete authored state with no address, exactly as the field
+source always was. Morph interpolates the two scalars and switches the kind at
+the midpoint through `field_source`'s existing pick. Dice and generator v8
+mutate only the two scalars, each in a fresh RNG domain, so every pre-B2 stream
+is byte-stable; the `GENERATOR_VERSION` bump to "8" names the fact that a
+generated piece now carries the two new values. The snapshot's additive
+`procedural` block and the sidecar's existing `requested_source` string carry
+the state; no sidecar schema bump, because no field was added. Export consumes
+the same plan and shader, codec acquisition skips procedural origins, and
+`render_procedural_motion_field_pipeline` is the labeled export case — a
+deliberately tapless single-layer stack, legal since the composite rank landed.
+
+What is proven and what is not: kind codes/keys, resolution at every scope, the
+analytic per-kind fixtures, numeric divergence-freedom for Curl, alpha-covered
+Chroma neutrality, canonical-range clamping, zero luma bytes, the
+procedural-versus-codec Collider planner fixture, and the full
+patch/Morph/modulation/Dice/generator/browser/export closure are hosted CPU
+tests. `gpu_procedural_field_matches_the_cpu_reference_for_every_kind`
+(worst |GPU − CPU| ≤ 0.008 UV/s across all six kinds) and the labeled export
+case are opt-in `#[ignore]` fixtures measured on one adapter (AMD Radeon
+RX 6950 XT / Vulkan 26.7.1).
+
 ### Named two-input Residual Counterpoint
 
 `Residual` is a Collision Rack node that recombines one route's large-scale
@@ -1780,11 +1860,11 @@ path cache, cancellation checks, before/after metadata consistency, at most
 zero is invalid. Operational paths and filesystem metadata must not enter
 shareable manifests or receipts.
 
-Generator v7 normalizes the anchor, replaces verified file sources with content
+Generator v8 normalizes the anchor, replaces verified file sources with content
 references, reduces filenames to logical names, and hashes version-prefixed
 canonical JSON with SHA-256. `anchor_sha256`, `piece_sha256`, and lineage must be
 path-independent and source-byte-sensitive. Schema-v2 manifests retain defaulted
-v1 fields for deserialization compatibility. Generator v7 also applies bounded,
+v1 fields for deserialization compatibility. Generator v8 also applies bounded,
 reflected spatial mutations through independent RNG domains without changing
 saved Fit/Edge/Sampling choices. Each generated piece stages
 `patch.yaml`, `manifest.json`, and deterministic `preflight.json`, then commits
@@ -2156,6 +2236,26 @@ mislead browser tests.
   carrier into the audience image, both inputs contributing, live/export
   identity parity, warm-allocation invariance, and byte-identical exact M4 when
   disabled — and `render_field_collider_pipeline` is the labeled export case.
+- B2 procedural-field tests must cover the closed kind vocabulary with its
+  permanent codes and the single `source_key` token table, resolution at every
+  scope with no codec dependency and no fallback, neutral (never
+  clamped-extreme) sanitize for both scalars, the four pure kinds proven never
+  to consult the image (a panicking closure) with fully open gates, the
+  analytic Radial/Spiral/Weave fixtures, numeric divergence-freedom for Curl at
+  base frequency, Contour's perpendicular-to-gradient law with gradient
+  confidence and flat content contributing nothing, Chroma's alpha-covered
+  neutrality (zero coverage steers nothing), clamping into the canonical
+  velocity range with non-finite time taking neutral zero, zero luma bytes in
+  preflight beside byte-identical vector/gate charges, the append-only origin
+  signature codes 4–9, a Collider planner fixture with one procedural and one
+  codec input, the patch round trip with absent-section byte identity, Morph
+  scalar interpolation with the kind switching at the midpoint, the two
+  modulation addresses at master and layer scope, ingress classification
+  (kind = MemoryTopology, scalars = ValuesOnly) with a bare `procedural` token
+  refused, and the wire vocabulary in `valid_motion_edit`.
+  `gpu_procedural_field_matches_the_cpu_reference_for_every_kind` carries the
+  physical-GPU claim and `render_procedural_motion_field_pipeline` is the
+  labeled export case.
 - Preview transform-gizmo tests must cover the pane/output/local round trip at
   multiple aspect ratios and DPI scales including a non-square output, an
   active crop, a nonzero shear and a letterboxed pane; the forward map agreeing

@@ -1422,6 +1422,7 @@ impl PreparedAdvanced {
                         ) || motion_plan.scope(field.scope).is_some_and(|scope| {
                             scope.params.field_source == crate::motion::MotionFieldSource::Auto
                         }),
+                        procedural: field.source.origin.procedural_kind(),
                         required_as_garden_signal: field.required_as_garden_signal,
                     })
                     .collect::<Vec<_>>();
@@ -1442,7 +1443,11 @@ impl PreparedAdvanced {
                                 MotionFieldOrigin::Lattice | MotionFieldOrigin::LatticeFallback
                             ) || motion_plan.scope(field.scope).is_some_and(|scope| {
                                 scope.params.field_source == crate::motion::MotionFieldSource::Auto
-                            })
+                            }) || field
+                                .source
+                                .origin
+                                .procedural_kind()
+                                .is_some_and(|kind| kind.reads_image())
                         })
                         .map(|field| {
                             let view = match field.scope {
@@ -1820,6 +1825,7 @@ impl PreparedAdvanced {
                     attachments: motion_input.attachments,
                     held_scopes: motion_input.held_scopes,
                 },
+                plan.base().context().time_seconds,
             )?;
             for field in motion_plan
                 .fields()

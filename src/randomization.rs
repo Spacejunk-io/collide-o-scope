@@ -734,6 +734,10 @@ const DICE_MOTION_SHUTTER_ANGLE: u64 = 0x5348_5554_414e_474c;
 const DICE_MOTION_SHUTTER_PHASE: u64 = 0x5348_5554_5048_4153;
 const DICE_MOTION_SHUTTER_CURVE: u64 = 0x5348_5554_4355_5256;
 const DICE_MOTION_CHROMATIC_LAG: u64 = 0x4348_524f_4d4c_4147;
+// B2 procedural field scalars live in fresh domains so every pre-B2 Dice
+// stream stays byte-stable.
+const DICE_MOTION_FIELD_SCALE: u64 = 0x4649_454c_4453_434c;
+const DICE_MOTION_FIELD_RATE: u64 = 0x4649_454c_4452_4154;
 
 const fn dice_motion_owner_domain(scope: DiceMotionScope) -> u64 {
     match scope {
@@ -857,6 +861,22 @@ pub(crate) fn mutate_live_motion(
         1.0,
         0.15,
         DICE_MOTION_CHROMATIC_LAG
+    );
+    linear!(
+        motion.procedural.scale,
+        defaults.procedural.scale,
+        0.0,
+        1.0,
+        0.2,
+        DICE_MOTION_FIELD_SCALE
+    );
+    linear!(
+        motion.procedural.rate,
+        defaults.procedural.rate,
+        -2.0,
+        2.0,
+        0.5,
+        DICE_MOTION_FIELD_RATE
     );
     *motion = motion.sanitized();
 }

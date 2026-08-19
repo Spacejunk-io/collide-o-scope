@@ -2457,7 +2457,8 @@ document.getElementById('temporal-score-trigger')?.addEventListener('click', () 
 // --- M4 Motion Fields / Faraday Transplant / Curved Shutter ---
 
 const MOTION_PARAM_DEFAULTS = Object.freeze({
-  field_source: 'auto', lattice_quality: 'live', transplant_amount: 0,
+  field_source: 'auto', lattice_quality: 'live', field_scale: 0.5, field_rate: 0.25,
+  transplant_amount: 0,
   carrier: 'transparent', confidence_threshold: 0.1, confidence_softness: 0.05,
   refresh: 1, decay: 1, occlusion: 0, shutter_angle: 0, shutter_phase: 0,
   shutter_curvature: 0, shutter_chromatic_lag: 0, shutter_quality: 'sharp',
@@ -2468,9 +2469,12 @@ function motionParamValue(motion = {}, param) {
   const transplant = motion.transplant || {};
   const shutter = motion.shutter || {};
   const collider = motion.collider || {};
+  const procedural = motion.procedural || {};
   const values = {
     field_source: motion.field_source,
     lattice_quality: motion.lattice_quality,
+    field_scale: procedural.scale,
+    field_rate: procedural.rate,
     transplant_amount: transplant.amount,
     carrier: transplant.carrier,
     confidence_threshold: transplant.confidence_threshold,
@@ -3496,8 +3500,10 @@ function motionSelectHtml(param, label, options) {
 function layerMotionControlsHtml(layer, index) {
   const motion = layer.motion || {};
   return `
-    ${motionSelectHtml('field_source', 'Field source', [['auto', 'Auto'], ['codec_vectors', 'Codec vectors'], ['lattice', 'Motion lattice']])}
+    ${motionSelectHtml('field_source', 'Field source', [['auto', 'Auto'], ['codec_vectors', 'Codec vectors'], ['lattice', 'Motion lattice'], ['procedural_curl', 'Curl field'], ['procedural_radial', 'Radial field'], ['procedural_spiral', 'Spiral field'], ['procedural_contour', 'Contour field'], ['procedural_chroma', 'Chroma field'], ['procedural_weave', 'Weave field']])}
     ${motionSelectHtml('lattice_quality', 'Lattice', [['draft', 'Draft · 16px'], ['live', 'Live · 8px'], ['high', 'High · 4px']])}
+    ${motionRangeHtml('field_scale', 'Field scale', 0, 1, 0.01, Number(motion.procedural?.scale ?? 0.5))}
+    ${motionRangeHtml('field_rate', 'Field rate', -2, 2, 0.01, Number(motion.procedural?.rate ?? 0.25))}
     <div class="param-row select-row motion-donor-row"><label for="layer-motion-donor-${index}">Faraday donor</label><select id="layer-motion-donor-${index}" class="motion-donor-select" aria-label="Layer ${index + 1} Faraday motion donor"><option value="none">None</option></select></div>
     ${motionRangeHtml('transplant_amount', 'Transplant', 0, 1, 0.01, Number(motion.transplant?.amount ?? 0))}
     ${motionSelectHtml('carrier', 'Carrier', [['transparent', 'Transparent'], ['black', 'Black'], ['first_source_frame', 'First source frame']])}

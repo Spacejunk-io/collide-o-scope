@@ -1413,12 +1413,29 @@ fn apply_motion_param(
                 Some("auto") => MotionFieldSource::Auto,
                 Some("codec_vectors") => MotionFieldSource::CodecVectors,
                 Some("lattice") => MotionFieldSource::Lattice,
-                _ => {
-                    return Err(
-                        "motion field_source must be auto, codec_vectors, or lattice".into(),
-                    )
+                Some(token) => match motion::ProceduralFieldKind::ALL
+                    .into_iter()
+                    .find(|kind| kind.source_key() == token)
+                {
+                    Some(kind) => MotionFieldSource::Procedural(kind),
+                    None => {
+                        return Err("motion field_source must be auto, codec_vectors, lattice, \
+                                    or a procedural_* kind"
+                            .into())
+                    }
+                },
+                None => {
+                    return Err("motion field_source must be auto, codec_vectors, lattice, \
+                                or a procedural_* kind"
+                        .into())
                 }
             };
+        }
+        "field_scale" => {
+            params.procedural.scale = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "field_rate" => {
+            params.procedural.rate = bounded_motion_value(value, -2.0, 2.0, param)?;
         }
         "lattice_quality" => {
             params.lattice_quality = match value.as_str() {
@@ -3123,22 +3140,21 @@ fn motion_telemetry_from_plan(
                 motion_runtime_diagnostic(scope.scope, executor.motion_diagnostics())
             });
             let planned_diagnostic = motion_scope_diagnostic(scope.scope, plan.diagnostics());
-            let effective_source = match scope.source.origin {
+            let origin_key = |origin: motion::MotionFieldOrigin| match origin {
                 motion::MotionFieldOrigin::None => "none",
                 motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
                 motion::MotionFieldOrigin::Lattice => "lattice",
                 motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+                motion::MotionFieldOrigin::Procedural(kind) => kind.source_key(),
             };
-            let rendered_source = match runtime
-                .filter(|runtime| runtime.valid_fields > 0)
-                .map_or(motion::MotionFieldOrigin::None, |runtime| {
-                    runtime.field_origin
-                }) {
-                motion::MotionFieldOrigin::None => "none",
-                motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
-                motion::MotionFieldOrigin::Lattice => "lattice",
-                motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
-            };
+            let effective_source = origin_key(scope.source.origin);
+            let rendered_source = origin_key(
+                runtime
+                    .filter(|runtime| runtime.valid_fields > 0)
+                    .map_or(motion::MotionFieldOrigin::None, |runtime| {
+                        runtime.field_origin
+                    }),
+            );
             let donor_missing = plan.diagnostics().iter().any(|diagnostic| {
                 matches!(
                     diagnostic,
@@ -22101,6 +22117,50 @@ mod app_state_tests {
 
     fn stable_layer(value: u64) -> image_routing::StableLayerId {
         image_routing::StableLayerId::new(value).unwrap()
+    }
+
+    #[test]
+    fn procedural_motion_ingress_is_closed_and_classifies_its_impact() {
+        let mut params = motion::MotionParams::default();
+        // Every kind token is a topology edit: it changes which pass writes
+        // the field and which bindings must be prepared.
+        let impact = apply_motion_param(
+            &mut params,
+            true,
+            "field_source",
+            &serde_json::json!("procedural_weave"),
+        )
+        .unwrap();
+        assert_eq!(impact, MotionEditImpact::MemoryTopology);
+        assert_eq!(
+            params.field_source,
+            motion::MotionFieldSource::Procedural(motion::ProceduralFieldKind::Weave)
+        );
+        // The two scalars are ordinary coalescible values at both scopes.
+        assert_eq!(
+            apply_motion_param(&mut params, true, "field_scale", &serde_json::json!(0.9)).unwrap(),
+            MotionEditImpact::ValuesOnly
+        );
+        assert_eq!(
+            apply_motion_param(&mut params, false, "field_rate", &serde_json::json!(-1.25))
+                .unwrap(),
+            MotionEditImpact::ValuesOnly
+        );
+        assert_eq!(params.procedural.scale, 0.9);
+        assert_eq!(params.procedural.rate, -1.25);
+        // A bare "procedural" token names no kind and is refused, never
+        // defaulted onto one; out-of-range scalars are refused, not clamped.
+        assert!(apply_motion_param(
+            &mut params,
+            true,
+            "field_source",
+            &serde_json::json!("procedural")
+        )
+        .is_err());
+        assert!(
+            apply_motion_param(&mut params, true, "field_rate", &serde_json::json!(2.5)).is_err()
+        );
+        assert_eq!(params.procedural.rate, -1.25);
     }
 
     #[test]
