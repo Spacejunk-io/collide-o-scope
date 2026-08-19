@@ -121,6 +121,48 @@ impl Default for ProxySettings {
 }
 
 impl ProxySettings {
+    /// The one authoring door for a non-default settings tuple. The wire and
+    /// the native surface carry only the three operator choices; the schema
+    /// and algorithm versions are always this build's own constants, so an
+    /// authored tuple can never smuggle a foreign version into a cache key.
+    /// Validation is built in rather than left to the caller.
+    pub fn authored(
+        scale: ProxyScale,
+        frame_rate: ProxyFrameRate,
+        include_audio: bool,
+    ) -> Result<Self, ProxyError> {
+        Self {
+            scale,
+            frame_rate,
+            include_audio,
+            ..Self::default()
+        }
+        .validate()
+    }
+
+    /// Operator-facing summary of the tuple, used by status lines. Wording
+    /// stays close to the plan vocabulary: scale, timing, audio policy.
+    pub fn summary(self) -> String {
+        let scale = match self.scale {
+            ProxyScale::Original => "original scale",
+            ProxyScale::Half => "half scale",
+            ProxyScale::Quarter => "quarter scale",
+        };
+        let timing = match self.frame_rate {
+            ProxyFrameRate::Source => "source timing".to_owned(),
+            ProxyFrameRate::Fixed {
+                numerator,
+                denominator,
+            } => format!("fixed {numerator}/{denominator} fps"),
+        };
+        let audio = if self.include_audio {
+            "audio carried"
+        } else {
+            "no audio"
+        };
+        format!("{scale}, {timing}, {audio}")
+    }
+
     pub fn validate(self) -> Result<Self, ProxyError> {
         if self.schema_version != PROXY_SCHEMA_VERSION {
             return Err(ProxyError::UnsupportedSchemaVersion(self.schema_version));
@@ -1078,6 +1120,57 @@ mod tests {
 
     fn key(digit: char) -> ProxyCacheKey {
         ProxyCacheKey::derive(&identity(digit, 4_096), ProxySettings::default()).unwrap()
+    }
+
+    #[test]
+    fn authored_settings_carry_this_builds_versions_and_refuse_invalid_rates() {
+        // The authoring door accepts only the three operator choices; the
+        // schema and algorithm versions are always this build's constants, so
+        // an authored tuple can never smuggle a foreign version into a key.
+        let authored = ProxySettings::authored(
+            ProxyScale::Quarter,
+            ProxyFrameRate::Fixed {
+                numerator: 24,
+                denominator: 1,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(authored.schema_version, PROXY_SCHEMA_VERSION);
+        assert_eq!(authored.algorithm_version, PROXY_ALGORITHM_VERSION);
+        assert_eq!(authored.format, ProxyFormat::Ffv1Matroska);
+
+        // Authoring the default choices reproduces the default tuple exactly.
+        assert_eq!(
+            ProxySettings::authored(ProxyScale::Half, ProxyFrameRate::Source, true).unwrap(),
+            ProxySettings::default()
+        );
+
+        // Validation is built in: a zero term and an over-cap rate are typed
+        // refusals, never clamped into a nearby legal tuple.
+        for (numerator, denominator) in [(0, 1), (30, 0), (241, 1)] {
+            assert!(matches!(
+                ProxySettings::authored(
+                    ProxyScale::Half,
+                    ProxyFrameRate::Fixed {
+                        numerator,
+                        denominator,
+                    },
+                    true,
+                ),
+                Err(ProxyError::InvalidFrameRate { .. })
+            ));
+        }
+
+        // The status-line vocabulary stays stable.
+        assert_eq!(
+            ProxySettings::default().summary(),
+            "half scale, source timing, audio carried"
+        );
+        assert_eq!(
+            authored.summary(),
+            "quarter scale, fixed 24/1 fps, no audio"
+        );
     }
 
     #[test]

@@ -41,6 +41,27 @@
           </select>
           <div id="new-layer-fit-help" class="media-safety-rationale">Host-session preference for future file, still, and Spout layers. Existing and recalled layers are unchanged.</div>
         </section>
+        <section class="new-layer-preference proxy-settings" aria-labelledby="proxy-settings-title">
+          <span id="proxy-settings-title">PROXY ENCODING</span>
+          <label for="proxy-scale">Scale</label>
+          <select id="proxy-scale" aria-describedby="proxy-settings-help">
+            <option value="original">Original</option>
+            <option value="half" selected>Half</option>
+            <option value="quarter">Quarter</option>
+          </select>
+          <label for="proxy-frame-rate">Timing</label>
+          <select id="proxy-frame-rate" aria-describedby="proxy-settings-help">
+            <option value="source" selected>Source timing</option>
+            <option value="24">Fixed 24 fps</option>
+            <option value="30">Fixed 30 fps</option>
+            <option value="60">Fixed 60 fps</option>
+          </select>
+          <label class="toggle-label" for="proxy-include-audio">
+            <input type="checkbox" id="proxy-include-audio" checked aria-describedby="proxy-settings-help">
+            Carry source audio
+          </label>
+          <div id="proxy-settings-help" class="media-safety-rationale">Host-session settings for future proxy encodes and cache lookups. Each combination keeps its own cached artifact; layers already proxy-backed and published artifacts are unchanged.</div>
+        </section>
         <section class="slot-load-target" aria-labelledby="slot-load-title">
           <label id="slot-load-title" for="library-slot-target">LOAD INTO SLOT</label>
           <select id="library-slot-target" aria-describedby="slot-load-help">

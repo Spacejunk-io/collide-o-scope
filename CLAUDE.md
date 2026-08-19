@@ -1898,6 +1898,26 @@ the browser cannot bypass the content-identity contract, and a request is an
 operational event: it records no manual history and survives an Apply Look
 unfiltered.
 
+Host-session proxy settings are authored, not fixed. `set_proxy_settings
+{ scale, frame_rate, include_audio }` is an ordinary immediate coalescible
+host action (`host:proxy-settings`, never quantized, never priority — the
+`set_media_safety_mode` shape), validated at the server gate and at the
+handler by `ProxySettings::authored`, the one authoring door, which always
+stamps this build's schema and algorithm versions so a wire tuple can never
+smuggle a foreign version into a cache key. The engine holds exactly one
+authored owner (`App::proxy_settings`); the HUD assessment, the patch-load
+consultation, the encode request, and the hot-adoption job all answer from
+it — pinned by a source audit on `ProxySettings::default()` — so the
+program can never encode under one settings tuple and consult under
+another. `AppSnapshot::proxy_settings` publishes only the three operator
+choices. Each tuple is its own content-addressed cache key by design: a
+change governs future encodes and consultations, touches no live
+proxy-backed layer and no published artifact, and a load consults the
+cache under the current session tuple only. Like the media-safety mode,
+the value is process-local, absent from patches, and a new process starts
+at the default; an operator-facing summary reports every installed tuple
+and every typed refusal, which leaves the authored owner untouched.
+
 Live NTSC diagnostics remain path-specific. For both the global and selective
 paths, `attempted` counts admission decisions, `accepted` counts admitted work,
 `skipped` counts only healthy Busy backpressure, and `unavailable` separately
@@ -2265,7 +2285,11 @@ a passing claim.
   fingerprints the source through the same bounded machinery (mint mode),
   lands the identity behind claim guards, and — the operator's S9 ruling —
   enters it into persistence, so the next patch capture emits the content
-  reference exactly as generation would have. Spout layers still cannot be
+  reference exactly as generation would have. Settings beyond the default
+  are now authored host-session state through the one-owner law in the web
+  section: each tuple keys its own cache entry, a load consults under the
+  current session tuple only, and the default tuple remains the process
+  start. Spout layers still cannot be
   proxied (no file bytes exist), which is a category fact rather than an
   edge. A host killed
   mid-encode may orphan one ffmpeg process bounded by its own completion;

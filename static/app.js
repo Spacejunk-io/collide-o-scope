@@ -13,6 +13,9 @@ const mediaSafetySummary = document.getElementById('media-safety-summary');
 const mediaSafetyRationale = document.getElementById('media-safety-rationale');
 const mediaSafetyStatus = document.getElementById('media-safety-status');
 const newLayerFit = document.getElementById('new-layer-fit');
+const proxyScale = document.getElementById('proxy-scale');
+const proxyFrameRate = document.getElementById('proxy-frame-rate');
+const proxyIncludeAudio = document.getElementById('proxy-include-audio');
 const librarySlotTarget = document.getElementById('library-slot-target');
 const librarySlotTrigger = document.getElementById('library-slot-trigger');
 const slotLoadStatus = document.getElementById('slot-load-status');
@@ -23,6 +26,10 @@ const sceneCaptureName = document.getElementById('scene-capture-name');
 const sceneCaptureMode = document.getElementById('scene-capture-mode');
 let authoritativeMediaSafetyMode = 'safe';
 let authoritativeNewLayerFit = 'fit';
+// Mirrors the engine's host-session ProxySettings tuple. `rateKey` is the
+// select's value vocabulary: 'source', a preset numerator, or 'fixed:N/D'
+// for a tuple another controller authored outside the presets.
+let authoritativeProxySettings = { scale: 'half', rateKey: 'source', includeAudio: true };
 
 const LAYER_BLEND_MODES = Object.freeze([
   { key: 'normal', label: 'Normal', description: 'Normal composites the layer over the content below.' },
@@ -80,6 +87,70 @@ newLayerFit?.addEventListener('change', () => {
     newLayerFit.value = authoritativeNewLayerFit;
   }
 });
+
+const PROXY_FRAME_RATE_PRESETS = new Set(['24', '30', '60']);
+
+// A fixed rate outside the preset list (authored by another controller) is
+// represented honestly by one dynamic option instead of being misreported as
+// the nearest preset.
+function setProxyFrameRateSelect(rateKey) {
+  if (!proxyFrameRate) return;
+  const dynamic = proxyFrameRate.querySelector('option[data-authored-elsewhere]');
+  const isPreset = rateKey === 'source' || PROXY_FRAME_RATE_PRESETS.has(rateKey);
+  if (isPreset) {
+    if (dynamic) dynamic.remove();
+    proxyFrameRate.value = rateKey;
+    return;
+  }
+  const match = /^fixed:(\d+)\/(\d+)$/.exec(rateKey);
+  if (!match) {
+    if (dynamic) dynamic.remove();
+    proxyFrameRate.value = 'source';
+    return;
+  }
+  const option = dynamic || document.createElement('option');
+  option.value = rateKey;
+  option.textContent = `Fixed ${match[1]}/${match[2]} fps`;
+  option.setAttribute('data-authored-elsewhere', '');
+  if (!dynamic) proxyFrameRate.appendChild(option);
+  proxyFrameRate.value = rateKey;
+}
+
+function resetProxySettingsControls() {
+  if (proxyScale) proxyScale.value = authoritativeProxySettings.scale;
+  setProxyFrameRateSelect(authoritativeProxySettings.rateKey);
+  if (proxyIncludeAudio) proxyIncludeAudio.checked = authoritativeProxySettings.includeAudio;
+}
+
+// Every edit carries the complete absolute tuple, so one control's change can
+// never silently reset another and coalescing keeps only the newest tuple.
+function sendProxySettings() {
+  if (!proxyScale || !proxyFrameRate || !proxyIncludeAudio) return;
+  const scale = ['original', 'half', 'quarter'].includes(proxyScale.value)
+    ? proxyScale.value
+    : authoritativeProxySettings.scale;
+  const rateKey = proxyFrameRate.value;
+  let frameRate = 'source';
+  if (PROXY_FRAME_RATE_PRESETS.has(rateKey)) {
+    frameRate = { fixed: { numerator: Number(rateKey), denominator: 1 } };
+  } else if (rateKey !== 'source') {
+    const match = /^fixed:(\d+)\/(\d+)$/.exec(rateKey);
+    if (match) {
+      frameRate = { fixed: { numerator: Number(match[1]), denominator: Number(match[2]) } };
+    }
+  }
+  const sent = sendAction({
+    action: 'set_proxy_settings',
+    scale,
+    frame_rate: frameRate,
+    include_audio: proxyIncludeAudio.checked,
+  });
+  if (!sent) resetProxySettingsControls();
+}
+
+proxyScale?.addEventListener('change', sendProxySettings);
+proxyFrameRate?.addEventListener('change', sendProxySettings);
+proxyIncludeAudio?.addEventListener('change', sendProxySettings);
 
 // Declared before the socket connects so reconnect reconciliation is safe
 // even when the initial connection opens immediately.
@@ -152,6 +223,7 @@ function connect() {
       expertMediaToggle.toggleAttribute('aria-busy', false);
     }
     if (newLayerFit) newLayerFit.value = authoritativeNewLayerFit;
+    resetProxySettingsControls();
     outputRequestSequence += 1;
     outputPendingOpen = null;
     renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
@@ -177,6 +249,7 @@ function connect() {
         syncLibrary(msg.library);
         syncMediaSafety(msg.media_safety);
         syncNewLayerFit(msg.new_layer_fit);
+        syncProxySettings(msg.proxy_settings);
         syncTransport(msg.program_frozen ?? msg.paused, msg.media_frozen);
         syncExport(msg.export_progress, msg.export_error, msg.export_status, msg.export_warnings, msg.export_motion);
         syncHistory(msg.history);
@@ -2852,6 +2925,27 @@ function syncNewLayerFit(value) {
   const fit = ['stretch', 'fit', 'fill', 'native'].includes(value) ? value : 'fit';
   authoritativeNewLayerFit = fit;
   if (canSync(newLayerFit)) newLayerFit.value = fit;
+}
+
+function syncProxySettings(settings) {
+  if (!proxyScale || !proxyFrameRate || !proxyIncludeAudio) return;
+  const scale = ['original', 'half', 'quarter'].includes(settings?.scale) ? settings.scale : 'half';
+  let rateKey = 'source';
+  const fixed = settings?.frame_rate?.fixed;
+  if (fixed) {
+    const numerator = Number(fixed.numerator) || 0;
+    const denominator = Number(fixed.denominator) || 0;
+    if (numerator > 0 && denominator > 0) {
+      rateKey = denominator === 1 && PROXY_FRAME_RATE_PRESETS.has(String(numerator))
+        ? String(numerator)
+        : `fixed:${numerator}/${denominator}`;
+    }
+  }
+  const includeAudio = settings?.include_audio !== false;
+  authoritativeProxySettings = { scale, rateKey, includeAudio };
+  if (canSync(proxyScale)) proxyScale.value = scale;
+  if (canSync(proxyFrameRate)) setProxyFrameRateSelect(rateKey);
+  if (canSync(proxyIncludeAudio)) proxyIncludeAudio.checked = includeAudio;
 }
 
 expertMediaToggle?.addEventListener('change', () => {

@@ -548,25 +548,23 @@ fn proxy_assessment_status(
     layer: &Layer,
     telemetry: &video::threaded::DecoderTelemetry,
     visible_layers: usize,
+    settings: proxy::ProxySettings,
 ) -> String {
     let Some(observation) = proxy_playback_observation(telemetry, visible_layers) else {
         return "proxy measurement collecting (0/60 complete samples)".to_string();
     };
     let identity = layer.content_identity_for_proxy();
-    proxy_assessment_status_from_observation(identity.as_ref(), observation)
+    proxy_assessment_status_from_observation(identity.as_ref(), observation, settings)
 }
 
 fn proxy_assessment_status_from_observation(
     identity: Option<&media_source::ContentIdentity>,
     observation: proxy::ProxyPlaybackObservation,
+    settings: proxy::ProxySettings,
 ) -> String {
     let assessment = match identity {
-        Some(identity) => proxy::assess_content_addressed_proxy(
-            identity,
-            proxy::ProxySettings::default(),
-            observation,
-        )
-        .map(|assessment| assessment.assessment),
+        Some(identity) => proxy::assess_content_addressed_proxy(identity, settings, observation)
+            .map(|assessment| assessment.assessment),
         None => proxy::assess_proxy(observation),
     };
     let status = match assessment {
@@ -3480,6 +3478,15 @@ struct App {
     /// Decode p95 observed when an encode was requested, keyed by source
     /// SHA-256 — the "before" half of the decoder A/B once a proxy is live.
     proxy_ab_baseline_micros: std::collections::HashMap<String, u32>,
+    /// The single authored owner of host-session proxy settings. Every
+    /// production consumer — the HUD assessment, the patch-load consultation,
+    /// the encode request, and the hot-adoption job — answers from this field,
+    /// so the program can never encode under one settings tuple and consult
+    /// under another. Host-session only: deliberately absent from patches
+    /// (like the media-safety mode), reset to the default in a new process,
+    /// and a change governs future encodes and consultations without touching
+    /// live proxy-backed layers or published artifacts.
+    proxy_settings: proxy::ProxySettings,
     /// Monotonic generation for the live layer stack. Browser actions carry
     /// this (plus a stable layer ID) so stale multi-controller edits cannot
     /// land on a different clip after a topology change.
@@ -3984,6 +3991,7 @@ impl App {
             study_library: study_eval::StudyProgramLibrary::default(),
             proxy_feedback: std::collections::HashMap::new(),
             proxy_ab_baseline_micros: std::collections::HashMap::new(),
+            proxy_settings: proxy::ProxySettings::default(),
             layer_stack_revision: 1,
             composition: legacy_runtime_composition(&[])
                 .expect("the empty legacy composition is valid"),
@@ -7047,7 +7055,7 @@ impl App {
                         match proxy_worker::consult_proxy_cache(
                             store,
                             &identity,
-                            proxy::ProxySettings::default(),
+                            self.proxy_settings,
                             &path,
                         ) {
                             proxy_worker::ProxyConsultation::Adopted { key, artifact_path } => {
@@ -14975,6 +14983,27 @@ impl App {
                     }
                 );
             }
+            WebAction::SetProxySettings {
+                scale,
+                frame_rate,
+                include_audio,
+            } => {
+                // The authoring door validates; a refused tuple leaves the
+                // authored owner untouched rather than landing on a clamp.
+                match proxy::ProxySettings::authored(scale, frame_rate, include_audio) {
+                    Ok(settings) => {
+                        self.proxy_settings = settings;
+                        self.media_safety_status = format!(
+                            "Future proxy encodes and cache consultations use {}",
+                            settings.summary()
+                        );
+                    }
+                    Err(error) => {
+                        self.media_safety_status = format!("Proxy settings rejected: {error}");
+                        log::warn!("{}", self.media_safety_status);
+                    }
+                }
+            }
             WebAction::Reroll {
                 scope,
                 index,
@@ -16624,7 +16653,7 @@ impl App {
         let minting = identity.is_none();
         let request = proxy_worker::ProxyEncodeRequest {
             source_path,
-            settings: proxy::ProxySettings::default(),
+            settings: self.proxy_settings,
             identity: identity_mode,
         };
         let submitted = self
@@ -16822,7 +16851,7 @@ impl App {
         let layer_count = candidates.len();
         let job = proxy_worker::ProxyAdoptionJob {
             identity: identity.clone(),
-            settings: proxy::ProxySettings::default(),
+            settings: self.proxy_settings,
             original_source,
             device_limits,
             candidates,
@@ -16969,7 +16998,8 @@ impl App {
                 None => format!("proxy active ({short}…): decode p95 {decode_p95} us"),
             };
         }
-        let mut status = proxy_assessment_status(layer, telemetry, visible_layers);
+        let mut status =
+            proxy_assessment_status(layer, telemetry, visible_layers, self.proxy_settings);
         let feedback_key = Self::proxy_feedback_key_for_layer(layer);
         if let Some(note) = self.proxy_feedback.get(&feedback_key) {
             status.push_str("; ");
@@ -17429,6 +17459,7 @@ impl App {
             ntsc: ntsc_snapshot,
             media_safety: media_safety_snapshot,
             new_layer_fit: self.new_layer_fit,
+            proxy_settings: web::state::ProxySettingsSnapshot::from_settings(self.proxy_settings),
             layers: self
                 .layers
                 .iter()
@@ -24862,7 +24893,11 @@ mod app_state_tests {
             proxy::assess_proxy(observation).unwrap(),
             proxy::ProxyAssessment::ProxyRecommended(_)
         ));
-        let unkeyed_status = proxy_assessment_status_from_observation(None, observation);
+        let unkeyed_status = proxy_assessment_status_from_observation(
+            None,
+            observation,
+            proxy::ProxySettings::default(),
+        );
         assert!(unkeyed_status.starts_with("proxy recommended from measured"));
         assert!(unkeyed_status.ends_with("cache identity unavailable"));
     }
@@ -27897,6 +27932,109 @@ mod app_state_tests {
         let yaml = serde_yaml::to_string(&app.capture_current_patch()).unwrap();
         assert!(!yaml.contains("media_safety"));
         assert!(!yaml.contains("expert"));
+    }
+
+    #[test]
+    fn proxy_settings_have_one_authored_owner_and_never_enter_patches() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        assert_eq!(app.proxy_settings, proxy::ProxySettings::default());
+
+        let fixed_30 = proxy::ProxyFrameRate::Fixed {
+            numerator: 30,
+            denominator: 1,
+        };
+        app.handle_web_action(web::state::WebAction::SetProxySettings {
+            scale: proxy::ProxyScale::Quarter,
+            frame_rate: fixed_30,
+            include_audio: false,
+        });
+        let authored =
+            proxy::ProxySettings::authored(proxy::ProxyScale::Quarter, fixed_30, false).unwrap();
+        assert_eq!(app.proxy_settings, authored);
+        assert!(
+            app.media_safety_status
+                .contains("quarter scale, fixed 30/1 fps, no audio"),
+            "the status line reports the installed tuple: {}",
+            app.media_safety_status
+        );
+
+        // A refused tuple leaves the authored owner untouched — no clamp, no
+        // partial install.
+        app.handle_web_action(web::state::WebAction::SetProxySettings {
+            scale: proxy::ProxyScale::Half,
+            frame_rate: proxy::ProxyFrameRate::Fixed {
+                numerator: 0,
+                denominator: 1,
+            },
+            include_audio: true,
+        });
+        assert_eq!(app.proxy_settings, authored);
+        assert!(app
+            .media_safety_status
+            .starts_with("Proxy settings rejected"));
+
+        // The snapshot publishes exactly the authored tuple.
+        assert_eq!(
+            web::state::ProxySettingsSnapshot::from_settings(app.proxy_settings),
+            web::state::ProxySettingsSnapshot {
+                scale: proxy::ProxyScale::Quarter,
+                frame_rate: fixed_30,
+                include_audio: false,
+            }
+        );
+
+        // Host-session only: patches never own the tuple, exactly like the
+        // media-safety mode.
+        let yaml = serde_yaml::to_string(&app.capture_current_patch()).unwrap();
+        assert!(!yaml.contains("proxy_settings"));
+        assert!(!yaml.contains("include_audio"));
+    }
+
+    #[test]
+    fn proxy_settings_action_survives_an_applied_look_unfiltered() {
+        use web::state::WebAction;
+
+        // Like the proxy request itself, the settings action is operational
+        // rather than creative, so an Apply Look barrier must preserve it.
+        let mut remainder = VecDeque::from(vec![WebAction::SetProxySettings {
+            scale: proxy::ProxyScale::Original,
+            frame_rate: proxy::ProxyFrameRate::Source,
+            include_audio: true,
+        }]);
+        App::apply_web_action_batch_disposition(
+            &mut remainder,
+            WebActionBatchDisposition::LookApplied(AppliedLookScope {
+                mapped_layer_ids: vec![7],
+                applied_ntsc: true,
+                applied_temporal: true,
+                applied_nodes: Vec::new(),
+                applied_group_ids: Vec::new(),
+                applied_bus_crossfade: false,
+            }),
+        );
+        assert_eq!(remainder.len(), 1);
+        assert!(matches!(remainder[0], WebAction::SetProxySettings { .. }));
+    }
+
+    #[test]
+    fn proxy_settings_default_has_exactly_one_production_call_site() {
+        // The one-owner law, pinned at the source: the App field initializer
+        // is the single production consumer of the default tuple; the HUD
+        // assessment, the patch-load consultation, the encode request, and
+        // the hot-adoption job must all answer from `self.proxy_settings`.
+        let source = include_str!("main.rs");
+        let (production, _tests) = source
+            .split_once("mod app_state_tests")
+            .expect("main.rs carries its test module");
+        assert_eq!(
+            production
+                .matches("proxy::ProxySettings::default()")
+                .count(),
+            1,
+            "a second production `ProxySettings::default()` would let the \
+             program encode under one settings tuple and consult under another"
+        );
     }
 
     #[test]
