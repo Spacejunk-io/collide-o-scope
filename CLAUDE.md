@@ -44,6 +44,7 @@ src/
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
 ├── renderer/study.rs    fixed-pipeline Study interpreter executor, two textures, no sampler
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
+├── video/hw_decode.rs   evaluation-only D3D11VA session and the interop probe seam
 ├── video/threaded.rs    request decoder, codec motion, telemetry, latest-only mailbox
 ├── layers/mod.rs        video/Spout layer sources, texture upload, frame pacer
 ├── effects/params.rs    effect and temporal parameters/normalization
@@ -1998,7 +1999,15 @@ mislead browser tests.
   measurement, commit it. The hosted
   `full16_history_plan_charges_eight_bytes_per_temporal_pixel_and_discriminates`
   pins the candidate plan's 8-byte temporal class against the settled 4-byte
-  one in both directions with one-byte-under rejection.
+  one in both directions with one-byte-under rejection. The Gate 4 hardware
+  decode backend uses
+  `hw_decode_interop_probe_measures_agreement_and_writes_the_receipt`
+  (Windows, a real D3D11VA device, `videos/audit.mp4`), which regenerates
+  the tracked `docs/evidence/hw-decode-interop-receipt.json` in place under
+  the same S2-receipt law; the hosted
+  `the_production_probe_defers_every_capability_with_its_actionable_reason`
+  pins the per-platform progression, including hardware decode stopping at
+  exactly `EvaluationRequired(InteroperabilityProof)` on Windows.
 - `s2-eight-texture-floor-receipt.json` is a tracked artifact that the probe in
   `tests/eight_texture_floor_probe.rs` regenerates in place. It is tracked
   because `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS` and the Symmetry Field's
@@ -2318,6 +2327,22 @@ a passing claim.
   Unix CI FFmpeg build carries `--disable-programs`, so end-to-end encode
   fixtures are opt-in like `effects_audit` and hosted CI proves the
   CLI-free cache half only.
+- Hardware decode now has a backend in the tree, and it is
+  **evaluation-only**: `video::hw_decode` is a Windows/D3D11VA session that
+  decodes through FFmpeg's library hwaccel path and downloads every hardware
+  surface for comparison. It is constructed by the opt-in interop probe
+  alone — no production decode path, no wire action, no toggle. Landing it
+  moved the capability to exactly
+  `EvaluationRequired(InteroperabilityProof)` on Windows through the
+  module's own `backend_integrated` seam, and deliberately no further: the
+  tracked interop receipt is evidence for the operator's next decision, not
+  a runtime fact, so `Available`, live usage, and zero-copy are separate
+  operator-decided tranches. `hardware_decode_active` stays false because
+  `EvaluationRequired` is not `Available`. Export determinism is a standing
+  boundary for any future live tranche: the offline renderer keeps its
+  synchronous software decoders unless per-adapter bit-exactness is proven —
+  "the same patch exports differently on different GPUs" is never an
+  acceptable trade.
 - `ExperimentalFull16History` now has an implemented render path, but it is
   **measurement-only**: `CompositionHost::new_with_history_storage` widens
   exactly the 25-layer temporal class (ring plus feedback) to RGBA16Float, is

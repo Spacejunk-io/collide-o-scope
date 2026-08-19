@@ -1101,7 +1101,11 @@ fn require_decoded_frame_before_loop(frame_count: u64, path: &str) -> Result<(),
     }
 }
 
-fn open_input(path: &str, cancel: Arc<AtomicBool>, operation: &str) -> Result<Input, String> {
+pub(super) fn open_input(
+    path: &str,
+    cancel: Arc<AtomicBool>,
+    operation: &str,
+) -> Result<Input, String> {
     let deadline = Instant::now() + MEDIA_IO_TIMEOUT;
     // FFmpeg retains this callback for the Input's lifetime. `opening` turns
     // off the startup deadline after stream probing succeeds; later packet
