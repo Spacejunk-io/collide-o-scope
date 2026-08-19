@@ -99,6 +99,8 @@ Patch load consults the cache for content-referenced video sources: a validated 
 
 Three edges stay open, stated rather than implied: adoption happens at patch (re)apply, not by hot-swapping a live decoder; only sources with a verified `cos-sha256` identity can be proxied, because the key is content-addressed; and the browser panel has no proxy surface — request and status are native. The hosted CI FFmpeg build on Unix carries `--disable-programs`, so the end-to-end encode fixtures are opt-in like the effects audit, and hosted three-platform CI proves the CLI-free cache half: the commit law, crash recovery, seals, eviction, and refusals.
 
+**Operator observation, 2026-08-18.** The complete loop was run by hand on the development host (AMD Radeon RX 6950 XT, Windows 11, FFmpeg 8.1.2): a content-referenced piece generated from `audit.mp4`, a Y-key encode under default settings (Half scale, source timing, audio carried), and a patch reload to adopt. The HUD reported `proxy active (bfc1add0…): decode p95 7489 us vs 62692 us before` — an 8.4× decode improvement, from roughly four times over the 16.7 ms frame budget to comfortably inside it — with the key prefix matching the published artifact (`bfc1add0….mkv`, 965,036 bytes, plus its 64-byte seal) and nothing else in the cache. This is one clip on one host, and the A/B is the session-local before/after the HUD is documented to be, not a controlled benchmark; it is recorded because it is the first time the recommendation, the encode, the sealed publication, the adoption, and the measured gain were observed end to end by an operator rather than a test.
+
 ## Data-only Study ABI
 
 Study schema 1 / ABI 1.0 is closed, typed data with these hard boundaries:
