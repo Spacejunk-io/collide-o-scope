@@ -74,6 +74,97 @@ pub enum MotionFieldSource {
     CodecVectors,
     /// Always run deterministic block matching.
     Lattice,
+    /// A deterministic synthetic field computed by the closed B2 vocabulary.
+    /// It needs no codec, no luma observation history, and no fallback: the
+    /// same authored kind, scale, rate, and program time always produce the
+    /// same field, live and offline.
+    Procedural(ProceduralFieldKind),
+}
+
+impl MotionFieldSource {
+    /// The authored procedural kind, if this source selects one.
+    pub const fn procedural_kind(self) -> Option<ProceduralFieldKind> {
+        match self {
+            Self::Procedural(kind) => Some(kind),
+            _ => None,
+        }
+    }
+}
+
+/// The closed B2 procedural field vocabulary.
+///
+/// Curl, Radial, Spiral, and Weave are pure functions of UV, program time, and
+/// the two authored scalars; their gates are fully open. Contour and Chroma
+/// additionally read the recipient's own image — alpha-covered, so hostile
+/// hidden RGB at zero coverage steers nothing — and report an honest gradient/
+/// saturation confidence instead of pretending flat content moves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProceduralFieldKind {
+    #[default]
+    Curl,
+    Radial,
+    Spiral,
+    Contour,
+    Chroma,
+    Weave,
+}
+
+impl ProceduralFieldKind {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Curl => 0,
+            Self::Radial => 1,
+            Self::Spiral => 2,
+            Self::Contour => 3,
+            Self::Chroma => 4,
+            Self::Weave => 5,
+        }
+    }
+
+    /// Every kind in the closed vocabulary, in code order.
+    pub const ALL: [Self; 6] = [
+        Self::Curl,
+        Self::Radial,
+        Self::Spiral,
+        Self::Contour,
+        Self::Chroma,
+        Self::Weave,
+    ];
+
+    /// True when this kind observes the recipient's image. Contour steers
+    /// along luma isolines; Chroma steers by the YIQ chroma pair. The other
+    /// four are pure functions of UV and time and bind no image at all.
+    pub const fn reads_image(self) -> bool {
+        matches!(self, Self::Contour | Self::Chroma)
+    }
+
+    /// The stable `field_source` wire/sidecar token for this kind. Every
+    /// stringify site answers from this one table so the wire, the snapshot,
+    /// and the sidecar can never disagree about a kind's name.
+    pub const fn source_key(self) -> &'static str {
+        match self {
+            Self::Curl => "procedural_curl",
+            Self::Radial => "procedural_radial",
+            Self::Spiral => "procedural_spiral",
+            Self::Contour => "procedural_contour",
+            Self::Chroma => "procedural_chroma",
+            Self::Weave => "procedural_weave",
+        }
+    }
+}
+
+impl fmt::Display for ProceduralFieldKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Curl => write!(f, "curl"),
+            Self::Radial => write!(f, "radial"),
+            Self::Spiral => write!(f, "spiral"),
+            Self::Contour => write!(f, "contour"),
+            Self::Chroma => write!(f, "chroma"),
+            Self::Weave => write!(f, "weave"),
+        }
+    }
 }
 
 /// Fixed, artist-visible Motion Lattice tiers. Timing pressure never changes
@@ -244,12 +335,47 @@ impl CurvedShutterParams {
     }
 }
 
+/// Authored scalars for the procedural field family.
+///
+/// Both values are scope state like the shutter's: they persist and modulate
+/// whether or not the current `field_source` is procedural, so switching kinds
+/// never erases what the operator dialed in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProceduralFieldParams {
+    /// Spatial density in `[0, 1]`; the field law maps it to 1–16 cycles
+    /// across the frame.
+    pub scale: f32,
+    /// Signed animation rate in turns per second, clamped to `[-2, 2]`.
+    pub rate: f32,
+}
+
+impl Default for ProceduralFieldParams {
+    fn default() -> Self {
+        Self {
+            scale: 0.5,
+            rate: 0.25,
+        }
+    }
+}
+
+impl ProceduralFieldParams {
+    pub fn sanitized(self) -> Self {
+        Self {
+            scale: unit(self.scale, 0.5),
+            rate: finite_or(self.rate, 0.25).clamp(-2.0, 2.0),
+        }
+    }
+}
+
 /// Complete M4 authored motion contract for one master or layer scope.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionParams {
     pub algorithm_version: u16,
     pub field_source: MotionFieldSource,
     pub lattice_quality: MotionLatticeQuality,
+    /// B2 procedural field scalars. Inert unless `field_source` is
+    /// `Procedural(_)`.
+    pub procedural: ProceduralFieldParams,
     pub transplant: FaradayParams,
     pub shutter: CurvedShutterParams,
     /// Field Collider v1. Disabled is exact M4: the block delegates before any
@@ -268,6 +394,7 @@ impl Default for MotionParams {
             algorithm_version: MOTION_ALGORITHM_VERSION,
             field_source: MotionFieldSource::Auto,
             lattice_quality: MotionLatticeQuality::Live,
+            procedural: ProceduralFieldParams::default(),
             transplant: FaradayParams::default(),
             shutter: CurvedShutterParams::default(),
             collider: FieldColliderParams::default(),
@@ -285,6 +412,7 @@ impl MotionParams {
             },
             field_source: self.field_source,
             lattice_quality: self.lattice_quality,
+            procedural: self.procedural.sanitized(),
             transplant: self.transplant.sanitized(),
             shutter: self.shutter.sanitized(),
             collider: self.collider.sanitized(),
@@ -333,6 +461,33 @@ pub enum MotionFieldOrigin {
     CodecVectors,
     Lattice,
     LatticeFallback,
+    /// A B2 procedural field. It carries its kind because Contour and Chroma
+    /// bind the recipient's image while the pure kinds bind nothing, so the
+    /// kind is genuinely part of the prepared topology, not presentation.
+    Procedural(ProceduralFieldKind),
+}
+
+impl MotionFieldOrigin {
+    /// Append-only topology-signature code. `None`, `CodecVectors`,
+    /// `Lattice`, and `LatticeFallback` keep their original 0–3; the six
+    /// procedural kinds occupy 4–9 by their own permanent codes.
+    pub const fn signature_code(self) -> u64 {
+        match self {
+            Self::None => 0,
+            Self::CodecVectors => 1,
+            Self::Lattice => 2,
+            Self::LatticeFallback => 3,
+            Self::Procedural(kind) => 4 + kind.code() as u64,
+        }
+    }
+
+    /// The procedural kind this origin renders, if any.
+    pub const fn procedural_kind(self) -> Option<ProceduralFieldKind> {
+        match self {
+            Self::Procedural(kind) => Some(kind),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -378,6 +533,12 @@ pub const fn resolve_motion_source(
         },
         MotionFieldSource::Lattice => MotionSourceDecision {
             origin: MotionFieldOrigin::Lattice,
+            diagnostic: MotionSourceDiagnostic::None,
+        },
+        // A procedural field is deterministic synthesis: it holds at master
+        // and layer scope alike, needs no codec, and never falls back.
+        MotionFieldSource::Procedural(kind) => MotionSourceDecision {
+            origin: MotionFieldOrigin::Procedural(kind),
             diagnostic: MotionSourceDiagnostic::None,
         },
     }
@@ -1887,6 +2048,149 @@ pub fn collide_motion_samples(
     }
 }
 
+/// Peak procedural field speed in UV per second.
+///
+/// Eight is one eighth of [`MOTION_MAX_UV_PER_SECOND`]: strong enough that a
+/// full-amount Faraday advection visibly moves the carrier, small enough that
+/// the multi-octave Curl sum and the frequency-scaled Contour tangent stay
+/// inside the canonical velocity range at ordinary settings instead of living
+/// on the clamp.
+pub const PROCEDURAL_FIELD_MAX_SPEED: f32 = 8.0;
+
+const TAU: f32 = std::f32::consts::TAU;
+
+/// The three frozen Curl octaves: wave vector, phase speed, phase offset.
+/// These constants are part of the field law — the WGSL twin carries the same
+/// numbers character for character.
+const CURL_OCTAVES: [([f32; 2], f32, f32); 3] = [
+    ([1.0, 0.618], 1.0, 0.0),
+    ([-1.618, 1.0], -0.5, 0.25),
+    ([0.786, -1.376], 0.25, 0.5),
+];
+
+/// Map the authored unit scale onto 1–16 spatial cycles across the frame.
+pub fn procedural_field_frequency(scale: f32) -> f32 {
+    1.0 + unit(scale, 0.5) * 15.0
+}
+
+/// The complete B2 procedural field law for one cell.
+///
+/// This is the independent CPU reference `motion_procedural.wgsl` is measured
+/// against, expression for expression. `uv` addresses the cell centre in
+/// `[0, 1]` field space, `cell_step_uv` is one field cell expressed in UV (the
+/// Contour gradient's tap distance), and `time_seconds` is *program* time from
+/// the shared frame-plan context — never wall time, so live and offline agree
+/// by construction and Pause holds the field still.
+///
+/// `image` observes the recipient's picture as covered premultiplied linear
+/// RGBA — exactly the quantity `covered_source_linear` computes — so hostile
+/// RGB hidden behind zero coverage steers nothing. The closure is consulted
+/// only by Contour and Chroma; the four pure kinds never call it.
+///
+/// Curl is the analytic curl of a three-octave sinusoidal stream function, so
+/// it is divergence-free by construction rather than by numerical accident.
+/// The pure kinds report fully open gates; Contour and Chroma report an honest
+/// gradient/saturation confidence so flat content contributes nothing.
+pub fn procedural_field_sample(
+    kind: ProceduralFieldKind,
+    uv: [f32; 2],
+    cell_step_uv: [f32; 2],
+    time_seconds: f32,
+    params: ProceduralFieldParams,
+    image: &dyn Fn([f32; 2]) -> [f32; 4],
+) -> MotionVectorSample {
+    let params = params.sanitized();
+    let freq = procedural_field_frequency(params.scale);
+    let phase = finite_or(time_seconds, 0.0).max(0.0) * params.rate;
+    let amp = PROCEDURAL_FIELD_MAX_SPEED;
+    let p = [uv[0] - 0.5, uv[1] - 0.5];
+    let luma_at = |uv: [f32; 2]| {
+        let c = image(uv);
+        c[0].mul_add(0.2126, c[1].mul_add(0.7152, c[2] * 0.0722))
+    };
+    let (velocity, confidence) = match kind {
+        ProceduralFieldKind::Curl => {
+            // v = (dpsi/dy, -dpsi/dx) of
+            // psi = sum(0.5^o / (TAU * freq) * sin(TAU * (freq * k.uv + c + s * phase))).
+            let mut gradient = [0.0_f32, 0.0_f32];
+            let mut weight = 1.0_f32;
+            for (k, speed, offset) in CURL_OCTAVES {
+                let argument =
+                    TAU * (freq * k[0].mul_add(uv[0], k[1] * uv[1]) + offset + speed * phase);
+                let ring = weight * argument.cos();
+                gradient[0] += ring * k[0];
+                gradient[1] += ring * k[1];
+                weight *= 0.5;
+            }
+            ([amp * gradient[1], -amp * gradient[0]], 1.0)
+        }
+        ProceduralFieldKind::Radial | ProceduralFieldKind::Spiral => {
+            let r = p[0].hypot(p[1]);
+            if r <= 1.0e-6 {
+                ([0.0, 0.0], 1.0)
+            } else {
+                let outward = [p[0] / r, p[1] / r];
+                let direction = if kind == ProceduralFieldKind::Radial {
+                    outward
+                } else {
+                    // The 45-degree pitch between outward and tangential.
+                    [
+                        (outward[0] - outward[1]) * std::f32::consts::FRAC_1_SQRT_2,
+                        (outward[1] + outward[0]) * std::f32::consts::FRAC_1_SQRT_2,
+                    ]
+                };
+                let ring = (TAU * freq.mul_add(r, -phase)).cos();
+                ([amp * direction[0] * ring, amp * direction[1] * ring], 1.0)
+            }
+        }
+        ProceduralFieldKind::Weave => (
+            [
+                amp * (TAU * freq.mul_add(uv[1], phase)).sin(),
+                amp * 0.25 * (TAU * freq.mul_add(uv[0], -phase)).sin(),
+            ],
+            1.0,
+        ),
+        ProceduralFieldKind::Contour => {
+            let gx = (luma_at([uv[0] + cell_step_uv[0], uv[1]])
+                - luma_at([uv[0] - cell_step_uv[0], uv[1]]))
+                * 0.5;
+            let gy = (luma_at([uv[0], uv[1] + cell_step_uv[1]])
+                - luma_at([uv[0], uv[1] - cell_step_uv[1]]))
+                * 0.5;
+            // Perpendicular to the luma gradient: flow along the isoline.
+            let tangent = [-gy, gx];
+            let swing = (TAU * phase).cos();
+            (
+                [
+                    amp * tangent[0] * freq * swing,
+                    amp * tangent[1] * freq * swing,
+                ],
+                unit(gx.hypot(gy) * 8.0, 0.0),
+            )
+        }
+        ProceduralFieldKind::Chroma => {
+            let c = image(uv);
+            let i = 0.596f32.mul_add(c[0], (-0.274f32).mul_add(c[1], -0.322 * c[2]));
+            let q = 0.211f32.mul_add(c[0], (-0.523f32).mul_add(c[1], 0.312 * c[2]));
+            let angle = TAU * phase;
+            let (sin, cos) = angle.sin_cos();
+            let steered = [i.mul_add(cos, -(q * sin)), i.mul_add(sin, q * cos)];
+            (
+                [amp * 2.0 * steered[0], amp * 2.0 * steered[1]],
+                unit(i.hypot(q) * 4.0, 0.0),
+            )
+        }
+    };
+    MotionVectorSample {
+        velocity_uv_per_second: [
+            clamp_motion_velocity(velocity[0]),
+            clamp_motion_velocity(velocity[1]),
+        ],
+        confidence,
+        visibility: 1.0,
+    }
+}
+
 /// Byte-exact collider-specific resource delta for one admitted collider.
 ///
 /// The two primitive input fields and the sole persistent carrier are already
@@ -3123,5 +3427,339 @@ mod tests {
         assert!((pixels_per_frame - 2.0).abs() < 0.01);
         assert_eq!(sample.confidence, 1.0);
         assert!((sample.visibility - 0.5).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------
+    // B2 procedural fields
+    // -----------------------------------------------------------------
+
+    /// Image closure for the four pure kinds: consulting it at all is the
+    /// defect under test.
+    fn forbidden_image() -> impl Fn([f32; 2]) -> [f32; 4] {
+        |_uv: [f32; 2]| -> [f32; 4] { panic!("a pure procedural kind observed the image") }
+    }
+
+    fn sample_pure(
+        kind: ProceduralFieldKind,
+        uv: [f32; 2],
+        time: f32,
+        params: ProceduralFieldParams,
+    ) -> MotionVectorSample {
+        procedural_field_sample(kind, uv, [0.01, 0.01], time, params, &forbidden_image())
+    }
+
+    #[test]
+    fn procedural_kind_codes_and_wire_keys_are_permanent() {
+        let expected = [
+            (ProceduralFieldKind::Curl, 0, "procedural_curl", false),
+            (ProceduralFieldKind::Radial, 1, "procedural_radial", false),
+            (ProceduralFieldKind::Spiral, 2, "procedural_spiral", false),
+            (ProceduralFieldKind::Contour, 3, "procedural_contour", true),
+            (ProceduralFieldKind::Chroma, 4, "procedural_chroma", true),
+            (ProceduralFieldKind::Weave, 5, "procedural_weave", false),
+        ];
+        for (index, (kind, code, key, reads_image)) in expected.into_iter().enumerate() {
+            assert_eq!(ProceduralFieldKind::ALL[index], kind);
+            assert_eq!(kind.code(), code);
+            assert_eq!(kind.source_key(), key);
+            assert_eq!(kind.reads_image(), reads_image);
+        }
+        // The origin signature codes are append-only: the original four keep
+        // 0-3 and the six kinds occupy 4-9 without collision, so a kind change
+        // re-prepares bind groups instead of silently reusing them.
+        assert_eq!(MotionFieldOrigin::None.signature_code(), 0);
+        assert_eq!(MotionFieldOrigin::CodecVectors.signature_code(), 1);
+        assert_eq!(MotionFieldOrigin::Lattice.signature_code(), 2);
+        assert_eq!(MotionFieldOrigin::LatticeFallback.signature_code(), 3);
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in ProceduralFieldKind::ALL {
+            let code = MotionFieldOrigin::Procedural(kind).signature_code();
+            assert!((4..=9).contains(&code));
+            assert!(seen.insert(code), "duplicate signature code {code}");
+        }
+    }
+
+    #[test]
+    fn procedural_source_resolves_at_every_scope_without_codec_or_fallback() {
+        for kind in ProceduralFieldKind::ALL {
+            for is_master in [false, true] {
+                for codec_available in [false, true] {
+                    let decision = resolve_motion_source(
+                        MotionFieldSource::Procedural(kind),
+                        is_master,
+                        codec_available,
+                    );
+                    assert_eq!(decision.origin, MotionFieldOrigin::Procedural(kind));
+                    assert_eq!(decision.diagnostic, MotionSourceDiagnostic::None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn procedural_params_sanitize_to_neutral_values_not_clamped_extremes() {
+        let hostile = ProceduralFieldParams {
+            scale: f32::NAN,
+            rate: f32::INFINITY,
+        }
+        .sanitized();
+        assert_eq!(hostile.scale, 0.5);
+        assert_eq!(hostile.rate, 0.25);
+        let clamped = ProceduralFieldParams {
+            scale: 2.0,
+            rate: -9.0,
+        }
+        .sanitized();
+        assert_eq!(clamped.scale, 1.0);
+        assert_eq!(clamped.rate, -2.0);
+        // The params ride MotionParams::sanitized like every other block.
+        let motion = MotionParams {
+            procedural: ProceduralFieldParams {
+                scale: f32::NAN,
+                rate: 5.0,
+            },
+            ..MotionParams::default()
+        }
+        .sanitized();
+        assert_eq!(motion.procedural.scale, 0.5);
+        assert_eq!(motion.procedural.rate, 2.0);
+    }
+
+    #[test]
+    fn pure_kinds_never_observe_the_image_and_open_their_gates_fully() {
+        for kind in [
+            ProceduralFieldKind::Curl,
+            ProceduralFieldKind::Radial,
+            ProceduralFieldKind::Spiral,
+            ProceduralFieldKind::Weave,
+        ] {
+            let sample = sample_pure(kind, [0.3, 0.7], 1.25, ProceduralFieldParams::default());
+            assert_eq!(sample.confidence, 1.0, "{kind} must open its gate");
+            assert_eq!(sample.visibility, 1.0);
+            assert!(sample.velocity_uv_per_second[0].is_finite());
+            assert!(sample.velocity_uv_per_second[1].is_finite());
+        }
+    }
+
+    #[test]
+    fn radial_pulses_outward_on_the_ring_law_and_is_still_at_the_centre() {
+        let params = ProceduralFieldParams {
+            scale: 0.0, // freq = 1
+            rate: 0.0,
+        };
+        // At the centre there is no direction, so there is no velocity.
+        let centre = sample_pure(ProceduralFieldKind::Radial, [0.5, 0.5], 0.0, params);
+        assert_eq!(centre.velocity_uv_per_second, [0.0, 0.0]);
+        // On the +x axis at radius r the law is amp * cos(TAU * freq * r).
+        let r = 0.25_f32;
+        let sample = sample_pure(ProceduralFieldKind::Radial, [0.5 + r, 0.5], 0.0, params);
+        let expected = PROCEDURAL_FIELD_MAX_SPEED * (TAU * r).cos();
+        assert!((sample.velocity_uv_per_second[0] - expected).abs() < 1.0e-4);
+        assert!(sample.velocity_uv_per_second[1].abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn spiral_is_the_radial_ring_pitched_forty_five_degrees() {
+        let params = ProceduralFieldParams {
+            scale: 0.0,
+            rate: 0.0,
+        };
+        let r = 0.2_f32;
+        let radial = sample_pure(ProceduralFieldKind::Radial, [0.5 + r, 0.5], 0.0, params);
+        let spiral = sample_pure(ProceduralFieldKind::Spiral, [0.5 + r, 0.5], 0.0, params);
+        let magnitude = |v: [f32; 2]| v[0].hypot(v[1]);
+        assert!(
+            (magnitude(radial.velocity_uv_per_second) - magnitude(spiral.velocity_uv_per_second))
+                .abs()
+                < 1.0e-3
+        );
+        // On the +x axis the outward direction is +x; the pitched direction
+        // splits equally between +x and +y.
+        assert!(
+            (spiral.velocity_uv_per_second[0] - spiral.velocity_uv_per_second[1]).abs() < 1.0e-3
+        );
+    }
+
+    #[test]
+    fn weave_is_orthogonal_sinusoidal_shear() {
+        let params = ProceduralFieldParams {
+            scale: 0.0,
+            rate: 0.0,
+        };
+        let uv = [0.15, 0.4];
+        let sample = sample_pure(ProceduralFieldKind::Weave, uv, 0.0, params);
+        let expected_x = PROCEDURAL_FIELD_MAX_SPEED * (TAU * uv[1]).sin();
+        let expected_y = PROCEDURAL_FIELD_MAX_SPEED * 0.25 * (TAU * uv[0]).sin();
+        assert!((sample.velocity_uv_per_second[0] - expected_x).abs() < 1.0e-4);
+        assert!((sample.velocity_uv_per_second[1] - expected_y).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn curl_is_numerically_divergence_free() {
+        // Base frequency: the analytic claim holds at every scale, but a
+        // central-difference estimate of an oscillatory f32 field carries
+        // O(amp * omega^3 * eps^2) truncation error, so the numeric check is
+        // meaningful only where that term stays far below the field peak.
+        let params = ProceduralFieldParams {
+            scale: 0.0,
+            rate: 1.0,
+        };
+        let epsilon = 1.0e-3_f32;
+        for (x, y) in [(0.2, 0.3), (0.5, 0.5), (0.8, 0.1), (0.35, 0.9)] {
+            let at = |uv: [f32; 2]| {
+                sample_pure(ProceduralFieldKind::Curl, uv, 2.0, params).velocity_uv_per_second
+            };
+            let dvx_dx = (at([x + epsilon, y])[0] - at([x - epsilon, y])[0]) / (2.0 * epsilon);
+            let dvy_dy = (at([x, y + epsilon])[1] - at([x, y - epsilon])[1]) / (2.0 * epsilon);
+            let divergence = dvx_dx + dvy_dy;
+            // The field peaks near 16 UV/s; a stream-function curl's numeric
+            // divergence at this epsilon stays orders of magnitude below it.
+            assert!(
+                divergence.abs() < 0.05,
+                "divergence {divergence} at ({x}, {y})"
+            );
+        }
+    }
+
+    #[test]
+    fn contour_flows_along_isolines_with_gradient_confidence() {
+        let params = ProceduralFieldParams {
+            scale: 0.0,
+            rate: 0.0,
+        };
+        // A pure horizontal luma ramp: gradient +x, isolines vertical.
+        let ramp = |uv: [f32; 2]| -> [f32; 4] { [uv[0], uv[0], uv[0], 1.0] };
+        let step = [0.05_f32, 0.05];
+        let sample = procedural_field_sample(
+            ProceduralFieldKind::Contour,
+            [0.5, 0.5],
+            step,
+            0.0,
+            params,
+            &ramp,
+        );
+        // luma(uv) = uv.x, central difference = step.x, tangent = (0, gx).
+        let gx = step[0];
+        let expected_y = PROCEDURAL_FIELD_MAX_SPEED * gx * 1.0;
+        assert!(sample.velocity_uv_per_second[0].abs() < 1.0e-4);
+        assert!((sample.velocity_uv_per_second[1] - expected_y).abs() < 1.0e-3);
+        assert!((sample.confidence - (gx * 8.0)).abs() < 1.0e-4);
+        // Flat content honestly contributes nothing.
+        let flat = procedural_field_sample(
+            ProceduralFieldKind::Contour,
+            [0.5, 0.5],
+            step,
+            0.0,
+            params,
+            &|_uv| [0.25, 0.25, 0.25, 1.0],
+        );
+        assert_eq!(flat.velocity_uv_per_second, [0.0, 0.0]);
+        assert_eq!(flat.confidence, 0.0);
+    }
+
+    #[test]
+    fn chroma_steering_is_alpha_covered_so_hidden_rgb_steers_nothing() {
+        let params = ProceduralFieldParams::default();
+        // The image contract is covered premultiplied RGBA, so zero coverage
+        // means zero channels — hostile hidden RGB cannot survive covering.
+        let covered_hostile = |_uv: [f32; 2]| -> [f32; 4] { [0.0, 0.0, 0.0, 0.0] };
+        let sample = procedural_field_sample(
+            ProceduralFieldKind::Chroma,
+            [0.4, 0.6],
+            [0.01, 0.01],
+            3.0,
+            params,
+            &covered_hostile,
+        );
+        assert_eq!(sample.velocity_uv_per_second, [0.0, 0.0]);
+        assert_eq!(sample.confidence, 0.0);
+        // A saturated red field steers along its YIQ chroma vector at rate 0.
+        let red = procedural_field_sample(
+            ProceduralFieldKind::Chroma,
+            [0.4, 0.6],
+            [0.01, 0.01],
+            0.0,
+            ProceduralFieldParams {
+                scale: 0.5,
+                rate: 0.0,
+            },
+            &|_uv| [1.0, 0.0, 0.0, 1.0],
+        );
+        let expected = [
+            PROCEDURAL_FIELD_MAX_SPEED * 2.0 * 0.596,
+            PROCEDURAL_FIELD_MAX_SPEED * 2.0 * 0.211,
+        ];
+        assert!((red.velocity_uv_per_second[0] - expected[0]).abs() < 1.0e-3);
+        assert!((red.velocity_uv_per_second[1] - expected[1]).abs() < 1.0e-3);
+        assert_eq!(red.visibility, 1.0);
+    }
+
+    #[test]
+    fn procedural_velocity_always_lands_inside_the_canonical_range() {
+        // A steep synthetic gradient through the frequency-scaled Contour
+        // tangent exceeds the raw range and must clamp, not escape.
+        let sample = procedural_field_sample(
+            ProceduralFieldKind::Contour,
+            [0.5, 0.5],
+            [0.5, 0.5],
+            0.0,
+            ProceduralFieldParams {
+                scale: 1.0,
+                rate: 0.0,
+            },
+            &|uv| {
+                let luma = if uv[0] > 0.5 { 1.0 } else { 0.0 };
+                [luma, luma, luma, 1.0]
+            },
+        );
+        for component in sample.velocity_uv_per_second {
+            assert!(component.abs() <= MOTION_MAX_UV_PER_SECOND);
+        }
+        // Non-finite time takes the neutral zero rather than poisoning phase.
+        let hostile_time = sample_pure(
+            ProceduralFieldKind::Weave,
+            [0.3, 0.3],
+            f32::NAN,
+            ProceduralFieldParams::default(),
+        );
+        assert!(hostile_time.velocity_uv_per_second[0].is_finite());
+        assert!(hostile_time.velocity_uv_per_second[1].is_finite());
+    }
+
+    #[test]
+    fn procedural_fields_charge_no_luma_bytes_in_preflight() {
+        let request = |field_source: MotionFieldSource| MotionScopeResourceRequest {
+            source_dimensions: [640, 360],
+            output_dimensions: [640, 360],
+            params: MotionParams {
+                field_source,
+                ..MotionParams::default()
+            }
+            .sanitized(),
+            is_master: false,
+            codec_vectors_available: false,
+            required_as_donor: true,
+            required_as_garden_signal: false,
+        };
+        let procedural = MotionResourcePlan::preflight(
+            &[request(MotionFieldSource::Procedural(
+                ProceduralFieldKind::Curl,
+            ))],
+            generous_limits(),
+        )
+        .unwrap();
+        assert_eq!(procedural.luma_bytes, 0);
+        assert_eq!(procedural.active_field_slots, 1);
+        assert!(procedural.vector_bytes > 0);
+        let lattice = MotionResourcePlan::preflight(
+            &[request(MotionFieldSource::Lattice)],
+            generous_limits(),
+        )
+        .unwrap();
+        assert!(lattice.luma_bytes > 0);
+        // Same vector/gate surfaces either way: the procedural delta is one
+        // low-resolution pass and zero bytes.
+        assert_eq!(procedural.vector_bytes, lattice.vector_bytes);
+        assert_eq!(procedural.gate_bytes, lattice.gate_bytes);
     }
 }

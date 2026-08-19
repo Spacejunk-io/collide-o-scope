@@ -1095,6 +1095,7 @@ const fn motion_source_key(value: crate::motion::MotionFieldSource) -> &'static 
         crate::motion::MotionFieldSource::Auto => "auto",
         crate::motion::MotionFieldSource::CodecVectors => "codec_vectors",
         crate::motion::MotionFieldSource::Lattice => "lattice",
+        crate::motion::MotionFieldSource::Procedural(kind) => kind.source_key(),
     }
 }
 
@@ -1112,6 +1113,7 @@ const fn motion_origin_key(value: crate::motion::MotionFieldOrigin) -> &'static 
         crate::motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
         crate::motion::MotionFieldOrigin::Lattice => "lattice",
         crate::motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+        crate::motion::MotionFieldOrigin::Procedural(kind) => kind.source_key(),
     }
 }
 
@@ -2666,6 +2668,23 @@ fn motion_donor_snapshot(donor: crate::motion::MotionDonor) -> MotionDonorSnapsh
     }
 }
 
+/// The B2 procedural field scalars as the browser sees them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProceduralFieldSnapshot {
+    pub scale: f32,
+    pub rate: f32,
+}
+
+impl Default for ProceduralFieldSnapshot {
+    fn default() -> Self {
+        let params = crate::motion::ProceduralFieldParams::default();
+        Self {
+            scale: params.scale,
+            rate: params.rate,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FaradayMotionSnapshot {
     pub amount: f32,
@@ -2756,6 +2775,11 @@ pub struct MotionSnapshot {
     pub algorithm_version: u16,
     pub field_source: String,
     pub lattice_quality: String,
+    /// Additive: the B2 procedural field scalars. An older client that never
+    /// reads this key sees exactly the pre-B2 snapshot, and a snapshot written
+    /// without it still deserializes to the neutral default.
+    #[serde(default)]
+    pub procedural: ProceduralFieldSnapshot,
     pub transplant: FaradayMotionSnapshot,
     pub shutter: CurvedShutterSnapshot,
     /// Additive: an older client that never reads this key sees exactly the
@@ -2783,6 +2807,7 @@ impl MotionSnapshot {
             MotionFieldSource::Auto => "auto",
             MotionFieldSource::CodecVectors => "codec_vectors",
             MotionFieldSource::Lattice => "lattice",
+            MotionFieldSource::Procedural(kind) => kind.source_key(),
         };
         let lattice_quality = match params.lattice_quality {
             MotionLatticeQuality::Draft => "draft",
@@ -2805,6 +2830,10 @@ impl MotionSnapshot {
             algorithm_version: params.algorithm_version,
             field_source: field_source.into(),
             lattice_quality: lattice_quality.into(),
+            procedural: ProceduralFieldSnapshot {
+                scale: params.procedural.scale,
+                rate: params.procedural.rate,
+            },
             transplant: FaradayMotionSnapshot {
                 amount: params.transplant.amount,
                 donor,
@@ -6962,7 +6991,7 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 97);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 99);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [

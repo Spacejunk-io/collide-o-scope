@@ -142,6 +142,11 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("motion_shutter_phase", -1.0, 1.0),
     ("motion_shutter_curvature", -2.0, 2.0),
     ("motion_shutter_chromatic_lag", 0.0, 1.0),
+    // B2 procedural field scalars. The kind itself is discrete authored state
+    // exactly as the field source always was; only the two continuous dials
+    // are addressable.
+    ("motion_field_scale", 0.0, 1.0),
+    ("motion_field_rate", -2.0, 2.0),
     // S3b gesture-field etching exposes only the three derived continuous
     // canvas scalars. The recorded event track is authored topology and has no
     // modulation address at all: nothing here can add, remove, retime, or
@@ -1541,6 +1546,8 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "motion_shutter_angle" => Some((0.0, 360.0)),
         "motion_shutter_phase" => Some((-1.0, 1.0)),
         "motion_shutter_curvature" => Some((-2.0, 2.0)),
+        "motion_field_scale" => Some((0.0, 1.0)),
+        "motion_field_rate" => Some((-2.0, 2.0)),
         _ => None,
     }
 }
@@ -2988,6 +2995,8 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "motion_shutter_phase",
     "motion_shutter_curvature",
     "motion_shutter_chromatic_lag",
+    "motion_field_scale",
+    "motion_field_rate",
 ];
 
 impl RoutingOffsets {
@@ -3106,6 +3115,8 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "motion_shutter_phase" => 55,
         "motion_shutter_curvature" => 56,
         "motion_shutter_chromatic_lag" => 57,
+        "motion_field_scale" => 58,
+        "motion_field_rate" => 59,
         _ => return None,
     })
 }
@@ -3167,6 +3178,8 @@ fn apply_motion_offsets(
     motion.shutter.phase += offset("motion_shutter_phase", -1.0, 1.0);
     motion.shutter.curvature += offset("motion_shutter_curvature", -2.0, 2.0);
     motion.shutter.chromatic_lag += offset("motion_shutter_chromatic_lag", 0.0, 1.0);
+    motion.procedural.scale += offset("motion_field_scale", 0.0, 1.0);
+    motion.procedural.rate += offset("motion_field_rate", -2.0, 2.0);
     *motion = motion.sanitized();
 }
 
@@ -4173,9 +4186,13 @@ mod tests {
             ("motion_shutter_phase", (-1.0, 1.0)),
             ("motion_shutter_curvature", (-2.0, 2.0)),
             ("motion_shutter_chromatic_lag", (0.0, 1.0)),
+            ("motion_field_scale", (0.0, 1.0)),
+            ("motion_field_rate", (-2.0, 2.0)),
             ("layer1_motion_transplant_amount", (0.0, 1.0)),
             ("layer1_motion_confidence_softness", (0.0, 0.5)),
             ("layer1_motion_shutter_angle", (0.0, 360.0)),
+            ("layer1_motion_field_scale", (0.0, 1.0)),
+            ("layer1_motion_field_rate", (-2.0, 2.0)),
         ] {
             assert_eq!(target_range(target), Some(range), "{target}");
         }
@@ -4221,6 +4238,8 @@ mod tests {
             "layer1_motion_transplant_amount",
             "layer1_motion_confidence_softness",
             "layer1_motion_shutter_angle",
+            "motion_field_rate",
+            "layer1_motion_field_scale",
         ]
         .into_iter()
         .map(|target| Routing::new(ModSource::Midi(0), target, 1.0))
@@ -4233,9 +4252,14 @@ mod tests {
         approx(master.shutter.angle_degrees, 200.0);
         approx(master.shutter.phase, 1.0);
         approx(master.transplant.amount, 0.25);
+        // The rate offset is 1.0 * (2 - -2) * 0.5 = +2.0, clamped at 2.0; the
+        // layer-only scale route leaves the master copy untouched.
+        approx(master.procedural.rate, 2.0);
+        approx(master.procedural.scale, 0.5);
         approx(layer.transplant.amount, 0.75);
         approx(layer.transplant.confidence_softness, 0.35);
         approx(layer.shutter.angle_degrees, 200.0);
+        approx(layer.procedural.scale, 1.0);
         assert_eq!(layer.algorithm_version, MOTION_ALGORITHM_VERSION);
         assert_eq!(layer.field_source, MotionFieldSource::CodecVectors);
         assert_eq!(layer.lattice_quality, MotionLatticeQuality::High);

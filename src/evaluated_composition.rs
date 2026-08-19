@@ -4526,15 +4526,11 @@ fn motion_topology_signature(
         hash = hash_value(hash, u64::from(field.grid.block_pixels));
         hash = hash_value(hash, u64::from(field.required_as_donor));
         hash = hash_value(hash, u64::from(field.required_as_garden_signal));
-        hash = hash_value(
-            hash,
-            match field.source.origin {
-                MotionFieldOrigin::None => 0,
-                MotionFieldOrigin::CodecVectors => 1,
-                MotionFieldOrigin::Lattice => 2,
-                MotionFieldOrigin::LatticeFallback => 3,
-            },
-        );
+        // `signature_code` is append-only: the original four keep 0-3 and the
+        // six procedural kinds occupy 4-9. Contour and Chroma bind the field
+        // scope's image while the pure kinds bind nothing, so a kind change
+        // must re-prepare rather than silently reuse stale bind groups.
+        hash = hash_value(hash, field.source.origin.signature_code());
     }
     hash
 }
@@ -5066,6 +5062,77 @@ mod tests {
         assert_eq!(resources.low_resolution_passes, 2);
         assert_eq!(resources.nearest_lookups, 5);
         assert_eq!(resources.max_sampled_textures_in_pass, 3);
+    }
+
+    #[test]
+    fn a_collider_recombines_a_procedural_field_against_a_codec_field() {
+        use crate::motion::{MotionFieldSource, ProceduralFieldKind};
+
+        let base = base(&[10, 20, 30], &[]);
+        let composition = legacy_composition(&[10, 20, 30]);
+        let racks = legacy_racks(&[10, 20, 30]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let layers = [
+            LayerMotionPlanInput {
+                stable_id: layer_id(10),
+                params: collider_recipient(
+                    FieldColliderMode::Sum,
+                    MotionBoundaryMode::Wrap,
+                    20,
+                    30,
+                ),
+                codec: MotionCodecFrameFacts::default(),
+            },
+            // Input A synthesizes; its authored Motion is otherwise zero, so
+            // only `required_as_donor` pulls the procedural field in.
+            LayerMotionPlanInput {
+                stable_id: layer_id(20),
+                params: MotionParams {
+                    field_source: MotionFieldSource::Procedural(ProceduralFieldKind::Curl),
+                    ..MotionParams::default()
+                },
+                codec: MotionCodecFrameFacts::default(),
+            },
+            // Input B observes real codec truth.
+            LayerMotionPlanInput {
+                stable_id: layer_id(30),
+                params: MotionParams {
+                    field_source: MotionFieldSource::CodecVectors,
+                    ..MotionParams::default()
+                },
+                codec: MotionCodecFrameFacts {
+                    available: true,
+                    source_generation: 7,
+                    frame_ordinal: 9,
+                },
+            },
+        ];
+        let advanced = advanced(
+            plan_with_motion(
+                &base,
+                &composition,
+                &master,
+                &racks,
+                MotionParams::default(),
+                &layers,
+            )
+            .unwrap(),
+        );
+        let motion = advanced.motion().advanced().expect("collider motion plan");
+        let plan = motion.collider().expect("an admitted collider plan");
+        let origin = |scope| {
+            let slot = motion.scope(scope).unwrap().admitted_field_slot().unwrap();
+            motion.fields()[usize::from(slot)].source.origin
+        };
+        assert_eq!(
+            origin(plan.input_a_scope),
+            MotionFieldOrigin::Procedural(ProceduralFieldKind::Curl)
+        );
+        assert_eq!(origin(plan.input_b_scope), MotionFieldOrigin::CodecVectors);
+        // A procedural input needs no luma observation plane, so the two
+        // fields differ by exactly the codec/lattice machinery and the mixed
+        // pair still satisfies the ordinary collider ledger.
+        assert_eq!(motion.collider_resources().active_colliders, 1);
     }
 
     #[test]

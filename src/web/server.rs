@@ -1199,7 +1199,22 @@ fn valid_motion_edit(scope: &MotionScopeSnapshot, param: &str, value: &serde_jso
         return false;
     }
     let common = match param {
-        "field_source" => matches!(value.as_str(), Some("auto" | "codec_vectors" | "lattice")),
+        "field_source" => matches!(
+            value.as_str(),
+            Some(
+                "auto"
+                    | "codec_vectors"
+                    | "lattice"
+                    | "procedural_curl"
+                    | "procedural_radial"
+                    | "procedural_spiral"
+                    | "procedural_contour"
+                    | "procedural_chroma"
+                    | "procedural_weave"
+            )
+        ),
+        "field_scale" => number_in(value, 0.0, 1.0),
+        "field_rate" => number_in(value, -2.0, 2.0),
         "lattice_quality" => matches!(value.as_str(), Some("draft" | "live" | "high")),
         "shutter_angle" => number_in(value, 0.0, 360.0),
         "shutter_phase" => number_in(value, -1.0, 1.0),
@@ -3970,6 +3985,20 @@ mod tests {
             (&layer, "decay", serde_json::json!(1.0)),
             (&layer, "occlusion", serde_json::json!(1.0)),
             (&layer, "carrier", serde_json::json!("first_source_frame")),
+            (
+                &master,
+                "field_source",
+                serde_json::json!("procedural_curl"),
+            ),
+            (&master, "field_scale", serde_json::json!(1.0)),
+            (&master, "field_rate", serde_json::json!(-2.0)),
+            (
+                &layer,
+                "field_source",
+                serde_json::json!("procedural_chroma"),
+            ),
+            (&layer, "field_scale", serde_json::json!(0.0)),
+            (&layer, "field_rate", serde_json::json!(2.0)),
         ] {
             assert!(
                 valid_action(
@@ -3995,6 +4024,9 @@ mod tests {
             (&layer, "lattice_quality", serde_json::json!("adaptive")),
             (&layer, "carrier", serde_json::json!("history")),
             (&layer, "shutter_quality", serde_json::json!("auto")),
+            (&master, "field_source", serde_json::json!("procedural")),
+            (&master, "field_scale", serde_json::json!(1.01)),
+            (&layer, "field_rate", serde_json::json!(-2.1)),
         ] {
             assert!(
                 !valid_action(

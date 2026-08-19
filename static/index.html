@@ -578,11 +578,17 @@
             <div class="fx-group-body motion-authoring" id="master-motion-panel" role="region" aria-label="Master motion field and curved shutter">
               <div class="param-row select-row" data-motion-param="field_source">
                 <label>Field source</label>
-                <select aria-label="Master motion field source"><option value="auto">Auto</option><option value="codec_vectors">Codec vectors</option><option value="lattice">Motion lattice</option></select>
+                <select aria-label="Master motion field source"><option value="auto">Auto</option><option value="codec_vectors">Codec vectors</option><option value="lattice">Motion lattice</option><option value="procedural_curl">Curl field</option><option value="procedural_radial">Radial field</option><option value="procedural_spiral">Spiral field</option><option value="procedural_contour">Contour field</option><option value="procedural_chroma">Chroma field</option><option value="procedural_weave">Weave field</option></select>
               </div>
               <div class="param-row select-row" data-motion-param="lattice_quality">
                 <label>Lattice</label>
                 <select aria-label="Master motion lattice quality"><option value="draft">Draft · 16px</option><option value="live" selected>Live · 8px</option><option value="high">High · 4px</option></select>
+              </div>
+              <div class="param-row" data-motion-param="field_scale" data-min="0" data-max="1" data-step="0.01">
+                <label>Field scale</label><input type="range" min="0" max="1" step="0.01" value="0.5" aria-label="Master procedural field scale"><span class="value">0.5</span>
+              </div>
+              <div class="param-row" data-motion-param="field_rate" data-min="-2" data-max="2" data-step="0.01">
+                <label>Field rate</label><input type="range" min="-2" max="2" step="0.01" value="0.25" aria-label="Master procedural field rate"><span class="value">0.25</span>
               </div>
               <div class="param-row" data-motion-param="shutter_angle" data-min="0" data-max="360" data-step="1">
                 <label>Shutter angle</label><input type="range" min="0" max="360" step="1" value="0" aria-label="Master shutter angle"><span class="value">0</span>
@@ -602,7 +608,7 @@
               </div>
               <div class="temporal-command-row"><button type="button" id="motion-clear-memory">Clear motion memory</button></div>
               <div class="audio-status motion-telemetry" id="master-motion-telemetry" role="status" aria-live="polite">v1 · planned idle · 0 vectors · no field planned · carrier empty</div>
-              <div class="audio-status">Auto uses codec vectors when valid on layers and visibly falls back to the deterministic lattice. Master Auto is lattice. Codec-only never falls back.</div>
+              <div class="audio-status">Auto uses codec vectors when valid on layers and visibly falls back to the deterministic lattice. Master Auto is lattice. Codec-only never falls back. Procedural kinds synthesize a deterministic field from program time; scale and rate shape it, and Contour/Chroma steer by the picture itself.</div>
             </div>
           </div>
 

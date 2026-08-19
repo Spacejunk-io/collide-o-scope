@@ -1693,6 +1693,7 @@ fn motion_field_source_key(value: crate::motion::MotionFieldSource) -> &'static 
         crate::motion::MotionFieldSource::Auto => "auto",
         crate::motion::MotionFieldSource::CodecVectors => "codec_vectors",
         crate::motion::MotionFieldSource::Lattice => "lattice",
+        crate::motion::MotionFieldSource::Procedural(kind) => kind.source_key(),
     }
 }
 
@@ -1727,6 +1728,7 @@ fn motion_origin_key(value: crate::motion::MotionFieldOrigin) -> &'static str {
         crate::motion::MotionFieldOrigin::CodecVectors => "codec_vectors",
         crate::motion::MotionFieldOrigin::Lattice => "lattice",
         crate::motion::MotionFieldOrigin::LatticeFallback => "lattice_fallback",
+        crate::motion::MotionFieldOrigin::Procedural(kind) => kind.source_key(),
     }
 }
 
@@ -17432,6 +17434,54 @@ mod effects_audit {
             ..MotionConfig::default()
         });
         render("field_collider", patch);
+    }
+
+    /// One clip whose Faraday carrier is advected by a synthetic B2 Curl
+    /// field. The layer is its own donor, so the only field in the plan is the
+    /// procedural one, and the stack is deliberately tapless — the composite
+    /// rank landed, so a bare Advanced motion case schedules without a
+    /// chaperone rack node.
+    ///
+    /// This is the labeled export case for B2: the offline renderer consumes
+    /// the same evaluated plan, the same `motion_procedural.wgsl` synthesis
+    /// pass, and the same advection path, with the pass's only time input the
+    /// shared frame-plan context derived from `frame_num` and the export FPS.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_procedural_motion_field_pipeline() {
+        use crate::patch::{
+            FaradayConfig, MotionCarrierConfig, MotionConfig, MotionDonorConfig,
+            MotionFieldSourceConfig, ProceduralFieldConfig,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut patch = base_patch();
+        patch.layers[0].motion = Some(MotionConfig {
+            field_source: MotionFieldSourceConfig::ProceduralCurl,
+            procedural: ProceduralFieldConfig {
+                scale: 0.35,
+                rate: 0.5,
+            },
+            transplant: FaradayConfig {
+                amount: 0.85,
+                carrier: MotionCarrierConfig::FirstSourceFrame,
+                confidence_threshold: 0.05,
+                confidence_softness: 0.1,
+                refresh: 0.35,
+                decay: 0.9,
+                donor: MotionDonorConfig::Selected {
+                    saved_position: SavedLayerPosition::new(0).expect("layer 0 exists"),
+                },
+                ..FaradayConfig::default()
+            },
+            ..MotionConfig::default()
+        });
+        render("procedural_motion_field", patch);
     }
 
     /// Three stacked clips where the upper layer's Residual Counterpoint node

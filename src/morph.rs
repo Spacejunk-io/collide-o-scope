@@ -20,9 +20,10 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    FieldColliderConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig, RefreshGardenConfig,
-    RefreshGardenMatteRouteConfig, RefreshGardenMotionRouteConfig, TemporalLoomConfig,
-    TemporalOriginalsConfig, TemporalResetPolicyConfig,
+    FieldColliderConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig,
+    ProceduralFieldConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
+    RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
+    TemporalResetPolicyConfig,
 };
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{
@@ -757,6 +758,12 @@ fn interpolate_motion_config(
         algorithm_version: pick(a.algorithm_version, b.algorithm_version, choose_b),
         field_source: pick(a.field_source, b.field_source, choose_b),
         lattice_quality: pick(a.lattice_quality, b.lattice_quality, choose_b),
+        // The procedural kind rides `field_source`'s midpoint switch above;
+        // its two scalars are ordinary continuous state and interpolate.
+        procedural: ProceduralFieldConfig {
+            scale: blend_finite(a.procedural.scale, b.procedural.scale, weights),
+            rate: blend_finite(a.procedural.rate, b.procedural.rate, weights),
+        },
         transplant: FaradayConfig {
             amount: blend_finite(a.transplant.amount, b.transplant.amount, weights),
             donor: pick(a.transplant.donor, b.transplant.donor, choose_b),
@@ -4024,6 +4031,50 @@ mod tests {
                 .collider
                 .input_a,
             b_block.input_a
+        );
+    }
+
+    #[test]
+    fn morph_interpolates_procedural_scalars_and_switches_the_kind_at_midpoint() {
+        use crate::patch::{MotionConfig, MotionFieldSourceConfig, ProceduralFieldConfig};
+
+        let a = MotionConfig {
+            field_source: MotionFieldSourceConfig::ProceduralCurl,
+            procedural: ProceduralFieldConfig {
+                scale: 0.2,
+                rate: -1.0,
+            },
+            ..MotionConfig::default()
+        };
+        let b = MotionConfig {
+            field_source: MotionFieldSourceConfig::ProceduralRadial,
+            procedural: ProceduralFieldConfig {
+                scale: 0.8,
+                rate: 1.0,
+            },
+            ..MotionConfig::default()
+        };
+        let quarter = interpolate_motion_config(a, b, [0.75, 0.25], false);
+        assert_eq!(
+            quarter.field_source,
+            MotionFieldSourceConfig::ProceduralCurl
+        );
+        assert!((quarter.procedural.scale - 0.35).abs() < 1.0e-6);
+        assert!((quarter.procedural.rate - -0.5).abs() < 1.0e-6);
+        let past_midpoint = interpolate_motion_config(a, b, [0.25, 0.75], true);
+        assert_eq!(
+            past_midpoint.field_source,
+            MotionFieldSourceConfig::ProceduralRadial
+        );
+        assert!((past_midpoint.procedural.scale - 0.65).abs() < 1.0e-6);
+        // Endpoints recall their authored values exactly.
+        assert_eq!(
+            interpolate_motion_config(a, b, [1.0, 0.0], false).procedural,
+            a.procedural
+        );
+        assert_eq!(
+            interpolate_motion_config(a, b, [0.0, 1.0], true).procedural,
+            b.procedural
         );
     }
 

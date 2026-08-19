@@ -26,7 +26,8 @@ use crate::modulation::{
 use crate::motion::{
     CurvedShutterParams, CurvedShutterQuality, FaradayParams, FieldColliderMode,
     FieldColliderParams, MotionBoundaryMode, MotionCarrier, MotionDonor, MotionFieldSource,
-    MotionLatticeQuality, MotionParams, FIELD_COLLIDER_ALGORITHM_VERSION, MOTION_ALGORITHM_VERSION,
+    MotionLatticeQuality, MotionParams, ProceduralFieldKind, ProceduralFieldParams,
+    FIELD_COLLIDER_ALGORITHM_VERSION, MOTION_ALGORITHM_VERSION,
 };
 use crate::ntsc::NtscParams;
 use crate::performance::{
@@ -1339,6 +1340,12 @@ pub enum MotionFieldSourceConfig {
     Auto,
     CodecVectors,
     Lattice,
+    ProceduralCurl,
+    ProceduralRadial,
+    ProceduralSpiral,
+    ProceduralContour,
+    ProceduralChroma,
+    ProceduralWeave,
 }
 
 impl MotionFieldSourceConfig {
@@ -1347,6 +1354,14 @@ impl MotionFieldSourceConfig {
             MotionFieldSource::Auto => Self::Auto,
             MotionFieldSource::CodecVectors => Self::CodecVectors,
             MotionFieldSource::Lattice => Self::Lattice,
+            MotionFieldSource::Procedural(kind) => match kind {
+                ProceduralFieldKind::Curl => Self::ProceduralCurl,
+                ProceduralFieldKind::Radial => Self::ProceduralRadial,
+                ProceduralFieldKind::Spiral => Self::ProceduralSpiral,
+                ProceduralFieldKind::Contour => Self::ProceduralContour,
+                ProceduralFieldKind::Chroma => Self::ProceduralChroma,
+                ProceduralFieldKind::Weave => Self::ProceduralWeave,
+            },
         }
     }
 
@@ -1355,7 +1370,50 @@ impl MotionFieldSourceConfig {
             Self::Auto => MotionFieldSource::Auto,
             Self::CodecVectors => MotionFieldSource::CodecVectors,
             Self::Lattice => MotionFieldSource::Lattice,
+            Self::ProceduralCurl => MotionFieldSource::Procedural(ProceduralFieldKind::Curl),
+            Self::ProceduralRadial => MotionFieldSource::Procedural(ProceduralFieldKind::Radial),
+            Self::ProceduralSpiral => MotionFieldSource::Procedural(ProceduralFieldKind::Spiral),
+            Self::ProceduralContour => MotionFieldSource::Procedural(ProceduralFieldKind::Contour),
+            Self::ProceduralChroma => MotionFieldSource::Procedural(ProceduralFieldKind::Chroma),
+            Self::ProceduralWeave => MotionFieldSource::Procedural(ProceduralFieldKind::Weave),
         }
+    }
+}
+
+/// Serializable B2 procedural field scalars. An omitted section is exactly the
+/// pre-B2 path, so every patch written before B2 keeps its original bytes and
+/// its original canonical hash.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProceduralFieldConfig {
+    pub scale: f32,
+    pub rate: f32,
+}
+
+impl Default for ProceduralFieldConfig {
+    fn default() -> Self {
+        Self::from_params(ProceduralFieldParams::default())
+    }
+}
+
+impl ProceduralFieldConfig {
+    pub fn from_params(value: ProceduralFieldParams) -> Self {
+        Self {
+            scale: value.scale,
+            rate: value.rate,
+        }
+    }
+
+    pub fn to_params(self) -> ProceduralFieldParams {
+        ProceduralFieldParams {
+            scale: self.scale,
+            rate: self.rate,
+        }
+        .sanitized()
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -1774,6 +1832,10 @@ pub struct MotionConfig {
     pub algorithm_version: u16,
     pub field_source: MotionFieldSourceConfig,
     pub lattice_quality: MotionLatticeQualityConfig,
+    /// B2 procedural field scalars. Skipped at default so pre-B2 patches keep
+    /// their bytes and canonical hashes.
+    #[serde(default, skip_serializing_if = "ProceduralFieldConfig::is_default")]
+    pub procedural: ProceduralFieldConfig,
     pub transplant: FaradayConfig,
     pub shutter: CurvedShutterConfig,
     /// Field Collider v1. An omitted section is exactly the pre-collider path,
@@ -1795,6 +1857,7 @@ impl MotionConfig {
             algorithm_version: value.algorithm_version,
             field_source: MotionFieldSourceConfig::from_runtime(value.field_source),
             lattice_quality: MotionLatticeQualityConfig::from_runtime(value.lattice_quality),
+            procedural: ProceduralFieldConfig::from_params(value.procedural),
             transplant: FaradayConfig::from_params(value.transplant),
             shutter: CurvedShutterConfig::from_params(value.shutter),
             collider: FieldColliderConfig::from_params(value.collider),
@@ -1824,6 +1887,7 @@ impl MotionConfig {
             },
             field_source: self.field_source.to_runtime(),
             lattice_quality: self.lattice_quality.to_runtime(),
+            procedural: self.procedural.to_params(),
             transplant: self.transplant.to_params(),
             shutter: self.shutter.to_params(),
             collider: self.collider.to_params(),
@@ -6344,6 +6408,10 @@ scenes:
             algorithm_version: MOTION_ALGORITHM_VERSION,
             field_source: MotionFieldSource::CodecVectors,
             lattice_quality: MotionLatticeQuality::High,
+            procedural: ProceduralFieldParams {
+                scale: 0.75,
+                rate: -1.5,
+            },
             transplant: FaradayParams {
                 amount: 0.75,
                 donor: MotionDonor::Selected {
@@ -6404,6 +6472,56 @@ scenes:
             }
         );
         assert_eq!(runtime.shutter.quality.sample_count(), 16);
+        assert_eq!(runtime.procedural.scale, 0.75);
+        assert_eq!(runtime.procedural.rate, -1.5);
+    }
+
+    #[test]
+    fn procedural_field_config_round_trips_and_an_absent_section_is_the_prior_path() {
+        // A default motion block serializes without the B2 section, so every
+        // pre-B2 patch keeps its original bytes and its canonical hash.
+        let default_yaml = serde_yaml::to_string(&MotionConfig::default()).unwrap();
+        assert!(!default_yaml.contains("procedural"));
+        let absent: MotionConfig = serde_yaml::from_str("field_source: lattice\n").unwrap();
+        assert_eq!(absent.procedural, ProceduralFieldConfig::default());
+
+        // All six kinds round trip through their stable tokens.
+        for (kind, token) in [
+            (ProceduralFieldKind::Curl, "procedural_curl"),
+            (ProceduralFieldKind::Radial, "procedural_radial"),
+            (ProceduralFieldKind::Spiral, "procedural_spiral"),
+            (ProceduralFieldKind::Contour, "procedural_contour"),
+            (ProceduralFieldKind::Chroma, "procedural_chroma"),
+            (ProceduralFieldKind::Weave, "procedural_weave"),
+        ] {
+            let config = MotionConfig::from_params(MotionParams {
+                field_source: MotionFieldSource::Procedural(kind),
+                procedural: ProceduralFieldParams {
+                    scale: 0.9,
+                    rate: 1.5,
+                },
+                ..MotionParams::default()
+            });
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            assert!(yaml.contains(&format!("field_source: {token}")), "{token}");
+            assert!(yaml.contains("procedural:"));
+            let restored: MotionConfig = serde_yaml::from_str(&yaml).unwrap();
+            let runtime = restored.to_params();
+            assert_eq!(runtime.field_source, MotionFieldSource::Procedural(kind));
+            assert_eq!(runtime.procedural.scale, 0.9);
+            assert_eq!(runtime.procedural.rate, 1.5);
+        }
+
+        // Hostile scalars sanitize on load to neutral values, and unknown
+        // fields inside the section are rejected rather than ignored.
+        let hostile: MotionConfig =
+            serde_yaml::from_str("procedural:\n  scale: .nan\n  rate: 99.0\n").unwrap();
+        let runtime = hostile.to_params();
+        assert_eq!(runtime.procedural.scale, 0.5);
+        assert_eq!(runtime.procedural.rate, 2.0);
+        assert!(
+            serde_yaml::from_str::<MotionConfig>("procedural:\n  scale: 0.5\n  seed: 4\n").is_err()
+        );
     }
 
     #[test]

@@ -37,9 +37,12 @@ use crate::visual_rack::{
 };
 
 /// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
-/// new isolated domains. Manifest readers remain data-driven and accept every
-/// earlier version string.
-pub const GENERATOR_VERSION: &str = "7";
+/// new isolated domains; v8 adds the B2 procedural field scalars in fresh
+/// domains — every field mutated by v7 keeps its byte-identical stream, but a
+/// generated piece now carries the two new values, so the version names the
+/// difference. Manifest readers remain data-driven and accept every earlier
+/// version string.
+pub const GENERATOR_VERSION: &str = "8";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -543,6 +546,10 @@ const PROCEDURAL_MOTION_SHUTTER_ANGLE: u64 = 0x5348_5554_414e_474c;
 const PROCEDURAL_MOTION_SHUTTER_PHASE: u64 = 0x5348_5554_5048_4153;
 const PROCEDURAL_MOTION_SHUTTER_CURVE: u64 = 0x5348_5554_4355_5256;
 const PROCEDURAL_MOTION_CHROMATIC_LAG: u64 = 0x4348_524f_4d4c_4147;
+// B2 procedural field scalars: fresh domains, so every v7 stream that never
+// carried them stays byte-stable.
+const PROCEDURAL_MOTION_FIELD_SCALE: u64 = 0x4649_454c_4453_434c;
+const PROCEDURAL_MOTION_FIELD_RATE: u64 = 0x4649_454c_4452_4154;
 
 fn mutate_motion_config(
     anchor: &MotionConfig,
@@ -648,6 +655,22 @@ fn mutate_motion_config(
         1.0,
         0.15,
         PROCEDURAL_MOTION_CHROMATIC_LAG
+    );
+    linear!(
+        value.procedural.scale,
+        anchor.procedural.scale,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_MOTION_FIELD_SCALE
+    );
+    linear!(
+        value.procedural.rate,
+        anchor.procedural.rate,
+        -2.0,
+        2.0,
+        0.5,
+        PROCEDURAL_MOTION_FIELD_RATE
     );
     *value = value.sanitized();
 }
@@ -3772,7 +3795,7 @@ scenes:
         .unwrap()
         .remove(0);
         let layer = &piece.patch.layers[0];
-        assert_eq!(piece.manifest.generator_version, "7");
+        assert_eq!(piece.manifest.generator_version, GENERATOR_VERSION);
         assert_eq!(layer.clip_slots.len(), 1);
         assert_eq!(
             layer.active_clip_slot,
@@ -3804,7 +3827,7 @@ scenes:
         let legacy_piece = generate(&legacy, &config).unwrap().remove(0);
         let advanced_piece = generate(&advanced, &config).unwrap().remove(0);
 
-        assert_eq!(advanced_piece.manifest.generator_version, "7");
+        assert_eq!(advanced_piece.manifest.generator_version, GENERATOR_VERSION);
         assert_creative_topology_and_switches_eq(&advanced, &advanced_piece.patch);
         assert_ne!(advanced_piece.patch.master_rack, advanced.master_rack);
         assert_ne!(advanced_piece.patch.layers[0].rack, advanced.layers[0].rack);

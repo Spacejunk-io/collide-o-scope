@@ -14,7 +14,7 @@ use crate::{
     },
     motion::{
         CurvedShutterParams, MotionCarrier, MotionField, MotionFieldOrigin, MotionGrid,
-        MotionResourcePlan, MOTION_ALGORITHM_VERSION,
+        MotionResourcePlan, ProceduralFieldKind, MOTION_ALGORITHM_VERSION,
     },
     spatial::{SpatialGpuUniforms, SpatialTransform},
     temporal::TemporalFrameInput,
@@ -36,6 +36,9 @@ pub(crate) const MOTION_COLLIDER_PAIR_FORMAT: wgpu::TextureFormat =
 pub(crate) struct MotionGpuFieldSpec {
     pub grid: MotionGrid,
     pub requires_luma: bool,
+    /// `Some` when this field is synthesized by the B2 procedural pass rather
+    /// than acquired from codec side data or lattice observation.
+    pub procedural: Option<ProceduralFieldKind>,
     pub required_as_garden_signal: bool,
 }
 
@@ -243,6 +246,7 @@ struct MotionGpuField {
     /// the exact field identity that will become resident on commit.
     staged_field: Option<Option<MotionAcceptedField>>,
     bindings: Option<MotionFieldBindings>,
+    procedural_bindings: Option<ProceduralFieldBindings>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +278,16 @@ impl MotionAcceptedField {
             product_content_sha256: None,
         }
     }
+
+    const fn procedural(kind: ProceduralFieldKind, source_scope: VisualScopeId) -> Self {
+        Self {
+            origin: MotionFieldOrigin::Procedural(kind),
+            source_scope,
+            source_generation: None,
+            frame_ordinal: None,
+            product_content_sha256: None,
+        }
+    }
 }
 
 struct MotionFieldBindings {
@@ -281,6 +295,14 @@ struct MotionFieldBindings {
     /// Indexed by the committed/read luma parity. The target is always the
     /// inactive parity, so no command can overwrite committed luma.
     lattice: [wgpu::BindGroup; 2],
+}
+
+/// One procedural field's prepared pass inputs. The uniform is rewritten every
+/// staged frame — time, scale, and rate are frame-evaluated values — while the
+/// bind group is prepared once and reused warm.
+struct ProceduralFieldBindings {
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 struct MotionScopeBindings {
@@ -313,6 +335,18 @@ struct LatticeGpuUniforms {
 }
 
 const _: () = assert!(std::mem::size_of::<LatticeGpuUniforms>() == 32);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ProceduralGpuUniforms {
+    field_size: [u32; 2],
+    kind: u32,
+    _pad0: u32,
+    /// x time_seconds, y scale, z rate, w unused.
+    values: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<ProceduralGpuUniforms>() == 32);
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -415,6 +449,7 @@ impl MotionGpuField {
             committed_field: None,
             staged_field: None,
             bindings: None,
+            procedural_bindings: None,
         })
     }
 
@@ -739,6 +774,7 @@ impl MotionColliderGpu {
 struct MotionPipelines {
     luma: wgpu::RenderPipeline,
     lattice: wgpu::RenderPipeline,
+    procedural: wgpu::RenderPipeline,
     apply: wgpu::RenderPipeline,
     refresh: wgpu::RenderPipeline,
     garden_signal: wgpu::RenderPipeline,
@@ -746,12 +782,18 @@ struct MotionPipelines {
     collider_collide: wgpu::RenderPipeline,
     luma_layout: wgpu::BindGroupLayout,
     lattice_layout: wgpu::BindGroupLayout,
+    procedural_layout: wgpu::BindGroupLayout,
     image_layout: wgpu::BindGroupLayout,
     garden_signal_layout: wgpu::BindGroupLayout,
     collider_map_layout: wgpu::BindGroupLayout,
     collider_collide_layout: wgpu::BindGroupLayout,
     linear_sampler: wgpu::Sampler,
     nearest_sampler: wgpu::Sampler,
+    /// One 1x1 defined-zero image bound by the pure procedural kinds, whose
+    /// shader never reads it: the layout owns a texture slot so Contour and
+    /// Chroma can observe the recipient, and an unread binding must still be
+    /// a valid one.
+    neutral_image: MotionTexture,
 }
 
 impl MotionPipelines {
@@ -786,6 +828,10 @@ impl MotionPipelines {
                 filtering_sampler_entry(2),
                 uniform_entry(3),
             ],
+        });
+        let procedural_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Motion procedural field BGL"),
+            entries: &[sampled_texture_entry(0), uniform_entry(1)],
         });
         let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Motion apply/refresh BGL"),
@@ -842,6 +888,12 @@ impl MotionPipelines {
             label: Some("Motion lattice shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_lattice.wgsl").into()),
         });
+        let procedural_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Motion procedural field shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../shaders/motion_procedural.wgsl").into(),
+            ),
+        });
         let apply_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Motion apply shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/motion_apply.wgsl").into()),
@@ -868,6 +920,13 @@ impl MotionPipelines {
             "Motion lattice pipeline",
             &lattice_layout,
             &lattice_module,
+            &[MOTION_VECTOR_FORMAT, MOTION_GATE_FORMAT],
+        );
+        let procedural = create_motion_pipeline(
+            device,
+            "Motion procedural field pipeline",
+            &procedural_layout,
+            &procedural_module,
             &[MOTION_VECTOR_FORMAT, MOTION_GATE_FORMAT],
         );
         let apply = create_motion_pipeline(
@@ -907,9 +966,19 @@ impl MotionPipelines {
             "fs_collide",
             &[MOTION_VECTOR_FORMAT, MOTION_GATE_FORMAT],
         );
+        // wgpu zero-initializes texture contents, so this 1x1 binding decodes
+        // to exactly nothing wherever an unread slot must still be bound.
+        let neutral_image = MotionTexture::new(
+            device,
+            "Motion procedural neutral image",
+            [1, 1],
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        );
         Self {
             luma,
             lattice,
+            procedural,
             apply,
             refresh,
             garden_signal,
@@ -917,12 +986,14 @@ impl MotionPipelines {
             collider_collide,
             luma_layout,
             lattice_layout,
+            procedural_layout,
             image_layout,
             garden_signal_layout,
             collider_map_layout,
             collider_collide_layout,
             linear_sampler,
             nearest_sampler,
+            neutral_image,
         }
     }
 }
@@ -1330,6 +1401,49 @@ impl MotionGpuResources {
                 .fields
                 .get_mut(usize::from(field_plan.slot))
                 .ok_or(MotionGpuError::FieldIndex(usize::from(field_plan.slot)))?;
+            if let Some(kind) = field.spec.procedural {
+                // Contour and Chroma observe the recipient's image; the pure
+                // kinds bind the defined-zero neutral their shader never
+                // reads. The uniform's frame-evaluated lanes are rewritten by
+                // every staged frame, so zeroed initial contents are fine.
+                let source = if kind.reads_image() {
+                    source_lookup
+                        .remove(&field_plan.slot)
+                        .ok_or(MotionGpuError::MissingFieldSource(field_plan.slot))?
+                } else {
+                    &self.pipelines.neutral_image.view
+                };
+                let uniform = fixed_uniform_buffer(
+                    device,
+                    queue,
+                    "Motion procedural field uniform",
+                    &ProceduralGpuUniforms {
+                        field_size: [field.spec.grid.width, field.spec.grid.height],
+                        kind: kind.code(),
+                        _pad0: 0,
+                        values: [0.0; 4],
+                    },
+                );
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Motion prepared procedural field BG"),
+                    layout: &self.pipelines.procedural_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(source),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: uniform.as_entire_binding(),
+                        },
+                    ],
+                });
+                field.procedural_bindings = Some(ProceduralFieldBindings {
+                    uniform,
+                    bind_group,
+                });
+                continue;
+            }
             if !field.spec.requires_luma {
                 continue;
             }
@@ -1550,6 +1664,9 @@ impl MotionGpuResources {
         plan: &AdvancedMotionPlan,
         temporal: TemporalFrameInput,
         input: MotionFrameInput<'_>,
+        // Shared frame-plan program time. Procedural fields are functions of
+        // this value, never of wall time, so live and offline agree.
+        time_seconds: f32,
     ) -> Result<(), MotionGpuError> {
         if self
             .fields
@@ -1587,8 +1704,15 @@ impl MotionGpuResources {
                 .fields
                 .get_mut(usize::from(field_plan.slot))
                 .ok_or(MotionGpuError::FieldIndex(usize::from(field_plan.slot)))?;
-            let acquisition_advances =
-                temporal.freeze.media_advances() && !input.held_scopes.contains(&field_plan.scope);
+            let procedural = field_plan.source.origin.procedural_kind();
+            // A procedural field is synthesized from program time, not
+            // acquired from media: Media Freeze and a paused layer hold
+            // decoders, while synthesis advances with the program exactly as
+            // the derived collider does. Program Freeze still holds it,
+            // because `program_advances` gates every staging path below.
+            let acquisition_advances = procedural.is_some()
+                || (temporal.freeze.media_advances()
+                    && !input.held_scopes.contains(&field_plan.scope));
             let lattice = matches!(
                 field_plan.source.origin,
                 MotionFieldOrigin::Lattice | MotionFieldOrigin::LatticeFallback
@@ -1626,7 +1750,10 @@ impl MotionGpuResources {
                 self.program_advances,
                 acquisition_advances,
                 lattice,
-                accepted_attachment.is_some(),
+                // A procedural pass publishes a freshly synthesized parity on
+                // every program-advancing frame, exactly the publication law a
+                // codec upload takes.
+                accepted_attachment.is_some() || procedural.is_some(),
                 false,
             );
             if self.program_advances && acquisition_advances {
@@ -1634,10 +1761,43 @@ impl MotionGpuResources {
                     field.upload_field(queue, attachment.field, stage.write_field_index)?;
                 }
             }
+            if let Some(kind) = procedural {
+                // Time, scale, and rate are frame-evaluated values; the plan's
+                // scope params already carry this frame's modulated copies.
+                let params = plan
+                    .scope(field_plan.scope)
+                    .map(|scope| scope.params.procedural.sanitized())
+                    .unwrap_or_default();
+                let bindings = field
+                    .procedural_bindings
+                    .as_ref()
+                    .ok_or(MotionGpuError::BindingsNotPrepared)?;
+                queue.write_buffer(
+                    &bindings.uniform,
+                    0,
+                    bytemuck::bytes_of(&ProceduralGpuUniforms {
+                        field_size: [field.spec.grid.width, field.spec.grid.height],
+                        kind: kind.code(),
+                        _pad0: 0,
+                        values: [
+                            if time_seconds.is_finite() {
+                                time_seconds.max(0.0)
+                            } else {
+                                0.0
+                            },
+                            params.scale,
+                            params.rate,
+                            0.0,
+                        ],
+                    }),
+                );
+            }
             let mut staged_field = field.committed_field;
             if self.program_advances && acquisition_advances {
                 if let Some(attachment) = accepted_attachment {
                     staged_field = Some(MotionAcceptedField::codec(attachment));
+                } else if let Some(kind) = procedural {
+                    staged_field = Some(MotionAcceptedField::procedural(kind, field_plan.scope));
                 } else if lattice && stage.update_lattice && stage.render_field_valid {
                     staged_field = Some(MotionAcceptedField::lattice(
                         field_plan.source.origin,
@@ -1969,6 +2129,24 @@ impl MotionGpuResources {
         };
         let field = &self.fields[usize::from(field_plan.slot)];
         let stage = field.frame_stage.ok_or(MotionGpuError::FrameNotStaged)?;
+        if field.spec.procedural.is_some() {
+            // One dual-target pass synthesizes this frame's parity. The
+            // staging above already published `write_field_index` as the
+            // render parity, exactly as a codec upload does.
+            let bindings = field
+                .procedural_bindings
+                .as_ref()
+                .ok_or(MotionGpuError::BindingsNotPrepared)?;
+            encode_dual_target_pass(
+                encoder,
+                "Motion procedural field synthesis",
+                &self.pipelines.procedural,
+                &bindings.bind_group,
+                &field.vectors[usize::from(stage.write_field_index)].view,
+                &field.gates[usize::from(stage.write_field_index)].view,
+            );
+            return Ok(());
+        }
         if !stage.update_lattice {
             return Ok(());
         }
@@ -3712,6 +3890,7 @@ mod tests {
                 &[MotionGpuFieldSpec {
                     grid,
                     requires_luma: true,
+                    procedural: None,
                     required_as_garden_signal: false,
                 }],
                 dimensions,
@@ -4148,6 +4327,225 @@ mod tests {
         assert_eq!(export.resources.memory_generation, 2);
     }
 
+    /// The B2 synthesis pass measured against `procedural_field_sample`,
+    /// texel for texel, for every kind in the closed vocabulary.
+    ///
+    /// The source image is linear in texel space (bytes 4x and 5y), so the
+    /// GPU's covered bilinear reproduces the analytic function exactly and the
+    /// CPU closure can mirror it without modelling filtering error. The
+    /// outermost cell ring is skipped for the two image-reading kinds because
+    /// corner clamping deviates from the clamped-coordinate closure there.
+    #[test]
+    #[ignore = "requires an opted-in physical GPU readback adapter"]
+    fn gpu_procedural_field_matches_the_cpu_reference_for_every_kind() {
+        use crate::motion::{procedural_field_sample, ProceduralFieldParams};
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("procedural field physical GPU adapter");
+        let adapter_info = adapter.get_info();
+        println!(
+            "procedural field physical adapter: {} ({:?}, {:?})",
+            adapter_info.name, adapter_info.backend, adapter_info.device_type
+        );
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Procedural field physical acceptance device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        }))
+        .expect("procedural field physical GPU device");
+
+        let dimensions = [64_u32, 48];
+        let quality = MotionLatticeQuality::High;
+        let grid = MotionGrid::for_source(dimensions, quality).unwrap();
+        let params = ProceduralFieldParams {
+            scale: 0.25,
+            rate: 0.8,
+        };
+        let time_seconds = 1.7_f32;
+        let cell_step = [1.0 / grid.width as f32, 1.0 / grid.height as f32];
+        // Linear-in-texel-space source: bytes are exactly on the ramp, so
+        // quantization contributes nothing.
+        let source_bytes = (0..dimensions[0] * dimensions[1])
+            .flat_map(|index| {
+                let x = (index % dimensions[0]) as u8;
+                let y = (index / dimensions[0]) as u8;
+                [x * 4, y.wrapping_mul(5), 64, 255]
+            })
+            .collect::<Vec<_>>();
+        let image = move |uv: [f32; 2]| -> [f32; 4] {
+            let cx = (uv[0] * 64.0 - 0.5).clamp(0.0, 63.0);
+            let cy = (uv[1] * 48.0 - 0.5).clamp(0.0, 47.0);
+            [cx * 4.0 / 255.0, cy * 5.0 / 255.0, 64.0 / 255.0, 1.0]
+        };
+
+        for kind in ProceduralFieldKind::ALL {
+            let plan = MotionResourcePlan::preflight(
+                &[crate::motion::MotionScopeResourceRequest {
+                    source_dimensions: dimensions,
+                    output_dimensions: dimensions,
+                    params: crate::motion::MotionParams {
+                        field_source: crate::motion::MotionFieldSource::Procedural(kind),
+                        lattice_quality: quality,
+                        procedural: params,
+                        ..Default::default()
+                    },
+                    is_master: false,
+                    codec_vectors_available: false,
+                    required_as_donor: true,
+                    required_as_garden_signal: false,
+                }],
+                MotionDeviceLimits::new(device.limits().max_texture_dimension_2d, u64::MAX),
+            )
+            .unwrap();
+            assert_eq!(plan.luma_bytes, 0, "{kind}: procedural fields need no luma");
+            let mut resources = MotionGpuResources::prepare(
+                &device,
+                plan,
+                &[MotionGpuFieldSpec {
+                    grid,
+                    requires_luma: false,
+                    procedural: Some(kind),
+                    required_as_garden_signal: false,
+                }],
+                dimensions,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let source = MotionTexture::new(
+                &device,
+                "Procedural field fixture source",
+                dimensions,
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            );
+            queue.write_texture(
+                source.texture.as_image_copy(),
+                &source_bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(dimensions[0] * 4),
+                    rows_per_image: Some(dimensions[1]),
+                },
+                wgpu::Extent3d {
+                    width: dimensions[0],
+                    height: dimensions[1],
+                    depth_or_array_layers: 1,
+                },
+            );
+            let uniform = fixed_uniform_buffer(
+                &device,
+                &queue,
+                "Procedural field fixture uniform",
+                &ProceduralGpuUniforms {
+                    field_size: [grid.width, grid.height],
+                    kind: kind.code(),
+                    _pad0: 0,
+                    values: [time_seconds, params.scale, params.rate, 0.0],
+                },
+            );
+            let source_view = if kind.reads_image() {
+                &source.view
+            } else {
+                &resources.pipelines.neutral_image.view
+            };
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Procedural field fixture BG"),
+                layout: &resources.pipelines.procedural_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(source_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: uniform.as_entire_binding(),
+                    },
+                ],
+            });
+            let field = &mut resources.fields[0];
+            field.procedural_bindings = Some(ProceduralFieldBindings {
+                uniform,
+                bind_group,
+            });
+            let stage = field.memory.stage(
+                1.0 / 30.0,
+                quality.update_hz(),
+                true,
+                true,
+                false,
+                true,
+                false,
+            );
+            assert!(stage.render_field_valid);
+            field.frame_stage = Some(stage);
+            let bindings = field.procedural_bindings.as_ref().unwrap();
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Procedural field fixture encoder"),
+            });
+            encode_dual_target_pass(
+                &mut encoder,
+                "Motion procedural field synthesis",
+                &resources.pipelines.procedural,
+                &bindings.bind_group,
+                &field.vectors[usize::from(stage.write_field_index)].view,
+                &field.gates[usize::from(stage.write_field_index)].view,
+            );
+            queue.submit(Some(encoder.finish()));
+            resources.commit_frame();
+            let metrics = resources.fields[0].memory.metrics();
+            assert!(metrics.field_valid, "{kind}: field must publish");
+            let vectors = read_motion_vectors(
+                &device,
+                &queue,
+                &resources.fields[0].vectors[usize::from(metrics.committed_field_index)].texture,
+                grid,
+            );
+
+            let border = usize::from(kind.reads_image());
+            let mut worst = 0.0_f32;
+            for cell_y in border..(grid.height as usize - border) {
+                for cell_x in border..(grid.width as usize - border) {
+                    let uv = [
+                        (cell_x as f32 + 0.5) / grid.width as f32,
+                        (cell_y as f32 + 0.5) / grid.height as f32,
+                    ];
+                    let expected =
+                        procedural_field_sample(kind, uv, cell_step, time_seconds, params, &image)
+                            .velocity_uv_per_second;
+                    let offset = (cell_y * grid.width as usize + cell_x) * 4;
+                    let actual = [
+                        motion_half_to_f32(u16::from_le_bytes([
+                            vectors[offset],
+                            vectors[offset + 1],
+                        ])),
+                        motion_half_to_f32(u16::from_le_bytes([
+                            vectors[offset + 2],
+                            vectors[offset + 3],
+                        ])),
+                    ];
+                    for axis in 0..2 {
+                        worst = worst.max((actual[axis] - expected[axis]).abs());
+                        assert!(
+                            (actual[axis] - expected[axis]).abs() < 0.08,
+                            "{kind} cell ({cell_x}, {cell_y}) axis {axis}: \
+                             GPU {actual:?} vs CPU {expected:?}"
+                        );
+                    }
+                }
+            }
+            println!("procedural {kind}: worst |GPU - CPU| = {worst}");
+        }
+    }
+
     #[test]
     fn gpu_motion_formats_pipelines_and_codec_upload_are_valid_when_opted_in() {
         if std::env::var_os("COLLIDE_GPU_GOLDENS").is_none() {
@@ -4198,6 +4596,7 @@ mod tests {
             &[MotionGpuFieldSpec {
                 grid,
                 requires_luma: true,
+                procedural: None,
                 required_as_garden_signal: true,
             }],
             dimensions,
