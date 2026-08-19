@@ -2169,6 +2169,13 @@ mislead browser tests.
   atomic publish law with the prior artifact readable until replacement and
   the seal following the artifact; mid-file corruption refused by the seal
   and discarded; eviction following the pure plan with a path-free receipt;
+  the advisory cross-session recency record — the mid-write reproduction
+  recovered beside a healthy sealed cache with the prior record applied in
+  full, cross-session eviction order surviving a reopen and reaching the
+  pure preflight, every hostile record shape (torn, wrong version, unknown
+  field, malformed or duplicate key, oversized) discarded whole without
+  refusing the cache, ghost rows resurrecting nothing and never advancing
+  the counter, and removals rewriting the record;
   foreign files counted but never touched; the contract-derived argv; garbage
   bytes failing decoded-identity validation; mutated/unreadable sources
   refused before any encode; the Y-key mapping; hot adoption's
@@ -2289,7 +2296,12 @@ a passing claim.
   are now authored host-session state through the one-owner law in the web
   section: each tuple keys its own cache entry, a load consults under the
   current session tuple only, and the default tuple remains the process
-  start. Spout layers still cannot be
+  start. Eviction recency survives sessions through the cache directory's
+  single advisory `recency.json`, written by the artifact publication's own
+  staged atomic replace: it orders eviction and nothing else, a missing or
+  hostile record degrades whole to session-local order, a row naming an
+  absent key resurrects nothing, and no record can refuse the cache or
+  bypass a seal — consumption re-hashes regardless. Spout layers still cannot be
   proxied (no file bytes exist), which is a category fact rather than an
   edge. A host killed
   mid-encode may orphan one ffmpeg process bounded by its own completion;

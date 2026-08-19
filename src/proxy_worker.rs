@@ -7,9 +7,15 @@
 //! parent-directory sync, with the prior artifact readable throughout. A
 //! crash leaves at worst a staging file, which recovery removes and never
 //! publishes or counts. The directory itself is the index: a scan rebuilds
-//! it, so there is no metadata file to corrupt. Last-used ordinals are
-//! session-local — a fresh process starts every entry at zero and the pure
-//! preflight's `(ordinal, key)` order breaks ties deterministically.
+//! it, and the store's one metadata file — the advisory recency record — is
+//! deliberately unable to corrupt anything, because it is advisory eviction
+//! input only. A valid record seeds last-used ordinals across sessions; a
+//! missing, torn, oversized, or hostile record degrades to exactly the old
+//! session-local behavior (every entry at zero, the pure preflight's
+//! `(ordinal, key)` order breaking ties deterministically) and is discarded.
+//! It can never refuse the cache, never name an artifact into existence —
+//! the directory stays the index — and never bypass a seal, because
+//! consumption re-hashes regardless of how an entry was ordered.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -48,6 +54,20 @@ pub const PROXY_STAGING_SUFFIX: &str = ".staging";
 /// artifact against the seal, so corruption anywhere in the file is refused,
 /// not just corruption a first-frame decode would notice.
 pub const PROXY_DIGEST_SUFFIX: &str = ".sha256";
+/// The store's own advisory cross-session recency record, written through
+/// the same staged atomic replace the artifact publication uses (so its
+/// crash residue is a `.staging` file the ordinary recovery law removes).
+/// Advisory means exactly that: it orders eviction and nothing else.
+pub const PROXY_RECENCY_FILE_NAME: &str = "recency.json";
+/// A recency record larger than this is refused before parsing — hostile
+/// input is bounded by the cap, never by allocating first.
+pub const PROXY_RECENCY_MAX_BYTES: u64 = 256 * 1024;
+/// Exact version gate. A record from any other version is advisory data
+/// this build does not understand: discarded whole, never migrated.
+pub const PROXY_RECENCY_VERSION: u16 = 1;
+/// More touch rows than the cache could ever hold is hostile or corrupt;
+/// the whole record is discarded rather than partially believed.
+pub const PROXY_RECENCY_MAX_TOUCHES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyWorkerError {
@@ -127,6 +147,15 @@ pub struct ProxyCacheRecovery {
     /// renames. Removed, never served, never counted.
     pub incomplete_removed: usize,
     pub foreign_entries: usize,
+    /// Ordinals applied from a valid advisory recency record — one count
+    /// per record row that named a directory-backed artifact. Rows naming
+    /// keys the directory does not back are ignored silently: the directory
+    /// is the index, and advisory data cannot resurrect an artifact.
+    pub recency_applied: usize,
+    /// A present-but-invalid recency record (torn, oversized, wrong
+    /// version, malformed or duplicate keys) was discarded. Eviction order
+    /// degrades to session-local for this process; nothing else changes.
+    pub recency_discarded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +163,53 @@ struct IndexEntry {
     artifact_bytes: u64,
     last_used_ordinal: u64,
     artifact_digest: String,
+}
+
+/// The serialized advisory recency record. Strict on the way in: unknown
+/// fields, a foreign version, over-cap row counts, malformed keys, and
+/// duplicate keys each discard the record whole — advisory data is either
+/// fully believed or not believed at all, never partially applied.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyRecencyRecord {
+    version: u16,
+    touches: Vec<(String, u64)>,
+}
+
+enum RecencyLoad {
+    Absent,
+    Invalid,
+    Valid(Vec<(ProxyCacheKey, u64)>),
+}
+
+fn load_recency_record(path: &Path) -> RecencyLoad {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return RecencyLoad::Absent;
+    };
+    if !metadata.is_file() || metadata.len() > PROXY_RECENCY_MAX_BYTES {
+        return RecencyLoad::Invalid;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return RecencyLoad::Invalid;
+    };
+    let Ok(record) = serde_json::from_slice::<ProxyRecencyRecord>(&bytes) else {
+        return RecencyLoad::Invalid;
+    };
+    if record.version != PROXY_RECENCY_VERSION || record.touches.len() > PROXY_RECENCY_MAX_TOUCHES {
+        return RecencyLoad::Invalid;
+    }
+    let mut touches = Vec::with_capacity(record.touches.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for (hex, ordinal) in record.touches {
+        let Ok(key) = ProxyCacheKey::from_hex(&hex) else {
+            return RecencyLoad::Invalid;
+        };
+        if !seen.insert(key) {
+            return RecencyLoad::Invalid;
+        }
+        touches.push((key, ordinal));
+    }
+    RecencyLoad::Valid(touches)
 }
 
 /// The cache directory plus its rebuilt in-memory index. One instance is
@@ -175,6 +251,12 @@ impl ProxyCacheStore {
                 std::fs::remove_file(&path)
                     .map_err(|error| ProxyWorkerError::CacheDirectory(error.to_string()))?;
                 recovery.staging_removed += 1;
+                continue;
+            }
+            // The store's own advisory recency record: neither an artifact
+            // nor a foreign file. Read and validated after the scan, once
+            // the directory has said which keys actually exist.
+            if name == PROXY_RECENCY_FILE_NAME {
                 continue;
             }
             if let Some(stem) = name
@@ -247,11 +329,35 @@ impl ProxyCacheStore {
                 .map_err(|error| ProxyWorkerError::CacheDirectory(error.to_string()))?;
             recovery.incomplete_removed += 1;
         }
+
+        // Apply the advisory recency record last, against the directory's
+        // verdict. A row naming a key the directory does not back is
+        // ignored; an invalid record is discarded whole and eviction order
+        // degrades to session-local — never a refused cache, never a served
+        // artifact the seal check did not pass.
+        let mut next_ordinal = 1;
+        let recency_path = root.join(PROXY_RECENCY_FILE_NAME);
+        match load_recency_record(&recency_path) {
+            RecencyLoad::Absent => {}
+            RecencyLoad::Invalid => {
+                let _ = std::fs::remove_file(&recency_path);
+                recovery.recency_discarded = true;
+            }
+            RecencyLoad::Valid(touches) => {
+                for (key, ordinal) in touches {
+                    if let Some(entry) = entries.get_mut(&key) {
+                        entry.last_used_ordinal = ordinal;
+                        next_ordinal = next_ordinal.max(ordinal.saturating_add(1));
+                        recovery.recency_applied += 1;
+                    }
+                }
+            }
+        }
         Ok((
             Self {
                 root,
                 entries,
-                next_ordinal: 1,
+                next_ordinal,
             },
             recovery,
         ))
@@ -282,11 +388,53 @@ impl ProxyCacheStore {
         self.entries.contains_key(&key)
     }
 
-    /// Record a use so eviction order reflects it. Unknown keys are inert.
+    /// Record a use so eviction order reflects it. Unknown keys are inert
+    /// and rewrite nothing.
     pub fn touch(&mut self, key: ProxyCacheKey) {
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used_ordinal = self.next_ordinal;
             self.next_ordinal = self.next_ordinal.saturating_add(1);
+            self.persist_recency();
+        }
+    }
+
+    /// Rewrite the advisory recency record through the same staged atomic
+    /// replace the artifact publication uses, so a crash mid-write leaves a
+    /// `.staging` file the ordinary recovery law removes while the prior
+    /// record stays readable. Failure is deliberately soft: recency is
+    /// advisory eviction input, so a write error degrades a future
+    /// session's eviction order and nothing else — it must never fail a
+    /// touch, a publication, or an eviction that already succeeded.
+    fn persist_recency(&self) {
+        let record = ProxyRecencyRecord {
+            version: PROXY_RECENCY_VERSION,
+            touches: self
+                .entries
+                .iter()
+                .map(|(key, entry)| (key.to_hex(), entry.last_used_ordinal))
+                .collect(),
+        };
+        let target = self.root.join(PROXY_RECENCY_FILE_NAME);
+        let staging = self
+            .root
+            .join(format!("{PROXY_RECENCY_FILE_NAME}{PROXY_STAGING_SUFFIX}"));
+        let outcome = (|| -> std::io::Result<()> {
+            let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+            let _ = std::fs::remove_file(&staging);
+            {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staging)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&staging, &target)?;
+            sync_parent_directory(&target)
+        })();
+        if let Err(error) = outcome {
+            log::warn!("proxy recency record not persisted (advisory): {error}");
         }
     }
 
@@ -320,6 +468,9 @@ impl ProxyCacheStore {
                 .map_err(|error| ProxyWorkerError::Evict(error.to_string()))?;
             let _ = std::fs::remove_file(self.seal_path(*key));
             evicted.push((*key, entry.artifact_bytes));
+        }
+        if !evicted.is_empty() {
+            self.persist_recency();
         }
         Ok(ProxyEvictionReceipt {
             evicted,
@@ -385,6 +536,7 @@ impl ProxyCacheStore {
             },
         );
         self.next_ordinal = self.next_ordinal.saturating_add(1);
+        self.persist_recency();
         Ok(())
     }
 
@@ -398,9 +550,12 @@ impl ProxyCacheStore {
     /// cache entry is regenerable by construction, so deletion is safe; the
     /// caller reports the refusal.
     pub fn discard_invalid(&mut self, key: ProxyCacheKey) {
-        self.entries.remove(&key);
+        let removed = self.entries.remove(&key).is_some();
         let _ = std::fs::remove_file(self.artifact_path(key));
         let _ = std::fs::remove_file(self.seal_path(key));
+        if removed {
+            self.persist_recency();
+        }
     }
 }
 
@@ -1548,6 +1703,217 @@ mod tests {
         let entries = store.entries_for_preflight();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, published_key);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn write_sealed_artifact(root: &Path, cache_key: ProxyCacheKey, bytes: &[u8]) {
+        std::fs::write(root.join(artifact_name(cache_key)), bytes).unwrap();
+        std::fs::write(
+            root.join(format!(
+                "{}{}",
+                artifact_name(cache_key),
+                PROXY_DIGEST_SUFFIX
+            )),
+            "e".repeat(64),
+        )
+        .unwrap();
+    }
+
+    // The reproduction the S12 prompt demanded, written first: a recency
+    // rewrite interrupted mid-write beside a healthy sealed cache. The
+    // staged half is crash residue the ordinary recovery law removes; the
+    // prior record — still readable throughout, that is what the atomic
+    // replace buys — applies in full and no artifact is lost.
+    #[test]
+    fn a_recency_record_interrupted_mid_write_is_removed_while_the_prior_record_applies() {
+        let root = temp_root("recency-crash");
+        let older = key('a');
+        let newer = key('b');
+        write_sealed_artifact(&root, older, b"older artifact");
+        write_sealed_artifact(&root, newer, b"newer artifact");
+        std::fs::write(
+            root.join(PROXY_RECENCY_FILE_NAME),
+            format!(
+                r#"{{"version":1,"touches":[["{}",5],["{}",9]]}}"#,
+                older.to_hex(),
+                newer.to_hex()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!("{PROXY_RECENCY_FILE_NAME}{PROXY_STAGING_SUFFIX}")),
+            b"{\"version\":1,\"touches\":[[\"torn",
+        )
+        .unwrap();
+
+        let (mut store, recovery) = ProxyCacheStore::open(root.clone()).unwrap();
+        assert_eq!(recovery.staging_removed, 1);
+        assert_eq!(recovery.artifacts, 2);
+        assert_eq!(recovery.recency_applied, 2);
+        assert!(!recovery.recency_discarded);
+        assert!(!root
+            .join(format!("{PROXY_RECENCY_FILE_NAME}{PROXY_STAGING_SUFFIX}"))
+            .exists());
+
+        let ordinals: BTreeMap<ProxyCacheKey, u64> = store
+            .entries_for_preflight()
+            .into_iter()
+            .map(|entry| (entry.key, entry.last_used_ordinal))
+            .collect();
+        assert_eq!(ordinals[&older], 5);
+        assert_eq!(ordinals[&newer], 9);
+
+        // The session counter resumes above the recorded maximum, so a new
+        // touch is newer than everything the prior session recorded.
+        store.touch(older);
+        let ordinals: BTreeMap<ProxyCacheKey, u64> = store
+            .entries_for_preflight()
+            .into_iter()
+            .map(|entry| (entry.key, entry.last_used_ordinal))
+            .collect();
+        assert_eq!(ordinals[&older], 10);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn recency_orders_cross_session_eviction_and_survives_reopen() {
+        let root = temp_root("recency-lru");
+        let stale = key('a');
+        let fresh = key('b');
+        {
+            let (store, _) = ProxyCacheStore::open(root.clone()).unwrap();
+            let store = Mutex::new(store);
+            for (cache_key, payload) in [(stale, b"one".as_slice()), (fresh, b"two".as_slice())] {
+                let staging = lock_store(&store).staging_path(cache_key);
+                std::fs::write(&staging, payload).unwrap();
+                let digest = hash_artifact_bytes(&staging).unwrap();
+                lock_store(&store)
+                    .publish_staged(cache_key, payload.len() as u64, digest)
+                    .unwrap();
+            }
+            // `stale` published first, `fresh` second; touching `stale`
+            // makes `fresh` the least recently used across the session end.
+            lock_store(&store).touch(stale);
+        }
+
+        let (store, recovery) = ProxyCacheStore::open(root.clone()).unwrap();
+        assert_eq!(recovery.recency_applied, 2);
+        assert!(!recovery.recency_discarded);
+        let entries = store.entries_for_preflight();
+        let ordinals: BTreeMap<ProxyCacheKey, u64> = entries
+            .iter()
+            .map(|entry| (entry.key, entry.last_used_ordinal))
+            .collect();
+        assert!(
+            ordinals[&stale] > ordinals[&fresh],
+            "the prior session's touch order must survive the reopen"
+        );
+
+        // The pure preflight now evicts by the *cross-session* order: with
+        // room for two entries, admitting a third evicts `fresh`, the least
+        // recently used — before this record existed, a reopen zeroed every
+        // ordinal and `(ordinal, key)` decided by key alone.
+        let plan = ProxyCachePlan::preflight(
+            key('c'),
+            3,
+            &entries,
+            crate::proxy::ProxyCacheLimits {
+                max_entries: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.evict.as_ref(), &[fresh]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hostile_recency_records_degrade_to_session_local_order_without_refusing_the_cache() {
+        let owned = key('a');
+        let torn = br#"{"version":1,"touches":[["torn"#.to_vec();
+        let wrong_version = br#"{"version":2,"touches":[]}"#.to_vec();
+        let unknown_field = br#"{"version":1,"touches":[],"extra":1}"#.to_vec();
+        let malformed_key = br#"{"version":1,"touches":[["zz",1]]}"#.to_vec();
+        let duplicate_key = format!(
+            r#"{{"version":1,"touches":[["{0}",1],["{0}",2]]}}"#,
+            owned.to_hex()
+        )
+        .into_bytes();
+        let oversized = vec![b' '; (PROXY_RECENCY_MAX_BYTES + 1) as usize];
+        for (label, payload) in [
+            ("torn", torn),
+            ("wrong-version", wrong_version),
+            ("unknown-field", unknown_field),
+            ("malformed-key", malformed_key),
+            ("duplicate-key", duplicate_key),
+            ("oversized", oversized),
+        ] {
+            let root = temp_root(&format!("recency-hostile-{label}"));
+            write_sealed_artifact(&root, owned, b"artifact");
+            std::fs::write(root.join(PROXY_RECENCY_FILE_NAME), payload).unwrap();
+
+            let (store, recovery) = ProxyCacheStore::open(root.clone()).unwrap();
+            assert!(recovery.recency_discarded, "{label}: record must discard");
+            assert_eq!(recovery.recency_applied, 0, "{label}");
+            assert_eq!(
+                recovery.artifacts, 1,
+                "{label}: the cache is refused nothing"
+            );
+            assert!(store.contains(owned), "{label}");
+            assert_eq!(
+                store.entries_for_preflight()[0].last_used_ordinal,
+                0,
+                "{label}: order degrades to session-local"
+            );
+            assert!(
+                !root.join(PROXY_RECENCY_FILE_NAME).exists(),
+                "{label}: an invalid advisory record is discarded, not retried"
+            );
+
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn recency_rows_never_resurrect_artifacts_and_removals_rewrite_the_record() {
+        let root = temp_root("recency-index");
+        let backed = key('a');
+        let ghost = key('f');
+        write_sealed_artifact(&root, backed, b"artifact");
+        std::fs::write(
+            root.join(PROXY_RECENCY_FILE_NAME),
+            format!(
+                r#"{{"version":1,"touches":[["{}",3],["{}",7]]}}"#,
+                backed.to_hex(),
+                ghost.to_hex()
+            ),
+        )
+        .unwrap();
+
+        let (mut store, recovery) = ProxyCacheStore::open(root.clone()).unwrap();
+        // The directory is the index: a row naming a key it does not back
+        // is ignored — applied to nothing, resurrecting nothing, and not
+        // advancing the session counter.
+        assert_eq!(recovery.recency_applied, 1);
+        assert!(!recovery.recency_discarded);
+        assert!(!store.contains(ghost));
+        store.touch(backed);
+        let entries = store.entries_for_preflight();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].last_used_ordinal, 4);
+
+        // Removing an entry rewrites the record, so a discarded artifact's
+        // row cannot linger and re-seed a future session.
+        store.discard_invalid(backed);
+        drop(store);
+        let (store, recovery) = ProxyCacheStore::open(root.clone()).unwrap();
+        assert_eq!(recovery.artifacts, 0);
+        assert_eq!(recovery.recency_applied, 0);
+        assert!(!recovery.recency_discarded);
+        assert!(store.entries_for_preflight().is_empty());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
