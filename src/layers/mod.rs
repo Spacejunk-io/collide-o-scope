@@ -204,6 +204,12 @@ pub enum LayerSource {
 pub(crate) struct LayerSourceActivation {
     source_path: String,
     persisted_source_reference: Option<String>,
+    /// The proxy cache key (hex) backing this bundle's decoder, if any. The
+    /// claim travels with the source resources it describes: a freshly
+    /// staged source is `None`, while a displaced artifact-backed source
+    /// carries its key through the prepared pool, so an A->B->A slot dance
+    /// restores a truthful `Layer::proxy_backing` instead of a cleared one.
+    proxy_backing: Option<String>,
     filename: String,
     source: LayerSource,
     texture: wgpu::Texture,
@@ -260,6 +266,9 @@ impl LayerSourceActivation {
         Ok(Self {
             source_path,
             persisted_source_reference,
+            // A freshly opened source is never proxy-backed; only the
+            // displaced records built by the two commit paths carry a claim.
+            proxy_backing: None,
             filename,
             source,
             texture,
@@ -942,6 +951,7 @@ impl Layer {
         let LayerSourceActivation {
             source_path,
             persisted_source_reference,
+            proxy_backing,
             filename,
             source,
             texture,
@@ -960,6 +970,11 @@ impl Layer {
                 &mut self.persisted_source_reference,
                 persisted_source_reference,
             ),
+            // The backing claim travels with the decoder it describes: the
+            // displaced record keeps this layer's claim, and the incoming
+            // activation's claim is installed below — None for a freshly
+            // opened source, the key for a reactivated displaced artifact.
+            proxy_backing: self.proxy_backing.take(),
             filename: std::mem::replace(&mut self.filename, filename),
             source: std::mem::replace(&mut self.source, source),
             texture: std::mem::replace(&mut self.texture, texture),
@@ -974,9 +989,7 @@ impl Layer {
         };
         self.width = width;
         self.height = height;
-        // A slot activation swaps in a freshly opened source, which is never
-        // proxy-backed; a stale backing claim must not survive the swap.
-        self.proxy_backing = None;
+        self.proxy_backing = proxy_backing;
         self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
         self.effects.resolution = [width as f32, height as f32];
         self.source_frame_initialized = source_frame_initialized;
@@ -1030,8 +1043,11 @@ impl Layer {
         let LayerSourceActivation {
             source_path,
             // Identity is not the activation's to change: the layer keeps its
-            // retained content reference and authored filename verbatim.
+            // retained content reference and authored filename verbatim. The
+            // backing claim likewise comes from the adoption key below, not
+            // from the freshly staged activation.
             persisted_source_reference: _,
+            proxy_backing: _,
             filename: _,
             source,
             texture,
@@ -1047,6 +1063,7 @@ impl Layer {
         let displaced = LayerSourceActivation {
             source_path: std::mem::replace(&mut self.source_path, source_path),
             persisted_source_reference: self.persisted_source_reference.clone(),
+            proxy_backing: self.proxy_backing.take(),
             filename: self.filename.clone(),
             source: std::mem::replace(&mut self.source, source),
             texture: std::mem::replace(&mut self.texture, texture),
