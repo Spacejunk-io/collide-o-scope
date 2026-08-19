@@ -1,6 +1,6 @@
 {
   "schema": "collide-o-scope-m6-gpu-precision-receipt/2",
-  "measured_at": "2026-08-17T17:50:17.9576854-04:00",
+  "measured_at": "2026-08-19T16:06:29.031915-04:00",
   "command": "cargo test --locked gpu_precision_receipt_measures_real_still_and_temporal_workloads -- --ignored --nocapture",
   "host": {
     "os": "windows",
@@ -12,8 +12,8 @@
   },
   "source_identity": {
     "crate_version": "0.1.0",
-    "shader_bundle_sha256": "1c30e098763ff6b1a89c56b89ca0af4fc98d489bebd03a41e5870bd940dab29c",
-    "cargo_lock_and_m6_sources_sha256": "71f44f14adea9f99006a0ea917b6760e1502a07572c10d20d067c62ccd2e2a64",
+    "shader_bundle_sha256": "d3db27d4078d7c27e7820170347abedf2de5e10772a74c692ec7e08cb2a4b9ec",
+    "cargo_lock_and_m6_sources_sha256": "aafeb174a59555683097807ef5f52382aa5416d8a983d46dfd60cfeccc0bf1d1",
     "manifest_scope": "length-prefixed Cargo.toml, Cargo.lock, production Rust encode/resource/uniform paths, receipt helpers, and every measured WGSL source"
   },
   "adapter": {
@@ -42,7 +42,7 @@
       "retained_gradient_events": 11942
     },
     "advanced_working_rgba16f": {
-      "rmse": 0.00004699488022035341,
+      "rmse": 4.699488022035341e-05,
       "max_absolute_error": 0.000382155179977417,
       "clamped_channel_events": 6,
       "reference_gradient_events": 16210,
@@ -63,14 +63,14 @@
       "retained_gradient_events": 260
     },
     "advanced_presented_spatial_8x8_mean": {
-      "rmse": 0.00006369797685187751,
+      "rmse": 6.369797685187751e-05,
       "max_absolute_error": 0.0003909766674041748,
       "clamped_channel_events": 1,
       "reference_gradient_events": 260,
       "retained_gradient_events": 260
     },
-    "compat8_fixture_wall_ns_per_frame": 740375,
-    "advanced_fixture_wall_ns_per_frame": 272625
+    "compat8_fixture_wall_ns_per_frame": 482950,
+    "advanced_fixture_wall_ns_per_frame": 256150
   },
   "temporal": {
     "frames": 12,
@@ -88,7 +88,7 @@
       "retained_gradient_events": 10931
     },
     "advanced_working_rgba16f": {
-      "rmse": 0.00009034139613221204,
+      "rmse": 9.034139613221204e-05,
       "max_absolute_error": 0.003038465976715088,
       "clamped_channel_events": 0,
       "reference_gradient_events": 11949,
@@ -102,21 +102,21 @@
       "retained_gradient_events": 8606
     },
     "compat8_spatial_8x8_mean": {
-      "rmse": 0.00007042327046906307,
+      "rmse": 7.042327046906307e-05,
       "max_absolute_error": 0.0006461739540100098,
       "clamped_channel_events": 0,
       "reference_gradient_events": 311,
       "retained_gradient_events": 311
     },
     "advanced_presented_spatial_8x8_mean": {
-      "rmse": 0.000059626370867447566,
+      "rmse": 5.9626370867447566e-05,
       "max_absolute_error": 0.00038954615592956543,
       "clamped_channel_events": 0,
       "reference_gradient_events": 311,
       "retained_gradient_events": 311
     },
-    "compat8_fixture_wall_ns_per_frame": 2606458,
-    "advanced_fixture_wall_ns_per_frame": 23284483
+    "compat8_fixture_wall_ns_per_frame": 2600916,
+    "advanced_fixture_wall_ns_per_frame": 23330691
   },
   "timing_scope": "fixture-local wall time with a per-frame GPU wait; Compat8 writes its final target in the core pass while Advanced includes its required encode_present pass; smoke evidence only, not a renderer-throughput comparison",
   "acceptance_gates": [

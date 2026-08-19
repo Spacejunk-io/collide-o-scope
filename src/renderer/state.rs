@@ -1702,16 +1702,30 @@ pub(crate) fn build_temporal_pipeline(
 
     let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Temporal Uniform BGL"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             },
-            count: None,
-        }],
+            // B3 feedback rig, a third fixed block beside the frozen 64-byte
+            // legacy uniform. Identity keeps the historical expression.
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
     });
 
     let vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1772,6 +1786,7 @@ pub(crate) struct PreparedTemporalGpuResources {
     legacy_uniform_group: wgpu::BindGroup,
     originals_uniform_buffer: wgpu::Buffer,
     originals_uniform_group: wgpu::BindGroup,
+    rig_uniform_buffer: wgpu::Buffer,
 }
 
 fn build_temporal_originals_pipeline(
@@ -1793,6 +1808,17 @@ fn build_temporal_originals_pipeline(
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // B3 feedback rig block, mirrored from the legacy layout.
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
@@ -1893,13 +1919,25 @@ pub(crate) fn build_prepared_temporal_gpu_resources(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let rig_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Prepared Temporal Rig Uniforms"),
+        size: std::mem::size_of::<crate::temporal::TemporalRigGpuUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let legacy_uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Prepared Temporal Legacy Uniform BG"),
         layout: legacy_uniform_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: legacy_uniform_buffer.as_entire_binding(),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: legacy_uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: rig_uniform_buffer.as_entire_binding(),
+            },
+        ],
     });
     let originals_uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Prepared Temporal Originals Uniform BG"),
@@ -1913,6 +1951,10 @@ pub(crate) fn build_prepared_temporal_gpu_resources(
                 binding: 1,
                 resource: originals_uniform_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: rig_uniform_buffer.as_entire_binding(),
+            },
         ],
     });
     PreparedTemporalGpuResources {
@@ -1922,6 +1964,7 @@ pub(crate) fn build_prepared_temporal_gpu_resources(
         legacy_uniform_group,
         originals_uniform_buffer,
         originals_uniform_group,
+        rig_uniform_buffer,
     }
 }
 
@@ -1937,6 +1980,11 @@ fn encode_prepared_temporal_pass(
         &resources.legacy_uniform_buffer,
         0,
         bytemuck::bytes_of(&plan.uniforms),
+    );
+    queue.write_buffer(
+        &resources.rig_uniform_buffer,
+        0,
+        bytemuck::bytes_of(&plan.rig_uniforms),
     );
     if plan.originals_shader_active {
         queue.write_buffer(
@@ -2263,13 +2311,21 @@ pub(crate) fn encode_temporal_with_dt(
                 },
             ],
         });
+        let rig_uniform_buffer =
+            create_uploaded_uniform(device, queue, "Temporal Rig Uniforms", &plan.rig_uniforms);
         let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Temporal Uniform BG"),
             layout: uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: rig_uniform_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         {

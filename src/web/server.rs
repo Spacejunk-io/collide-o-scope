@@ -1136,6 +1136,20 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         "feedback" => number_in(value, 0.0, 0.95),
         "fb_zoom" => number_in(value, 0.9, 1.1),
         "fb_rotate" => number_in(value, -5.0, 5.0),
+        "fb_offset_x" | "fb_offset_y" => number_in(value, -0.5, 0.5),
+        "fb_hue_rotate" => number_in(value, -180.0, 180.0),
+        "fb_saturation" | "fb_gain_r" | "fb_gain_g" | "fb_gain_b" | "fb_sharpen" => {
+            number_in(value, 0.0, 2.0)
+        }
+        "fb_chroma_displace" => number_in(value, 0.0, 0.05),
+        "fb_blur" | "fb_pivot" | "fb_threshold" | "fb_noise" => number_in(value, 0.0, 1.0),
+        "fb_drive" => number_in(value, 0.25, 4.0),
+        "fb_shape" => matches!(value.as_str(), Some("clamp" | "soft" | "wrap" | "fold")),
+        "fb_edge" => matches!(
+            value.as_str(),
+            Some("transparent" | "mirror" | "wrap" | "hold")
+        ),
+        "fb_reflect_x" | "fb_reflect_y" | "fb_servo" | "fb_servo_defeated" => value.is_boolean(),
         "slitscan" | "slit_axis" => number_in(value, 0.0, 1.0),
         "slit_angle" | "loom_angle" => number_in(value, -180.0, 180.0),
         "key_mode" => integer_in(value, 0, 4),
@@ -3858,6 +3872,23 @@ mod tests {
     fn temporal_originals_ingress_has_a_closed_bounded_vocabulary() {
         for (param, value) in [
             ("feedback", serde_json::json!(0.95)),
+            ("fb_offset_x", serde_json::json!(-0.5)),
+            ("fb_offset_y", serde_json::json!(0.5)),
+            ("fb_reflect_x", serde_json::json!(true)),
+            ("fb_hue_rotate", serde_json::json!(-180.0)),
+            ("fb_saturation", serde_json::json!(2.0)),
+            ("fb_gain_g", serde_json::json!(0.0)),
+            ("fb_chroma_displace", serde_json::json!(0.05)),
+            ("fb_blur", serde_json::json!(1.0)),
+            ("fb_sharpen", serde_json::json!(2.0)),
+            ("fb_shape", serde_json::json!("fold")),
+            ("fb_drive", serde_json::json!(4.0)),
+            ("fb_pivot", serde_json::json!(0.5)),
+            ("fb_threshold", serde_json::json!(1.0)),
+            ("fb_noise", serde_json::json!(1.0)),
+            ("fb_edge", serde_json::json!("mirror")),
+            ("fb_servo", serde_json::json!(true)),
+            ("fb_servo_defeated", serde_json::json!(false)),
             ("fb_zoom", serde_json::json!(1.1)),
             ("fb_rotate", serde_json::json!(-5.0)),
             ("slitscan", serde_json::json!(1.0)),

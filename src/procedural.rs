@@ -531,6 +531,70 @@ fn mutate_temporal_originals(
     }
 }
 
+// B3 feedback-rig values live in field-isolated streams like the originals,
+// so appending them cannot shift any earlier generator draw.
+const PROCEDURAL_TEMPORAL_RIG_DOMAIN: u64 = 0x4233_5249_4700_0001;
+const PROCEDURAL_RIG_OFFSET_X: u64 = 0x4f46_4653_4554_5800;
+const PROCEDURAL_RIG_OFFSET_Y: u64 = 0x4f46_4653_4554_5900;
+const PROCEDURAL_RIG_HUE: u64 = 0x4855_4552_4f54_0001;
+const PROCEDURAL_RIG_SATURATION: u64 = 0x5341_5455_5241_0001;
+const PROCEDURAL_RIG_GAIN_R: u64 = 0x4741_494e_5200_0001;
+const PROCEDURAL_RIG_GAIN_G: u64 = 0x4741_494e_4700_0001;
+const PROCEDURAL_RIG_GAIN_B: u64 = 0x4741_494e_4200_0001;
+const PROCEDURAL_RIG_CHROMA: u64 = 0x4348_524f_4d41_0001;
+const PROCEDURAL_RIG_BLUR: u64 = 0x424c_5552_0000_0001;
+const PROCEDURAL_RIG_SHARPEN: u64 = 0x5348_4152_5045_4e00;
+const PROCEDURAL_RIG_DRIVE: u64 = 0x4452_4956_4500_0001;
+const PROCEDURAL_RIG_PIVOT: u64 = 0x5049_564f_5400_0001;
+const PROCEDURAL_RIG_THRESHOLD: u64 = 0x5448_5245_5348_4f4c;
+const PROCEDURAL_RIG_NOISE: u64 = 0x4e4f_4953_4500_0001;
+
+/// Vary only the rig's bounded continuous values. Reflections, shape, edge,
+/// and the two servo switches are discrete authored state and never change.
+fn mutate_temporal_rig(
+    anchor: &crate::patch::TemporalRigConfig,
+    value: &mut crate::patch::TemporalRigConfig,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    macro_rules! linear {
+        ($field:ident, $min:expr, $max:expr, $scale:expr, $domain:expr) => {{
+            let mut rng = SplitMix64::new(domain_seed(
+                seed,
+                index,
+                PROCEDURAL_TEMPORAL_RIG_DOMAIN ^ $domain,
+            ));
+            value.$field = mutate_linear(
+                anchor.$field,
+                value.$field,
+                $min,
+                $max,
+                temperature * $scale,
+                &mut rng,
+            );
+        }};
+    }
+    linear!(offset_x, -0.5, 0.5, 0.05, PROCEDURAL_RIG_OFFSET_X);
+    linear!(offset_y, -0.5, 0.5, 0.05, PROCEDURAL_RIG_OFFSET_Y);
+    linear!(hue_rotate, -180.0, 180.0, 12.0, PROCEDURAL_RIG_HUE);
+    linear!(saturation, 0.0, 2.0, 0.1, PROCEDURAL_RIG_SATURATION);
+    linear!(gain_r, 0.0, 2.0, 0.08, PROCEDURAL_RIG_GAIN_R);
+    linear!(gain_g, 0.0, 2.0, 0.08, PROCEDURAL_RIG_GAIN_G);
+    linear!(gain_b, 0.0, 2.0, 0.08, PROCEDURAL_RIG_GAIN_B);
+    linear!(chroma_displace, 0.0, 0.05, 0.004, PROCEDURAL_RIG_CHROMA);
+    linear!(blur, 0.0, 1.0, 0.1, PROCEDURAL_RIG_BLUR);
+    linear!(sharpen, 0.0, 2.0, 0.15, PROCEDURAL_RIG_SHARPEN);
+    linear!(drive, 0.25, 4.0, 0.2, PROCEDURAL_RIG_DRIVE);
+    linear!(pivot, 0.0, 1.0, 0.05, PROCEDURAL_RIG_PIVOT);
+    linear!(threshold, 0.0, 1.0, 0.08, PROCEDURAL_RIG_THRESHOLD);
+    linear!(noise, 0.0, 1.0, 0.08, PROCEDURAL_RIG_NOISE);
+    *value = value.sanitized();
+}
+
 // M4 numeric values live in field-isolated streams. Master and each persisted
 // saved-layer position also own separate domains, so Motion cannot perturb
 // any v1-v6 generator sequence or a sibling scope. Every topology/provenance
@@ -2637,6 +2701,17 @@ pub fn generate_with_inventory(
         ) {
             mutate_temporal_originals(anchor_originals, originals, temperature, config.seed, index);
         }
+        if let (Some(anchor_temporal), Some(temporal)) =
+            (normalized.temporal.as_ref(), patch.temporal.as_mut())
+        {
+            mutate_temporal_rig(
+                &anchor_temporal.rig,
+                &mut temporal.rig,
+                temperature,
+                config.seed,
+                index,
+            );
+        }
         if let (Some(anchor_modulation), Some(modulation)) =
             (normalized.modulation.as_ref(), patch.modulation.as_mut())
         {
@@ -3461,6 +3536,41 @@ mod tests {
         );
         patch.visual_schema_version = 1;
         patch
+    }
+
+    #[test]
+    fn temporal_rig_generation_is_domain_isolated_and_preserves_discrete_laws() {
+        use crate::patch::{FeedbackShapeConfig, MotionBoundaryModeConfig, TemporalRigConfig};
+        let authored = TemporalRigConfig {
+            reflect_x: true,
+            shape: FeedbackShapeConfig::Soft,
+            edge: MotionBoundaryModeConfig::Wrap,
+            servo: true,
+            servo_defeated: true,
+            drive: 2.0,
+            ..TemporalRigConfig::default()
+        };
+        let mut left = authored;
+        let mut right = authored;
+        mutate_temporal_rig(&authored, &mut left, 2.0, 77, 3);
+        mutate_temporal_rig(&authored, &mut right, 2.0, 77, 3);
+        assert_eq!(left, right, "rig mutation replays deterministically");
+        assert_ne!(left.drive, authored.drive, "temperature moves the values");
+        // Discrete laws never change.
+        assert!(left.reflect_x);
+        assert_eq!(left.shape, FeedbackShapeConfig::Soft);
+        assert_eq!(left.edge, MotionBoundaryModeConfig::Wrap);
+        assert!(left.servo && left.servo_defeated);
+        // Every mutated value stays inside its authored bound.
+        assert!((-0.5..=0.5).contains(&left.offset_x));
+        assert!((-180.0..=180.0).contains(&left.hue_rotate));
+        assert!((0.0..=2.0).contains(&left.saturation));
+        assert!((0.0..=0.05).contains(&left.chroma_displace));
+        assert!((0.25..=4.0).contains(&left.drive));
+        // Zero temperature is byte-exact.
+        let mut untouched = authored;
+        mutate_temporal_rig(&authored, &mut untouched, 0.0, 77, 3);
+        assert_eq!(untouched, authored);
     }
 
     #[test]

@@ -17559,6 +17559,84 @@ mod effects_audit {
         );
     }
 
+    /// The B3 feedback-rig labeled export case: a hot feedback loop with the
+    /// full rig authored — offset and reflection reshaping the trail's
+    /// geometry, hue/gain/saturation working the colour in-loop, the fold
+    /// waveshaper and threshold bounding it, deterministic loop noise, and the
+    /// engaged servo holding the above-unity gains. Offline consumes the same
+    /// temporal shaders and the same frame-plan cadence, so the loop replays
+    /// exactly.
+    ///
+    /// The case renders an `_unrigged` twin — identical patch, identity rig —
+    /// and asserts the decoded frames differ: the rig demonstrably reaches the
+    /// pixels through the real export path, and an authored identity remains
+    /// the exact prior program.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_feedback_rig_pipeline() {
+        use crate::effects::params::{FeedbackRigParams, FeedbackShape};
+        use crate::patch::TemporalConfig;
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let temporal = |rig: FeedbackRigParams| {
+            let mut params = crate::effects::params::TemporalParams {
+                feedback: 0.9,
+                fb_zoom: 1.02,
+                fb_rotate: 2.0,
+                ..Default::default()
+            };
+            params.rig = rig;
+            TemporalConfig::from_params(&params)
+        };
+        let mut rigged = base_patch();
+        rigged.temporal = Some(temporal(FeedbackRigParams {
+            offset_x: 0.01,
+            reflect_x: true,
+            hue_rotate: 12.0,
+            saturation: 1.2,
+            gain_r: 1.3,
+            gain_g: 1.1,
+            gain_b: 1.4,
+            chroma_displace: 0.004,
+            blur: 0.2,
+            sharpen: 0.6,
+            shape: FeedbackShape::Fold,
+            drive: 1.6,
+            pivot: 0.45,
+            threshold: 0.08,
+            noise: 0.15,
+            edge: crate::motion::MotionBoundaryMode::Mirror,
+            servo: true,
+            ..FeedbackRigParams::default()
+        }));
+        let rigged_temporal = rigged.temporal.clone();
+        render("feedback_rig", rigged);
+        let mut unrigged = base_patch();
+        unrigged.temporal = Some(temporal(FeedbackRigParams::default()));
+        render("feedback_rig_unrigged", unrigged);
+        assert_ne!(
+            decoded_framemd5("renders/audit_feedback_rig.mp4"),
+            decoded_framemd5("renders/audit_feedback_rig_unrigged.mp4"),
+            "an authored rig must change the decoded frames"
+        );
+        // Determinism: the same rigged patch renders byte-identically twice.
+        render("feedback_rig_repeat", {
+            let mut repeat = base_patch();
+            repeat.temporal = rigged_temporal;
+            repeat
+        });
+        assert_eq!(
+            decoded_framemd5("renders/audit_feedback_rig.mp4"),
+            decoded_framemd5("renders/audit_feedback_rig_repeat.mp4"),
+            "the rigged loop must replay deterministically"
+        );
+    }
+
     /// Three stacked clips where the upper layer's Residual Counterpoint node
     /// recombines the middle layer's large-scale structure with its own detail
     /// measured against the bottom layer. This is the labeled export case for
