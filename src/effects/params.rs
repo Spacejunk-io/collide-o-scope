@@ -573,7 +573,8 @@ mod temporal_tests {
 }
 
 /// GPU-side effect parameters, uploaded as a uniform buffer each frame.
-/// Must be 16-byte aligned (160 bytes total = 10 x vec4).
+/// Must be 16-byte aligned (288 bytes total = 18 x vec4: the ten legacy
+/// slots plus the eight B13 small-effects slots).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EffectUniforms {
@@ -626,6 +627,50 @@ pub struct EffectUniforms {
     pub shift_block_size: f32, // 2.0..256.0 screen pixels per horizontal band
     pub shift_density: f32, // 0.0..1.0 fraction of bands displaced per epoch
     pub shift_speed: f32,  // 0.0..20.0 deterministic epochs per second
+    // B13 small-effects tranche. Every amount's zero default takes an exact
+    // no-op shader branch, preserving legacy pixels byte for byte. The laws
+    // are derived from BENDR (MIT, © 2026 Steve Blythe); every one is a
+    // rewrite in linear light.
+    // vec4 #11 — isolines between brightness bands
+    pub contour: f32,       // 0.0 = off, 0.0..1.0 isoline strength
+    pub contour_bands: f32, // 2.0..40.0 luma bands across the tonal range
+    pub contour_width: f32, // 0.2..6.0 isoline width in pixels
+    pub contour_hue: f32,   // 0.0..1.0 palette phase; near zero = white lines
+    // vec4 #12 — keep-fill plus luma flattening
+    pub contour_fill: f32,   // 0.0..1.0 surviving fill between isolines
+    pub flatten: f32,        // 0.0 = off, 0.0..1.0 quantize luma to solid fields
+    pub flatten_levels: f32, // 2.0..16.0 luma steps
+    pub contour_dither: f32, // 0.0..1.0 ordered Bayer dither on the flatten
+    // vec4 #13 — solarize plus the negative family
+    pub solarize: f32,      // 0.0 = off, 0.0..1.0 fold-back exposure
+    pub negative: f32,      // 0.0 = off, 0.0..1.0 inversion amount
+    pub negative_mode: f32, // 0=rgb, 1=luma-only, 2=hue-flip (permanent codes)
+    pub colourpass: f32,    // 0.0 = off, 0.0..1.0 hue-window isolation
+    // vec4 #14 — colourpass window plus find-edge
+    pub colourpass_hue: f32,   // -180..180 degrees, surviving hue centre
+    pub colourpass_width: f32, // 0.0..1.0 window width
+    pub edge_amount: f32,      // 0.0 = off, 0.0..1.0 Sobel outline
+    pub edge_hue: f32,         // -180..180 degrees, outline hue
+    // vec4 #15 — emboss plus halftone
+    pub emboss: f32,         // 0.0 = off, 0.0..1.0 directional relief
+    pub emboss_angle: f32,   // -180..180 degrees light direction
+    pub halftone: f32,       // 0.0 = off, 0.0..1.0 dot-screen dropout
+    pub halftone_pitch: f32, // 0.0..1.0 dot pitch (0 coarse, 1 fine)
+    // vec4 #16 — halftone screen angle, moiré, row smear
+    pub halftone_angle: f32, // -180..180 degrees screen angle
+    pub moire: f32,          // 0.0 = off, 0.0..1.0 interference strength
+    pub moire_freq: f32,     // 0.0..1.0 virtual grid frequency
+    pub row_smear: f32,      // 0.0 = off, 0.0..1.0 wrong-predictor row shear
+    // vec4 #17 — ordered-dither crush plus the dumb tile
+    pub bitcrush: f32,        // 0.0 = off, 0.0..1.0 mono quantize amount
+    pub bitcrush_levels: f32, // 2.0..16.0 luma levels (2 = 1-bit)
+    pub bitcrush_dither: f32, // 0.0..1.0 ordered Bayer dither amount
+    pub multi_grid_x: f32,    // 1.0..8.0 tiles across; 1 = exact off
+    // vec4 #18 — the tile's Y count plus the master-only optics
+    pub multi_grid_y: f32,      // 1.0..8.0 tiles down; 1 = exact off
+    pub barrel: f32,            // -1.0..1.0 radial distortion (master only)
+    pub chroma_aberration: f32, // 0.0..1.0 radial fringe (master only)
+    pub anamorphic_streak: f32, // 0.0..1.0 horizontal flare (master only)
 }
 
 impl Default for EffectUniforms {
@@ -668,6 +713,38 @@ impl Default for EffectUniforms {
             shift_block_size: 8.0,
             shift_density: 0.5,
             shift_speed: 3.0,
+            contour: 0.0,
+            contour_bands: 10.0,
+            contour_width: 1.2,
+            contour_hue: 0.0,
+            contour_fill: 0.25,
+            flatten: 0.0,
+            flatten_levels: 5.0,
+            contour_dither: 0.0,
+            solarize: 0.0,
+            negative: 0.0,
+            negative_mode: 0.0,
+            colourpass: 0.0,
+            colourpass_hue: 0.0,
+            colourpass_width: 0.25,
+            edge_amount: 0.0,
+            edge_hue: 0.0,
+            emboss: 0.0,
+            emboss_angle: 45.0,
+            halftone: 0.0,
+            halftone_pitch: 0.4,
+            halftone_angle: 0.0,
+            moire: 0.0,
+            moire_freq: 0.4,
+            row_smear: 0.0,
+            bitcrush: 0.0,
+            bitcrush_levels: 2.0,
+            bitcrush_dither: 1.0,
+            multi_grid_x: 1.0,
+            multi_grid_y: 1.0,
+            barrel: 0.0,
+            chroma_aberration: 0.0,
+            anamorphic_streak: 0.0,
         }
     }
 }
@@ -713,6 +790,16 @@ impl EffectUniforms {
         self.resolution = res;
     }
 
+    /// The three B13 optics are master-scope only. Every seam that authors
+    /// layer effect state calls this after applying, so a hostile patch or a
+    /// legacy wire client cannot install an optic on a layer copy.
+    pub fn clear_master_only_effects(&mut self) {
+        let defaults = Self::default();
+        self.barrel = defaults.barrel;
+        self.chroma_aberration = defaults.chroma_aberration;
+        self.anamorphic_streak = defaults.anamorphic_streak;
+    }
+
     /// Reset every alpha-key control without disturbing color/spatial effects.
     #[allow(dead_code)]
     pub fn reset_key(&mut self) {
@@ -733,8 +820,8 @@ mod uniform_tests {
     use super::*;
 
     #[test]
-    fn effect_uniform_layout_is_ten_vec4s() {
-        assert_eq!(std::mem::size_of::<EffectUniforms>(), 160);
+    fn effect_uniform_layout_is_eighteen_vec4s() {
+        assert_eq!(std::mem::size_of::<EffectUniforms>(), 288);
         assert!(std::mem::size_of::<EffectUniforms>().is_multiple_of(16));
         assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_amount), 96);
         assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_scale), 100);
@@ -759,6 +846,16 @@ mod uniform_tests {
         assert_eq!(std::mem::offset_of!(EffectUniforms, shift_block_size), 148);
         assert_eq!(std::mem::offset_of!(EffectUniforms, shift_density), 152);
         assert_eq!(std::mem::offset_of!(EffectUniforms, shift_speed), 156);
+        // B13 small-effects lanes: eight appended vec4s at offsets 160..288.
+        assert_eq!(std::mem::offset_of!(EffectUniforms, contour), 160);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, contour_fill), 176);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, solarize), 192);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, colourpass_hue), 208);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, emboss), 224);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, halftone_angle), 240);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, bitcrush), 256);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, multi_grid_y), 272);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, anamorphic_streak), 284);
         assert_eq!(EffectUniforms::default().random_seed, 0);
 
         let shader = include_str!("../shaders/effects.wgsl");
@@ -787,6 +884,95 @@ mod uniform_tests {
         assert!(shader.contains("pattern_seed_offset()"));
         assert!(shader.contains("if uniforms.random_seed == 0u"));
         assert!(shader.contains("if uniforms.random_seed != 0u"));
+
+        // B13: the eight appended vec4s sit between the ten legacy slots and
+        // the four spatial slots, in the exact CPU field order.
+        let b13_first = shader.find("contour: f32").unwrap();
+        let b13_last = shader.find("anamorphic_streak: f32").unwrap();
+        let spatial_first = shader.find("spatial_inverse_row_0: vec4f").unwrap();
+        assert!(shift_speed < b13_first && b13_first < b13_last && b13_last < spatial_first);
+    }
+
+    /// The B13 golden-branch law: every small effect is gated on its own
+    /// authored amount, so a default patch never enters a new shader branch
+    /// and the prior image is byte-exact. The three optics are additionally
+    /// pinned as master-only through the clearing helper.
+    #[test]
+    fn small_effects_are_amount_gated_and_optics_are_master_only() {
+        let shader = include_str!("../shaders/effects.wgsl");
+        for gate in [
+            "if uniforms.contour > 0.0001",
+            "if uniforms.flatten > 0.0001",
+            "if uniforms.solarize > 0.0001",
+            "if uniforms.negative > 0.0001",
+            "if uniforms.colourpass > 0.0001",
+            "if uniforms.edge_amount > 0.0001",
+            "if uniforms.emboss > 0.0001",
+            "if uniforms.halftone > 0.0001",
+            "if uniforms.moire > 0.0001",
+            "if uniforms.row_smear > 0.0001",
+            "if uniforms.bitcrush > 0.0001",
+            "if uniforms.multi_grid_x >= 1.5 || uniforms.multi_grid_y >= 1.5",
+            "if abs(uniforms.barrel) > 0.0001",
+            "if uniforms.chroma_aberration > 0.0001",
+            "if uniforms.anamorphic_streak > 0.0001",
+        ] {
+            assert!(shader.contains(gate), "missing amount gate: {gate}");
+        }
+        // Secondary controls (dither) stay inside their owner's gate:
+        // contour_dither is consulted only under flatten or bitcrush.
+        assert!(!shader.contains("if uniforms.contour_dither > 0.0001\n    {"));
+
+        // Defaults are exact off, and reset restores every B13 value.
+        let defaults = EffectUniforms::default();
+        for (name, value, expected) in [
+            ("contour", defaults.contour, 0.0),
+            ("flatten", defaults.flatten, 0.0),
+            ("solarize", defaults.solarize, 0.0),
+            ("negative", defaults.negative, 0.0),
+            ("negative_mode", defaults.negative_mode, 0.0),
+            ("colourpass", defaults.colourpass, 0.0),
+            ("edge_amount", defaults.edge_amount, 0.0),
+            ("emboss", defaults.emboss, 0.0),
+            ("halftone", defaults.halftone, 0.0),
+            ("moire", defaults.moire, 0.0),
+            ("row_smear", defaults.row_smear, 0.0),
+            ("bitcrush", defaults.bitcrush, 0.0),
+            ("multi_grid_x", defaults.multi_grid_x, 1.0),
+            ("multi_grid_y", defaults.multi_grid_y, 1.0),
+            ("barrel", defaults.barrel, 0.0),
+            ("chroma_aberration", defaults.chroma_aberration, 0.0),
+            ("anamorphic_streak", defaults.anamorphic_streak, 0.0),
+        ] {
+            assert_eq!(value, expected, "{name} default must be exact off");
+        }
+        let mut changed = defaults;
+        changed.contour = 1.0;
+        changed.bitcrush = 0.7;
+        changed.multi_grid_x = 4.0;
+        changed.barrel = -0.5;
+        changed.reset();
+        assert_eq!(changed.contour, 0.0);
+        assert_eq!(changed.bitcrush, 0.0);
+        assert_eq!(changed.multi_grid_x, 1.0);
+        assert_eq!(changed.barrel, 0.0);
+
+        // The master-only clear removes exactly the three optics and leaves
+        // every shared control untouched.
+        let mut layered = EffectUniforms {
+            contour: 0.8,
+            halftone: 0.6,
+            barrel: 0.9,
+            chroma_aberration: 0.5,
+            anamorphic_streak: 0.4,
+            ..EffectUniforms::default()
+        };
+        layered.clear_master_only_effects();
+        assert_eq!(layered.contour, 0.8);
+        assert_eq!(layered.halftone, 0.6);
+        assert_eq!(layered.barrel, 0.0);
+        assert_eq!(layered.chroma_aberration, 0.0);
+        assert_eq!(layered.anamorphic_streak, 0.0);
     }
 
     #[test]

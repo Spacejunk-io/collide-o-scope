@@ -90,6 +90,74 @@ fn default_temporal_key_threshold() -> f32 {
 fn default_temporal_key_softness() -> f32 {
     0.03
 }
+// B13 small-effects defaults. Every new DTO field is skip-serialized at its
+// default so pre-B13 patches keep their bytes and canonical hashes.
+fn default_contour_bands() -> f32 {
+    10.0
+}
+fn default_contour_width() -> f32 {
+    1.2
+}
+fn default_contour_fill() -> f32 {
+    0.25
+}
+fn default_flatten_levels() -> f32 {
+    5.0
+}
+fn default_colourpass_width() -> f32 {
+    0.25
+}
+fn default_emboss_angle() -> f32 {
+    45.0
+}
+fn default_halftone_pitch() -> f32 {
+    0.4
+}
+fn default_moire_freq() -> f32 {
+    0.4
+}
+fn default_bitcrush_levels() -> f32 {
+    2.0
+}
+fn default_bitcrush_dither() -> f32 {
+    1.0
+}
+fn is_zero_f32(value: &f32) -> bool {
+    *value == 0.0
+}
+fn is_one_f32(value: &f32) -> bool {
+    *value == 1.0
+}
+fn is_default_contour_bands(value: &f32) -> bool {
+    *value == default_contour_bands()
+}
+fn is_default_contour_width(value: &f32) -> bool {
+    *value == default_contour_width()
+}
+fn is_default_contour_fill(value: &f32) -> bool {
+    *value == default_contour_fill()
+}
+fn is_default_flatten_levels(value: &f32) -> bool {
+    *value == default_flatten_levels()
+}
+fn is_default_colourpass_width(value: &f32) -> bool {
+    *value == default_colourpass_width()
+}
+fn is_default_emboss_angle(value: &f32) -> bool {
+    *value == default_emboss_angle()
+}
+fn is_default_halftone_pitch(value: &f32) -> bool {
+    *value == default_halftone_pitch()
+}
+fn is_default_moire_freq(value: &f32) -> bool {
+    *value == default_moire_freq()
+}
+fn is_default_bitcrush_levels(value: &f32) -> bool {
+    *value == default_bitcrush_levels()
+}
+fn is_default_bitcrush_dither(value: &f32) -> bool {
+    *value == default_bitcrush_dither()
+}
 
 fn is_legacy_spatial_identity(value: &SpatialTransform) -> bool {
     (*value).is_legacy_identity()
@@ -287,6 +355,60 @@ pub fn param_meta(name: &str) -> Option<ParamMeta> {
             min: 0.0,
             max: 0.5,
             desc: "key edge feather",
+        }),
+        // B13 small effects.
+        "contour" | "flatten" | "contour_dither" | "solarize" | "negative" | "colourpass"
+        | "edge_amount" | "emboss" | "halftone" | "moire" | "row_smear" | "bitcrush"
+        | "bitcrush_dither" | "contour_hue" | "contour_fill" | "colourpass_width"
+        | "halftone_pitch" | "moire_freq" | "chroma_aberration" | "anamorphic_streak" => {
+            Some(ParamMeta {
+                step: 0.05,
+                min: 0.0,
+                max: 1.0,
+                desc: "normalized small-effect control",
+            })
+        }
+        "contour_bands" => Some(ParamMeta {
+            step: 1.0,
+            min: 2.0,
+            max: 40.0,
+            desc: "luma bands",
+        }),
+        "contour_width" => Some(ParamMeta {
+            step: 0.1,
+            min: 0.2,
+            max: 6.0,
+            desc: "isoline width px",
+        }),
+        "flatten_levels" | "bitcrush_levels" => Some(ParamMeta {
+            step: 1.0,
+            min: 2.0,
+            max: 16.0,
+            desc: "quantize levels",
+        }),
+        "negative_mode" => Some(ParamMeta {
+            step: 1.0,
+            min: 0.0,
+            max: 2.0,
+            desc: "0=rgb 1=luma 2=hue-flip",
+        }),
+        "colourpass_hue" | "edge_hue" | "emboss_angle" | "halftone_angle" => Some(ParamMeta {
+            step: 5.0,
+            min: -180.0,
+            max: 180.0,
+            desc: "degrees",
+        }),
+        "multi_grid_x" | "multi_grid_y" => Some(ParamMeta {
+            step: 1.0,
+            min: 1.0,
+            max: 8.0,
+            desc: "tile count (1=off)",
+        }),
+        "barrel" => Some(ParamMeta {
+            step: 0.05,
+            min: -1.0,
+            max: 1.0,
+            desc: "radial lens distortion",
         }),
         "opacity" => Some(ParamMeta {
             step: 0.05,
@@ -3063,6 +3185,104 @@ pub struct EffectsConfig {
     pub cellular_gap_threshold: f32,
     #[serde(default = "default_cellular_gap_softness")]
     pub cellular_gap_softness: f32,
+    // B13 small effects. Skip-serialized at their defaults so pre-B13
+    // patches keep their bytes and canonical hashes.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub contour: f32,
+    #[serde(
+        default = "default_contour_bands",
+        skip_serializing_if = "is_default_contour_bands"
+    )]
+    pub contour_bands: f32,
+    #[serde(
+        default = "default_contour_width",
+        skip_serializing_if = "is_default_contour_width"
+    )]
+    pub contour_width: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub contour_hue: f32,
+    #[serde(
+        default = "default_contour_fill",
+        skip_serializing_if = "is_default_contour_fill"
+    )]
+    pub contour_fill: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub flatten: f32,
+    #[serde(
+        default = "default_flatten_levels",
+        skip_serializing_if = "is_default_flatten_levels"
+    )]
+    pub flatten_levels: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub contour_dither: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub solarize: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub negative: f32,
+    /// Permanent codes: 0 = rgb, 1 = luma-only, 2 = hue-flip.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub negative_mode: u32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub colourpass: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub colourpass_hue: f32,
+    #[serde(
+        default = "default_colourpass_width",
+        skip_serializing_if = "is_default_colourpass_width"
+    )]
+    pub colourpass_width: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub edge_amount: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub edge_hue: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub emboss: f32,
+    #[serde(
+        default = "default_emboss_angle",
+        skip_serializing_if = "is_default_emboss_angle"
+    )]
+    pub emboss_angle: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub halftone: f32,
+    #[serde(
+        default = "default_halftone_pitch",
+        skip_serializing_if = "is_default_halftone_pitch"
+    )]
+    pub halftone_pitch: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub halftone_angle: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub moire: f32,
+    #[serde(
+        default = "default_moire_freq",
+        skip_serializing_if = "is_default_moire_freq"
+    )]
+    pub moire_freq: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub row_smear: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub bitcrush: f32,
+    #[serde(
+        default = "default_bitcrush_levels",
+        skip_serializing_if = "is_default_bitcrush_levels"
+    )]
+    pub bitcrush_levels: f32,
+    #[serde(
+        default = "default_bitcrush_dither",
+        skip_serializing_if = "is_default_bitcrush_dither"
+    )]
+    pub bitcrush_dither: f32,
+    #[serde(default = "one", skip_serializing_if = "is_one_f32")]
+    pub multi_grid_x: f32,
+    #[serde(default = "one", skip_serializing_if = "is_one_f32")]
+    pub multi_grid_y: f32,
+    /// Master-only optics; a layer's copies stay at their defaults.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub barrel: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub chroma_aberration: f32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub anamorphic_streak: f32,
 }
 
 fn default_key_threshold() -> f32 {
@@ -3110,6 +3330,38 @@ impl Default for EffectsConfig {
             cellular_gap_amount: 0.0,
             cellular_gap_threshold: 0.65,
             cellular_gap_softness: 0.08,
+            contour: 0.0,
+            contour_bands: default_contour_bands(),
+            contour_width: default_contour_width(),
+            contour_hue: 0.0,
+            contour_fill: default_contour_fill(),
+            flatten: 0.0,
+            flatten_levels: default_flatten_levels(),
+            contour_dither: 0.0,
+            solarize: 0.0,
+            negative: 0.0,
+            negative_mode: 0,
+            colourpass: 0.0,
+            colourpass_hue: 0.0,
+            colourpass_width: default_colourpass_width(),
+            edge_amount: 0.0,
+            edge_hue: 0.0,
+            emboss: 0.0,
+            emboss_angle: default_emboss_angle(),
+            halftone: 0.0,
+            halftone_pitch: default_halftone_pitch(),
+            halftone_angle: 0.0,
+            moire: 0.0,
+            moire_freq: default_moire_freq(),
+            row_smear: 0.0,
+            bitcrush: 0.0,
+            bitcrush_levels: default_bitcrush_levels(),
+            bitcrush_dither: default_bitcrush_dither(),
+            multi_grid_x: 1.0,
+            multi_grid_y: 1.0,
+            barrel: 0.0,
+            chroma_aberration: 0.0,
+            anamorphic_streak: 0.0,
         }
     }
 }
@@ -3154,6 +3406,38 @@ impl EffectsConfig {
             cellular_gap_amount: u.cellular_gap_amount,
             cellular_gap_threshold: u.cellular_gap_threshold,
             cellular_gap_softness: u.cellular_gap_softness,
+            contour: u.contour,
+            contour_bands: u.contour_bands,
+            contour_width: u.contour_width,
+            contour_hue: u.contour_hue,
+            contour_fill: u.contour_fill,
+            flatten: u.flatten,
+            flatten_levels: u.flatten_levels,
+            contour_dither: u.contour_dither,
+            solarize: u.solarize,
+            negative: u.negative,
+            negative_mode: u.negative_mode as u32,
+            colourpass: u.colourpass,
+            colourpass_hue: u.colourpass_hue,
+            colourpass_width: u.colourpass_width,
+            edge_amount: u.edge_amount,
+            edge_hue: u.edge_hue,
+            emboss: u.emboss,
+            emboss_angle: u.emboss_angle,
+            halftone: u.halftone,
+            halftone_pitch: u.halftone_pitch,
+            halftone_angle: u.halftone_angle,
+            moire: u.moire,
+            moire_freq: u.moire_freq,
+            row_smear: u.row_smear,
+            bitcrush: u.bitcrush,
+            bitcrush_levels: u.bitcrush_levels,
+            bitcrush_dither: u.bitcrush_dither,
+            multi_grid_x: u.multi_grid_x,
+            multi_grid_y: u.multi_grid_y,
+            barrel: u.barrel,
+            chroma_aberration: u.chroma_aberration,
+            anamorphic_streak: u.anamorphic_streak,
         }
     }
 
@@ -3197,6 +3481,38 @@ impl EffectsConfig {
         u.cellular_gap_amount = finite_or(self.cellular_gap_amount, 0.0).clamp(0.0, 1.0);
         u.cellular_gap_threshold = finite_or(self.cellular_gap_threshold, 0.65).clamp(0.0, 1.0);
         u.cellular_gap_softness = finite_or(self.cellular_gap_softness, 0.08).clamp(0.0, 0.5);
+        u.contour = finite_or(self.contour, 0.0).clamp(0.0, 1.0);
+        u.contour_bands = finite_or(self.contour_bands, 10.0).clamp(2.0, 40.0);
+        u.contour_width = finite_or(self.contour_width, 1.2).clamp(0.2, 6.0);
+        u.contour_hue = finite_or(self.contour_hue, 0.0).clamp(0.0, 1.0);
+        u.contour_fill = finite_or(self.contour_fill, 0.25).clamp(0.0, 1.0);
+        u.flatten = finite_or(self.flatten, 0.0).clamp(0.0, 1.0);
+        u.flatten_levels = finite_or(self.flatten_levels, 5.0).clamp(2.0, 16.0);
+        u.contour_dither = finite_or(self.contour_dither, 0.0).clamp(0.0, 1.0);
+        u.solarize = finite_or(self.solarize, 0.0).clamp(0.0, 1.0);
+        u.negative = finite_or(self.negative, 0.0).clamp(0.0, 1.0);
+        u.negative_mode = self.negative_mode.min(2) as f32;
+        u.colourpass = finite_or(self.colourpass, 0.0).clamp(0.0, 1.0);
+        u.colourpass_hue = finite_or(self.colourpass_hue, 0.0).clamp(-180.0, 180.0);
+        u.colourpass_width = finite_or(self.colourpass_width, 0.25).clamp(0.0, 1.0);
+        u.edge_amount = finite_or(self.edge_amount, 0.0).clamp(0.0, 1.0);
+        u.edge_hue = finite_or(self.edge_hue, 0.0).clamp(-180.0, 180.0);
+        u.emboss = finite_or(self.emboss, 0.0).clamp(0.0, 1.0);
+        u.emboss_angle = finite_or(self.emboss_angle, 45.0).clamp(-180.0, 180.0);
+        u.halftone = finite_or(self.halftone, 0.0).clamp(0.0, 1.0);
+        u.halftone_pitch = finite_or(self.halftone_pitch, 0.4).clamp(0.0, 1.0);
+        u.halftone_angle = finite_or(self.halftone_angle, 0.0).clamp(-180.0, 180.0);
+        u.moire = finite_or(self.moire, 0.0).clamp(0.0, 1.0);
+        u.moire_freq = finite_or(self.moire_freq, 0.4).clamp(0.0, 1.0);
+        u.row_smear = finite_or(self.row_smear, 0.0).clamp(0.0, 1.0);
+        u.bitcrush = finite_or(self.bitcrush, 0.0).clamp(0.0, 1.0);
+        u.bitcrush_levels = finite_or(self.bitcrush_levels, 2.0).clamp(2.0, 16.0);
+        u.bitcrush_dither = finite_or(self.bitcrush_dither, 1.0).clamp(0.0, 1.0);
+        u.multi_grid_x = finite_or(self.multi_grid_x, 1.0).clamp(1.0, 8.0);
+        u.multi_grid_y = finite_or(self.multi_grid_y, 1.0).clamp(1.0, 8.0);
+        u.barrel = finite_or(self.barrel, 0.0).clamp(-1.0, 1.0);
+        u.chroma_aberration = finite_or(self.chroma_aberration, 0.0).clamp(0.0, 1.0);
+        u.anamorphic_streak = finite_or(self.anamorphic_streak, 0.0).clamp(0.0, 1.0);
     }
 
     /// Get fields organized into groups for display.
@@ -3275,6 +3591,54 @@ impl EffectsConfig {
                     ("key_color_g", format!("{:.3}", self.key_color[1])),
                     ("key_color_b", format!("{:.3}", self.key_color[2])),
                     ("key_tolerance", format!("{:.2}", self.key_tolerance)),
+                ],
+            ),
+            (
+                "small fx",
+                vec![
+                    ("contour", format!("{:.2}", self.contour)),
+                    ("contour_bands", format!("{:.1}", self.contour_bands)),
+                    ("contour_width", format!("{:.2}", self.contour_width)),
+                    ("contour_hue", format!("{:.2}", self.contour_hue)),
+                    ("contour_fill", format!("{:.2}", self.contour_fill)),
+                    ("flatten", format!("{:.2}", self.flatten)),
+                    ("flatten_levels", format!("{:.1}", self.flatten_levels)),
+                    ("contour_dither", format!("{:.2}", self.contour_dither)),
+                    ("solarize", format!("{:.2}", self.solarize)),
+                    ("negative", format!("{:.2}", self.negative)),
+                    ("negative_mode", format!("{}", self.negative_mode)),
+                    ("colourpass", format!("{:.2}", self.colourpass)),
+                    ("colourpass_hue", format!("{:.1}", self.colourpass_hue)),
+                    ("colourpass_width", format!("{:.2}", self.colourpass_width)),
+                    ("edge_amount", format!("{:.2}", self.edge_amount)),
+                    ("edge_hue", format!("{:.1}", self.edge_hue)),
+                    ("emboss", format!("{:.2}", self.emboss)),
+                    ("emboss_angle", format!("{:.1}", self.emboss_angle)),
+                    ("halftone", format!("{:.2}", self.halftone)),
+                    ("halftone_pitch", format!("{:.2}", self.halftone_pitch)),
+                    ("halftone_angle", format!("{:.1}", self.halftone_angle)),
+                    ("moire", format!("{:.2}", self.moire)),
+                    ("moire_freq", format!("{:.2}", self.moire_freq)),
+                    ("row_smear", format!("{:.2}", self.row_smear)),
+                    ("bitcrush", format!("{:.2}", self.bitcrush)),
+                    ("bitcrush_levels", format!("{:.1}", self.bitcrush_levels)),
+                    ("bitcrush_dither", format!("{:.2}", self.bitcrush_dither)),
+                    ("multi_grid_x", format!("{:.0}", self.multi_grid_x)),
+                    ("multi_grid_y", format!("{:.0}", self.multi_grid_y)),
+                ],
+            ),
+            (
+                "optics",
+                vec![
+                    ("barrel", format!("{:.2}", self.barrel)),
+                    (
+                        "chroma_aberration",
+                        format!("{:.2}", self.chroma_aberration),
+                    ),
+                    (
+                        "anamorphic_streak",
+                        format!("{:.2}", self.anamorphic_streak),
+                    ),
                 ],
             ),
         ]
@@ -3492,6 +3856,58 @@ impl EffectsConfig {
                     return true;
                 }
             }
+            "negative_mode" => {
+                if let Ok(v) = value.parse() {
+                    self.negative_mode = v;
+                    return true;
+                }
+            }
+            // B13 small effects: every remaining control is a plain float.
+            "contour" | "contour_bands" | "contour_width" | "contour_hue" | "contour_fill"
+            | "flatten" | "flatten_levels" | "contour_dither" | "solarize" | "negative"
+            | "colourpass" | "colourpass_hue" | "colourpass_width" | "edge_amount" | "edge_hue"
+            | "emboss" | "emboss_angle" | "halftone" | "halftone_pitch" | "halftone_angle"
+            | "moire" | "moire_freq" | "row_smear" | "bitcrush" | "bitcrush_levels"
+            | "bitcrush_dither" | "multi_grid_x" | "multi_grid_y" | "barrel"
+            | "chroma_aberration" | "anamorphic_streak" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    let slot = match key {
+                        "contour" => &mut self.contour,
+                        "contour_bands" => &mut self.contour_bands,
+                        "contour_width" => &mut self.contour_width,
+                        "contour_hue" => &mut self.contour_hue,
+                        "contour_fill" => &mut self.contour_fill,
+                        "flatten" => &mut self.flatten,
+                        "flatten_levels" => &mut self.flatten_levels,
+                        "contour_dither" => &mut self.contour_dither,
+                        "solarize" => &mut self.solarize,
+                        "negative" => &mut self.negative,
+                        "colourpass" => &mut self.colourpass,
+                        "colourpass_hue" => &mut self.colourpass_hue,
+                        "colourpass_width" => &mut self.colourpass_width,
+                        "edge_amount" => &mut self.edge_amount,
+                        "edge_hue" => &mut self.edge_hue,
+                        "emboss" => &mut self.emboss,
+                        "emboss_angle" => &mut self.emboss_angle,
+                        "halftone" => &mut self.halftone,
+                        "halftone_pitch" => &mut self.halftone_pitch,
+                        "halftone_angle" => &mut self.halftone_angle,
+                        "moire" => &mut self.moire,
+                        "moire_freq" => &mut self.moire_freq,
+                        "row_smear" => &mut self.row_smear,
+                        "bitcrush" => &mut self.bitcrush,
+                        "bitcrush_levels" => &mut self.bitcrush_levels,
+                        "bitcrush_dither" => &mut self.bitcrush_dither,
+                        "multi_grid_x" => &mut self.multi_grid_x,
+                        "multi_grid_y" => &mut self.multi_grid_y,
+                        "barrel" => &mut self.barrel,
+                        "chroma_aberration" => &mut self.chroma_aberration,
+                        _ => &mut self.anamorphic_streak,
+                    };
+                    *slot = v;
+                    return true;
+                }
+            }
             _ => {}
         }
         false
@@ -3603,6 +4019,9 @@ impl LayerConfig {
         layer.bypass_master_fx = self.bypass_master_fx;
         layer.reroll_on_loop = self.reroll_on_loop;
         self.effects.apply_to_uniforms(&mut layer.effects);
+        // The B13 optics author at master scope only; a hostile or hand-edited
+        // layer section cannot install one on a layer copy.
+        layer.effects.clear_master_only_effects();
         layer.transform = self.transform.sanitized();
         layer.motion = self.motion.unwrap_or_default().to_params().sanitized();
     }
@@ -3638,6 +4057,9 @@ impl LayerConfig {
         *visible = self.visible;
         *bypass_master_fx = self.bypass_master_fx;
         self.effects.apply_to_uniforms(effects);
+        // Look application targets layer scope here; the B13 optics stay
+        // master-only.
+        effects.clear_master_only_effects();
         *transform = self.transform.sanitized();
     }
 
@@ -6772,6 +7194,113 @@ scenes:
         assert_eq!(runtime.rig.drive, 1.0);
         assert_eq!(runtime.rig.saturation, 2.0);
         assert!(serde_yaml::from_str::<TemporalConfig>("rig:\n  seed: 4\n").is_err());
+    }
+
+    #[test]
+    fn small_effects_round_trip_and_absent_fields_keep_prior_bytes() {
+        // Every B13 field is skip-serialized at its default, so a default
+        // effects block serializes without any of the new keys and pre-B13
+        // patch bytes and canonical hashes keep.
+        let default_yaml = serde_yaml::to_string(&EffectsConfig::default()).unwrap();
+        for key in [
+            "contour",
+            "flatten",
+            "solarize",
+            "negative",
+            "colourpass",
+            "edge_amount",
+            "emboss",
+            "halftone",
+            "moire",
+            "row_smear",
+            "bitcrush",
+            "multi_grid_x",
+            "multi_grid_y",
+            "barrel",
+            "chroma_aberration",
+            "anamorphic_streak",
+        ] {
+            assert!(!default_yaml.contains(key), "default must omit {key}");
+        }
+
+        // A non-default set round trips whole, including the discrete mode.
+        let mut config = EffectsConfig {
+            contour: 0.8,
+            contour_bands: 24.0,
+            flatten: 0.5,
+            flatten_levels: 7.0,
+            contour_dither: 0.4,
+            solarize: 0.6,
+            negative: 0.9,
+            negative_mode: 2,
+            colourpass: 0.7,
+            colourpass_hue: -120.0,
+            edge_amount: 0.3,
+            emboss_angle: -30.0,
+            halftone: 0.5,
+            halftone_angle: 15.0,
+            moire: 0.2,
+            row_smear: 0.4,
+            bitcrush: 0.8,
+            bitcrush_levels: 4.0,
+            multi_grid_x: 3.0,
+            multi_grid_y: 2.0,
+            barrel: -0.4,
+            chroma_aberration: 0.6,
+            anamorphic_streak: 0.35,
+            ..EffectsConfig::default()
+        };
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let restored: EffectsConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut uniforms = EffectUniforms::default();
+        restored.apply_to_uniforms(&mut uniforms);
+        assert_eq!(uniforms.contour, 0.8);
+        assert_eq!(uniforms.contour_bands, 24.0);
+        assert_eq!(uniforms.negative_mode, 2.0);
+        assert_eq!(uniforms.colourpass_hue, -120.0);
+        assert_eq!(uniforms.bitcrush_levels, 4.0);
+        assert_eq!(uniforms.multi_grid_x, 3.0);
+        assert_eq!(uniforms.barrel, -0.4);
+        assert_eq!(uniforms.anamorphic_streak, 0.35);
+
+        // Hostile scalars sanitize to the neutral value or clamp, never NaN.
+        config.contour_bands = f32::NAN;
+        config.bitcrush_levels = 999.0;
+        config.barrel = f32::NEG_INFINITY;
+        let mut hostile = EffectUniforms::default();
+        config.apply_to_uniforms(&mut hostile);
+        assert_eq!(hostile.contour_bands, 10.0);
+        assert_eq!(hostile.bitcrush_levels, 16.0);
+        assert_eq!(hostile.barrel, 0.0);
+
+        // Look application targets layer scope: the optics are cleared while
+        // every shared control lands.
+        let mut layer_config = saved_layer("optics.mp4", 1.0, "normal", true, false, 0.0, 0);
+        layer_config.effects = EffectsConfig {
+            halftone: 0.9,
+            barrel: 0.8,
+            chroma_aberration: 0.7,
+            anamorphic_streak: 0.6,
+            ..EffectsConfig::default()
+        };
+        let mut opacity = 1.0;
+        let mut blend_mode = BlendMode::Normal;
+        let mut visible = true;
+        let mut bypass = false;
+        let mut effects = EffectUniforms::default();
+        let mut transform = SpatialTransform::default();
+        layer_config.apply_look_to_fields(
+            &mut opacity,
+            &mut blend_mode,
+            &mut visible,
+            &mut bypass,
+            &mut effects,
+            &mut transform,
+        );
+        assert_eq!(effects.halftone, 0.9);
+        assert_eq!(effects.barrel, 0.0);
+        assert_eq!(effects.chroma_aberration, 0.0);
+        assert_eq!(effects.anamorphic_streak, 0.0);
     }
 
     #[test]

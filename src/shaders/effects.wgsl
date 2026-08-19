@@ -48,8 +48,43 @@ struct Uniforms {
     shift_block_size: f32,
     shift_density: f32,
     shift_speed: f32,
+    // B13 small-effects tranche: eight appended vec4 slots. Every amount's
+    // zero default takes an exact no-op branch. Laws derived from BENDR
+    // (MIT, © 2026 Steve Blythe); every one is a rewrite in linear light.
+    contour: f32,
+    contour_bands: f32,
+    contour_width: f32,
+    contour_hue: f32,
+    contour_fill: f32,
+    flatten: f32,
+    flatten_levels: f32,
+    contour_dither: f32,
+    solarize: f32,
+    negative: f32,
+    negative_mode: f32,
+    colourpass: f32,
+    colourpass_hue: f32,
+    colourpass_width: f32,
+    edge_amount: f32,
+    edge_hue: f32,
+    emboss: f32,
+    emboss_angle: f32,
+    halftone: f32,
+    halftone_pitch: f32,
+    halftone_angle: f32,
+    moire: f32,
+    moire_freq: f32,
+    row_smear: f32,
+    bitcrush: f32,
+    bitcrush_levels: f32,
+    bitcrush_dither: f32,
+    multi_grid_x: f32,
+    multi_grid_y: f32,
+    barrel: f32,
+    chroma_aberration: f32,
+    anamorphic_streak: f32,
     // Canonical authored spatial transform. These four vec4 slots are packed
-    // immediately after the ten legacy effect slots by EffectPassUniforms.
+    // immediately after the eighteen effect slots by EffectPassUniforms.
     spatial_inverse_row_0: vec4f,
     spatial_inverse_row_1: vec4f,
     // Crop origin X/Y followed by crop extent X/Y in source UV space.
@@ -377,6 +412,34 @@ fn processed_chroma(linear_color: vec3f) -> vec2f {
 // subset. Equal-neutral colors (including black and white) remain distance 0.
 const MAX_DISPLAY_CHROMA_DISTANCE: f32 = 1.1913178;
 
+// Rec.709 linear-light luma, the weighting every B13 law shares.
+const B13_LUMA: vec3f = vec3f(0.2126, 0.7152, 0.0722);
+
+// The classic 4x4 ordered-dither matrix shared by flatten and bitcrush,
+// normalized to [0, 1) and centred by the callers.
+fn bayer_threshold(pixel: vec2f) -> f32 {
+    var table = array<f32, 16>(
+        0.0, 8.0, 2.0, 10.0,
+        12.0, 4.0, 14.0, 6.0,
+        3.0, 11.0, 1.0, 9.0,
+        15.0, 7.0, 13.0, 5.0,
+    );
+    let cell = vec2u(vec2i(floor(pixel))) % vec2u(4u, 4u);
+    return table[cell.y * 4u + cell.x] / 16.0;
+}
+
+// Compact HSV for the find-edge outline colour, mirroring the derived law.
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3f {
+    let k = fract(vec3f(h) + vec3f(0.0, 2.0 / 3.0, 1.0 / 3.0));
+    return v * mix(vec3f(1.0), clamp(abs(k * 6.0 - 3.0) - 1.0, vec3f(0.0), vec3f(1.0)), s);
+}
+
+// Source luma at a displaced coordinate, through the one canonical sampling
+// chain so an active spatial transform keeps owning every exposed coordinate.
+fn source_luma(uv: vec2f) -> f32 {
+    return dot(sample_source(uv).rgb, B13_LUMA);
+}
+
 fn rgb_to_hsl(c: vec3f) -> vec3f {
     let max_c = max(max(c.r, c.g), c.b);
     let min_c = min(min(c.r, c.g), c.b);
@@ -440,6 +503,22 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var sample_uv = uv;
     var cellular_ridge = 0.0;
 
+    // --- Multi grid (B13): the dumb 1-8 x 1-8 tile of the framed image ---
+    // Odd cells mirror so the tiles meet instead of butting hard. Counts of
+    // one on both axes take the exact prior path; the folded coordinate is
+    // always inside the unit square, so no edge law is consulted.
+    if uniforms.multi_grid_x >= 1.5 || uniforms.multi_grid_y >= 1.5 {
+        let n = vec2f(
+            clamp(floor(uniforms.multi_grid_x + 0.5), 1.0, 8.0),
+            clamp(floor(uniforms.multi_grid_y + 0.5), 1.0, 8.0),
+        );
+        let cell = floor(sample_uv * n);
+        var g = fract(sample_uv * n);
+        if (cell.x % 2.0) > 0.5 { g.x = 1.0 - g.x; }
+        if (cell.y % 2.0) > 0.5 { g.y = 1.0 - g.y; }
+        sample_uv = g;
+    }
+
     // --- Breathing (UV distortion before sampling) ---
     if uniforms.breathe_scale > 0.0 || uniforms.breathe_rotation > 0.0 || uniforms.breathe_position > 0.0 {
         sample_uv = apply_breathing(sample_uv);
@@ -502,6 +581,33 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         }
     }
 
+    // --- Barrel (B13, master-only optics): radial lens distortion ---
+    if abs(uniforms.barrel) > 0.0001 {
+        let centered = sample_uv - 0.5;
+        let r2 = dot(centered, centered);
+        let distorted = vec2f(0.5) + centered * (1.0 + clamp(uniforms.barrel, -1.0, 1.0) * 0.9 * r2);
+        // The inactive spatial path keeps its historical clamp; an active
+        // transform owns every exposed coordinate through its edge law.
+        if uniforms.spatial_modes.w == 0u {
+            sample_uv = clamp(distorted, vec2f(0.0), vec2f(1.0));
+        } else {
+            sample_uv = distorted;
+        }
+    }
+
+    // --- Row smear (B13): rows rebuilt with the wrong predictor ---
+    if uniforms.row_smear > 0.0001 {
+        let amt = clamp(uniforms.row_smear, 0.0, 1.0) * 0.35;
+        var smeared = sample_uv;
+        smeared.x -= amt * fract(uv.y * max(uniforms.resolution.y, 1.0) * 0.5) * 0.4;
+        smeared.y -= amt * 0.02;
+        if uniforms.spatial_modes.w == 0u {
+            sample_uv = fract(smeared);
+        } else {
+            sample_uv = smeared;
+        }
+    }
+
     // --- Downsample (lossy video look) ---
     if uniforms.downsample < 0.99 {
         let virtual_res = uniforms.resolution * uniforms.downsample;
@@ -540,7 +646,44 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         color = sample_source(sample_uv);
     }
 
+    // --- Chroma aberration (B13, master-only optics) ---
+    // The three primaries focus at slightly different scales, so colour
+    // fringes grow towards the corners.
+    if uniforms.chroma_aberration > 0.0001 {
+        let dc = sample_uv - 0.5;
+        let kr = 1.0 + clamp(uniforms.chroma_aberration, 0.0, 1.0) * 0.012;
+        let kb = 1.0 - clamp(uniforms.chroma_aberration, 0.0, 1.0) * 0.012;
+        color.r = sample_source(vec2f(0.5) + dc * kr).r;
+        color.b = sample_source(vec2f(0.5) + dc * kb).b;
+    }
+
     var rgb = color.rgb;
+
+    // --- Halftone (B13): everything drops out except dots sized by
+    // brightness, on a rotatable dot screen. Runs before the colour
+    // adjustments so the dots receive them, matching the derived stage order.
+    if uniforms.halftone > 0.0001 {
+        let pitch = mix(26.0, 6.0, clamp(uniforms.halftone_pitch, 0.0, 1.0));
+        let angle = uniforms.halftone_angle * 0.0174533;
+        let ca = cos(angle);
+        let sa = sin(angle);
+        let centered_px = (sample_uv - 0.5) * uniforms.resolution;
+        let rotated = vec2f(
+            centered_px.x * ca + centered_px.y * sa,
+            -centered_px.x * sa + centered_px.y * ca,
+        );
+        let grid = rotated / pitch;
+        let cell_centre_rot = (floor(grid) + 0.5) * pitch;
+        let cell_centre = vec2f(
+            cell_centre_rot.x * ca - cell_centre_rot.y * sa,
+            cell_centre_rot.x * sa + cell_centre_rot.y * ca,
+        ) / uniforms.resolution + 0.5;
+        let dot_colour = sample_source(cell_centre).rgb;
+        let dot_luma = dot(dot_colour, B13_LUMA);
+        let radius = length(fract(grid) - 0.5);
+        let dot_mask = smoothstep(dot_luma * 0.72 + 0.06, dot_luma * 0.72 - 0.06, radius);
+        rgb = mix(rgb, dot_colour * dot_mask, clamp(uniforms.halftone, 0.0, 1.0));
+    }
 
     // --- Color adjustment (hue/saturation) ---
     if abs(uniforms.hue_shift) > 0.1 || abs(uniforms.saturation) > 0.001 {
@@ -561,6 +704,12 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         rgb = (rgb - 0.5) * factor + 0.5;
     }
 
+    // --- Solarize (B13): fold-back exposure ---
+    if uniforms.solarize > 0.0001 {
+        let folded = abs(vec3f(1.0) - abs(vec3f(1.0) - 2.0 * rgb));
+        rgb = mix(rgb, folded, clamp(uniforms.solarize, 0.0, 1.0));
+    }
+
     // --- Posterize ---
     if uniforms.posterize >= 2.0 {
         let levels = uniforms.posterize;
@@ -570,6 +719,116 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     // --- Invert ---
     if uniforms.invert > 0.5 {
         rgb = vec3f(1.0) - rgb;
+    }
+
+    // --- Flatten (B13): quantize luma into hard steps for solid colour
+    // fields, with an optional ordered Bayer dither on the step boundary.
+    if uniforms.flatten > 0.0001 {
+        let l0 = dot(rgb, B13_LUMA);
+        let levels = clamp(floor(uniforms.flatten_levels + 0.5), 2.0, 16.0);
+        var dith = 0.0;
+        if uniforms.contour_dither > 0.0001 {
+            dith = (bayer_threshold(uv * uniforms.resolution) - 0.5)
+                * clamp(uniforms.contour_dither, 0.0, 1.0) / levels;
+        }
+        let quantized = floor((l0 + dith) * levels + 0.5) / levels;
+        var flattened = vec3f(quantized);
+        if l0 > 0.001 {
+            flattened = rgb * (quantized / max(l0, 0.001));
+        }
+        rgb = mix(rgb, clamp(flattened, vec3f(0.0), vec3f(1.6)), clamp(uniforms.flatten, 0.0, 1.0));
+    }
+
+    // --- Contour (B13): draw the isolines between luma bands ---
+    if uniforms.contour > 0.0001 {
+        // Smooth the luma first so grain doesn't spawn false isolines.
+        let spread = 1.4 / uniforms.resolution;
+        var smoothed = dot(rgb, B13_LUMA) * 0.36;
+        smoothed += source_luma(sample_uv + vec2f(spread.x, 0.0)) * 0.16;
+        smoothed += source_luma(sample_uv - vec2f(spread.x, 0.0)) * 0.16;
+        smoothed += source_luma(sample_uv + vec2f(0.0, spread.y)) * 0.16;
+        smoothed += source_luma(sample_uv - vec2f(0.0, spread.y)) * 0.16;
+        let bands = clamp(uniforms.contour_bands, 2.0, 40.0);
+        let banded = smoothed * bands;
+        let gradient = length(vec2f(dpdx(banded), dpdy(banded))) + 1e-4;
+        let f = fract(banded);
+        let distance_px = min(f, 1.0 - f) / gradient;
+        let width = clamp(uniforms.contour_width, 0.2, 6.0);
+        let line = 1.0 - smoothstep(width * 0.5, width * 0.5 + 1.0, distance_px);
+        let band_index = floor(banded);
+        let hue_phase = clamp(uniforms.contour_hue, 0.0, 1.0);
+        var line_colour = 0.5 + 0.5 * cos(
+            6.2832 * (vec3f(band_index / bands * 1.5 + hue_phase) + vec3f(0.0, 0.33, 0.67)),
+        );
+        line_colour = mix(vec3f(1.0), line_colour, smoothstep(0.0, 0.15, hue_phase));
+        let fill = rgb * clamp(uniforms.contour_fill, 0.0, 1.0);
+        rgb = mix(rgb, mix(fill, line_colour, line), clamp(uniforms.contour, 0.0, 1.0));
+    }
+
+    // --- Negative (B13): invert colour, brightness, or both ---
+    // Permanent mode codes: 0 = rgb, 1 = luma-only (invert brightness, keep
+    // colour), 2 = hue-flip (complementary colour at the same brightness).
+    if uniforms.negative > 0.0001 {
+        let luma = dot(rgb, B13_LUMA);
+        var inverted = vec3f(1.0) - rgb;
+        let mode = u32(clamp(uniforms.negative_mode, 0.0, 2.0));
+        if mode == 1u {
+            inverted = clamp(rgb + vec3f(1.0 - 2.0 * luma), vec3f(0.0), vec3f(1.0));
+        } else if mode == 2u {
+            inverted = clamp(vec3f(2.0 * luma) - rgb, vec3f(0.0), vec3f(1.0));
+        }
+        rgb = mix(rgb, inverted, clamp(uniforms.negative, 0.0, 1.0));
+    }
+
+    // --- Colourpass (B13): one hue window survives, the rest goes mono ---
+    if uniforms.colourpass > 0.0001 {
+        let i = dot(rgb, vec3f(0.596, -0.274, -0.322));
+        let q = dot(rgb, vec3f(0.211, -0.523, 0.312));
+        let hue_angle = atan2(q, i) / 6.2832 + 0.5;
+        let pass_hue = uniforms.colourpass_hue / 360.0;
+        let hue_distance = abs(fract(hue_angle - pass_hue + 0.5) - 0.5) * 2.0;
+        let width = clamp(uniforms.colourpass_width, 0.0, 1.0);
+        var keep = 1.0 - smoothstep(width * 0.5, width * 0.5 + 0.12, hue_distance);
+        keep *= smoothstep(0.02, 0.16, length(vec2f(i, q)));
+        let luma = dot(rgb, B13_LUMA);
+        rgb = mix(rgb, mix(vec3f(luma), rgb, keep), clamp(uniforms.colourpass, 0.0, 1.0));
+    }
+
+    // --- Find edge (B13): a Sobel outline, coloured, on a dark ground ---
+    if uniforms.edge_amount > 0.0001 {
+        let e = 1.0 / uniforms.resolution;
+        let gx = source_luma(sample_uv + vec2f(e.x, 0.0)) - source_luma(sample_uv - vec2f(e.x, 0.0));
+        let gy = source_luma(sample_uv + vec2f(0.0, e.y)) - source_luma(sample_uv - vec2f(0.0, e.y));
+        let strength = clamp(length(vec2f(gx, gy)) * 4.5, 0.0, 1.0);
+        let outline = hsv_to_rgb(fract(uniforms.edge_hue / 360.0 + strength * 0.25), 0.9, 1.0);
+        rgb = mix(rgb, outline * strength, clamp(uniforms.edge_amount, 0.0, 1.0));
+    }
+
+    // --- Emboss (B13): a directional difference lit from one side ---
+    if uniforms.emboss > 0.0001 {
+        let angle = uniforms.emboss_angle * 0.0174533;
+        let step_uv = vec2f(cos(angle), sin(angle)) * 1.6 / uniforms.resolution;
+        let relief = (source_luma(sample_uv + step_uv) - source_luma(sample_uv - step_uv)) * 3.0 + 0.5;
+        let lit = vec3f(relief) * mix(vec3f(1.0), rgb * 1.6, 0.35);
+        rgb = mix(rgb, lit, clamp(uniforms.emboss, 0.0, 1.0));
+    }
+
+    // --- Moiré (B13): interference against a virtual grid ---
+    if uniforms.moire > 0.0001 {
+        let freq = mix(40.0, 400.0, clamp(uniforms.moire_freq, 0.0, 1.0));
+        let wave = sin(uv.x * freq) * sin(uv.y * freq * 1.03 + max(uniforms.time, 0.0) * 0.4);
+        rgb *= 1.0 + wave * clamp(uniforms.moire, 0.0, 1.0) * 0.5;
+    }
+
+    // --- Bitcrush (B13): mono ordered-dither quantize; two levels is the
+    // classic 1-bit crush.
+    if uniforms.bitcrush > 0.0001 {
+        let luma = dot(rgb, B13_LUMA);
+        let steps = clamp(floor(uniforms.bitcrush_levels + 0.5), 2.0, 16.0) - 1.0;
+        let dith = (bayer_threshold(uv * uniforms.resolution) - 0.5)
+            * clamp(uniforms.bitcrush_dither, 0.0, 1.0);
+        let quantized = clamp(floor(luma * steps + 0.5 + dith) / steps, 0.0, 1.0);
+        rgb = mix(rgb, vec3f(quantized), clamp(uniforms.bitcrush, 0.0, 1.0));
     }
 
     // A restrained dark ridge makes cell boundaries legible without turning
@@ -590,6 +849,27 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     if uniforms.grain_intensity > 0.0 {
         let grain = get_grain(uv);
         rgb += grain;
+    }
+
+    // --- Anamorphic streak (B13, master-only optics): a horizontal flare
+    // off anything hot enough to bloom, blue because the coatings that
+    // cause it are. Ten taps each way, weighted 1/i, thresholded at 0.62.
+    if uniforms.anamorphic_streak > 0.0001 {
+        var streak = vec3f(0.0);
+        var weight_sum = 0.0;
+        for (var i = 1; i <= 10; i += 1) {
+            let offset = f32(i) * 0.016;
+            let weight = 1.0 / f32(i);
+            let left = sample_uv + vec2f(offset, 0.0);
+            let right = sample_uv - vec2f(offset, 0.0);
+            let left_in = step(0.0, left.x) * step(left.x, 1.0);
+            let right_in = step(0.0, right.x) * step(right.x, 1.0);
+            streak += max(sample_source(left).rgb - vec3f(0.62), vec3f(0.0)) * weight * left_in;
+            streak += max(sample_source(right).rgb - vec3f(0.62), vec3f(0.0)) * weight * right_in;
+            weight_sum += weight * 2.0;
+        }
+        streak /= max(weight_sum, 0.0001);
+        rgb += streak * clamp(uniforms.anamorphic_streak, 0.0, 1.0) * 6.0 * vec3f(0.3, 0.55, 1.7);
     }
 
     rgb = clamp(rgb, vec3f(0.0), vec3f(1.0));

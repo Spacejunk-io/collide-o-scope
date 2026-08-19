@@ -42,7 +42,7 @@ use crate::visual_rack::{
 /// its byte-identical stream, but a generated piece now carries the new
 /// values, so the version names the difference. Manifest readers remain
 /// data-driven and accept every earlier version string.
-pub const GENERATOR_VERSION: &str = "8";
+pub const GENERATOR_VERSION: &str = "9";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -348,6 +348,163 @@ fn mutate_effects(
         temperature * 0.08,
         rng,
     );
+}
+
+/// Appended B13 stream: the small-effects tranche mutates in its own
+/// domain-separated sequence per scope, so every pre-B13 procedural stream
+/// stays byte-for-byte stable for the same seed. `negative_mode` is a
+/// discrete law and never mutates; the three optics mutate at master scope
+/// only, matching their master-only authoring law.
+const PROCEDURAL_SMALL_FX_DOMAIN: u64 = 0x4233_534d_464c_5800;
+
+fn mutate_small_effects(
+    anchor: &EffectsConfig,
+    e: &mut EffectsConfig,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+    scope_domain: u64,
+    include_optics: bool,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    let t = temperature;
+    let mut rng = SplitMix64::new(domain_seed(
+        seed,
+        index,
+        PROCEDURAL_SMALL_FX_DOMAIN ^ scope_domain,
+    ));
+    let rng = &mut rng;
+    e.contour = mutate_linear(anchor.contour, e.contour, 0.0, 1.0, t * 0.14, rng);
+    e.contour_bands = mutate_log(
+        anchor.contour_bands,
+        e.contour_bands,
+        2.0,
+        40.0,
+        t * 0.25,
+        rng,
+    )
+    .round();
+    e.contour_width = mutate_linear(
+        anchor.contour_width,
+        e.contour_width,
+        0.2,
+        6.0,
+        t * 0.5,
+        rng,
+    );
+    e.contour_hue = mutate_linear(anchor.contour_hue, e.contour_hue, 0.0, 1.0, t * 0.15, rng);
+    e.contour_fill = mutate_linear(anchor.contour_fill, e.contour_fill, 0.0, 1.0, t * 0.12, rng);
+    e.flatten = mutate_linear(anchor.flatten, e.flatten, 0.0, 1.0, t * 0.14, rng);
+    e.flatten_levels = mutate_log(
+        anchor.flatten_levels,
+        e.flatten_levels,
+        2.0,
+        16.0,
+        t * 0.25,
+        rng,
+    )
+    .round();
+    e.contour_dither = mutate_linear(
+        anchor.contour_dither,
+        e.contour_dither,
+        0.0,
+        1.0,
+        t * 0.15,
+        rng,
+    );
+    e.solarize = mutate_linear(anchor.solarize, e.solarize, 0.0, 1.0, t * 0.12, rng);
+    e.negative = mutate_linear(anchor.negative, e.negative, 0.0, 1.0, t * 0.1, rng);
+    e.colourpass = mutate_linear(anchor.colourpass, e.colourpass, 0.0, 1.0, t * 0.12, rng);
+    e.colourpass_hue = mutate_circular(
+        anchor.colourpass_hue,
+        e.colourpass_hue,
+        -180.0,
+        180.0,
+        t * 35.0,
+        rng,
+    );
+    e.colourpass_width = mutate_linear(
+        anchor.colourpass_width,
+        e.colourpass_width,
+        0.0,
+        1.0,
+        t * 0.12,
+        rng,
+    );
+    e.edge_amount = mutate_linear(anchor.edge_amount, e.edge_amount, 0.0, 1.0, t * 0.12, rng);
+    e.edge_hue = mutate_circular(anchor.edge_hue, e.edge_hue, -180.0, 180.0, t * 35.0, rng);
+    e.emboss = mutate_linear(anchor.emboss, e.emboss, 0.0, 1.0, t * 0.1, rng);
+    e.emboss_angle = mutate_circular(
+        anchor.emboss_angle,
+        e.emboss_angle,
+        -180.0,
+        180.0,
+        t * 35.0,
+        rng,
+    );
+    e.halftone = mutate_linear(anchor.halftone, e.halftone, 0.0, 1.0, t * 0.12, rng);
+    e.halftone_pitch = mutate_linear(
+        anchor.halftone_pitch,
+        e.halftone_pitch,
+        0.0,
+        1.0,
+        t * 0.15,
+        rng,
+    );
+    e.halftone_angle = mutate_circular(
+        anchor.halftone_angle,
+        e.halftone_angle,
+        -180.0,
+        180.0,
+        t * 35.0,
+        rng,
+    );
+    e.moire = mutate_linear(anchor.moire, e.moire, 0.0, 1.0, t * 0.1, rng);
+    e.moire_freq = mutate_linear(anchor.moire_freq, e.moire_freq, 0.0, 1.0, t * 0.15, rng);
+    e.row_smear = mutate_linear(anchor.row_smear, e.row_smear, 0.0, 1.0, t * 0.12, rng);
+    e.bitcrush = mutate_linear(anchor.bitcrush, e.bitcrush, 0.0, 1.0, t * 0.1, rng);
+    e.bitcrush_levels = mutate_log(
+        anchor.bitcrush_levels,
+        e.bitcrush_levels,
+        2.0,
+        16.0,
+        t * 0.25,
+        rng,
+    )
+    .round();
+    e.bitcrush_dither = mutate_linear(
+        anchor.bitcrush_dither,
+        e.bitcrush_dither,
+        0.0,
+        1.0,
+        t * 0.15,
+        rng,
+    );
+    e.multi_grid_x =
+        mutate_linear(anchor.multi_grid_x, e.multi_grid_x, 1.0, 8.0, t * 0.7, rng).round();
+    e.multi_grid_y =
+        mutate_linear(anchor.multi_grid_y, e.multi_grid_y, 1.0, 8.0, t * 0.7, rng).round();
+    if include_optics {
+        e.barrel = mutate_linear(anchor.barrel, e.barrel, -1.0, 1.0, t * 0.12, rng);
+        e.chroma_aberration = mutate_linear(
+            anchor.chroma_aberration,
+            e.chroma_aberration,
+            0.0,
+            1.0,
+            t * 0.12,
+            rng,
+        );
+        e.anamorphic_streak = mutate_linear(
+            anchor.anamorphic_streak,
+            e.anamorphic_streak,
+            0.0,
+            1.0,
+            t * 0.08,
+            rng,
+        );
+    }
 }
 
 // Appended M3 streams. Every numeric value is isolated so introducing a new
@@ -2517,6 +2674,15 @@ pub fn generate_with_inventory(
             temperature,
             &mut master_rng,
         );
+        mutate_small_effects(
+            &normalized.master,
+            &mut patch.master,
+            temperature,
+            config.seed,
+            index,
+            0x4d41_5354_4552,
+            true,
+        );
         let mut master_spatial_rng =
             SplitMix64::new(domain_seed(config.seed, index, 0x4d53_5041_544c));
         mutate_transform(
@@ -2555,6 +2721,15 @@ pub fn generate_with_inventory(
                 &mut layer.effects,
                 temperature,
                 &mut rng,
+            );
+            mutate_small_effects(
+                &anchor_layer.effects,
+                &mut layer.effects,
+                temperature,
+                config.seed,
+                index,
+                0x4c41_5945_5200 ^ layer_index as u64,
+                false,
             );
             let mut spatial_rng = SplitMix64::new(domain_seed(
                 config.seed,
@@ -3315,6 +3490,52 @@ impl Drop for PatchCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_effects_generator_mutates_in_a_fresh_domain_and_respects_scope() {
+        let anchor = EffectsConfig::default();
+        let yaml = |config: &EffectsConfig| serde_yaml::to_string(config).unwrap();
+
+        // Temperature zero is a strict no-op.
+        let mut frozen = anchor.clone();
+        mutate_small_effects(&anchor, &mut frozen, 0.0, 7, 3, 0x4d41_5354_4552, true);
+        assert_eq!(yaml(&frozen), yaml(&anchor));
+
+        // The mutation is deterministic per seed/index/scope and bounded,
+        // integer counts round, and the discrete negative mode never moves.
+        let mut a = anchor.clone();
+        let mut b = anchor.clone();
+        mutate_small_effects(&anchor, &mut a, 1.5, 7, 3, 0x4d41_5354_4552, true);
+        mutate_small_effects(&anchor, &mut b, 1.5, 7, 3, 0x4d41_5354_4552, true);
+        assert_eq!(yaml(&a), yaml(&b));
+        assert!((0.0..=1.0).contains(&a.contour));
+        assert!((2.0..=40.0).contains(&a.contour_bands));
+        assert_eq!(a.contour_bands.fract(), 0.0);
+        assert!((2.0..=16.0).contains(&a.bitcrush_levels));
+        assert_eq!(a.bitcrush_levels.fract(), 0.0);
+        assert!((1.0..=8.0).contains(&a.multi_grid_x));
+        assert_eq!(a.multi_grid_x.fract(), 0.0);
+        assert!((-180.0..=180.0).contains(&a.colourpass_hue));
+        assert!((-1.0..=1.0).contains(&a.barrel));
+        assert_eq!(a.negative_mode, 0);
+
+        // A different scope domain draws a different sequence, and the layer
+        // form never touches the three master-only optics.
+        let mut other_scope = anchor.clone();
+        mutate_small_effects(
+            &anchor,
+            &mut other_scope,
+            1.5,
+            7,
+            3,
+            0x4c41_5945_5200,
+            false,
+        );
+        assert_ne!(yaml(&other_scope), yaml(&a));
+        assert_eq!(other_scope.barrel, 0.0);
+        assert_eq!(other_scope.chroma_aberration, 0.0);
+        assert_eq!(other_scope.anamorphic_streak, 0.0);
+    }
 
     #[test]
     fn dice_the_generator_and_modulation_all_preserve_the_collider_block_exactly() {

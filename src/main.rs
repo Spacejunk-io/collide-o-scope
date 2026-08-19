@@ -8402,6 +8402,9 @@ impl App {
                     amount,
                     include_grain_controls,
                 );
+                // The B13 optics author at master scope only; layer Dice
+                // must not install one.
+                self.layers[index].effects.clear_master_only_effects();
                 if include_transform && amount.is_finite() && amount > 0.0 {
                     let layer = &mut self.layers[index];
                     let mut target = if mode == web::state::RerollMode::Pattern {
@@ -8605,6 +8608,8 @@ impl App {
                         amount,
                         include_grain_controls,
                     );
+                    // The B13 optics author at master scope only.
+                    layer.effects.clear_master_only_effects();
                     if include_transform && amount.is_finite() && amount > 0.0 {
                         let mut target = if mode == web::state::RerollMode::Pattern {
                             spatial::SpatialTransform {
@@ -8667,9 +8672,47 @@ impl App {
             | "shift_amount"
             | "shift_block_size"
             | "shift_density"
-            | "shift_speed" => value.as_f64().is_some_and(f64::is_finite),
+            | "shift_speed"
+            | "contour"
+            | "contour_bands"
+            | "contour_width"
+            | "contour_hue"
+            | "contour_fill"
+            | "flatten"
+            | "flatten_levels"
+            | "contour_dither"
+            | "solarize"
+            | "negative"
+            | "colourpass"
+            | "colourpass_hue"
+            | "colourpass_width"
+            | "edge_amount"
+            | "edge_hue"
+            | "emboss"
+            | "emboss_angle"
+            | "halftone"
+            | "halftone_pitch"
+            | "halftone_angle"
+            | "moire"
+            | "moire_freq"
+            | "row_smear"
+            | "bitcrush"
+            | "bitcrush_levels"
+            | "bitcrush_dither"
+            | "multi_grid_x"
+            | "multi_grid_y"
+            | "barrel"
+            | "chroma_aberration"
+            | "anamorphic_streak" => value.as_f64().is_some_and(f64::is_finite),
+            "negative_mode" => value.as_u64().is_some_and(|number| number <= 2),
             _ => false,
         }
+    }
+
+    /// The B13 optics author at master scope only; a layer edit or Dice pass
+    /// naming one is dropped rather than applied to a layer copy.
+    fn master_only_effect_param(param: &str) -> bool {
+        matches!(param, "barrel" | "chroma_aberration" | "anamorphic_streak")
     }
 
     fn valid_spatial_transform_edit(param: &str, value: &serde_json::Value) -> bool {
@@ -9335,7 +9378,16 @@ impl App {
             }
             WebAction::ResetGroup { group } => matches!(
                 group.as_str(),
-                "digital" | "analog" | "key" | "motion" | "cellular" | "shift" | "vhs" | "temporal"
+                "digital"
+                    | "analog"
+                    | "key"
+                    | "motion"
+                    | "cellular"
+                    | "shift"
+                    | "small_fx"
+                    | "optics"
+                    | "vhs"
+                    | "temporal"
             ),
             WebAction::SetLayerParam {
                 index,
@@ -15160,6 +15212,42 @@ impl App {
                         self.master_effects.shift_density = defaults.shift_density;
                         self.master_effects.shift_speed = defaults.shift_speed;
                     }
+                    "small_fx" => {
+                        self.master_effects.contour = defaults.contour;
+                        self.master_effects.contour_bands = defaults.contour_bands;
+                        self.master_effects.contour_width = defaults.contour_width;
+                        self.master_effects.contour_hue = defaults.contour_hue;
+                        self.master_effects.contour_fill = defaults.contour_fill;
+                        self.master_effects.flatten = defaults.flatten;
+                        self.master_effects.flatten_levels = defaults.flatten_levels;
+                        self.master_effects.contour_dither = defaults.contour_dither;
+                        self.master_effects.solarize = defaults.solarize;
+                        self.master_effects.negative = defaults.negative;
+                        self.master_effects.negative_mode = defaults.negative_mode;
+                        self.master_effects.colourpass = defaults.colourpass;
+                        self.master_effects.colourpass_hue = defaults.colourpass_hue;
+                        self.master_effects.colourpass_width = defaults.colourpass_width;
+                        self.master_effects.edge_amount = defaults.edge_amount;
+                        self.master_effects.edge_hue = defaults.edge_hue;
+                        self.master_effects.emboss = defaults.emboss;
+                        self.master_effects.emboss_angle = defaults.emboss_angle;
+                        self.master_effects.halftone = defaults.halftone;
+                        self.master_effects.halftone_pitch = defaults.halftone_pitch;
+                        self.master_effects.halftone_angle = defaults.halftone_angle;
+                        self.master_effects.moire = defaults.moire;
+                        self.master_effects.moire_freq = defaults.moire_freq;
+                        self.master_effects.row_smear = defaults.row_smear;
+                        self.master_effects.bitcrush = defaults.bitcrush;
+                        self.master_effects.bitcrush_levels = defaults.bitcrush_levels;
+                        self.master_effects.bitcrush_dither = defaults.bitcrush_dither;
+                        self.master_effects.multi_grid_x = defaults.multi_grid_x;
+                        self.master_effects.multi_grid_y = defaults.multi_grid_y;
+                    }
+                    "optics" => {
+                        self.master_effects.barrel = defaults.barrel;
+                        self.master_effects.chroma_aberration = defaults.chroma_aberration;
+                        self.master_effects.anamorphic_streak = defaults.anamorphic_streak;
+                    }
                     "transform" => {
                         self.master_transform = spatial::SpatialTransform::default();
                     }
@@ -16458,9 +16546,13 @@ impl App {
             } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
                     let layer = &mut self.layers[index];
-                    let mut snapshot = web::state::EffectsSnapshot::from_uniforms(&layer.effects);
-                    snapshot.apply_param(&param, &value);
-                    snapshot.apply_to_uniforms(&mut layer.effects);
+                    if !Self::master_only_effect_param(&param) {
+                        let mut snapshot =
+                            web::state::EffectsSnapshot::from_uniforms(&layer.effects);
+                        snapshot.apply_param(&param, &value);
+                        snapshot.apply_to_uniforms(&mut layer.effects);
+                        layer.effects.clear_master_only_effects();
+                    }
                 }
             }
             WebAction::SetLayerTransform {
@@ -26195,6 +26287,67 @@ mod app_state_tests {
         });
         assert_eq!(app.master_effects.random_seed, 0);
         assert!(app.mod_matrix.lfos.iter().all(|lfo| lfo.seed == 0));
+    }
+
+    #[test]
+    fn small_effect_params_validate_and_the_optics_are_master_only() {
+        for param in [
+            "contour",
+            "contour_bands",
+            "contour_width",
+            "contour_hue",
+            "contour_fill",
+            "flatten",
+            "flatten_levels",
+            "contour_dither",
+            "solarize",
+            "negative",
+            "colourpass",
+            "colourpass_hue",
+            "colourpass_width",
+            "edge_amount",
+            "edge_hue",
+            "emboss",
+            "emboss_angle",
+            "halftone",
+            "halftone_pitch",
+            "halftone_angle",
+            "moire",
+            "moire_freq",
+            "row_smear",
+            "bitcrush",
+            "bitcrush_levels",
+            "bitcrush_dither",
+            "multi_grid_x",
+            "multi_grid_y",
+            "barrel",
+            "chroma_aberration",
+            "anamorphic_streak",
+        ] {
+            assert!(
+                App::valid_effect_edit(param, &serde_json::json!(0.5)),
+                "{param} must validate as a finite float edit"
+            );
+        }
+        assert!(App::valid_effect_edit(
+            "negative_mode",
+            &serde_json::json!(2)
+        ));
+        assert!(!App::valid_effect_edit(
+            "negative_mode",
+            &serde_json::json!(3)
+        ));
+        // serde_json renders a non-finite float as null, which as_f64 refuses.
+        assert!(!App::valid_effect_edit(
+            "contour",
+            &serde_json::json!(f64::NAN)
+        ));
+        for optic in ["barrel", "chroma_aberration", "anamorphic_streak"] {
+            assert!(App::master_only_effect_param(optic), "{optic}");
+        }
+        for shared in ["contour", "halftone", "multi_grid_x", "negative_mode"] {
+            assert!(!App::master_only_effect_param(shared), "{shared}");
+        }
     }
 
     #[test]

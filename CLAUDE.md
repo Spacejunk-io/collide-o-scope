@@ -826,6 +826,73 @@ renders a `_ramp` twin (decoded frames must differ) and a repeat (decoded
 frames must match), so reach and the sweep clock's determinism are both
 measured.
 
+### B13 small effects
+
+One tranche, one law, fifteen looks. The shared effect uniform grew from ten
+to eighteen vec4s (160 → 288 bytes; `EffectPassUniforms` 224 → 352, spatial
+slots now at byte 288), and every new control's default takes an exact no-op
+shader branch, so a default patch's pixels are byte-identical — proven by the
+re-pinned M6 shader-bundle digest with all six output SHAs unchanged. The
+laws are derived from BENDR (MIT, © 2026 Steve Blythe); every one is a
+rewrite in linear light with Rec.709 luma.
+
+**Both scopes** (layer and master, 28 continuous controls + 1 discrete):
+`contour`/`contour_bands`/`contour_width`/`contour_hue`/`contour_fill`
+(isolines between smoothed luma bands, screen-space derivative distance,
+white lines near hue phase zero), `flatten`/`flatten_levels` +
+`contour_dither` (luma quantized to solid fields with an ordered 4×4 Bayer
+dither), `solarize` (fold-back exposure), `negative` + `negative_mode`
+(permanent codes: 0 rgb `1-c`, 1 luma-only `c + (1-2·luma)`, 2 hue-flip
+`2·luma - c`), `colourpass`/`colourpass_hue`/`colourpass_width` (one YIQ hue
+window survives, the rest goes mono; hue in degrees on the wrap allowlist),
+`edge_amount`/`edge_hue` (Sobel outline over source luma, HSV-coloured),
+`emboss`/`emboss_angle` (directional difference lit from one side),
+`halftone`/`halftone_pitch`/`halftone_angle` (brightness-sized dots on a
+rotatable screen, before the colour adjustments so the dots receive them),
+`moire`/`moire_freq` (interference against a virtual grid on the established
+effect time), `row_smear` (wrong-predictor row shear, a UV effect on the
+Shift precedent), `bitcrush`/`bitcrush_levels`/`bitcrush_dither` (mono
+ordered-dither quantize; two levels is the classic 1-bit crush), and
+`multi_grid_x`/`multi_grid_y` (the dumb 1–8 × 1–8 tile with odd cells
+mirrored so tiles meet; the Symmetry Field's p1 lattice stays the smart one).
+
+**Master-only optics** (3 continuous controls): `barrel` (radial distortion),
+`chroma_aberration` (per-primary radial scale), `anamorphic_streak`
+(thresholded horizontal flare, blue because the coatings that cause it are;
+ten 1/i-weighted taps each way). Master-only is enforced at every layer
+authoring seam through `EffectUniforms::clear_master_only_effects` — the
+layer wire applier, layer patch/Look application, layer Dice, and the offline
+layer builders — so a hostile patch or legacy client cannot install an optic
+on a layer copy, and no `layerN_` modulation address exists for the three.
+
+**UV and sampling contract.** Multi grid, barrel, and row smear are UV
+effects in the established order (multi grid first, then breathing, cellular,
+shift, barrel, row smear, downsample, pixelate); their legacy branches keep
+the historical clamp/wrap while an active spatial transform owns every
+exposed coordinate. Every neighbour read (contour smoothing 4, find-edge 4,
+emboss 2, halftone 1, chroma aberration 2, anamorphic 20) goes through the
+one canonical `sample_source` chain — there is no second sampling path — and
+each is gated by its own authored amount, so an inactive effect costs zero
+extra lookups.
+
+**Closure.** Patch: every field on `EffectsConfig`, skip-serialized at its
+default so pre-B13 patches keep their bytes and canonical hashes; hostile
+scalars sanitize to neutral values. Wire: all controls ride the ordinary
+coalescible `set_param`/`set_layer_effect` (`negative_mode` as an integer,
+the grain_algo precedent); the layer applier drops master-only names.
+Snapshot: additive fields with prior-path defaults. Panel: two master
+fx-groups (SMALL FX, OPTICS) with group resets, and a layer-card SMALL FX
+disclosure beside CELLULAR. Modulation: 31 master targets inserted before
+`morph` (which stays last) and 28 layer suffixes appended at indices 64–91;
+`negative_mode` is a discrete law with no address; the four angle/hue
+controls are degree-wrapped in Morph. Morph blends every continuous value and
+recalls `negative_mode` at the midpoint. Dice mutates all 31 in a fresh
+domain-separated stream (pre-B13 streams proven byte-stable against a pinned
+pre-B13 golden) and the generator mutates them in a fresh per-scope domain —
+`GENERATOR_VERSION` is now "9" — with layer optics never mutated. Export
+rides the same shader; `render_small_effects_pipeline` is the labeled export
+case with its `_plain` difference and `_repeat` determinism assertions.
+
 ## Effects and compositing
 
 - One combined uniform-driven effect shader avoids pipeline switches.
@@ -2452,6 +2519,26 @@ mislead browser tests.
   is a B12 non-measurement — and `render_time_displace_pipeline` is the
   labeled export case with its `_ramp` difference and `_repeat` determinism
   assertions.
+- Small-effects tests must cover the eighteen-vec4 layout assertions (with
+  the spatial slots moved to byte 288 and the pass at 352), the per-effect
+  amount-gate source audit with the multi-grid `>= 1.5` law and the WGSL
+  field order between `shift_speed` and the spatial rows, exact-off defaults
+  with reset coverage, the master-only law at every seam
+  (`clear_master_only_effects` unit coverage, Look application clearing the
+  optics, `master_only_effect_param` beside `valid_effect_edit`'s closed
+  vocabulary with `negative_mode` capped at 2, layer optics absent from
+  modulation and never generator-mutated), the patch round trip with
+  skip-at-default omission and neutral hostile sanitize, the snapshot round
+  trip with a pre-B13 JSON decoding to the exact prior path, Morph blending
+  values with wrapped hue arcs and midpoint recall of the negative mode, the
+  modulation targets resolving at both scopes with `morph` still last and
+  bases immutable, the pinned pre-B13 Dice golden (established streams
+  byte-stable beside the fresh domain-separated small-effects stream), the
+  generator's fresh per-scope domain with temperature-zero no-op and rounded
+  integer counts, and the bumped 148-slider range contract. The re-pinned M6
+  shader-bundle digest is a deliberate B13 re-measurement whose six output
+  SHAs must not move. `render_small_effects_pipeline` is the labeled export
+  case with its `_plain` difference and `_repeat` determinism assertions.
 - Preview transform-gizmo tests must cover the pane/output/local round trip at
   multiple aspect ratios and DPI scales including a non-square output, an
   active crop, a nonzero shear and a letterboxed pane; the forward map agreeing

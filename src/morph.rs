@@ -187,6 +187,41 @@ pub struct MorphMasterSnapshot {
     pub shift_block_size: f32,
     pub shift_density: f32,
     pub shift_speed: f32,
+    // B13 small effects. `negative_mode` is a discrete law and recalls an
+    // endpoint at the midpoint; the four angle/hue controls blend on their
+    // shortest wrapped arcs.
+    pub contour: f32,
+    pub contour_bands: f32,
+    pub contour_width: f32,
+    pub contour_hue: f32,
+    pub contour_fill: f32,
+    pub flatten: f32,
+    pub flatten_levels: f32,
+    pub contour_dither: f32,
+    pub solarize: f32,
+    pub negative: f32,
+    pub negative_mode: f32,
+    pub colourpass: f32,
+    pub colourpass_hue: f32,
+    pub colourpass_width: f32,
+    pub edge_amount: f32,
+    pub edge_hue: f32,
+    pub emboss: f32,
+    pub emboss_angle: f32,
+    pub halftone: f32,
+    pub halftone_pitch: f32,
+    pub halftone_angle: f32,
+    pub moire: f32,
+    pub moire_freq: f32,
+    pub row_smear: f32,
+    pub bitcrush: f32,
+    pub bitcrush_levels: f32,
+    pub bitcrush_dither: f32,
+    pub multi_grid_x: f32,
+    pub multi_grid_y: f32,
+    pub barrel: f32,
+    pub chroma_aberration: f32,
+    pub anamorphic_streak: f32,
 }
 
 impl Default for MorphMasterSnapshot {
@@ -232,6 +267,38 @@ impl MorphMasterSnapshot {
             shift_block_size: value.shift_block_size,
             shift_density: value.shift_density,
             shift_speed: value.shift_speed,
+            contour: value.contour,
+            contour_bands: value.contour_bands,
+            contour_width: value.contour_width,
+            contour_hue: value.contour_hue,
+            contour_fill: value.contour_fill,
+            flatten: value.flatten,
+            flatten_levels: value.flatten_levels,
+            contour_dither: value.contour_dither,
+            solarize: value.solarize,
+            negative: value.negative,
+            negative_mode: value.negative_mode,
+            colourpass: value.colourpass,
+            colourpass_hue: value.colourpass_hue,
+            colourpass_width: value.colourpass_width,
+            edge_amount: value.edge_amount,
+            edge_hue: value.edge_hue,
+            emboss: value.emboss,
+            emboss_angle: value.emboss_angle,
+            halftone: value.halftone,
+            halftone_pitch: value.halftone_pitch,
+            halftone_angle: value.halftone_angle,
+            moire: value.moire,
+            moire_freq: value.moire_freq,
+            row_smear: value.row_smear,
+            bitcrush: value.bitcrush,
+            bitcrush_levels: value.bitcrush_levels,
+            bitcrush_dither: value.bitcrush_dither,
+            multi_grid_x: value.multi_grid_x,
+            multi_grid_y: value.multi_grid_y,
+            barrel: value.barrel,
+            chroma_aberration: value.chroma_aberration,
+            anamorphic_streak: value.anamorphic_streak,
         }
         .sanitized()
     }
@@ -279,6 +346,38 @@ impl MorphMasterSnapshot {
             shift_block_size: finite_clamp(self.shift_block_size, 8.0, 2.0, 256.0),
             shift_density: finite_clamp(self.shift_density, 0.5, 0.0, 1.0),
             shift_speed: finite_clamp(self.shift_speed, 3.0, 0.0, 20.0),
+            contour: finite_clamp(self.contour, 0.0, 0.0, 1.0),
+            contour_bands: finite_clamp(self.contour_bands, 10.0, 2.0, 40.0),
+            contour_width: finite_clamp(self.contour_width, 1.2, 0.2, 6.0),
+            contour_hue: finite_clamp(self.contour_hue, 0.0, 0.0, 1.0),
+            contour_fill: finite_clamp(self.contour_fill, 0.25, 0.0, 1.0),
+            flatten: finite_clamp(self.flatten, 0.0, 0.0, 1.0),
+            flatten_levels: finite_clamp(self.flatten_levels, 5.0, 2.0, 16.0),
+            contour_dither: finite_clamp(self.contour_dither, 0.0, 0.0, 1.0),
+            solarize: finite_clamp(self.solarize, 0.0, 0.0, 1.0),
+            negative: finite_clamp(self.negative, 0.0, 0.0, 1.0),
+            negative_mode: discrete_f32(self.negative_mode, 0.0, 2.0),
+            colourpass: finite_clamp(self.colourpass, 0.0, 0.0, 1.0),
+            colourpass_hue: finite_clamp(self.colourpass_hue, 0.0, -180.0, 180.0),
+            colourpass_width: finite_clamp(self.colourpass_width, 0.25, 0.0, 1.0),
+            edge_amount: finite_clamp(self.edge_amount, 0.0, 0.0, 1.0),
+            edge_hue: finite_clamp(self.edge_hue, 0.0, -180.0, 180.0),
+            emboss: finite_clamp(self.emboss, 0.0, 0.0, 1.0),
+            emboss_angle: finite_clamp(self.emboss_angle, 45.0, -180.0, 180.0),
+            halftone: finite_clamp(self.halftone, 0.0, 0.0, 1.0),
+            halftone_pitch: finite_clamp(self.halftone_pitch, 0.4, 0.0, 1.0),
+            halftone_angle: finite_clamp(self.halftone_angle, 0.0, -180.0, 180.0),
+            moire: finite_clamp(self.moire, 0.0, 0.0, 1.0),
+            moire_freq: finite_clamp(self.moire_freq, 0.4, 0.0, 1.0),
+            row_smear: finite_clamp(self.row_smear, 0.0, 0.0, 1.0),
+            bitcrush: finite_clamp(self.bitcrush, 0.0, 0.0, 1.0),
+            bitcrush_levels: finite_clamp(self.bitcrush_levels, 2.0, 2.0, 16.0),
+            bitcrush_dither: finite_clamp(self.bitcrush_dither, 1.0, 0.0, 1.0),
+            multi_grid_x: finite_clamp(self.multi_grid_x, 1.0, 1.0, 8.0),
+            multi_grid_y: finite_clamp(self.multi_grid_y, 1.0, 1.0, 8.0),
+            barrel: finite_clamp(self.barrel, 0.0, -1.0, 1.0),
+            chroma_aberration: finite_clamp(self.chroma_aberration, 0.0, 0.0, 1.0),
+            anamorphic_streak: finite_clamp(self.anamorphic_streak, 0.0, 0.0, 1.0),
         }
     }
 
@@ -320,6 +419,38 @@ impl MorphMasterSnapshot {
         value.shift_block_size = clean.shift_block_size;
         value.shift_density = clean.shift_density;
         value.shift_speed = clean.shift_speed;
+        value.contour = clean.contour;
+        value.contour_bands = clean.contour_bands;
+        value.contour_width = clean.contour_width;
+        value.contour_hue = clean.contour_hue;
+        value.contour_fill = clean.contour_fill;
+        value.flatten = clean.flatten;
+        value.flatten_levels = clean.flatten_levels;
+        value.contour_dither = clean.contour_dither;
+        value.solarize = clean.solarize;
+        value.negative = clean.negative;
+        value.negative_mode = clean.negative_mode;
+        value.colourpass = clean.colourpass;
+        value.colourpass_hue = clean.colourpass_hue;
+        value.colourpass_width = clean.colourpass_width;
+        value.edge_amount = clean.edge_amount;
+        value.edge_hue = clean.edge_hue;
+        value.emboss = clean.emboss;
+        value.emboss_angle = clean.emboss_angle;
+        value.halftone = clean.halftone;
+        value.halftone_pitch = clean.halftone_pitch;
+        value.halftone_angle = clean.halftone_angle;
+        value.moire = clean.moire;
+        value.moire_freq = clean.moire_freq;
+        value.row_smear = clean.row_smear;
+        value.bitcrush = clean.bitcrush;
+        value.bitcrush_levels = clean.bitcrush_levels;
+        value.bitcrush_dither = clean.bitcrush_dither;
+        value.multi_grid_x = clean.multi_grid_x;
+        value.multi_grid_y = clean.multi_grid_y;
+        value.barrel = clean.barrel;
+        value.chroma_aberration = clean.chroma_aberration;
+        value.anamorphic_streak = clean.anamorphic_streak;
     }
 
     fn interpolate(a: &Self, b: &Self, weights: [f32; 2], choose_b: bool) -> Self {
@@ -376,6 +507,38 @@ impl MorphMasterSnapshot {
             shift_block_size: blend_finite(a.shift_block_size, b.shift_block_size, weights),
             shift_density: blend_finite(a.shift_density, b.shift_density, weights),
             shift_speed: blend_finite(a.shift_speed, b.shift_speed, weights),
+            contour: blend_finite(a.contour, b.contour, weights),
+            contour_bands: blend_finite(a.contour_bands, b.contour_bands, weights),
+            contour_width: blend_finite(a.contour_width, b.contour_width, weights),
+            contour_hue: blend_finite(a.contour_hue, b.contour_hue, weights),
+            contour_fill: blend_finite(a.contour_fill, b.contour_fill, weights),
+            flatten: blend_finite(a.flatten, b.flatten, weights),
+            flatten_levels: blend_finite(a.flatten_levels, b.flatten_levels, weights),
+            contour_dither: blend_finite(a.contour_dither, b.contour_dither, weights),
+            solarize: blend_finite(a.solarize, b.solarize, weights),
+            negative: blend_finite(a.negative, b.negative, weights),
+            negative_mode: pick_finite(a.negative_mode, b.negative_mode, choose_b),
+            colourpass: blend_finite(a.colourpass, b.colourpass, weights),
+            colourpass_hue: blend_wrapped_degrees(a.colourpass_hue, b.colourpass_hue, weights),
+            colourpass_width: blend_finite(a.colourpass_width, b.colourpass_width, weights),
+            edge_amount: blend_finite(a.edge_amount, b.edge_amount, weights),
+            edge_hue: blend_wrapped_degrees(a.edge_hue, b.edge_hue, weights),
+            emboss: blend_finite(a.emboss, b.emboss, weights),
+            emboss_angle: blend_wrapped_degrees(a.emboss_angle, b.emboss_angle, weights),
+            halftone: blend_finite(a.halftone, b.halftone, weights),
+            halftone_pitch: blend_finite(a.halftone_pitch, b.halftone_pitch, weights),
+            halftone_angle: blend_wrapped_degrees(a.halftone_angle, b.halftone_angle, weights),
+            moire: blend_finite(a.moire, b.moire, weights),
+            moire_freq: blend_finite(a.moire_freq, b.moire_freq, weights),
+            row_smear: blend_finite(a.row_smear, b.row_smear, weights),
+            bitcrush: blend_finite(a.bitcrush, b.bitcrush, weights),
+            bitcrush_levels: blend_finite(a.bitcrush_levels, b.bitcrush_levels, weights),
+            bitcrush_dither: blend_finite(a.bitcrush_dither, b.bitcrush_dither, weights),
+            multi_grid_x: blend_finite(a.multi_grid_x, b.multi_grid_x, weights),
+            multi_grid_y: blend_finite(a.multi_grid_y, b.multi_grid_y, weights),
+            barrel: blend_finite(a.barrel, b.barrel, weights),
+            chroma_aberration: blend_finite(a.chroma_aberration, b.chroma_aberration, weights),
+            anamorphic_streak: blend_finite(a.anamorphic_streak, b.anamorphic_streak, weights),
         }
         .sanitized()
     }
@@ -3869,6 +4032,7 @@ mod tests {
                 shift_block_size: 256.0,
                 shift_density: 1.0,
                 shift_speed: 20.0,
+                ..MorphMasterSnapshot::default()
             }
         } else {
             MorphMasterSnapshot::default()
@@ -4158,6 +4322,48 @@ mod tests {
             MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).rig,
             b.rig.sanitized()
         );
+    }
+
+    #[test]
+    fn small_effects_morph_blends_values_and_recalls_discrete_laws() {
+        let a = MorphMasterSnapshot {
+            contour: 0.2,
+            colourpass_hue: 170.0,
+            negative_mode: 0.0,
+            bitcrush_levels: 2.0,
+            barrel: -0.4,
+            ..MorphMasterSnapshot::default()
+        };
+        let b = MorphMasterSnapshot {
+            contour: 1.0,
+            colourpass_hue: -170.0,
+            negative_mode: 2.0,
+            bitcrush_levels: 10.0,
+            barrel: 0.4,
+            ..MorphMasterSnapshot::default()
+        };
+
+        let quarter = MorphMasterSnapshot::interpolate(&a, &b, [0.75, 0.25], false);
+        close(quarter.contour, 0.4);
+        close(quarter.bitcrush_levels, 4.0);
+        close(quarter.barrel, -0.2);
+        // The colourpass hue takes the short wrapped arc through 180, not
+        // the long way through zero (which would have landed at 85).
+        close(quarter.colourpass_hue, 175.0);
+        // The discrete negative mode recalls an endpoint at the midpoint.
+        assert_eq!(quarter.negative_mode, 0.0);
+        let past = MorphMasterSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
+        assert_eq!(past.negative_mode, 2.0);
+
+        // Capture/apply carries every B13 field through the uniforms.
+        let mut uniforms = crate::effects::EffectUniforms::default();
+        b.apply_to(&mut uniforms);
+        assert_eq!(uniforms.contour, 1.0);
+        assert_eq!(uniforms.negative_mode, 2.0);
+        assert_eq!(uniforms.bitcrush_levels, 10.0);
+        assert_eq!(uniforms.barrel, 0.4);
+        let recaptured = MorphMasterSnapshot::capture(&uniforms);
+        assert_eq!(recaptured, b.sanitized());
     }
 
     #[test]

@@ -177,6 +177,40 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("gesture_radius", 0.0, 1.0),
     ("gesture_strength", 0.0, 1.0),
     ("gesture_retention", 0.0, 1.0),
+    // B13 small effects: every continuous control is addressable at master
+    // scope. `negative_mode` is a discrete authored law and has no address.
+    ("contour", 0.0, 1.0),
+    ("contour_bands", 2.0, 40.0),
+    ("contour_width", 0.2, 6.0),
+    ("contour_hue", 0.0, 1.0),
+    ("contour_fill", 0.0, 1.0),
+    ("flatten", 0.0, 1.0),
+    ("flatten_levels", 2.0, 16.0),
+    ("contour_dither", 0.0, 1.0),
+    ("solarize", 0.0, 1.0),
+    ("negative", 0.0, 1.0),
+    ("colourpass", 0.0, 1.0),
+    ("colourpass_hue", -180.0, 180.0),
+    ("colourpass_width", 0.0, 1.0),
+    ("edge_amount", 0.0, 1.0),
+    ("edge_hue", -180.0, 180.0),
+    ("emboss", 0.0, 1.0),
+    ("emboss_angle", -180.0, 180.0),
+    ("halftone", 0.0, 1.0),
+    ("halftone_pitch", 0.0, 1.0),
+    ("halftone_angle", -180.0, 180.0),
+    ("moire", 0.0, 1.0),
+    ("moire_freq", 0.0, 1.0),
+    ("row_smear", 0.0, 1.0),
+    ("bitcrush", 0.0, 1.0),
+    ("bitcrush_levels", 2.0, 16.0),
+    ("bitcrush_dither", 0.0, 1.0),
+    ("multi_grid_x", 1.0, 8.0),
+    ("multi_grid_y", 1.0, 8.0),
+    // B13 master-only optics: no layerN_ address exists for these three.
+    ("barrel", -1.0, 1.0),
+    ("chroma_aberration", 0.0, 1.0),
+    ("anamorphic_streak", 0.0, 1.0),
     // The patch-morph crossfader; applied by the app, not apply_offset.
     ("morph", 0.0, 1.0),
 ];
@@ -1571,6 +1605,17 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "motion_field_rate" => Some((-2.0, 2.0)),
         "motion_stretch" | "motion_edge_repel" | "motion_vector_trash" => Some((0.0, 1.0)),
         "motion_trash_block_size" => Some((2.0, 256.0)),
+        // B13 small effects at layer scope. The three optics are master-only
+        // and deliberately absent here.
+        "contour" | "contour_hue" | "contour_fill" | "flatten" | "contour_dither" | "solarize"
+        | "negative" | "colourpass" | "colourpass_width" | "edge_amount" | "emboss"
+        | "halftone" | "halftone_pitch" | "moire" | "moire_freq" | "row_smear" | "bitcrush"
+        | "bitcrush_dither" => Some((0.0, 1.0)),
+        "contour_bands" => Some((2.0, 40.0)),
+        "contour_width" => Some((0.2, 6.0)),
+        "flatten_levels" | "bitcrush_levels" => Some((2.0, 16.0)),
+        "colourpass_hue" | "edge_hue" | "emboss_angle" | "halftone_angle" => Some((-180.0, 180.0)),
+        "multi_grid_x" | "multi_grid_y" => Some((1.0, 8.0)),
         _ => None,
     }
 }
@@ -2697,6 +2742,34 @@ impl ModMatrix {
         apply!(shift_block_size, "shift_block_size", 2.0, 256.0);
         apply!(shift_density, "shift_density", 0.0, 1.0);
         apply!(shift_speed, "shift_speed", 0.0, 20.0);
+        apply!(contour, "contour", 0.0, 1.0);
+        apply!(contour_bands, "contour_bands", 2.0, 40.0);
+        apply!(contour_width, "contour_width", 0.2, 6.0);
+        apply!(contour_hue, "contour_hue", 0.0, 1.0);
+        apply!(contour_fill, "contour_fill", 0.0, 1.0);
+        apply!(flatten, "flatten", 0.0, 1.0);
+        apply!(flatten_levels, "flatten_levels", 2.0, 16.0);
+        apply!(contour_dither, "contour_dither", 0.0, 1.0);
+        apply!(solarize, "solarize", 0.0, 1.0);
+        apply!(negative, "negative", 0.0, 1.0);
+        apply!(colourpass, "colourpass", 0.0, 1.0);
+        apply!(colourpass_hue, "colourpass_hue", -180.0, 180.0);
+        apply!(colourpass_width, "colourpass_width", 0.0, 1.0);
+        apply!(edge_amount, "edge_amount", 0.0, 1.0);
+        apply!(edge_hue, "edge_hue", -180.0, 180.0);
+        apply!(emboss, "emboss", 0.0, 1.0);
+        apply!(emboss_angle, "emboss_angle", -180.0, 180.0);
+        apply!(halftone, "halftone", 0.0, 1.0);
+        apply!(halftone_pitch, "halftone_pitch", 0.0, 1.0);
+        apply!(halftone_angle, "halftone_angle", -180.0, 180.0);
+        apply!(moire, "moire", 0.0, 1.0);
+        apply!(moire_freq, "moire_freq", 0.0, 1.0);
+        apply!(row_smear, "row_smear", 0.0, 1.0);
+        apply!(bitcrush, "bitcrush", 0.0, 1.0);
+        apply!(bitcrush_levels, "bitcrush_levels", 2.0, 16.0);
+        apply!(bitcrush_dither, "bitcrush_dither", 0.0, 1.0);
+        apply!(multi_grid_x, "multi_grid_x", 1.0, 8.0);
+        apply!(multi_grid_y, "multi_grid_y", 1.0, 8.0);
 
         apply_spatial_offsets(&mut transform, offset);
 
@@ -3024,6 +3097,36 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "motion_edge_repel",
     "motion_vector_trash",
     "motion_trash_block_size",
+    // B13 small effects, appended so every established compiled suffix index
+    // remains stable. The three master-only optics are deliberately absent.
+    "contour",
+    "contour_bands",
+    "contour_width",
+    "contour_hue",
+    "contour_fill",
+    "flatten",
+    "flatten_levels",
+    "contour_dither",
+    "solarize",
+    "negative",
+    "colourpass",
+    "colourpass_hue",
+    "colourpass_width",
+    "edge_amount",
+    "edge_hue",
+    "emboss",
+    "emboss_angle",
+    "halftone",
+    "halftone_pitch",
+    "halftone_angle",
+    "moire",
+    "moire_freq",
+    "row_smear",
+    "bitcrush",
+    "bitcrush_levels",
+    "bitcrush_dither",
+    "multi_grid_x",
+    "multi_grid_y",
 ];
 
 impl RoutingOffsets {
@@ -3148,6 +3251,34 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "motion_edge_repel" => 61,
         "motion_vector_trash" => 62,
         "motion_trash_block_size" => 63,
+        "contour" => 64,
+        "contour_bands" => 65,
+        "contour_width" => 66,
+        "contour_hue" => 67,
+        "contour_fill" => 68,
+        "flatten" => 69,
+        "flatten_levels" => 70,
+        "contour_dither" => 71,
+        "solarize" => 72,
+        "negative" => 73,
+        "colourpass" => 74,
+        "colourpass_hue" => 75,
+        "colourpass_width" => 76,
+        "edge_amount" => 77,
+        "edge_hue" => 78,
+        "emboss" => 79,
+        "emboss_angle" => 80,
+        "halftone" => 81,
+        "halftone_pitch" => 82,
+        "halftone_angle" => 83,
+        "moire" => 84,
+        "moire_freq" => 85,
+        "row_smear" => 86,
+        "bitcrush" => 87,
+        "bitcrush_levels" => 88,
+        "bitcrush_dither" => 89,
+        "multi_grid_x" => 90,
+        "multi_grid_y" => 91,
         _ => return None,
     })
 }
@@ -3327,6 +3458,37 @@ fn apply_offset(
         "shift_block_size" => &mut fx.shift_block_size,
         "shift_density" => &mut fx.shift_density,
         "shift_speed" => &mut fx.shift_speed,
+        "contour" => &mut fx.contour,
+        "contour_bands" => &mut fx.contour_bands,
+        "contour_width" => &mut fx.contour_width,
+        "contour_hue" => &mut fx.contour_hue,
+        "contour_fill" => &mut fx.contour_fill,
+        "flatten" => &mut fx.flatten,
+        "flatten_levels" => &mut fx.flatten_levels,
+        "contour_dither" => &mut fx.contour_dither,
+        "solarize" => &mut fx.solarize,
+        "negative" => &mut fx.negative,
+        "colourpass" => &mut fx.colourpass,
+        "colourpass_hue" => &mut fx.colourpass_hue,
+        "colourpass_width" => &mut fx.colourpass_width,
+        "edge_amount" => &mut fx.edge_amount,
+        "edge_hue" => &mut fx.edge_hue,
+        "emboss" => &mut fx.emboss,
+        "emboss_angle" => &mut fx.emboss_angle,
+        "halftone" => &mut fx.halftone,
+        "halftone_pitch" => &mut fx.halftone_pitch,
+        "halftone_angle" => &mut fx.halftone_angle,
+        "moire" => &mut fx.moire,
+        "moire_freq" => &mut fx.moire_freq,
+        "row_smear" => &mut fx.row_smear,
+        "bitcrush" => &mut fx.bitcrush,
+        "bitcrush_levels" => &mut fx.bitcrush_levels,
+        "bitcrush_dither" => &mut fx.bitcrush_dither,
+        "multi_grid_x" => &mut fx.multi_grid_x,
+        "multi_grid_y" => &mut fx.multi_grid_y,
+        "barrel" => &mut fx.barrel,
+        "chroma_aberration" => &mut fx.chroma_aberration,
+        "anamorphic_streak" => &mut fx.anamorphic_streak,
         "ntsc_snow" => &mut np.snow_intensity,
         "ntsc_tracking_snow" => &mut np.tracking_noise_snow,
         "ntsc_edge_wave" => &mut np.edge_wave_intensity,
@@ -3916,6 +4078,88 @@ mod tests {
         let huge = matrix.modulate_layer_full(usize::MAX - 1, &base, &spatial, 1.0, 1.0, 30.0);
         approx(huge.effects.brightness, 1.0);
         approx(base.brightness, 0.0);
+    }
+
+    #[test]
+    fn small_effects_targets_modulate_both_scopes_and_optics_stay_master_only() {
+        // Every continuous B13 control resolves at master scope, the shared
+        // set resolves at layer scope, and the three optics deliberately have
+        // no layer address. The discrete negative mode has no address at all.
+        for (target, range) in [
+            ("contour", (0.0, 1.0)),
+            ("contour_bands", (2.0, 40.0)),
+            ("contour_width", (0.2, 6.0)),
+            ("flatten_levels", (2.0, 16.0)),
+            ("solarize", (0.0, 1.0)),
+            ("colourpass_hue", (-180.0, 180.0)),
+            ("edge_hue", (-180.0, 180.0)),
+            ("emboss_angle", (-180.0, 180.0)),
+            ("halftone_angle", (-180.0, 180.0)),
+            ("bitcrush_levels", (2.0, 16.0)),
+            ("multi_grid_x", (1.0, 8.0)),
+            ("barrel", (-1.0, 1.0)),
+            ("chroma_aberration", (0.0, 1.0)),
+            ("anamorphic_streak", (0.0, 1.0)),
+            ("layer16_contour", (0.0, 1.0)),
+            ("layer16_contour_bands", (2.0, 40.0)),
+            ("layer16_bitcrush_levels", (2.0, 16.0)),
+            ("layer16_multi_grid_y", (1.0, 8.0)),
+            ("layer16_halftone_angle", (-180.0, 180.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+        for absent in [
+            "layer1_barrel",
+            "layer1_chroma_aberration",
+            "layer1_anamorphic_streak",
+            "negative_mode",
+            "layer1_negative_mode",
+        ] {
+            assert_eq!(target_range(absent), None, "{absent} must not resolve");
+        }
+        assert_eq!(TARGETS[TARGETS.len() - 1].0, "morph", "morph stays last");
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        for target in [
+            "solarize",
+            "contour_bands",
+            "colourpass_hue",
+            "multi_grid_x",
+            "barrel",
+            "layer1_bitcrush",
+            "layer1_bitcrush_levels",
+        ] {
+            matrix
+                .routings
+                .push(Routing::new(ModSource::Midi(0), target, 1.0));
+        }
+        matrix.update_at_beat(0.0, 0.0);
+
+        let base = EffectUniforms::default();
+        let (master, _, _, _) = matrix.modulate(
+            &base,
+            &SpatialTransform::default(),
+            &NtscParams::default(),
+            &TemporalParams::default(),
+        );
+        approx(master.solarize, 0.5);
+        approx(master.contour_bands, 29.0);
+        approx(master.colourpass_hue, 180.0);
+        approx(master.multi_grid_x, 4.5);
+        approx(master.barrel, 1.0);
+
+        let layer =
+            matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
+        approx(layer.effects.bitcrush, 0.5);
+        approx(layer.effects.bitcrush_levels, 9.0);
+        // The optics route contributed nothing at layer scope.
+        approx(layer.effects.barrel, 0.0);
+
+        // Bases stay immutable; the route offsets a per-frame copy.
+        approx(base.solarize, 0.0);
+        approx(base.contour_bands, 10.0);
+        approx(base.barrel, 0.0);
     }
 
     #[test]

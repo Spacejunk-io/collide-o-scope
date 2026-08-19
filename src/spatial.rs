@@ -571,8 +571,10 @@ mod tests {
     #[test]
     fn gpu_layout_is_wgsl_uniform_aligned() {
         assert_eq!(std::mem::size_of::<SpatialGpuUniforms>(), 64);
-        assert_eq!(std::mem::size_of::<EffectPassUniforms>(), 224);
-        assert_eq!(std::mem::offset_of!(EffectPassUniforms, spatial), 160);
+        // B13 grew the shared effect block from ten to eighteen vec4s, so the
+        // four spatial slots now pack at byte 288 and the pass is 352 bytes.
+        assert_eq!(std::mem::size_of::<EffectPassUniforms>(), 352);
+        assert_eq!(std::mem::offset_of!(EffectPassUniforms, spatial), 288);
         assert!(std::mem::size_of::<EffectPassUniforms>().is_multiple_of(16));
     }
 

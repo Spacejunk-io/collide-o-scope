@@ -333,6 +333,127 @@
             </div>
           </div>
 
+          <div class="fx-group" data-group="small_fx">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">SMALL FX</span>
+              <button class="group-reset" data-group="small_fx" aria-label="Reset small effects">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row" data-param="contour" data-min="0" data-max="1" data-step="0.01">
+                <label>Contour</label><input type="range" aria-label="Master contour isolines"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="contour_bands" data-min="2" data-max="40" data-step="1">
+                <label>Bands</label><input type="range" aria-label="Master contour bands"><span class="value">10</span>
+              </div>
+              <div class="param-row" data-param="contour_width" data-min="0.2" data-max="6" data-step="0.1">
+                <label>Line Width</label><input type="range" aria-label="Master contour line width"><span class="value">1.2</span>
+              </div>
+              <div class="param-row" data-param="contour_hue" data-min="0" data-max="1" data-step="0.01">
+                <label>Line Hue</label><input type="range" aria-label="Master contour line hue"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="contour_fill" data-min="0" data-max="1" data-step="0.01">
+                <label>Keep Fill</label><input type="range" aria-label="Master contour surviving fill"><span class="value">0.25</span>
+              </div>
+              <div class="param-row" data-param="flatten" data-min="0" data-max="1" data-step="0.01">
+                <label>Flatten</label><input type="range" aria-label="Master luma flatten"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="flatten_levels" data-min="2" data-max="16" data-step="1">
+                <label>Levels</label><input type="range" aria-label="Master flatten levels"><span class="value">5</span>
+              </div>
+              <div class="param-row" data-param="contour_dither" data-min="0" data-max="1" data-step="0.01">
+                <label>Dither</label><input type="range" aria-label="Master flatten ordered dither"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="solarize" data-min="0" data-max="1" data-step="0.01">
+                <label>Solarize</label><input type="range" aria-label="Master solarize"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="negative" data-min="0" data-max="1" data-step="0.01">
+                <label>Negative</label><input type="range" aria-label="Master negative amount"><span class="value">0</span>
+              </div>
+              <div class="param-row select-row" data-param="negative_mode">
+                <label>Neg Mode</label>
+                <select aria-label="Master negative inversion mode">
+                  <option value="0">RGB</option><option value="1">Luma</option><option value="2">Hue Flip</option>
+                </select>
+              </div>
+              <div class="param-row" data-param="colourpass" data-min="0" data-max="1" data-step="0.01">
+                <label>Colourpass</label><input type="range" aria-label="Master colourpass amount"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="colourpass_hue" data-min="-180" data-max="180" data-step="1">
+                <label>Pass Hue</label><input type="range" aria-label="Master colourpass hue"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="colourpass_width" data-min="0" data-max="1" data-step="0.01">
+                <label>Pass Width</label><input type="range" aria-label="Master colourpass window width"><span class="value">0.25</span>
+              </div>
+              <div class="param-row" data-param="edge_amount" data-min="0" data-max="1" data-step="0.01">
+                <label>Find Edge</label><input type="range" aria-label="Master find-edge amount"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="edge_hue" data-min="-180" data-max="180" data-step="1">
+                <label>Edge Hue</label><input type="range" aria-label="Master find-edge hue"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="emboss" data-min="0" data-max="1" data-step="0.01">
+                <label>Emboss</label><input type="range" aria-label="Master emboss amount"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="emboss_angle" data-min="-180" data-max="180" data-step="1">
+                <label>Emboss Dir</label><input type="range" aria-label="Master emboss light direction"><span class="value">45</span>
+              </div>
+              <div class="param-row" data-param="halftone" data-min="0" data-max="1" data-step="0.01">
+                <label>Halftone</label><input type="range" aria-label="Master halftone amount"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="halftone_pitch" data-min="0" data-max="1" data-step="0.01">
+                <label>Dot Pitch</label><input type="range" aria-label="Master halftone dot pitch"><span class="value">0.4</span>
+              </div>
+              <div class="param-row" data-param="halftone_angle" data-min="-180" data-max="180" data-step="1">
+                <label>Dot Angle</label><input type="range" aria-label="Master halftone screen angle"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="moire" data-min="0" data-max="1" data-step="0.01">
+                <label>Moir&#233;</label><input type="range" aria-label="Master moire interference"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="moire_freq" data-min="0" data-max="1" data-step="0.01">
+                <label>Moir&#233; Freq</label><input type="range" aria-label="Master moire grid frequency"><span class="value">0.4</span>
+              </div>
+              <div class="param-row" data-param="row_smear" data-min="0" data-max="1" data-step="0.01">
+                <label>Row Smear</label><input type="range" aria-label="Master row smear"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="bitcrush" data-min="0" data-max="1" data-step="0.01">
+                <label>Bitcrush</label><input type="range" aria-label="Master bitcrush amount"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="bitcrush_levels" data-min="2" data-max="16" data-step="1">
+                <label>Crush Levels</label><input type="range" aria-label="Master bitcrush levels"><span class="value">2</span>
+              </div>
+              <div class="param-row" data-param="bitcrush_dither" data-min="0" data-max="1" data-step="0.01">
+                <label>Crush Dither</label><input type="range" aria-label="Master bitcrush ordered dither"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-param="multi_grid_x" data-min="1" data-max="8" data-step="1">
+                <label>Grid X</label><input type="range" aria-label="Master multi grid tiles across"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-param="multi_grid_y" data-min="1" data-max="8" data-step="1">
+                <label>Grid Y</label><input type="range" aria-label="Master multi grid tiles down"><span class="value">1</span>
+              </div>
+              <div class="audio-status">Every default is the exact prior image. The negative mode is a discrete law; everything else modulates.</div>
+            </div>
+          </div>
+
+          <div class="fx-group" data-group="optics">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">OPTICS (MASTER ONLY)</span>
+              <button class="group-reset" data-group="optics" aria-label="Reset master optics">reset</button>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row" data-param="barrel" data-min="-1" data-max="1" data-step="0.01">
+                <label>Barrel</label><input type="range" aria-label="Master barrel distortion"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="chroma_aberration" data-min="0" data-max="1" data-step="0.01">
+                <label>Lens Fringe</label><input type="range" aria-label="Master chromatic aberration"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-param="anamorphic_streak" data-min="0" data-max="1" data-step="0.01">
+                <label>Anamorphic</label><input type="range" aria-label="Master anamorphic streak"><span class="value">0</span>
+              </div>
+              <div class="audio-status">The lens in front of the program. These three exist only at master scope.</div>
+            </div>
+          </div>
+
           <div class="fx-group" data-group="analog">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>
