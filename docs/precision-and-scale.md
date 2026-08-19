@@ -24,6 +24,49 @@ The production minimum proof uses 1,920 × 1,080 = 2,073,600 pixels, eight RGBA1
 | Exact fixture total | 340,082,688 bytes (324.328125 MiB) | 547,442,688 bytes (522.082031 MiB) |
 | Exact increase | — | 207,360,000 bytes (197.753906 MiB) |
 
+### Full-16 history candidate measurement
+
+The Gate 6 commission opened the missing half of the candidate row above: an
+experimental render path to measure. `CompositionHost::new_with_history_storage`
+widens exactly the 25-layer temporal class — the 24-layer clean-history ring
+and the recursive feedback image — to RGBA16Float, leaving working, present,
+dither, and every consumer shader untouched. Because the class is written only
+by render passes (the no-dither conversion pipeline) and read only by texture
+loads, both storages present identical *linear* values to every consumer:
+sRGB8 encodes on write and decodes on read, f16 carries linear directly, so
+the candidate changes quantization, never value domain. The path is
+**measurement-only**: it is constructed by the receipt fixture alone, has no
+wire action, no patch field, and no production call site, and the settled
+`AdvancedWorking16HistoryCompat8` default has not moved — the production
+constructor delegates with Compat8 and the M6 receipt's pinned output SHAs
+hold across the change.
+
+The measurement lives in the tracked
+[`full16-history-candidate-receipt.json`](evidence/full16-history-candidate-receipt.json),
+regenerated in place by the opt-in fixture on the receipt adapter
+(AMD Radeon RX 6950 XT / Vulkan, 192×108, production device request). Two
+lanes, each against an analytic f32 reference no candidate output touches:
+
+| Lane | Metric | Settled Compat8 history | Full-16 candidate |
+| --- | --- | ---: | ---: |
+| Clean-history storage fidelity | RMSE | 0.0005051289 | 0.0000147806 |
+| | Max absolute error | 0.0037157834 | 0.0001202226 |
+| | Retained gradients | 10,312 / 11,506 | 11,506 / 11,506 |
+| Feedback recursion (12 frames) | RMSE | 0.0000903414 | 0.0000216753 |
+| | Max absolute error | 0.0030384660 | 0.0003659725 |
+| | Retained gradients | 11,949 / 11,949 | 11,949 / 11,949 |
+
+The documented result: a measured objective gain at a measured cost — the
+`ArtisticGainAssessment` verdict is "resource or metric tradeoff" on both
+lanes, its exact phrase for improvement that is not free. Ring storage error
+falls roughly 34× and the settled ring demonstrably loses 1,194 of 11,506
+real reference gradients to 8-bit quantization that the candidate retains in
+full; accumulated feedback error falls roughly 4×. The cost is the exact
+delta in the candidate table above: +207,360,000 bytes (197.753906 MiB) at
+1080p, all 25 temporal surfaces, nothing else. Whether that trade is worth
+paying live remains a product decision this measurement now informs; the
+candidate stays evaluation-only until it is made.
+
 Eight is the minimum executor topology, not a universal constant: accepted N-1 Program history, rack/image taps, and other planned surfaces increase the creative allocation explicitly. `CompositionAllocationSnapshot` reports accepted creative and motion bytes; selective NTSC reports two RGBA8 scratch textures plus its current staging capacity only after allocation; composition staging and readback report their actual capacities. `RuntimeResourceLedger::reconcile` uses checked arithmetic across creative, motion, NTSC, staging, and readback, requires planned creative bytes to equal the physical allocation snapshot, and has an exact proof that a cap one byte below the computed total is rejected.
 
 Advanced premultiplied bilinear lookups are four explicit shader texture loads. Descriptor admission charges all four operations while retaining separate frozen limits of 32 logical lookups per rack and 1,024 per frame; explicit shader-operation limits are 128 and 4,096. An eight-node worst-case Advanced rack is accepted at exactly 32 logical lookups and 128 shader operations. A frame at exactly 1,024 logical lookups is accepted and 1,025 is rejected; 86 LegacyCanonical-only racks are also rejected at 1,032. The accounting neither disguises four loads as one sample nor grants Legacy/mixed plans four times the former logical budget.

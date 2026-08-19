@@ -1989,7 +1989,16 @@ mislead browser tests.
   `gpu_precision_receipt_measures_real_still_and_temporal_workloads` plus its
   premultiplied-edge, temporal-feedback, LegacyExact-spatial, and 24/30/60
   temporal parity companions. Keep the adapter/backend, exact command, source
-  manifest, and receipt hash with any claim.
+  manifest, and receipt hash with any claim. The Gate 6 Full-16 history
+  candidate uses
+  `gpu_full16_history_candidate_measures_temporal_gain_and_writes_the_receipt`,
+  which regenerates the tracked
+  `docs/evidence/full16-history-candidate-receipt.json` in place — the
+  S2-receipt law applies: a changed receipt after an opt-in run is a new
+  measurement, commit it. The hosted
+  `full16_history_plan_charges_eight_bytes_per_temporal_pixel_and_discriminates`
+  pins the candidate plan's 8-byte temporal class against the settled 4-byte
+  one in both directions with one-byte-under rejection.
 - `s2-eight-texture-floor-receipt.json` is a tracked artifact that the probe in
   `tests/eight_texture_floor_probe.rs` regenerates in place. It is tracked
   because `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS` and the Symmetry Field's
@@ -2309,6 +2318,20 @@ a passing claim.
   Unix CI FFmpeg build carries `--disable-programs`, so end-to-end encode
   fixtures are opt-in like `effects_audit` and hosted CI proves the
   CLI-free cache half only.
+- `ExperimentalFull16History` now has an implemented render path, but it is
+  **measurement-only**: `CompositionHost::new_with_history_storage` widens
+  exactly the 25-layer temporal class (ring plus feedback) to RGBA16Float, is
+  constructed by the Gate 6 receipt fixture alone, and has no wire action, no
+  patch field, no env toggle, and no production call site. The settled
+  `AdvancedWorking16HistoryCompat8` default has not moved — the production
+  `CompositionHost::new` delegates with `Compat8` and the M6 receipt's pinned
+  output SHAs prove byte identity. Because the ring and feedback are written
+  only by render passes and read only by texture loads, both storages present
+  identical linear values to every consumer; the candidate changes
+  quantization, never value domain, and no consumer shader changed. The
+  Symmetry-Field section's prohibition on a *new* RGBA16F full-frame history
+  ring is untouched: the candidate widens the existing ring under the
+  documented budget, it does not add a second one.
 - The Symmetry Field's eight-texture single pass is a *floor* claim resting on
   the S2 receipt's enforced-cap argument, measured on one adapter and one
   backend. It is a capability claim only, not performance, bandwidth, or cache
