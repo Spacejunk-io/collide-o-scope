@@ -640,11 +640,84 @@
               <div class="param-row" data-temporal="fb_rotate" data-min="-5" data-max="5" data-step="0.1">
                 <label>FB Rotate</label><input type="range"><span class="value">0</span>
               </div>
+              <div class="param-row" data-temporal="fb_offset_x" data-min="-0.5" data-max="0.5" data-step="0.005">
+                <label>FB Offset X</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="fb_offset_y" data-min="-0.5" data-max="0.5" data-step="0.005">
+                <label>FB Offset Y</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row toggle-row" data-temporal="fb_reflect_x">
+                <label>FB Reflect X</label><label class="toggle"><input type="checkbox" aria-label="Feedback reflect X"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" data-temporal="fb_reflect_y">
+                <label>FB Reflect Y</label><label class="toggle"><input type="checkbox" aria-label="Feedback reflect Y"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row" data-temporal="fb_hue_rotate" data-min="-180" data-max="180" data-step="1">
+                <label>FB Hue</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="fb_saturation" data-min="0" data-max="2" data-step="0.01">
+                <label>FB Saturation</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-temporal="fb_gain_r" data-min="0" data-max="2" data-step="0.01">
+                <label>FB Gain R</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-temporal="fb_gain_g" data-min="0" data-max="2" data-step="0.01">
+                <label>FB Gain G</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-temporal="fb_gain_b" data-min="0" data-max="2" data-step="0.01">
+                <label>FB Gain B</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-temporal="fb_chroma_displace" data-min="0" data-max="0.05" data-step="0.001">
+                <label>FB Chroma</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="fb_blur" data-min="0" data-max="1" data-step="0.01">
+                <label>FB Blur</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="fb_sharpen" data-min="0" data-max="2" data-step="0.01">
+                <label>FB Sharpen</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row select-row" data-temporal="fb_shape">
+                <label>FB Shape</label>
+                <select aria-label="Feedback waveshaper"><option value="clamp">Clamp</option><option value="soft">Soft</option><option value="wrap">Wrap</option><option value="fold">Fold</option></select>
+              </div>
+              <div class="param-row" data-temporal="fb_drive" data-min="0.25" data-max="4" data-step="0.01">
+                <label>FB Drive</label><input type="range"><span class="value">1</span>
+              </div>
+              <div class="param-row" data-temporal="fb_pivot" data-min="0" data-max="1" data-step="0.01">
+                <label>FB Pivot</label><input type="range"><span class="value">0.5</span>
+              </div>
+              <div class="param-row" data-temporal="fb_threshold" data-min="0" data-max="1" data-step="0.01">
+                <label>FB Threshold</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-temporal="fb_noise" data-min="0" data-max="1" data-step="0.01">
+                <label>FB Noise</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row select-row" data-temporal="fb_edge">
+                <label>FB Edge</label>
+                <select aria-label="Feedback edge law"><option value="transparent">Transparent</option><option value="mirror">Mirror</option><option value="wrap">Wrap</option><option value="hold">Hold</option></select>
+              </div>
+              <div class="param-row toggle-row" data-temporal="fb_servo">
+                <label>FB Servo</label><label class="toggle"><input type="checkbox" aria-label="Feedback auto-level servo"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" data-temporal="fb_servo_defeated">
+                <label>Servo Defeat</label><label class="toggle"><input type="checkbox" aria-label="Feedback servo defeated"><span class="toggle-slider"></span></label>
+              </div>
               <div class="param-row" data-temporal="slitscan" data-min="0" data-max="1" data-step="0.01">
                 <label>Slit-Scan</label><input type="range"><span class="value">0</span>
               </div>
               <div class="param-row" data-temporal="slit_angle" data-min="-180" data-max="180" data-step="1">
                 <label>Slit Angle</label><input type="range"><span class="value">0°</span>
+              </div>
+              <div class="param-row select-row" data-temporal="slit_map">
+                <label>Time Map</label>
+                <select aria-label="Slit-scan time-displace map">
+                  <option value="ramp">Ramp</option><option value="brightness">Brightness</option>
+                  <option value="radial">Radial</option><option value="tbc_ramp">TBC Ramp</option>
+                  <option value="sweep">Sweep</option>
+                </select>
+              </div>
+              <div class="param-row toggle-row" data-temporal="slit_interp">
+                <label>Time Interp</label><label class="toggle"><input type="checkbox" aria-label="Slit-scan time interpolation"><span class="toggle-slider"></span></label>
               </div>
               <div class="param-row select-row" data-temporal="key_mode">
                 <label>History Key</label>

@@ -102,6 +102,22 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("temporal_slitscan", 0.0, 1.0),
     ("temporal_fb_zoom", 0.9, 1.1),
     ("temporal_fb_rotate", -5.0, 5.0),
+    // B3 feedback rig: the fourteen continuous in-loop controls. Reflections,
+    // shape, edge, and the servo switches are discrete authored state.
+    ("temporal_fb_offset_x", -0.5, 0.5),
+    ("temporal_fb_offset_y", -0.5, 0.5),
+    ("temporal_fb_hue_rotate", -180.0, 180.0),
+    ("temporal_fb_saturation", 0.0, 2.0),
+    ("temporal_fb_gain_r", 0.0, 2.0),
+    ("temporal_fb_gain_g", 0.0, 2.0),
+    ("temporal_fb_gain_b", 0.0, 2.0),
+    ("temporal_fb_chroma_displace", 0.0, 0.05),
+    ("temporal_fb_blur", 0.0, 1.0),
+    ("temporal_fb_sharpen", 0.0, 2.0),
+    ("temporal_fb_drive", 0.25, 4.0),
+    ("temporal_fb_pivot", 0.0, 1.0),
+    ("temporal_fb_threshold", 0.0, 1.0),
+    ("temporal_fb_noise", 0.0, 1.0),
     ("temporal_slit_angle", -180.0, 180.0),
     ("temporal_key_threshold", 0.0, 1.0),
     ("temporal_key_softness", 0.0, 0.5),
@@ -3327,6 +3343,20 @@ fn apply_offset(
         "temporal_slitscan" => &mut tp.slitscan,
         "temporal_fb_zoom" => &mut tp.fb_zoom,
         "temporal_fb_rotate" => &mut tp.fb_rotate,
+        "temporal_fb_offset_x" => &mut tp.rig.offset_x,
+        "temporal_fb_offset_y" => &mut tp.rig.offset_y,
+        "temporal_fb_hue_rotate" => &mut tp.rig.hue_rotate,
+        "temporal_fb_saturation" => &mut tp.rig.saturation,
+        "temporal_fb_gain_r" => &mut tp.rig.gain_r,
+        "temporal_fb_gain_g" => &mut tp.rig.gain_g,
+        "temporal_fb_gain_b" => &mut tp.rig.gain_b,
+        "temporal_fb_chroma_displace" => &mut tp.rig.chroma_displace,
+        "temporal_fb_blur" => &mut tp.rig.blur,
+        "temporal_fb_sharpen" => &mut tp.rig.sharpen,
+        "temporal_fb_drive" => &mut tp.rig.drive,
+        "temporal_fb_pivot" => &mut tp.rig.pivot,
+        "temporal_fb_threshold" => &mut tp.rig.threshold,
+        "temporal_fb_noise" => &mut tp.rig.noise,
         "temporal_slit_angle" => &mut tp.slit_angle,
         "temporal_key_threshold" => &mut tp.key_threshold,
         "temporal_key_softness" => &mut tp.key_softness,
@@ -4191,6 +4221,64 @@ mod tests {
             matrix.modulate_layer_full(0, &base, &SpatialTransform::default(), 1.0, 1.0, 30.0);
         approx(layer.fps, 149.5);
         approx(base.key_threshold, EffectUniforms::default().key_threshold);
+    }
+
+    #[test]
+    fn temporal_rig_modulation_is_bounded_and_leaves_discrete_laws_untouched() {
+        for (target, range) in [
+            ("temporal_fb_offset_x", (-0.5, 0.5)),
+            ("temporal_fb_offset_y", (-0.5, 0.5)),
+            ("temporal_fb_hue_rotate", (-180.0, 180.0)),
+            ("temporal_fb_saturation", (0.0, 2.0)),
+            ("temporal_fb_gain_r", (0.0, 2.0)),
+            ("temporal_fb_gain_g", (0.0, 2.0)),
+            ("temporal_fb_gain_b", (0.0, 2.0)),
+            ("temporal_fb_chroma_displace", (0.0, 0.05)),
+            ("temporal_fb_blur", (0.0, 1.0)),
+            ("temporal_fb_sharpen", (0.0, 2.0)),
+            ("temporal_fb_drive", (0.25, 4.0)),
+            ("temporal_fb_pivot", (0.0, 1.0)),
+            ("temporal_fb_threshold", (0.0, 1.0)),
+            ("temporal_fb_noise", (0.0, 1.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+        for discrete in [
+            "temporal_fb_reflect_x",
+            "temporal_fb_reflect_y",
+            "temporal_fb_shape",
+            "temporal_fb_edge",
+            "temporal_fb_servo",
+            "temporal_fb_servo_defeated",
+        ] {
+            assert_eq!(target_range(discrete), None, "{discrete}");
+        }
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = [
+            ("temporal_fb_hue_rotate", 0.5),
+            ("temporal_fb_gain_r", 1.0),
+            ("temporal_fb_drive", 1.0),
+        ]
+        .into_iter()
+        .map(|(target, depth)| Routing::new(ModSource::Midi(0), target, depth))
+        .collect();
+        matrix.update_at_beat(0.0, 0.0);
+        let frame = matrix.frame(0);
+        let (_fx, _spatial, _np, tp) = frame.modulate(
+            &crate::effects::EffectUniforms::default(),
+            &crate::spatial::SpatialTransform::default(),
+            &crate::ntsc::NtscParams::default(),
+            &crate::effects::params::TemporalParams::default(),
+        );
+        approx(tp.rig.hue_rotate, 90.0);
+        approx(tp.rig.gain_r, 2.0);
+        approx(tp.rig.drive, 1.0 + (4.0 - 0.25) * 0.5);
+        // Discrete rig state never moves under modulation.
+        assert!(!tp.rig.reflect_x);
+        assert_eq!(tp.rig.shape, crate::effects::params::FeedbackShape::Clamp);
+        assert!(!tp.rig.servo);
     }
 
     #[test]

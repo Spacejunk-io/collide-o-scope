@@ -2082,6 +2082,12 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
     slider.step = step;
     const defaults = {
       fb_zoom: 1,
+      fb_saturation: 1,
+      fb_gain_r: 1,
+      fb_gain_g: 1,
+      fb_gain_b: 1,
+      fb_drive: 1,
+      fb_pivot: 0.5,
       key_threshold: 0.1,
       key_softness: 0.03,
       key_history: 1,
@@ -2224,12 +2230,35 @@ function syncTemporal(t) {
   const garden = originals.garden || {};
   const score = originals.score || {};
   const reset = originals.reset || {};
+  const rig = t.rig || {};
   const values = {
     feedback: t.feedback,
     fb_zoom: t.fb_zoom,
     fb_rotate: t.fb_rotate,
+    fb_offset_x: rig.offset_x,
+    fb_offset_y: rig.offset_y,
+    fb_reflect_x: rig.reflect_x,
+    fb_reflect_y: rig.reflect_y,
+    fb_hue_rotate: rig.hue_rotate,
+    fb_saturation: rig.saturation,
+    fb_gain_r: rig.gain_r,
+    fb_gain_g: rig.gain_g,
+    fb_gain_b: rig.gain_b,
+    fb_chroma_displace: rig.chroma_displace,
+    fb_blur: rig.blur,
+    fb_sharpen: rig.sharpen,
+    fb_shape: rig.shape,
+    fb_drive: rig.drive,
+    fb_pivot: rig.pivot,
+    fb_threshold: rig.threshold,
+    fb_noise: rig.noise,
+    fb_edge: rig.edge,
+    fb_servo: rig.servo,
+    fb_servo_defeated: rig.servo_defeated,
     slitscan: t.slitscan,
     slit_angle: t.slit_angle,
+    slit_map: t.slit_map,
+    slit_interp: t.slit_interp,
     key_mode: t.key_mode,
     key_threshold: t.key_threshold,
     key_softness: t.key_softness,

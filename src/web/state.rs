@@ -2102,6 +2102,12 @@ pub struct TemporalSnapshot {
     #[serde(default)]
     pub slit_angle: f32,
     pub slit_axis: f32,
+    /// Additive B12 time-displace map token; absent means the exact `ramp`.
+    #[serde(default = "default_time_displace_map")]
+    pub slit_map: String,
+    /// Additive B12 interpolation toggle; absent means the banded floor law.
+    #[serde(default)]
+    pub slit_interp: bool,
     #[serde(default)]
     pub key_mode: u32,
     #[serde(default = "default_temporal_key_threshold")]
@@ -2113,6 +2119,9 @@ pub struct TemporalSnapshot {
     /// Additive M3 authoring state. Every default is an exact no-op.
     #[serde(default)]
     pub originals: TemporalOriginalsSnapshot,
+    /// Additive B3 feedback rig. The default is the exact historical path.
+    #[serde(default)]
+    pub rig: TemporalRigSnapshot,
     /// Read-only renderer truth. Main fills this DTO when the active executor
     /// exposes metrics; older/exact paths safely report the zero placeholder.
     #[serde(default)]
@@ -2371,6 +2380,10 @@ fn default_temporal_key_threshold() -> f32 {
     0.1
 }
 
+fn default_time_displace_map() -> String {
+    "ramp".into()
+}
+
 fn default_temporal_key_softness() -> f32 {
     0.03
 }
@@ -2388,12 +2401,88 @@ impl Default for TemporalSnapshot {
             slitscan: 0.0,
             slit_angle: 0.0,
             slit_axis: 0.0,
+            slit_map: default_time_displace_map(),
+            slit_interp: false,
             key_mode: 0,
             key_threshold: default_temporal_key_threshold(),
             key_softness: default_temporal_key_softness(),
             key_history: default_temporal_key_history(),
             originals: TemporalOriginalsSnapshot::default(),
+            rig: TemporalRigSnapshot::default(),
             telemetry: TemporalTelemetrySnapshot::default(),
+        }
+    }
+}
+
+/// The B3 feedback rig as the browser sees it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TemporalRigSnapshot {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub reflect_x: bool,
+    pub reflect_y: bool,
+    pub hue_rotate: f32,
+    pub saturation: f32,
+    pub gain_r: f32,
+    pub gain_g: f32,
+    pub gain_b: f32,
+    pub chroma_displace: f32,
+    pub blur: f32,
+    pub sharpen: f32,
+    pub shape: String,
+    pub drive: f32,
+    pub pivot: f32,
+    pub threshold: f32,
+    pub noise: f32,
+    pub edge: String,
+    pub servo: bool,
+    pub servo_defeated: bool,
+}
+
+impl Default for TemporalRigSnapshot {
+    fn default() -> Self {
+        Self::from_params(crate::effects::params::FeedbackRigParams::default())
+    }
+}
+
+impl TemporalRigSnapshot {
+    fn from_params(rig: crate::effects::params::FeedbackRigParams) -> Self {
+        use crate::effects::params::FeedbackShape;
+        use crate::motion::MotionBoundaryMode;
+        let rig = rig.sanitized();
+        Self {
+            offset_x: rig.offset_x,
+            offset_y: rig.offset_y,
+            reflect_x: rig.reflect_x,
+            reflect_y: rig.reflect_y,
+            hue_rotate: rig.hue_rotate,
+            saturation: rig.saturation,
+            gain_r: rig.gain_r,
+            gain_g: rig.gain_g,
+            gain_b: rig.gain_b,
+            chroma_displace: rig.chroma_displace,
+            blur: rig.blur,
+            sharpen: rig.sharpen,
+            shape: match rig.shape {
+                FeedbackShape::Clamp => "clamp",
+                FeedbackShape::Soft => "soft",
+                FeedbackShape::Wrap => "wrap",
+                FeedbackShape::Fold => "fold",
+            }
+            .into(),
+            drive: rig.drive,
+            pivot: rig.pivot,
+            threshold: rig.threshold,
+            noise: rig.noise,
+            edge: match rig.edge {
+                MotionBoundaryMode::Transparent => "transparent",
+                MotionBoundaryMode::Mirror => "mirror",
+                MotionBoundaryMode::Wrap => "wrap",
+                MotionBoundaryMode::Hold => "hold",
+            }
+            .into(),
+            servo: rig.servo,
+            servo_defeated: rig.servo_defeated,
         }
     }
 }
@@ -2402,6 +2491,7 @@ impl TemporalSnapshot {
     pub fn from_params(p: &crate::effects::params::TemporalParams) -> Self {
         use crate::effects::params::{
             CollisionScoreTrigger, RefreshGardenGate, TemporalInterpolation, TemporalTopology,
+            TimeDisplaceMap,
         };
         use crate::temporal::{
             CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
@@ -2419,6 +2509,13 @@ impl TemporalSnapshot {
         let interpolation = match p.originals.loom.interpolation {
             TemporalInterpolation::Floor => "floor",
             TemporalInterpolation::Linear => "linear",
+        };
+        let slit_map = match p.slit_map {
+            TimeDisplaceMap::Ramp => "ramp",
+            TimeDisplaceMap::Brightness => "brightness",
+            TimeDisplaceMap::Radial => "radial",
+            TimeDisplaceMap::TbcRamp => "tbc_ramp",
+            TimeDisplaceMap::Sweep => "sweep",
         };
         let gate = match p.originals.garden.gate {
             RefreshGardenGate::TemporalDelta => "temporal_delta",
@@ -2498,10 +2595,13 @@ impl TemporalSnapshot {
             slitscan: p.slitscan,
             slit_angle: p.slit_angle,
             slit_axis: p.slit_axis,
+            slit_map: slit_map.into(),
+            slit_interp: p.slit_interp,
             key_mode: p.key_mode.round().clamp(0.0, 4.0) as u32,
             key_threshold: p.key_threshold,
             key_softness: p.key_softness,
             key_history: p.key_history,
+            rig: TemporalRigSnapshot::from_params(p.rig),
             originals: TemporalOriginalsSnapshot {
                 loom: TemporalLoomSnapshot {
                     amount: p.originals.loom.amount,
@@ -7021,7 +7121,7 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 103);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 117);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [

@@ -34,7 +34,7 @@ src/
 ├── transform_gizmo.rs   preview-only direct manipulation of that same transform
 ├── motion.rs            canonical codec/lattice/procedural fields, Motion authoring, Field Collider, resource preflight
 ├── symmetry.rs          closed symmetry groups, 32-sector table, 1,024-byte uniform
-├── temporal.rs          Loom/Atlas/Garden/Score state, events, resets, commit/discard
+├── temporal.rs          Loom/Atlas/Garden/Score state, feedback rig, events, resets, commit/discard
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
@@ -701,6 +701,130 @@ established Temporal path.
 
 Live rendering passes elapsed dt; export passes frame-index-derived dt. Keep
 the shader uniform layout tests current when changing temporal uniforms.
+
+### The B3 feedback rig
+
+`FeedbackRigParams` on `TemporalParams` is everything the loop does to the
+fed-back sample beyond the frozen zoom/rotate/retention trio: per-tick offset,
+the two discrete reflections (the regime no rotation can reach), in-loop hue
+rotation / saturation / per-channel gain, chromatic displacement of the
+lookup, the blur+sharpen activator–inhibitor pair over fixed two-texel cross
+taps, the `FeedbackShape` waveshaper (`Clamp | Soft | Wrap | Fold`, permanent
+codes 0–3, `Clamp` at drive 1 the identity) with drive/pivot, a threshold that
+decays sub-threshold light out of the loop, deterministic loop noise on the
+shared `cellular_avalanche` hash keyed by pixel and 30 Hz reference tick, an
+`fb_edge` boundary law on the frozen program-wide
+`Transparent = 0, Mirror = 1, Wrap = 2, Hold = 3` numbering (`Transparent` is
+the exact historical inside test), and the servo.
+
+**Identity is the exact prior path.** The rig rides its own 96-byte
+`TemporalRigGpuUniforms` third fixed binding — the legacy 64-byte uniform and
+its byte golden are untouched — and the shader's activity flag answers from
+the *authored* identity, so a default patch executes the historical feedback
+expression byte for byte in both variants of both temporal shaders. That
+exactness is proven three ways: the startup pixel goldens, the M6 receipt's
+six output SHAs (unchanged under the re-pinned shader-bundle digest), and a
+decoded-frame-identical cross-build A/B of an unrigged labeled export case.
+
+**Rate law.** Rate-like controls (offset, hue, chroma displace, blur, sharpen,
+noise) scale linearly per 1/30-second reference tick; multiplicative controls
+(saturation, gains) exponentiate, the `feedback`/`fb_zoom` law; the nonlinear
+stage and the servo mix toward identity by the clamped tick fraction
+(`rig_tick_mix`), exact at the 30 Hz reference. The loop's gains may exceed
+unity — that is what the servo is for. The servo is deliberately a
+**deterministic per-pixel compressive auto-level**, not a measured-mean loop:
+a readback-driven servo would give live and export different dynamics, which
+the export contract forbids. `servo_defeated` wins over engage — defeated, the
+loop may run to white or black and stay there (B14's philosophy, landed
+here). The rig hangs off an active `feedback`; with feedback zero there is no
+loop to shape.
+
+**Refresh Garden keeps its frozen carrier law.** In the originals shader the
+shared carrier read serves Garden and the rig-inactive feedback; an active rig
+takes its own transformed read so Garden's bounded identity/warp law never
+changes. The shared-read predicate narrows to `garden || (feedback && !rig)`,
+which simplifies to the original at rig identity. The rig's extra reads (one
+base + two chromatic + four cross taps, each gated by its own authored
+amount) are counted in the shader-contract test, and the frozen
+`temporal.wgsl` SHA was re-pinned for the change.
+
+**CPU reference and regime proof.** `temporal::feedback_rig_resolve` and
+`feedback_rig_grade` are the law the shaders follow expression for expression.
+The regime fixtures run a low-resolution CPU loop: a quarter-turn-per-frame
+rotation locks an impulse into four arms carrying the analytic retention
+powers, detune shears them off, reflection produces the two-cycle alternating
+regime no rotation reaches, and the servo bounds a gain-2 loop that runs away
+monotonically when defeated.
+
+**Closure.** Patch: `TemporalRigConfig` is skip-serialized at identity, so
+pre-B3 patches keep their bytes and canonical hashes; hostile scalars sanitize
+to neutral values and unknown fields are rejected. Wire: eighteen `fb_*`
+params on the ordinary coalescible `set_temporal` (both validators plus the
+applier agree on ranges and tokens). Snapshot: an additive `rig` block. Morph:
+continuous values blend, the in-loop hue on its wrapped arc, and reflections,
+shape, edge, and both servo switches recall an endpoint at the midpoint.
+Modulation adds fourteen `temporal_fb_*` continuous addresses (inserted
+before `morph`, which stays last); the six discrete laws have none. The
+generator mutates the fourteen continuous values in fresh per-field domains
+(`mutate_temporal_rig`), never the discrete laws; live Dice continues not to
+touch legacy temporal at all. Export rides `TemporalConfig::to_params` and
+the shared plan; `render_feedback_rig_pipeline` is the labeled export case —
+it renders an `_unrigged` twin (decoded frames must differ) and a repeat
+(decoded frames must match), so reach and determinism are both measured.
+
+### B12 time-displace maps
+
+Slit-scan's map is the instrument. `TimeDisplaceMap` on `TemporalParams` is a
+closed vocabulary with permanent codes 0–4 — `Ramp` (the exact existing angle
+path, default), `Brightness` (the current sample's alpha-covered Rec.709 luma:
+bright things lag dark ones), `Radial` (aspect-correct distance from centre,
+reach 1.6), `TbcRamp` (a sawtooth over each 8-scanline group,
+`fract(uv.y · height / 8)` — per-line by design, so different output heights
+legitimately band differently), and `Sweep` (a wrapped horizontal ramp
+travelling one full crossing per 600 reference ticks — 20 s at 30 Hz, fixed
+law, phase from the same accumulated `total_reference_ticks` the rig's noise
+epoch uses, so Freeze holds it and export replays it structurally).
+`slit_interp: bool` selects linear interpolation between the two adjacent ring
+layers; off is the exact banded floor law. The vocabulary is derived from
+BENDR (MIT, © 2026 Steve Blythe); every law is a rewrite. The CPU reference is
+`temporal::time_displace_coord` plus `time_displace_sweep_phase`, followed by
+the shader expression for expression.
+
+**Identity is the frozen legacy shader.** `TemporalParams::time_displace_active`
+(slit-scan on ∧ (non-Ramp map ∨ interp)) joins `originals.is_zero()` in the
+plan's `originals_shader_active` predicate, so a non-default B12 state runs in
+`temporal_originals.wgsl` — the same seam Loom/Atlas/Garden use — and
+`temporal.wgsl` was not edited: its pinned SHA did not move and the authored
+default keeps executing the frozen legacy shader byte for byte. Within the
+originals shader, Ramp+floor routes through `history_age_sample` with layer
+arithmetic identical to the removed inline read, so an already-active Loom
+patch with default slit state is also pixel-exact. The Advanced host's
+pre-Garden originals predicate answers to the slit lanes only while slit-scan
+is active, mirroring the plan predicate.
+
+**Ledger: zero new surfaces, zero new uniform bytes, ≤ 1 extra history load
+per pixel.** The map code and interp flag ride the two reserved
+`loom_geometry` lanes; the sweep phase rides a reserved `atlas_values` lane
+and is populated only when Sweep is authored, so a default patch's uniform
+bytes never vary with the tick counter. Depth clamps against the
+valid-history counter exactly as History Key does — both slit blocks read
+history only through the age helpers whose age 0 is the virtual current
+image. Ring depth stays 24.
+
+**Closure.** Patch: `slit_map`/`slit_interp` on `TemporalConfig`,
+skip-serialized at default so pre-B12 patches keep their bytes and canonical
+hashes; an unknown map token is a deserialization rejection. Wire: both fields
+ride the ordinary coalescible `set_temporal` (`slit_map` as the closed token
+vocabulary `ramp | brightness | radial | tbc_ramp | sweep`, `slit_interp` as a
+boolean), validated in both validators plus the applier. Snapshot: additive
+`slit_map`/`slit_interp` fields defaulting to the exact prior path. Panel: a
+select and a toggle beside the slit controls. Both fields are discrete laws:
+Morph recalls an endpoint at the midpoint, no modulatable address exists, and
+Dice/the generator continue not to touch legacy temporal. Export rides the
+shared plan; `render_time_displace_pipeline` is the labeled export case — it
+renders a `_ramp` twin (decoded frames must differ) and a repeat (decoded
+frames must match), so reach and the sweep clock's determinism are both
+measured.
 
 ## Effects and compositing
 
@@ -2292,6 +2416,42 @@ mislead browser tests.
   physical-GPU claim; `render_procedural_motion_field_pipeline` and
   `render_motion_flow_shaping_pipeline` (whose `_unshaped` twin must decode
   differently) are the labeled export cases.
+- Feedback-rig tests must cover the identity/exactness laws (authored identity
+  keeps the activity flag closed, the legacy 64-byte golden untouched, the
+  96-byte rig uniform assertion), neutral sanitize with a reflection alone
+  refusing identity, the complete rate law (linear halves, multiplicative
+  square roots, authored nonlinear values beside the clamped tick fraction),
+  the shape codes 0–3, the edge laws on the frozen boundary numbering, the
+  regime fixtures (four-arm lock with analytic retention powers, detune shear,
+  the reflection two-cycle, servo bound versus monotonic defeated runaway),
+  the uniform lanes (epoch low bits, defeat-wins servo strength, reflect/
+  shape/edge codes), the patch round trip with absent-section byte identity,
+  Morph blend/wrapped-hue/discrete-recall, the fourteen modulation addresses
+  with the six discrete laws refused, the eighteen-param wire vocabulary in
+  both validators, generator mutation in fresh domains preserving discrete
+  laws, and the shader-contract counts (one shared legacy carrier sample plus
+  the rig's seven gated taps; rig binding 2 in both shaders). The re-pinned
+  `temporal.wgsl` SHA and M6 shader-bundle digest are deliberate B3
+  re-measurements. `render_feedback_rig_pipeline` is the labeled export case
+  with its `_unrigged` difference and `_repeat` determinism assertions.
+- Time-displace tests must cover the closed map codes 0–4 with `Ramp` the
+  default, the analytic per-map fixtures (Ramp equal to the legacy dot law,
+  Brightness as clamped covered-luma passthrough, aspect-correct Radial with
+  its 1.6 reach and corner clamp, TbcRamp's 8-scanline sawtooth constant in
+  x, Sweep's wrap and phase travel) with hostile inputs staying inside the
+  unit coordinate, the deterministic 600-tick sweep phase, the
+  unwritten-history depth-clamp sweep over every validity count for both the
+  floor and interpolated laws, the plan fixture proving the originals shader
+  is selected only off the exact Ramp/floor path with the reserved-lane
+  assignments (and the sweep lane zero for every other map at nonzero
+  ticks), the patch round trip with absent-section byte identity and unknown
+  tokens rejected, Morph endpoint recall at the midpoint, the wire vocabulary
+  in both validators, and the shader-contract counts (legacy-prefix inline
+  samples at 11, the interpolation toggle and valid-history clamp present in
+  both variants). `temporal.wgsl` is deliberately untouched — its pinned SHA
+  is a B12 non-measurement — and `render_time_displace_pipeline` is the
+  labeled export case with its `_ramp` difference and `_repeat` determinism
+  assertions.
 - Preview transform-gizmo tests must cover the pane/output/local round trip at
   multiple aspect ratios and DPI scales including a non-square output, an
   active crop, a nonzero shear and a letterboxed pane; the forward map agreeing

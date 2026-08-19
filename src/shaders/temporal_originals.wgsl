@@ -23,6 +23,16 @@ struct TemporalUniforms {
     _pad0: f32,
 };
 
+// B3 feedback rig, mirrored from temporal.wgsl in lockstep.
+struct TemporalRigUniforms {
+    values_a: vec4f, // offset_x, offset_y, hue rotate radians, saturation
+    values_b: vec4f, // chroma displace, blur, sharpen, drive
+    values_c: vec4f, // pivot, threshold, noise, tick mix
+    values_d: vec4f, // gain r, gain g, gain b, servo strength
+    modes_a: vec4u,  // reflect x, reflect y, shape code, edge code
+    modes_b: vec4u,  // noise epoch, rig active, reserved, reserved
+};
+
 struct TemporalOriginalsUniforms {
     loom_values: vec4f,    // amount, depth, phase, scale
     loom_geometry: vec4f,  // angle radians, aspect ratio, reserved, reserved
@@ -40,13 +50,213 @@ struct TemporalOriginalsUniforms {
 @group(0) @binding(3) var feedback_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> u: TemporalUniforms;
 @group(1) @binding(1) var<uniform> originals: TemporalOriginalsUniforms;
+@group(1) @binding(2) var<uniform> rig: TemporalRigUniforms;
 
 const TAU: f32 = 6.28318530717958647692;
+
+// B12 fixed law: scanlines per TBC-failure sawtooth period.
+const TIME_DISPLACE_TBC_LINES: f32 = 8.0;
 
 fn wrap_layer(idx: f32) -> i32 {
     let n = u.history_len;
     return i32(((idx % n) + n) % n);
 }
+
+// ---------------------------------------------------------------------------
+// B12 time-displace maps. CPU reference: `temporal::time_displace_coord`,
+// followed expression for expression. Map codes are permanent: 0 Ramp,
+// 1 Brightness, 2 Radial, 3 TbcRamp, 4 Sweep. Ramp is the exact legacy
+// slit-scan coordinate; the map code and interpolation flag ride the two
+// reserved loom_geometry lanes and the sweep phase rides the reserved
+// atlas_values lane, all zero for a default patch.
+// ---------------------------------------------------------------------------
+
+fn time_displace_coord(uv: vec2f, covered_luma_in: f32) -> f32 {
+    let map_code = u32(originals.loom_geometry.z);
+    if map_code == 1u {
+        // The picture times itself: bright things lag dark ones.
+        return clamp(covered_luma_in, 0.0, 1.0);
+    }
+    if map_code == 2u {
+        // Time pushed out from the centre, aspect-correct.
+        let centered = vec2f((uv.x - 0.5) * originals.loom_geometry.y, uv.y - 0.5);
+        return clamp(length(centered) * 1.6, 0.0, 1.0);
+    }
+    if map_code == 3u {
+        // Per-scanline failure ramp: a sawtooth over each 8-line group.
+        let height = f32(textureDimensions(current_tex).y);
+        let line_phase = clamp(uv.y, 0.0, 1.0) * height / TIME_DISPLACE_TBC_LINES;
+        return clamp(unit_fraction(line_phase), 0.0, 1.0);
+    }
+    if map_code == 4u {
+        // Wrapped horizontal ramp travelling on the 30 Hz reference clock.
+        return clamp(unit_fraction(uv.x - originals.atlas_values.z), 0.0, 1.0);
+    }
+    return clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// B3 feedback-rig helpers. This block is duplicated in lockstep in
+// temporal_originals.wgsl, exactly as the frozen feedback expression already
+// is. The CPU reference is `temporal::feedback_rig_reference`.
+// ---------------------------------------------------------------------------
+
+fn rig_active() -> bool {
+    return rig.modes_b.y != 0u;
+}
+
+// Reflections and the per-tick offset act on the centred, already
+// rotated/zoomed coordinate — the regime no rotation can reach.
+fn rig_reflect_offset(p_centered: vec2f) -> vec2f {
+    var p = p_centered;
+    if rig.modes_a.x != 0u { p.x = -p.x; }
+    if rig.modes_a.y != 0u { p.y = -p.y; }
+    return p + rig.values_a.xy;
+}
+
+fn rig_mirror_unit(value: f32) -> f32 {
+    let half = value / 2.0;
+    let period = (half - floor(half)) * 2.0;
+    return clamp(select(period, 2.0 - period, period > 1.0), 0.0, 1.0);
+}
+
+// Resolve the fed-back lookup under the frozen program-wide boundary
+// numbering. xy is the resolved coordinate, z the coverage: Transparent is
+// the exact historical inside test, and the other three always cover.
+fn rig_resolve_edge(p: vec2f) -> vec3f {
+    let edge = rig.modes_a.w;
+    if edge == 1u {
+        return vec3f(rig_mirror_unit(p.x), rig_mirror_unit(p.y), 1.0);
+    }
+    if edge == 2u {
+        return vec3f(clamp(p - floor(p), vec2f(0.0), vec2f(1.0)), 1.0);
+    }
+    if edge == 3u {
+        return vec3f(clamp(p, vec2f(0.0), vec2f(1.0)), 1.0);
+    }
+    let inside = select(0.0, 1.0,
+        p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0);
+    return vec3f(clamp(p, vec2f(0.0), vec2f(1.0)), inside);
+}
+
+fn rig_avalanche(value: u32) -> u32 {
+    var x = value;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+fn rig_noise_sample(uv: vec2f) -> f32 {
+    let px = vec2u(uv * vec2f(textureDimensions(feedback_tex)));
+    let seed = rig_avalanche(
+        px.x ^ (px.y * 0x9e3779b9u) ^ (rig.modes_b.x * 0x85ebca6bu) ^ 0x42335247u,
+    );
+    return f32(seed & 0x00ffffffu) / 16777216.0;
+}
+
+fn rig_shape_component(x: f32, shape: u32) -> f32 {
+    if shape == 1u {
+        // Soft: unit slope at the pivot, compressing to +/-0.5.
+        return tanh(2.0 * x) * 0.5;
+    }
+    if shape == 2u {
+        // Wrap into [-0.5, 0.5).
+        return fract(x + 0.5) - 0.5;
+    }
+    if shape == 3u {
+        // Triangular fold: identity through [-0.5, 0.5], reflecting beyond.
+        let t = fract((x + 0.5) / 2.0) * 2.0;
+        return select(t - 0.5, 1.5 - t, t > 1.0);
+    }
+    // Clamp.
+    return clamp(x, -0.5, 0.5);
+}
+
+// The pointwise colour pipeline over the fed-back sample: gains, hue
+// rotation, saturation, waveshaper, threshold decay, loop noise, and the
+// deterministic compressive servo. The nonlinear stages mix toward identity
+// by the clamped tick fraction so the loop stays rate-independent.
+fn rig_grade(color_in: vec3f, frag_uv: vec2f) -> vec3f {
+    var color = color_in * rig.values_d.xyz;
+    let hue = rig.values_a.z;
+    if abs(hue) > 1.0e-6 {
+        let y = dot(color, vec3f(0.299, 0.587, 0.114));
+        let i = dot(color, vec3f(0.596, -0.274, -0.322));
+        let q = dot(color, vec3f(0.211, -0.523, 0.312));
+        let c = cos(hue);
+        let s = sin(hue);
+        let i2 = i * c - q * s;
+        let q2 = i * s + q * c;
+        color = vec3f(
+            y + 0.956 * i2 + 0.621 * q2,
+            y - 0.272 * i2 - 0.647 * q2,
+            y - 1.106 * i2 + 1.703 * q2,
+        );
+    }
+    let saturation = rig.values_a.w;
+    if abs(saturation - 1.0) > 1.0e-6 {
+        let luma = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+        color = mix(vec3f(luma), color, saturation);
+    }
+    let tick_mix = clamp(rig.values_c.w, 0.0, 1.0);
+    let drive = rig.values_b.w;
+    let shape = rig.modes_a.z;
+    if shape != 0u || abs(drive - 1.0) > 1.0e-6 {
+        let pivot = rig.values_c.x;
+        let x = (color - vec3f(pivot)) * drive;
+        let shaped = vec3f(
+            rig_shape_component(x.r, shape),
+            rig_shape_component(x.g, shape),
+            rig_shape_component(x.b, shape),
+        ) + vec3f(pivot);
+        color = mix(color, shaped, tick_mix);
+    }
+    let threshold = rig.values_c.y;
+    if threshold > 0.0 {
+        let luma = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+        let gate = smoothstep(threshold - 0.05, threshold + 0.05, luma);
+        color = color * mix(1.0, gate, tick_mix);
+    }
+    let noise = rig.values_c.z;
+    if noise > 0.0 {
+        color = color + vec3f((rig_noise_sample(frag_uv) * 2.0 - 1.0) * noise * 0.25);
+    }
+    if rig.values_d.w > 0.0 {
+        // Deterministic per-pixel auto-level: compress everything the loop
+        // pushed above unity. Defeated, this stage is absent and the loop may
+        // run to white or black and stay there.
+        let luma = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+        let compressed = color / (1.0 + max(luma - 1.0, 0.0));
+        color = mix(color, compressed, tick_mix * rig.values_d.w);
+    }
+    return max(color, vec3f(0.0));
+}
+
+// Sampling-dependent rig stages for the legacy (straight-alpha textureSample)
+// variant: chromatic displacement of the lookup and the blur/sharpen
+// activator-inhibitor pair over fixed two-texel cross taps.
+fn rig_sample_legacy(p: vec2f) -> vec3f {
+    var rgb = textureSample(feedback_tex, samp, p).rgb;
+    let chroma = rig.values_b.x;
+    if chroma > 0.0 {
+        let d = vec2f(chroma, 0.0);
+        rgb.r = textureSample(feedback_tex, samp, p + d).r;
+        rgb.b = textureSample(feedback_tex, samp, p - d).b;
+    }
+    let blur = rig.values_b.y;
+    let sharpen = rig.values_b.z;
+    if blur > 0.0 || sharpen > 0.0 {
+        let step = vec2f(2.0) / max(vec2f(textureDimensions(feedback_tex)), vec2f(1.0));
+        let ring = textureSample(feedback_tex, samp, p + vec2f(step.x, 0.0)).rgb
+            + textureSample(feedback_tex, samp, p - vec2f(step.x, 0.0)).rgb
+            + textureSample(feedback_tex, samp, p + vec2f(0.0, step.y)).rgb
+            + textureSample(feedback_tex, samp, p - vec2f(0.0, step.y)).rgb;
+        let blurred = (rgb + ring) / 5.0;
+        rgb = mix(rgb, blurred, clamp(blur, 0.0, 1.0)) + (rgb - blurred) * sharpen;
+    }
+    return rgb;
+}
+
 
 fn unit_fraction(value: f32) -> f32 {
     return value - floor(value);
@@ -228,16 +438,23 @@ fn legacy_originals(uv: vec2f) -> vec4f {
     var color = current;
     let garden_amount = originals.garden_values.x;
 
-    // Frozen legacy slit-scan arithmetic/order.
+    // Frozen legacy slit-scan arithmetic/order, generalized by the B12
+    // time-displace map. Ramp with interpolation off routes through
+    // `history_age_sample` with the identical layer arithmetic, so the
+    // default path stays pixel-exact; interpolation costs at most one extra
+    // history load per pixel and the depth still clamps against the
+    // valid-history counter exactly as History Key does.
     if u.slitscan > 0.001 && u.valid_history > 0.5 {
-        let coord = clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
+        let coord = time_displace_coord(uv, covered_luma(current));
         let max_depth = max(u.valid_history - 1.0, 0.0);
         let requested_depth = coord * u.slitscan * (u.history_len - 1.0);
         let depth = min(requested_depth, max_depth);
-        if requested_depth >= 1.0 && max_depth >= 1.0 {
-            let layer = wrap_layer(u.write_index - floor(depth));
-            let hist = textureSample(history_tex, samp, uv, layer);
-            color = hist;
+        if originals.loom_geometry.w > 0.5 {
+            let lower = history_age_sample(current, uv, u32(floor(depth)));
+            let upper = history_age_sample(current, uv, u32(ceil(depth)));
+            color = mix(lower, upper, fract(depth));
+        } else if requested_depth >= 1.0 && max_depth >= 1.0 {
+            color = history_age_sample(current, uv, u32(floor(depth)));
         }
     }
 
@@ -265,7 +482,8 @@ fn legacy_originals(uv: vec2f) -> vec4f {
     // legacy feedback transform is also Garden's bounded identity/warp law.
     var previous = vec4f(0.0);
     var previous_inside = 0.0;
-    if (u.feedback > 0.001 || garden_amount > 0.0) && u.feedback_valid > 0.5 {
+    if (garden_amount > 0.0 || (u.feedback > 0.001 && !rig_active()))
+        && u.feedback_valid > 0.5 {
         let angle = u.fb_rotate * 0.0174533;
         let c = cos(angle);
         let s = sin(angle);
@@ -277,9 +495,21 @@ fn legacy_originals(uv: vec2f) -> vec4f {
             p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0);
     }
 
-    // Frozen legacy feedback arithmetic/order.
+    // Frozen legacy feedback arithmetic/order. An active rig takes its own
+    // transformed read so Garden keeps the frozen shared carrier untouched.
     if u.feedback > 0.001 && u.feedback_valid > 0.5 {
-        color = vec4f(max(color.rgb, previous.rgb * u.feedback * previous_inside), color.a);
+        if rig_active() {
+            let angle = u.fb_rotate * 0.0174533;
+            let c = cos(angle);
+            let s = sin(angle);
+            var p = uv - 0.5;
+            p = vec2f(p.x * c - p.y * s, p.x * s + p.y * c) / max(u.fb_zoom, 0.01);
+            let resolved = rig_resolve_edge(rig_reflect_offset(p) + 0.5);
+            let prev_rgb = rig_grade(rig_sample_legacy(resolved.xy), uv);
+            color = vec4f(max(color.rgb, prev_rgb * u.feedback * resolved.z), color.a);
+        } else {
+            color = vec4f(max(color.rgb, previous.rgb * u.feedback * previous_inside), color.a);
+        }
     }
 
     // Frozen legacy temporal-key arithmetic/order.
@@ -390,6 +620,33 @@ fn advanced_feedback_premultiplied_linear(uv: vec2f) -> vec4f {
     return mix(mix(c00, c10, fraction.x), mix(c01, c11, fraction.x), fraction.y);
 }
 
+// The same stages for the advanced (covered premultiplied load) variant.
+fn rig_sample_advanced(p: vec2f) -> vec4f {
+    var previous = advanced_feedback_premultiplied_linear(p);
+    let chroma = rig.values_b.x;
+    if chroma > 0.0 {
+        let d = vec2f(chroma, 0.0);
+        previous.r = advanced_feedback_premultiplied_linear(p + d).r;
+        previous.b = advanced_feedback_premultiplied_linear(p - d).b;
+    }
+    let blur = rig.values_b.y;
+    let sharpen = rig.values_b.z;
+    if blur > 0.0 || sharpen > 0.0 {
+        let step = vec2f(2.0) / max(vec2f(textureDimensions(feedback_tex)), vec2f(1.0));
+        let ring = advanced_feedback_premultiplied_linear(p + vec2f(step.x, 0.0)).rgb
+            + advanced_feedback_premultiplied_linear(p - vec2f(step.x, 0.0)).rgb
+            + advanced_feedback_premultiplied_linear(p + vec2f(0.0, step.y)).rgb
+            + advanced_feedback_premultiplied_linear(p - vec2f(0.0, step.y)).rgb;
+        let blurred = (previous.rgb + ring) / 5.0;
+        previous = vec4f(
+            mix(previous.rgb, blurred, clamp(blur, 0.0, 1.0))
+                + (previous.rgb - blurred) * sharpen,
+            previous.a,
+        );
+    }
+    return previous;
+}
+
 fn advanced_history_age_sample(current: vec4f, uv: vec2f, discrete_age: u32) -> vec4f {
     if discrete_age == 0u { return current; }
     let layer = wrap_layer(u.write_index - f32(discrete_age));
@@ -415,14 +672,19 @@ fn advanced_originals(uv: vec2f) -> vec4f {
     var color = current;
     let garden_amount = originals.garden_values.x;
 
+    // The premultiplied twin of the legacy block above; `current` is already
+    // premultiplied here, so its covered luma is a direct dot product.
     if u.slitscan > 0.001 && u.valid_history > 0.5 {
-        let coord = clamp(dot(uv - 0.5, u.slit_direction) + 0.5, 0.0, 1.0);
+        let coord = time_displace_coord(uv, dot(current.rgb, vec3f(0.2126, 0.7152, 0.0722)));
         let max_depth = max(u.valid_history - 1.0, 0.0);
         let requested_depth = coord * u.slitscan * (u.history_len - 1.0);
         let depth = min(requested_depth, max_depth);
-        if requested_depth >= 1.0 && max_depth >= 1.0 {
-            let layer = wrap_layer(u.write_index - floor(depth));
-            color = premultiply_originals(textureSample(history_tex, samp, uv, layer));
+        if originals.loom_geometry.w > 0.5 {
+            let lower = advanced_history_age_sample(current, uv, u32(floor(depth)));
+            let upper = advanced_history_age_sample(current, uv, u32(ceil(depth)));
+            color = mix(lower, upper, fract(depth));
+        } else if requested_depth >= 1.0 && max_depth >= 1.0 {
+            color = advanced_history_age_sample(current, uv, u32(floor(depth)));
         }
     }
 
@@ -445,7 +707,8 @@ fn advanced_originals(uv: vec2f) -> vec4f {
 
     var previous = vec4f(0.0);
     var previous_inside = 0.0;
-    if (u.feedback > 0.001 || garden_amount > 0.0) && u.feedback_valid > 0.5 {
+    if (garden_amount > 0.0 || (u.feedback > 0.001 && !rig_active()))
+        && u.feedback_valid > 0.5 {
         let angle = u.fb_rotate * 0.0174533;
         let c = cos(angle);
         let s = sin(angle);
@@ -458,11 +721,26 @@ fn advanced_originals(uv: vec2f) -> vec4f {
     }
 
     if u.feedback > 0.001 && u.feedback_valid > 0.5 {
-        let retention = u.feedback * previous_inside;
-        color = vec4f(
-            max(color.rgb, previous.rgb * retention),
-            max(color.a, previous.a * retention),
-        );
+        if rig_active() {
+            let angle = u.fb_rotate * 0.0174533;
+            let c = cos(angle);
+            let s = sin(angle);
+            var p = uv - 0.5;
+            p = vec2f(p.x * c - p.y * s, p.x * s + p.y * c) / max(u.fb_zoom, 0.01);
+            let resolved = rig_resolve_edge(rig_reflect_offset(p) + 0.5);
+            let rigged = rig_sample_advanced(resolved.xy);
+            let retention = u.feedback * resolved.z;
+            color = vec4f(
+                max(color.rgb, rig_grade(rigged.rgb, uv) * retention),
+                max(color.a, rigged.a * retention),
+            );
+        } else {
+            let retention = u.feedback * previous_inside;
+            color = vec4f(
+                max(color.rgb, previous.rgb * retention),
+                max(color.a, previous.a * retention),
+            );
+        }
     }
 
     if u.key_mode > 0.5 && u.key_valid > 0.5 {

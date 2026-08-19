@@ -9160,12 +9160,43 @@ impl App {
             "fb_rotate" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (-5.0..=5.0).contains(&number)),
+            "fb_offset_x" | "fb_offset_y" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-0.5..=0.5).contains(&number)),
+            "fb_hue_rotate" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-180.0..=180.0).contains(&number)),
+            "fb_saturation" | "fb_gain_r" | "fb_gain_g" | "fb_gain_b" | "fb_sharpen" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=2.0).contains(&number)),
+            "fb_chroma_displace" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=0.05).contains(&number)),
+            "fb_blur" | "fb_pivot" | "fb_threshold" | "fb_noise" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            "fb_drive" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.25..=4.0).contains(&number)),
+            "fb_shape" => matches!(value.as_str(), Some("clamp" | "soft" | "wrap" | "fold")),
+            "fb_edge" => matches!(
+                value.as_str(),
+                Some("transparent" | "mirror" | "wrap" | "hold")
+            ),
+            "fb_reflect_x" | "fb_reflect_y" | "fb_servo" | "fb_servo_defeated" => {
+                value.is_boolean()
+            }
             "slitscan" | "slit_axis" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
             "slit_angle" | "loom_angle" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (-180.0..=180.0).contains(&number)),
+            "slit_map" => matches!(
+                value.as_str(),
+                Some("ramp" | "brightness" | "radial" | "tbc_ramp" | "sweep")
+            ),
+            "slit_interp" => value.is_boolean(),
             "key_mode" => value.as_u64().is_some_and(|number| number <= 4),
             "key_threshold" | "loom_amount" | "loom_depth" | "atlas_amount" | "atlas_collision"
             | "garden_amount" | "garden_threshold" | "garden_decay" => value
@@ -15668,6 +15699,112 @@ impl App {
                             p.fb_rotate = (n as f32).clamp(-5.0, 5.0);
                         }
                     }
+                    "fb_offset_x" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.offset_x = (n as f32).clamp(-0.5, 0.5);
+                        }
+                    }
+                    "fb_offset_y" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.offset_y = (n as f32).clamp(-0.5, 0.5);
+                        }
+                    }
+                    "fb_reflect_x" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.rig.reflect_x = flag;
+                        }
+                    }
+                    "fb_reflect_y" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.rig.reflect_y = flag;
+                        }
+                    }
+                    "fb_hue_rotate" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.hue_rotate = (n as f32).clamp(-180.0, 180.0);
+                        }
+                    }
+                    "fb_saturation" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.saturation = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "fb_gain_r" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.gain_r = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "fb_gain_g" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.gain_g = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "fb_gain_b" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.gain_b = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "fb_chroma_displace" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.chroma_displace = (n as f32).clamp(0.0, 0.05);
+                        }
+                    }
+                    "fb_blur" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.blur = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "fb_sharpen" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.sharpen = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "fb_shape" => {
+                        p.rig.shape = match value.as_str() {
+                            Some("soft") => effects::params::FeedbackShape::Soft,
+                            Some("wrap") => effects::params::FeedbackShape::Wrap,
+                            Some("fold") => effects::params::FeedbackShape::Fold,
+                            _ => effects::params::FeedbackShape::Clamp,
+                        };
+                    }
+                    "fb_drive" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.drive = (n as f32).clamp(0.25, 4.0);
+                        }
+                    }
+                    "fb_pivot" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.pivot = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "fb_threshold" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.threshold = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "fb_noise" => {
+                        if let Some(n) = value.as_f64() {
+                            p.rig.noise = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "fb_edge" => {
+                        p.rig.edge = match value.as_str() {
+                            Some("mirror") => motion::MotionBoundaryMode::Mirror,
+                            Some("wrap") => motion::MotionBoundaryMode::Wrap,
+                            Some("hold") => motion::MotionBoundaryMode::Hold,
+                            _ => motion::MotionBoundaryMode::Transparent,
+                        };
+                    }
+                    "fb_servo" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.rig.servo = flag;
+                        }
+                    }
+                    "fb_servo_defeated" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.rig.servo_defeated = flag;
+                        }
+                    }
                     "slitscan" => {
                         if let Some(n) = value.as_f64() {
                             p.slitscan = (n as f32).clamp(0.0, 1.0);
@@ -15685,6 +15822,21 @@ impl App {
                             if angle.is_finite() {
                                 p.slit_angle = angle.clamp(-180.0, 180.0);
                             }
+                        }
+                    }
+                    "slit_map" => {
+                        p.slit_map = match value.as_str() {
+                            Some("brightness") => temporal::TimeDisplaceMap::Brightness,
+                            Some("radial") => temporal::TimeDisplaceMap::Radial,
+                            Some("tbc_ramp") => temporal::TimeDisplaceMap::TbcRamp,
+                            Some("sweep") => temporal::TimeDisplaceMap::Sweep,
+                            Some("ramp") => temporal::TimeDisplaceMap::Ramp,
+                            _ => p.slit_map,
+                        };
+                    }
+                    "slit_interp" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.slit_interp = flag;
                         }
                     }
                     "key_mode" => {

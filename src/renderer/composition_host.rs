@@ -16,7 +16,8 @@ use crate::renderer::compositor::MatteCompositeUniforms;
 use crate::spatial::EffectPassUniforms;
 use crate::temporal::{
     TemporalFrameAction, TemporalFrameInput, TemporalGpuUniforms, TemporalOriginalsGpuUniforms,
-    TemporalResetCause, TemporalState, TemporalStateMetrics, TEMPORAL_HISTORY_LEN,
+    TemporalResetCause, TemporalRigGpuUniforms, TemporalState, TemporalStateMetrics,
+    TEMPORAL_HISTORY_LEN,
 };
 use crate::visual_rack::{
     CreativeResourcePlan, ADVANCED_PROGRAM_HISTORY_STAGING_LAYERS,
@@ -467,6 +468,7 @@ pub(crate) struct CompositionHost {
     temporal_uniform_group: wgpu::BindGroup,
     temporal_originals_uniform_buffer: wgpu::Buffer,
     temporal_originals_uniform_group: wgpu::BindGroup,
+    temporal_rig_uniform_buffer: wgpu::Buffer,
     routed_garden_uniform_buffer: wgpu::Buffer,
     routed_garden_uniform_group: wgpu::BindGroup,
     _temporal_history_texture: wgpu::Texture,
@@ -684,6 +686,7 @@ fn create_temporal_originals_uniform(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     legacy: &wgpu::Buffer,
+    rig: &wgpu::Buffer,
     counters: &HostAllocationCounters,
 ) -> (wgpu::Buffer, wgpu::BindGroup) {
     let originals = device.create_buffer(&wgpu::BufferDescriptor {
@@ -704,6 +707,10 @@ fn create_temporal_originals_uniform(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: originals.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: rig.as_entire_binding(),
             },
         ],
     });
@@ -961,10 +968,20 @@ impl CompositionHost {
         let temporal_uniform_layout = create_layout(
             device,
             "Advanced composition legacy temporal uniform",
-            &[uniform_layout_entry(
-                std::mem::size_of::<TemporalGpuUniforms>() as u64,
-                false,
-            )],
+            &[
+                uniform_layout_entry_at(
+                    0,
+                    std::mem::size_of::<TemporalGpuUniforms>() as u64,
+                    false,
+                ),
+                // B3 feedback rig, a third fixed block beside the frozen
+                // legacy uniform.
+                uniform_layout_entry_at(
+                    2,
+                    std::mem::size_of::<TemporalRigGpuUniforms>() as u64,
+                    false,
+                ),
+            ],
             &counters,
         );
         let temporal_originals_uniform_layout = create_layout(
@@ -979,6 +996,11 @@ impl CompositionHost {
                 uniform_layout_entry_at(
                     1,
                     std::mem::size_of::<TemporalOriginalsGpuUniforms>() as u64,
+                    false,
+                ),
+                uniform_layout_entry_at(
+                    2,
+                    std::mem::size_of::<TemporalRigGpuUniforms>() as u64,
                     false,
                 ),
             ],
@@ -1228,18 +1250,41 @@ impl CompositionHost {
             "Advanced composition bus uniform",
             &counters,
         );
-        let (temporal_uniform_buffer, temporal_uniform_group) =
-            create_fixed_uniform::<TemporalGpuUniforms>(
-                device,
-                &temporal_uniform_layout,
-                "Advanced composition legacy temporal uniform",
-                &counters,
-            );
+        let temporal_rig_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Advanced composition temporal rig uniform"),
+            size: std::mem::size_of::<TemporalRigGpuUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        counters.buffers.fetch_add(1, Ordering::Relaxed);
+        let temporal_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Advanced composition legacy temporal uniform"),
+            size: std::mem::size_of::<TemporalGpuUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        counters.buffers.fetch_add(1, Ordering::Relaxed);
+        let temporal_uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Advanced composition legacy temporal uniform"),
+            layout: &temporal_uniform_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: temporal_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: temporal_rig_uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        counters.bind_groups.fetch_add(1, Ordering::Relaxed);
         let (temporal_originals_uniform_buffer, temporal_originals_uniform_group) =
             create_temporal_originals_uniform(
                 device,
                 &temporal_originals_uniform_layout,
                 &temporal_uniform_buffer,
+                &temporal_rig_uniform_buffer,
                 &counters,
             );
         let (routed_garden_uniform_buffer, routed_garden_uniform_group) =
@@ -1377,6 +1422,7 @@ impl CompositionHost {
             temporal_uniform_group,
             temporal_originals_uniform_buffer,
             temporal_originals_uniform_group,
+            temporal_rig_uniform_buffer,
             routed_garden_uniform_buffer,
             routed_garden_uniform_group,
             _temporal_history_texture: temporal_history_texture,
@@ -1923,11 +1969,23 @@ impl CompositionHost {
                 0,
                 bytemuck::bytes_of(&advanced_uniforms),
             );
+            queue.write_buffer(
+                &self.temporal_rig_uniform_buffer,
+                0,
+                bytemuck::bytes_of(&plan.rig_uniforms),
+            );
 
             let mut pre_garden_originals = plan.originals_uniforms;
             pre_garden_originals.garden_values[0] = 0.0;
+            // Loom, Atlas, and an authored B12 time-displace map/interp all
+            // need the originals shader ahead of the routed Garden pass; the
+            // slit lanes only matter while slit-scan is active, mirroring the
+            // plan's own activity predicate.
             let pre_garden_originals_active = pre_garden_originals.loom_values[0] > 0.0
-                || pre_garden_originals.atlas_values[0] > 0.0;
+                || pre_garden_originals.atlas_values[0] > 0.0
+                || (plan.uniforms.slitscan > 0.001
+                    && (pre_garden_originals.loom_geometry[2] != 0.0
+                        || pre_garden_originals.loom_geometry[3] != 0.0));
             if pre_garden_originals_active {
                 queue.write_buffer(
                     &self.temporal_originals_uniform_buffer,
@@ -2038,6 +2096,11 @@ impl CompositionHost {
             &self.temporal_uniform_buffer,
             0,
             bytemuck::bytes_of(&advanced_uniforms),
+        );
+        queue.write_buffer(
+            &self.temporal_rig_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&plan.rig_uniforms),
         );
         let (pipeline, uniforms) = if plan.originals_shader_active {
             queue.write_buffer(
@@ -4444,9 +4507,12 @@ mod tests {
         let temporal_compat8_sha256 = sha256(&temporal_exact_output);
         let temporal_advanced_working_sha256 = sha256(&temporal_advanced_working_output);
         let temporal_advanced_presented_sha256 = sha256(&temporal_advanced_presented_output);
+        // B3 re-pinned this digest: the feedback rig joined the temporal
+        // shaders and their param source. The six output SHAs below did not
+        // move, which is the byte-exactness proof for the rig-inactive path.
         assert_eq!(
             shader_bundle_sha256,
-            "1c30e098763ff6b1a89c56b89ca0af4fc98d489bebd03a41e5870bd940dab29c"
+            "d3db27d4078d7c27e7820170347abedf2de5e10772a74c692ec7e08cb2a4b9ec"
         );
         assert_eq!(
             still_fixture_sha256,
