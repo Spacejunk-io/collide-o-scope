@@ -22,12 +22,16 @@
 //!   validator already imposes on constants, applied uniformly so no
 //!   instruction chain can escape the representable range the ABI promises.
 
-// The reference lands one tranche ahead of its consumers by design — the
-// S10b WGSL interpreter checks against it and the renderer wiring follows —
-// so until that tranche the module's only callers are its own law tests.
-// This allow is scoped to exactly that window and comes out with S10b.
+// The S10b interpreter consumes this module (`renderer/study.rs` encodes
+// compiled studies for the fixed WGSL interpreter and its fixtures prove
+// CPU/GPU agreement), but the whole chain stays unreachable from the frame
+// loop until a Study gains an authored audience surface — where it plugs
+// into the composition is a product decision the operator has not yet
+// opened. This allow is scoped to exactly that window and comes out with
+// the authored-surface tranche.
 #![allow(dead_code)]
 
+use bytemuck::Zeroable;
 use sha2::{Digest, Sha256};
 
 use crate::study::{
@@ -38,8 +42,11 @@ use crate::study::{
 
 /// Append-only version of the evaluation semantics themselves. Changing any
 /// law in this module — the bound, the guard, the hash layout, the hue math —
-/// requires bumping this and revisiting the ABI's R3 window.
-pub const STUDY_EVAL_ALGORITHM_VERSION: u16 = 1;
+/// requires bumping this and revisiting the ABI's R3 window. Version 2 (the
+/// S10b interpreter tranche, days after version 1 and before any consumer
+/// existed) added the HueRotate unorm input clamp so the CPU and GPU halves
+/// agree everywhere WGSL's non-finite handling is implementation-defined.
+pub const STUDY_EVAL_ALGORITHM_VERSION: u16 = 2;
 
 /// Domain-separation lanes for the R2 deterministic-random hash. The layout
 /// is frozen: the first eight canonical-digest bytes little-endian, XOR the
@@ -458,7 +465,16 @@ fn fract(value: f32) -> f32 {
 }
 
 fn hue_rotate(color: [f32; 4], turns: f32) -> [f32; 4] {
-    let mut hsl = rgb_to_hsl([color[0], color[1], color[2]]);
+    // The S10b domain clamp: the HSL round trip is defined on unorm colors —
+    // outside that range its divisions can reach non-finite values whose
+    // handling WGSL leaves implementation-defined, so both evaluators clamp
+    // the rgb operand first and the halves stay bit-agreeable everywhere.
+    // Alpha passes through untouched.
+    let mut hsl = rgb_to_hsl([
+        color[0].clamp(0.0, 1.0),
+        color[1].clamp(0.0, 1.0),
+        color[2].clamp(0.0, 1.0),
+    ]);
     // `fract` on a non-finite turn is meaningless; the neutral is no
     // rotation, never a clamped extreme.
     if turns.is_finite() {
@@ -474,19 +490,138 @@ pub fn consumes(document: &StudyDocument, capability: StudyCapability) -> bool {
     document.capabilities.contains(&capability)
 }
 
+// --- The frozen GPU instruction encoding -----------------------------------
+
+/// GPU opcode numbering, append-only exactly like `NodeKindTag` codes:
+/// 0 LoadCurrentColor, 1 LoadHistoryColor, 2 LoadMotionVector,
+/// 3 LoadAudioBand, 4 LoadBeatPhase, 5 LoadDeterministicRandom (resolved to
+/// an immediate at compile — the GPU never hashes), 6 ConstantScalar,
+/// 7 ConstantVector2, 8 ConstantColor, 9 Add, 10 Subtract, 11 Multiply,
+/// 12 Mix, 13 Clamp01, 14 HueRotate, 15 OutputColor. Codes are never
+/// renumbered or reused; growth is an R3 minor bump.
+pub const STUDY_GPU_MAX_INSTRUCTIONS: usize = crate::study::STUDY_MAX_INSTRUCTIONS;
+
+/// One encoded instruction, 32 bytes, uniform-array stride safe.
+/// `words[0]` carries the opcode in its low 16 bits and the auxiliary
+/// operand — Mix's amount register, HueRotate's turns register, the history
+/// age, the audio band — in its high 16; `words[1..=3]` are dst, src a,
+/// src b. The immediate carries constants and resolved random values.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct StudyGpuOp {
+    pub words: [u32; 4],
+    pub immediate: [f32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<StudyGpuOp>() == 32);
+
+impl CompiledStudy {
+    /// Encode this study for the fixed WGSL interpreter. The full uniform
+    /// array is always `STUDY_GPU_MAX_INSTRUCTIONS` long — unused slots are
+    /// zero and the shader walks only `instruction_count` — so one buffer
+    /// size serves every study and a swap never reallocates.
+    pub fn encode_gpu_program(&self) -> Vec<StudyGpuOp> {
+        let mut ops = vec![StudyGpuOp::zeroed(); STUDY_GPU_MAX_INSTRUCTIONS];
+        for (index, instruction) in self.instructions.iter().enumerate() {
+            let op = &mut ops[index];
+            let mut encode = |opcode: u32, aux: u32, dst: u8, a: u8, b: u8, immediate: [f32; 4]| {
+                op.words = [
+                    opcode | (aux << 16),
+                    u32::from(dst),
+                    u32::from(a),
+                    u32::from(b),
+                ];
+                op.immediate = immediate;
+            };
+            match instruction {
+                StudyInstruction::LoadCurrentColor { dst } => {
+                    encode(0, 0, dst.get(), 0, 0, [0.0; 4]);
+                }
+                StudyInstruction::LoadHistoryColor { dst, age } => {
+                    encode(1, u32::from(*age), dst.get(), 0, 0, [0.0; 4]);
+                }
+                StudyInstruction::LoadMotionVector { dst } => {
+                    encode(2, 0, dst.get(), 0, 0, [0.0; 4]);
+                }
+                StudyInstruction::LoadAudioBand { dst, band } => {
+                    encode(3, u32::from(*band), dst.get(), 0, 0, [0.0; 4]);
+                }
+                StudyInstruction::LoadBeatPhase { dst } => {
+                    encode(4, 0, dst.get(), 0, 0, [0.0; 4]);
+                }
+                StudyInstruction::LoadDeterministicRandom { dst, .. } => {
+                    let value = self.resolved_random[index]
+                        .expect("compile resolved every random instruction");
+                    encode(5, 0, dst.get(), 0, 0, [value, 0.0, 0.0, 0.0]);
+                }
+                StudyInstruction::ConstantScalar { dst, value } => {
+                    encode(6, 0, dst.get(), 0, 0, [*value, 0.0, 0.0, 0.0]);
+                }
+                StudyInstruction::ConstantVector2 { dst, value } => {
+                    encode(7, 0, dst.get(), 0, 0, [value[0], value[1], 0.0, 0.0]);
+                }
+                StudyInstruction::ConstantColor { dst, value } => {
+                    encode(8, 0, dst.get(), 0, 0, *value);
+                }
+                StudyInstruction::Add { dst, left, right } => {
+                    encode(9, 0, dst.get(), left.get(), right.get(), [0.0; 4]);
+                }
+                StudyInstruction::Subtract { dst, left, right } => {
+                    encode(10, 0, dst.get(), left.get(), right.get(), [0.0; 4]);
+                }
+                StudyInstruction::Multiply { dst, left, right } => {
+                    encode(11, 0, dst.get(), left.get(), right.get(), [0.0; 4]);
+                }
+                StudyInstruction::Mix { dst, a, b, amount } => {
+                    encode(
+                        12,
+                        u32::from(amount.get()),
+                        dst.get(),
+                        a.get(),
+                        b.get(),
+                        [0.0; 4],
+                    );
+                }
+                StudyInstruction::Clamp01 { dst, input } => {
+                    encode(13, 0, dst.get(), input.get(), 0, [0.0; 4]);
+                }
+                StudyInstruction::HueRotate { dst, color, turns } => {
+                    encode(
+                        14,
+                        u32::from(turns.get()),
+                        dst.get(),
+                        color.get(),
+                        0,
+                        [0.0; 4],
+                    );
+                }
+                StudyInstruction::OutputColor { color } => {
+                    encode(15, 0, 0, color.get(), 0, [0.0; 4]);
+                }
+            }
+        }
+        ops
+    }
+
+    /// The number of live instructions the shader must walk.
+    pub fn instruction_count(&self) -> u32 {
+        self.instructions.len() as u32
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::study::{
         StudyAbiVersion, StudyLicenseNotice, StudyMetadata, StudyPublicationBoundary,
         STUDY_SCHEMA_VERSION,
     };
 
-    fn register(value: u8) -> StudyRegister {
+    pub(crate) fn register(value: u8) -> StudyRegister {
         StudyRegister::new(value).unwrap()
     }
 
-    fn document(
+    pub(crate) fn document(
         capabilities: Vec<StudyCapability>,
         instructions: Vec<StudyInstruction>,
     ) -> StudyDocument {
@@ -854,6 +989,184 @@ mod tests {
             },
         );
         assert_eq!(out, [0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// A document exercising all sixteen opcodes with valid SSA, shared by
+    /// the encoding golden below and the GPU agreement fixtures.
+    pub(crate) fn every_opcode_document() -> StudyDocument {
+        document(
+            vec![
+                StudyCapability::CurrentColor,
+                StudyCapability::HistoryRead,
+                StudyCapability::MotionFieldRead,
+                StudyCapability::AudioFeatures,
+                StudyCapability::BeatPhase,
+                StudyCapability::DeterministicRandom,
+            ],
+            vec![
+                StudyInstruction::LoadCurrentColor { dst: register(0) },
+                StudyInstruction::LoadHistoryColor {
+                    dst: register(1),
+                    age: 7,
+                },
+                StudyInstruction::LoadMotionVector { dst: register(2) },
+                StudyInstruction::LoadAudioBand {
+                    dst: register(3),
+                    band: 5,
+                },
+                StudyInstruction::LoadBeatPhase { dst: register(4) },
+                StudyInstruction::LoadDeterministicRandom {
+                    dst: register(5),
+                    domain: 9,
+                },
+                StudyInstruction::ConstantScalar {
+                    dst: register(6),
+                    value: 0.25,
+                },
+                StudyInstruction::ConstantVector2 {
+                    dst: register(7),
+                    value: [0.5, -0.5],
+                },
+                StudyInstruction::ConstantColor {
+                    dst: register(8),
+                    value: [0.1, 0.2, 0.3, 0.4],
+                },
+                StudyInstruction::Add {
+                    dst: register(9),
+                    left: register(0),
+                    right: register(1),
+                },
+                StudyInstruction::Subtract {
+                    dst: register(10),
+                    left: register(9),
+                    right: register(8),
+                },
+                StudyInstruction::Multiply {
+                    dst: register(11),
+                    left: register(10),
+                    right: register(8),
+                },
+                StudyInstruction::Mix {
+                    dst: register(12),
+                    a: register(11),
+                    b: register(8),
+                    amount: register(6),
+                },
+                StudyInstruction::Clamp01 {
+                    dst: register(13),
+                    input: register(12),
+                },
+                StudyInstruction::HueRotate {
+                    dst: register(14),
+                    color: register(13),
+                    turns: register(4),
+                },
+                StudyInstruction::OutputColor {
+                    color: register(14),
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn the_gpu_encoding_is_the_frozen_layout() {
+        let compiled = CompiledStudy::compile(&every_opcode_document()).unwrap();
+        let ops = compiled.encode_gpu_program();
+        assert_eq!(ops.len(), STUDY_GPU_MAX_INSTRUCTIONS);
+        assert_eq!(compiled.instruction_count(), 16);
+
+        let words = |index: usize| ops[index].words;
+        let imm = |index: usize| ops[index].immediate;
+        // opcode | aux << 16, dst, a, b — the append-only numbering.
+        assert_eq!(words(0), [0, 0, 0, 0]); // LoadCurrentColor -> r0
+        assert_eq!(words(1), [1 | (7 << 16), 1, 0, 0]); // history age 7
+        assert_eq!(words(2), [2, 2, 0, 0]); // motion (dead lane)
+        assert_eq!(words(3), [3 | (5 << 16), 3, 0, 0]); // audio band 5
+        assert_eq!(words(4), [4, 4, 0, 0]); // beat phase
+        assert_eq!(words(5), [5, 5, 0, 0]); // random, resolved immediate
+        assert_eq!(
+            imm(5)[0],
+            deterministic_random(compiled.canonical_digest(), 9)
+        );
+        assert_eq!(words(6), [6, 6, 0, 0]);
+        assert_eq!(imm(6), [0.25, 0.0, 0.0, 0.0]);
+        assert_eq!(words(7), [7, 7, 0, 0]);
+        assert_eq!(imm(7), [0.5, -0.5, 0.0, 0.0]);
+        assert_eq!(words(8), [8, 8, 0, 0]);
+        assert_eq!(imm(8), [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(words(9), [9, 9, 0, 1]); // add r0 r1
+        assert_eq!(words(10), [10, 10, 9, 8]);
+        assert_eq!(words(11), [11, 11, 10, 8]);
+        assert_eq!(words(12), [12 | (6 << 16), 12, 11, 8]); // mix amount r6
+        assert_eq!(words(13), [13, 13, 12, 0]);
+        assert_eq!(words(14), [14 | (4 << 16), 14, 13, 0]); // hue turns r4
+        assert_eq!(words(15), [15, 0, 14, 0]); // output reads r14
+                                               // Unused slots are zero, so one fixed-size buffer serves every study.
+        assert_eq!(ops[16], StudyGpuOp::zeroed());
+        assert_eq!(ops[STUDY_GPU_MAX_INSTRUCTIONS - 1], StudyGpuOp::zeroed());
+    }
+
+    #[test]
+    fn hue_rotation_clamps_its_operand_to_the_unorm_domain() {
+        // The S10b domain clamp (semantics version 2): an out-of-range color
+        // rotates exactly as its unorm clamp does, on both evaluators.
+        let rotate = |red: f32| {
+            let compiled = CompiledStudy::compile(&document(
+                vec![],
+                vec![
+                    StudyInstruction::ConstantColor {
+                        dst: register(0),
+                        value: [red, -3.0, 0.0, 1.0],
+                    },
+                    StudyInstruction::ConstantScalar {
+                        dst: register(1),
+                        value: 0.5,
+                    },
+                    StudyInstruction::HueRotate {
+                        dst: register(2),
+                        color: register(0),
+                        turns: register(1),
+                    },
+                    StudyInstruction::OutputColor { color: register(2) },
+                ],
+            ))
+            .unwrap();
+            compiled.evaluate_pixel(&StudyFrameContext::default(), &pixel([0.0; 4], &NoHistory))
+        };
+        assert_eq!(rotate(2.0), rotate(1.0));
+        assert_eq!(STUDY_EVAL_ALGORITHM_VERSION, 2);
+    }
+
+    #[test]
+    fn the_interpreter_shader_shares_the_rack_hue_law_character_for_character() {
+        const INTERPRETER: &str = include_str!("shaders/study_interpreter.wgsl");
+        const RACK: &str = include_str!("shaders/rack_node.wgsl");
+        fn wgsl_function<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} is missing"));
+            let body = &source[start..];
+            let end = body
+                .find("\n}\n")
+                .expect("a top level body ends at column zero");
+            &body[..end]
+        }
+        for signature in ["fn rgb_to_hsl(", "fn hue_to_rgb(", "fn hsl_to_rgb("] {
+            assert_eq!(
+                wgsl_function(INTERPRETER, signature),
+                wgsl_function(RACK, signature),
+                "{signature} must stay one law"
+            );
+        }
+        // The interpreter walks at most the frozen capacity, the bound is
+        // the ABI's, and the guard uses the committed validity counter.
+        assert_eq!(
+            STUDY_GPU_MAX_INSTRUCTIONS,
+            crate::study::STUDY_MAX_INSTRUCTIONS
+        );
+        assert!(INTERPRETER.contains("const STUDY_GPU_MAX_INSTRUCTIONS: u32 = 256u;"));
+        assert!(INTERPRETER.contains("const STUDY_BOUND: f32 = 65504.0;"));
+        assert!(INTERPRETER.contains("frame.valid_history - 1u"));
     }
 
     #[test]

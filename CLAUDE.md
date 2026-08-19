@@ -42,6 +42,7 @@ src/
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
+├── renderer/study.rs    fixed-pipeline Study interpreter executor, two textures, no sampler
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
 ├── video/threaded.rs    request decoder, codec motion, telemetry, latest-only mailbox
 ├── layers/mod.rs        video/Spout layer sources, texture upload, frame pacer
@@ -75,6 +76,7 @@ src/
     ├── fullscreen.wgsl  fullscreen triangle vertex shader
     ├── effects.wgsl     LegacyExact and Advanced layer/master effects
     ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
+    ├── study_interpreter.wgsl fixed Study interpreter over a bounded instruction buffer
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
@@ -2121,9 +2123,20 @@ mislead browser tests.
   unbounded evaluator, frame-input sanitization to documented neutrals,
   Vector2 evaluated honestly as the recorded dead end, compile-time
   required-age listing, compile-refuses-invalid, and the R3 backward-minor
-  window (newer minor and other majors rejected). The WGSL interpreter,
-  when it lands, is checked against this reference and retires the module's
-  scoped dead-code allow.
+  window (newer minor and other majors rejected). The S10b interpreter adds:
+  the frozen GPU encoding golden (append-only opcodes 0…15, aux in the high
+  half-word, resolved randomness as an immediate so the GPU never hashes,
+  zeroed tail slots so one 8,192-byte buffer serves every study), the
+  semantics-version-2 hue unorm-input clamp, and the source-text law that
+  `study_interpreter.wgsl` shares `rack_node.wgsl`'s three hue functions
+  character for character. The two
+  `renderer::study::tests::gpu_study_` fixtures carry the physical-GPU
+  claim: the interpreter matches the CPU reference across every opcode at
+  2e-5 with the R1 guard observably discriminating a young ring from a
+  committed one, and a study swap is two writes into fixed buffers with a
+  deterministic re-render. The whole chain stays behind a scoped dead-code
+  allow until a Study gains an authored audience surface — a product
+  decision, not a renderer one.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
