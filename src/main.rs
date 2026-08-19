@@ -38,6 +38,7 @@ mod spout_out;
 mod stage_health;
 mod stage_map;
 mod study;
+mod study_eval;
 // The S4 symmetry domain is the frozen CPU reference that the pending dedicated
 // Symmetry Field pass reproduces. Until that pass lands, the module is reached
 // only from its own tests.
