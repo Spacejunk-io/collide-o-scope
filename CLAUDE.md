@@ -387,7 +387,14 @@ editor-only transform: S6 proves that closure rather than adding to it.
   admission for safety/release actions, and broadcasts a complete
   `AppSnapshot`. Do not replace it with an unbounded collection.
 - The **proxy encode worker** owns one thread and a one-slot job queue that
-  refuses new work while busy instead of queueing a backlog. A job
+  refuses new work while busy instead of queueing a backlog. A request
+  resolves its identity mode first: `Verified` carries the layer's retained
+  reference, while `Mint` fingerprints the source through the same bounded
+  `FingerprintSession` machinery and reports the minted identity with its
+  claim (stable layer ID plus source-resource epoch) before any encode; the
+  drain re-validates the claim and lands the identity into the layer's
+  persistence, and an unlanded identity simply leaves no layer for the
+  completion to adopt into. Either way the job then
   re-fingerprints its source, probes and plans through `plan_proxy_input`,
   holds a `MediaSafetyPolicy` reservation for the encode's life, and babysits
   one ffmpeg child with an absolute plan-derived deadline, a staging-size
@@ -1851,9 +1858,11 @@ mislead browser tests.
 - `F` — main-window fullscreen
 - `O` — fullscreen output window
 - `B` — blackout
-- `Y` — encode a proxy for the selected layer's verified content identity;
-  every refusal and completion reports through that layer's HUD status line,
-  and a completion hot-adopts into every matching live layer at its current
+- `Y` — encode a proxy for the selected video layer; a layer without a
+  verified content identity first mints one through the bounded fingerprint
+  machinery (entering persistence when its claim re-validates). Every
+  refusal and completion reports through that layer's HUD status line, and a
+  completion hot-adopts into every matching live layer at its current
   playhead (falling back to reapply-the-patch wording only when adoption is
   refused or no live layer matches)
 - `Ctrl+E` — patch parameter editor
@@ -2071,10 +2080,15 @@ mislead browser tests.
   and discarded; eviction following the pure plan with a path-free receipt;
   foreign files counted but never touched; the contract-derived argv; garbage
   bytes failing decoded-identity validation; mutated/unreadable sources
-  refused before any encode; the Y-key mapping; and hot adoption's
+  refused before any encode; the Y-key mapping; hot adoption's
   CLI-free half — an empty cache and a refused consultation each producing
   one named, job-level `ProxyAdoptionEvent::Refused` through exactly the
-  patch-load consultation law, with no per-layer preparation fabricated.
+  patch-load consultation law, with no per-layer preparation fabricated;
+  and identity minting's CLI-free half — the mint matching the fingerprint
+  law byte-for-byte with unreadable sources typed-refused, and the worker
+  reporting `IdentityMinted` with its claim passed through verbatim before
+  any encode outcome, an unreadable source yielding one layer-keyed
+  `MintFailed` with nothing started under a fabricated identity.
   Opt-in (`--ignored`, ffmpeg CLI required, like `effects_audit`):
   `proxy_worker_end_to_end_encode_publish_rename_and_corruption_survival` —
   encode, validate, publish, cache hit, identical bytes at a renamed path
@@ -2090,7 +2104,11 @@ mislead browser tests.
   `gpu_proxy_hot_adoption_swaps_a_live_layer_and_keeps_identity_and_playhead`
   — the infallible `commit_adopted_proxy` swap keeps identity, filename, and
   playhead while moving decoder, texture, dimensions, and runtime path, and
-  advances the source-resource epoch. Windows fsync law: `FlushFileBuffers`
+  advances the source-resource epoch — and
+  `proxy_identity_mint_end_to_end_encodes_and_hits_the_cache_under_the_minted_key`
+  — a real source with no retained identity walks mint → encode →
+  publication under the minted identity, and the same bytes again are a
+  cache hit under the same key. Windows fsync law: `FlushFileBuffers`
   demands writable handles for both the staging file and the parent
   directory; do not "fix" a publish failure by dropping either sync.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
@@ -2139,9 +2157,14 @@ a passing claim.
   decoder off the render thread, and the drain installs it only after every
   claim re-validates (see the threading section). The browser surface closed
   the former native-only edge: the layer card's Encode proxy control drives
-  the same engine ladder the Y key uses (see the web section). The remaining
-  edge: only sources with a verified `cos-sha256` identity can be proxied,
-  because the key is content-addressed. A host killed
+  the same engine ladder the Y key uses (see the web section). Identity
+  minting closed the last edge: a request on a path-based video layer
+  fingerprints the source through the same bounded machinery (mint mode),
+  lands the identity behind claim guards, and — the operator's S9 ruling —
+  enters it into persistence, so the next patch capture emits the content
+  reference exactly as generation would have. Spout layers still cannot be
+  proxied (no file bytes exist), which is a category fact rather than an
+  edge. A host killed
   mid-encode may orphan one ffmpeg process bounded by its own completion;
   the staged file it writes is recovery residue, never an artifact. The
   Unix CI FFmpeg build carries `--disable-programs`, so end-to-end encode
