@@ -1,9 +1,9 @@
-# B2 — Synthetic and shaped motion fields (procedural field sources)
+# B2 — Synthetic and shaped motion fields
 
-Tranche B2 of the Bendr derivation plan, first slice: the six procedural field
-kinds. The flow-shaping controls (`stretch`, `edge_repel`, `vector_trash`)
-named in the plan's "Also here" paragraph are deliberately **not** in this
-slice and remain open B2 work.
+Tranche B2 of the Bendr derivation plan, in two slices: the six procedural
+field kinds (slice 1) and the flow-shaping controls (slice 2 — `stretch`,
+`edge_repel`, `vector_trash` + `trash_block_size`, the plan's "Also here"
+paragraph). With slice 2 landed, B2 is complete.
 
 ## What landed
 
@@ -68,10 +68,42 @@ zero-luma-bytes preflight, the procedural-versus-codec Collider planner
 fixture, patch/Morph/modulation/Dice/wire closure tests, and the ingress
 impact classification.
 
+## Slice 2 — flow shaping
+
+- `FlowShapingParams` on `MotionParams`: `stretch`, `edge_repel`,
+  `vector_trash` (unit amounts), `trash_block_size` (2–256 px). The law is
+  `motion::shape_flow_velocity`, mirrored in `motion_apply.wgsl`, ordered
+  stretch → repel → trash → canonical clamp, operating on the gated sampled
+  velocity so shaping never manufactures motion without a valid applied field.
+- Trash fires per cell per 8 Hz event tick with probability `vector_trash`,
+  under the shared `cellular_avalanche` hash in the fixed "MTRS" domain — no
+  authored seed, so replay is structural.
+- Apply uniform grew 1,664 → 1,680 bytes (`shaping_values` lane) with the
+  compile-time assertion updated; `motion_pass_budget` charges exactly four
+  covered-luma taps per fragment while `edge_repel` is nonzero and nothing
+  otherwise.
+- Full closure: skip-at-default `shaping` patch block, Morph blend of all four,
+  Dice/generator v8 fresh domains, modulation addresses at both scopes
+  (layer suffixes 60–63), ValuesOnly ingress, wire vocabulary, additive
+  snapshot block, panel ranges.
+
+Measurements on this host (same adapter):
+
+- `render_motion_flow_shaping_pipeline` renders a shaped file and an
+  `_unshaped` twin and asserts their decoded framemd5 sequences differ —
+  shaping reaches the pixels through the real export path. Passed.
+- Cross-build exactness: `renders/audit_procedural_motion_field.mp4` rendered
+  before and after the shaping change is **decoded-frame identical**
+  (framemd5), so the all-zero shaping path did not move a pixel.
+- The env-gated `gpu_motion_formats_pipelines_and_codec_upload_are_valid_when_opted_in`
+  validates the modified `motion_apply.wgsl` through real pipeline creation.
+- Hosted suite after slice 2: 1,332 tests passing.
+
 ## Explicitly not claimed
 
 - No cross-adapter portability claim beyond hosted three-platform CI.
-- The flow-shaping controls (`stretch`, `edge_repel`, `vector_trash`) are not
-  implemented.
 - No new modulation source, no Symmetry-side change, no change to the M4
   velocity contract, byte ledger, or selective-VHS budgets.
+- The trash event clock (8 Hz) and shove amplitude (16 UV/s) are fixed law,
+  not authored controls; a future authored rate would need its own address,
+  Morph law, and Dice domain.

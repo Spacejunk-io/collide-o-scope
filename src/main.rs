@@ -1437,6 +1437,18 @@ fn apply_motion_param(
         "field_rate" => {
             params.procedural.rate = bounded_motion_value(value, -2.0, 2.0, param)?;
         }
+        "stretch" => {
+            params.shaping.stretch = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "edge_repel" => {
+            params.shaping.edge_repel = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "vector_trash" => {
+            params.shaping.vector_trash = bounded_motion_value(value, 0.0, 1.0, param)?;
+        }
+        "trash_block_size" => {
+            params.shaping.trash_block_size = bounded_motion_value(value, 2.0, 256.0, param)?;
+        }
         "lattice_quality" => {
             params.lattice_quality = match value.as_str() {
                 Some("draft") => MotionLatticeQuality::Draft,
@@ -22161,6 +22173,29 @@ mod app_state_tests {
             apply_motion_param(&mut params, true, "field_rate", &serde_json::json!(2.5)).is_err()
         );
         assert_eq!(params.procedural.rate, -1.25);
+        // The four flow-shaping controls are likewise ordinary values, at
+        // both scopes, refused (never clamped) out of range.
+        for (param, value) in [
+            ("stretch", 0.5),
+            ("edge_repel", 0.25),
+            ("vector_trash", 0.75),
+            ("trash_block_size", 64.0),
+        ] {
+            assert_eq!(
+                apply_motion_param(&mut params, true, param, &serde_json::json!(value)).unwrap(),
+                MotionEditImpact::ValuesOnly,
+                "{param}"
+            );
+        }
+        assert_eq!(params.shaping.stretch, 0.5);
+        assert_eq!(params.shaping.trash_block_size, 64.0);
+        assert!(apply_motion_param(
+            &mut params,
+            false,
+            "trash_block_size",
+            &serde_json::json!(1.0)
+        )
+        .is_err());
     }
 
     #[test]

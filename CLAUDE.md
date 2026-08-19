@@ -1393,15 +1393,45 @@ the same plan and shader, codec acquisition skips procedural origins, and
 `render_procedural_motion_field_pipeline` is the labeled export case — a
 deliberately tapless single-layer stack, legal since the composite rank landed.
 
+**Flow shaping.** `FlowShapingParams { stretch, edge_repel, vector_trash,
+trash_block_size }` shapes the field the advection pass *applies* — after
+sampling and gating, before the trajectory offset — so it acts on every field
+kind: codec, lattice, procedural, or the derived collided field. The law is
+the CPU reference `motion::shape_flow_velocity`, mirrored in
+`motion_apply.wgsl` and ordered stretch → repel → trash → canonical clamp.
+Stretch grows the flow radially by local field magnitude; edge repel pushes
+down the carrier's covered-luma gradient with the push saturating at one full
+luma step per texel; vector trash shoves whole cells by hashed garbage vectors
+gated per cell per tick on the fixed `FLOW_TRASH_EVENT_HZ` (8 Hz) event clock,
+with `vector_trash` the firing probability, under the shared
+`cellular_avalanche` integer hash in the fixed "MTRS" domain — no authored
+seed, so live and offline replay identically from frame-plan time. Shaping
+runs only under a valid applied field and only when an amount is authored:
+all-zero shaping is byte-exact with the unshaped path (no clamp, no texture
+operation), proven by a decoded-frame-identical A/B across the change. Edge
+repel charges exactly four covered-luma taps per fragment in
+`motion_pass_budget`, only while nonzero; stretch and trash are arithmetic.
+The four controls are ordinary continuous values everywhere: ValuesOnly
+ingress, coalescible wire params at both scopes, `motion_stretch` /
+`motion_edge_repel` / `motion_vector_trash` / `motion_trash_block_size`
+modulation addresses (layer suffixes 60–63), Morph blend, Dice/generator v8
+mutation in fresh domains, a skip-at-default `shaping` patch block, and an
+additive snapshot block. `render_motion_flow_shaping_pipeline` is the labeled
+export case and renders an `_unshaped` twin, asserting the decoded frames
+differ — shaping demonstrably reaches the pixels and an authored zero
+demonstrably remains a different program.
+
 What is proven and what is not: kind codes/keys, resolution at every scope, the
 analytic per-kind fixtures, numeric divergence-freedom for Curl, alpha-covered
 Chroma neutrality, canonical-range clamping, zero luma bytes, the
-procedural-versus-codec Collider planner fixture, and the full
+procedural-versus-codec Collider planner fixture, the shaping law's analytic
+stretch/repel fixtures, deterministic trash firing with its probability gate,
+shaped-velocity clamping under hostile inputs, and the full
 patch/Morph/modulation/Dice/generator/browser/export closure are hosted CPU
 tests. `gpu_procedural_field_matches_the_cpu_reference_for_every_kind`
-(worst |GPU − CPU| ≤ 0.008 UV/s across all six kinds) and the labeled export
-case are opt-in `#[ignore]` fixtures measured on one adapter (AMD Radeon
-RX 6950 XT / Vulkan 26.7.1).
+(worst |GPU − CPU| ≤ 0.008 UV/s across all six kinds) and the two labeled
+export cases are opt-in `#[ignore]` fixtures measured on one adapter (AMD
+Radeon RX 6950 XT / Vulkan 26.7.1).
 
 ### Named two-input Residual Counterpoint
 
@@ -2252,10 +2282,16 @@ mislead browser tests.
   scalar interpolation with the kind switching at the midpoint, the two
   modulation addresses at master and layer scope, ingress classification
   (kind = MemoryTopology, scalars = ValuesOnly) with a bare `procedural` token
-  refused, and the wire vocabulary in `valid_motion_edit`.
+  refused, and the wire vocabulary in `valid_motion_edit`. Flow-shaping tests
+  must additionally cover neutral sanitize with a block size alone shaping
+  nothing, the analytic stretch and saturated/linear repel fixtures,
+  deterministic trash firing against the exact hash law with its probability
+  gate honest over many cells, canonical-range clamping under hostile inputs,
+  the four-taps-only-when-active pass budget, and the shaping closure ladder.
   `gpu_procedural_field_matches_the_cpu_reference_for_every_kind` carries the
-  physical-GPU claim and `render_procedural_motion_field_pipeline` is the
-  labeled export case.
+  physical-GPU claim; `render_procedural_motion_field_pipeline` and
+  `render_motion_flow_shaping_pipeline` (whose `_unshaped` twin must decode
+  differently) are the labeled export cases.
 - Preview transform-gizmo tests must cover the pane/output/local round trip at
   multiple aspect ratios and DPI scales including a non-square output, an
   active crop, a nonzero shear and a letterboxed pane; the forward map agreeing

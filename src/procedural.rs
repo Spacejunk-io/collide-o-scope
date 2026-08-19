@@ -37,11 +37,11 @@ use crate::visual_rack::{
 };
 
 /// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
-/// new isolated domains; v8 adds the B2 procedural field scalars in fresh
-/// domains — every field mutated by v7 keeps its byte-identical stream, but a
-/// generated piece now carries the two new values, so the version names the
-/// difference. Manifest readers remain data-driven and accept every earlier
-/// version string.
+/// new isolated domains; v8 adds the B2 procedural field scalars and the four
+/// flow-shaping controls in fresh domains — every field mutated by v7 keeps
+/// its byte-identical stream, but a generated piece now carries the new
+/// values, so the version names the difference. Manifest readers remain
+/// data-driven and accept every earlier version string.
 pub const GENERATOR_VERSION: &str = "8";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
@@ -550,6 +550,11 @@ const PROCEDURAL_MOTION_CHROMATIC_LAG: u64 = 0x4348_524f_4d4c_4147;
 // carried them stays byte-stable.
 const PROCEDURAL_MOTION_FIELD_SCALE: u64 = 0x4649_454c_4453_434c;
 const PROCEDURAL_MOTION_FIELD_RATE: u64 = 0x4649_454c_4452_4154;
+// B2 flow shaping, likewise in fresh domains.
+const PROCEDURAL_MOTION_STRETCH: u64 = 0x5354_5245_5443_4800;
+const PROCEDURAL_MOTION_EDGE_REPEL: u64 = 0x4544_4745_5245_5045;
+const PROCEDURAL_MOTION_VECTOR_TRASH: u64 = 0x5645_4354_5452_4153;
+const PROCEDURAL_MOTION_TRASH_BLOCK: u64 = 0x5452_4153_424c_4f43;
 
 fn mutate_motion_config(
     anchor: &MotionConfig,
@@ -671,6 +676,38 @@ fn mutate_motion_config(
         2.0,
         0.5,
         PROCEDURAL_MOTION_FIELD_RATE
+    );
+    linear!(
+        value.shaping.stretch,
+        anchor.shaping.stretch,
+        0.0,
+        1.0,
+        0.15,
+        PROCEDURAL_MOTION_STRETCH
+    );
+    linear!(
+        value.shaping.edge_repel,
+        anchor.shaping.edge_repel,
+        0.0,
+        1.0,
+        0.15,
+        PROCEDURAL_MOTION_EDGE_REPEL
+    );
+    linear!(
+        value.shaping.vector_trash,
+        anchor.shaping.vector_trash,
+        0.0,
+        1.0,
+        0.1,
+        PROCEDURAL_MOTION_VECTOR_TRASH
+    );
+    linear!(
+        value.shaping.trash_block_size,
+        anchor.shaping.trash_block_size,
+        2.0,
+        256.0,
+        24.0,
+        PROCEDURAL_MOTION_TRASH_BLOCK
     );
     *value = value.sanitized();
 }
