@@ -83,12 +83,12 @@ and Legacy Temporal markers retain the established order during migration.
 Unsafe sample counts, image dependencies, current-frame cycles, or GPU resource
 plans are rejected before the live graph changes.
 
-Entirely new studies and operators are intentionally not half-shipped in this
-repair release. The dependency order, frozen candidate APIs, resource ledgers,
-state-integration matrix, and acceptance gates for named Displace, Residual
-Counterpoint, Gesture-Field Etching, Symmetry Field, Field Collider, the native
-transform gizmo, and evidence-gated scale runtimes are recorded in the
-[successor-session implementation plan](docs/successor-session-enrichment-implementation-plan.md).
+Entirely new studies and operators are intentionally never half-shipped. The
+named Displace, Residual Counterpoint, Gesture-Field Etching, Symmetry Field,
+Field Collider, native transform gizmo, and evidence-gated scale tranches that
+were once planned here have all landed; the resource ledgers, acceptance
+gates, and measurements that governed each landing are preserved per tranche
+in the evidence notes and receipts under `docs/evidence/`.
 
 The composition root can contain layers and up to 16 one-level groups. Groups
 own contiguous members, opacity, transform, rack, matte, solo/bypass, and a
