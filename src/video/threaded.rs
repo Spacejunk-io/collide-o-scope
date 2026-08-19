@@ -272,6 +272,22 @@ impl ReadyFrame {
     }
 }
 
+/// How selecting a seed frame at a requested start position ended without
+/// producing one. The caller owns the operator-facing message — it knows the
+/// source path and its own deadline policy — so these variants carry only
+/// what the caller cannot re-derive.
+#[derive(Debug)]
+pub enum SeedSelectError {
+    /// The caller's currency check answered false mid-wait.
+    Superseded,
+    /// The decoder opened without publishing a decoded first frame.
+    NoSeedFrame,
+    /// The decoder reported a hard error.
+    Decode(String),
+    /// No frame for the requested generation arrived within the deadline.
+    Timeout { target_seconds: f64 },
+}
+
 /// Stable decoder state for snapshots and operator-facing health reporting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecoderHealth {
@@ -770,6 +786,51 @@ impl ThreadedDecoder {
     #[allow(dead_code)]
     pub fn source_generation(&self) -> u64 {
         self.mailbox.generation()
+    }
+
+    /// Harvest the open seed frame and, for a nonzero start position on a
+    /// seekable source, replace it with the frame at that position: bump the
+    /// source generation, queue the absolute selection, and poll until the
+    /// matching frame arrives or `timeout` elapses. This is the single
+    /// implementation of the prepared-source seed dance; the performance
+    /// preparer and proxy hot adoption both call it so the two cannot drift.
+    pub fn select_seed_frame_at(
+        &mut self,
+        start_position: f64,
+        timeout: Duration,
+        poll: Duration,
+        is_current: &dyn Fn() -> bool,
+    ) -> Result<ReadyFrame, SeedSelectError> {
+        let seed = self
+            .try_next_ready_frame_result()
+            .map_err(SeedSelectError::Decode)?
+            .ok_or(SeedSelectError::NoSeedFrame)?;
+        if start_position <= 0.0 || self.duration_seconds <= 0.0 {
+            return Ok(seed);
+        }
+        let generation = self.source_generation().checked_add(1).ok_or_else(|| {
+            SeedSelectError::Decode("prepared video source generation exhausted".to_string())
+        })?;
+        let target_seconds = start_position * self.duration_seconds;
+        self.request_source_time(generation, target_seconds)
+            .map_err(SeedSelectError::Decode)?;
+        let started = Instant::now();
+        loop {
+            if !is_current() {
+                return Err(SeedSelectError::Superseded);
+            }
+            match self
+                .try_next_ready_frame_result()
+                .map_err(SeedSelectError::Decode)?
+            {
+                Some(frame) if frame.source_generation == generation => return Ok(frame),
+                Some(_) | None => {}
+            }
+            if started.elapsed() >= timeout {
+                return Err(SeedSelectError::Timeout { target_seconds });
+            }
+            std::thread::sleep(poll);
+        }
     }
 
     pub fn try_next_ready_frame_result(&mut self) -> Result<Option<ReadyFrame>, String> {

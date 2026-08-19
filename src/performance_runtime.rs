@@ -31,7 +31,9 @@ use crate::media_source::{
 use crate::performance::{ClipSlotConfig, ClipSlotId, Scene, SceneId, MAX_SCENE_BINDINGS};
 use crate::spout_in::SpoutIn;
 use crate::transport::{CueId, NormalizedTime};
-use crate::video::{decode_still_image_with_media_policy, StillImage, ThreadedDecoder};
+use crate::video::{
+    decode_still_image_with_media_policy, SeedSelectError, StillImage, ThreadedDecoder,
+};
 
 pub const DEFAULT_SPOUT_PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 const SPOUT_PREPARE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -705,58 +707,35 @@ impl SystemSourcePreparer {
         if !is_current() {
             return Err(SourcePrepareError::Superseded);
         }
-        let seed = decoder
-            .try_next_ready_frame_result()
-            .map_err(|error| SourcePrepareError::Failed(PreparationFailureKind::SourceOpen, error))?
-            .ok_or_else(|| {
-                SourcePrepareError::Failed(
+        let first = decoder
+            .select_seed_frame_at(
+                start_position.get(),
+                VIDEO_PREPARE_SELECT_TIMEOUT,
+                VIDEO_PREPARE_POLL_INTERVAL,
+                is_current,
+            )
+            .map_err(|error| match error {
+                SeedSelectError::Superseded => SourcePrepareError::Superseded,
+                SeedSelectError::NoSeedFrame => SourcePrepareError::Failed(
                     PreparationFailureKind::SourceOpen,
                     format!(
                         "video {} opened without a decoded first frame",
                         path.display()
                     ),
-                )
-            })?;
-        let first = if start_position == NormalizedTime::ZERO || decoder.duration_seconds <= 0.0 {
-            seed
-        } else {
-            let generation = decoder.source_generation().checked_add(1).ok_or_else(|| {
-                SourcePrepareError::Failed(
-                    PreparationFailureKind::SourceOpen,
-                    "prepared video source generation exhausted".to_string(),
-                )
-            })?;
-            let target_seconds = start_position.get() * decoder.duration_seconds;
-            decoder
-                .request_source_time(generation, target_seconds)
-                .map_err(|error| {
+                ),
+                SeedSelectError::Decode(error) => {
                     SourcePrepareError::Failed(PreparationFailureKind::SourceOpen, error)
-                })?;
-            let started = Instant::now();
-            loop {
-                if !is_current() {
-                    return Err(SourcePrepareError::Superseded);
                 }
-                match decoder.try_next_ready_frame_result().map_err(|error| {
-                    SourcePrepareError::Failed(PreparationFailureKind::SourceOpen, error)
-                })? {
-                    Some(frame) if frame.source_generation == generation => break frame,
-                    Some(_) | None => {}
-                }
-                if started.elapsed() >= VIDEO_PREPARE_SELECT_TIMEOUT {
-                    return Err(SourcePrepareError::Failed(
-                        PreparationFailureKind::SourceTimeout,
-                        format!(
-                            "video {} did not produce source position {:.6}s within {:.1}s",
-                            path.display(),
-                            target_seconds,
-                            VIDEO_PREPARE_SELECT_TIMEOUT.as_secs_f64()
-                        ),
-                    ));
-                }
-                std::thread::sleep(VIDEO_PREPARE_POLL_INTERVAL);
-            }
-        };
+                SeedSelectError::Timeout { target_seconds } => SourcePrepareError::Failed(
+                    PreparationFailureKind::SourceTimeout,
+                    format!(
+                        "video {} did not produce source position {:.6}s within {:.1}s",
+                        path.display(),
+                        target_seconds,
+                        VIDEO_PREPARE_SELECT_TIMEOUT.as_secs_f64()
+                    ),
+                ),
+            })?;
         let preload_bytes = decoder.media_allocation_plan().working_set_bytes;
         Ok(CpuPreparedSource {
             width: decoder.width,

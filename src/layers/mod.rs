@@ -1006,6 +1006,69 @@ impl Layer {
         }
     }
 
+    /// Infallible source-only install of a validated proxy artifact behind
+    /// the same authored clip. This is deliberately not a clip switch: clip
+    /// slots, the active slot, transport position/direction/generation state,
+    /// speed, target decode FPS, pending seeks/cues, pause, the authored
+    /// filename, and the persisted content reference are all untouched, so
+    /// the audience keeps the exact playhead — and a completed OneShot stays
+    /// transparent — while the decoder underneath moves to the artifact.
+    /// Only the decoder-facing fields move: runtime source path, source,
+    /// texture, dimensions, preload weight, and codec motion (reset, exactly
+    /// as a transport discontinuity resets it, because the old field's
+    /// resolution no longer matches). The displaced original source is
+    /// returned for the caller to retire.
+    pub(crate) fn commit_adopted_proxy(
+        &mut self,
+        activation: LayerSourceActivation,
+        key: String,
+    ) -> LayerSourceActivation {
+        let prior_source_fps = match &self.source {
+            LayerSource::Video(decoder) => decoder.fps,
+            LayerSource::Still(_) | LayerSource::Spout(_) => 30.0,
+        };
+        let LayerSourceActivation {
+            source_path,
+            // Identity is not the activation's to change: the layer keeps its
+            // retained content reference and authored filename verbatim.
+            persisted_source_reference: _,
+            filename: _,
+            source,
+            texture,
+            texture_view,
+            width,
+            height,
+            source_fps: _,
+            preload_bytes,
+            source_error,
+            source_frame_initialized,
+            codec_motion,
+        } = activation;
+        let displaced = LayerSourceActivation {
+            source_path: std::mem::replace(&mut self.source_path, source_path),
+            persisted_source_reference: self.persisted_source_reference.clone(),
+            filename: self.filename.clone(),
+            source: std::mem::replace(&mut self.source, source),
+            texture: std::mem::replace(&mut self.texture, texture),
+            texture_view: std::mem::replace(&mut self.texture_view, texture_view),
+            width: self.width,
+            height: self.height,
+            source_fps: prior_source_fps,
+            preload_bytes: self.source_preload_bytes,
+            source_error: std::mem::replace(&mut self.source_error, source_error),
+            source_frame_initialized: self.source_frame_initialized,
+            codec_motion: std::mem::replace(&mut self.codec_motion, codec_motion),
+        };
+        self.width = width;
+        self.height = height;
+        self.proxy_backing = Some(key);
+        self.source_resource_epoch = self.source_resource_epoch.wrapping_add(1).max(1);
+        self.effects.resolution = [width as f32, height as f32];
+        self.source_frame_initialized = source_frame_initialized;
+        self.source_preload_bytes = preload_bytes;
+        displaced
+    }
+
     /// Keep a verified content reference while the decoder uses its resolved
     /// host path. Passing `None` restores ordinary path-based persistence.
     pub(crate) fn set_persisted_source_reference(&mut self, reference: Option<String>) {
