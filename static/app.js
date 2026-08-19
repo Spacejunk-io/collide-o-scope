@@ -2001,6 +2001,14 @@ document.querySelectorAll('.param-row[data-param]').forEach((row) => {
       cellular_gap_threshold: 0.65, cellular_gap_softness: 0.08,
       key_color_r: 0, key_color_g: 1, key_color_b: 0,
       key_threshold: 0.5, key_softness: 0.1, key_tolerance: 0.15,
+      contour: 0, contour_bands: 10, contour_width: 1.2, contour_hue: 0,
+      contour_fill: 0.25, flatten: 0, flatten_levels: 5, contour_dither: 0,
+      solarize: 0, negative: 0, colourpass: 0, colourpass_hue: 0,
+      colourpass_width: 0.25, edge_amount: 0, edge_hue: 0, emboss: 0,
+      emboss_angle: 45, halftone: 0, halftone_pitch: 0.4, halftone_angle: 0,
+      moire: 0, moire_freq: 0.4, row_smear: 0, bitcrush: 0,
+      bitcrush_levels: 2, bitcrush_dither: 1, multi_grid_x: 1, multi_grid_y: 1,
+      barrel: 0, chroma_aberration: 0, anamorphic_streak: 0,
     };
     resetRangeOnDoubleActivation(slider, defaults[param] ?? min);
   }
@@ -3285,7 +3293,43 @@ const LAYER_EFFECT_CONTROLS = [
   ['cellular_gap_amount', 'Gap Key', 'range', 0, 1, 0.01, 0],
   ['cellular_gap_threshold', 'Gap Thresh', 'range', 0, 1, 0.01, 0.65],
   ['cellular_gap_softness', 'Gap Soft', 'range', 0, 0.5, 0.01, 0.08],
+  // B13 small effects. The three master-only optics are deliberately absent
+  // from layer cards.
+  ['contour', 'Contour', 'range', 0, 1, 0.01, 0],
+  ['contour_bands', 'Bands', 'range', 2, 40, 1, 10],
+  ['contour_width', 'Line Width', 'range', 0.2, 6, 0.1, 1.2],
+  ['contour_hue', 'Line Hue', 'range', 0, 1, 0.01, 0],
+  ['contour_fill', 'Keep Fill', 'range', 0, 1, 0.01, 0.25],
+  ['flatten', 'Flatten', 'range', 0, 1, 0.01, 0],
+  ['flatten_levels', 'Levels', 'range', 2, 16, 1, 5],
+  ['contour_dither', 'Dither', 'range', 0, 1, 0.01, 0],
+  ['solarize', 'Solarize', 'range', 0, 1, 0.01, 0],
+  ['negative', 'Negative', 'range', 0, 1, 0.01, 0],
+  ['negative_mode', 'Neg Mode', 'select', 0, 2, 1, 0],
+  ['colourpass', 'Colourpass', 'range', 0, 1, 0.01, 0],
+  ['colourpass_hue', 'Pass Hue', 'range', -180, 180, 1, 0],
+  ['colourpass_width', 'Pass Width', 'range', 0, 1, 0.01, 0.25],
+  ['edge_amount', 'Find Edge', 'range', 0, 1, 0.01, 0],
+  ['edge_hue', 'Edge Hue', 'range', -180, 180, 1, 0],
+  ['emboss', 'Emboss', 'range', 0, 1, 0.01, 0],
+  ['emboss_angle', 'Emboss Dir', 'range', -180, 180, 1, 45],
+  ['halftone', 'Halftone', 'range', 0, 1, 0.01, 0],
+  ['halftone_pitch', 'Dot Pitch', 'range', 0, 1, 0.01, 0.4],
+  ['halftone_angle', 'Dot Angle', 'range', -180, 180, 1, 0],
+  ['moire', 'Moire', 'range', 0, 1, 0.01, 0],
+  ['moire_freq', 'Moire Freq', 'range', 0, 1, 0.01, 0.4],
+  ['row_smear', 'Row Smear', 'range', 0, 1, 0.01, 0],
+  ['bitcrush', 'Bitcrush', 'range', 0, 1, 0.01, 0],
+  ['bitcrush_levels', 'Crush Levels', 'range', 2, 16, 1, 2],
+  ['bitcrush_dither', 'Crush Dither', 'range', 0, 1, 0.01, 1],
+  ['multi_grid_x', 'Grid X', 'range', 1, 8, 1, 1],
+  ['multi_grid_y', 'Grid Y', 'range', 1, 8, 1, 1],
 ];
+
+const LAYER_EFFECT_SELECT_OPTIONS = {
+  grain_algo: [['0', 'Gaussian'], ['1', 'Perlin'], ['2', 'Salt &amp; Pepper'], ['3', 'Blue']],
+  negative_mode: [['0', 'RGB'], ['1', 'Luma'], ['2', 'Hue Flip']],
+};
 
 function layerEffectsHtml(effects, index) {
   const rowHtml = ([param, label, kind, min, max, step, fallback]) => {
@@ -3294,19 +3338,30 @@ function layerEffectsHtml(effects, index) {
       return `<div class="param-row toggle-row layer-effect-row" data-layer-effect="${param}"><label>${label}</label><label class="toggle"><input type="checkbox" ${value ? 'checked' : ''} aria-label="Layer ${index + 1} ${label}"><span class="toggle-slider"></span></label></div>`;
     }
     if (kind === 'select') {
-      return `<div class="param-row select-row layer-effect-row" data-layer-effect="${param}"><label>${label}</label><select aria-label="Layer ${index + 1} ${label}"><option value="0">Gaussian</option><option value="1">Perlin</option><option value="2">Salt &amp; Pepper</option><option value="3">Blue</option></select></div>`;
+      const options = (LAYER_EFFECT_SELECT_OPTIONS[param] || [])
+        .map(([optionValue, optionLabel]) => `<option value="${optionValue}">${optionLabel}</option>`)
+        .join('');
+      return `<div class="param-row select-row layer-effect-row" data-layer-effect="${param}"><label>${label}</label><select aria-label="Layer ${index + 1} ${label}">${options}</select></div>`;
     }
     return `<div class="param-row layer-effect-row" data-layer-effect="${param}" data-min="${min}" data-max="${max}" data-step="${step}"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-label="Layer ${index + 1} ${label}"><span class="value">${formatValue(Number(value), min, max, step)}</span></div>`;
   };
   const cellularIndex = LAYER_EFFECT_CONTROLS.findIndex(([param]) => param === 'cellular_amount');
+  const smallFxIndex = LAYER_EFFECT_CONTROLS.findIndex(([param]) => param === 'contour');
   const ordinary = LAYER_EFFECT_CONTROLS.slice(0, cellularIndex).map(rowHtml).join('');
-  const cellular = LAYER_EFFECT_CONTROLS.slice(cellularIndex).map(rowHtml).join('');
+  const cellular = LAYER_EFFECT_CONTROLS.slice(cellularIndex, smallFxIndex).map(rowHtml).join('');
+  const smallFx = LAYER_EFFECT_CONTROLS.slice(smallFxIndex).map(rowHtml).join('');
   return `${ordinary}
     <div class="layer-cellular-disclosure">
       <button class="layer-cellular-toggle" type="button" aria-expanded="false" aria-controls="layer-cellular-body-${index}">
         <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>CELLULAR</span>
       </button>
       <div class="layer-cellular-body" id="layer-cellular-body-${index}" role="region" aria-label="Layer ${index + 1} cellular effects" hidden>${cellular}</div>
+    </div>
+    <div class="layer-cellular-disclosure">
+      <button class="layer-cellular-toggle" type="button" aria-expanded="false" aria-controls="layer-small-fx-body-${index}">
+        <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>SMALL FX</span>
+      </button>
+      <div class="layer-cellular-body" id="layer-small-fx-body-${index}" role="region" aria-label="Layer ${index + 1} small effects" hidden>${smallFx}</div>
     </div>`;
 }
 
@@ -3476,8 +3531,6 @@ function wireLayerDisclosures(card, layer, index) {
   const motionBody = card.querySelector('.layer-motion-body');
   const effectsButton = card.querySelector('.layer-fx-toggle');
   const effectsBody = card.querySelector('.layer-fx-body');
-  const cellularButton = card.querySelector('.layer-cellular-toggle');
-  const cellularBody = card.querySelector('.layer-cellular-body');
   const performanceButton = card.querySelector('.layer-performance-toggle');
   const performanceBody = card.querySelector('.layer-performance-body');
   const matteButton = card.querySelector('.layer-matte-toggle');
@@ -3485,7 +3538,20 @@ function wireLayerDisclosures(card, layer, index) {
   setLayerDisclosure(transformButton, transformBody, !!remembered.transform);
   setLayerDisclosure(motionButton, motionBody, !!remembered.motion);
   setLayerDisclosure(effectsButton, effectsBody, remembered.effects);
-  setLayerDisclosure(cellularButton, cellularBody, remembered.cellular);
+  // Cellular and Small FX share one disclosure idiom; each toggle pairs with
+  // the body its aria-controls names and remembers its own open state.
+  card.querySelectorAll('.layer-cellular-toggle').forEach((button) => {
+    const controls = button.getAttribute('aria-controls') || '';
+    const body = card.querySelector(`#${controls}`);
+    if (!body) return;
+    const stateKey = controls.includes('small-fx') ? 'small_fx' : 'cellular';
+    setLayerDisclosure(button, body, !!remembered[stateKey]);
+    button.addEventListener('click', () => {
+      remembered[stateKey] = button.getAttribute('aria-expanded') !== 'true';
+      layerDisclosureState.set(key, remembered);
+      setLayerDisclosure(button, body, remembered[stateKey]);
+    });
+  });
   setLayerDisclosure(performanceButton, performanceBody, remembered.performance);
   setLayerDisclosure(matteButton, matteBody, remembered.matte);
   transformButton.addEventListener('click', () => {
@@ -3502,11 +3568,6 @@ function wireLayerDisclosures(card, layer, index) {
     remembered.effects = effectsButton.getAttribute('aria-expanded') !== 'true';
     layerDisclosureState.set(key, remembered);
     setLayerDisclosure(effectsButton, effectsBody, remembered.effects);
-  });
-  cellularButton.addEventListener('click', () => {
-    remembered.cellular = cellularButton.getAttribute('aria-expanded') !== 'true';
-    layerDisclosureState.set(key, remembered);
-    setLayerDisclosure(cellularButton, cellularBody, remembered.cellular);
   });
   performanceButton.addEventListener('click', () => {
     remembered.performance = performanceButton.getAttribute('aria-expanded') !== 'true';

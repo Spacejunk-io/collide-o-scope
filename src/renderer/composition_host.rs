@@ -4507,16 +4507,20 @@ mod tests {
         let temporal_compat8_sha256 = sha256(&temporal_exact_output);
         let temporal_advanced_working_sha256 = sha256(&temporal_advanced_working_output);
         let temporal_advanced_presented_sha256 = sha256(&temporal_advanced_presented_output);
-        // B3 re-pinned this digest: the feedback rig joined the temporal
-        // shaders and their param source. The six output SHAs below did not
-        // move, which is the byte-exactness proof for the rig-inactive path.
+        // B13 re-pinned this digest: the small-effects tranche grew the
+        // shared effects shader by eight amount-gated vec4 slots. The six
+        // output SHAs below did not move, which is the byte-exactness proof
+        // for every default-off branch.
         assert_eq!(
             shader_bundle_sha256,
-            "d3db27d4078d7c27e7820170347abedf2de5e10772a74c692ec7e08cb2a4b9ec"
+            "3e280fd7861956d6e363079b14b06b81c8a853ddf9a3763031c3a15d1b0387f4"
         );
+        // B13 re-pinned this input-identity lane: the still fixture hash
+        // covers the raw EffectPassUniforms bytes, which grew 224 -> 352.
+        // The output SHAs below are the pixel claim and did not move.
         assert_eq!(
             still_fixture_sha256,
-            "ddaa723b65d5d664ccb326e7bbe3acd3943391718a830e4f12b374a23ce32916"
+            "0aeb411e29b0d88a10ddd3e0a7cbb55f91f409da8cd705568f93bf7ecc475f4a"
         );
         assert_eq!(
             temporal_fixture_sha256,

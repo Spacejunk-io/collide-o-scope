@@ -435,6 +435,268 @@ pub(crate) fn mutate_live_effects(
         amount * 2.5,
         &mut shift_rng,
     );
+
+    // B13 small effects mutate in their own domain-separated stream so every
+    // pre-B13 Dice result stays byte-for-byte stable for the same seed and
+    // stream. `negative_mode` is a discrete law and is deliberately not
+    // rerolled. The layer call sites clear the three master-only optics after
+    // this returns, so their mutation reaches master scope only.
+    let mut small_fx_rng = SplitMix64::new(
+        u64::from(seed) ^ stream.wrapping_mul(0xa076_1d64_78bd_642f) ^ 0x534d_4c46_5800_0001,
+    );
+    effects.contour = mutate_linear(
+        defaults.contour,
+        effects.contour,
+        0.0,
+        1.0,
+        amount * 0.18,
+        &mut small_fx_rng,
+    );
+    effects.contour_bands = mutate_log(
+        defaults.contour_bands,
+        effects.contour_bands,
+        2.0,
+        40.0,
+        amount * 0.25,
+        &mut small_fx_rng,
+    )
+    .round();
+    effects.contour_width = mutate_linear(
+        defaults.contour_width,
+        effects.contour_width,
+        0.2,
+        6.0,
+        amount * 0.6,
+        &mut small_fx_rng,
+    );
+    effects.contour_hue = mutate_linear(
+        defaults.contour_hue,
+        effects.contour_hue,
+        0.0,
+        1.0,
+        amount * 0.2,
+        &mut small_fx_rng,
+    );
+    effects.contour_fill = mutate_linear(
+        defaults.contour_fill,
+        effects.contour_fill,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.flatten = mutate_linear(
+        defaults.flatten,
+        effects.flatten,
+        0.0,
+        1.0,
+        amount * 0.18,
+        &mut small_fx_rng,
+    );
+    effects.flatten_levels = mutate_log(
+        defaults.flatten_levels,
+        effects.flatten_levels,
+        2.0,
+        16.0,
+        amount * 0.3,
+        &mut small_fx_rng,
+    )
+    .round();
+    effects.contour_dither = mutate_linear(
+        defaults.contour_dither,
+        effects.contour_dither,
+        0.0,
+        1.0,
+        amount * 0.2,
+        &mut small_fx_rng,
+    );
+    effects.solarize = mutate_linear(
+        defaults.solarize,
+        effects.solarize,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.negative = mutate_linear(
+        defaults.negative,
+        effects.negative,
+        0.0,
+        1.0,
+        amount * 0.12,
+        &mut small_fx_rng,
+    );
+    effects.colourpass = mutate_linear(
+        defaults.colourpass,
+        effects.colourpass,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.colourpass_hue = mutate_circular(
+        defaults.colourpass_hue,
+        effects.colourpass_hue,
+        -180.0,
+        180.0,
+        amount * 40.0,
+        &mut small_fx_rng,
+    );
+    effects.colourpass_width = mutate_linear(
+        defaults.colourpass_width,
+        effects.colourpass_width,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.edge_amount = mutate_linear(
+        defaults.edge_amount,
+        effects.edge_amount,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.edge_hue = mutate_circular(
+        defaults.edge_hue,
+        effects.edge_hue,
+        -180.0,
+        180.0,
+        amount * 40.0,
+        &mut small_fx_rng,
+    );
+    effects.emboss = mutate_linear(
+        defaults.emboss,
+        effects.emboss,
+        0.0,
+        1.0,
+        amount * 0.12,
+        &mut small_fx_rng,
+    );
+    effects.emboss_angle = mutate_circular(
+        defaults.emboss_angle,
+        effects.emboss_angle,
+        -180.0,
+        180.0,
+        amount * 40.0,
+        &mut small_fx_rng,
+    );
+    effects.halftone = mutate_linear(
+        defaults.halftone,
+        effects.halftone,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.halftone_pitch = mutate_linear(
+        defaults.halftone_pitch,
+        effects.halftone_pitch,
+        0.0,
+        1.0,
+        amount * 0.2,
+        &mut small_fx_rng,
+    );
+    effects.halftone_angle = mutate_circular(
+        defaults.halftone_angle,
+        effects.halftone_angle,
+        -180.0,
+        180.0,
+        amount * 40.0,
+        &mut small_fx_rng,
+    );
+    effects.moire = mutate_linear(
+        defaults.moire,
+        effects.moire,
+        0.0,
+        1.0,
+        amount * 0.12,
+        &mut small_fx_rng,
+    );
+    effects.moire_freq = mutate_linear(
+        defaults.moire_freq,
+        effects.moire_freq,
+        0.0,
+        1.0,
+        amount * 0.2,
+        &mut small_fx_rng,
+    );
+    effects.row_smear = mutate_linear(
+        defaults.row_smear,
+        effects.row_smear,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.bitcrush = mutate_linear(
+        defaults.bitcrush,
+        effects.bitcrush,
+        0.0,
+        1.0,
+        amount * 0.12,
+        &mut small_fx_rng,
+    );
+    effects.bitcrush_levels = mutate_log(
+        defaults.bitcrush_levels,
+        effects.bitcrush_levels,
+        2.0,
+        16.0,
+        amount * 0.3,
+        &mut small_fx_rng,
+    )
+    .round();
+    effects.bitcrush_dither = mutate_linear(
+        defaults.bitcrush_dither,
+        effects.bitcrush_dither,
+        0.0,
+        1.0,
+        amount * 0.2,
+        &mut small_fx_rng,
+    );
+    effects.multi_grid_x = mutate_linear(
+        defaults.multi_grid_x,
+        effects.multi_grid_x,
+        1.0,
+        8.0,
+        amount * 0.8,
+        &mut small_fx_rng,
+    )
+    .round();
+    effects.multi_grid_y = mutate_linear(
+        defaults.multi_grid_y,
+        effects.multi_grid_y,
+        1.0,
+        8.0,
+        amount * 0.8,
+        &mut small_fx_rng,
+    )
+    .round();
+    effects.barrel = mutate_linear(
+        defaults.barrel,
+        effects.barrel,
+        -1.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.chroma_aberration = mutate_linear(
+        defaults.chroma_aberration,
+        effects.chroma_aberration,
+        0.0,
+        1.0,
+        amount * 0.15,
+        &mut small_fx_rng,
+    );
+    effects.anamorphic_streak = mutate_linear(
+        defaults.anamorphic_streak,
+        effects.anamorphic_streak,
+        0.0,
+        1.0,
+        amount * 0.1,
+        &mut small_fx_rng,
+    );
 }
 
 /// Bounded opt-in Dice mutation for authored geometry.
@@ -1549,6 +1811,85 @@ mod tests {
         assert_eq!(effects.shift_block_size.fract(), 0.0);
         assert!((0.0..=1.0).contains(&effects.shift_density));
         assert!((0.0..=20.0).contains(&effects.shift_speed));
+        // B13 small effects.
+        assert!((0.0..=1.0).contains(&effects.contour));
+        assert!((2.0..=40.0).contains(&effects.contour_bands));
+        assert_eq!(effects.contour_bands.fract(), 0.0);
+        assert!((0.2..=6.0).contains(&effects.contour_width));
+        assert!((0.0..=1.0).contains(&effects.contour_hue));
+        assert!((0.0..=1.0).contains(&effects.contour_fill));
+        assert!((0.0..=1.0).contains(&effects.flatten));
+        assert!((2.0..=16.0).contains(&effects.flatten_levels));
+        assert_eq!(effects.flatten_levels.fract(), 0.0);
+        assert!((0.0..=1.0).contains(&effects.contour_dither));
+        assert!((0.0..=1.0).contains(&effects.solarize));
+        assert!((0.0..=1.0).contains(&effects.negative));
+        assert!((0.0..=1.0).contains(&effects.colourpass));
+        assert!((-180.0..=180.0).contains(&effects.colourpass_hue));
+        assert!((0.0..=1.0).contains(&effects.colourpass_width));
+        assert!((0.0..=1.0).contains(&effects.edge_amount));
+        assert!((-180.0..=180.0).contains(&effects.edge_hue));
+        assert!((0.0..=1.0).contains(&effects.emboss));
+        assert!((-180.0..=180.0).contains(&effects.emboss_angle));
+        assert!((0.0..=1.0).contains(&effects.halftone));
+        assert!((0.0..=1.0).contains(&effects.halftone_pitch));
+        assert!((-180.0..=180.0).contains(&effects.halftone_angle));
+        assert!((0.0..=1.0).contains(&effects.moire));
+        assert!((0.0..=1.0).contains(&effects.moire_freq));
+        assert!((0.0..=1.0).contains(&effects.row_smear));
+        assert!((0.0..=1.0).contains(&effects.bitcrush));
+        assert!((2.0..=16.0).contains(&effects.bitcrush_levels));
+        assert_eq!(effects.bitcrush_levels.fract(), 0.0);
+        assert!((0.0..=1.0).contains(&effects.bitcrush_dither));
+        assert!((1.0..=8.0).contains(&effects.multi_grid_x));
+        assert_eq!(effects.multi_grid_x.fract(), 0.0);
+        assert!((1.0..=8.0).contains(&effects.multi_grid_y));
+        assert_eq!(effects.multi_grid_y.fract(), 0.0);
+        assert!((-1.0..=1.0).contains(&effects.barrel));
+        assert!((0.0..=1.0).contains(&effects.chroma_aberration));
+        assert!((0.0..=1.0).contains(&effects.anamorphic_streak));
+    }
+
+    /// The B13 domain-separation golden: this array was measured on the
+    /// pre-B13 build (a7c700c) for the identical seed/stream/amount, where
+    /// the small-effects stream did not exist. The established Dice fields
+    /// must reproduce it byte for byte, because the new controls draw from
+    /// their own domain-separated stream rather than consuming the
+    /// established sequences.
+    #[test]
+    fn small_effects_dice_leaves_pre_b13_streams_byte_stable() {
+        let mut effects = EffectUniforms::default();
+        mutate_live_effects(&mut effects, 2.0, true, 1234, 9);
+        assert_eq!(
+            [
+                effects.pixelate_size,
+                effects.hue_shift,
+                effects.contrast,
+                effects.grain_size,
+                effects.cellular_speed,
+                effects.shift_amount,
+                effects.shift_block_size,
+                effects.shift_speed,
+            ],
+            [
+                2.0,
+                -82.2763,
+                -0.14153367,
+                1.9421463,
+                0.31503654,
+                0.20584321,
+                8.0,
+                2.1054444,
+            ],
+            "pre-B13 Dice values must not move"
+        );
+        // The new controls mutate deterministically in their own stream and
+        // the discrete negative mode never rerolls.
+        let mut again = EffectUniforms::default();
+        mutate_live_effects(&mut again, 2.0, true, 1234, 9);
+        assert_eq!(bytemuck::bytes_of(&effects), bytemuck::bytes_of(&again));
+        assert_eq!(effects.negative_mode, 0.0);
+        assert_live_bounds(&effects);
     }
 
     fn assert_spatial_bounds(transform: SpatialTransform) {

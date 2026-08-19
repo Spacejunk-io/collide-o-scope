@@ -2849,6 +2849,7 @@ fn black_placeholder_layer(
         ..Default::default()
     };
     layer_cfg.effects.apply_to_uniforms(&mut effects);
+    effects.clear_master_only_effects();
     let transport = ExportClipTransport::from_layer_config(layer_cfg, 0.0, 0);
     let fps = export_transport_fps(&transport, layer_cfg.fps);
     Ok(ExportLayer {
@@ -2908,6 +2909,7 @@ fn still_export_layer(
         ..Default::default()
     };
     layer_cfg.effects.apply_to_uniforms(&mut effects);
+    effects.clear_master_only_effects();
     let transport = ExportClipTransport::from_layer_config(layer_cfg, 0.0, 1);
     let fps = export_transport_fps(&transport, layer_cfg.fps);
     Ok(ExportLayer {
@@ -5118,6 +5120,7 @@ fn run_export(
             ..Default::default()
         };
         layer_cfg.effects.apply_to_uniforms(&mut effects);
+        effects.clear_master_only_effects();
 
         layers.push(ExportLayer {
             source_index,
@@ -17634,6 +17637,70 @@ mod effects_audit {
             decoded_framemd5("renders/audit_feedback_rig.mp4"),
             decoded_framemd5("renders/audit_feedback_rig_repeat.mp4"),
             "the rigged loop must replay deterministically"
+        );
+    }
+
+    /// B13's labeled export case for the whole small-effects tranche: a
+    /// master program authoring contour, flatten, solarize, negative,
+    /// colourpass, halftone, moiré, bitcrush, row smear, the multi grid, and
+    /// all three master-only optics over a layer authoring its own find-edge
+    /// and emboss, rendered through the real export path. The `_plain` twin
+    /// is the identical patch with every B13 control at its default and must
+    /// decode differently; the `_repeat` render must decode identically, so
+    /// the moiré animation's frame-indexed clock is proven deterministic.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_small_effects_pipeline() {
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let mut authored = base_patch();
+        authored.master.contour = 0.6;
+        authored.master.contour_bands = 14.0;
+        authored.master.flatten = 0.5;
+        authored.master.flatten_levels = 6.0;
+        authored.master.contour_dither = 0.8;
+        authored.master.solarize = 0.35;
+        authored.master.negative = 0.4;
+        authored.master.negative_mode = 2;
+        authored.master.colourpass = 0.5;
+        authored.master.colourpass_hue = -40.0;
+        authored.master.halftone = 0.45;
+        authored.master.halftone_angle = 30.0;
+        authored.master.moire = 0.3;
+        authored.master.bitcrush = 0.35;
+        authored.master.bitcrush_levels = 3.0;
+        authored.master.row_smear = 0.4;
+        authored.master.multi_grid_x = 2.0;
+        authored.master.multi_grid_y = 2.0;
+        authored.master.barrel = -0.6;
+        authored.master.chroma_aberration = 0.8;
+        authored.master.anamorphic_streak = 0.5;
+        authored.layers[0].effects.edge_amount = 0.5;
+        authored.layers[0].effects.edge_hue = 150.0;
+        authored.layers[0].effects.emboss = 0.4;
+        let authored_master = authored.master.clone();
+        let authored_layer = authored.layers[0].effects.clone();
+        render("small_effects", authored);
+        render("small_effects_plain", base_patch());
+        assert_ne!(
+            decoded_framemd5("renders/audit_small_effects.mp4"),
+            decoded_framemd5("renders/audit_small_effects_plain.mp4"),
+            "the authored small effects must change the decoded frames"
+        );
+        render("small_effects_repeat", {
+            let mut repeat = base_patch();
+            repeat.master = authored_master;
+            repeat.layers[0].effects = authored_layer;
+            repeat
+        });
+        assert_eq!(
+            decoded_framemd5("renders/audit_small_effects.mp4"),
+            decoded_framemd5("renders/audit_small_effects_repeat.mp4"),
+            "the small effects must replay deterministically"
         );
     }
 
