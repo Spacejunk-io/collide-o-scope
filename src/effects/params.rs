@@ -38,6 +38,181 @@ pub struct TemporalParams {
     /// Inert/zero by default. T0 freezes the authoring contract while the
     /// legacy 64-byte GPU path remains the only materialized implementation.
     pub originals: TemporalOriginalsParams,
+    /// B3 feedback rig. Identity by default, which is the exact prior
+    /// feedback path: the shader takes the historical expression untouched.
+    pub rig: FeedbackRigParams,
+}
+
+/// The B3 waveshaper vocabulary applied to the fed-back sample.
+/// Permanent append-only codes; `Clamp` is the default and, at drive 1 and
+/// pivot 0.5, the exact identity on in-range values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FeedbackShape {
+    #[default]
+    Clamp,
+    Soft,
+    Wrap,
+    Fold,
+}
+
+impl FeedbackShape {
+    /// Permanent append-only shader code. Never renumber an existing entry.
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Clamp => 0,
+            Self::Soft => 1,
+            Self::Wrap => 2,
+            Self::Fold => 3,
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the closed-vocabulary fixtures iterate the frozen code table"
+    )]
+    pub const ALL: [Self; 4] = [Self::Clamp, Self::Soft, Self::Wrap, Self::Fold];
+}
+
+/// The complete B3 feedback rig: everything the loop does to the fed-back
+/// sample beyond the frozen zoom/rotate/retention trio. Identity is the exact
+/// prior path — the shader's rig-active flag is false and the historical
+/// feedback expression runs untouched, byte for byte.
+///
+/// Rate law: rate-like controls (offset, hue rotate, chroma displace, blur,
+/// sharpen, noise) scale linearly per 1/30-second reference tick;
+/// multiplicative controls (saturation, per-channel gain) exponentiate, the
+/// `feedback`/`fb_zoom` law; the nonlinear stage (shape/drive/threshold) and
+/// the servo mix toward identity by the clamped tick fraction, exact at the
+/// 30 Hz reference and rate-independent to first order elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FeedbackRigParams {
+    /// Fed-back image offset per reference tick, output UV.
+    pub offset_x: f32,
+    pub offset_y: f32,
+    /// Discrete reflections about the frame centre — the regime no rotation
+    /// can reach.
+    pub reflect_x: bool,
+    pub reflect_y: bool,
+    /// In-loop hue rotation, degrees per reference tick.
+    pub hue_rotate: f32,
+    /// In-loop saturation pull per reference tick; 1 is identity.
+    pub saturation: f32,
+    /// Per-channel loop gain per reference tick; 1 is identity. Above 1 the
+    /// loop can exceed unity and run away — that is what the servo is for.
+    pub gain_r: f32,
+    pub gain_g: f32,
+    pub gain_b: f32,
+    /// Chromatic displacement of the fed-back lookup, UV per reference tick.
+    pub chroma_displace: f32,
+    /// Cross-blur of the fed-back sample; with `sharpen` this is the
+    /// activator-inhibitor pair.
+    pub blur: f32,
+    /// Unsharp gain over the same cross taps.
+    pub sharpen: f32,
+    pub shape: FeedbackShape,
+    /// Waveshaper drive about the pivot; 1 is identity.
+    pub drive: f32,
+    pub pivot: f32,
+    /// Fed-back luma below this level decays out of the loop; 0 is exact off.
+    pub threshold: f32,
+    /// Deterministic loop noise per reference tick.
+    pub noise: f32,
+    /// Boundary law for the fed-back lookup. `Transparent` is the exact
+    /// historical inside test; the numbering is the frozen program-wide
+    /// boundary table.
+    pub edge: crate::motion::MotionBoundaryMode,
+    /// Engage the per-pixel compressive auto-level. Deliberately deterministic
+    /// (no measured-mean loop): a readback-driven servo would give live and
+    /// export different dynamics, which the export contract forbids.
+    pub servo: bool,
+    /// B14's philosophy: defeated, the loop may run to white or black and
+    /// stay there. Defeat wins over engage.
+    pub servo_defeated: bool,
+}
+
+impl Default for FeedbackRigParams {
+    fn default() -> Self {
+        Self {
+            offset_x: 0.0,
+            offset_y: 0.0,
+            reflect_x: false,
+            reflect_y: false,
+            hue_rotate: 0.0,
+            saturation: 1.0,
+            gain_r: 1.0,
+            gain_g: 1.0,
+            gain_b: 1.0,
+            chroma_displace: 0.0,
+            blur: 0.0,
+            sharpen: 0.0,
+            shape: FeedbackShape::Clamp,
+            drive: 1.0,
+            pivot: 0.5,
+            threshold: 0.0,
+            noise: 0.0,
+            edge: crate::motion::MotionBoundaryMode::Transparent,
+            servo: false,
+            servo_defeated: false,
+        }
+    }
+}
+
+impl FeedbackRigParams {
+    /// Clamp continuous values and replace non-finite input with the field's
+    /// neutral value, never a clamped extreme.
+    pub fn sanitized(self) -> Self {
+        let unit = |value: f32, neutral: f32| finite_or(value, neutral).clamp(0.0, 1.0);
+        Self {
+            offset_x: finite_or(self.offset_x, 0.0).clamp(-0.5, 0.5),
+            offset_y: finite_or(self.offset_y, 0.0).clamp(-0.5, 0.5),
+            reflect_x: self.reflect_x,
+            reflect_y: self.reflect_y,
+            hue_rotate: finite_or(self.hue_rotate, 0.0).clamp(-180.0, 180.0),
+            saturation: finite_or(self.saturation, 1.0).clamp(0.0, 2.0),
+            gain_r: finite_or(self.gain_r, 1.0).clamp(0.0, 2.0),
+            gain_g: finite_or(self.gain_g, 1.0).clamp(0.0, 2.0),
+            gain_b: finite_or(self.gain_b, 1.0).clamp(0.0, 2.0),
+            chroma_displace: finite_or(self.chroma_displace, 0.0).clamp(0.0, 0.05),
+            blur: unit(self.blur, 0.0),
+            sharpen: finite_or(self.sharpen, 0.0).clamp(0.0, 2.0),
+            shape: self.shape,
+            drive: finite_or(self.drive, 1.0).clamp(0.25, 4.0),
+            pivot: unit(self.pivot, 0.5),
+            threshold: unit(self.threshold, 0.0),
+            noise: unit(self.noise, 0.0),
+            edge: self.edge,
+            servo: self.servo,
+            servo_defeated: self.servo_defeated,
+        }
+    }
+
+    /// True when the rig is the exact prior feedback path.
+    pub fn is_identity(self) -> bool {
+        self.sanitized() == Self::default()
+    }
+
+    /// The rate law: convert 30 Hz-authored values into one render step.
+    /// Rate-like terms scale linearly; multiplicative terms exponentiate. The
+    /// nonlinear stage keeps its authored values — the shader mixes it toward
+    /// identity by the clamped tick fraction carried beside these params.
+    pub(crate) fn for_frame_scale(self, frame_scale: f32) -> Self {
+        let sanitized = self.sanitized();
+        let power = |value: f32| finite_or(value.powf(frame_scale), 1.0).clamp(0.0, 4.0);
+        Self {
+            offset_x: sanitized.offset_x * frame_scale,
+            offset_y: sanitized.offset_y * frame_scale,
+            hue_rotate: sanitized.hue_rotate * frame_scale,
+            saturation: power(sanitized.saturation),
+            gain_r: power(sanitized.gain_r),
+            gain_g: power(sanitized.gain_g),
+            gain_b: power(sanitized.gain_b),
+            chroma_displace: sanitized.chroma_displace * frame_scale,
+            blur: sanitized.blur * frame_scale,
+            sharpen: sanitized.sharpen * frame_scale,
+            noise: sanitized.noise * frame_scale,
+            ..sanitized
+        }
+    }
 }
 
 /// Return an aspect-correct, normalized scan direction for shader use.
@@ -73,6 +248,7 @@ impl Default for TemporalParams {
             key_softness: 0.03,
             key_history: 1.0,
             originals: TemporalOriginalsParams::default(),
+            rig: FeedbackRigParams::default(),
         }
     }
 }
@@ -130,7 +306,21 @@ impl TemporalParams {
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
             key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
             originals: self.originals.sanitized(),
+            rig: self.rig.for_frame_scale(frame_scale),
         }
+    }
+
+    /// The clamped tick fraction the shader uses to mix the rig's nonlinear
+    /// stage toward identity. Exactly one at the 30 Hz reference; capped at
+    /// one below it so a slow display cannot extrapolate the shaper.
+    pub(crate) fn rig_tick_mix(delta_seconds: f32) -> f32 {
+        let reference_delta = 1.0 / TEMPORAL_REFERENCE_FPS;
+        let delta = if delta_seconds.is_finite() {
+            delta_seconds.max(0.0)
+        } else {
+            reference_delta
+        };
+        (delta * TEMPORAL_REFERENCE_FPS).clamp(0.0, 1.0)
     }
 }
 
@@ -156,6 +346,23 @@ mod temporal_tests {
             feedback: 0.81,
             fb_zoom: 1.04,
             fb_rotate: 3.0,
+            rig: FeedbackRigParams {
+                offset_x: 0.2,
+                offset_y: -0.1,
+                hue_rotate: 24.0,
+                saturation: 1.44,
+                gain_r: 1.21,
+                gain_g: 0.81,
+                gain_b: 1.69,
+                chroma_displace: 0.02,
+                blur: 0.4,
+                sharpen: 0.8,
+                drive: 2.0,
+                pivot: 0.3,
+                threshold: 0.25,
+                noise: 0.5,
+                ..FeedbackRigParams::default()
+            },
             slitscan: 0.7,
             slit_angle: 42.0,
             slit_axis: 1.0,
@@ -170,6 +377,36 @@ mod temporal_tests {
         close(half.feedback * half.feedback, params.feedback);
         close(half.fb_zoom * half.fb_zoom, params.fb_zoom);
         close(half.fb_rotate + half.fb_rotate, params.fb_rotate);
+        // The rig obeys the same two laws: rate-like terms halve, and
+        // multiplicative terms take the square root.
+        close(half.rig.offset_x + half.rig.offset_x, params.rig.offset_x);
+        close(
+            half.rig.hue_rotate + half.rig.hue_rotate,
+            params.rig.hue_rotate,
+        );
+        close(
+            half.rig.chroma_displace + half.rig.chroma_displace,
+            params.rig.chroma_displace,
+        );
+        close(half.rig.blur + half.rig.blur, params.rig.blur);
+        close(half.rig.sharpen + half.rig.sharpen, params.rig.sharpen);
+        close(half.rig.noise + half.rig.noise, params.rig.noise);
+        close(
+            half.rig.saturation * half.rig.saturation,
+            params.rig.saturation,
+        );
+        close(half.rig.gain_r * half.rig.gain_r, params.rig.gain_r);
+        close(half.rig.gain_g * half.rig.gain_g, params.rig.gain_g);
+        close(half.rig.gain_b * half.rig.gain_b, params.rig.gain_b);
+        // The nonlinear stage keeps its authored values; the tick fraction the
+        // shader mixes by is computed beside them.
+        close(half.rig.drive, params.rig.drive);
+        close(half.rig.pivot, params.rig.pivot);
+        close(half.rig.threshold, params.rig.threshold);
+        close(TemporalParams::rig_tick_mix(1.0 / 60.0), 0.5);
+        close(TemporalParams::rig_tick_mix(1.0 / 30.0), 1.0);
+        // Below the reference rate the shaper saturates at one tick.
+        close(TemporalParams::rig_tick_mix(1.0 / 24.0), 1.0);
         close(half.slitscan, params.slitscan);
         close(half.key_mode, params.key_mode);
         close(half.key_threshold, params.key_threshold);
@@ -191,6 +428,7 @@ mod temporal_tests {
             key_softness: f32::NEG_INFINITY,
             key_history: 999.0,
             originals: TemporalOriginalsParams::default(),
+            rig: FeedbackRigParams::default(),
         };
         let normalized = params.for_frame_delta(f32::NAN);
 
@@ -224,6 +462,47 @@ mod temporal_tests {
         assert_eq!(params.key_threshold, 0.1);
         assert_eq!(params.key_softness, 0.03);
         assert_eq!(params.key_history, 1.0);
+    }
+
+    #[test]
+    fn feedback_rig_identity_is_the_exact_default_and_sanitize_is_neutral() {
+        assert!(FeedbackRigParams::default().is_identity());
+        let hostile = FeedbackRigParams {
+            offset_x: f32::NAN,
+            saturation: f32::INFINITY,
+            gain_g: f32::NEG_INFINITY,
+            chroma_displace: 9.0,
+            drive: f32::NAN,
+            pivot: -3.0,
+            ..FeedbackRigParams::default()
+        }
+        .sanitized();
+        // Non-finite input takes the field's neutral value, never a clamped
+        // extreme; finite input clamps.
+        assert_eq!(hostile.offset_x, 0.0);
+        assert_eq!(hostile.saturation, 1.0);
+        assert_eq!(hostile.gain_g, 1.0);
+        assert_eq!(hostile.chroma_displace, 0.05);
+        assert_eq!(hostile.drive, 1.0);
+        assert_eq!(hostile.pivot, 0.0);
+        // A reflection alone is emphatically not identity: it is the regime
+        // no rotation can reach.
+        assert!(!FeedbackRigParams {
+            reflect_x: true,
+            ..FeedbackRigParams::default()
+        }
+        .is_identity());
+        assert!(!FeedbackRigParams {
+            servo: true,
+            ..FeedbackRigParams::default()
+        }
+        .is_identity());
+        // Shape codes are permanent and append-only.
+        let codes: Vec<u32> = FeedbackShape::ALL
+            .iter()
+            .map(|shape| shape.code())
+            .collect();
+        assert_eq!(codes, [0, 1, 2, 3]);
     }
 
     #[test]

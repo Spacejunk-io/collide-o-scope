@@ -9,9 +9,9 @@ use crate::composition::{
     RuntimeRootItem,
 };
 use crate::effects::params::{
-    CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, RefreshGardenGate,
-    RefreshGardenParams, TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
-    TemporalParams, TemporalTopology,
+    CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, FeedbackRigParams,
+    FeedbackShape, RefreshGardenGate, RefreshGardenParams, TemporalInterpolation,
+    TemporalLoomParams, TemporalOriginalsParams, TemporalParams, TemporalTopology,
 };
 use crate::effects::EffectUniforms;
 use crate::image_routing::{
@@ -558,6 +558,137 @@ pub struct TemporalConfig {
     /// no-op, so old patches retain byte-compatible temporal behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub originals: Option<TemporalOriginalsConfig>,
+    /// Additive B3 feedback rig. Skipped at identity so earlier patches keep
+    /// their bytes and canonical hashes.
+    #[serde(default, skip_serializing_if = "TemporalRigConfig::is_default")]
+    pub rig: TemporalRigConfig,
+}
+
+/// Stable serialized vocabulary for the B3 feedback-rig waveshaper.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackShapeConfig {
+    #[default]
+    Clamp,
+    Soft,
+    Wrap,
+    Fold,
+}
+
+impl FeedbackShapeConfig {
+    fn from_runtime(value: FeedbackShape) -> Self {
+        match value {
+            FeedbackShape::Clamp => Self::Clamp,
+            FeedbackShape::Soft => Self::Soft,
+            FeedbackShape::Wrap => Self::Wrap,
+            FeedbackShape::Fold => Self::Fold,
+        }
+    }
+
+    fn to_runtime(self) -> FeedbackShape {
+        match self {
+            Self::Clamp => FeedbackShape::Clamp,
+            Self::Soft => FeedbackShape::Soft,
+            Self::Wrap => FeedbackShape::Wrap,
+            Self::Fold => FeedbackShape::Fold,
+        }
+    }
+}
+
+/// Serializable B3 feedback rig. An omitted section is exactly the historical
+/// feedback path, so earlier patches keep their bytes and canonical hashes.
+/// The edge law reuses the frozen program-wide boundary vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TemporalRigConfig {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub reflect_x: bool,
+    pub reflect_y: bool,
+    pub hue_rotate: f32,
+    pub saturation: f32,
+    pub gain_r: f32,
+    pub gain_g: f32,
+    pub gain_b: f32,
+    pub chroma_displace: f32,
+    pub blur: f32,
+    pub sharpen: f32,
+    pub shape: FeedbackShapeConfig,
+    pub drive: f32,
+    pub pivot: f32,
+    pub threshold: f32,
+    pub noise: f32,
+    pub edge: MotionBoundaryModeConfig,
+    pub servo: bool,
+    pub servo_defeated: bool,
+}
+
+impl Default for TemporalRigConfig {
+    fn default() -> Self {
+        Self::from_params(FeedbackRigParams::default())
+    }
+}
+
+impl TemporalRigConfig {
+    pub fn from_params(value: FeedbackRigParams) -> Self {
+        let value = value.sanitized();
+        Self {
+            offset_x: value.offset_x,
+            offset_y: value.offset_y,
+            reflect_x: value.reflect_x,
+            reflect_y: value.reflect_y,
+            hue_rotate: value.hue_rotate,
+            saturation: value.saturation,
+            gain_r: value.gain_r,
+            gain_g: value.gain_g,
+            gain_b: value.gain_b,
+            chroma_displace: value.chroma_displace,
+            blur: value.blur,
+            sharpen: value.sharpen,
+            shape: FeedbackShapeConfig::from_runtime(value.shape),
+            drive: value.drive,
+            pivot: value.pivot,
+            threshold: value.threshold,
+            noise: value.noise,
+            edge: MotionBoundaryModeConfig::from_runtime(value.edge),
+            servo: value.servo,
+            servo_defeated: value.servo_defeated,
+        }
+    }
+
+    pub fn to_params(self) -> FeedbackRigParams {
+        FeedbackRigParams {
+            offset_x: self.offset_x,
+            offset_y: self.offset_y,
+            reflect_x: self.reflect_x,
+            reflect_y: self.reflect_y,
+            hue_rotate: self.hue_rotate,
+            saturation: self.saturation,
+            gain_r: self.gain_r,
+            gain_g: self.gain_g,
+            gain_b: self.gain_b,
+            chroma_displace: self.chroma_displace,
+            blur: self.blur,
+            sharpen: self.sharpen,
+            shape: self.shape.to_runtime(),
+            drive: self.drive,
+            pivot: self.pivot,
+            threshold: self.threshold,
+            noise: self.noise,
+            edge: self.edge.to_runtime(),
+            servo: self.servo,
+            servo_defeated: self.servo_defeated,
+        }
+        .sanitized()
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self::from_params(self.to_params())
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Stable serialized vocabulary for the Temporal Topology Loom.
@@ -1258,6 +1389,7 @@ impl TemporalConfig {
             key_softness: p.key_softness,
             key_history: p.key_history,
             originals: (!originals.is_default()).then_some(originals),
+            rig: TemporalRigConfig::from_params(p.rig),
         }
     }
 
@@ -1311,6 +1443,7 @@ impl TemporalConfig {
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
             key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
             originals: self.originals.unwrap_or_default().to_params(),
+            rig: self.rig.to_params(),
         }
     }
 }
@@ -6536,6 +6669,62 @@ scenes:
     }
 
     #[test]
+    fn temporal_rig_round_trips_and_an_absent_section_is_the_prior_path() {
+        use crate::motion::MotionBoundaryMode;
+
+        // A default temporal block serializes without the rig section, so
+        // every pre-B3 patch keeps its bytes and canonical hashes.
+        let default_yaml = serde_yaml::to_string(&TemporalConfig::default()).unwrap();
+        assert!(!default_yaml.contains("rig"));
+        let absent: TemporalConfig = serde_yaml::from_str("feedback: 0.2\n").unwrap();
+        assert!(absent.rig.is_default());
+        assert!(absent.to_params().rig.is_identity());
+
+        // A non-default rig round trips whole, including both closed
+        // vocabularies and the two servo switches.
+        let params = TemporalParams {
+            rig: FeedbackRigParams {
+                offset_x: 0.25,
+                reflect_y: true,
+                hue_rotate: -45.0,
+                saturation: 1.5,
+                gain_b: 1.8,
+                chroma_displace: 0.03,
+                blur: 0.6,
+                sharpen: 1.2,
+                shape: FeedbackShape::Fold,
+                drive: 2.5,
+                pivot: 0.4,
+                threshold: 0.2,
+                noise: 0.3,
+                edge: MotionBoundaryMode::Mirror,
+                servo: true,
+                servo_defeated: true,
+                ..FeedbackRigParams::default()
+            },
+            ..TemporalParams::default()
+        };
+        let config = TemporalConfig::from_params(&params);
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("rig:"));
+        assert!(yaml.contains("shape: fold"));
+        assert!(yaml.contains("edge: mirror"));
+        let restored: TemporalConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.rig, config.rig);
+        let runtime = restored.to_params();
+        assert_eq!(runtime.rig, params.rig.sanitized());
+
+        // Hostile scalars sanitize to neutral values and unknown fields are
+        // rejected rather than ignored.
+        let hostile: TemporalConfig =
+            serde_yaml::from_str("rig:\n  drive: .nan\n  saturation: 99.0\n").unwrap();
+        let runtime = hostile.to_params();
+        assert_eq!(runtime.rig.drive, 1.0);
+        assert_eq!(runtime.rig.saturation, 2.0);
+        assert!(serde_yaml::from_str::<TemporalConfig>("rig:\n  seed: 4\n").is_err());
+    }
+
+    #[test]
     fn flow_shaping_config_round_trips_and_an_absent_section_is_the_prior_path() {
         // A default motion block serializes without the shaping section.
         let default_yaml = serde_yaml::to_string(&MotionConfig::default()).unwrap();
@@ -7102,6 +7291,7 @@ scenes:
             key_softness: 0.05,
             key_history: 4.0,
             originals: Default::default(),
+            rig: Default::default(),
         };
 
         let patch = PatchState::capture(

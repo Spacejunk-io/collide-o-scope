@@ -23,7 +23,7 @@ use crate::patch::{
     FieldColliderConfig, FlowShapingConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig,
     ProceduralFieldConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
     RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
-    TemporalResetPolicyConfig,
+    TemporalResetPolicyConfig, TemporalRigConfig,
 };
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{
@@ -581,6 +581,8 @@ pub struct MorphTemporalSnapshot {
     /// Garden carrier pixels, and the Collision Score ordinal are runtime
     /// memory and deliberately never enter a morph slot.
     pub originals: TemporalOriginalsConfig,
+    /// B3 feedback rig, captured as its serializable config block.
+    pub rig: TemporalRigConfig,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -603,6 +605,7 @@ impl MorphTemporalSnapshot {
             key_softness: value.key_softness,
             key_history: value.key_history,
             originals: TemporalOriginalsConfig::from_params(value.originals),
+            rig: TemporalRigConfig::from_params(value.rig),
         }
         .sanitized()
     }
@@ -620,6 +623,7 @@ impl MorphTemporalSnapshot {
             key_softness: finite_clamp(self.key_softness, 0.03, 0.0, 0.5),
             key_history: finite_clamp(self.key_history, 1.0, 1.0, 23.0).round(),
             originals: self.originals.sanitized(),
+            rig: self.rig.sanitized(),
         }
     }
 
@@ -637,6 +641,7 @@ impl MorphTemporalSnapshot {
             key_softness: clean.key_softness,
             key_history: clean.key_history,
             originals: clean.originals.to_params(),
+            rig: clean.rig.to_params(),
         }
     }
 
@@ -655,9 +660,46 @@ impl MorphTemporalSnapshot {
             key_softness: blend_finite(a.key_softness, b.key_softness, weights),
             key_history: blend_finite(a.key_history, b.key_history, weights),
             originals: interpolate_temporal_originals(a.originals, b.originals, weights, choose_b),
+            rig: interpolate_temporal_rig(a.rig, b.rig, weights, choose_b),
         }
         .sanitized()
     }
+}
+
+/// B3 rig morphing: continuous values blend, the in-loop hue rotation blends
+/// on its wrapped arc, and the discrete laws — reflections, shape, edge, and
+/// the two servo switches — recall an endpoint at the midpoint.
+fn interpolate_temporal_rig(
+    a: TemporalRigConfig,
+    b: TemporalRigConfig,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> TemporalRigConfig {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    TemporalRigConfig {
+        offset_x: blend_finite(a.offset_x, b.offset_x, weights),
+        offset_y: blend_finite(a.offset_y, b.offset_y, weights),
+        reflect_x: pick(a.reflect_x, b.reflect_x, choose_b),
+        reflect_y: pick(a.reflect_y, b.reflect_y, choose_b),
+        hue_rotate: blend_wrapped_degrees(a.hue_rotate, b.hue_rotate, weights),
+        saturation: blend_finite(a.saturation, b.saturation, weights),
+        gain_r: blend_finite(a.gain_r, b.gain_r, weights),
+        gain_g: blend_finite(a.gain_g, b.gain_g, weights),
+        gain_b: blend_finite(a.gain_b, b.gain_b, weights),
+        chroma_displace: blend_finite(a.chroma_displace, b.chroma_displace, weights),
+        blur: blend_finite(a.blur, b.blur, weights),
+        sharpen: blend_finite(a.sharpen, b.sharpen, weights),
+        shape: pick(a.shape, b.shape, choose_b),
+        drive: blend_finite(a.drive, b.drive, weights),
+        pivot: blend_finite(a.pivot, b.pivot, weights),
+        threshold: blend_finite(a.threshold, b.threshold, weights),
+        noise: blend_finite(a.noise, b.noise, weights),
+        edge: pick(a.edge, b.edge, choose_b),
+        servo: pick(a.servo, b.servo, choose_b),
+        servo_defeated: pick(a.servo_defeated, b.servo_defeated, choose_b),
+    }
+    .sanitized()
 }
 
 fn blend_u8(a: u8, b: u8, weights: [f32; 2], min: u8, max: u8) -> u8 {
@@ -4042,6 +4084,63 @@ mod tests {
                 .collider
                 .input_a,
             b_block.input_a
+        );
+    }
+
+    #[test]
+    fn temporal_rig_morphs_continuous_values_and_recalls_discrete_laws() {
+        let a = MorphTemporalSnapshot {
+            rig: TemporalRigConfig {
+                offset_x: -0.2,
+                hue_rotate: 170.0,
+                gain_r: 0.5,
+                shape: crate::patch::FeedbackShapeConfig::Soft,
+                reflect_x: true,
+                servo: true,
+                ..TemporalRigConfig::default()
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+        let b = MorphTemporalSnapshot {
+            rig: TemporalRigConfig {
+                offset_x: 0.4,
+                hue_rotate: -170.0,
+                gain_r: 1.5,
+                shape: crate::patch::FeedbackShapeConfig::Wrap,
+                servo_defeated: true,
+                ..TemporalRigConfig::default()
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+
+        let quarter = MorphTemporalSnapshot::interpolate(&a, &b, [0.75, 0.25], false);
+        assert!((quarter.rig.offset_x - -0.05).abs() < 1.0e-6);
+        assert!((quarter.rig.gain_r - 0.75).abs() < 1.0e-6);
+        // The in-loop hue takes the short wrapped arc through 180 (170 plus
+        // a quarter of the 20-degree arc), not the long way through zero,
+        // which would have landed at 85.
+        assert!(
+            (quarter.rig.hue_rotate - 175.0).abs() < 1.0e-3,
+            "wrapped hue arc, got {}",
+            quarter.rig.hue_rotate
+        );
+        // Discrete laws recall an endpoint at the midpoint, never a blend.
+        assert_eq!(quarter.rig.shape, crate::patch::FeedbackShapeConfig::Soft);
+        assert!(quarter.rig.reflect_x);
+        assert!(quarter.rig.servo);
+        assert!(!quarter.rig.servo_defeated);
+        let past = MorphTemporalSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
+        assert_eq!(past.rig.shape, crate::patch::FeedbackShapeConfig::Wrap);
+        assert!(!past.rig.reflect_x);
+        assert!(past.rig.servo_defeated);
+        // Endpoints recall the authored blocks exactly.
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [1.0, 0.0], false).rig,
+            a.rig.sanitized()
+        );
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).rig,
+            b.rig.sanitized()
         );
     }
 

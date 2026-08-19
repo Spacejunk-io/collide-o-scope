@@ -1,6 +1,6 @@
 # B2 — Synthetic and shaped motion fields
 
-Tranche B2 of the Bendr derivation plan, in two slices: the six procedural
+Tranche B2 of the enrichment plan, in two slices: the six procedural
 field kinds (slice 1) and the flow-shaping controls (slice 2 — `stretch`,
 `edge_repel`, `vector_trash` + `trash_block_size`, the plan's "Also here"
 paragraph). With slice 2 landed, B2 is complete.

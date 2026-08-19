@@ -10,7 +10,9 @@
     reason = "shared temporal event/reset adapters land across the staged M3 host integrations"
 )]
 
-use crate::effects::params::{normalized_slit_direction, TemporalParams, TEMPORAL_REFERENCE_FPS};
+use crate::effects::params::{
+    normalized_slit_direction, FeedbackRigParams, TemporalParams, TEMPORAL_REFERENCE_FPS,
+};
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::performance::SavedLayerPosition;
 
@@ -895,6 +897,234 @@ pub(crate) struct TemporalGpuUniforms {
 
 const _: () = assert!(std::mem::size_of::<TemporalGpuUniforms>() == 64);
 
+/// The B3 feedback-rig shader contract. The legacy 64-byte uniform above is
+/// frozen, so the rig lives in its own third fixed binding exactly as the
+/// originals took a second: a default patch keeps executing the old
+/// expression literally unchanged, gated by `modes[3] == 0`.
+///
+/// Six complete 16-byte lanes, mirroring six WGSL vec4 values.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct TemporalRigGpuUniforms {
+    /// offset_x, offset_y, hue rotate in radians, saturation
+    pub values_a: [f32; 4],
+    /// chroma displace, blur, sharpen, drive
+    pub values_b: [f32; 4],
+    /// pivot, threshold, noise, tick mix (clamped tick fraction)
+    pub values_c: [f32; 4],
+    /// gain r, gain g, gain b, servo strength (0 off/defeated, 1 engaged)
+    pub values_d: [f32; 4],
+    /// reflect x, reflect y, shape code, edge code
+    pub modes_a: [u32; 4],
+    /// noise epoch (30 Hz reference ticks), rig active flag, reserved x2
+    pub modes_b: [u32; 4],
+}
+
+const _: () = assert!(std::mem::size_of::<TemporalRigGpuUniforms>() == 96);
+
+/// CPU reference for the B3 rig coordinate law, mirroring
+/// `rig_reflect_offset` + `rig_resolve_edge` in the temporal shaders,
+/// expression for expression. `p_centered` is the already rotated/zoomed
+/// centred lookup; the return is the resolved texture coordinate and its
+/// coverage. `Transparent` is the exact historical inside test; the other
+/// three laws always cover.
+pub(crate) fn feedback_rig_resolve(
+    p_centered: [f32; 2],
+    rig: &FeedbackRigParams,
+) -> ([f32; 2], f32) {
+    fn mirror_unit(value: f32) -> f32 {
+        let half = value / 2.0;
+        let period = (half - half.floor()) * 2.0;
+        let folded = if period > 1.0 { 2.0 - period } else { period };
+        folded.clamp(0.0, 1.0)
+    }
+    let mut p = p_centered;
+    if rig.reflect_x {
+        p[0] = -p[0];
+    }
+    if rig.reflect_y {
+        p[1] = -p[1];
+    }
+    let p = [p[0] + rig.offset_x + 0.5, p[1] + rig.offset_y + 0.5];
+    match rig.edge {
+        crate::motion::MotionBoundaryMode::Mirror => ([mirror_unit(p[0]), mirror_unit(p[1])], 1.0),
+        crate::motion::MotionBoundaryMode::Wrap => (
+            [
+                (p[0] - p[0].floor()).clamp(0.0, 1.0),
+                (p[1] - p[1].floor()).clamp(0.0, 1.0),
+            ],
+            1.0,
+        ),
+        crate::motion::MotionBoundaryMode::Hold => {
+            ([p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)], 1.0)
+        }
+        crate::motion::MotionBoundaryMode::Transparent => {
+            let inside = if p[0] >= 0.0 && p[0] <= 1.0 && p[1] >= 0.0 && p[1] <= 1.0 {
+                1.0
+            } else {
+                0.0
+            };
+            ([p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0)], inside)
+        }
+    }
+}
+
+fn rig_reference_avalanche(value: u32) -> u32 {
+    let mut x = value;
+    x = (x ^ (x >> 16)).wrapping_mul(0x7feb_352d);
+    x = (x ^ (x >> 15)).wrapping_mul(0x846c_a68b);
+    x ^ (x >> 16)
+}
+
+fn rig_reference_shape(x: f32, shape: crate::effects::params::FeedbackShape) -> f32 {
+    use crate::effects::params::FeedbackShape;
+    match shape {
+        FeedbackShape::Soft => (2.0 * x).tanh() * 0.5,
+        FeedbackShape::Wrap => {
+            let v = x + 0.5;
+            (v - v.floor()) - 0.5
+        }
+        FeedbackShape::Fold => {
+            let v = (x + 0.5) / 2.0;
+            let t = (v - v.floor()) * 2.0;
+            if t > 1.0 {
+                1.5 - t
+            } else {
+                t - 0.5
+            }
+        }
+        FeedbackShape::Clamp => x.clamp(-0.5, 0.5),
+    }
+}
+
+/// CPU reference for the B3 rig colour pipeline, mirroring `rig_grade` in the
+/// temporal shaders, expression for expression: gains, YIQ hue rotation,
+/// saturation, the tick-mixed waveshaper, threshold decay, deterministic loop
+/// noise, and the compressive servo. `frag_px` is the fragment's quantized
+/// pixel in feedback-texture space and `noise_epoch` the 30 Hz reference tick.
+pub(crate) fn feedback_rig_grade(
+    rgb: [f32; 3],
+    rig: &FeedbackRigParams,
+    tick_mix: f32,
+    frag_px: [u32; 2],
+    noise_epoch: u32,
+) -> [f32; 3] {
+    use crate::effects::params::FeedbackShape;
+    let servo_strength = if rig.servo && !rig.servo_defeated {
+        1.0
+    } else {
+        0.0
+    };
+    let mut color = [
+        rgb[0] * rig.gain_r,
+        rgb[1] * rig.gain_g,
+        rgb[2] * rig.gain_b,
+    ];
+    let hue = rig.hue_rotate.to_radians();
+    if hue.abs() > 1.0e-6 {
+        let y = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+        let i = 0.596 * color[0] - 0.274 * color[1] - 0.322 * color[2];
+        let q = 0.211 * color[0] - 0.523 * color[1] + 0.312 * color[2];
+        let (sin, cos) = hue.sin_cos();
+        let i2 = i * cos - q * sin;
+        let q2 = i * sin + q * cos;
+        color = [
+            y + 0.956 * i2 + 0.621 * q2,
+            y - 0.272 * i2 - 0.647 * q2,
+            y - 1.106 * i2 + 1.703 * q2,
+        ];
+    }
+    if (rig.saturation - 1.0).abs() > 1.0e-6 {
+        let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+        for channel in &mut color {
+            *channel = luma + (*channel - luma) * rig.saturation;
+        }
+    }
+    let tick_mix = tick_mix.clamp(0.0, 1.0);
+    if rig.shape != FeedbackShape::Clamp || (rig.drive - 1.0).abs() > 1.0e-6 {
+        for channel in &mut color {
+            let x = (*channel - rig.pivot) * rig.drive;
+            let shaped = rig_reference_shape(x, rig.shape) + rig.pivot;
+            *channel += (shaped - *channel) * tick_mix;
+        }
+    }
+    if rig.threshold > 0.0 {
+        let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+        let edge0 = rig.threshold - 0.05;
+        let edge1 = rig.threshold + 0.05;
+        let t = ((luma - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+        let gate = t * t * (3.0 - 2.0 * t);
+        let factor = 1.0 + (gate - 1.0) * tick_mix;
+        for channel in &mut color {
+            *channel *= factor;
+        }
+    }
+    if rig.noise > 0.0 {
+        let seed = rig_reference_avalanche(
+            frag_px[0]
+                ^ frag_px[1].wrapping_mul(0x9e37_79b9)
+                ^ noise_epoch.wrapping_mul(0x85eb_ca6b)
+                ^ 0x4233_5247,
+        );
+        let sample = (seed & 0x00ff_ffff) as f32 / 16_777_216.0;
+        let offset = (sample * 2.0 - 1.0) * rig.noise * 0.25;
+        for channel in &mut color {
+            *channel += offset;
+        }
+    }
+    if servo_strength > 0.0 {
+        let luma = 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2];
+        let compression = 1.0 + (luma - 1.0).max(0.0);
+        let mix = tick_mix * servo_strength;
+        for channel in &mut color {
+            let compressed = *channel / compression;
+            *channel += (compressed - *channel) * mix;
+        }
+    }
+    [color[0].max(0.0), color[1].max(0.0), color[2].max(0.0)]
+}
+
+impl TemporalRigGpuUniforms {
+    fn for_frame(
+        rig: FeedbackRigParams,
+        authored_identity: bool,
+        tick_mix: f32,
+        noise_epoch: u64,
+    ) -> Self {
+        let servo_strength = if rig.servo && !rig.servo_defeated {
+            1.0
+        } else {
+            0.0
+        };
+        Self {
+            values_a: [
+                rig.offset_x,
+                rig.offset_y,
+                rig.hue_rotate.to_radians(),
+                rig.saturation,
+            ],
+            values_b: [rig.chroma_displace, rig.blur, rig.sharpen, rig.drive],
+            values_c: [rig.pivot, rig.threshold, rig.noise, tick_mix],
+            values_d: [rig.gain_r, rig.gain_g, rig.gain_b, servo_strength],
+            modes_a: [
+                u32::from(rig.reflect_x),
+                u32::from(rig.reflect_y),
+                rig.shape.code(),
+                rig.edge.code(),
+            ],
+            modes_b: [
+                (noise_epoch & 0xffff_ffff) as u32,
+                // The activity flag answers from the AUTHORED values, not the
+                // frame-scaled copies: a frame-scaled gain is transiently 1 at
+                // dt 0 while the authored loop is emphatically not identity.
+                u32::from(!authored_identity),
+                0,
+                0,
+            ],
+        }
+    }
+}
+
 /// Additive M3 shader contract. The legacy uniform above is intentionally
 /// frozen; originals live in a second fixed binding so a zero/default patch
 /// can keep executing the old shader and pipeline literally unchanged.
@@ -1019,6 +1249,8 @@ pub(crate) struct TemporalFramePlan {
     pub read: TemporalReadSnapshot,
     pub uniforms: TemporalGpuUniforms,
     pub originals_uniforms: TemporalOriginalsGpuUniforms,
+    /// B3 feedback-rig lanes for the third fixed binding.
+    pub rig_uniforms: TemporalRigGpuUniforms,
     pub legacy_shader_active: bool,
     pub originals_shader_active: bool,
     pub history_write_target: Option<usize>,
@@ -1212,6 +1444,12 @@ impl TemporalState {
                     false,
                     false,
                 ),
+                rig_uniforms: TemporalRigGpuUniforms::for_frame(
+                    frame_params.rig,
+                    params.rig.is_identity(),
+                    TemporalParams::rig_tick_mix(input.delta_seconds),
+                    before.total_reference_ticks,
+                ),
                 legacy_shader_active: frame_params.is_active(),
                 originals_shader_active: !frame_params.originals.is_zero(),
                 history_write_target: None,
@@ -1262,6 +1500,12 @@ impl TemporalState {
                 input.audio_energy,
                 input.events.audio_onset_events > 0,
                 garden_force_refresh,
+            ),
+            rig_uniforms: TemporalRigGpuUniforms::for_frame(
+                frame_params.rig,
+                params.rig.is_identity(),
+                TemporalParams::rig_tick_mix(input.delta_seconds),
+                before.total_reference_ticks,
             ),
             legacy_shader_active: frame_params.is_active(),
             originals_shader_active: !frame_params.originals.is_zero(),
@@ -1740,6 +1984,7 @@ mod tests {
             key_softness: 0.25,
             key_history: 1.0,
             originals: TemporalOriginalsParams::default(),
+            rig: FeedbackRigParams::default(),
         };
         let plan =
             TemporalState::default().stage_frame(&params, running(1.0 / 30.0), [1_920, 1_080]);
@@ -2551,9 +2796,12 @@ mod tests {
 
         let legacy = include_str!("shaders/temporal.wgsl").replace("\r\n", "\n");
         let originals = include_str!("shaders/temporal_originals.wgsl");
+        // B3 re-froze this hash: the feedback rig joined both variants behind
+        // its identity gate, with the historical expression untouched in the
+        // rig-inactive branch.
         assert_eq!(
             format!("{:x}", Sha256::digest(legacy.as_bytes())),
-            "388fa95fc027c00078dc5d7d380370d335fc3fa332ec0e2dead9f7b202f269d6",
+            "07e5cde0a6f24ed03dfa0e9f8ddf086fe3e3d4de4227a17b6a8ccf8773e59486",
             "the LF-canonical shared legacy/Advanced shader source is a frozen contract"
         );
         assert!(!legacy.contains("TemporalOriginalsUniforms"));
@@ -2571,14 +2819,30 @@ mod tests {
             .next()
             .expect("legacy Originals source prefix");
         assert_eq!(originals.matches("var feedback_tex: texture_2d").count(), 1);
+        // The frozen shared read stays singular; the other seven live inside
+        // `rig_sample_legacy`, which only an authored rig reaches (one base,
+        // two chromatic, four blur/sharpen cross taps).
         assert_eq!(
             legacy_originals
                 .matches("textureSample(feedback_tex")
                 .count(),
-            1,
-            "legacy feedback and Garden must share one carrier sample"
+            8,
+            "one shared legacy carrier sample plus the rig's seven gated taps"
         );
-        assert_eq!(legacy_originals.matches("textureSample(").count(), 5);
+        assert_eq!(
+            legacy_originals
+                .split("fn rig_sample_legacy")
+                .next()
+                .expect("pre-rig prefix")
+                .matches("textureSample(feedback_tex")
+                .count(),
+            0,
+            "no feedback sample precedes the rig helper block"
+        );
+        assert_eq!(legacy_originals.matches("textureSample(").count(), 12);
+        // Both shaders bind the rig at the same third fixed slot.
+        assert!(legacy.contains("@group(1) @binding(2) var<uniform> rig"));
+        assert!(originals.contains("@group(1) @binding(2) var<uniform> rig"));
         assert_eq!(originals.matches("textureLoad(feedback_tex").count(), 4);
         assert!(originals.contains("advanced_woven_history"));
         assert!(originals.contains("return mix(lower, upper, fract(depth));"));
@@ -2918,5 +3182,312 @@ mod tests {
             ]
             .map(str::to_string)
         );
+    }
+
+    // -----------------------------------------------------------------
+    // B3 feedback rig
+    // -----------------------------------------------------------------
+
+    /// A small CPU feedback loop over the legacy variant semantics: rotate/
+    /// zoom, the rig coordinate and colour laws, bilinear clamp sampling, and
+    /// the frozen max-combine. This is the low-resolution instrument the
+    /// regime fixtures measure.
+    fn simulate_rig_loop(
+        params: &TemporalParams,
+        dt: f32,
+        frames: usize,
+        size: usize,
+        current: &dyn Fn(usize, usize) -> [f32; 3],
+    ) -> Vec<Vec<[f32; 3]>> {
+        let frame_params = params.for_frame_delta(dt);
+        let tick_mix = TemporalParams::rig_tick_mix(dt);
+        let rig_identity = params.rig.is_identity();
+        let sample = |grid: &Vec<Vec<[f32; 3]>>, uv: [f32; 2]| -> [f32; 3] {
+            let n = size as f32;
+            let x = (uv[0] * n - 0.5).clamp(0.0, n - 1.0);
+            let y = (uv[1] * n - 0.5).clamp(0.0, n - 1.0);
+            let x0 = x.floor() as usize;
+            let y0 = y.floor() as usize;
+            let x1 = (x0 + 1).min(size - 1);
+            let y1 = (y0 + 1).min(size - 1);
+            let fx = x - x0 as f32;
+            let fy = y - y0 as f32;
+            let mut out = [0.0_f32; 3];
+            for c in 0..3 {
+                let top = grid[y0][x0][c] * (1.0 - fx) + grid[y0][x1][c] * fx;
+                let bottom = grid[y1][x0][c] * (1.0 - fx) + grid[y1][x1][c] * fx;
+                out[c] = top * (1.0 - fy) + bottom * fy;
+            }
+            out
+        };
+        let mut previous = vec![vec![[0.0_f32; 3]; size]; size];
+        let mut feedback_valid = false;
+        for frame in 0..frames {
+            let mut next = vec![vec![[0.0_f32; 3]; size]; size];
+            for (y, row) in next.iter_mut().enumerate() {
+                for (x, cell) in row.iter_mut().enumerate() {
+                    let mut color = current(x, y);
+                    if frame_params.feedback > 0.001 && feedback_valid {
+                        let uv = [
+                            (x as f32 + 0.5) / size as f32,
+                            (y as f32 + 0.5) / size as f32,
+                        ];
+                        let angle = frame_params.fb_rotate * 0.017_453_3;
+                        let (sin, cos) = (angle.sin(), angle.cos());
+                        let centered = [uv[0] - 0.5, uv[1] - 0.5];
+                        let zoom = frame_params.fb_zoom.max(0.01);
+                        let p = [
+                            (centered[0] * cos - centered[1] * sin) / zoom,
+                            (centered[0] * sin + centered[1] * cos) / zoom,
+                        ];
+                        let (resolved, inside, graded) = if rig_identity {
+                            let q = [p[0] + 0.5, p[1] + 0.5];
+                            let inside = if q[0] >= 0.0 && q[0] <= 1.0 && q[1] >= 0.0 && q[1] <= 1.0
+                            {
+                                1.0
+                            } else {
+                                0.0
+                            };
+                            let clamped = [q[0].clamp(0.0, 1.0), q[1].clamp(0.0, 1.0)];
+                            let prev = sample(&previous, clamped);
+                            (clamped, inside, prev)
+                        } else {
+                            let (resolved, inside) = feedback_rig_resolve(p, &frame_params.rig);
+                            let prev = sample(&previous, resolved);
+                            let frag_px =
+                                [(uv[0] * size as f32) as u32, (uv[1] * size as f32) as u32];
+                            let graded = feedback_rig_grade(
+                                prev,
+                                &frame_params.rig,
+                                tick_mix,
+                                frag_px,
+                                frame as u32,
+                            );
+                            (resolved, inside, graded)
+                        };
+                        let _ = resolved;
+                        for c in 0..3 {
+                            color[c] = color[c].max(graded[c] * frame_params.feedback * inside);
+                        }
+                    }
+                    *cell = color;
+                }
+            }
+            previous = next;
+            feedback_valid = true;
+        }
+        previous
+    }
+
+    fn impulse_current(_size: usize, at: (usize, usize)) -> impl Fn(usize, usize) -> [f32; 3] {
+        move |x, y| {
+            if (x, y) == at {
+                [1.0, 1.0, 1.0]
+            } else {
+                [0.0, 0.0, 0.0]
+            }
+        }
+    }
+
+    fn luma_at(grid: &[Vec<[f32; 3]>], x: usize, y: usize) -> f32 {
+        let c = grid[y][x];
+        0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    }
+
+    #[test]
+    fn whole_fraction_rotation_locks_into_four_arms_and_detune_shears_them() {
+        // Authored rotation is 5 degrees per reference tick; eighteen ticks
+        // per simulated frame make each application a quarter turn, so an
+        // impulse fed back four times returns to itself: four locked arms.
+        let size = 41;
+        let impulse = (30_usize, 20_usize);
+        let params = TemporalParams {
+            feedback: 0.95,
+            fb_rotate: 5.0,
+            ..TemporalParams::default()
+        };
+        let locked = simulate_rig_loop(
+            &params,
+            18.0 / TEMPORAL_REFERENCE_FPS,
+            8,
+            size,
+            &impulse_current(size, impulse),
+        );
+        // The impulse sits at +x from centre (20, 20); each fed-back hop
+        // rotates it a quarter turn and decays it by feedback^18, so the
+        // three ghost arms carry the analytic retention powers (bilinear
+        // resampling loses a little more, hence the 0.3 factor).
+        let retention = 0.95_f32.powf(18.0);
+        let arms = [(20, 10), (10, 20), (20, 30)];
+        for (hop, &(x, y)) in arms.iter().enumerate() {
+            let expected = retention.powi(hop as i32 + 1);
+            assert!(
+                luma_at(&locked, x, y) > expected * 0.3,
+                "locked hop {hop} at ({x}, {y}) = {} (expected near {expected})",
+                luma_at(&locked, x, y)
+            );
+        }
+        // Detuned to eighty degrees per application, the quarter-turn
+        // positions no longer coincide with the trail: the arms shear away.
+        let detuned = simulate_rig_loop(
+            &params,
+            16.0 / TEMPORAL_REFERENCE_FPS,
+            8,
+            size,
+            &impulse_current(size, impulse),
+        );
+        let locked_energy: f32 = arms.iter().map(|&(x, y)| luma_at(&locked, x, y)).sum();
+        let detuned_energy: f32 = arms.iter().map(|&(x, y)| luma_at(&detuned, x, y)).sum();
+        assert!(
+            detuned_energy < locked_energy * 0.25,
+            "detuned arms must shear off the lock: locked {locked_energy}, detuned {detuned_energy}"
+        );
+    }
+
+    #[test]
+    fn reflection_is_the_alternating_regime_no_rotation_reaches() {
+        let size = 41;
+        let impulse = (30_usize, 20_usize);
+        let mirrored = (size - 1 - 30, 20_usize);
+        let mut params = TemporalParams {
+            feedback: 0.9,
+            ..TemporalParams::default()
+        };
+        params.rig.reflect_x = true;
+        let reflected = simulate_rig_loop(
+            &params,
+            1.0 / TEMPORAL_REFERENCE_FPS,
+            3,
+            size,
+            &impulse_current(size, impulse),
+        );
+        assert!(
+            luma_at(&reflected, mirrored.0, mirrored.1) > 0.5,
+            "the mirrored ghost must appear"
+        );
+        // Without the reflection nothing ever reaches the mirrored position.
+        let plain = simulate_rig_loop(
+            &TemporalParams {
+                feedback: 0.9,
+                ..TemporalParams::default()
+            },
+            1.0 / TEMPORAL_REFERENCE_FPS,
+            3,
+            size,
+            &impulse_current(size, impulse),
+        );
+        assert!(luma_at(&plain, mirrored.0, mirrored.1) < 1.0e-3);
+    }
+
+    #[test]
+    fn the_servo_bounds_a_hot_loop_and_defeat_lets_it_run_to_white_and_stay() {
+        let size = 9;
+        let gray = |_: usize, _: usize| [0.5_f32, 0.5, 0.5];
+        let mut hot = TemporalParams {
+            feedback: 0.95,
+            ..TemporalParams::default()
+        };
+        hot.rig.gain_r = 2.0;
+        hot.rig.gain_g = 2.0;
+        hot.rig.gain_b = 2.0;
+        hot.rig.servo = true;
+        let dt = 1.0 / TEMPORAL_REFERENCE_FPS;
+        let served = simulate_rig_loop(&hot, dt, 40, size, &gray);
+        let served_luma = luma_at(&served, 4, 4);
+        assert!(
+            served_luma < 2.5,
+            "the engaged servo must bound the loop, got {served_luma}"
+        );
+        // Defeated, the same loop runs away and never comes back down.
+        hot.rig.servo_defeated = true;
+        let defeated_short = simulate_rig_loop(&hot, dt, 20, size, &gray);
+        let defeated_long = simulate_rig_loop(&hot, dt, 40, size, &gray);
+        let short_luma = luma_at(&defeated_short, 4, 4);
+        let long_luma = luma_at(&defeated_long, 4, 4);
+        assert!(
+            long_luma > served_luma * 10.0,
+            "defeat must let the loop exceed the served level: {long_luma}"
+        );
+        assert!(
+            long_luma >= short_luma,
+            "a defeated runaway stays where it ran: {short_luma} -> {long_luma}"
+        );
+    }
+
+    #[test]
+    fn rig_uniform_lanes_carry_the_authored_activity_and_servo_laws() {
+        use crate::effects::params::FeedbackShape;
+        assert_eq!(std::mem::size_of::<TemporalRigGpuUniforms>(), 96);
+        // Authored identity keeps the activity flag closed even though the
+        // frame-scaled gains transiently read 1 at dt 0.
+        let identity = TemporalRigGpuUniforms::for_frame(
+            FeedbackRigParams::default().for_frame_scale(0.0),
+            true,
+            0.0,
+            77,
+        );
+        assert_eq!(identity.modes_b[1], 0);
+        assert_eq!(identity.modes_b[0], 77);
+        let mut authored = FeedbackRigParams {
+            reflect_y: true,
+            hue_rotate: 90.0,
+            shape: FeedbackShape::Fold,
+            edge: crate::motion::MotionBoundaryMode::Mirror,
+            servo: true,
+            ..FeedbackRigParams::default()
+        };
+        let active = TemporalRigGpuUniforms::for_frame(
+            authored.for_frame_scale(1.0),
+            authored.is_identity(),
+            1.0,
+            (1_u64 << 40) | 5,
+        );
+        assert_eq!(active.modes_b[1], 1);
+        // The epoch lane is the low 32 bits of the reference tick.
+        assert_eq!(active.modes_b[0], 5);
+        assert_eq!(active.modes_a, [0, 1, 3, 1]);
+        assert!((active.values_a[2] - std::f32::consts::FRAC_PI_2).abs() < 1.0e-6);
+        assert_eq!(active.values_d[3], 1.0);
+        // Defeat wins over engage.
+        authored.servo_defeated = true;
+        let defeated = TemporalRigGpuUniforms::for_frame(
+            authored.for_frame_scale(1.0),
+            authored.is_identity(),
+            1.0,
+            0,
+        );
+        assert_eq!(defeated.values_d[3], 0.0);
+    }
+
+    #[test]
+    fn rig_reference_edge_laws_share_the_frozen_boundary_numbering() {
+        use crate::motion::MotionBoundaryMode;
+        let rig_with_edge = |edge: MotionBoundaryMode| FeedbackRigParams {
+            edge,
+            offset_x: 0.4,
+            ..FeedbackRigParams::default()
+        };
+        // Outside the unit square: Transparent removes coverage, the other
+        // three always cover, exactly the program-wide boundary table.
+        let outside = [0.4_f32, 0.0];
+        let (_, transparent) =
+            feedback_rig_resolve(outside, &rig_with_edge(MotionBoundaryMode::Transparent));
+        assert_eq!(transparent, 0.0);
+        for edge in [
+            MotionBoundaryMode::Mirror,
+            MotionBoundaryMode::Wrap,
+            MotionBoundaryMode::Hold,
+        ] {
+            let (resolved, coverage) = feedback_rig_resolve(outside, &rig_with_edge(edge));
+            assert_eq!(coverage, 1.0, "{edge:?}");
+            assert!((0.0..=1.0).contains(&resolved[0]));
+        }
+        // Hold clamps, Wrap wraps, Mirror reflects.
+        let (hold, _) = feedback_rig_resolve(outside, &rig_with_edge(MotionBoundaryMode::Hold));
+        assert_eq!(hold[0], 1.0);
+        let (wrap, _) = feedback_rig_resolve(outside, &rig_with_edge(MotionBoundaryMode::Wrap));
+        assert!((wrap[0] - 0.3).abs() < 1.0e-6);
+        let (mirror, _) = feedback_rig_resolve(outside, &rig_with_edge(MotionBoundaryMode::Mirror));
+        assert!((mirror[0] - 0.7).abs() < 1.0e-6);
     }
 }
