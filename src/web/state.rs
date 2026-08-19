@@ -2675,6 +2675,27 @@ pub struct ProceduralFieldSnapshot {
     pub rate: f32,
 }
 
+/// The B2 flow-shaping controls as the browser sees them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowShapingSnapshot {
+    pub stretch: f32,
+    pub edge_repel: f32,
+    pub vector_trash: f32,
+    pub trash_block_size: f32,
+}
+
+impl Default for FlowShapingSnapshot {
+    fn default() -> Self {
+        let params = crate::motion::FlowShapingParams::default();
+        Self {
+            stretch: params.stretch,
+            edge_repel: params.edge_repel,
+            vector_trash: params.vector_trash,
+            trash_block_size: params.trash_block_size,
+        }
+    }
+}
+
 impl Default for ProceduralFieldSnapshot {
     fn default() -> Self {
         let params = crate::motion::ProceduralFieldParams::default();
@@ -2780,6 +2801,9 @@ pub struct MotionSnapshot {
     /// without it still deserializes to the neutral default.
     #[serde(default)]
     pub procedural: ProceduralFieldSnapshot,
+    /// Additive like `procedural`: absent means the neutral default.
+    #[serde(default)]
+    pub shaping: FlowShapingSnapshot,
     pub transplant: FaradayMotionSnapshot,
     pub shutter: CurvedShutterSnapshot,
     /// Additive: an older client that never reads this key sees exactly the
@@ -2833,6 +2857,12 @@ impl MotionSnapshot {
             procedural: ProceduralFieldSnapshot {
                 scale: params.procedural.scale,
                 rate: params.procedural.rate,
+            },
+            shaping: FlowShapingSnapshot {
+                stretch: params.shaping.stretch,
+                edge_repel: params.shaping.edge_repel,
+                vector_trash: params.shaping.vector_trash,
+                trash_block_size: params.shaping.trash_block_size,
             },
             transplant: FaradayMotionSnapshot {
                 amount: params.transplant.amount,
@@ -6991,7 +7021,7 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 99);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 103);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [

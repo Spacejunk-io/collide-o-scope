@@ -25,9 +25,9 @@ use crate::modulation::{
 };
 use crate::motion::{
     CurvedShutterParams, CurvedShutterQuality, FaradayParams, FieldColliderMode,
-    FieldColliderParams, MotionBoundaryMode, MotionCarrier, MotionDonor, MotionFieldSource,
-    MotionLatticeQuality, MotionParams, ProceduralFieldKind, ProceduralFieldParams,
-    FIELD_COLLIDER_ALGORITHM_VERSION, MOTION_ALGORITHM_VERSION,
+    FieldColliderParams, FlowShapingParams, MotionBoundaryMode, MotionCarrier, MotionDonor,
+    MotionFieldSource, MotionLatticeQuality, MotionParams, ProceduralFieldKind,
+    ProceduralFieldParams, FIELD_COLLIDER_ALGORITHM_VERSION, MOTION_ALGORITHM_VERSION,
 };
 use crate::ntsc::NtscParams;
 use crate::performance::{
@@ -1417,6 +1417,49 @@ impl ProceduralFieldConfig {
     }
 }
 
+/// Serializable B2 flow-shaping controls. An omitted section is exactly the
+/// pre-shaping advection path, so earlier patches keep their bytes and
+/// canonical hashes.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlowShapingConfig {
+    pub stretch: f32,
+    pub edge_repel: f32,
+    pub vector_trash: f32,
+    pub trash_block_size: f32,
+}
+
+impl Default for FlowShapingConfig {
+    fn default() -> Self {
+        Self::from_params(FlowShapingParams::default())
+    }
+}
+
+impl FlowShapingConfig {
+    pub fn from_params(value: FlowShapingParams) -> Self {
+        Self {
+            stretch: value.stretch,
+            edge_repel: value.edge_repel,
+            vector_trash: value.vector_trash,
+            trash_block_size: value.trash_block_size,
+        }
+    }
+
+    pub fn to_params(self) -> FlowShapingParams {
+        FlowShapingParams {
+            stretch: self.stretch,
+            edge_repel: self.edge_repel,
+            vector_trash: self.vector_trash,
+            trash_block_size: self.trash_block_size,
+        }
+        .sanitized()
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MotionLatticeQualityConfig {
@@ -1836,6 +1879,10 @@ pub struct MotionConfig {
     /// their bytes and canonical hashes.
     #[serde(default, skip_serializing_if = "ProceduralFieldConfig::is_default")]
     pub procedural: ProceduralFieldConfig,
+    /// B2 flow shaping. Skipped at default so earlier patches keep their
+    /// bytes and canonical hashes.
+    #[serde(default, skip_serializing_if = "FlowShapingConfig::is_default")]
+    pub shaping: FlowShapingConfig,
     pub transplant: FaradayConfig,
     pub shutter: CurvedShutterConfig,
     /// Field Collider v1. An omitted section is exactly the pre-collider path,
@@ -1858,6 +1905,7 @@ impl MotionConfig {
             field_source: MotionFieldSourceConfig::from_runtime(value.field_source),
             lattice_quality: MotionLatticeQualityConfig::from_runtime(value.lattice_quality),
             procedural: ProceduralFieldConfig::from_params(value.procedural),
+            shaping: FlowShapingConfig::from_params(value.shaping),
             transplant: FaradayConfig::from_params(value.transplant),
             shutter: CurvedShutterConfig::from_params(value.shutter),
             collider: FieldColliderConfig::from_params(value.collider),
@@ -1888,6 +1936,7 @@ impl MotionConfig {
             field_source: self.field_source.to_runtime(),
             lattice_quality: self.lattice_quality.to_runtime(),
             procedural: self.procedural.to_params(),
+            shaping: self.shaping.to_params(),
             transplant: self.transplant.to_params(),
             shutter: self.shutter.to_params(),
             collider: self.collider.to_params(),
@@ -6412,6 +6461,12 @@ scenes:
                 scale: 0.75,
                 rate: -1.5,
             },
+            shaping: FlowShapingParams {
+                stretch: 0.3,
+                edge_repel: 0.4,
+                vector_trash: 0.2,
+                trash_block_size: 32.0,
+            },
             transplant: FaradayParams {
                 amount: 0.75,
                 donor: MotionDonor::Selected {
@@ -6474,6 +6529,57 @@ scenes:
         assert_eq!(runtime.shutter.quality.sample_count(), 16);
         assert_eq!(runtime.procedural.scale, 0.75);
         assert_eq!(runtime.procedural.rate, -1.5);
+        assert_eq!(runtime.shaping.stretch, 0.3);
+        assert_eq!(runtime.shaping.edge_repel, 0.4);
+        assert_eq!(runtime.shaping.vector_trash, 0.2);
+        assert_eq!(runtime.shaping.trash_block_size, 32.0);
+    }
+
+    #[test]
+    fn flow_shaping_config_round_trips_and_an_absent_section_is_the_prior_path() {
+        // A default motion block serializes without the shaping section.
+        let default_yaml = serde_yaml::to_string(&MotionConfig::default()).unwrap();
+        assert!(!default_yaml.contains("shaping"));
+        let absent: MotionConfig = serde_yaml::from_str(
+            "field_source: lattice
+",
+        )
+        .unwrap();
+        assert_eq!(absent.shaping, FlowShapingConfig::default());
+        assert!(absent.shaping.to_params().is_exact_zero());
+
+        // Hostile scalars sanitize to neutral values, unknown fields are
+        // rejected, and a non-default block round trips exactly.
+        let hostile: MotionConfig = serde_yaml::from_str(
+            "shaping:
+  stretch: .nan
+  trash_block_size: 9999.0
+",
+        )
+        .unwrap();
+        let runtime = hostile.to_params();
+        assert_eq!(runtime.shaping.stretch, 0.0);
+        assert_eq!(runtime.shaping.trash_block_size, 256.0);
+        assert!(serde_yaml::from_str::<MotionConfig>(
+            "shaping:
+  stretch: 0.5
+  seed: 4
+"
+        )
+        .is_err());
+        let config = MotionConfig::from_params(MotionParams {
+            shaping: FlowShapingParams {
+                stretch: 0.25,
+                edge_repel: 0.5,
+                vector_trash: 0.75,
+                trash_block_size: 48.0,
+            },
+            ..MotionParams::default()
+        });
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("shaping:"));
+        let restored: MotionConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.shaping, config.shaping);
     }
 
     #[test]

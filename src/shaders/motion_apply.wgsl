@@ -14,8 +14,13 @@ struct MotionApplyUniforms {
     donor_to_recipient_row_1: vec4<f32>,
     shutter_values: vec4<f32>,
     faraday_values: vec4<f32>,
+    // x delta seconds, y frame-plan program time, z/w unused.
     frame_values: vec4<f32>,
     modes: vec4<u32>,
+    // B2 flow shaping: x stretch, y edge_repel, z vector_trash, w trash
+    // block size in output pixels. All-zero amounts are the exact prior
+    // path: no extra texture operation and no velocity contribution.
+    shaping_values: vec4<f32>,
     spatial_samples: array<MotionSpatialSample, 16>,
 };
 
@@ -42,6 +47,79 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     output.position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
     output.uv = positions[vertex_index] * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
     return output;
+}
+
+// The shared integer avalanche, byte-identical to effects.wgsl's
+// cellular_avalanche and to motion.rs's motion_avalanche.
+fn shaping_avalanche(value: u32) -> u32 {
+    var x = value;
+    x = (x ^ (x >> 16u)) * 0x7feb352du;
+    x = (x ^ (x >> 15u)) * 0x846ca68bu;
+    return x ^ (x >> 16u);
+}
+
+// One deterministic unit sample for a trash cell, epoch, and lane. The
+// 24-bit mantissa path is the CPU reference's `flow_trash_hash`, expression
+// for expression, under the same "MTRS" domain constant.
+fn flow_trash_hash(cell: vec2<i32>, epoch: u32, lane: u32) -> f32 {
+    let seed = shaping_avalanche(
+        bitcast<u32>(cell.x)
+            ^ (bitcast<u32>(cell.y) * 0x9e3779b9u)
+            ^ (epoch * 0x85ebca6bu)
+            ^ (lane * 0x27d4eb2fu)
+            ^ 0x4d545253u,
+    );
+    return f32(seed & 0x00ffffffu) / 16777216.0;
+}
+
+fn covered_carrier_luma(uv: vec2<f32>) -> f32 {
+    let sample = textureSample(carrier_texture, linear_sampler, uv);
+    return dot(sample.rgb * clamp(sample.a, 0.0, 1.0), vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// The B2 flow-shaping law over the gated sampled velocity: stretch, then
+// repel, then trash, then the canonical clamp — the CPU reference
+// `shape_flow_velocity`, expression for expression. Each sub-block guards on
+// its own amount so an authored zero takes no extra texture operation.
+fn shape_flow(velocity: vec2<f32>, uv: vec2<f32>) -> vec2<f32> {
+    var v = velocity;
+    let stretch = uniforms.shaping_values.x;
+    if (stretch > 0.0) {
+        let p = uv - vec2<f32>(0.5);
+        let r = length(p);
+        if (r > 1.0e-6) {
+            v = v + p / r * length(v) * stretch;
+        }
+    }
+    let edge_repel = uniforms.shaping_values.y;
+    if (edge_repel > 0.0) {
+        let step = vec2<f32>(1.0) / max(vec2<f32>(textureDimensions(carrier_texture)), vec2<f32>(1.0));
+        let gx = (covered_carrier_luma(uv + vec2<f32>(step.x, 0.0))
+            - covered_carrier_luma(uv - vec2<f32>(step.x, 0.0))) * 0.5;
+        let gy = (covered_carrier_luma(uv + vec2<f32>(0.0, step.y))
+            - covered_carrier_luma(uv - vec2<f32>(0.0, step.y))) * 0.5;
+        let g = vec2<f32>(gx, gy);
+        let magnitude = length(g);
+        if (magnitude > 1.0e-6) {
+            let push = min(magnitude * 8.0, 1.0) * 8.0 * edge_repel;
+            v = v - g / magnitude * push;
+        }
+    }
+    let vector_trash = uniforms.shaping_values.z;
+    if (vector_trash > 0.0) {
+        let block = uniforms.shaping_values.w;
+        let output_px = uv * vec2<f32>(textureDimensions(carrier_texture));
+        let cell = vec2<i32>(floor(output_px / block));
+        let epoch = u32(max(uniforms.frame_values.y, 0.0) * 8.0);
+        if (flow_trash_hash(cell, epoch, 0u) < vector_trash) {
+            let garbage = vec2<f32>(
+                flow_trash_hash(cell, epoch, 1u) * 2.0 - 1.0,
+                flow_trash_hash(cell, epoch, 2u) * 2.0 - 1.0,
+            );
+            v = v + garbage * 16.0;
+        }
+    }
+    return clamp(v, vec2<f32>(-64.0), vec2<f32>(64.0));
 }
 
 fn gate_weight(gate: vec2<f32>) -> f32 {
@@ -138,6 +216,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
             );
             let gate = gate_weight(textureSample(gate_texture, nearest_sampler, donor_uv).xy);
             velocity = mapped_velocity * gate;
+        }
+        // Shaping modifies an APPLIED field: it runs only under a valid
+        // field, and only when an amount is authored, so all-zero shaping is
+        // byte-exact with the unshaped path — no clamp, no texture op.
+        let shaping = uniforms.shaping_values;
+        if (shaping.x > 0.0 || shaping.y > 0.0 || shaping.z > 0.0) {
+            velocity = shape_flow(velocity, input.uv);
         }
     }
     let sample_count = clamp(uniforms.modes.y, 1u, 16u);

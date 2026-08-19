@@ -367,6 +367,54 @@ impl ProceduralFieldParams {
     }
 }
 
+/// Authored B2 flow-shaping controls.
+///
+/// These shape the field the advection pass *applies* — after sampling and
+/// gating, before the trajectory offset — so they act on every field kind:
+/// codec, lattice, procedural, or the derived collided field. All three
+/// amounts at zero are the exact prior path: the shader takes no extra
+/// texture operation and adds nothing to the velocity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlowShapingParams {
+    /// Radial growth by local field magnitude. Zero is exact off.
+    pub stretch: f32,
+    /// Push away from the carrier's luma gradient. Zero is exact off.
+    pub edge_repel: f32,
+    /// Probability per cell per event tick that a hashed garbage vector
+    /// shoves the cell. Zero is exact off.
+    pub vector_trash: f32,
+    /// Trash cell edge in output pixels, clamped to `[2, 256]`.
+    pub trash_block_size: f32,
+}
+
+impl Default for FlowShapingParams {
+    fn default() -> Self {
+        Self {
+            stretch: 0.0,
+            edge_repel: 0.0,
+            vector_trash: 0.0,
+            trash_block_size: 16.0,
+        }
+    }
+}
+
+impl FlowShapingParams {
+    pub fn sanitized(self) -> Self {
+        Self {
+            stretch: unit(self.stretch, 0.0),
+            edge_repel: unit(self.edge_repel, 0.0),
+            vector_trash: unit(self.vector_trash, 0.0),
+            trash_block_size: finite_or(self.trash_block_size, 16.0).clamp(2.0, 256.0),
+        }
+    }
+
+    /// True when shaping is the exact prior path.
+    pub fn is_exact_zero(self) -> bool {
+        let sanitized = self.sanitized();
+        sanitized.stretch == 0.0 && sanitized.edge_repel == 0.0 && sanitized.vector_trash == 0.0
+    }
+}
+
 /// Complete M4 authored motion contract for one master or layer scope.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionParams {
@@ -376,6 +424,9 @@ pub struct MotionParams {
     /// B2 procedural field scalars. Inert unless `field_source` is
     /// `Procedural(_)`.
     pub procedural: ProceduralFieldParams,
+    /// B2 flow shaping applied where the field is consumed. All-zero is the
+    /// exact prior advection path.
+    pub shaping: FlowShapingParams,
     pub transplant: FaradayParams,
     pub shutter: CurvedShutterParams,
     /// Field Collider v1. Disabled is exact M4: the block delegates before any
@@ -395,6 +446,7 @@ impl Default for MotionParams {
             field_source: MotionFieldSource::Auto,
             lattice_quality: MotionLatticeQuality::Live,
             procedural: ProceduralFieldParams::default(),
+            shaping: FlowShapingParams::default(),
             transplant: FaradayParams::default(),
             shutter: CurvedShutterParams::default(),
             collider: FieldColliderParams::default(),
@@ -413,6 +465,7 @@ impl MotionParams {
             field_source: self.field_source,
             lattice_quality: self.lattice_quality,
             procedural: self.procedural.sanitized(),
+            shaping: self.shaping.sanitized(),
             transplant: self.transplant.sanitized(),
             shutter: self.shutter.sanitized(),
             collider: self.collider.sanitized(),
@@ -2191,6 +2244,105 @@ pub fn procedural_field_sample(
     }
 }
 
+/// The flow-shaping event clock in ticks per second of program time.
+///
+/// A fixed law rather than an authored control: the plan's three shaping
+/// amounts stay the whole authored surface, and `vector_trash` is a firing
+/// probability per cell per tick.
+pub const FLOW_TRASH_EVENT_HZ: f32 = 8.0;
+
+/// Fixed domain constant separating the trash hash from every other stream.
+const FLOW_TRASH_DOMAIN: u32 = 0x4d54_5253; // "MTRS"
+
+/// The shared integer avalanche used by the deterministic per-cell laws.
+/// Byte-identical to `effects.wgsl`'s `cellular_avalanche` so every backend
+/// lands on the same path.
+fn motion_avalanche(value: u32) -> u32 {
+    let mut x = value;
+    x = (x ^ (x >> 16)).wrapping_mul(0x7feb_352d);
+    x = (x ^ (x >> 15)).wrapping_mul(0x846c_a68b);
+    x ^ (x >> 16)
+}
+
+/// One deterministic unit sample for a trash cell, epoch, and lane. The
+/// 24-bit mantissa path keeps CPU and every GPU backend bit-identical.
+pub fn flow_trash_hash(cell: [i32; 2], epoch: u32, lane: u32) -> f32 {
+    let seed = motion_avalanche(
+        (cell[0] as u32)
+            ^ (cell[1] as u32).wrapping_mul(0x9e37_79b9)
+            ^ epoch.wrapping_mul(0x85eb_ca6b)
+            ^ lane.wrapping_mul(0x27d4_eb2f)
+            ^ FLOW_TRASH_DOMAIN,
+    );
+    (seed & 0x00ff_ffff) as f32 / 16_777_216.0
+}
+
+/// The complete B2 flow-shaping law for one applied velocity.
+///
+/// This is the independent CPU reference the shaping block in
+/// `motion_apply.wgsl` is measured against, expression for expression. It
+/// operates on the *gated sampled* velocity — after confidence/visibility
+/// gating, before the trajectory offset — so shaping modifies an applied
+/// field and never manufactures motion where no admitted valid field exists.
+///
+/// `luma_gradient_per_texel` is the caller's central-difference observation of
+/// the current image's covered luma, one texel out per axis; `output_px` is
+/// the fragment position in output pixels; `time_seconds` is frame-plan
+/// program time. Order is stretch, then repel, then trash, then the canonical
+/// clamp, and the order is part of the law.
+pub fn shape_flow_velocity(
+    velocity: [f32; 2],
+    uv: [f32; 2],
+    luma_gradient_per_texel: [f32; 2],
+    output_px: [f32; 2],
+    time_seconds: f32,
+    params: FlowShapingParams,
+) -> [f32; 2] {
+    let params = params.sanitized();
+    let mut v = [finite_or(velocity[0], 0.0), finite_or(velocity[1], 0.0)];
+    if params.stretch > 0.0 {
+        let p = [uv[0] - 0.5, uv[1] - 0.5];
+        let r = p[0].hypot(p[1]);
+        if r > 1.0e-6 {
+            let magnitude = v[0].hypot(v[1]);
+            v[0] += p[0] / r * magnitude * params.stretch;
+            v[1] += p[1] / r * magnitude * params.stretch;
+        }
+    }
+    if params.edge_repel > 0.0 {
+        let g = [
+            finite_or(luma_gradient_per_texel[0], 0.0),
+            finite_or(luma_gradient_per_texel[1], 0.0),
+        ];
+        let length = g[0].hypot(g[1]);
+        if length > 1.0e-6 {
+            // The push saturates at one full luma step per texel, so a razor
+            // edge cannot launch an unbounded velocity before the clamp.
+            let push = (length * 8.0).min(1.0) * PROCEDURAL_FIELD_MAX_SPEED * params.edge_repel;
+            v[0] -= g[0] / length * push;
+            v[1] -= g[1] / length * push;
+        }
+    }
+    if params.vector_trash > 0.0 {
+        let block = params.trash_block_size;
+        let cell = [
+            (finite_or(output_px[0], 0.0) / block).floor() as i32,
+            (finite_or(output_px[1], 0.0) / block).floor() as i32,
+        ];
+        let epoch = (finite_or(time_seconds, 0.0).max(0.0) * FLOW_TRASH_EVENT_HZ) as u32;
+        if flow_trash_hash(cell, epoch, 0) < params.vector_trash {
+            let garbage = [
+                flow_trash_hash(cell, epoch, 1).mul_add(2.0, -1.0),
+                flow_trash_hash(cell, epoch, 2).mul_add(2.0, -1.0),
+            ];
+            let shove = 2.0 * PROCEDURAL_FIELD_MAX_SPEED;
+            v[0] += garbage[0] * shove;
+            v[1] += garbage[1] * shove;
+        }
+    }
+    [clamp_motion_velocity(v[0]), clamp_motion_velocity(v[1])]
+}
+
 /// Byte-exact collider-specific resource delta for one admitted collider.
 ///
 /// The two primitive input fields and the sole persistent carrier are already
@@ -3724,6 +3876,176 @@ mod tests {
         );
         assert!(hostile_time.velocity_uv_per_second[0].is_finite());
         assert!(hostile_time.velocity_uv_per_second[1].is_finite());
+    }
+
+    #[test]
+    fn flow_shaping_sanitizes_to_neutral_values_and_zero_is_exact() {
+        let hostile = FlowShapingParams {
+            stretch: f32::NAN,
+            edge_repel: -3.0,
+            vector_trash: f32::INFINITY,
+            trash_block_size: f32::NAN,
+        }
+        .sanitized();
+        assert_eq!(hostile.stretch, 0.0);
+        assert_eq!(hostile.edge_repel, 0.0);
+        assert_eq!(hostile.vector_trash, 0.0);
+        assert_eq!(hostile.trash_block_size, 16.0);
+        assert!(hostile.is_exact_zero());
+        assert!(FlowShapingParams::default().is_exact_zero());
+        assert!(!FlowShapingParams {
+            stretch: 0.1,
+            ..FlowShapingParams::default()
+        }
+        .is_exact_zero());
+        // A nonzero block size alone shapes nothing.
+        assert!(FlowShapingParams {
+            trash_block_size: 64.0,
+            ..FlowShapingParams::default()
+        }
+        .is_exact_zero());
+    }
+
+    #[test]
+    fn stretch_grows_radially_by_field_magnitude() {
+        let params = FlowShapingParams {
+            stretch: 0.5,
+            ..FlowShapingParams::default()
+        };
+        // On the +x axis with a purely vertical velocity of magnitude 4, the
+        // stretch term adds outward (+x) motion of 4 * 0.5.
+        let shaped =
+            shape_flow_velocity([0.0, 4.0], [0.75, 0.5], [0.0, 0.0], [0.0, 0.0], 0.0, params);
+        assert!((shaped[0] - 2.0).abs() < 1.0e-5);
+        assert!((shaped[1] - 4.0).abs() < 1.0e-5);
+        // At the centre there is no outward direction, and with a zero field
+        // there is nothing to grow.
+        assert_eq!(
+            shape_flow_velocity([0.0, 0.0], [0.5, 0.5], [0.0, 0.0], [0.0, 0.0], 0.0, params),
+            [0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn edge_repel_pushes_down_the_saturated_luma_gradient() {
+        let params = FlowShapingParams {
+            edge_repel: 1.0,
+            ..FlowShapingParams::default()
+        };
+        // A strong +x gradient saturates the push at one full luma step per
+        // texel, so the contribution is exactly -PROCEDURAL_FIELD_MAX_SPEED.
+        let shaped =
+            shape_flow_velocity([0.0, 0.0], [0.4, 0.4], [0.5, 0.0], [0.0, 0.0], 0.0, params);
+        assert!((shaped[0] + PROCEDURAL_FIELD_MAX_SPEED).abs() < 1.0e-5);
+        assert_eq!(shaped[1], 0.0);
+        // A weak gradient scales linearly below saturation.
+        let weak =
+            shape_flow_velocity([0.0, 0.0], [0.4, 0.4], [0.05, 0.0], [0.0, 0.0], 0.0, params);
+        assert!((weak[0] + 0.05 * 8.0 * PROCEDURAL_FIELD_MAX_SPEED).abs() < 1.0e-4);
+        // Flat content repels nothing.
+        assert_eq!(
+            shape_flow_velocity([1.0, 1.0], [0.4, 0.4], [0.0, 0.0], [0.0, 0.0], 0.0, params),
+            [1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn vector_trash_fires_deterministically_by_cell_epoch_probability() {
+        let params = FlowShapingParams {
+            vector_trash: 1.0,
+            trash_block_size: 16.0,
+            ..FlowShapingParams::default()
+        };
+        // Probability one fires every cell; the shove is the deterministic
+        // hash of (cell, epoch) and replays bit-identically.
+        let first = shape_flow_velocity(
+            [0.0, 0.0],
+            [0.5, 0.5],
+            [0.0, 0.0],
+            [40.0, 24.0],
+            1.0,
+            params,
+        );
+        let replay = shape_flow_velocity(
+            [0.0, 0.0],
+            [0.5, 0.5],
+            [0.0, 0.0],
+            [40.0, 24.0],
+            1.0,
+            params,
+        );
+        assert_eq!(first, replay);
+        assert!(first[0] != 0.0 || first[1] != 0.0);
+        let expected_epoch = (1.0 * FLOW_TRASH_EVENT_HZ) as u32;
+        let cell = [2, 1];
+        let expected = [
+            flow_trash_hash(cell, expected_epoch, 1).mul_add(2.0, -1.0)
+                * 2.0
+                * PROCEDURAL_FIELD_MAX_SPEED,
+            flow_trash_hash(cell, expected_epoch, 2).mul_add(2.0, -1.0)
+                * 2.0
+                * PROCEDURAL_FIELD_MAX_SPEED,
+        ];
+        assert!((first[0] - expected[0]).abs() < 1.0e-5);
+        assert!((first[1] - expected[1]).abs() < 1.0e-5);
+        // Probability zero never fires, and the gate itself is the honest
+        // per-cell hash: over many cells at 0.25 roughly a quarter fire.
+        assert_eq!(
+            shape_flow_velocity(
+                [0.0, 0.0],
+                [0.5, 0.5],
+                [0.0, 0.0],
+                [40.0, 24.0],
+                1.0,
+                FlowShapingParams::default()
+            ),
+            [0.0, 0.0]
+        );
+        let quarter = FlowShapingParams {
+            vector_trash: 0.25,
+            trash_block_size: 2.0,
+            ..FlowShapingParams::default()
+        };
+        let fired = (0..64)
+            .filter(|index| {
+                let px = [(index % 8) as f32 * 2.0, (index / 8) as f32 * 2.0];
+                shape_flow_velocity([0.0, 0.0], [0.5, 0.5], [0.0, 0.0], px, 0.0, quarter)
+                    != [0.0, 0.0]
+            })
+            .count();
+        assert!((8..=24).contains(&fired), "fired {fired} of 64 cells");
+    }
+
+    #[test]
+    fn shaped_velocity_always_lands_inside_the_canonical_range() {
+        let params = FlowShapingParams {
+            stretch: 1.0,
+            edge_repel: 1.0,
+            vector_trash: 1.0,
+            trash_block_size: 2.0,
+        };
+        let shaped = shape_flow_velocity(
+            [63.0, -63.0],
+            [0.9, 0.1],
+            [1.0, -1.0],
+            [500.0, 300.0],
+            2.5,
+            params,
+        );
+        for component in shaped {
+            assert!(component.abs() <= MOTION_MAX_UV_PER_SECOND);
+            assert!(component.is_finite());
+        }
+        // Hostile inputs take neutral zeros rather than poisoning the sum.
+        let hostile = shape_flow_velocity(
+            [f32::NAN, 1.0],
+            [0.5, 0.5],
+            [f32::NAN, 0.0],
+            [f32::NAN, 0.0],
+            f32::NAN,
+            params,
+        );
+        assert!(hostile[0].is_finite() && hostile[1].is_finite());
     }
 
     #[test]

@@ -354,12 +354,16 @@ struct MotionApplyGpuUniforms {
     transform: MotionTransformGpu,
     shutter_values: [f32; 4],
     faraday_values: [f32; 4],
+    /// x delta seconds, y frame-plan program time, z/w unused.
     frame_values: [f32; 4],
     modes: [u32; 4],
+    /// B2 flow shaping: x stretch, y edge_repel, z vector_trash, w trash
+    /// block size in output pixels.
+    shaping_values: [f32; 4],
     spatial_samples: [MotionSpatialSampleGpu; 16],
 }
 
-const _: () = assert!(std::mem::size_of::<MotionApplyGpuUniforms>() == 1_664);
+const _: () = assert!(std::mem::size_of::<MotionApplyGpuUniforms>() == 1_680);
 
 /// Three affine output-to-current-image maps for one shutter instant. The
 /// chromatic variants let RGB lag evaluate the authored transform at the same
@@ -1841,7 +1845,7 @@ impl MotionGpuResources {
             self.carrier_stage = self.program_advances.then_some(stage);
         }
         self.stage_collider(queue, plan)?;
-        self.write_scope_uniforms(queue, plan, temporal.delta_seconds)?;
+        self.write_scope_uniforms(queue, plan, temporal.delta_seconds, time_seconds)?;
         Ok(())
     }
 
@@ -1984,6 +1988,7 @@ impl MotionGpuResources {
         queue: &wgpu::Queue,
         plan: &AdvancedMotionPlan,
         delta_seconds: f32,
+        time_seconds: f32,
     ) -> Result<(), MotionGpuError> {
         for scope in plan.scopes() {
             let Some(render_field_slot) = self
@@ -2075,7 +2080,16 @@ impl MotionGpuResources {
                     faraday.confidence_softness,
                     faraday.occlusion,
                 ],
-                frame_values: [delta_seconds.max(0.0), 0.0, 0.0, 0.0],
+                frame_values: [
+                    delta_seconds.max(0.0),
+                    if time_seconds.is_finite() {
+                        time_seconds.max(0.0)
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                ],
                 modes: [
                     u32::from(active),
                     u32::from(if shutter.is_exact_zero() {
@@ -2086,6 +2100,15 @@ impl MotionGpuResources {
                     0,
                     u32::from(field_valid),
                 ],
+                shaping_values: {
+                    let shaping = scope.params.shaping.sanitized();
+                    [
+                        shaping.stretch,
+                        shaping.edge_repel,
+                        shaping.vector_trash,
+                        shaping.trash_block_size,
+                    ]
+                },
                 spatial_samples: spatial_samples.unwrap_or_else(identity_spatial_samples),
             };
             queue.write_buffer(&bindings.apply_uniform, 0, bytemuck::bytes_of(&uniforms));
@@ -3257,6 +3280,7 @@ pub(crate) fn motion_pass_budget(
     shutter_samples: u8,
     chromatic_lag: bool,
     faraday_active: bool,
+    edge_repel_active: bool,
 ) -> MotionPassBudget {
     let shutter_samples = shutter_samples.clamp(1, 16);
     let carrier_lookups = if chromatic_lag {
@@ -3271,7 +3295,11 @@ pub(crate) fn motion_pass_budget(
             .saturating_add(2)
             // Faraday refresh owns three lookups. Luma acquisition now owns
             // four explicit covered-color loads at its downsample boundary.
-            .saturating_add(u8::from(faraday_active) * 7),
+            .saturating_add(u8::from(faraday_active) * 7)
+            // B2 edge repel observes the carrier's covered luma at four taps,
+            // once per fragment, only while its amount is nonzero. Stretch
+            // and vector trash are arithmetic and cost no texture operation.
+            .saturating_add(u8::from(edge_repel_active) * 4),
         max_sampled_textures_in_pass: 3,
     }
 }
@@ -3793,7 +3821,7 @@ mod tests {
     #[test]
     fn fixed_shutter_quality_and_chromatic_costs_are_visible_and_bounded() {
         assert_eq!(
-            motion_pass_budget(1, false, false),
+            motion_pass_budget(1, false, false, false),
             MotionPassBudget {
                 full_frame_passes: 1,
                 texture_samples_per_pixel: 6,
@@ -3801,12 +3829,22 @@ mod tests {
             }
         );
         assert_eq!(
-            motion_pass_budget(16, true, true),
+            motion_pass_budget(16, true, true, false),
             MotionPassBudget {
                 full_frame_passes: 2,
                 texture_samples_per_pixel: 201,
                 max_sampled_textures_in_pass: 3,
             }
+        );
+        // B2 edge repel adds exactly four covered-luma taps per fragment, and
+        // only while its amount is nonzero.
+        assert_eq!(
+            motion_pass_budget(1, false, false, true).texture_samples_per_pixel,
+            10
+        );
+        assert_eq!(
+            motion_pass_budget(16, true, true, true).texture_samples_per_pixel,
+            205
         );
     }
 

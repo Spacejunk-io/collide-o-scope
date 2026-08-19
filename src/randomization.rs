@@ -738,6 +738,11 @@ const DICE_MOTION_CHROMATIC_LAG: u64 = 0x4348_524f_4d4c_4147;
 // stream stays byte-stable.
 const DICE_MOTION_FIELD_SCALE: u64 = 0x4649_454c_4453_434c;
 const DICE_MOTION_FIELD_RATE: u64 = 0x4649_454c_4452_4154;
+// B2 flow shaping, likewise in fresh domains.
+const DICE_MOTION_STRETCH: u64 = 0x5354_5245_5443_4800;
+const DICE_MOTION_EDGE_REPEL: u64 = 0x4544_4745_5245_5045;
+const DICE_MOTION_VECTOR_TRASH: u64 = 0x5645_4354_5452_4153;
+const DICE_MOTION_TRASH_BLOCK: u64 = 0x5452_4153_424c_4f43;
 
 const fn dice_motion_owner_domain(scope: DiceMotionScope) -> u64 {
     match scope {
@@ -877,6 +882,38 @@ pub(crate) fn mutate_live_motion(
         2.0,
         0.5,
         DICE_MOTION_FIELD_RATE
+    );
+    linear!(
+        motion.shaping.stretch,
+        defaults.shaping.stretch,
+        0.0,
+        1.0,
+        0.15,
+        DICE_MOTION_STRETCH
+    );
+    linear!(
+        motion.shaping.edge_repel,
+        defaults.shaping.edge_repel,
+        0.0,
+        1.0,
+        0.15,
+        DICE_MOTION_EDGE_REPEL
+    );
+    linear!(
+        motion.shaping.vector_trash,
+        defaults.shaping.vector_trash,
+        0.0,
+        1.0,
+        0.1,
+        DICE_MOTION_VECTOR_TRASH
+    );
+    linear!(
+        motion.shaping.trash_block_size,
+        defaults.shaping.trash_block_size,
+        2.0,
+        256.0,
+        24.0,
+        DICE_MOTION_TRASH_BLOCK
     );
     *motion = motion.sanitized();
 }

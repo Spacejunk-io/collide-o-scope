@@ -147,6 +147,11 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     // are addressable.
     ("motion_field_scale", 0.0, 1.0),
     ("motion_field_rate", -2.0, 2.0),
+    // B2 flow shaping: four continuous controls at both scopes.
+    ("motion_stretch", 0.0, 1.0),
+    ("motion_edge_repel", 0.0, 1.0),
+    ("motion_vector_trash", 0.0, 1.0),
+    ("motion_trash_block_size", 2.0, 256.0),
     // S3b gesture-field etching exposes only the three derived continuous
     // canvas scalars. The recorded event track is authored topology and has no
     // modulation address at all: nothing here can add, remove, retime, or
@@ -1548,6 +1553,8 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "motion_shutter_curvature" => Some((-2.0, 2.0)),
         "motion_field_scale" => Some((0.0, 1.0)),
         "motion_field_rate" => Some((-2.0, 2.0)),
+        "motion_stretch" | "motion_edge_repel" | "motion_vector_trash" => Some((0.0, 1.0)),
+        "motion_trash_block_size" => Some((2.0, 256.0)),
         _ => None,
     }
 }
@@ -2997,6 +3004,10 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "motion_shutter_chromatic_lag",
     "motion_field_scale",
     "motion_field_rate",
+    "motion_stretch",
+    "motion_edge_repel",
+    "motion_vector_trash",
+    "motion_trash_block_size",
 ];
 
 impl RoutingOffsets {
@@ -3117,6 +3128,10 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "motion_shutter_chromatic_lag" => 57,
         "motion_field_scale" => 58,
         "motion_field_rate" => 59,
+        "motion_stretch" => 60,
+        "motion_edge_repel" => 61,
+        "motion_vector_trash" => 62,
+        "motion_trash_block_size" => 63,
         _ => return None,
     })
 }
@@ -3180,6 +3195,10 @@ fn apply_motion_offsets(
     motion.shutter.chromatic_lag += offset("motion_shutter_chromatic_lag", 0.0, 1.0);
     motion.procedural.scale += offset("motion_field_scale", 0.0, 1.0);
     motion.procedural.rate += offset("motion_field_rate", -2.0, 2.0);
+    motion.shaping.stretch += offset("motion_stretch", 0.0, 1.0);
+    motion.shaping.edge_repel += offset("motion_edge_repel", 0.0, 1.0);
+    motion.shaping.vector_trash += offset("motion_vector_trash", 0.0, 1.0);
+    motion.shaping.trash_block_size += offset("motion_trash_block_size", 2.0, 256.0);
     *motion = motion.sanitized();
 }
 
@@ -4193,6 +4212,12 @@ mod tests {
             ("layer1_motion_shutter_angle", (0.0, 360.0)),
             ("layer1_motion_field_scale", (0.0, 1.0)),
             ("layer1_motion_field_rate", (-2.0, 2.0)),
+            ("motion_stretch", (0.0, 1.0)),
+            ("motion_edge_repel", (0.0, 1.0)),
+            ("motion_vector_trash", (0.0, 1.0)),
+            ("motion_trash_block_size", (2.0, 256.0)),
+            ("layer1_motion_stretch", (0.0, 1.0)),
+            ("layer1_motion_trash_block_size", (2.0, 256.0)),
         ] {
             assert_eq!(target_range(target), Some(range), "{target}");
         }
@@ -4240,6 +4265,7 @@ mod tests {
             "layer1_motion_shutter_angle",
             "motion_field_rate",
             "layer1_motion_field_scale",
+            "layer1_motion_stretch",
         ]
         .into_iter()
         .map(|target| Routing::new(ModSource::Midi(0), target, 1.0))
@@ -4260,6 +4286,9 @@ mod tests {
         approx(layer.transplant.confidence_softness, 0.35);
         approx(layer.shutter.angle_degrees, 200.0);
         approx(layer.procedural.scale, 1.0);
+        // stretch offset = 1.0 * (1 - 0) * 0.5 = +0.5 on the layer copy only.
+        approx(layer.shaping.stretch, 0.5);
+        approx(master.shaping.stretch, 0.0);
         assert_eq!(layer.algorithm_version, MOTION_ALGORITHM_VERSION);
         assert_eq!(layer.field_source, MotionFieldSource::CodecVectors);
         assert_eq!(layer.lattice_quality, MotionLatticeQuality::High);

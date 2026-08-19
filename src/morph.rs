@@ -20,7 +20,7 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    FieldColliderConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig,
+    FieldColliderConfig, FlowShapingConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig,
     ProceduralFieldConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
     RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
     TemporalResetPolicyConfig,
@@ -763,6 +763,17 @@ fn interpolate_motion_config(
         procedural: ProceduralFieldConfig {
             scale: blend_finite(a.procedural.scale, b.procedural.scale, weights),
             rate: blend_finite(a.procedural.rate, b.procedural.rate, weights),
+        },
+        // All four shaping controls are continuous values.
+        shaping: FlowShapingConfig {
+            stretch: blend_finite(a.shaping.stretch, b.shaping.stretch, weights),
+            edge_repel: blend_finite(a.shaping.edge_repel, b.shaping.edge_repel, weights),
+            vector_trash: blend_finite(a.shaping.vector_trash, b.shaping.vector_trash, weights),
+            trash_block_size: blend_finite(
+                a.shaping.trash_block_size,
+                b.shaping.trash_block_size,
+                weights,
+            ),
         },
         transplant: FaradayConfig {
             amount: blend_finite(a.transplant.amount, b.transplant.amount, weights),

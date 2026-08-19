@@ -1215,6 +1215,8 @@ fn valid_motion_edit(scope: &MotionScopeSnapshot, param: &str, value: &serde_jso
         ),
         "field_scale" => number_in(value, 0.0, 1.0),
         "field_rate" => number_in(value, -2.0, 2.0),
+        "stretch" | "edge_repel" | "vector_trash" => number_in(value, 0.0, 1.0),
+        "trash_block_size" => number_in(value, 2.0, 256.0),
         "lattice_quality" => matches!(value.as_str(), Some("draft" | "live" | "high")),
         "shutter_angle" => number_in(value, 0.0, 360.0),
         "shutter_phase" => number_in(value, -1.0, 1.0),
@@ -4027,6 +4029,8 @@ mod tests {
             (&master, "field_source", serde_json::json!("procedural")),
             (&master, "field_scale", serde_json::json!(1.01)),
             (&layer, "field_rate", serde_json::json!(-2.1)),
+            (&layer, "vector_trash", serde_json::json!(1.5)),
+            (&master, "trash_block_size", serde_json::json!(1.0)),
         ] {
             assert!(
                 !valid_action(

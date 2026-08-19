@@ -590,6 +590,18 @@
               <div class="param-row" data-motion-param="field_rate" data-min="-2" data-max="2" data-step="0.01">
                 <label>Field rate</label><input type="range" min="-2" max="2" step="0.01" value="0.25" aria-label="Master procedural field rate"><span class="value">0.25</span>
               </div>
+              <div class="param-row" data-motion-param="stretch" data-min="0" data-max="1" data-step="0.01">
+                <label>Stretch</label><input type="range" min="0" max="1" step="0.01" value="0" aria-label="Master flow stretch"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-motion-param="edge_repel" data-min="0" data-max="1" data-step="0.01">
+                <label>Edge repel</label><input type="range" min="0" max="1" step="0.01" value="0" aria-label="Master flow edge repel"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-motion-param="vector_trash" data-min="0" data-max="1" data-step="0.01">
+                <label>Vector trash</label><input type="range" min="0" max="1" step="0.01" value="0" aria-label="Master flow vector trash"><span class="value">0</span>
+              </div>
+              <div class="param-row" data-motion-param="trash_block_size" data-min="2" data-max="256" data-step="1">
+                <label>Trash block</label><input type="range" min="2" max="256" step="1" value="16" aria-label="Master flow trash block size"><span class="value">16</span>
+              </div>
               <div class="param-row" data-motion-param="shutter_angle" data-min="0" data-max="360" data-step="1">
                 <label>Shutter angle</label><input type="range" min="0" max="360" step="1" value="0" aria-label="Master shutter angle"><span class="value">0</span>
               </div>
@@ -608,7 +620,7 @@
               </div>
               <div class="temporal-command-row"><button type="button" id="motion-clear-memory">Clear motion memory</button></div>
               <div class="audio-status motion-telemetry" id="master-motion-telemetry" role="status" aria-live="polite">v1 · planned idle · 0 vectors · no field planned · carrier empty</div>
-              <div class="audio-status">Auto uses codec vectors when valid on layers and visibly falls back to the deterministic lattice. Master Auto is lattice. Codec-only never falls back. Procedural kinds synthesize a deterministic field from program time; scale and rate shape it, and Contour/Chroma steer by the picture itself.</div>
+              <div class="audio-status">Auto uses codec vectors when valid on layers and visibly falls back to the deterministic lattice. Master Auto is lattice. Codec-only never falls back. Procedural kinds synthesize a deterministic field from program time; scale and rate shape it, and Contour/Chroma steer by the picture itself. Stretch, edge repel, and vector trash shape whichever field is applied.</div>
             </div>
           </div>
 

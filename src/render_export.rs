@@ -17484,6 +17484,81 @@ mod effects_audit {
         render("procedural_motion_field", patch);
     }
 
+    /// Decoded-frame digests for one rendered file, via the same ffmpeg CLI
+    /// the export path already requires.
+    fn decoded_framemd5(path: &str) -> String {
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i", path, "-f", "framemd5", "-"])
+            .output()
+            .expect("ffmpeg framemd5");
+        assert!(output.status.success(), "framemd5 failed for {path}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// The B2 flow-shaping labeled export case: a self-donor Faraday advection
+    /// driven by a Radial field, with all three shaping controls authored —
+    /// stretch growing the flow outward, edge repel pushing off luma edges,
+    /// and vector trash shoving hashed cells on its fixed 8 Hz event clock.
+    /// Offline consumes the same apply shader and the same frame-plan time, so
+    /// the trash epochs are frame-indexed and the render is repeatable.
+    ///
+    /// The case renders an `_unshaped` twin — identical patch, shaping zero —
+    /// and asserts the decoded frames differ: shaping demonstrably reaches the
+    /// pixels through the real export path, and an authored zero demonstrably
+    /// remains a different program.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_motion_flow_shaping_pipeline() {
+        use crate::patch::{
+            FaradayConfig, FlowShapingConfig, MotionCarrierConfig, MotionConfig, MotionDonorConfig,
+            MotionFieldSourceConfig, ProceduralFieldConfig,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let motion = |shaping: FlowShapingConfig| MotionConfig {
+            field_source: MotionFieldSourceConfig::ProceduralRadial,
+            procedural: ProceduralFieldConfig {
+                scale: 0.3,
+                rate: 0.4,
+            },
+            shaping,
+            transplant: FaradayConfig {
+                amount: 0.8,
+                carrier: MotionCarrierConfig::FirstSourceFrame,
+                confidence_threshold: 0.05,
+                confidence_softness: 0.1,
+                refresh: 0.4,
+                decay: 0.9,
+                donor: MotionDonorConfig::Selected {
+                    saved_position: SavedLayerPosition::new(0).expect("layer 0 exists"),
+                },
+                ..FaradayConfig::default()
+            },
+            ..MotionConfig::default()
+        };
+        let mut shaped = base_patch();
+        shaped.layers[0].motion = Some(motion(FlowShapingConfig {
+            stretch: 0.6,
+            edge_repel: 0.5,
+            vector_trash: 0.35,
+            trash_block_size: 24.0,
+        }));
+        render("motion_flow_shaping", shaped);
+        let mut unshaped = base_patch();
+        unshaped.layers[0].motion = Some(motion(FlowShapingConfig::default()));
+        render("motion_flow_shaping_unshaped", unshaped);
+        assert_ne!(
+            decoded_framemd5("renders/audit_motion_flow_shaping.mp4"),
+            decoded_framemd5("renders/audit_motion_flow_shaping_unshaped.mp4"),
+            "authored shaping must change the decoded frames"
+        );
+    }
+
     /// Three stacked clips where the upper layer's Residual Counterpoint node
     /// recombines the middle layer's large-scale structure with its own detail
     /// measured against the bottom layer. This is the labeled export case for
