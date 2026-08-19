@@ -483,6 +483,31 @@ fn duration_micros_u32(duration: Option<Duration>) -> u32 {
     })
 }
 
+/// Whether the decode path may claim hardware or zero-copy activity. The
+/// capability evaluator is the single authority: a capability that is not
+/// `Available` cannot be active, and no integrated backend exists to report
+/// activity even if one were. These were previously bare `false` literals —
+/// falses that would have silently stayed false after a backend landed;
+/// deriving them here means the claim starts telling the truth the moment
+/// the evaluator's answer changes, with no edit at this seam.
+fn decode_activity_claims() -> (bool, bool) {
+    let hardware_available = matches!(
+        precision::scale_capability_decision(precision::ScaleCapability::HardwareDecode),
+        precision::CapabilityDecision::Available
+    );
+    let zero_copy_available = matches!(
+        precision::scale_capability_decision(precision::ScaleCapability::ZeroCopyDecode),
+        precision::CapabilityDecision::Available
+    );
+    // Activity additionally requires a runtime signal from the (absent)
+    // backend, so availability alone still reports inactive.
+    let backend_reports_activity = false;
+    (
+        hardware_available && backend_reports_activity,
+        zero_copy_available && backend_reports_activity,
+    )
+}
+
 fn proxy_playback_observation(
     telemetry: &video::threaded::DecoderTelemetry,
     visible_layers: usize,
@@ -500,6 +525,7 @@ fn proxy_playback_observation(
         .frame_overwrites
         .saturating_add(telemetry.frame_drops)
         .min(u64::from(sampled_frames)) as u32;
+    let (hardware_decode_active, zero_copy_active) = decode_activity_claims();
     Some(proxy::ProxyPlaybackObservation {
         sampled_frames,
         visible_layers: u16::try_from(
@@ -512,8 +538,8 @@ fn proxy_playback_observation(
         frame_age_p95_micros: duration_micros_u32(telemetry.frame_age_p95_duration),
         dropped_frames,
         pending_frames_peak: u16::from(telemetry.pending_frames_peak),
-        hardware_decode_active: false,
-        zero_copy_active: false,
+        hardware_decode_active,
+        zero_copy_active,
     })
 }
 
