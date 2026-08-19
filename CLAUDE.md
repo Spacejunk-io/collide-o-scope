@@ -398,6 +398,25 @@ editor-only transform: S6 proves that closure rather than adding to it.
   and then its SHA-256 seal, so recovery can remove unsealed residue without
   serving it. Events return to the render thread through a nonblocking
   channel drained once per frame.
+- The **proxy adoption worker** owns one thread and a one-slot job queue
+  that refuses new work while busy. On an encode completion the render
+  thread captures, per matching live layer, a claim — stable layer ID,
+  source-resource epoch, and the live playhead — and the worker prepares off
+  the render thread: one shared `consult_proxy_cache` (seal re-hash, source
+  re-probe/re-plan, decoded-identity validation — exactly the patch-load
+  adoption law, never a laxer private path), then one decoder open and one
+  playhead-seeded frame per candidate through the same
+  `select_seed_frame_at` dance the performance preparer uses. The render
+  thread's per-frame drain re-validates every claim against the live layer —
+  a stale epoch, vanished ID, changed identity, or already-backed layer is
+  discarded with a named reason, never applied to whatever now occupies the
+  position — then installs through the infallible `commit_adopted_proxy`
+  field swap behind fallible GPU staging. That swap is deliberately not a
+  clip switch: slots, transport position/direction/generation state, speed,
+  target FPS, pending seeks, pause, the authored filename, and the persisted
+  content reference are all untouched, so the audience keeps the exact
+  playhead — and a completed OneShot stays transparent — while the decoder
+  underneath moves to the artifact.
 - **Thumbnail/preview helpers** invoke FFmpeg outside the render path only after
   a metadata probe and `MediaSafetyPolicy` plan. Keep candidates, elapsed time,
   captured stdout/stderr, and concurrency bounded; Safe admits at most four
@@ -1820,7 +1839,10 @@ mislead browser tests.
 - `O` — fullscreen output window
 - `B` — blackout
 - `Y` — encode a proxy for the selected layer's verified content identity;
-  every refusal and completion reports through that layer's HUD status line
+  every refusal and completion reports through that layer's HUD status line,
+  and a completion hot-adopts into every matching live layer at its current
+  playhead (falling back to reapply-the-patch wording only when adoption is
+  refused or no live layer matches)
 - `Ctrl+E` — patch parameter editor
 - `Ctrl+S` / `Ctrl+O` — save/load patch
 - `Ctrl+Shift+I` / `Ctrl+Shift+X` — import/export the bounded controller profile
@@ -2032,17 +2054,28 @@ mislead browser tests.
   and discarded; eviction following the pure plan with a path-free receipt;
   foreign files counted but never touched; the contract-derived argv; garbage
   bytes failing decoded-identity validation; mutated/unreadable sources
-  refused before any encode; and the Y-key mapping. Opt-in (`--ignored`,
-  ffmpeg CLI required, like `effects_audit`):
+  refused before any encode; the Y-key mapping; and hot adoption's
+  CLI-free half — an empty cache and a refused consultation each producing
+  one named, job-level `ProxyAdoptionEvent::Refused` through exactly the
+  patch-load consultation law, with no per-layer preparation fabricated.
+  Opt-in (`--ignored`, ffmpeg CLI required, like `effects_audit`):
   `proxy_worker_end_to_end_encode_publish_rename_and_corruption_survival` —
   encode, validate, publish, cache hit, identical bytes at a renamed path
   hitting the same key and adopting, corruption refused at consultation and
   at the job's own cache-hit path, crash recovery beside a live cache, and
   both audio laws — plus
   `proxy_encode_kill_bounds_are_typed_and_publish_nothing` for the deadline
-  and size-cap kills. Windows fsync law: `FlushFileBuffers` demands writable
-  handles for both the staging file and the parent directory; do not "fix" a
-  publish failure by dropping either sync.
+  and size-cap kills,
+  `proxy_hot_adoption_prepares_playhead_seeded_decoders_end_to_end` — two
+  candidates at different playheads each receiving their own half-scale
+  decoder whose seed frames demonstrably differ, claims passed through
+  verbatim — and (GPU adapter additionally required)
+  `gpu_proxy_hot_adoption_swaps_a_live_layer_and_keeps_identity_and_playhead`
+  — the infallible `commit_adopted_proxy` swap keeps identity, filename, and
+  playhead while moving decoder, texture, dimensions, and runtime path, and
+  advances the source-resource epoch. Windows fsync law: `FlushFileBuffers`
+  demands writable handles for both the staging file and the parent
+  directory; do not "fix" a publish failure by dropping either sync.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,
@@ -2074,24 +2107,28 @@ a passing claim.
 - Procedural generation emits patches/manifests/preflight receipts only; MP4
   batch rendering, clip-statistics curation, and visual-driven audio DSP remain
   explicit deferred/research boundaries.
-- The proxy loop is closed for content-referenced video, with three honest
+- The proxy loop is closed for content-referenced video, with two honest
   edges. `proxy_worker.rs` executes the `plan_proxy_input` contract: the Y
   key requests a bounded FFV1/Matroska encode (single helper, absolute
   deadline, staging-size kill, `MediaSafetyPolicy` reservation held for the
   encode, source re-fingerprinted first), publication follows the atomic
   commit law with a SHA-256 seal published after the artifact, recovery
-  removes staging and unsealed residue without ever serving it, and patch
-  load consults the cache — a validated artifact backs the decoder while the
-  layer keeps the original identity, so a proxy can never enter a patch, an
-  export, or Dice. The edges: adoption happens at patch (re)apply, not by
-  hot-swapping a live decoder; only sources with a verified `cos-sha256`
-  identity can be proxied, because the key is content-addressed; and the
-  browser panel has no proxy surface — request and status are native
-  (Y key + stage-health HUD). A host killed mid-encode may orphan one ffmpeg
-  process bounded by its own completion; the staged file it writes is
-  recovery residue, never an artifact. The Unix CI FFmpeg build carries
-  `--disable-programs`, so end-to-end encode fixtures are opt-in like
-  `effects_audit` and hosted CI proves the CLI-free cache half only.
+  removes staging and unsealed residue without ever serving it, and both
+  patch load and publication-time hot adoption consult the cache — a
+  validated artifact backs the decoder while the layer keeps the original
+  identity, so a proxy can never enter a patch, an export, or Dice. Hot
+  adoption closed the former reapply-the-patch edge: an encode completion
+  captures per-layer claims, the adoption worker prepares a playhead-seeded
+  decoder off the render thread, and the drain installs it only after every
+  claim re-validates (see the threading section). The remaining edges: only
+  sources with a verified `cos-sha256` identity can be proxied, because the
+  key is content-addressed; and the browser panel has no proxy surface —
+  request and status are native (Y key + stage-health HUD). A host killed
+  mid-encode may orphan one ffmpeg process bounded by its own completion;
+  the staged file it writes is recovery residue, never an artifact. The
+  Unix CI FFmpeg build carries `--disable-programs`, so end-to-end encode
+  fixtures are opt-in like `effects_audit` and hosted CI proves the
+  CLI-free cache half only.
 - The Symmetry Field's eight-texture single pass is a *floor* claim resting on
   the S2 receipt's enforced-cap argument, measured on one adapter and one
   backend. It is a capability claim only, not performance, bandwidth, or cache

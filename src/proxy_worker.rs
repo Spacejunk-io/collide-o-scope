@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::image_routing::StableLayerId;
 use crate::media_safety::{MediaDeviceLimits, MediaSafetyPolicy, MediaSourceKind};
 use crate::media_source::{ContentIdentity, FingerprintLimits, FingerprintSession};
 use crate::proxy::{
@@ -25,6 +26,7 @@ use crate::proxy::{
     ProxyCachePlan, ProxyError, ProxyFrameTimingLaw, ProxyInputPlan, ProxySettings,
     ProxySourceProbe,
 };
+use crate::video::{SeedSelectError, ThreadedDecoder};
 
 /// Poll cadence for the encode child. The deadline is absolute and checked
 /// first each iteration, so this only bounds reaction latency.
@@ -1131,6 +1133,228 @@ pub fn consult_proxy_cache(
     }
 }
 
+// --- Hot adoption ----------------------------------------------------------
+
+/// The playhead seed for an adoption decoder follows the performance
+/// preparer's deadline shape: an absolute timeout, a short poll that only
+/// bounds reaction latency.
+pub const PROXY_ADOPTION_SEED_TIMEOUT: Duration = Duration::from_secs(5);
+pub const PROXY_ADOPTION_SEED_POLL: Duration = Duration::from_millis(2);
+
+/// One live layer's claim on a pending hot adoption, captured on the render
+/// thread when an encode completion arrives. Every field is re-validated
+/// against the live layer before the prepared decoder is installed: the
+/// stable layer ID must still resolve, the source-resource epoch must be
+/// unchanged (a clip-slot switch makes the claim stale; a patch apply mints
+/// new layer IDs entirely), and the layer must still carry this identity
+/// un-proxied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProxyAdoptionCandidate {
+    pub layer_id: StableLayerId,
+    pub source_resource_epoch: u64,
+    /// The live playhead at capture, normalized `0..=1`. The seed frame is
+    /// decoded here so the swap presents the position the audience is
+    /// watching rather than the artifact's first frame.
+    pub start_position: f64,
+}
+
+/// A hot-adoption request for one published identity. `original_source` is
+/// the layers' current runtime path — the original file — which the cache
+/// consultation re-probes and re-plans before the artifact is trusted.
+pub struct ProxyAdoptionJob {
+    pub identity: ContentIdentity,
+    pub settings: ProxySettings,
+    pub original_source: PathBuf,
+    pub device_limits: MediaDeviceLimits,
+    pub candidates: Vec<ProxyAdoptionCandidate>,
+}
+
+/// What adoption preparation produced. Unlike [`ProxyWorkerEvent`], the
+/// `Prepared` variant is a resource hand-off to the owning render thread,
+/// not telemetry: the artifact path must ride along because the layer
+/// records it as its runtime source path — exactly as patch-load adoption
+/// does — and it travels no further than that field.
+pub enum ProxyAdoptionEvent {
+    Prepared {
+        identity: ContentIdentity,
+        key: ProxyCacheKey,
+        candidate: ProxyAdoptionCandidate,
+        artifact_path: PathBuf,
+        decoder: Box<ThreadedDecoder>,
+        first_rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        source_fps: f32,
+        preload_bytes: u64,
+    },
+    Refused {
+        identity: ContentIdentity,
+        error: String,
+    },
+}
+
+/// The bounded preparation for one adoption job: one cache consultation for
+/// the identity — integrity seal, source re-probe, re-plan, decoded-identity
+/// validation, exactly the patch-load adoption law — then one decoder open
+/// and one playhead-seeded frame per candidate. Every refusal becomes a
+/// typed, operator-facing event; nothing here touches a live layer.
+fn prepare_adoption_job(
+    store: &Mutex<ProxyCacheStore>,
+    media_policy: &MediaSafetyPolicy,
+    job: ProxyAdoptionJob,
+    cancel: &AtomicBool,
+) -> Vec<ProxyAdoptionEvent> {
+    let mut events = Vec::new();
+    if job.candidates.is_empty() {
+        return events;
+    }
+    let (key, artifact_path) =
+        match consult_proxy_cache(store, &job.identity, job.settings, &job.original_source) {
+            ProxyConsultation::Adopted { key, artifact_path } => (key, artifact_path),
+            ProxyConsultation::NoArtifact => {
+                events.push(ProxyAdoptionEvent::Refused {
+                    identity: job.identity,
+                    error: "no published artifact for this identity".to_owned(),
+                });
+                return events;
+            }
+            ProxyConsultation::RefusedInvalid { error, .. } => {
+                events.push(ProxyAdoptionEvent::Refused {
+                    identity: job.identity,
+                    error: format!("proxy artifact refused and discarded: {error}"),
+                });
+                return events;
+            }
+        };
+    let Some(artifact_text) = artifact_path.to_str().map(str::to_owned) else {
+        events.push(ProxyAdoptionEvent::Refused {
+            identity: job.identity,
+            error: "proxy artifact path is not valid Unicode".to_owned(),
+        });
+        return events;
+    };
+    for candidate in job.candidates {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut decoder = match ThreadedDecoder::open_with_media_policy(
+            &artifact_text,
+            media_policy,
+            job.device_limits,
+        ) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                events.push(ProxyAdoptionEvent::Refused {
+                    identity: job.identity.clone(),
+                    error: format!("proxy artifact failed to open: {error}"),
+                });
+                continue;
+            }
+        };
+        let seed = match decoder.select_seed_frame_at(
+            candidate.start_position,
+            PROXY_ADOPTION_SEED_TIMEOUT,
+            PROXY_ADOPTION_SEED_POLL,
+            &|| !cancel.load(Ordering::Relaxed),
+        ) {
+            Ok(frame) => frame,
+            Err(SeedSelectError::Superseded) => break,
+            Err(SeedSelectError::NoSeedFrame) => {
+                events.push(ProxyAdoptionEvent::Refused {
+                    identity: job.identity.clone(),
+                    error: "proxy artifact opened without a decoded first frame".to_owned(),
+                });
+                continue;
+            }
+            Err(SeedSelectError::Decode(error)) => {
+                events.push(ProxyAdoptionEvent::Refused {
+                    identity: job.identity.clone(),
+                    error,
+                });
+                continue;
+            }
+            Err(SeedSelectError::Timeout { target_seconds }) => {
+                events.push(ProxyAdoptionEvent::Refused {
+                    identity: job.identity.clone(),
+                    error: format!(
+                        "proxy artifact did not produce source position {:.6}s within {:.1}s",
+                        target_seconds,
+                        PROXY_ADOPTION_SEED_TIMEOUT.as_secs_f64()
+                    ),
+                });
+                continue;
+            }
+        };
+        let preload_bytes = decoder.media_allocation_plan().working_set_bytes;
+        events.push(ProxyAdoptionEvent::Prepared {
+            identity: job.identity.clone(),
+            key,
+            candidate,
+            artifact_path: artifact_path.clone(),
+            width: decoder.width,
+            height: decoder.height,
+            source_fps: decoder.fps,
+            first_rgba: seed.rgba,
+            decoder: Box::new(decoder),
+            preload_bytes,
+        });
+    }
+    events
+}
+
+/// Supervisor for hot adoption: one thread, a one-slot job queue that
+/// refuses new work while busy instead of queueing a backlog, and a
+/// nonblocking event channel drained once per frame by the render thread.
+pub struct ProxyAdoptionWorker {
+    jobs: mpsc::SyncSender<ProxyAdoptionJob>,
+    events: mpsc::Receiver<ProxyAdoptionEvent>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ProxyAdoptionWorker {
+    pub fn spawn(store: Arc<Mutex<ProxyCacheStore>>, media_policy: MediaSafetyPolicy) -> Self {
+        let (job_sender, job_receiver) = mpsc::sync_channel::<ProxyAdoptionJob>(1);
+        let (event_sender, event_receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let builder = std::thread::Builder::new().name("proxy-adopt".to_owned());
+        let spawned = builder.spawn(move || {
+            while let Ok(job) = job_receiver.recv() {
+                for event in prepare_adoption_job(&store, &media_policy, job, &worker_cancel) {
+                    let _ = event_sender.send(event);
+                }
+            }
+        });
+        if let Err(error) = spawned {
+            log::warn!("proxy adoption worker thread failed to spawn: {error}");
+        }
+        Self {
+            jobs: job_sender,
+            events: event_receiver,
+            cancel,
+        }
+    }
+
+    /// Submit a job; a busy worker refuses rather than queueing a backlog.
+    pub fn submit(&self, job: ProxyAdoptionJob) -> Result<(), &'static str> {
+        self.jobs
+            .try_send(job)
+            .map_err(|_| "a proxy adoption is already preparing")
+    }
+
+    pub fn drain_events(&self) -> Vec<ProxyAdoptionEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.events.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    pub fn cancel_all(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,5 +2029,366 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn adoption_candidate(id: u64, epoch: u64, position: f64) -> ProxyAdoptionCandidate {
+        ProxyAdoptionCandidate {
+            layer_id: StableLayerId::new(id).unwrap(),
+            source_resource_epoch: epoch,
+            start_position: position,
+        }
+    }
+
+    #[test]
+    fn hot_adoption_prepares_nothing_without_an_artifact_and_names_the_refusal() {
+        let root = temp_root("adopt-none");
+        let (store, _) = ProxyCacheStore::open(root.clone()).unwrap();
+        let store = Mutex::new(store);
+        let policy = MediaSafetyPolicy::safe();
+        let cancel = AtomicBool::new(false);
+
+        // No candidates: no consultation, no events.
+        let idle = prepare_adoption_job(
+            &store,
+            &policy,
+            ProxyAdoptionJob {
+                identity: identity('a', 64),
+                settings: ProxySettings::default(),
+                original_source: root.join("unused.mp4"),
+                device_limits: MediaDeviceLimits::none(),
+                candidates: Vec::new(),
+            },
+            &cancel,
+        );
+        assert!(idle.is_empty());
+
+        // A candidate against an empty cache is one named refusal, and the
+        // refusal never fabricates a per-layer preparation.
+        let events = prepare_adoption_job(
+            &store,
+            &policy,
+            ProxyAdoptionJob {
+                identity: identity('a', 64),
+                settings: ProxySettings::default(),
+                original_source: root.join("unused.mp4"),
+                device_limits: MediaDeviceLimits::none(),
+                candidates: vec![adoption_candidate(7, 3, 0.5)],
+            },
+            &cancel,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ProxyAdoptionEvent::Refused { identity: refused, error }
+                if *refused == identity('a', 64)
+                    && error.contains("no published artifact")
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hot_adoption_refuses_through_the_same_consultation_law_as_patch_load() {
+        let root = temp_root("adopt-refuse");
+        let (store, _) = ProxyCacheStore::open(root.clone()).unwrap();
+        let store = Mutex::new(store);
+        let policy = MediaSafetyPolicy::safe();
+        let cancel = AtomicBool::new(false);
+        let source_identity = identity('b', 4_096);
+        let cached_key = ProxyCacheKey::derive(&source_identity, ProxySettings::default()).unwrap();
+
+        // A sealed artifact whose original cannot be re-probed is refused by
+        // the shared consultation — hot adoption has no laxer private path.
+        let staging = lock_store(&store).staging_path(cached_key);
+        std::fs::write(&staging, vec![0x2A_u8; 2_048]).unwrap();
+        let digest = hash_artifact_bytes(&staging).unwrap();
+        lock_store(&store)
+            .publish_staged(cached_key, 2_048, digest)
+            .unwrap();
+        let fake_source = root.join("source.mp4");
+        std::fs::write(&fake_source, b"not media").unwrap();
+
+        let events = prepare_adoption_job(
+            &store,
+            &policy,
+            ProxyAdoptionJob {
+                identity: source_identity.clone(),
+                settings: ProxySettings::default(),
+                original_source: fake_source.clone(),
+                device_limits: MediaDeviceLimits::none(),
+                candidates: vec![adoption_candidate(1, 1, 0.0), adoption_candidate(2, 1, 0.5)],
+            },
+            &cancel,
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "one job-level refusal, not one per candidate"
+        );
+        assert!(matches!(
+            &events[0],
+            ProxyAdoptionEvent::Refused { error, .. }
+                if error.contains("refused and discarded")
+        ));
+
+        // Post-seal corruption is likewise refused and the artifact is
+        // discarded, exactly as consultation at patch load would.
+        let staging = lock_store(&store).staging_path(cached_key);
+        std::fs::write(&staging, vec![0x2A_u8; 2_048]).unwrap();
+        let digest = hash_artifact_bytes(&staging).unwrap();
+        lock_store(&store)
+            .publish_staged(cached_key, 2_048, digest)
+            .unwrap();
+        let artifact = lock_store(&store).artifact_path(cached_key);
+        let mut bytes = std::fs::read(&artifact).unwrap();
+        for byte in bytes.iter_mut().skip(1_000).take(32) {
+            *byte ^= 0xFF;
+        }
+        std::fs::write(&artifact, &bytes).unwrap();
+        let events = prepare_adoption_job(
+            &store,
+            &policy,
+            ProxyAdoptionJob {
+                identity: source_identity.clone(),
+                settings: ProxySettings::default(),
+                original_source: fake_source,
+                device_limits: MediaDeviceLimits::none(),
+                candidates: vec![adoption_candidate(1, 1, 0.0)],
+            },
+            &cancel,
+        );
+        assert!(matches!(
+            &events[0],
+            ProxyAdoptionEvent::Refused { error, .. } if error.contains("seal")
+        ));
+        assert!(
+            !artifact.exists(),
+            "a refused artifact is discarded, not retained"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The adoption delivery fixture. Requires the ffmpeg CLI on PATH
+    /// (CI's Unix FFmpeg is built with --disable-programs, so this is
+    /// opt-in like effects_audit).
+    #[test]
+    #[ignore]
+    fn proxy_hot_adoption_prepares_playhead_seeded_decoders_end_to_end() {
+        let root = temp_root("adopt-e2e");
+        let source = root.join("clip.mp4");
+        generate_test_source(&source, false);
+        let source_identity = fingerprint_of(&source);
+        let settings = ProxySettings::default();
+        let policy = MediaSafetyPolicy::safe();
+        let cancel = AtomicBool::new(false);
+        let (store, _) = ProxyCacheStore::open(root.join("cache")).unwrap();
+        let store = Mutex::new(store);
+        let job = ProxyEncodeJob {
+            source_path: source.clone(),
+            identity: source_identity.clone(),
+            settings,
+        };
+        let outcome =
+            run_proxy_encode_job(&store, &job, ProxyCacheLimits::default(), &policy, &cancel)
+                .unwrap();
+
+        // Two candidates at different playheads: each gets its own decoder,
+        // seeded where its audience is watching, at the artifact's half
+        // scale, with the candidate's claim passed through for the render
+        // thread's staleness guards.
+        let events = prepare_adoption_job(
+            &store,
+            &policy,
+            ProxyAdoptionJob {
+                identity: source_identity.clone(),
+                settings,
+                original_source: source.clone(),
+                device_limits: MediaDeviceLimits::none(),
+                candidates: vec![
+                    adoption_candidate(11, 4, 0.0),
+                    adoption_candidate(12, 9, 0.5),
+                ],
+            },
+            &cancel,
+        );
+        assert_eq!(events.len(), 2);
+        let mut seeds = Vec::new();
+        for (index, event) in events.into_iter().enumerate() {
+            match event {
+                ProxyAdoptionEvent::Prepared {
+                    identity,
+                    key,
+                    candidate,
+                    width,
+                    height,
+                    first_rgba,
+                    preload_bytes,
+                    ..
+                } => {
+                    assert_eq!(identity, source_identity);
+                    assert_eq!(key, outcome.key);
+                    assert_eq!((width, height), (32, 18));
+                    assert_eq!(first_rgba.len(), 32 * 18 * 4);
+                    assert!(preload_bytes > 0);
+                    let expected = if index == 0 {
+                        adoption_candidate(11, 4, 0.0)
+                    } else {
+                        adoption_candidate(12, 9, 0.5)
+                    };
+                    assert_eq!(candidate, expected);
+                    seeds.push(first_rgba);
+                }
+                ProxyAdoptionEvent::Refused { error, .. } => {
+                    panic!("expected preparation, got refusal: {error}")
+                }
+            }
+        }
+        assert_ne!(
+            seeds[0], seeds[1],
+            "a mid-clip playhead must seed a different frame than the start"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The physical claim: a prepared adoption installs into a live layer
+    /// through the infallible field swap — identity, filename, and playhead
+    /// kept; decoder, texture, and dimensions moved. Requires the ffmpeg CLI
+    /// and a GPU adapter.
+    #[test]
+    #[ignore]
+    fn gpu_proxy_hot_adoption_swaps_a_live_layer_and_keeps_identity_and_playhead() {
+        use crate::layers::{Layer, LayerSourceActivation};
+        use crate::transport::{ClipTransportState, NormalizedTime, PlaybackDirection};
+
+        let root = temp_root("adopt-gpu");
+        let source = root.join("clip.mp4");
+        generate_test_source(&source, false);
+        let source_identity = fingerprint_of(&source);
+        let settings = ProxySettings::default();
+        let policy = MediaSafetyPolicy::safe();
+        let cancel = AtomicBool::new(false);
+        let (store, _) = ProxyCacheStore::open(root.join("cache")).unwrap();
+        let store = Mutex::new(store);
+        run_proxy_encode_job(
+            &store,
+            &ProxyEncodeJob {
+                source_path: source.clone(),
+                identity: source_identity.clone(),
+                settings,
+            },
+            ProxyCacheLimits::default(),
+            &policy,
+            &cancel,
+        )
+        .unwrap();
+
+        let instance = wgpu::Instance::default();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
+        .expect("GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Proxy Hot Adoption Test"),
+            ..Default::default()
+        }))
+        .expect("GPU device");
+
+        let mut layer =
+            Layer::new_with_media_policy(source.to_str().unwrap(), &device, &policy).unwrap();
+        layer.set_persisted_source_reference(Some(source_identity.source_reference()));
+        layer.clip_transport =
+            ClipTransportState::at(NormalizedTime::clamped(0.5), PlaybackDirection::Forward);
+        let authored_filename = layer.filename.clone();
+        let authored_reference = layer.source_reference_for_persistence().to_owned();
+        let prior_epoch = layer.source_resource_epoch();
+        assert_eq!((layer.width, layer.height), (64, 36));
+        assert!(layer.proxy_backing().is_none());
+
+        let candidate = ProxyAdoptionCandidate {
+            layer_id: layer.stable_layer_id(),
+            source_resource_epoch: prior_epoch,
+            start_position: layer.clip_transport.position.get(),
+        };
+        let events = prepare_adoption_job(
+            &store,
+            &policy,
+            ProxyAdoptionJob {
+                identity: source_identity.clone(),
+                settings,
+                original_source: source.clone(),
+                device_limits: MediaDeviceLimits::none(),
+                candidates: vec![candidate],
+            },
+            &cancel,
+        );
+        assert_eq!(events.len(), 1);
+        let ProxyAdoptionEvent::Prepared {
+            key,
+            artifact_path,
+            decoder,
+            first_rgba,
+            width,
+            height,
+            source_fps,
+            preload_bytes,
+            ..
+        } = events.into_iter().next().unwrap()
+        else {
+            panic!("expected a prepared adoption");
+        };
+
+        let activation = LayerSourceActivation::stage(
+            &device,
+            &queue,
+            artifact_path.to_string_lossy().into_owned(),
+            Some(authored_reference.clone()),
+            authored_filename.clone(),
+            crate::layers::LayerSource::Video(*decoder),
+            width,
+            height,
+            source_fps,
+            preload_bytes,
+            &first_rgba,
+        )
+        .unwrap();
+        let displaced = layer.commit_adopted_proxy(activation, key.to_hex());
+        drop(displaced);
+
+        assert_eq!(layer.proxy_backing(), Some(key.to_hex().as_str()));
+        assert_eq!((layer.width, layer.height), (32, 18));
+        assert_eq!(layer.filename, authored_filename);
+        assert_eq!(layer.source_reference_for_persistence(), authored_reference);
+        assert_eq!(
+            layer.source_path,
+            artifact_path.to_string_lossy().into_owned(),
+            "the runtime open path is the only proxy fact"
+        );
+        assert!(
+            layer.clip_transport.position == NormalizedTime::clamped(0.5),
+            "the audience playhead survives the swap"
+        );
+        assert!(
+            layer.source_resource_epoch() != prior_epoch,
+            "an adoption is a source-resource change and must advance the epoch"
+        );
+
+        // Decoder drop signals its worker without joining, so the artifact
+        // handle closes asynchronously; Windows refuses to remove a
+        // directory holding an open file. Bound the wait rather than racing.
+        drop(layer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => break,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("temp root cleanup failed: {error}"),
+            }
+        }
     }
 }

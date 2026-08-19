@@ -3454,6 +3454,9 @@ struct App {
     proxy_store_error: Option<String>,
     /// The single encode worker, spawned beside the store on first request.
     proxy_encode_worker: Option<proxy_worker::ProxyEncodeWorker>,
+    /// The single hot-adoption worker, spawned on the first encode completion
+    /// that finds a live layer to adopt into. One-slot queue, refuse-busy.
+    proxy_adoption_worker: Option<proxy_worker::ProxyAdoptionWorker>,
     /// Session-local, bounded per-identity notes: encode progress, readiness,
     /// refusals. Keyed by source SHA-256 so they survive patch reloads.
     proxy_feedback: std::collections::HashMap<String, String>,
@@ -3960,6 +3963,7 @@ impl App {
             proxy_store: None,
             proxy_store_error: None,
             proxy_encode_worker: None,
+            proxy_adoption_worker: None,
             proxy_feedback: std::collections::HashMap::new(),
             proxy_ab_baseline_micros: std::collections::HashMap::new(),
             layer_stack_revision: 1,
@@ -16506,8 +16510,8 @@ impl App {
                     self.note_proxy_feedback(identity.sha256, note);
                 }
                 proxy_worker::ProxyWorkerEvent::Finished { identity, outcome } => {
-                    let note = if outcome.already_cached {
-                        "proxy already cached — reapply the patch to adopt it".to_owned()
+                    let base = if outcome.already_cached {
+                        "proxy already cached".to_owned()
                     } else {
                         let evicted = outcome
                             .eviction
@@ -16516,17 +16520,18 @@ impl App {
                             .unwrap_or(0);
                         if evicted > 0 {
                             format!(
-                                "proxy ready ({} bytes, {} evicted, {}s) — reapply the patch to adopt it",
+                                "proxy ready ({} bytes, {} evicted, {}s)",
                                 outcome.artifact_bytes, evicted, outcome.encode_seconds
                             )
                         } else {
                             format!(
-                                "proxy ready ({} bytes, {}s) — reapply the patch to adopt it",
+                                "proxy ready ({} bytes, {}s)",
                                 outcome.artifact_bytes, outcome.encode_seconds
                             )
                         }
                     };
-                    self.note_proxy_feedback(identity.sha256, note);
+                    let disposition = self.request_proxy_hot_adoption(&identity);
+                    self.note_proxy_feedback(identity.sha256, format!("{base} — {disposition}"));
                 }
                 proxy_worker::ProxyWorkerEvent::Failed { identity, error } => {
                     self.note_proxy_feedback(
@@ -16536,6 +16541,185 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Ask the adoption worker to prepare a hot swap of every live,
+    /// un-proxied video layer carrying this identity onto the published
+    /// artifact. Returns the operator-facing disposition for the HUD note.
+    /// Preparation — seal re-hash, source re-probe, decoder open, playhead
+    /// seed — happens off the render thread; the guarded infallible install
+    /// happens at the per-frame event drain.
+    fn request_proxy_hot_adoption(&mut self, identity: &media_source::ContentIdentity) -> String {
+        let mut original_source: Option<std::path::PathBuf> = None;
+        let candidates: Vec<proxy_worker::ProxyAdoptionCandidate> = self
+            .layers
+            .iter()
+            .filter(|layer| {
+                layer.is_video()
+                    && layer.proxy_backing().is_none()
+                    && layer.content_identity_for_proxy().as_ref() == Some(identity)
+            })
+            .map(|layer| {
+                original_source.get_or_insert_with(|| std::path::PathBuf::from(&layer.source_path));
+                proxy_worker::ProxyAdoptionCandidate {
+                    layer_id: layer.stable_layer_id(),
+                    source_resource_epoch: layer.source_resource_epoch(),
+                    start_position: layer.clip_transport.position.get(),
+                }
+            })
+            .collect();
+        let Some(original_source) = original_source else {
+            return "no live layer to adopt; it will back the next patch apply".to_owned();
+        };
+        let Some(store) = self.ensure_proxy_store() else {
+            let error = self
+                .proxy_store_error
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned());
+            return format!("proxy cache unavailable: {error}");
+        };
+        if self.proxy_adoption_worker.is_none() {
+            self.proxy_adoption_worker = Some(proxy_worker::ProxyAdoptionWorker::spawn(
+                store,
+                self.media_safety_policy.clone(),
+            ));
+        }
+        let device_limits =
+            self.renderer
+                .as_ref()
+                .map_or_else(media_safety::MediaDeviceLimits::none, |renderer| {
+                    let limits = renderer.device.limits();
+                    media_safety::MediaDeviceLimits::new(
+                        limits.max_texture_dimension_2d,
+                        limits.max_buffer_size,
+                    )
+                });
+        let layer_count = candidates.len();
+        let job = proxy_worker::ProxyAdoptionJob {
+            identity: identity.clone(),
+            settings: proxy::ProxySettings::default(),
+            original_source,
+            device_limits,
+            candidates,
+        };
+        match self
+            .proxy_adoption_worker
+            .as_ref()
+            .expect("worker was just ensured")
+            .submit(job)
+        {
+            Ok(()) => format!("adopting into {layer_count} live layer(s)"),
+            Err(refusal) => format!("{refusal}; reapply the patch to adopt"),
+        }
+    }
+
+    /// Drain adoption-preparation completions nonblockingly, once per frame,
+    /// and perform the guarded infallible install for each prepared decoder.
+    fn drain_proxy_adoption_events(&mut self) {
+        let events = match &self.proxy_adoption_worker {
+            Some(worker) => worker.drain_events(),
+            None => return,
+        };
+        for event in events {
+            match event {
+                proxy_worker::ProxyAdoptionEvent::Prepared {
+                    identity,
+                    key,
+                    candidate,
+                    artifact_path,
+                    decoder,
+                    first_rgba,
+                    width,
+                    height,
+                    source_fps,
+                    preload_bytes,
+                } => {
+                    let note = self.install_prepared_proxy_adoption(
+                        &identity,
+                        key,
+                        candidate,
+                        &artifact_path,
+                        decoder,
+                        &first_rgba,
+                        width,
+                        height,
+                        source_fps,
+                        preload_bytes,
+                    );
+                    self.note_proxy_feedback(identity.sha256, note);
+                }
+                proxy_worker::ProxyAdoptionEvent::Refused { identity, error } => {
+                    self.note_proxy_feedback(
+                        identity.sha256,
+                        format!("proxy adoption refused: {error}; reapply the patch to adopt"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The render-thread half of hot adoption. Every claim captured with the
+    /// candidate is re-validated against the live layer — stale claims are
+    /// discarded with a named reason, never applied to whatever now occupies
+    /// the position — and the swap itself is the infallible
+    /// `commit_adopted_proxy` field exchange behind a fallible GPU staging.
+    #[allow(clippy::too_many_arguments)]
+    fn install_prepared_proxy_adoption(
+        &mut self,
+        identity: &media_source::ContentIdentity,
+        key: proxy::ProxyCacheKey,
+        candidate: proxy_worker::ProxyAdoptionCandidate,
+        artifact_path: &std::path::Path,
+        decoder: Box<video::ThreadedDecoder>,
+        first_rgba: &[u8],
+        width: u32,
+        height: u32,
+        source_fps: f32,
+        preload_bytes: u64,
+    ) -> String {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return "proxy adoption discarded: renderer is not ready".to_owned();
+        };
+        let Some(layer) = self
+            .layers
+            .iter_mut()
+            .find(|layer| layer.stable_layer_id() == candidate.layer_id)
+        else {
+            return "proxy adoption discarded: the layer is gone".to_owned();
+        };
+        if layer.source_resource_epoch() != candidate.source_resource_epoch {
+            return "proxy adoption discarded: the layer's source changed while preparing"
+                .to_owned();
+        }
+        if !layer.is_video() || layer.proxy_backing().is_some() {
+            return "proxy adoption discarded: the layer no longer qualifies".to_owned();
+        }
+        if layer.content_identity_for_proxy().as_ref() != Some(identity) {
+            return "proxy adoption discarded: the layer's identity changed while preparing"
+                .to_owned();
+        }
+        let activation = match layers::LayerSourceActivation::stage(
+            &renderer.device,
+            &renderer.queue,
+            artifact_path.to_string_lossy().into_owned(),
+            Some(layer.source_reference_for_persistence().to_owned()),
+            layer.filename.clone(),
+            layers::LayerSource::Video(*decoder),
+            width,
+            height,
+            source_fps,
+            preload_bytes,
+            first_rgba,
+        ) {
+            Ok(activation) => activation,
+            Err(error) => {
+                return format!("proxy adoption failed at GPU staging: {error}");
+            }
+        };
+        let displaced = layer.commit_adopted_proxy(activation, key.to_hex());
+        drop(displaced);
+        let key_hex = key.to_hex();
+        format!("proxy adopted live ({}…)", &key_hex[..8.min(key_hex.len())])
     }
 
     /// Compose the operator-facing proxy line for one layer: an active
@@ -18352,6 +18536,9 @@ impl ApplicationHandler for App {
                                 if let Some(worker) = &self.proxy_encode_worker {
                                     worker.cancel_all();
                                 }
+                                if let Some(worker) = &self.proxy_adoption_worker {
+                                    worker.cancel_all();
+                                }
                                 event_loop.exit();
                             }
                             ControlFlow::TogglePause | ControlFlow::ToggleMediaFreeze => {
@@ -18375,6 +18562,9 @@ impl ApplicationHandler for App {
                     match flow {
                         ControlFlow::Quit => {
                             if let Some(worker) = &self.proxy_encode_worker {
+                                worker.cancel_all();
+                            }
+                            if let Some(worker) = &self.proxy_adoption_worker {
                                 worker.cancel_all();
                             }
                             event_loop.exit();
@@ -18412,6 +18602,7 @@ impl ApplicationHandler for App {
                     // this same browser batch then sees the transaction idle.
                     self.poll_live_capture();
                     self.drain_proxy_worker_events();
+                    self.drain_proxy_adoption_events();
 
                     // Process actions from web UI
                     let mut pending_actions: VecDeque<_> = self
