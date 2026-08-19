@@ -1843,7 +1843,11 @@ mislead browser tests.
   requires Linux, macOS, and Windows CI success for the exact published
   commit SHA; an older green run is not transferable evidence, and CI
   installs `stable` fresh — verify the local toolchain matches it before
-  claiming a gate.
+  claiming a gate. Verify CI with `python scripts/check-ci-status.py <sha>`:
+  a SHA can carry multiple check suites (push and PR runs), so counting
+  success conclusions across the flat check-runs list can declare green
+  while one suite's job is mid-failure — the script answers per suite, per
+  named job.
 - Physical-GPU proofs are opt-in and therefore separate from ordinary CI.
   StageMap uses the five `renderer::stage_map::tests::physical_gpu_` fixtures.
   M6 precision uses
