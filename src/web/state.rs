@@ -2102,6 +2102,12 @@ pub struct TemporalSnapshot {
     #[serde(default)]
     pub slit_angle: f32,
     pub slit_axis: f32,
+    /// Additive B12 time-displace map token; absent means the exact `ramp`.
+    #[serde(default = "default_time_displace_map")]
+    pub slit_map: String,
+    /// Additive B12 interpolation toggle; absent means the banded floor law.
+    #[serde(default)]
+    pub slit_interp: bool,
     #[serde(default)]
     pub key_mode: u32,
     #[serde(default = "default_temporal_key_threshold")]
@@ -2374,6 +2380,10 @@ fn default_temporal_key_threshold() -> f32 {
     0.1
 }
 
+fn default_time_displace_map() -> String {
+    "ramp".into()
+}
+
 fn default_temporal_key_softness() -> f32 {
     0.03
 }
@@ -2391,6 +2401,8 @@ impl Default for TemporalSnapshot {
             slitscan: 0.0,
             slit_angle: 0.0,
             slit_axis: 0.0,
+            slit_map: default_time_displace_map(),
+            slit_interp: false,
             key_mode: 0,
             key_threshold: default_temporal_key_threshold(),
             key_softness: default_temporal_key_softness(),
@@ -2479,6 +2491,7 @@ impl TemporalSnapshot {
     pub fn from_params(p: &crate::effects::params::TemporalParams) -> Self {
         use crate::effects::params::{
             CollisionScoreTrigger, RefreshGardenGate, TemporalInterpolation, TemporalTopology,
+            TimeDisplaceMap,
         };
         use crate::temporal::{
             CollisionScoreLoopDriver, RefreshGardenMatteRoute, RefreshGardenMotionRoute,
@@ -2496,6 +2509,13 @@ impl TemporalSnapshot {
         let interpolation = match p.originals.loom.interpolation {
             TemporalInterpolation::Floor => "floor",
             TemporalInterpolation::Linear => "linear",
+        };
+        let slit_map = match p.slit_map {
+            TimeDisplaceMap::Ramp => "ramp",
+            TimeDisplaceMap::Brightness => "brightness",
+            TimeDisplaceMap::Radial => "radial",
+            TimeDisplaceMap::TbcRamp => "tbc_ramp",
+            TimeDisplaceMap::Sweep => "sweep",
         };
         let gate = match p.originals.garden.gate {
             RefreshGardenGate::TemporalDelta => "temporal_delta",
@@ -2575,6 +2595,8 @@ impl TemporalSnapshot {
             slitscan: p.slitscan,
             slit_angle: p.slit_angle,
             slit_axis: p.slit_axis,
+            slit_map: slit_map.into(),
+            slit_interp: p.slit_interp,
             key_mode: p.key_mode.round().clamp(0.0, 4.0) as u32,
             key_threshold: p.key_threshold,
             key_softness: p.key_softness,

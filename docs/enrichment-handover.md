@@ -18,29 +18,17 @@ second full-frame history ring.
 
 | Tranche | State | Where |
 |---|---|---|
-| B2 — synthetic + shaped motion fields | **Complete** | PR #30 (merged), PR #31; `docs/evidence/b2-procedural-motion-fields-note.md` |
-| B3 — the feedback rig | **Complete** | PR #32; `docs/evidence/b3-feedback-rig-note.md` |
+| B2 — synthetic + shaped motion fields | **Complete** | PR #30 (merged), PR #31 (merged); `docs/evidence/b2-procedural-motion-fields-note.md` |
+| B3 — the feedback rig | **Complete** | PR #32 (merged); `docs/evidence/b3-feedback-rig-note.md` |
+| B12 — time-displace maps | **Complete** | `docs/evidence/b12-time-displace-note.md`; CLAUDE.md "B12 time-displace maps" |
 | B14 — failure switches | **Partially landed early** | `servo_defeated` shipped inside B3; the remaining piece is `sync_latched` on the tape/NTSC-adjacent shear model |
-| B12, B13, B1, B4, B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
+| B13, B1, B4, B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
 its evidence note. Read those before extending either subsystem.
 
 ## Next up
-
-**B12 — time-displace maps** (seat: `temporal.rs` + `temporal_originals.wgsl`).
-The 24-deep clean ring already pays for the memory; slit-scan spends it on one
-map (an angled ramp). The tranche makes the map the instrument: a closed
-`TimeDisplaceMap` enum — `Ramp` (the existing angle path, default, exact),
-`Brightness` (bright things lag dark ones), `Radial` (time pushed out from the
-centre), `TbcRamp` (per-line failure ramp), `Sweep` — plus a `time_interp`
-toggle whose *off* state gives visible time-quantized bands. Depth keeps
-clamping against the valid-history counter exactly as History Key does. Ring
-depth stays 24. Ledger: zero new surfaces, at most one extra history load per
-pixel. Proof: analytic map fixtures, the unwritten-history guard, a labeled
-export case. Note: `temporal.wgsl`/`temporal_originals.wgsl` edits re-pin the
-frozen SHA and re-measure the M6 receipt — see "Receipts" below.
 
 **B13 — the small-effects tranche** (seat: `effects/params.rs` +
 `effects.wgsl`, layer and master scope, every default = byte-exact off):

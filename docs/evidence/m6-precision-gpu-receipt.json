@@ -1,6 +1,6 @@
 {
   "schema": "collide-o-scope-m6-gpu-precision-receipt/2",
-  "measured_at": "2026-08-19T16:06:29.031915-04:00",
+  "measured_at": "2026-08-19T18:10:26.022636-04:00",
   "command": "cargo test --locked gpu_precision_receipt_measures_real_still_and_temporal_workloads -- --ignored --nocapture",
   "host": {
     "os": "windows",
@@ -13,7 +13,7 @@
   "source_identity": {
     "crate_version": "0.1.0",
     "shader_bundle_sha256": "d3db27d4078d7c27e7820170347abedf2de5e10772a74c692ec7e08cb2a4b9ec",
-    "cargo_lock_and_m6_sources_sha256": "aafeb174a59555683097807ef5f52382aa5416d8a983d46dfd60cfeccc0bf1d1",
+    "cargo_lock_and_m6_sources_sha256": "afe95e80019e1b7226353e4143c16bd52b8775947a899d5e33a049320b8af9ad",
     "manifest_scope": "length-prefixed Cargo.toml, Cargo.lock, production Rust encode/resource/uniform paths, receipt helpers, and every measured WGSL source"
   },
   "adapter": {
@@ -69,8 +69,8 @@
       "reference_gradient_events": 260,
       "retained_gradient_events": 260
     },
-    "compat8_fixture_wall_ns_per_frame": 482950,
-    "advanced_fixture_wall_ns_per_frame": 256150
+    "compat8_fixture_wall_ns_per_frame": 484450,
+    "advanced_fixture_wall_ns_per_frame": 346400
   },
   "temporal": {
     "frames": 12,
@@ -115,8 +115,8 @@
       "reference_gradient_events": 311,
       "retained_gradient_events": 311
     },
-    "compat8_fixture_wall_ns_per_frame": 2600916,
-    "advanced_fixture_wall_ns_per_frame": 23330691
+    "compat8_fixture_wall_ns_per_frame": 2618825,
+    "advanced_fixture_wall_ns_per_frame": 23142641
   },
   "timing_scope": "fixture-local wall time with a per-frame GPU wait; Compat8 writes its final target in the core pass while Advanced includes its required encode_present pass; smoke evidence only, not a renderer-throughput comparison",
   "acceptance_gates": [

@@ -1243,6 +1243,91 @@ mod temporal_state_tests {
 
     #[test]
     #[ignore = "requires a GPU adapter"]
+    fn gpu_time_displace_keeps_the_ramp_floor_path_exact_and_every_map_reaches_the_pixels() {
+        use crate::effects::params::TimeDisplaceMap;
+
+        let fixture = TemporalOriginalsGpuFixture::new(13, 9);
+        let current = [7, 19, 41, 255];
+        // Loom shares the frame at 0.3 so the originals shader is selected on
+        // the pre-B12 build too and the slit output survives the loom mix.
+        let params_for = |map, interp| TemporalParams {
+            slitscan: 0.8,
+            slit_map: map,
+            slit_interp: interp,
+            originals: TemporalOriginalsParams {
+                loom: TemporalLoomParams {
+                    amount: 0.3,
+                    ..TemporalLoomParams::default()
+                },
+                ..TemporalOriginalsParams::default()
+            },
+            ..TemporalParams::default()
+        };
+
+        // Pixel exactness of the rewritten slit block: this golden was
+        // measured on the pre-B12 build (533b434) with the identical
+        // loom + slitscan params, where the block was the inline legacy
+        // expression. Ramp with the floor law must reproduce it byte for
+        // byte through the new `history_age_sample` routing.
+        let ramp = pixel_hash(&fixture.render(
+            &params_for(TimeDisplaceMap::Ramp, false),
+            &mut full_temporal_history_state(),
+            current,
+        ));
+        assert_eq!(
+            ramp, "3abc4fef404f4d37128df8bc53460c423b7c50413a0f7b667655c847c48c59a3",
+            "Ramp/floor must be pixel-exact with the pre-B12 slit block"
+        );
+
+        // Every non-default map is deterministic and demonstrably reaches
+        // the pixels: each hash differs from Ramp's and from every other's.
+        let mut seen = vec![ramp];
+        for map in [
+            TimeDisplaceMap::Brightness,
+            TimeDisplaceMap::Radial,
+            TimeDisplaceMap::TbcRamp,
+            TimeDisplaceMap::Sweep,
+        ] {
+            let hash = pixel_hash(&fixture.render(
+                &params_for(map, false),
+                &mut full_temporal_history_state(),
+                current,
+            ));
+            let again = pixel_hash(&fixture.render(
+                &params_for(map, false),
+                &mut full_temporal_history_state(),
+                current,
+            ));
+            assert_eq!(hash, again, "{map:?} must render deterministically");
+            assert!(!seen.contains(&hash), "{map:?} must change the pixels");
+            seen.push(hash);
+        }
+        let interpolated = pixel_hash(&fixture.render(
+            &params_for(TimeDisplaceMap::Ramp, true),
+            &mut full_temporal_history_state(),
+            current,
+        ));
+        assert!(
+            !seen.contains(&interpolated),
+            "the interpolation toggle must change the banded pixels"
+        );
+
+        // The unwritten-history guard on the GPU: a fresh ring under a
+        // non-default map with interpolation must pass the current image
+        // through untouched rather than sample unwritten layers.
+        let startup = fixture.render(
+            &params_for(TimeDisplaceMap::Brightness, true),
+            &mut TemporalState::default(),
+            current,
+        );
+        assert!(
+            startup.chunks_exact(4).all(|pixel| pixel == current),
+            "unwritten ring layers must be unreachable at startup"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
     fn gpu_refresh_garden_gates_recurrence_max_hold_freeze_blackout_reset_and_rate_goldens() {
         let fixture = TemporalOriginalsGpuFixture::new(13, 9);
         let prime = [15, 25, 35, 255];

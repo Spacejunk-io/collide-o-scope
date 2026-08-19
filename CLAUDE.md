@@ -772,6 +772,60 @@ the shared plan; `render_feedback_rig_pipeline` is the labeled export case —
 it renders an `_unrigged` twin (decoded frames must differ) and a repeat
 (decoded frames must match), so reach and determinism are both measured.
 
+### B12 time-displace maps
+
+Slit-scan's map is the instrument. `TimeDisplaceMap` on `TemporalParams` is a
+closed vocabulary with permanent codes 0–4 — `Ramp` (the exact existing angle
+path, default), `Brightness` (the current sample's alpha-covered Rec.709 luma:
+bright things lag dark ones), `Radial` (aspect-correct distance from centre,
+reach 1.6), `TbcRamp` (a sawtooth over each 8-scanline group,
+`fract(uv.y · height / 8)` — per-line by design, so different output heights
+legitimately band differently), and `Sweep` (a wrapped horizontal ramp
+travelling one full crossing per 600 reference ticks — 20 s at 30 Hz, fixed
+law, phase from the same accumulated `total_reference_ticks` the rig's noise
+epoch uses, so Freeze holds it and export replays it structurally).
+`slit_interp: bool` selects linear interpolation between the two adjacent ring
+layers; off is the exact banded floor law. The vocabulary is derived from
+BENDR (MIT, © 2026 Steve Blythe); every law is a rewrite. The CPU reference is
+`temporal::time_displace_coord` plus `time_displace_sweep_phase`, followed by
+the shader expression for expression.
+
+**Identity is the frozen legacy shader.** `TemporalParams::time_displace_active`
+(slit-scan on ∧ (non-Ramp map ∨ interp)) joins `originals.is_zero()` in the
+plan's `originals_shader_active` predicate, so a non-default B12 state runs in
+`temporal_originals.wgsl` — the same seam Loom/Atlas/Garden use — and
+`temporal.wgsl` was not edited: its pinned SHA did not move and the authored
+default keeps executing the frozen legacy shader byte for byte. Within the
+originals shader, Ramp+floor routes through `history_age_sample` with layer
+arithmetic identical to the removed inline read, so an already-active Loom
+patch with default slit state is also pixel-exact. The Advanced host's
+pre-Garden originals predicate answers to the slit lanes only while slit-scan
+is active, mirroring the plan predicate.
+
+**Ledger: zero new surfaces, zero new uniform bytes, ≤ 1 extra history load
+per pixel.** The map code and interp flag ride the two reserved
+`loom_geometry` lanes; the sweep phase rides a reserved `atlas_values` lane
+and is populated only when Sweep is authored, so a default patch's uniform
+bytes never vary with the tick counter. Depth clamps against the
+valid-history counter exactly as History Key does — both slit blocks read
+history only through the age helpers whose age 0 is the virtual current
+image. Ring depth stays 24.
+
+**Closure.** Patch: `slit_map`/`slit_interp` on `TemporalConfig`,
+skip-serialized at default so pre-B12 patches keep their bytes and canonical
+hashes; an unknown map token is a deserialization rejection. Wire: both fields
+ride the ordinary coalescible `set_temporal` (`slit_map` as the closed token
+vocabulary `ramp | brightness | radial | tbc_ramp | sweep`, `slit_interp` as a
+boolean), validated in both validators plus the applier. Snapshot: additive
+`slit_map`/`slit_interp` fields defaulting to the exact prior path. Panel: a
+select and a toggle beside the slit controls. Both fields are discrete laws:
+Morph recalls an endpoint at the midpoint, no modulatable address exists, and
+Dice/the generator continue not to touch legacy temporal. Export rides the
+shared plan; `render_time_displace_pipeline` is the labeled export case — it
+renders a `_ramp` twin (decoded frames must differ) and a repeat (decoded
+frames must match), so reach and the sweep clock's determinism are both
+measured.
+
 ## Effects and compositing
 
 - One combined uniform-driven effect shader avoids pipeline switches.
@@ -2380,6 +2434,24 @@ mislead browser tests.
   `temporal.wgsl` SHA and M6 shader-bundle digest are deliberate B3
   re-measurements. `render_feedback_rig_pipeline` is the labeled export case
   with its `_unrigged` difference and `_repeat` determinism assertions.
+- Time-displace tests must cover the closed map codes 0–4 with `Ramp` the
+  default, the analytic per-map fixtures (Ramp equal to the legacy dot law,
+  Brightness as clamped covered-luma passthrough, aspect-correct Radial with
+  its 1.6 reach and corner clamp, TbcRamp's 8-scanline sawtooth constant in
+  x, Sweep's wrap and phase travel) with hostile inputs staying inside the
+  unit coordinate, the deterministic 600-tick sweep phase, the
+  unwritten-history depth-clamp sweep over every validity count for both the
+  floor and interpolated laws, the plan fixture proving the originals shader
+  is selected only off the exact Ramp/floor path with the reserved-lane
+  assignments (and the sweep lane zero for every other map at nonzero
+  ticks), the patch round trip with absent-section byte identity and unknown
+  tokens rejected, Morph endpoint recall at the midpoint, the wire vocabulary
+  in both validators, and the shader-contract counts (legacy-prefix inline
+  samples at 11, the interpolation toggle and valid-history clamp present in
+  both variants). `temporal.wgsl` is deliberately untouched — its pinned SHA
+  is a B12 non-measurement — and `render_time_displace_pipeline` is the
+  labeled export case with its `_ramp` difference and `_repeat` determinism
+  assertions.
 - Preview transform-gizmo tests must cover the pane/output/local round trip at
   multiple aspect ratios and DPI scales including a non-square output, an
   active crop, a nonzero shear and a letterboxed pane; the forward map agreeing

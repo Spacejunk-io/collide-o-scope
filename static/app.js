@@ -2257,6 +2257,8 @@ function syncTemporal(t) {
     fb_servo_defeated: rig.servo_defeated,
     slitscan: t.slitscan,
     slit_angle: t.slit_angle,
+    slit_map: t.slit_map,
+    slit_interp: t.slit_interp,
     key_mode: t.key_mode,
     key_threshold: t.key_threshold,
     key_softness: t.key_softness,

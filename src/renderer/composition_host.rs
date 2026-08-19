@@ -1977,8 +1977,15 @@ impl CompositionHost {
 
             let mut pre_garden_originals = plan.originals_uniforms;
             pre_garden_originals.garden_values[0] = 0.0;
+            // Loom, Atlas, and an authored B12 time-displace map/interp all
+            // need the originals shader ahead of the routed Garden pass; the
+            // slit lanes only matter while slit-scan is active, mirroring the
+            // plan's own activity predicate.
             let pre_garden_originals_active = pre_garden_originals.loom_values[0] > 0.0
-                || pre_garden_originals.atlas_values[0] > 0.0;
+                || pre_garden_originals.atlas_values[0] > 0.0
+                || (plan.uniforms.slitscan > 0.001
+                    && (pre_garden_originals.loom_geometry[2] != 0.0
+                        || pre_garden_originals.loom_geometry[3] != 0.0));
             if pre_garden_originals_active {
                 queue.write_buffer(
                     &self.temporal_originals_uniform_buffer,
