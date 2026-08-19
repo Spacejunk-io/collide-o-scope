@@ -11707,6 +11707,7 @@ impl App {
                 | WebAction::SetStageHealthHud { .. }
                 | WebAction::SetStageTestCard { .. }
                 | WebAction::SetOutputIdentification { .. }
+                | WebAction::RequestLayerProxy { .. }
                 | WebAction::RescanLibrary
                 | WebAction::QuickSavePatch
                 | WebAction::StartExport { .. }
@@ -15789,6 +15790,9 @@ impl App {
             WebAction::SetStageHealthHud { enabled } => {
                 self.stage_tools.set_health_hud(enabled);
             }
+            WebAction::RequestLayerProxy { layer_id } => {
+                self.request_layer_proxy_from_browser(&layer_id);
+            }
             WebAction::SetStageTestCard {
                 mode,
                 output_endpoint_id,
@@ -16421,6 +16425,27 @@ impl App {
             log::info!("proxy encode request ignored: no layer is selected");
             return;
         };
+        self.request_proxy_for_layer(index);
+    }
+
+    /// The browser twin of the Y key. The stable ID is authoritative with no
+    /// positional fallback; a vanished ID is a safe no-op, exactly as the
+    /// transform actions treat post-deletion edits. Everything past ID
+    /// resolution is the identical shared ladder, so the browser cannot
+    /// bypass a refusal the native key enforces.
+    fn request_layer_proxy_from_browser(&mut self, layer_id: &str) {
+        let Some(index) = self.resolve_stable_layer_id(layer_id) else {
+            log::info!("proxy encode request ignored: layer {layer_id} is not present");
+            return;
+        };
+        self.request_proxy_for_layer(index);
+    }
+
+    /// The one refusal ladder behind both the native Y key and the browser
+    /// action. Every refusal lands in the layer's session note (HUD status
+    /// line and snapshot `proxy_note`); nothing here blocks the render
+    /// thread.
+    fn request_proxy_for_layer(&mut self, index: usize) {
         let Some(layer) = self.layers.get(index) else {
             return;
         };
@@ -17326,6 +17351,15 @@ impl App {
                         } else {
                             "Live Spout input renders as deterministic black offline".to_string()
                         },
+                        proxy_backing_prefix: layer
+                            .proxy_backing()
+                            .map(|backing| backing[..8.min(backing.len())].to_string())
+                            .unwrap_or_default(),
+                        proxy_note: self
+                            .proxy_feedback
+                            .get(&Self::proxy_feedback_key_for_layer(layer))
+                            .cloned()
+                            .unwrap_or_default(),
                         performance,
                     }
                 })

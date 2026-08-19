@@ -3781,6 +3781,10 @@ function createLayerCard(layer, index) {
     </div>
     <div class="layer-progress"><div class="layer-progress-fill" style="width:${(layer.progress * 100).toFixed(1)}%"></div></div>
     <div class="layer-source-status" role="status" aria-live="polite"></div>
+    <div class="layer-proxy-row">
+      <button class="layer-proxy-btn" type="button" title="Encode a proxy for this clip's verified content identity; completion hot-adopts it live" aria-label="Encode proxy for layer ${index + 1}">Encode proxy</button>
+      <span class="layer-proxy-status" role="status" aria-live="polite"></span>
+    </div>
     <div class="layer-body">
       <div class="param-row" data-layer="${index}" data-param="opacity">
         <label>Opacity</label>
@@ -3892,6 +3896,15 @@ function createLayerCard(layer, index) {
     e.stopPropagation();
     const current = currentLayerContext(card, layer, index);
     sendAction({ action: 'set_layer_paused', ...layerSelector(current.layer, current.index), paused: !current.layer.paused });
+  });
+
+  // Proxy request — the browser twin of the native Y key. The stable ID is
+  // mandatory and authoritative: the engine owns every refusal, and this
+  // action deliberately has no positional fallback.
+  card.querySelector('.layer-proxy-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    const id = currentStableLayerId(card, layer, index);
+    if (id) sendAction({ action: 'request_layer_proxy', layer_id: id });
   });
 
   // Pointer-owned reorder works for mouse, pen, and touch. The list stays
@@ -4089,6 +4102,27 @@ function updateLayerCard(card, layer, index) {
     } else {
       sourceStatus.textContent = `waiting for ${layer.source_name || 'sender'} \u00b7 offline export: black`;
       sourceStatus.className = 'layer-source-status';
+    }
+  }
+
+  const proxyRow = card.querySelector('.layer-proxy-row');
+  if (proxyRow) {
+    const proxyBtn = proxyRow.querySelector('.layer-proxy-btn');
+    const proxyStatus = proxyRow.querySelector('.layer-proxy-status');
+    const isVideo = layer.source_kind === 'video';
+    const backed = String(layer.proxy_backing_prefix || '');
+    // Only decoded video can be proxied; the engine's ladder still owns the
+    // finer refusals (verified identity, busy worker, unavailable cache).
+    proxyRow.hidden = !isVideo;
+    if (proxyBtn) {
+      proxyBtn.disabled = !isVideo || !!backed;
+      proxyBtn.setAttribute('aria-label', `Encode proxy for layer ${index + 1}`);
+    }
+    if (proxyStatus) {
+      proxyStatus.textContent = backed
+        ? `proxy active (${backed}…)`
+        : String(layer.proxy_note || '');
+      proxyStatus.className = `layer-proxy-status${backed ? ' active' : ''}`;
     }
   }
 
