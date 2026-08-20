@@ -37,8 +37,10 @@ src/
 ├── temporal.rs          Loom/Atlas/Garden/Score state, feedback rig, events, resets, commit/discard
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
+├── scan_processor.rs    B1 Scan Processor law: authored params, beam CPU reference, vertex budget
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
+├── renderer/scan_processor.rs dedicated instanced-ribbon executor and shared accumulator
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
@@ -78,6 +80,7 @@ src/
     ├── effects.wgsl     LegacyExact and Advanced layer/master effects
     ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
     ├── study_interpreter.wgsl fixed Study interpreter over a bounded instruction buffer
+    ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
@@ -1786,6 +1789,114 @@ status region. Export resolves the same digests from the patch's own
 `studies` section through `ExportCreativeGraph`; there is no export-only
 Study path, and `render_study_field_pipeline` is the labeled export case.
 
+### The B1 Scan Processor
+
+`ScanProcessor` is a Rutt/Etra-style drawn raster and the tree's **first
+non-fullscreen-triangle pass**: one instanced triangle-strip ribbon per
+scanline, no vertex buffers — position from `vertex_index`/`instance_index`
+(the fullscreen-triangle tradition, extended), the carrier fetched in the
+**vertex stage** through the explicit-load premultiplied bilinear,
+sampler-free like every dedicated pass. Ribbons accumulate additively into a
+shared transient `Rgba16Float` accumulator cleared to alpha one
+(contributions carry alpha zero, so coverage cannot stack past unity where
+lines bunch), and a fullscreen resolve applies the engine-wide node wet/blend
+law through the one canonical `blend.wgsl` kernel. What the mechanism buys is
+line *density*: bright caustic ridges where scanlines bunch and dark gaps
+where they splay, which no fragment-shader displacement can produce, because
+a fragment shader has no notion of line density. `NodeKindTag::ScanProcessor`
+holds append-only signature code 14 and `occupies_dedicated_pass = true`
+(the Symmetry/Study lift, for a stronger reason: no ordinary segment could
+ever encode geometry).
+
+**The algorithm, kept whole.** The beam law is derived from BENDR (MIT,
+© 2026 Steve Blythe); the `beam_position` composition order and the
+beam-energy law are transcribed faithfully with attribution, and
+`scan_processor.rs` is the independent CPU reference the WGSL follows
+expression for expression (the `gesture.rs` tradition: no wgpu, clock,
+filesystem, or UI dependency). Composition order: sweep/field reversal
+(applied to the *read*, so reversing mirrors the picture, never the raster),
+S-curve, skew, deflection oscillator, raster collapse, luminance into
+vertical deflection about the 0.35 luma pivot, then tilt/perspective as a
+photographed 2D deflection — never a scene. The oscillator locked
+(`osc_lock = 1`) quantizes to a whole multiple of the field rate and stands
+still; detuned it crawls, and the crawl is the instrument's gesture. The
+central-difference tangent gives the ribbon normal and the beam speed at
+once, and `gain = clamp(2 / speed, 0.05, 8)` mixed by `velocity_mix` is the
+beam-energy law — a slower beam deposits more energy per unit length, and
+that one term is the difference between this and a displacement map. Luma is
+alpha-covered Rec.709 in linear light (the house rewrite of BENDR's 601
+gamma-space luma), so hostile RGB behind zero coverage steers and draws
+nothing by arithmetic. A degenerate tangent takes the vertical normal rather
+than dividing by zero — the one transcription deviation, and it is the house
+non-finite law, changing no finite path.
+
+**Authored state.** Nineteen params, prefixed `scan_*` on the wire.
+Fifteen continuous and modulatable: `amount`, `ribbon_width`,
+`velocity_mix`, `tilt_x`, `tilt_y`, `perspective`, `s_curve`, `skew`,
+`collapse`, `osc_amount`, `osc_freq`, `osc_lock`, `lissajous`, `mono`,
+`hue`. Two plan-time geometry integers with no modulatable address —
+`lines` (16–1,080, default 320) and `samples_per_line` (64–512, default
+256), the Residual block-grid law, because they size the instanced draw and
+the vertex ledger. Two discrete laws: `reverse_h`, `reverse_v`. Non-finite
+input takes the neutral default, never a clamped extreme.
+
+**The wake law.** `is_exact_bypass()` is true when no *deflection* is
+authored: amount, collapse, oscillator amount, S-curve, skew, both tilts all
+zero and both reversals off. Dressing controls (ribbon width, velocity mix,
+perspective, oscillator frequency/lock, Lissajous, mono, hue) shape a raster
+that exists only once a deflection is authored — perspective without a
+depth term is arithmetic identity — so they do not wake the node. BENDR's
+own stage gate is the precedent; ours widens it to include skew and the
+tilts, which genuinely author deflection alone. A default node is an exact
+bypass: the executor encodes nothing and the carrier passes through
+untouched, byte-identical to no node at all.
+
+**Ledger.** Charged through the node descriptor plus the dedicated
+`ScanProcessorResourcePlan` re-derived from emitted steps:
+
+| Item | Exact charge |
+|---|---:|
+| Render passes | 2 (instanced geometry + fullscreen resolve) |
+| Vertices | `lines × samples × 2`, the tree's one named vertex budget, cap `MAX_SCAN_PROCESSOR_VERTICES` = 1,105,920 |
+| Vertex-stage carrier fetches | 3 covered bilinears per vertex (here/ahead/back), 12 loads |
+| Resolve lookups/pixel | 2 (dry carrier + accumulator, one `textureLoad` each) |
+| Simultaneously sampled textures | 2 (geometry binds 1; resolve binds 2) |
+| Samplers | 0 |
+| Uniform bytes | 128 (compile-time asserted) |
+| Shared transient accumulator | 1 full-frame `Rgba16Float`, 8 B/px, charged once while any step exists |
+| Cross-scope image taps | 0 |
+| New full-frame persistent surfaces | 0 |
+
+The vertex cap is structural (the authored maxima admit exactly it) and the
+lift still refuses one vertex over with the typed
+`ScanProcessorVertexBudget` — the Residual grid-edge law, defense in depth,
+never a silent clamp. The topology signature hashes pass count and layout
+only, deliberately never the vertex total: lines/samples are draw-call
+arguments, so a geometry edit re-encodes the next frame without re-preparing
+pipelines, arenas, or the accumulator.
+
+**Closure.** Patch: the params ride the node's ordinary serde
+(`kind: scan_processor`), absent from every pre-B1 patch so old bytes and
+canonical hashes keep; unknown fields are rejected and hostile scalars
+sanitize to neutral. Wire: all nineteen params ride the ordinary coalescible
+`set_visual_node_param` — no routes exist, so the node has no topology
+action at all. Snapshot: the nineteen values plus derived read-only
+`scan_exact_bypass` and `scan_vertex_count`. Panel: a generated node card
+with fifteen sliders, two number inputs, and two toggles. Modulation:
+fifteen `scan_*` stable addresses (none angular — the tilts are authored in
+signed radian units, not degrees); geometry and reversals have no address.
+Morph: the fifteen values blend, and lines/samples/reversals recall an
+endpoint at the midpoint; no route gate, so any scan pair interpolates.
+Look/preset: the whole params bundle transfers as values (no route to
+preserve). Dice and generator v9 mutate the fifteen continuous values in
+each node's own stable domain and never touch geometry or reversals; no
+`GENERATOR_VERSION` bump, because no pre-existing anchor contains a scan
+node and no existing seed's output changes. Export consumes the same
+evaluated plan and the same `scan_processor.wgsl`, with time from the shared
+frame-plan context only — Pause holds the detuned oscillator still and
+export replays it structurally; `render_scan_processor_pipeline` is the
+labeled export case.
+
 ## Gesture-field etching
 
 A gesture is an ordered stream of quantized events addressed on the 30 Hz
@@ -2563,6 +2674,31 @@ mislead browser tests.
   identical while both differ from the third. The gizmo introduces no export
   path, so the six pre-existing labeled cases must additionally be proven
   `framemd5`-identical across the tranche by a same-branch A/B.
+- Scan Processor tests must cover the append-only kind code 14 with the
+  dedicated list `[Symmetry, Study, ScanProcessor]`, the 19-row descriptor
+  contract (modulatable ⇔ Float ⇔ Dice-eligible; geometry Unsigned;
+  reversals Bool), the analytic beam-law fixtures (flat-raster identity,
+  luma pivot/span, read-side reversal, collapse, locked-oscillator standing
+  pattern and whole-multiple quantization, detuned crawl, the `2/speed`
+  clamp with its mix, central-difference speed with its floor, fail-safe
+  ribbon normal, pixel width law, colorize with black-stays-black,
+  tilt-authors-while-perspective-alone-does-not), hostile neutral sanitize,
+  node serde with unknown-field rejection, the default-bypass wake law, the
+  planner lift at the authored position with segmentation resuming behind
+  it, the derived dedicated ledger (2 passes / 2 textures / 128 uniform
+  bytes / summed vertices / 8 B-px transient) with the structural vertex
+  cap, a topology signature that discriminates presence but is invariant to
+  geometry edits, the fifteen stable modulation addresses with
+  geometry/reversals unreachable, the Morph blend with midpoint recall of
+  the discrete class, Dice value-only mutation with neighbour invariance,
+  and the snapshot's derived wake law. The production GPU fixture
+  `production_scan_processor_density_exceeds_any_displacement_and_default_is_bypass`
+  carries the physical-GPU claim — with the beam-energy law disengaged, a
+  collapsed raster's additive line density exceeds twice the flat source's
+  maximum (impossible for any single-sample displacement), the authored
+  default is byte-identical to no node, warm frames allocate nothing —
+  and `render_scan_processor_pipeline` is the labeled export case with its
+  `_bypass` difference and `_repeat` determinism assertions.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

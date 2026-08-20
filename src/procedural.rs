@@ -1787,6 +1787,127 @@ fn mutate_saved_rack_values(
             }
             (VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal, _)
             | (_, VisualNodeKind::LegacyCanonical | VisualNodeKind::LegacyTemporal) => {}
+            (VisualNodeKind::ScanProcessor(anchor), VisualNodeKind::ScanProcessor(value)) => {
+                // The two geometry counts and the two reversals are stable
+                // authored topology for generation's purposes and are
+                // preserved exactly. The fifteen continuous controls mutate
+                // anchor-relatively, and each node draws from its own domain,
+                // so this arm cannot perturb any older generated stream.
+                value.amount = mutate_linear(
+                    anchor.amount,
+                    value.amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.ribbon_width = mutate_linear(
+                    anchor.ribbon_width,
+                    value.ribbon_width,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.velocity_mix = mutate_linear(
+                    anchor.velocity_mix,
+                    value.velocity_mix,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.tilt_x = mutate_linear(
+                    anchor.tilt_x,
+                    value.tilt_x,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.tilt_y = mutate_linear(
+                    anchor.tilt_y,
+                    value.tilt_y,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.perspective = mutate_linear(
+                    anchor.perspective,
+                    value.perspective,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.s_curve = mutate_linear(
+                    anchor.s_curve,
+                    value.s_curve,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.skew = mutate_linear(
+                    anchor.skew,
+                    value.skew,
+                    -1.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.collapse = mutate_linear(
+                    anchor.collapse,
+                    value.collapse,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.osc_amount = mutate_linear(
+                    anchor.osc_amount,
+                    value.osc_amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.osc_freq = mutate_linear(
+                    anchor.osc_freq,
+                    value.osc_freq,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.osc_lock = mutate_linear(
+                    anchor.osc_lock,
+                    value.osc_lock,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.lissajous = mutate_linear(
+                    anchor.lissajous,
+                    value.lissajous,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.mono = mutate_linear(
+                    anchor.mono,
+                    value.mono,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.hue =
+                    mutate_linear(anchor.hue, value.hue, 0.0, 1.0, temperature * 0.2, &mut rng);
+            }
             // A generated patch never changes rack topology. Be defensive if
             // a future schema-normalization step supplies unlike kinds.
             _ => {}

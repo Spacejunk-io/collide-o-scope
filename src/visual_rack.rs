@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::performance::SavedLayerPosition;
+use crate::scan_processor::ScanProcessorParams;
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{RuntimeSymmetryParams, SymmetryParams};
 
@@ -1656,6 +1657,12 @@ pub enum VisualNodeKind {
     /// Field: the fixed rack layout cannot bind the clean-history array, so
     /// the planner lifts it into its own step.
     Study(StudyRackParams),
+    /// The B1 Scan Processor, a dedicated pass for a different reason than
+    /// the two above: it is the tree's first non-fullscreen-triangle pass —
+    /// an instanced ribbon per scanline accumulated additively into its own
+    /// transient — so it cannot ride the rack's fixed fullscreen layout at
+    /// all.
+    ScanProcessor(ScanProcessorParams),
 }
 
 impl VisualNodeKind {
@@ -1674,6 +1681,7 @@ impl VisualNodeKind {
             Self::Symmetry(_) => NodeKindTag::Symmetry,
             Self::Residual(_) => NodeKindTag::Residual,
             Self::Study(_) => NodeKindTag::Study,
+            Self::ScanProcessor(_) => NodeKindTag::ScanProcessor,
         }
     }
 
@@ -1689,6 +1697,7 @@ impl VisualNodeKind {
             Self::Displace(value) => Self::Displace(value.sanitized()),
             Self::Symmetry(value) => Self::Symmetry(value.sanitized()),
             Self::Residual(value) => Self::Residual(value.sanitized()),
+            Self::ScanProcessor(value) => Self::ScanProcessor(value.sanitized()),
             marker => marker,
         }
     }
@@ -1784,6 +1793,7 @@ pub enum NodeKindTag {
     Symmetry,
     Residual,
     Study,
+    ScanProcessor,
 }
 
 impl NodeKindTag {
@@ -1805,6 +1815,7 @@ impl NodeKindTag {
             Self::Residual => 11,
             Self::Symmetry => 12,
             Self::Study => 13,
+            Self::ScanProcessor => 14,
         }
     }
 
@@ -1817,8 +1828,11 @@ impl NodeKindTag {
         match self {
             // The Study interpreter binds the clean-history D2 array beside
             // its carrier and owns its own uniform layout, so like Symmetry
-            // it cannot ride an ordinary rack segment.
-            Self::Symmetry | Self::Study => true,
+            // it cannot ride an ordinary rack segment. The Scan Processor is
+            // dedicated for a stronger reason still: it is instanced ribbon
+            // geometry accumulating additively into its own transient, not a
+            // fullscreen triangle at all.
+            Self::Symmetry | Self::Study | Self::ScanProcessor => true,
             Self::LegacyCanonical
             | Self::LegacyTemporal
             | Self::Transform
@@ -1867,7 +1881,7 @@ pub struct NodeKindDescriptor {
     pub budget: NodeResourceBudget,
 }
 
-pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 13] = [
+pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 14] = [
     NodeKindDescriptor {
         tag: NodeKindTag::LegacyCanonical,
         key: "legacy_canonical",
@@ -2095,6 +2109,33 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 13] = [
             // A Study reads only its carrier and the master ring: no image
             // taps, no donors, no routes — the whole tombstone/route surface
             // is structurally absent in ABI 1.0.
+            cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::ScanProcessor,
+        key: "scan_processor",
+        title: "Scan Processor",
+        budget: NodeResourceBudget {
+            // The instanced geometry pass into the transient accumulator plus
+            // the fullscreen resolve that applies the node law. The geometry
+            // pass's per-vertex carrier fetches are charged in the dedicated
+            // `ScanProcessorResourcePlan` as the tree's one named vertex
+            // budget; the per-pixel fields here describe the resolve.
+            full_frame_passes: 2,
+            // Resolve: the dry carrier and the accumulated raster, one
+            // textureLoad each.
+            logical_texture_lookups_per_pixel: 2,
+            texture_samples_per_pixel: 2,
+            // Geometry binds one texture (the carrier, vertex stage); the
+            // resolve binds two (carrier plus accumulator). The frame's
+            // requirement is the widest single pass.
+            sampled_textures_in_pass: 2,
+            // The scan reads only its carrier: no image taps, no donors, no
+            // routes — the whole tombstone/route surface is structurally
+            // absent.
             cross_input_taps: 0,
             reduced_resolution_passes: 0,
             reduced_resolution_surfaces: 0,
@@ -2687,6 +2728,62 @@ pub const NODE_PARAM_DESCRIPTORS: &[NodeParamDescriptor] = &[
         dice_eligible: false,
         modulatable: false,
     },
+    // The Scan Processor's continuous set, prefixed like Symmetry's so no
+    // wire key can collide with another kind's. `scan_lines` and
+    // `scan_samples` are plan-time geometry (they size the instanced draw and
+    // the vertex ledger, the Residual block-grid law) and the two reversals
+    // are discrete laws; neither class is modulatable or Dice-eligible.
+    NodeParamDescriptor {
+        kind: NodeKindTag::ScanProcessor,
+        key: "scan_lines",
+        value_type: NodeParamType::Unsigned,
+        range: Some([16.0, 1_080.0]),
+        default: Some(320.0),
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::ScanProcessor,
+        key: "scan_samples",
+        value_type: NodeParamType::Unsigned,
+        range: Some([64.0, 512.0]),
+        default: Some(256.0),
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::ScanProcessor,
+        key: "scan_reverse_h",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    NodeParamDescriptor {
+        kind: NodeKindTag::ScanProcessor,
+        key: "scan_reverse_v",
+        value_type: NodeParamType::Bool,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
+    float_param!(ScanProcessor, "scan_amount", 0.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_ribbon_width", 0.0, 1.0, 0.12),
+    float_param!(ScanProcessor, "scan_velocity_mix", 0.0, 1.0, 0.8),
+    float_param!(ScanProcessor, "scan_tilt_x", -1.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_tilt_y", -1.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_perspective", 0.0, 1.0, 0.3),
+    float_param!(ScanProcessor, "scan_s_curve", -1.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_skew", -1.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_collapse", 0.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_osc_amount", 0.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_osc_freq", 0.0, 1.0, 0.25),
+    float_param!(ScanProcessor, "scan_osc_lock", 0.0, 1.0, 1.0),
+    float_param!(ScanProcessor, "scan_lissajous", 0.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_mono", 0.0, 1.0, 0.0),
+    float_param!(ScanProcessor, "scan_hue", 0.0, 1.0, 0.0),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3728,6 +3825,7 @@ pub enum RuntimeVisualNodeKind {
     Symmetry(RuntimeSymmetryParams),
     Residual(RuntimeResidualParams),
     Study(StudyRackParams),
+    ScanProcessor(ScanProcessorParams),
 }
 
 impl RuntimeVisualNodeKind {
@@ -3746,6 +3844,7 @@ impl RuntimeVisualNodeKind {
             Self::Symmetry(_) => NodeKindTag::Symmetry,
             Self::Residual(_) => NodeKindTag::Residual,
             Self::Study(_) => NodeKindTag::Study,
+            Self::ScanProcessor(_) => NodeKindTag::ScanProcessor,
         }
     }
 
@@ -3780,6 +3879,9 @@ impl RuntimeVisualNodeKind {
             // A Study owns no routes: the digest is opaque authored identity
             // and resolves against the host library at prepare, not here.
             VisualNodeKind::Study(value) => Self::Study(value.sanitized()),
+            // The Scan Processor owns no routes either: it reads only its
+            // carrier.
+            VisualNodeKind::ScanProcessor(value) => Self::ScanProcessor(value.sanitized()),
         }
     }
 
@@ -3807,6 +3909,7 @@ impl RuntimeVisualNodeKind {
                 VisualNodeKind::Residual(value.capture_routes(position_of_layer))
             }
             Self::Study(value) => VisualNodeKind::Study(value.sanitized()),
+            Self::ScanProcessor(value) => VisualNodeKind::ScanProcessor(value.sanitized()),
         }
     }
 
@@ -3822,6 +3925,7 @@ impl RuntimeVisualNodeKind {
             Self::Displace(value) => Self::Displace(value.sanitized()),
             Self::Symmetry(value) => Self::Symmetry(value.sanitized()),
             Self::Residual(value) => Self::Residual(value.sanitized()),
+            Self::ScanProcessor(value) => Self::ScanProcessor(value.sanitized()),
             marker => marker,
         }
     }
@@ -5271,9 +5375,10 @@ extra: 1"
         assert_eq!(tags.len(), NODE_KIND_DESCRIPTORS.len());
         assert_eq!(keys.len(), NODE_KIND_DESCRIPTORS.len());
         // Ten historical kinds through Displace (code 10), plus Residual
-        // Counterpoint (11), the Symmetry Field (12) and the Study (13).
-        // Kind codes are append-only, so this count only ever grows.
-        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 13);
+        // Counterpoint (11), the Symmetry Field (12), the Study (13), and the
+        // Scan Processor (14). Kind codes are append-only, so this count only
+        // ever grows.
+        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 14);
         for descriptor in NODE_KIND_DESCRIPTORS {
             assert!(descriptor.budget.full_frame_passes > 0);
             assert!(descriptor.budget.logical_texture_lookups_per_pixel > 0);
@@ -6543,6 +6648,7 @@ extra: 1"
             (NodeKindTag::Displace, 10),
             (NodeKindTag::Symmetry, 12),
             (NodeKindTag::Study, 13),
+            (NodeKindTag::ScanProcessor, 14),
         ] {
             assert_eq!(tag.signature_code(), code);
         }
@@ -6557,14 +6663,22 @@ extra: 1"
             "Symmetry Field"
         );
 
-        // Two kinds are lifted into dedicated passes: the Symmetry Field's
-        // eight-texture fold and the Study interpreter's history-array pass.
+        // Three kinds are lifted into dedicated passes: the Symmetry Field's
+        // eight-texture fold, the Study interpreter's history-array pass, and
+        // the Scan Processor's instanced ribbon geometry.
         let dedicated: Vec<_> = NODE_KIND_DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.tag.occupies_dedicated_pass())
             .map(|descriptor| descriptor.tag)
             .collect();
-        assert_eq!(dedicated, vec![NodeKindTag::Symmetry, NodeKindTag::Study]);
+        assert_eq!(
+            dedicated,
+            vec![
+                NodeKindTag::Symmetry,
+                NodeKindTag::Study,
+                NodeKindTag::ScanProcessor
+            ]
+        );
 
         assert_eq!(
             VisualRack::synthetic_legacy(LegacyRackScope::Layer).topology_signature(),
@@ -6574,6 +6688,134 @@ extra: 1"
             VisualRack::synthetic_legacy(LegacyRackScope::Master).topology_signature(),
             LEGACY_MASTER_RACK_SIGNATURE
         );
+    }
+
+    /// The Scan Processor's declared surface: fifteen continuous modulatable
+    /// Dice-eligible floats, two plan-time geometry integers, and two
+    /// discrete reversal laws — nothing else, and none of the discrete class
+    /// carries a modulatable address.
+    #[test]
+    fn scan_processor_exposes_fifteen_continuous_controls_and_four_discrete_laws() {
+        let rows: Vec<_> = NODE_PARAM_DESCRIPTORS
+            .iter()
+            .filter(|descriptor| descriptor.kind == NodeKindTag::ScanProcessor)
+            .collect();
+        assert_eq!(rows.len(), 19);
+        let continuous: Vec<_> = rows
+            .iter()
+            .filter(|descriptor| descriptor.modulatable)
+            .map(|descriptor| descriptor.key)
+            .collect();
+        assert_eq!(
+            continuous,
+            vec![
+                "scan_amount",
+                "scan_ribbon_width",
+                "scan_velocity_mix",
+                "scan_tilt_x",
+                "scan_tilt_y",
+                "scan_perspective",
+                "scan_s_curve",
+                "scan_skew",
+                "scan_collapse",
+                "scan_osc_amount",
+                "scan_osc_freq",
+                "scan_osc_lock",
+                "scan_lissajous",
+                "scan_mono",
+                "scan_hue",
+            ]
+        );
+        for descriptor in &rows {
+            assert_eq!(
+                descriptor.modulatable, descriptor.dice_eligible,
+                "{} must be Dice-eligible exactly when modulatable",
+                descriptor.key
+            );
+            assert_eq!(
+                descriptor.modulatable,
+                descriptor.value_type == NodeParamType::Float,
+                "{} continuous exactly when Float",
+                descriptor.key
+            );
+        }
+        for geometry in ["scan_lines", "scan_samples"] {
+            let row = rows
+                .iter()
+                .find(|descriptor| descriptor.key == geometry)
+                .expect("geometry row");
+            assert_eq!(row.value_type, NodeParamType::Unsigned);
+        }
+        for reversal in ["scan_reverse_h", "scan_reverse_v"] {
+            let row = rows
+                .iter()
+                .find(|descriptor| descriptor.key == reversal)
+                .expect("reversal row");
+            assert_eq!(row.value_type, NodeParamType::Bool);
+        }
+    }
+
+    /// The default is an exact bypass, any deflection wakes it, hostile
+    /// scalars land on the neutral default, and the vertex ledger is exactly
+    /// two per sample per line with the structural cap at the maxima.
+    #[test]
+    fn scan_processor_defaults_sanitize_and_declare_exact_bypass() {
+        use crate::scan_processor::{ScanProcessorParams, MAX_SCAN_PROCESSOR_VERTICES};
+        let default = ScanProcessorParams::default();
+        assert!(default.is_exact_bypass());
+        assert_eq!(default.vertex_count(), 320 * 256 * 2);
+        let woken = ScanProcessorParams {
+            amount: 0.5,
+            ..ScanProcessorParams::default()
+        };
+        assert!(!woken.is_exact_bypass());
+        let hostile = ScanProcessorParams {
+            amount: f32::NAN,
+            lines: u32::MAX,
+            samples_per_line: 0,
+            ..ScanProcessorParams::default()
+        };
+        let clean = hostile.sanitized();
+        assert_eq!(clean.amount, 0.0);
+        assert_eq!(clean.lines, 1_080);
+        assert_eq!(clean.samples_per_line, 64);
+        assert!(clean.is_exact_bypass());
+        let maxed = ScanProcessorParams {
+            lines: 1_080,
+            samples_per_line: 512,
+            ..ScanProcessorParams::default()
+        };
+        assert_eq!(maxed.vertex_count(), MAX_SCAN_PROCESSOR_VERTICES);
+    }
+
+    /// The node's serde: the tagged kind round trips, absent fields default,
+    /// and an unknown field is a deserialization rejection.
+    #[test]
+    fn scan_processor_serde_round_trips_and_rejects_unknown_fields() {
+        use crate::scan_processor::ScanProcessorParams;
+        let node = VisualNode::authored(
+            NodeId::new(7).unwrap(),
+            VisualNodeKind::ScanProcessor(ScanProcessorParams {
+                amount: 0.4,
+                reverse_h: true,
+                lines: 240,
+                ..ScanProcessorParams::default()
+            }),
+        );
+        let yaml = serde_yaml::to_string(&node).expect("serialize");
+        assert!(yaml.contains("kind: scan_processor"));
+        let restored: VisualNode = serde_yaml::from_str(&yaml).expect("round trip");
+        assert_eq!(restored, node);
+        let partial = "stable_id: 3\nkind:\n  kind: scan_processor\n  params:\n    amount: 0.25\n";
+        let parsed: VisualNode = serde_yaml::from_str(partial).expect("partial params");
+        let VisualNodeKind::ScanProcessor(params) = parsed.kind else {
+            panic!("scan processor kind");
+        };
+        assert_eq!(params.amount, 0.25);
+        assert_eq!(params.lines, 320);
+        let hostile =
+            "stable_id: 3\nkind:\n  kind: scan_processor\n  params:\n    unknown_field: 1\n";
+        assert!(serde_yaml::from_str::<VisualNode>(hostile).is_err());
     }
 
     /// The exact default is cyclic at one fold, carrier only, with no motion,

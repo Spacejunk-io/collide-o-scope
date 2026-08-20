@@ -425,6 +425,16 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
                 tag: node.kind.tag(),
             });
         }
+        // The Scan Processor is instanced ribbon geometry accumulating into
+        // its own transient — not a fullscreen pass at all — so it is never
+        // encodable here either; the planner lifts it into a dedicated step
+        // and reaching this arm is a planner error, reported by name.
+        RuntimeVisualNodeKind::ScanProcessor(_) => {
+            return Err(RackCompileError::DedicatedPassNode {
+                node_id: node.stable_id,
+                tag: node.kind.tag(),
+            });
+        }
     };
     Ok(RackPassDescriptor {
         node_id: node.stable_id,

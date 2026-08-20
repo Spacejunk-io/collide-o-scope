@@ -319,6 +319,12 @@ pub enum EvaluatedScopeStep {
     /// committed clean-history array and owns its own uniform layout, so it
     /// can never share an ordinary rack segment.
     StudyField { plan: EvaluatedStudyPlan },
+    /// One dedicated Scan Processor pass, at its exact authored rack
+    /// position. It is lifted for a stronger reason than the two above: it
+    /// is instanced ribbon geometry accumulated additively into its own
+    /// transient, not a fullscreen triangle, so no ordinary segment could
+    /// ever encode it.
+    ScanProcessorField { plan: EvaluatedScanProcessorPlan },
     /// Stateful master-only boundary in its exact authored position.
     LegacyTemporal { params: TemporalParams },
     /// Group matte is post-transform/rack and pre-opacity/admission.
@@ -344,6 +350,7 @@ impl EvaluatedScopeStep {
             // own kind rather than hiding behind a segment.
             Self::SymmetryField { .. } => Some(NodeKindTag::Symmetry),
             Self::StudyField { .. } => Some(NodeKindTag::Study),
+            Self::ScanProcessorField { .. } => Some(NodeKindTag::ScanProcessor),
             Self::MaterializeSpatial { .. }
             | Self::CollisionRack { .. }
             | Self::GroupMatte { .. } => None,
@@ -940,6 +947,121 @@ fn study_field_resource_plan(passes: u32) -> Result<StudyFieldResourcePlan, Comp
 /// `renderer/study.rs`.
 const STUDY_FIELD_UNIFORM_BYTES: u32 = 64 + 8_192;
 
+/// The evaluated payload of one dedicated Scan Processor pass — the tree's
+/// first non-fullscreen-triangle step. The node reads only its carrier, so
+/// there is no route, no donor, and no resolution state here: the sanitized
+/// authored params size the instanced draw and everything else is fixed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvaluatedScanProcessorPlan {
+    pub node_id: NodeId,
+    pub enabled: bool,
+    pub wet: f32,
+    pub blend: NodeBlend,
+    pub params: crate::scan_processor::ScanProcessorParams,
+    pub resources: ScanProcessorResourcePlan,
+}
+
+/// The dedicated Scan Processor ledger, the `SymmetryFieldResourcePlan`
+/// shape plus two terms no prior pass owns: a named vertex budget (this is
+/// the one pass in the tree with geometry) and the shared full-frame
+/// `Rgba16Float` transient the ribbons accumulate into, charged byte-exactly
+/// at 8 bytes per output pixel while any step exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanProcessorResourcePlan {
+    pub full_frame_passes: u32,
+    pub logical_texture_lookups_per_pixel: u32,
+    pub texture_operations_per_pixel: u32,
+    pub max_sampled_textures_in_pass: u32,
+    pub uniform_bytes: u32,
+    /// Instanced ribbon vertices summed across every emitted step. Each step
+    /// is individually refused one vertex over
+    /// [`crate::scan_processor::MAX_SCAN_PROCESSOR_VERTICES`] at lift time;
+    /// this field carries the frame total for the ledger and its tests.
+    pub vertices: u32,
+    /// One shared accumulator, not one per node: every scan pass in the frame
+    /// clears and reuses it, so the charge does not scale with step count.
+    pub transient_bytes: u64,
+}
+
+/// The table for the emitted Scan Processor steps. Dormant with none.
+fn scan_processor_resource_plan(
+    passes: u32,
+    vertices: u32,
+    output: [u32; 2],
+) -> Result<ScanProcessorResourcePlan, CompositionPlanError> {
+    if passes == 0 {
+        return Ok(ScanProcessorResourcePlan::default());
+    }
+    let descriptor = crate::visual_rack::node_kind_descriptor(NodeKindTag::ScanProcessor).budget;
+    let scale = |per_pass: u8| {
+        u32::from(per_pass)
+            .checked_mul(passes)
+            .ok_or(CompositionPlanError::Resource(
+                ResourcePreflightError::ArithmeticOverflow,
+            ))
+    };
+    let transient_bytes = u64::from(output[0])
+        .checked_mul(u64::from(output[1]))
+        .and_then(|pixels| pixels.checked_mul(8))
+        .ok_or(CompositionPlanError::Resource(
+            ResourcePreflightError::ArithmeticOverflow,
+        ))?;
+    Ok(ScanProcessorResourcePlan {
+        full_frame_passes: scale(descriptor.full_frame_passes)?,
+        logical_texture_lookups_per_pixel: scale(descriptor.logical_texture_lookups_per_pixel)?,
+        texture_operations_per_pixel: scale(descriptor.texture_samples_per_pixel)?,
+        max_sampled_textures_in_pass: u32::from(descriptor.sampled_textures_in_pass),
+        uniform_bytes: SCAN_PROCESSOR_UNIFORM_BYTES.checked_mul(passes).ok_or(
+            CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow),
+        )?,
+        vertices,
+        transient_bytes,
+    })
+}
+
+/// One pass's dynamic-offset uniform record, restated from the compile-time
+/// size assertion in `scan_processor.rs`.
+const SCAN_PROCESSOR_UNIFORM_BYTES: u32 = 128;
+
+/// Count the dedicated Scan Processor steps the segmenter actually emitted,
+/// and sum their authored vertex requests.
+fn count_scan_processor_steps(
+    layers: &[EvaluatedLayerScopePlan],
+    groups: &[EvaluatedGroupScopePlan],
+    master: &EvaluatedMasterScopePlan,
+) -> Result<(u32, u32), CompositionPlanError> {
+    let mut passes = 0_u32;
+    let mut vertices = 0_u32;
+    let mut tally = |execution: &EvaluatedScopeExecution| -> Result<(), CompositionPlanError> {
+        for step in execution.steps() {
+            if let EvaluatedScopeStep::ScanProcessorField { plan } = step {
+                passes = passes.checked_add(1).ok_or(CompositionPlanError::Resource(
+                    ResourcePreflightError::ArithmeticOverflow,
+                ))?;
+                vertices = vertices.checked_add(plan.params.vertex_count()).ok_or(
+                    CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow),
+                )?;
+            }
+        }
+        Ok(())
+    };
+    for layer in layers {
+        tally(&layer.execution)?;
+    }
+    for group in groups {
+        tally(&group.execution)?;
+    }
+    tally(&master.execution)?;
+    Ok((passes, vertices))
+}
+
+fn validate_scan_processor_textures(
+    scan_processor: ScanProcessorResourcePlan,
+    limits: CreativeResourceLimits,
+) -> Result<(), CompositionPlanError> {
+    validate_dedicated_sampled_textures(scan_processor.max_sampled_textures_in_pass, limits)
+}
+
 /// Plan-visible Study identity: every emitted step's node, digest, and
 /// resolution state. This feeds the advanced topology signature, so a
 /// document assignment — or a library insert that resolves a previously
@@ -1280,6 +1402,14 @@ pub struct AdvancedCompositionPlan {
         )
     )]
     study_field_resources: StudyFieldResourcePlan,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated Scan Processor ledger is consumed by the prepared executor and tests"
+        )
+    )]
+    scan_processor_resources: ScanProcessorResourcePlan,
     topology_signature: u64,
 }
 
@@ -1404,6 +1534,21 @@ impl AdvancedCompositionPlan {
     )]
     pub const fn study_field_resources(&self) -> StudyFieldResourcePlan {
         self.study_field_resources
+    }
+
+    /// The combined constant table of every dedicated Scan Processor pass
+    /// this frame encodes, including the named vertex budget and the shared
+    /// transient accumulator's byte charge. Default when the frame encodes
+    /// none.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated Scan Processor ledger is consumed by the prepared executor and tests"
+        )
+    )]
+    pub const fn scan_processor_resources(&self) -> ScanProcessorResourcePlan {
+        self.scan_processor_resources
     }
 
     pub const fn topology_signature(&self) -> u64 {
@@ -1594,6 +1739,15 @@ pub enum CompositionPlanError {
         loads: u32,
         limit: u32,
     },
+    /// A Scan Processor's authored geometry requests more instanced ribbon
+    /// vertices than the named vertex budget. The sanitized ranges cannot
+    /// exceed it today, so this is defense in depth with a typed error —
+    /// the over-budget Residual-grid law, never a silent clamp.
+    ScanProcessorVertexBudget {
+        node: NodeId,
+        vertices: u32,
+        limit: u32,
+    },
     UnknownLayerRack(StableLayerId),
     DuplicateLayerMotion(StableLayerId),
     MissingLayerMotion(StableLayerId),
@@ -1681,6 +1835,17 @@ impl fmt::Display for CompositionPlanError {
                 write!(
                     formatter,
                     "study node {} performs {loads} per-pixel texture loads; the admission budget is {limit}",
+                    node.get()
+                )
+            }
+            Self::ScanProcessorVertexBudget {
+                node,
+                vertices,
+                limit,
+            } => {
+                write!(
+                    formatter,
+                    "scan processor node {} requests {vertices} ribbon vertices; the vertex budget is {limit}",
                     node.get()
                 )
             }
@@ -2363,6 +2528,11 @@ impl<'a> Planner<'a> {
         )?)?;
         validate_study_field_textures(study_field_resources, self.input.resource_limits)?;
         let study_identity = study_identity_hash(&layer_plans, &group_plans, &master);
+        let (scan_passes, scan_vertices) =
+            count_scan_processor_steps(&layer_plans, &group_plans, &master)?;
+        let scan_processor_resources =
+            scan_processor_resource_plan(scan_passes, scan_vertices, output)?;
+        validate_scan_processor_textures(scan_processor_resources, self.input.resource_limits)?;
         let (resources, residual_resources) = resource_preflight(
             output,
             self.input,
@@ -2387,6 +2557,7 @@ impl<'a> Planner<'a> {
             symmetry_field_resources,
             study_field_resources,
             study_identity,
+            scan_processor_resources,
             residual_resources,
         );
 
@@ -2410,6 +2581,7 @@ impl<'a> Planner<'a> {
                 refresh_garden_resources,
                 symmetry_field_resources,
                 study_field_resources,
+                scan_processor_resources,
                 topology_signature,
             },
         )))
@@ -3150,6 +3322,40 @@ fn flush_segment(
             )?;
             steps.push(EvaluatedScopeStep::SymmetryField {
                 plan: symmetry_field_plan(scope, node, params, motion)?,
+            });
+            continue;
+        }
+        if let RuntimeVisualNodeKind::ScanProcessor(params) = node.kind {
+            // The same dedicated lift, same kind-only reasoning — and the one
+            // place the named vertex budget is enforced. The sanitized ranges
+            // cannot exceed the cap today, so this refusal is the Residual
+            // grid-edge law: defense in depth with a typed error, never a
+            // silent clamp.
+            compile_segment_nodes(
+                std::mem::take(&mut ordinary),
+                steps,
+                segment_index,
+                scope,
+                output,
+            )?;
+            let params = params.sanitized();
+            let vertices = params.vertex_count();
+            if vertices > crate::scan_processor::MAX_SCAN_PROCESSOR_VERTICES {
+                return Err(CompositionPlanError::ScanProcessorVertexBudget {
+                    node: node.stable_id,
+                    vertices,
+                    limit: crate::scan_processor::MAX_SCAN_PROCESSOR_VERTICES,
+                });
+            }
+            steps.push(EvaluatedScopeStep::ScanProcessorField {
+                plan: EvaluatedScanProcessorPlan {
+                    node_id: node.stable_id,
+                    enabled: node.enabled,
+                    wet: node.wet,
+                    blend: node.blend,
+                    params,
+                    resources: scan_processor_resource_plan(1, vertices, output)?,
+                },
             });
             continue;
         }
@@ -4300,6 +4506,7 @@ fn advanced_topology_signature(
     symmetry_field: SymmetryFieldResourcePlan,
     study_field: StudyFieldResourcePlan,
     study_identity: u64,
+    scan_processor: ScanProcessorResourcePlan,
     residual: ResidualResourcePlan,
 ) -> u64 {
     let mut hash = hash_value(FNV_OFFSET, 0x4144_5641_4e43_4544);
@@ -4401,6 +4608,17 @@ fn advanced_topology_signature(
         hash = hash_value(hash, u64::from(study_field.max_sampled_textures_in_pass));
         hash = hash_value(hash, u64::from(study_field.uniform_bytes));
         hash = hash_value(hash, study_identity);
+    }
+    // Deliberately passes and layout only, never the vertex total: the vertex
+    // count is a draw-call argument sized by authored values, so a lines or
+    // samples edit re-encodes the next frame without re-preparing pipelines,
+    // arenas, or the shared accumulator.
+    if scan_processor.full_frame_passes > 0 {
+        // Append-only domain tag: "SCANPROC".
+        hash = hash_value(hash, 0x5343_414e_5052_4f43);
+        hash = hash_value(hash, u64::from(scan_processor.full_frame_passes));
+        hash = hash_value(hash, u64::from(scan_processor.max_sampled_textures_in_pass));
+        hash = hash_value(hash, u64::from(scan_processor.uniform_bytes));
     }
     // The reduced block-mean grid is plan-visible resource topology: its
     // dimensions come from the authored block vocabulary, which the rack
@@ -8230,6 +8448,151 @@ mod tests {
             &heavy_library,
         )
         .expect("seven history loads plus the carrier fill the budget exactly");
+    }
+
+    /// The Scan Processor lift follows the Study shape exactly: flush before,
+    /// one kind-only dedicated step at the authored position, segmentation
+    /// resumes behind it. The dedicated ledger re-derives from the emitted
+    /// steps — two passes, two simultaneous bindings, 128 uniform bytes, the
+    /// named vertex budget, and the shared 8-byte-per-pixel transient — and
+    /// the topology signature is pass-layout identity only, so a geometry
+    /// edit re-encodes without re-preparing.
+    #[test]
+    fn a_scan_processor_flushes_its_segment_and_charges_the_named_vertex_ledger() {
+        use crate::scan_processor::ScanProcessorParams;
+
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let node = racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::ScanProcessor(ScanProcessorParams {
+                amount: 0.5,
+                lines: 240,
+                samples_per_line: 96,
+                ..ScanProcessorParams::default()
+            }))
+            .unwrap();
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+
+        let compiled =
+            advanced(plan_at_device_floor(&base, &composition, &master, &racks).unwrap());
+        let steps = layer_plan(&compiled, 2).execution.steps();
+        assert!(matches!(
+            steps[2],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 0,
+                ..
+            }
+        ));
+        let EvaluatedScopeStep::ScanProcessorField { plan: field } = &steps[3] else {
+            panic!("a Scan Processor must own a dedicated step, not a rack segment");
+        };
+        assert_eq!(field.node_id, node);
+        assert_eq!(field.params.amount, 0.5);
+        assert_eq!(field.params.vertex_count(), 240 * 96 * 2);
+        assert!(!field.params.is_exact_bypass());
+        assert!(matches!(
+            steps[4],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 1,
+                ..
+            }
+        ));
+        assert_eq!(steps[3].node_kind_tag(), Some(NodeKindTag::ScanProcessor));
+
+        // The dedicated ledger: geometry + resolve, the widest pass binds
+        // two textures, one 128-byte record, the summed vertex request, and
+        // the 64x64 output's 8-byte-per-pixel shared transient.
+        let resources = compiled.scan_processor_resources();
+        assert_eq!(resources.full_frame_passes, 2);
+        assert_eq!(resources.logical_texture_lookups_per_pixel, 2);
+        assert_eq!(resources.max_sampled_textures_in_pass, 2);
+        assert_eq!(resources.uniform_bytes, 128);
+        assert_eq!(resources.vertices, 240 * 96 * 2);
+        assert_eq!(resources.transient_bytes, 64 * 64 * 8);
+
+        // A plan with no scan node charges nothing and carries a different
+        // signature; a geometry edit keeps the signature (the vertex count
+        // is a draw-call argument, not topology). The control rack carries an
+        // ordinary node so it still plans Advanced.
+        let mut plain_racks = legacy_racks(&[1, 2]);
+        plain_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let plain =
+            advanced(plan_at_device_floor(&base, &composition, &master, &plain_racks).unwrap());
+        assert_eq!(
+            plain.scan_processor_resources(),
+            ScanProcessorResourcePlan::default()
+        );
+        assert_ne!(compiled.topology_signature(), plain.topology_signature());
+        let mut resized_racks = legacy_racks(&[1, 2]);
+        resized_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        resized_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::ScanProcessor(ScanProcessorParams {
+                amount: 0.5,
+                lines: 1_080,
+                samples_per_line: 512,
+                ..ScanProcessorParams::default()
+            }))
+            .unwrap();
+        resized_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let resized =
+            advanced(plan_at_device_floor(&base, &composition, &master, &resized_racks).unwrap());
+        assert_eq!(
+            resized.scan_processor_resources().vertices,
+            crate::scan_processor::MAX_SCAN_PROCESSOR_VERTICES
+        );
+        assert_eq!(
+            resized.topology_signature(),
+            compiled.topology_signature(),
+            "geometry is a draw-call argument, never plan-visible topology"
+        );
+
+        // A default node is an exact bypass but the lift is kind-only: the
+        // dedicated position survives so slot numbering never depends on
+        // frame-local values, and the executor skips it at encode.
+        let mut bypass_racks = legacy_racks(&[1, 2]);
+        bypass_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::ScanProcessor(
+                ScanProcessorParams::default(),
+            ))
+            .unwrap();
+        let bypassed =
+            advanced(plan_at_device_floor(&base, &composition, &master, &bypass_racks).unwrap());
+        let bypass_steps = layer_plan(&bypassed, 2).execution.steps();
+        let EvaluatedScopeStep::ScanProcessorField { plan: inert } = &bypass_steps[2] else {
+            panic!("the dedicated position is kind-only and survives an exact bypass");
+        };
+        assert!(inert.params.is_exact_bypass());
     }
 
     fn plan_with_motion_at_device_floor(

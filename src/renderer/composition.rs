@@ -11,9 +11,9 @@ use std::fmt;
 use crate::composition::{BusAssignment, RuntimeRootItem};
 use crate::evaluated_frame::evaluated_composition::{
     AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
-    EvaluatedRefreshGardenSignalPlan, EvaluatedScopeExecution, EvaluatedScopeStep,
-    EvaluatedStudyPlan, EvaluatedSymmetryFieldPlan, ImageTapConsumer, LegacyCanonicalApplication,
-    MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
+    EvaluatedRefreshGardenSignalPlan, EvaluatedScanProcessorPlan, EvaluatedScopeExecution,
+    EvaluatedScopeStep, EvaluatedStudyPlan, EvaluatedSymmetryFieldPlan, ImageTapConsumer,
+    LegacyCanonicalApplication, MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
 };
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::layers::BlendMode;
@@ -40,6 +40,7 @@ use crate::renderer::readback::{
     RecorderReadbackReadiness, RecorderReadbackRequest, RecorderReadbackReservation,
     RecorderReadbackTag,
 };
+use crate::renderer::scan_processor::{ScanProcessorGpuExecutor, ScanProcessorGpuUniforms};
 use crate::renderer::study::{StudyGpuExecutor, StudyGpuFrameUniforms};
 use crate::renderer::symmetry_field::{
     SymmetryFieldBindings, SymmetryFieldExecutor, SymmetryFieldGpuError, SymmetryFieldInput,
@@ -436,6 +437,19 @@ struct PreparedStudyField {
     bind_group: wgpu::BindGroup,
 }
 
+/// One prepared dedicated Scan Processor pass: the arena slot its uniforms
+/// occupy and its two bind groups (geometry over the Ping carrier; resolve
+/// over Ping plus the shared accumulator). No taps, no motion, no donors —
+/// the whole binding set is topology-fixed, and the vertex count is a
+/// draw-call argument read from the evaluated plan at encode.
+struct PreparedScanProcessorField {
+    scope: VisualScopeId,
+    node_id: NodeId,
+    uniform_slot: u32,
+    geometry_bind_group: wgpu::BindGroup,
+    resolve_bind_group: wgpu::BindGroup,
+}
+
 struct PreparedSymmetryField {
     scope: VisualScopeId,
     node_id: NodeId,
@@ -474,6 +488,8 @@ struct PreparedAdvanced {
     symmetry_fields: Vec<PreparedSymmetryField>,
     study: Option<StudyGpuExecutor>,
     study_fields: Vec<PreparedStudyField>,
+    scan: Option<ScanProcessorGpuExecutor>,
+    scan_fields: Vec<PreparedScanProcessorField>,
     motion: Option<MotionGpuResources>,
     taps: Box<[PreparedTap]>,
     /// Current-frame PreLocal donors are independently materialized and
@@ -1639,6 +1655,19 @@ impl PreparedAdvanced {
                 ),
                 None => Vec::new(),
             };
+            let scan_slot_count = scan_processor_field_step_count(plan);
+            let scan = (scan_slot_count > 0).then(|| {
+                ScanProcessorGpuExecutor::new(
+                    device,
+                    crate::renderer::composition_host::HOST_WORKING_FORMAT,
+                    scan_slot_count as u32,
+                    dimensions,
+                )
+            });
+            let scan_fields = match &scan {
+                Some(executor) => prepare_scan_processor_fields(device, plan, executor, ping.view),
+                None => Vec::new(),
+            };
             let retained_scope_sources = retained_scope_sources(plan, &taps);
             let (root_schedule, member_schedules) =
                 build_block_schedules(plan, &retained_scope_sources)?;
@@ -1746,6 +1775,8 @@ impl PreparedAdvanced {
                 symmetry_fields,
                 study,
                 study_fields,
+                scan,
+                scan_fields,
                 motion,
                 taps: taps.into_boxed_slice(),
                 prelocal_surfaces,
@@ -2131,6 +2162,7 @@ impl PreparedAdvanced {
                 | EvaluatedScopeStep::LegacyTemporal { .. }
                 | EvaluatedScopeStep::SymmetryField { .. }
                 | EvaluatedScopeStep::StudyField { .. }
+                | EvaluatedScopeStep::ScanProcessorField { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => continue,
             };
             self.host
@@ -2429,6 +2461,9 @@ impl PreparedAdvanced {
                 EvaluatedScopeStep::StudyField { plan: field } => {
                     self.execute_study_field(queue, encoder, plan, scope, field)?;
                 }
+                EvaluatedScopeStep::ScanProcessorField { plan: field } => {
+                    self.execute_scan_processor_field(queue, encoder, plan, scope, field)?;
+                }
                 EvaluatedScopeStep::LegacyTemporal { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(format!(
@@ -2613,6 +2648,65 @@ impl PreparedAdvanced {
         Ok(())
     }
 
+    /// Encode one dedicated Scan Processor step: the instanced ribbon
+    /// geometry pass into the shared accumulator, the fullscreen resolve
+    /// into Pong, then the established Pong→Ping copy. An inert plan —
+    /// disabled, dry, or no deflection authored — is a real delegation:
+    /// nothing is encoded and nothing is copied.
+    fn execute_scan_processor_field(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        scope: VisualScopeId,
+        field: &EvaluatedScanProcessorPlan,
+    ) -> Result<(), CompositionGpuError> {
+        if ScanProcessorGpuExecutor::is_inert(field) {
+            return Ok(());
+        }
+        let prepared = self
+            .scan_fields
+            .iter()
+            .find(|prepared| prepared.scope == scope && prepared.node_id == field.node_id)
+            .ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "Scan Processor node {} in {scope:?} was not prepared",
+                    field.node_id.get()
+                ))
+            })?;
+        let executor = self.scan.as_ref().ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(
+                "a Scan Processor step was planned without its dedicated executor".into(),
+            )
+        })?;
+        // The only time input is the shared frame-plan seconds — the same
+        // immutable sample live, frame-derived offline — so Pause holds the
+        // detuned oscillator still and export replays it structurally.
+        let frame = ScanProcessorGpuUniforms::from_parts(
+            &field.params,
+            self.host.dimensions(),
+            plan.base().context().time_seconds,
+            field.wet,
+            field.blend,
+        );
+        executor.write_frame(queue, prepared.uniform_slot, &frame);
+        executor.encode_at(
+            encoder,
+            &prepared.geometry_bind_group,
+            &prepared.resolve_bind_group,
+            self.host.surface(HostSurface::Pong).view,
+            prepared.uniform_slot,
+            &field.params,
+        );
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Pong).texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        Ok(())
+    }
+
     fn execute_rack_segment(
         &mut self,
         queue: &wgpu::Queue,
@@ -2783,6 +2877,9 @@ impl PreparedAdvanced {
                     }
                     EvaluatedScopeStep::StudyField { plan: field } => {
                         self.execute_study_field(queue, encoder, plan, scope, field)?;
+                    }
+                    EvaluatedScopeStep::ScanProcessorField { plan: field } => {
+                        self.execute_scan_processor_field(queue, encoder, plan, scope, field)?;
                     }
                     EvaluatedScopeStep::GroupMatte { .. } => {
                         self.execute_group_matte(encoder, plan, group_id)?;
@@ -3077,6 +3174,15 @@ impl PreparedAdvanced {
                 }
                 EvaluatedScopeStep::StudyField { plan: field } => {
                     self.execute_study_field(queue, encoder, plan, VisualScopeId::Master, field)?;
+                }
+                EvaluatedScopeStep::ScanProcessorField { plan: field } => {
+                    self.execute_scan_processor_field(
+                        queue,
+                        encoder,
+                        plan,
+                        VisualScopeId::Master,
+                        field,
+                    )?;
                 }
                 EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(
@@ -3562,6 +3668,61 @@ fn prepare_study_fields(
                 node_id: field.node_id,
                 uniform_slot,
                 bind_group: executor.create_bind_group(device, carrier, history),
+            });
+        }
+    };
+    for layer in plan.layers() {
+        visit(VisualScopeId::Layer(layer.stable_id), &layer.execution);
+    }
+    for group in plan.groups() {
+        visit(VisualScopeId::Group(group.id), &group.execution);
+    }
+    visit(VisualScopeId::Master, &plan.master().execution);
+    prepared
+}
+
+fn scan_processor_field_step_count(plan: &AdvancedCompositionPlan) -> usize {
+    let mut count = 0;
+    let mut tally = |execution: &EvaluatedScopeExecution| {
+        count += execution
+            .steps()
+            .iter()
+            .filter(|step| matches!(step, EvaluatedScopeStep::ScanProcessorField { .. }))
+            .count();
+    };
+    for layer in plan.layers() {
+        tally(&layer.execution);
+    }
+    for group in plan.groups() {
+        tally(&group.execution);
+    }
+    tally(&plan.master().execution);
+    count
+}
+
+/// Assign every planned Scan Processor step an arena slot in deterministic
+/// layers-then-groups-then-master step order and build its two topology-fixed
+/// bind groups. Inert steps still own their slot so slot numbering never
+/// depends on frame-local values.
+fn prepare_scan_processor_fields(
+    device: &wgpu::Device,
+    plan: &AdvancedCompositionPlan,
+    executor: &ScanProcessorGpuExecutor,
+    carrier: &wgpu::TextureView,
+) -> Vec<PreparedScanProcessorField> {
+    let mut prepared = Vec::new();
+    let mut visit = |scope: VisualScopeId, execution: &EvaluatedScopeExecution| {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::ScanProcessorField { plan: field } = step else {
+                continue;
+            };
+            let uniform_slot = prepared.len() as u32;
+            prepared.push(PreparedScanProcessorField {
+                scope,
+                node_id: field.node_id,
+                uniform_slot,
+                geometry_bind_group: executor.create_geometry_bind_group(device, carrier),
+                resolve_bind_group: executor.create_resolve_bind_group(device, carrier),
             });
         }
     };
@@ -6340,6 +6501,141 @@ mod tests {
             "an unresolved digest is inert — never a fallback onto another document"
         );
         assert!(active.iter().flatten().all(|value| value.is_finite()));
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ScanFixtureMode {
+        /// Raster collapse at zero velocity mix: the density payoff, with the
+        /// beam-energy law deliberately disengaged so nothing but additive
+        /// line overlap can raise a pixel above the source maximum.
+        Collapsed,
+        /// The authored default: an exact bypass.
+        Bypass,
+        NoNode,
+    }
+
+    fn scan_layer_fixture(dimensions: [u32; 2], mode: ScanFixtureMode) -> EvaluatedCompositionPlan {
+        use crate::scan_processor::ScanProcessorParams;
+
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::A,
+            }],
+            None,
+            0.0,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::empty();
+        match mode {
+            ScanFixtureMode::Collapsed => {
+                layer_rack
+                    .push(RuntimeVisualNodeKind::ScanProcessor(ScanProcessorParams {
+                        collapse: 0.85,
+                        velocity_mix: 0.0,
+                        lines: 32,
+                        samples_per_line: 64,
+                        ..ScanProcessorParams::default()
+                    }))
+                    .unwrap();
+            }
+            ScanFixtureMode::Bypass => {
+                layer_rack
+                    .push(RuntimeVisualNodeKind::ScanProcessor(
+                        ScanProcessorParams::default(),
+                    ))
+                    .unwrap();
+            }
+            ScanFixtureMode::NoNode => {}
+        }
+        let racks = vec![(stable_layer(1), layer_rack)];
+        let mut input = crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+            &composition,
+            &master,
+            &racks,
+        );
+        input.resource_limits.max_sampled_textures_per_shader_stage = 16;
+        let plan = EvaluatedCompositionPlan::evaluate(&base, input).unwrap();
+        let EvaluatedCompositionPlan::Advanced(advanced) = &plan else {
+            panic!("a Scan Processor node forces an Advanced plan");
+        };
+        assert_eq!(
+            scan_processor_field_step_count(advanced),
+            usize::from(mode != ScanFixtureMode::NoNode),
+        );
+        plan
+    }
+
+    /// The pixels claim for the drawn raster, and the fixture that
+    /// distinguishes the mechanism from the imitation: with the beam-energy
+    /// law disengaged (`velocity_mix = 0`), a collapsed raster's additive
+    /// line overlap drives pixels far above the flat source's maximum
+    /// luminance — which no single-sample displacement of the same image can
+    /// ever do. The authored default is byte-identical to no node at all,
+    /// and warm frames allocate nothing.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn production_scan_processor_density_exceeds_any_displacement_and_default_is_bypass() {
+        let gpu = GpuHarness::new();
+        let dimensions = [64, 64];
+        // Mid-grey: sRGB 120 decodes to ~0.188 linear, so a doubled pixel is
+        // unmistakable and still far below the clamp.
+        let source = gpu.source(dimensions, [120, 120, 120, 255], "Scan flat grey source");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let render_mode = |mode: ScanFixtureMode| {
+            let plan = scan_layer_fixture(dimensions, mode);
+            let mut executor =
+                CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+            executor
+                .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+                .unwrap();
+            let warmed = executor.allocation_snapshot();
+            let first = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+            assert_eq!(
+                executor.allocation_snapshot(),
+                warmed,
+                "a warmed Scan Processor frame must allocate nothing"
+            );
+            executor.reset_history();
+            let second = gpu.render(&mut executor, &plan, 1.0 / 30.0, false);
+            assert_eq!(first, second, "the drawn raster is deterministic");
+            first
+        };
+        let collapsed = render_mode(ScanFixtureMode::Collapsed);
+        let bypassed = render_mode(ScanFixtureMode::Bypass);
+        let control = render_mode(ScanFixtureMode::NoNode);
+
+        assert_eq!(
+            bypassed, control,
+            "the authored default is an exact bypass, byte-identical to no node"
+        );
+        assert_ne!(collapsed, control, "a collapsed raster reaches the pixels");
+
+        let max_channel = |image: &[[f32; 4]]| {
+            image
+                .iter()
+                .flat_map(|pixel| pixel[..3].iter().copied())
+                .fold(0.0_f32, f32::max)
+        };
+        let source_max = max_channel(&control);
+        let ridge = max_channel(&collapsed);
+        assert!(
+            source_max < 0.25,
+            "the flat grey control must stay near 0.19 linear, got {source_max}"
+        );
+        assert!(
+            ridge > source_max * 2.0,
+            "additive line density must exceed any single-sample bound: \
+             ridge {ridge} vs source max {source_max}"
+        );
+        assert!(collapsed.iter().flatten().all(|value| value.is_finite()));
     }
 
     fn symmetry_field_layer_fixture(
