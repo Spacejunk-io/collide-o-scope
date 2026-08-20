@@ -8,9 +8,13 @@ use crate::media_safety::{
     MediaSourceKind,
 };
 use crate::motion::MotionParams;
+use crate::pattern_synth::{PatternSynthParams, PATTERN_SYNTH_HEIGHT, PATTERN_SYNTH_WIDTH};
 use crate::performance::{ClipSlotConfig, ClipSlotId, ClipSlots};
 use crate::spatial::SpatialTransform;
 use crate::spout_in::{SpoutFrame, SpoutIn, SpoutStatus};
+use crate::text_page::{
+    render_text_page, TextPageFonts, TextPageParams, TEXT_PAGE_HEIGHT, TEXT_PAGE_WIDTH,
+};
 use crate::transport::{
     ClipTransportState, CueId, FrameSelection, NormalizedTime, PlaybackDirection,
     ProgramTransportTick, TransportTimeline,
@@ -23,6 +27,12 @@ use crate::video::{
 use crate::visual_rack::{LegacyRackScope, RuntimeVisualRack};
 
 pub const SPOUT_SOURCE_PREFIX: &str = "spout://";
+/// The B7 generator sentinels: stable source identities on the `spout://`
+/// rules — fixed, never a host path, and carrying no file identity because
+/// the whole authored state lives in `LayerConfig`. The singleton form is
+/// deliberate: the *kind* is the identity, and everything else is values.
+pub const PATTERN_SOURCE_PATH: &str = "synth://pattern";
+pub const TEXT_PAGE_SOURCE_PATH: &str = "text://page";
 pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "webm", "mov", "avi", "mkv"];
 pub const STILL_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp"];
 
@@ -254,6 +264,26 @@ pub enum LayerSource {
     Video(ThreadedDecoder),
     Still(StillImage),
     Spout(SpoutIn),
+    /// B7 pattern synth: the picture is computed by one GPU pass per frame
+    /// from these authored values and frame-plan time. No pixels live here.
+    Pattern(PatternSynthState),
+    /// B7 text page: a static CPU raster re-rendered only on authored
+    /// change; between edits it costs exactly what a still costs.
+    TextPage(TextPageState),
+}
+
+/// The pattern synth's authored state. The GPU pass is the only pixel
+/// producer, so this is values only.
+pub struct PatternSynthState {
+    pub params: PatternSynthParams,
+}
+
+/// The text page's authored state plus the raster awaiting upload. The
+/// pending frame follows the still-image publish law: taken by the ready
+/// -frame pump, restored on a failed upload.
+pub struct TextPageState {
+    params: TextPageParams,
+    pending_frame: Option<Vec<u8>>,
 }
 
 /// A fully allocated and initialized replacement for a layer's source-only
@@ -352,6 +382,8 @@ impl LayerSource {
             Self::Video(_) => "video",
             Self::Still(_) => "image",
             Self::Spout(_) => "spout",
+            Self::Pattern(_) => "pattern",
+            Self::TextPage(_) => "text",
         }
     }
 }
@@ -768,8 +800,207 @@ impl Layer {
         })
     }
 
+    /// Create a B7 pattern-synth layer: a fixed 1920x1080 page the renderer
+    /// computes with one GPU pass per frame. The texture takes the ordinary
+    /// still-image admission gate so the generator obeys the same media
+    /// policy every pixel source does, and it is created renderable because
+    /// the pass — not an upload — is its only producer.
+    pub fn new_pattern_with_media_policy(
+        params: PatternSynthParams,
+        device: &wgpu::Device,
+        media_policy: &MediaSafetyPolicy,
+    ) -> Result<Self, String> {
+        let device_limits = media_device_limits(device);
+        let width = PATTERN_SYNTH_WIDTH;
+        let height = PATTERN_SYNTH_HEIGHT;
+        let source_preload_bytes = validate_source_texture_dimensions_with_media_policy(
+            width,
+            height,
+            device_limits,
+            MediaSourceKind::Still,
+            "pattern synth",
+            media_policy,
+        )?
+        .working_set_bytes;
+        let (texture, texture_view) =
+            create_renderable_layer_texture(device, width, height, "Pattern Layer Texture")?;
+        let effects = EffectUniforms {
+            resolution: [width as f32, height as f32],
+            ..Default::default()
+        };
+        let source_path = PATTERN_SOURCE_PATH.to_string();
+        let filename = "Pattern Synth".to_string();
+        let (clip_slots, active_clip_slot, clip_transport) =
+            initial_performance_state(&filename, &source_path, 30.0);
+        Ok(Self {
+            layer_id: allocate_layer_id(),
+            source_path,
+            persisted_source_reference: None,
+            proxy_backing: None,
+            filename,
+            source: LayerSource::Pattern(PatternSynthState {
+                params: params.sanitized(),
+            }),
+            texture,
+            texture_view,
+            source_resource_epoch: 1,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            paused: false,
+            visible: true,
+            bypass_master_fx: default_bypass_master_fx(),
+            reroll_on_loop: false,
+            effects,
+            rack: default_layer_rack(),
+            transform: SpatialTransform::new_layer_default(),
+            motion: default_layer_motion(),
+            clip_slots,
+            active_clip_slot,
+            clip_transport,
+            matte: LayerMatte::default(),
+            pending_transport_seek: None,
+            pending_transport_cue: None,
+            last_transport_selection: None,
+            width,
+            height,
+            source_error: String::new(),
+            // The first encoded pass initializes the picture; until then the
+            // texture must not be sampled as content.
+            source_frame_initialized: false,
+            codec_motion: None,
+            source_preload_bytes,
+            speed: 1.0,
+            fps: 30.0,
+        })
+    }
+
+    /// Create a B7 text-page layer: a static CPU raster on the still-image
+    /// publish law. The page is rastered here once and again only when the
+    /// authored state changes.
+    pub fn new_text_page_with_media_policy(
+        params: TextPageParams,
+        device: &wgpu::Device,
+        media_policy: &MediaSafetyPolicy,
+        fonts: &TextPageFonts,
+    ) -> Result<Self, String> {
+        let device_limits = media_device_limits(device);
+        let width = TEXT_PAGE_WIDTH;
+        let height = TEXT_PAGE_HEIGHT;
+        let source_preload_bytes = validate_source_texture_dimensions_with_media_policy(
+            width,
+            height,
+            device_limits,
+            MediaSourceKind::Still,
+            "text page",
+            media_policy,
+        )?
+        .working_set_bytes;
+        let (texture, texture_view) =
+            create_layer_texture(device, width, height, "Text Page Layer Texture")?;
+        let clean = params.sanitized();
+        let page = render_text_page(&clean, fonts);
+        let effects = EffectUniforms {
+            resolution: [width as f32, height as f32],
+            ..Default::default()
+        };
+        let source_path = TEXT_PAGE_SOURCE_PATH.to_string();
+        let filename = "Text Page".to_string();
+        let (clip_slots, active_clip_slot, clip_transport) =
+            initial_performance_state(&filename, &source_path, 30.0);
+        Ok(Self {
+            layer_id: allocate_layer_id(),
+            source_path,
+            persisted_source_reference: None,
+            proxy_backing: None,
+            filename,
+            source: LayerSource::TextPage(TextPageState {
+                params: clean,
+                pending_frame: Some(page),
+            }),
+            texture,
+            texture_view,
+            source_resource_epoch: 1,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            paused: false,
+            visible: true,
+            bypass_master_fx: default_bypass_master_fx(),
+            reroll_on_loop: false,
+            effects,
+            rack: default_layer_rack(),
+            transform: SpatialTransform::new_layer_default(),
+            motion: default_layer_motion(),
+            clip_slots,
+            active_clip_slot,
+            clip_transport,
+            matte: LayerMatte::default(),
+            pending_transport_seek: None,
+            pending_transport_cue: None,
+            last_transport_selection: None,
+            width,
+            height,
+            source_error: String::new(),
+            source_frame_initialized: false,
+            codec_motion: None,
+            source_preload_bytes,
+            speed: 1.0,
+            fps: 30.0,
+        })
+    }
+
     pub fn source_kind(&self) -> &'static str {
         self.source.kind()
+    }
+
+    /// Authored pattern-synth values, present only on a pattern layer.
+    pub fn pattern_params(&self) -> Option<&PatternSynthParams> {
+        match &self.source {
+            LayerSource::Pattern(state) => Some(&state.params),
+            _ => None,
+        }
+    }
+
+    /// Direct authored access for wire/Morph/Look appliers. Frame-local
+    /// modulation never writes through this — it offsets a per-frame copy.
+    pub fn pattern_params_mut(&mut self) -> Option<&mut PatternSynthParams> {
+        match &mut self.source {
+            LayerSource::Pattern(state) => Some(&mut state.params),
+            _ => None,
+        }
+    }
+
+    /// Authored text-page values, present only on a text layer.
+    pub fn text_page_params(&self) -> Option<&TextPageParams> {
+        match &self.source {
+            LayerSource::TextPage(state) => Some(&state.params),
+            _ => None,
+        }
+    }
+
+    /// Apply an authored text-page edit. The page re-rasters only when the
+    /// sanitized state actually changed — the whole law of the source is
+    /// that between edits it costs what a still costs. Returns whether a
+    /// re-raster happened.
+    pub fn set_text_page_params(&mut self, params: TextPageParams, fonts: &TextPageFonts) -> bool {
+        let LayerSource::TextPage(state) = &mut self.source else {
+            return false;
+        };
+        let clean = params.sanitized();
+        if clean == state.params {
+            return false;
+        }
+        let page = render_text_page(&clean, fonts);
+        state.params = clean;
+        state.pending_frame = Some(page);
+        true
+    }
+
+    /// Called by the renderer when a pattern pass has been encoded into the
+    /// frame: from that submission on, the texture holds defined content.
+    pub fn mark_pattern_frame_encoded(&mut self) {
+        if matches!(self.source, LayerSource::Pattern(_)) {
+            self.source_frame_initialized = true;
+        }
     }
 
     /// Reset only authored M4 motion controls. Source/transport resources,
@@ -869,7 +1100,10 @@ impl Layer {
     pub fn source_duration_seconds(&self) -> f64 {
         match &self.source {
             LayerSource::Video(decoder) => decoder.duration_seconds,
-            LayerSource::Still(_) | LayerSource::Spout(_) => 0.0,
+            LayerSource::Still(_)
+            | LayerSource::Spout(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => 0.0,
         }
     }
 
@@ -887,6 +1121,9 @@ impl Layer {
             }
             LayerSource::Still(_) => 1,
             LayerSource::Spout(_) => 0,
+            // A pattern has a clock but no frames; a text page is one page.
+            LayerSource::Pattern(_) => 0,
+            LayerSource::TextPage(_) => 1,
         }
     }
 
@@ -933,7 +1170,10 @@ impl Layer {
         // absolute request can never be rejected as stale.
         let decoder_generation = match &self.source {
             LayerSource::Video(decoder) => Some(decoder.source_generation()),
-            LayerSource::Still(_) | LayerSource::Spout(_) => None,
+            LayerSource::Still(_)
+            | LayerSource::Spout(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => None,
         };
         let mut config = self.active_clip_config().transport;
         config.rate = effective_rate;
@@ -996,7 +1236,10 @@ impl Layer {
         let prior_start_position = self.clip_transport.position;
         let prior_source_fps = match &self.source {
             LayerSource::Video(decoder) => decoder.fps,
-            LayerSource::Still(_) | LayerSource::Spout(_) => 30.0,
+            LayerSource::Still(_)
+            | LayerSource::Spout(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => 30.0,
         };
         let mut prior_slot = self.active_clip_config().clone();
         prior_slot.filename.clone_from(&self.filename);
@@ -1096,7 +1339,10 @@ impl Layer {
     ) -> LayerSourceActivation {
         let prior_source_fps = match &self.source {
             LayerSource::Video(decoder) => decoder.fps,
-            LayerSource::Still(_) | LayerSource::Spout(_) => 30.0,
+            LayerSource::Still(_)
+            | LayerSource::Spout(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => 30.0,
         };
         let LayerSourceActivation {
             source_path,
@@ -1185,11 +1431,29 @@ impl Layer {
         matches!(self.source, LayerSource::Video(_) | LayerSource::Still(_))
     }
 
+    /// B7 generator sources: no file identity at all — the whole authored
+    /// state travels in `LayerConfig`, so offline reconstruction is perfect
+    /// by construction.
+    pub fn is_generator(&self) -> bool {
+        matches!(
+            self.source,
+            LayerSource::Pattern(_) | LayerSource::TextPage(_)
+        )
+    }
+
+    /// Every source offline export reconstructs exactly: file media by
+    /// identity, generators by authored values. Spout stays the one
+    /// deterministic-black exception.
+    pub fn is_offline_reconstructable(&self) -> bool {
+        self.is_file_media() || self.is_generator()
+    }
+
     pub fn progress(&self) -> f32 {
         match &self.source {
             LayerSource::Video(decoder) => decoder.progress(),
             LayerSource::Still(_) => 0.0,
             LayerSource::Spout(_) => 0.0,
+            LayerSource::Pattern(_) | LayerSource::TextPage(_) => 0.0,
         }
     }
 
@@ -1219,12 +1483,21 @@ impl Layer {
             LayerSource::Video(decoder) => decoder.try_next_ready_frame_result(),
             LayerSource::Still(image) => Ok(image.take_frame().map(ReadyFrame::still)),
             LayerSource::Spout(_) => Ok(None),
+            // A pattern's producer is the GPU pass, never an upload.
+            LayerSource::Pattern(_) => Ok(None),
+            LayerSource::TextPage(state) => Ok(state.pending_frame.take().map(ReadyFrame::still)),
         }
     }
 
     pub fn restore_ready_media_frame_after_failed_upload(&mut self, frame: ReadyFrame) {
-        if let LayerSource::Still(image) = &mut self.source {
-            image.restore_frame_after_failed_upload(frame.rgba);
+        match &mut self.source {
+            LayerSource::Still(image) => image.restore_frame_after_failed_upload(frame.rgba),
+            // Keep the exact still-image retry law: the page waits for the
+            // next successful upload rather than re-rastering.
+            LayerSource::TextPage(state) if state.pending_frame.is_none() => {
+                state.pending_frame = Some(frame.rgba);
+            }
+            _ => {}
         }
     }
 
@@ -1270,6 +1543,7 @@ impl Layer {
             LayerSource::Video(decoder) => Some(decoder.health()),
             LayerSource::Still(_) => None,
             LayerSource::Spout(_) => None,
+            LayerSource::Pattern(_) | LayerSource::TextPage(_) => None,
         }
     }
 
@@ -1279,7 +1553,10 @@ impl Layer {
     pub fn video_telemetry(&self) -> Option<DecoderTelemetry> {
         match &self.source {
             LayerSource::Video(decoder) => Some(decoder.telemetry()),
-            LayerSource::Still(_) | LayerSource::Spout(_) => None,
+            LayerSource::Still(_)
+            | LayerSource::Spout(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => None,
         }
     }
 
@@ -1292,7 +1569,10 @@ impl Layer {
                 }
                 Some(status)
             }
-            LayerSource::Video(_) | LayerSource::Still(_) => None,
+            LayerSource::Video(_)
+            | LayerSource::Still(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => None,
         }
     }
 
@@ -1305,7 +1585,10 @@ impl Layer {
     pub fn try_spout_frame(&self) -> Option<SpoutFrame> {
         match &self.source {
             LayerSource::Spout(receiver) => receiver.try_recv(),
-            LayerSource::Video(_) | LayerSource::Still(_) => None,
+            LayerSource::Video(_)
+            | LayerSource::Still(_)
+            | LayerSource::Pattern(_)
+            | LayerSource::TextPage(_) => None,
         }
     }
 
@@ -1526,6 +1809,48 @@ fn create_layer_texture(
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ];
+    if let Some(error) = errors.into_iter().flatten().next() {
+        return Err(format!(
+            "could not allocate {label} at {width}x{height}: {error}"
+        ));
+    }
+    Ok((texture, texture_view))
+}
+
+/// The pattern layer's texture: the ordinary layer texture plus
+/// `RENDER_ATTACHMENT`, because its one producer is a render pass rather
+/// than an upload. Same format, same error-scope law.
+fn create_renderable_layer_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> Result<(wgpu::Texture, wgpu::TextureView), String> {
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());

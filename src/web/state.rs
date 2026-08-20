@@ -3638,6 +3638,13 @@ pub struct LayerSnapshot {
     /// this persistent visual layer identity.
     #[serde(default)]
     pub performance: LayerPerformanceSnapshot,
+    /// B7 pattern-synth authored state, present only on a pattern layer.
+    /// Additive: legacy clients that ignore it keep their exact meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<crate::patch::PatternSynthConfig>,
+    /// B7 text-page authored state, present only on a text layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_page: Option<crate::patch::TextPageConfig>,
 }
 
 fn default_layer_fps() -> f32 {
@@ -4031,6 +4038,13 @@ pub enum WebAction {
     /// Add a layer from the library by filename
     #[serde(rename = "add_layer")]
     AddLayer { filename: String },
+    /// Add a B7 pattern-synth layer with default authored values. Topology
+    /// edit: immediate, never coalesced, never quantized.
+    #[serde(rename = "add_pattern_layer")]
+    AddPatternLayer,
+    /// Add a B7 text-page layer with the default page. Same topology law.
+    #[serde(rename = "add_text_layer")]
+    AddTextLayer,
     /// Stage a library source into a persistent layer. `None` appends a new
     /// engine-assigned slot; `Some` replaces that exact stable slot. Source
     /// open and first-frame decode complete before any optional activation.
@@ -4190,6 +4204,27 @@ pub enum WebAction {
     /// Set one direct per-layer effect parameter.
     #[serde(rename = "set_layer_effect")]
     SetLayerEffect {
+        index: usize,
+        #[serde(default)]
+        layer_id: Option<String>,
+        param: String,
+        value: serde_json::Value,
+    },
+    /// Set one absolute authored B7 pattern-synth value on a pattern layer.
+    /// Coalescible per param; the three discrete vocabularies ride as closed
+    /// snake_case tokens and coalesce like every absolute choice.
+    #[serde(rename = "set_layer_pattern")]
+    SetLayerPattern {
+        index: usize,
+        #[serde(default)]
+        layer_id: Option<String>,
+        param: String,
+        value: serde_json::Value,
+    },
+    /// Set one absolute authored B7 text-page value on a text layer. The
+    /// page re-rasters only when the sanitized state actually changes.
+    #[serde(rename = "set_layer_text")]
+    SetLayerText {
         index: usize,
         #[serde(default)]
         layer_id: Option<String>,
@@ -4886,6 +4921,24 @@ impl WebAction {
             } if matches!(param.as_str(), "amount" | "threshold" | "softness") => {
                 Some(format!("layer:id:{layer_id}:matte:{param}"))
             }
+            Self::SetLayerPattern {
+                index,
+                layer_id,
+                param,
+                ..
+            } => Some(format!(
+                "layer:{}:pattern:{param}",
+                Self::layer_key(*index, layer_id)
+            )),
+            Self::SetLayerText {
+                index,
+                layer_id,
+                param,
+                ..
+            } => Some(format!(
+                "layer:{}:text:{param}",
+                Self::layer_key(*index, layer_id)
+            )),
             Self::SetMasterPaused { .. } => Some("master:paused".into()),
             Self::SetProgramFrozen { .. } => Some("master:paused".into()),
             Self::SetMediaFrozen { .. } => Some("media:frozen".into()),
@@ -7029,6 +7082,8 @@ mod protocol_tests {
             proxy_backing_prefix: String::new(),
             proxy_note: String::new(),
             performance: LayerPerformanceSnapshot::default(),
+            pattern: None,
+            text_page: None,
         };
         let mut value = serde_json::to_value(current).unwrap();
         // Empty proxy state stays off the wire entirely rather than shipping
@@ -7579,8 +7634,11 @@ mod protocol_tests {
         // B8 added the seventeen bus-mixer sliders (wipe 5, dirt 6, melt 6),
         // the six master melting-edge sliders, and the key-dressing pair at
         // both scopes (two static master rows, two layer template rows).
+        // B7 added the two generated generator-card templates (one pattern
+        // row template, one text row template); their rows render from
+        // tables, so only the two literal template tags move the JS count.
         assert_eq!(assert_range_tags_are_bounded(html, true), 198);
-        assert_eq!(assert_range_tags_are_bounded(js, false), 19);
+        assert_eq!(assert_range_tags_are_bounded(js, false), 21);
 
         for contract in [
             "function normalizeRangeValue(slider, rawValue)",

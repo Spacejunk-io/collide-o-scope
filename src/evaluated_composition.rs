@@ -5043,6 +5043,7 @@ mod tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: bypass.contains(id),
+                    pattern: None,
                 }),
         )
     }
@@ -5113,6 +5114,7 @@ mod tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }),
         )
     }
@@ -5794,6 +5796,7 @@ mod tests {
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                pattern: None,
             }],
         );
         assert_eq!(base.layers()[0].transform.position[0], 1.0);

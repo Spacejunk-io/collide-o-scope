@@ -3052,6 +3052,16 @@ pub struct LayerConfig {
     /// Saved-position matte DTO; runtime IDs are resolved only after layers exist.
     #[serde(default, skip_serializing_if = "LayerMatteConfig::is_legacy_disabled")]
     pub matte: LayerMatteConfig,
+    /// B7 pattern-synth authored state; `Some` iff `source_path` is the
+    /// `synth://pattern` sentinel. The whole identity — every value the
+    /// picture depends on — lives here, so offline reconstruction is
+    /// perfect with no file, no content reference, no placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<PatternSynthConfig>,
+    /// B7 text-page authored state; `Some` iff `source_path` is the
+    /// `text://page` sentinel. Same self-containment law.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_page: Option<TextPageConfig>,
 }
 
 fn default_blend() -> String {
@@ -3103,6 +3113,10 @@ impl<'de> Deserialize<'de> for LayerConfig {
             active_clip_slot: Option<ClipSlotId>,
             #[serde(default)]
             matte: LayerMatteConfig,
+            #[serde(default)]
+            pattern: Option<PatternSynthConfig>,
+            #[serde(default)]
+            text_page: Option<TextPageConfig>,
         }
 
         let raw = RawLayerConfig::deserialize(deserializer)?;
@@ -3137,9 +3151,414 @@ impl<'de> Deserialize<'de> for LayerConfig {
             clip_slots,
             active_clip_slot,
             matte: raw.matte.sanitized(),
+            // Hostile scalars sanitize to their neutral values on load; the
+            // closed token vocabularies were already rejected by serde.
+            pattern: raw.pattern.map(PatternSynthConfig::sanitized),
+            text_page: raw.text_page.map(TextPageConfig::sanitized),
         };
         config.sync_legacy_mirrors_from_active_slot();
         Ok(config)
+    }
+}
+
+/// Closed pattern-shape token vocabulary. An unknown token is a
+/// deserialization rejection, never a silent default.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternShapeConfig {
+    #[default]
+    Scan,
+    Radial,
+    Spiral,
+    Plasma,
+    Lissajous,
+    Rings,
+    Starburst,
+    Grid,
+    Tunnel,
+    Cells,
+    Interference,
+    Polygon,
+}
+
+impl PatternShapeConfig {
+    pub fn to_runtime(self) -> crate::pattern_synth::PatternShape {
+        use crate::pattern_synth::PatternShape as S;
+        match self {
+            Self::Scan => S::Scan,
+            Self::Radial => S::Radial,
+            Self::Spiral => S::Spiral,
+            Self::Plasma => S::Plasma,
+            Self::Lissajous => S::Lissajous,
+            Self::Rings => S::Rings,
+            Self::Starburst => S::Starburst,
+            Self::Grid => S::Grid,
+            Self::Tunnel => S::Tunnel,
+            Self::Cells => S::Cells,
+            Self::Interference => S::Interference,
+            Self::Polygon => S::Polygon,
+        }
+    }
+
+    pub fn from_runtime(value: crate::pattern_synth::PatternShape) -> Self {
+        use crate::pattern_synth::PatternShape as S;
+        match value {
+            S::Scan => Self::Scan,
+            S::Radial => Self::Radial,
+            S::Spiral => Self::Spiral,
+            S::Plasma => Self::Plasma,
+            S::Lissajous => Self::Lissajous,
+            S::Rings => Self::Rings,
+            S::Starburst => Self::Starburst,
+            S::Grid => Self::Grid,
+            S::Tunnel => Self::Tunnel,
+            S::Cells => Self::Cells,
+            S::Interference => Self::Interference,
+            S::Polygon => Self::Polygon,
+        }
+    }
+}
+
+/// Closed oscillator-waveform token vocabulary.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternWaveConfig {
+    #[default]
+    Sine,
+    Triangle,
+    Saw,
+    Square,
+    Pulse,
+    SampleHold,
+}
+
+impl PatternWaveConfig {
+    pub fn to_runtime(self) -> crate::pattern_synth::PatternWave {
+        use crate::pattern_synth::PatternWave as W;
+        match self {
+            Self::Sine => W::Sine,
+            Self::Triangle => W::Triangle,
+            Self::Saw => W::Saw,
+            Self::Square => W::Square,
+            Self::Pulse => W::Pulse,
+            Self::SampleHold => W::SampleHold,
+        }
+    }
+
+    pub fn from_runtime(value: crate::pattern_synth::PatternWave) -> Self {
+        use crate::pattern_synth::PatternWave as W;
+        match value {
+            W::Sine => Self::Sine,
+            W::Triangle => Self::Triangle,
+            W::Saw => Self::Saw,
+            W::Square => Self::Square,
+            W::Pulse => Self::Pulse,
+            W::SampleHold => Self::SampleHold,
+        }
+    }
+}
+
+/// Closed colouriser token vocabulary.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternColorModeConfig {
+    Mono,
+    #[default]
+    RgbPhase,
+    HsvSweep,
+    Duotone,
+    Bands,
+}
+
+impl PatternColorModeConfig {
+    pub fn to_runtime(self) -> crate::pattern_synth::PatternColorMode {
+        use crate::pattern_synth::PatternColorMode as C;
+        match self {
+            Self::Mono => C::Mono,
+            Self::RgbPhase => C::RgbPhase,
+            Self::HsvSweep => C::HsvSweep,
+            Self::Duotone => C::Duotone,
+            Self::Bands => C::Bands,
+        }
+    }
+
+    pub fn from_runtime(value: crate::pattern_synth::PatternColorMode) -> Self {
+        use crate::pattern_synth::PatternColorMode as C;
+        match value {
+            C::Mono => Self::Mono,
+            C::RgbPhase => Self::RgbPhase,
+            C::HsvSweep => Self::HsvSweep,
+            C::Duotone => Self::Duotone,
+            C::Bands => Self::Bands,
+        }
+    }
+}
+
+/// The B7 pattern-synth patch DTO: three closed vocabularies plus the
+/// twenty-two continuous values, byte-mirroring the runtime law's ranges.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct PatternSynthConfig {
+    pub shape: PatternShapeConfig,
+    pub wave: PatternWaveConfig,
+    pub color_mode: PatternColorModeConfig,
+    pub freq_x: f32,
+    pub freq_y: f32,
+    pub phase: f32,
+    pub rate: f32,
+    pub cross_mod: f32,
+    pub wavefold: f32,
+    pub pulse_width: f32,
+    pub comparator: f32,
+    pub comp_threshold: f32,
+    pub comp_soft: f32,
+    pub symmetry: f32,
+    pub zoom: f32,
+    pub rotate: f32,
+    pub skew: f32,
+    pub center_x: f32,
+    pub center_y: f32,
+    pub warp: f32,
+    pub hue: f32,
+    pub hue_spread: f32,
+    pub saturation: f32,
+    pub brightness: f32,
+    pub color_bands: f32,
+}
+
+impl Default for PatternSynthConfig {
+    fn default() -> Self {
+        Self::from_params(&crate::pattern_synth::PatternSynthParams::default())
+    }
+}
+
+impl PatternSynthConfig {
+    pub fn from_params(params: &crate::pattern_synth::PatternSynthParams) -> Self {
+        let q = params.sanitized();
+        Self {
+            shape: PatternShapeConfig::from_runtime(q.shape),
+            wave: PatternWaveConfig::from_runtime(q.wave),
+            color_mode: PatternColorModeConfig::from_runtime(q.color_mode),
+            freq_x: q.freq_x,
+            freq_y: q.freq_y,
+            phase: q.phase,
+            rate: q.rate,
+            cross_mod: q.cross_mod,
+            wavefold: q.wavefold,
+            pulse_width: q.pulse_width,
+            comparator: q.comparator,
+            comp_threshold: q.comp_threshold,
+            comp_soft: q.comp_soft,
+            symmetry: q.symmetry,
+            zoom: q.zoom,
+            rotate: q.rotate,
+            skew: q.skew,
+            center_x: q.center_x,
+            center_y: q.center_y,
+            warp: q.warp,
+            hue: q.hue,
+            hue_spread: q.hue_spread,
+            saturation: q.saturation,
+            brightness: q.brightness,
+            color_bands: q.color_bands,
+        }
+    }
+
+    pub fn to_params(self) -> crate::pattern_synth::PatternSynthParams {
+        crate::pattern_synth::PatternSynthParams {
+            shape: self.shape.to_runtime(),
+            wave: self.wave.to_runtime(),
+            color_mode: self.color_mode.to_runtime(),
+            freq_x: self.freq_x,
+            freq_y: self.freq_y,
+            phase: self.phase,
+            rate: self.rate,
+            cross_mod: self.cross_mod,
+            wavefold: self.wavefold,
+            pulse_width: self.pulse_width,
+            comparator: self.comparator,
+            comp_threshold: self.comp_threshold,
+            comp_soft: self.comp_soft,
+            symmetry: self.symmetry,
+            zoom: self.zoom,
+            rotate: self.rotate,
+            skew: self.skew,
+            center_x: self.center_x,
+            center_y: self.center_y,
+            warp: self.warp,
+            hue: self.hue,
+            hue_spread: self.hue_spread,
+            saturation: self.saturation,
+            brightness: self.brightness,
+            color_bands: self.color_bands,
+        }
+        .sanitized()
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self::from_params(&self.to_params())
+    }
+}
+
+/// Closed text-page face token vocabulary — the two bundled licensed faces.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPageFontConfig {
+    #[default]
+    Mono,
+    Sans,
+}
+
+impl TextPageFontConfig {
+    pub fn to_runtime(self) -> crate::text_page::TextPageFont {
+        match self {
+            Self::Mono => crate::text_page::TextPageFont::Mono,
+            Self::Sans => crate::text_page::TextPageFont::Sans,
+        }
+    }
+
+    pub fn from_runtime(value: crate::text_page::TextPageFont) -> Self {
+        match value {
+            crate::text_page::TextPageFont::Mono => Self::Mono,
+            crate::text_page::TextPageFont::Sans => Self::Sans,
+        }
+    }
+}
+
+/// Closed text-page shape-fan token vocabulary.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPageShapeConfig {
+    #[default]
+    None,
+    Circle,
+    Ring,
+    Rect,
+    Tri,
+    Cross,
+    Bars,
+    Grid,
+    Rings,
+    Starburst,
+}
+
+impl TextPageShapeConfig {
+    pub fn to_runtime(self) -> crate::text_page::TextPageShape {
+        use crate::text_page::TextPageShape as S;
+        match self {
+            Self::None => S::None,
+            Self::Circle => S::Circle,
+            Self::Ring => S::Ring,
+            Self::Rect => S::Rect,
+            Self::Tri => S::Tri,
+            Self::Cross => S::Cross,
+            Self::Bars => S::Bars,
+            Self::Grid => S::Grid,
+            Self::Rings => S::Rings,
+            Self::Starburst => S::Starburst,
+        }
+    }
+
+    pub fn from_runtime(value: crate::text_page::TextPageShape) -> Self {
+        use crate::text_page::TextPageShape as S;
+        match value {
+            S::None => Self::None,
+            S::Circle => Self::Circle,
+            S::Ring => Self::Ring,
+            S::Rect => Self::Rect,
+            S::Tri => Self::Tri,
+            S::Cross => Self::Cross,
+            S::Bars => Self::Bars,
+            S::Grid => Self::Grid,
+            S::Rings => Self::Rings,
+            S::Starburst => Self::Starburst,
+        }
+    }
+}
+
+/// The B7 text-page patch DTO. Everything the raster depends on — the body,
+/// the face, the layout, the shape fan — travels here, so a patch is
+/// self-contained and the offline raster is byte-identical to the live one.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(deny_unknown_fields, default)]
+pub struct TextPageConfig {
+    pub body: String,
+    pub font: TextPageFontConfig,
+    pub size: f32,
+    pub track: f32,
+    pub x: f32,
+    pub y: f32,
+    pub rot_degrees: f32,
+    pub repeat: u32,
+    pub outline: f32,
+    pub ink: [f32; 3],
+    pub bg: [f32; 3],
+    pub shape: TextPageShapeConfig,
+    pub shape_count: u32,
+    pub shape_size: f32,
+    pub shape_x: f32,
+    pub shape_y: f32,
+    pub shape_fill: [f32; 3],
+    pub shape_stroke: f32,
+}
+
+impl Default for TextPageConfig {
+    fn default() -> Self {
+        Self::from_params(&crate::text_page::TextPageParams::default())
+    }
+}
+
+impl TextPageConfig {
+    pub fn from_params(params: &crate::text_page::TextPageParams) -> Self {
+        let q = params.sanitized();
+        Self {
+            body: q.body,
+            font: TextPageFontConfig::from_runtime(q.font),
+            size: q.size,
+            track: q.track,
+            x: q.x,
+            y: q.y,
+            rot_degrees: q.rot_degrees,
+            repeat: q.repeat,
+            outline: q.outline,
+            ink: q.ink,
+            bg: q.bg,
+            shape: TextPageShapeConfig::from_runtime(q.shape),
+            shape_count: q.shape_count,
+            shape_size: q.shape_size,
+            shape_x: q.shape_x,
+            shape_y: q.shape_y,
+            shape_fill: q.shape_fill,
+            shape_stroke: q.shape_stroke,
+        }
+    }
+
+    pub fn to_params(&self) -> crate::text_page::TextPageParams {
+        crate::text_page::TextPageParams {
+            body: self.body.clone(),
+            font: self.font.to_runtime(),
+            size: self.size,
+            track: self.track,
+            x: self.x,
+            y: self.y,
+            rot_degrees: self.rot_degrees,
+            repeat: self.repeat,
+            outline: self.outline,
+            ink: self.ink,
+            bg: self.bg,
+            shape: self.shape.to_runtime(),
+            shape_count: self.shape_count,
+            shape_size: self.shape_size,
+            shape_x: self.shape_x,
+            shape_y: self.shape_y,
+            shape_fill: self.shape_fill,
+            shape_stroke: self.shape_stroke,
+        }
+        .sanitized()
+    }
+
+    pub fn sanitized(self) -> Self {
+        Self::from_params(&self.to_params())
     }
 }
 
@@ -4001,6 +4420,8 @@ impl LayerConfig {
             clip_slots,
             active_clip_slot: Some(layer.active_clip_slot),
             matte: LayerMatteConfig::default(),
+            pattern: layer.pattern_params().map(PatternSynthConfig::from_params),
+            text_page: layer.text_page_params().map(TextPageConfig::from_params),
         }
     }
 
@@ -4083,6 +4504,12 @@ impl LayerConfig {
         layer.effects.clear_master_only_effects();
         layer.transform = self.transform.sanitized();
         layer.motion = self.motion.unwrap_or_default().to_params().sanitized();
+        // B7 pattern values land only on a layer that actually is a pattern
+        // source; the constructor already installed the config's params, so
+        // this is the same values-follow-kind law the effects take.
+        if let (Some(config), Some(params)) = (self.pattern, layer.pattern_params_mut()) {
+            *params = config.to_params();
+        }
     }
 
     /// Apply only the visual contribution of this saved position. Source
@@ -4099,6 +4526,13 @@ impl LayerConfig {
         );
         if let Some(motion) = self.motion {
             apply_motion_look(motion, &mut layer.motion);
+        }
+        // B7 pattern values transfer as a look only onto a live pattern
+        // layer — the matte kind-match precedent: values move, the source
+        // identity never does. A text page's body is content identity, not a
+        // look, and is deliberately not transferred.
+        if let (Some(config), Some(params)) = (self.pattern, layer.pattern_params_mut()) {
+            *params = config.to_params();
         }
     }
 
@@ -6060,6 +6494,8 @@ mod tests {
             )),
             active_clip_slot: Some(ClipSlotId::LEGACY),
             matte: LayerMatteConfig::default(),
+            pattern: None,
+            text_page: None,
         }
     }
 
@@ -6705,6 +7141,8 @@ scenes:
                 )),
                 active_clip_slot: Some(ClipSlotId::LEGACY),
                 matte: LayerMatteConfig::default(),
+                pattern: None,
+                text_page: None,
             }],
             master_rack: None,
             composition: None,
@@ -10218,5 +10656,105 @@ routings:
         assert_eq!(canvas.radius, 0.2);
         assert_eq!(canvas.strength, GestureCanvasConfig::default().strength);
         assert_eq!(canvas.retention, GestureCanvasConfig::default().retention);
+    }
+
+    #[test]
+    fn generator_sections_round_trip_and_absent_sections_keep_old_bytes() {
+        // An ordinary layer serializes without either generator section, so
+        // every pre-B7 patch keeps its bytes and canonical hashes.
+        let plain = LayerConfig {
+            filename: "clip.mp4".into(),
+            source_path: String::new(),
+            opacity: 1.0,
+            blend_mode: "normal".into(),
+            speed: 1.0,
+            fps: 30.0,
+            paused: false,
+            visible: true,
+            bypass_master_fx: false,
+            reroll_on_loop: false,
+            effects: EffectsConfig::default(),
+            transform: SpatialTransform::default(),
+            motion: None,
+            rack: None,
+            clip_slots: ClipSlots::singleton(ClipSlotConfig::from_legacy(
+                "clip.mp4".into(),
+                String::new(),
+                1.0,
+                30.0,
+            )),
+            active_clip_slot: None,
+            matte: LayerMatteConfig::default(),
+            pattern: None,
+            text_page: None,
+        };
+        let yaml = serde_yaml::to_string(&plain).unwrap();
+        assert!(!yaml.contains("pattern"));
+        assert!(!yaml.contains("text_page"));
+        let absent: LayerConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(absent.pattern, None);
+        assert_eq!(absent.text_page, None);
+
+        // A pattern section round trips whole, including the three closed
+        // vocabularies.
+        let authored = crate::pattern_synth::PatternSynthParams {
+            shape: crate::pattern_synth::PatternShape::Tunnel,
+            wave: crate::pattern_synth::PatternWave::SampleHold,
+            color_mode: crate::pattern_synth::PatternColorMode::Bands,
+            wavefold: 0.7,
+            hue: 0.31,
+            ..crate::pattern_synth::PatternSynthParams::default()
+        };
+        let config = PatternSynthConfig::from_params(&authored);
+        let pattern_yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(pattern_yaml.contains("shape: tunnel"));
+        assert!(pattern_yaml.contains("wave: sample_hold"));
+        assert!(pattern_yaml.contains("color_mode: bands"));
+        let restored: PatternSynthConfig = serde_yaml::from_str(&pattern_yaml).unwrap();
+        assert_eq!(restored, config);
+        assert_eq!(restored.to_params(), authored.sanitized());
+
+        // Hostile scalars sanitize to neutral values; unknown tokens and
+        // unknown fields are deserialization rejections.
+        let hostile: PatternSynthConfig =
+            serde_yaml::from_str("freq_x: .nan\nbrightness: 99.0\n").unwrap();
+        assert_eq!(hostile.to_params().freq_x, 0.18);
+        assert_eq!(hostile.to_params().brightness, 1.5);
+        assert!(
+            serde_yaml::from_str::<PatternSynthConfig>("shape: hypercube\n").is_err(),
+            "an unknown shape token is a deserialization rejection"
+        );
+        assert!(
+            serde_yaml::from_str::<PatternSynthConfig>("voltage: 1.0\n").is_err(),
+            "an unknown pattern field is a deserialization rejection"
+        );
+
+        // The text page round trips whole and its oversized body truncates on
+        // load rather than refusing the patch.
+        let page = crate::text_page::TextPageParams {
+            body: "HELLO\nWORLD".into(),
+            font: crate::text_page::TextPageFont::Sans,
+            shape: crate::text_page::TextPageShape::Starburst,
+            rot_degrees: 33.0,
+            ..crate::text_page::TextPageParams::default()
+        };
+        let text_config = TextPageConfig::from_params(&page);
+        let text_yaml = serde_yaml::to_string(&text_config).unwrap();
+        assert!(text_yaml.contains("font: sans"));
+        assert!(text_yaml.contains("shape: starburst"));
+        let text_restored: TextPageConfig = serde_yaml::from_str(&text_yaml).unwrap();
+        assert_eq!(text_restored, text_config);
+        assert_eq!(text_restored.to_params(), page.sanitized());
+        assert!(
+            serde_yaml::from_str::<TextPageConfig>("font: papyrus\n").is_err(),
+            "a face outside the bundled two is a deserialization rejection"
+        );
+
+        // Apply-to-layer look transfer stays kind-gated: a pattern config on
+        // a saved position moves values only through a live pattern layer,
+        // which is exercised by the runtime tests; here the DTO carries the
+        // sentinel contract.
+        assert_eq!(crate::layers::PATTERN_SOURCE_PATH, "synth://pattern");
+        assert_eq!(crate::layers::TEXT_PAGE_SOURCE_PATH, "text://page");
     }
 }

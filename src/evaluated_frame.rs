@@ -116,6 +116,10 @@ pub struct LayerFrameInput<'a> {
     pub visible: bool,
     pub paused: bool,
     pub bypass_master_fx: bool,
+    /// The B7 pattern synth's authored base, present only on a pattern
+    /// layer. The evaluator resolves this frame's modulated copy so live and
+    /// export encode identical pattern uniforms from the plan alone.
+    pub pattern: Option<&'a crate::pattern_synth::PatternSynthParams>,
 }
 
 /// Non-pixel state resolved for one layer. It stays index-aligned with the
@@ -138,6 +142,10 @@ pub struct EvaluatedLayer {
     pub visible: bool,
     pub paused: bool,
     pub bypass_master_fx: bool,
+    /// This frame's modulated pattern-synth values (base plus offsets,
+    /// sanitized), or `None` for every other source kind. Frame-local
+    /// evaluated data, never authored state.
+    pub pattern: Option<crate::pattern_synth::PatternSynthParams>,
 }
 
 /// One unique, output-sized donor image that must be materialized before the
@@ -318,6 +326,9 @@ impl EvaluatedFramePlan {
                 visible: input.visible,
                 paused: input.paused,
                 bypass_master_fx: input.bypass_master_fx,
+                pattern: input
+                    .pattern
+                    .map(|base| modulation.modulate_layer_pattern(index, base)),
             });
         }
 
@@ -643,6 +654,7 @@ mod tests {
             visible: base.visible,
             paused: base.paused,
             bypass_master_fx: base.bypass_master_fx,
+            pattern: None,
         }
     }
 

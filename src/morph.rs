@@ -1291,6 +1291,12 @@ pub struct LayerMorphSnapshot {
     /// snapshots store this value inside `effects` and omit this duplicate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_threshold: Option<f32>,
+    /// B7 pattern-synth capture, `Some` only when the captured layer was a
+    /// pattern source. Interpolation requires both slots to carry it, and
+    /// application lands only on a live pattern layer, so no morph position
+    /// can put pattern values on a different source kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<crate::patch::PatternSynthConfig>,
 }
 
 /// One independently optional field family in a persisted layer capture.
@@ -1310,6 +1316,7 @@ pub(crate) enum LayerMorphControl {
     BypassMasterFx,
     Transform,
     Motion,
+    Pattern,
 }
 
 impl Default for LayerMorphSnapshot {
@@ -1327,6 +1334,7 @@ impl Default for LayerMorphSnapshot {
             transform: None,
             motion: None,
             key_threshold: None,
+            pattern: None,
         }
     }
 }
@@ -1353,6 +1361,9 @@ impl LayerMorphSnapshot {
                 layer_ids,
             )),
             key_threshold: None,
+            pattern: layer
+                .pattern_params()
+                .map(crate::patch::PatternSynthConfig::from_params),
         }
         .sanitized()
     }
@@ -1379,6 +1390,9 @@ impl LayerMorphSnapshot {
             transform: self.transform.map(SpatialTransform::sanitized),
             motion: self.motion.map(MotionConfig::sanitized),
             key_threshold: if has_effects { None } else { legacy_key },
+            pattern: self
+                .pattern
+                .map(crate::patch::PatternSynthConfig::sanitized),
         }
     }
 
@@ -1440,6 +1454,10 @@ impl LayerMorphSnapshot {
                 _ => None,
             },
             key_threshold,
+            pattern: match (a.pattern, b.pattern) {
+                (Some(a), Some(b)) => Some(interpolate_pattern_config(a, b, weights, choose_b)),
+                _ => None,
+            },
         }
     }
 
@@ -1474,7 +1492,56 @@ impl LayerMorphSnapshot {
         if let Some(motion) = clean.motion {
             layer.motion = motion.to_params().sanitized();
         }
+        // Kind-gated at application: pattern values land only on a layer
+        // that actually is a pattern source.
+        if let (Some(config), Some(params)) = (clean.pattern, layer.pattern_params_mut()) {
+            *params = config.to_params();
+        }
     }
+}
+
+/// Blend the B7 pattern-synth capture: the twenty-two continuous values
+/// interpolate — hue along its shortest wrapped unit arc — and the three
+/// discrete vocabularies recall an endpoint at the midpoint.
+fn interpolate_pattern_config(
+    a: crate::patch::PatternSynthConfig,
+    b: crate::patch::PatternSynthConfig,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> crate::patch::PatternSynthConfig {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    let blend = |x: f32, y: f32| blend_finite(x, y, weights);
+    let hue =
+        blend_wrapped_degrees(a.hue * 360.0, b.hue * 360.0, weights).rem_euclid(360.0) / 360.0;
+    crate::patch::PatternSynthConfig {
+        shape: pick(a.shape, b.shape, choose_b),
+        wave: pick(a.wave, b.wave, choose_b),
+        color_mode: pick(a.color_mode, b.color_mode, choose_b),
+        freq_x: blend(a.freq_x, b.freq_x),
+        freq_y: blend(a.freq_y, b.freq_y),
+        phase: blend(a.phase, b.phase),
+        rate: blend(a.rate, b.rate),
+        cross_mod: blend(a.cross_mod, b.cross_mod),
+        wavefold: blend(a.wavefold, b.wavefold),
+        pulse_width: blend(a.pulse_width, b.pulse_width),
+        comparator: blend(a.comparator, b.comparator),
+        comp_threshold: blend(a.comp_threshold, b.comp_threshold),
+        comp_soft: blend(a.comp_soft, b.comp_soft),
+        symmetry: blend(a.symmetry, b.symmetry),
+        zoom: blend(a.zoom, b.zoom),
+        rotate: blend(a.rotate, b.rotate),
+        skew: blend(a.skew, b.skew),
+        center_x: blend(a.center_x, b.center_x),
+        center_y: blend(a.center_y, b.center_y),
+        warp: blend(a.warp, b.warp),
+        hue,
+        hue_spread: blend(a.hue_spread, b.hue_spread),
+        saturation: blend(a.saturation, b.saturation),
+        brightness: blend(a.brightness, b.brightness),
+        color_bands: blend(a.color_bands, b.color_bands),
+    }
+    .sanitized()
 }
 
 /// One serializable A or B morph slot. This is the neutral persistence type;
@@ -2595,6 +2662,10 @@ impl Morph {
             }
             LayerMorphControl::Transform => a.transform.is_some() && b.transform.is_some(),
             LayerMorphControl::Motion => a.motion.is_some() && b.motion.is_some(),
+            // Both slots must have captured a pattern source at this
+            // position; two slots captured against different source kinds
+            // own nothing and stay directly editable.
+            LayerMorphControl::Pattern => a.pattern.is_some() && b.pattern.is_some(),
         }
     }
 
@@ -4380,6 +4451,7 @@ mod tests {
             }),
             motion: None,
             key_threshold: None,
+            pattern: None,
         }
     }
 
@@ -4863,6 +4935,87 @@ mod tests {
             interpolate_motion_config(a, b, [0.0, 1.0], true).procedural,
             b.procedural
         );
+    }
+
+    #[test]
+    fn pattern_capture_blends_values_wraps_hue_and_recalls_discrete_laws_at_midpoint() {
+        use crate::patch::{
+            PatternColorModeConfig, PatternShapeConfig, PatternSynthConfig, PatternWaveConfig,
+        };
+
+        let a = PatternSynthConfig {
+            shape: PatternShapeConfig::Scan,
+            wave: PatternWaveConfig::Sine,
+            color_mode: PatternColorModeConfig::Mono,
+            wavefold: 0.2,
+            hue: 0.95,
+            ..PatternSynthConfig::default()
+        };
+        let b = PatternSynthConfig {
+            shape: PatternShapeConfig::Polygon,
+            wave: PatternWaveConfig::SampleHold,
+            color_mode: PatternColorModeConfig::Bands,
+            wavefold: 0.8,
+            hue: 0.05,
+            ..PatternSynthConfig::default()
+        };
+        // Before the midpoint: A's discrete laws, blended values, and the
+        // hue takes the short arc across the wrap rather than sweeping the
+        // whole circle.
+        let quarter = interpolate_pattern_config(a, b, [0.75, 0.25], false);
+        assert_eq!(quarter.shape, PatternShapeConfig::Scan);
+        assert_eq!(quarter.wave, PatternWaveConfig::Sine);
+        assert_eq!(quarter.color_mode, PatternColorModeConfig::Mono);
+        assert!((quarter.wavefold - 0.35).abs() < 1.0e-6);
+        let wrapped = quarter.hue;
+        assert!(
+            !(0.2..=0.8).contains(&wrapped),
+            "hue must cross the wrap, got {wrapped}"
+        );
+        // Past the midpoint: B's discrete laws.
+        let past = interpolate_pattern_config(a, b, [0.25, 0.75], true);
+        assert_eq!(past.shape, PatternShapeConfig::Polygon);
+        assert_eq!(past.wave, PatternWaveConfig::SampleHold);
+        assert_eq!(past.color_mode, PatternColorModeConfig::Bands);
+        // Endpoints are exact.
+        assert_eq!(interpolate_pattern_config(a, b, [1.0, 0.0], false), a);
+        assert_eq!(interpolate_pattern_config(a, b, [0.0, 1.0], true), b);
+    }
+
+    #[test]
+    fn pattern_ownership_requires_both_slots_and_interpolation_requires_both_captures() {
+        use crate::patch::PatternSynthConfig;
+
+        // A snapshot pair where only one side captured a pattern source
+        // interpolates to no pattern claim at all.
+        let with_pattern = LayerMorphSnapshot {
+            pattern: Some(PatternSynthConfig::default()),
+            ..LayerMorphSnapshot::default()
+        };
+        let without = LayerMorphSnapshot::default();
+        let mixed = LayerMorphSnapshot::interpolate(&with_pattern, &without, [0.5, 0.5], false);
+        assert_eq!(mixed.pattern, None);
+        let paired =
+            LayerMorphSnapshot::interpolate(&with_pattern, &with_pattern, [0.5, 0.5], false);
+        assert!(paired.pattern.is_some());
+
+        // Ownership answers from the same both-slots gate.
+        let mut morph = Morph::default();
+        let make_slot = |pattern: Option<PatternSynthConfig>| MorphSlot {
+            layers: vec![LayerMorphSnapshot {
+                position: 0,
+                pattern,
+                ..LayerMorphSnapshot::default()
+            }],
+            ..MorphSlot::default()
+        };
+        morph.a = Some(make_slot(Some(PatternSynthConfig::default())));
+        morph.b = Some(make_slot(None));
+        assert!(!morph.controls_layer_field(0, LayerMorphControl::Pattern));
+        morph.b = Some(make_slot(Some(PatternSynthConfig::default())));
+        assert!(morph.controls_layer_field(0, LayerMorphControl::Pattern));
+        // An appended layer outside the capture stays directly editable.
+        assert!(!morph.controls_layer_field(1, LayerMorphControl::Pattern));
     }
 
     #[test]

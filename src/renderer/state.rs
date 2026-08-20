@@ -2950,6 +2950,11 @@ pub struct Renderer {
     pub output_width: u32,
     pub output_height: u32,
 
+    // The B7 pattern-synth source executor, lazily constructed on the first
+    // pattern layer. Not a full-frame surface owner: it renders into
+    // layer-owned textures, so it never enters the texture-floor accounting.
+    pattern_synth: Option<crate::renderer::pattern_synth::PatternSynthGpu>,
+
     // Staging buffers for async NTSC readback (created lazily, reused)
     readback_slots: Vec<ReadbackSlot>,
     next_readback_sequence: u64,
@@ -3375,6 +3380,7 @@ impl Renderer {
             output_view,
             output_width,
             output_height,
+            pattern_synth: None,
             readback_slots: Vec::new(),
             next_readback_sequence: 1,
             last_harvested_readback_sequence: 0,
@@ -3693,6 +3699,27 @@ impl Renderer {
     /// image (program memory, the temporal-ring/melt precedent), so no frame
     /// rendered under the emergency cut ever enters a re-entry loop and a
     /// release resumes from the picture the cut interrupted.
+    /// Encode every pattern layer's synth pass into the frame encoder,
+    /// before any consumer samples the layer textures. The executor is
+    /// lazily constructed on the first job, so a session with no pattern
+    /// layer charges nothing.
+    pub fn encode_pattern_synth_layers(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        jobs: &[(
+            crate::pattern_synth::PatternSynthGpuUniforms,
+            &wgpu::TextureView,
+        )],
+    ) {
+        if jobs.is_empty() {
+            return;
+        }
+        let stage = self.pattern_synth.get_or_insert_with(|| {
+            crate::renderer::pattern_synth::PatternSynthGpu::new(&self.device)
+        });
+        stage.encode(&self.device, &self.queue, encoder, jobs);
+    }
+
     pub fn publish_program_tap(&mut self) {
         let mut encoder = self
             .device

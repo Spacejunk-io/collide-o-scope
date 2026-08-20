@@ -1654,6 +1654,10 @@ enum ExportMotionSourceKind {
     Still,
     SpoutBlack,
     UnavailableBlack,
+    /// B7 pattern synth: reconstructed exactly from the patch, no bytes.
+    PatternSynth,
+    /// B7 text page: rastered exactly from the patch, no bytes.
+    TextPage,
 }
 
 #[derive(Debug, Clone)]
@@ -1720,6 +1724,10 @@ struct ExportLayer {
     fps: f32,
     width: u32,
     height: u32,
+    /// B7 pattern-synth authored values reconstructed from the patch;
+    /// `Some` iff this layer is a pattern layer. The per-frame GPU pass is
+    /// its only pixel producer offline exactly as live.
+    pattern: Option<crate::pattern_synth::PatternSynthParams>,
 }
 
 fn motion_field_source_key(value: crate::motion::MotionFieldSource) -> &'static str {
@@ -1798,6 +1806,8 @@ fn export_motion_source_kind_key(value: ExportMotionSourceKind) -> &'static str 
         ExportMotionSourceKind::Still => "still",
         ExportMotionSourceKind::SpoutBlack => "spout_deterministic_black",
         ExportMotionSourceKind::UnavailableBlack => "unavailable_deterministic_black",
+        ExportMotionSourceKind::PatternSynth => "pattern_synth",
+        ExportMotionSourceKind::TextPage => "text_page",
     }
 }
 
@@ -2531,6 +2541,10 @@ struct ExportFrameLayerBase {
     visible: bool,
     paused: bool,
     bypass_master_fx: bool,
+    /// B7 pattern-synth base, present only for a pattern layer. Morph
+    /// samples write into it exactly as they write effects, so the shared
+    /// evaluator sees the same post-morph base live rendering sees.
+    pattern: Option<crate::pattern_synth::PatternSynthParams>,
 }
 
 impl From<&ExportLayer> for ExportFrameLayerBase {
@@ -2545,6 +2559,7 @@ impl From<&ExportLayer> for ExportFrameLayerBase {
             visible: layer.visible,
             paused: layer.paused,
             bypass_master_fx: layer.bypass_master_fx,
+            pattern: layer.pattern,
         }
     }
 }
@@ -2765,7 +2780,10 @@ fn resolve_export_visual_source(
     context: &crate::media_source::ResolveContext,
     fingerprints: &mut crate::media_source::FingerprintSession,
 ) -> Result<crate::media_source::ResolvedVisualSource, crate::media_source::SourceResolveError> {
-    if crate::layers::spout_sender_from_source_path(persisted_source).is_some() {
+    if crate::layers::spout_sender_from_source_path(persisted_source).is_some()
+        || persisted_source == crate::layers::PATTERN_SOURCE_PATH
+        || persisted_source == crate::layers::TEXT_PAGE_SOURCE_PATH
+    {
         return crate::media_source::resolve_visual_source(
             persisted_source,
             logical_name,
@@ -2918,6 +2936,178 @@ fn black_placeholder_layer(
         fps,
         width,
         height,
+        pattern: None,
+    })
+}
+
+/// B7 pattern-synth reconstruction: no bytes exist or could — the per-frame
+/// GPU pass computes the picture from the patch's own authored values, so
+/// the texture is created renderable and uploaded nothing.
+fn pattern_export_layer(
+    device: &wgpu::Device,
+    source_index: usize,
+    layer_cfg: &crate::patch::LayerConfig,
+) -> Result<ExportLayer, String> {
+    let width = crate::pattern_synth::PATTERN_SYNTH_WIDTH;
+    let height = crate::pattern_synth::PATTERN_SYNTH_HEIGHT;
+    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let out_of_memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Export Pattern Layer"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let errors = [
+        pollster::block_on(out_of_memory.pop()),
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+    ];
+    if let Some(error) = errors.into_iter().flatten().next() {
+        return Err(format!(
+            "could not allocate Export Pattern Layer at {width}x{height}: {error}"
+        ));
+    }
+
+    let mut effects = EffectUniforms {
+        resolution: [width as f32, height as f32],
+        ..Default::default()
+    };
+    layer_cfg.effects.apply_to_uniforms(&mut effects);
+    effects.clear_master_only_effects();
+    let transport = ExportClipTransport::from_layer_config(layer_cfg, 0.0, 0);
+    let fps = export_transport_fps(&transport, layer_cfg.fps);
+    let params = layer_cfg
+        .pattern
+        .map(crate::patch::PatternSynthConfig::to_params)
+        .unwrap_or_default();
+    Ok(ExportLayer {
+        source_index,
+        motion_source: {
+            let (logical_name, persisted_reference) = active_export_clip_source(layer_cfg);
+            ExportMotionSourceRecord {
+                kind: ExportMotionSourceKind::PatternSynth,
+                logical_name: logical_name.to_owned(),
+                persisted_reference: persisted_reference.to_owned(),
+                fingerprint: None,
+            }
+        },
+        decoder: None,
+        codec_motion: None,
+        codec_motion_predecessor: None,
+        _still_source: None,
+        texture,
+        texture_view,
+        effects,
+        transform: layer_cfg.transform.sanitized(),
+        opacity: layer_cfg.opacity,
+        blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
+        bypass_master_fx: layer_cfg.bypass_master_fx,
+        matte: LayerMatte::default(),
+        reroll_on_loop: false,
+        consumed_loop_generation: 0,
+        transport,
+        speed: transport.authored.rate as f32,
+        visible: layer_cfg.visible,
+        paused: layer_cfg.paused,
+        fps,
+        width,
+        height,
+        pattern: Some(params),
+    })
+}
+
+/// B7 text-page reconstruction: the identical CPU raster the live layer ran,
+/// from the patch's own authored values, uploaded once like a still.
+fn text_page_export_layer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source_index: usize,
+    layer_cfg: &crate::patch::LayerConfig,
+    media_policy: &crate::media_safety::MediaSafetyPolicy,
+    device_limits: crate::media_safety::MediaDeviceLimits,
+) -> Result<ExportLayer, String> {
+    let width = crate::text_page::TEXT_PAGE_WIDTH;
+    let height = crate::text_page::TEXT_PAGE_HEIGHT;
+    media_policy
+        .plan(
+            crate::media_safety::MediaSourceKind::Still,
+            width,
+            height,
+            device_limits,
+        )
+        .map_err(|error| format!("text page source rejected: {error}"))?;
+    let params = layer_cfg
+        .text_page
+        .as_ref()
+        .map(crate::patch::TextPageConfig::to_params)
+        .unwrap_or_default();
+    let page = crate::text_page::render_text_page(&params, crate::text_page::bundled_fonts());
+    let (texture, texture_view) =
+        create_export_source_texture(device, width, height, "Export Text Page Layer")?;
+    upload_export_texture_checked(
+        device,
+        queue,
+        &texture,
+        &page,
+        width,
+        height,
+        "Export Text Page Layer",
+    )?;
+
+    let mut effects = EffectUniforms {
+        resolution: [width as f32, height as f32],
+        ..Default::default()
+    };
+    layer_cfg.effects.apply_to_uniforms(&mut effects);
+    effects.clear_master_only_effects();
+    let transport = ExportClipTransport::from_layer_config(layer_cfg, 0.0, 1);
+    let fps = export_transport_fps(&transport, layer_cfg.fps);
+    Ok(ExportLayer {
+        source_index,
+        motion_source: {
+            let (logical_name, persisted_reference) = active_export_clip_source(layer_cfg);
+            ExportMotionSourceRecord {
+                kind: ExportMotionSourceKind::TextPage,
+                logical_name: logical_name.to_owned(),
+                persisted_reference: persisted_reference.to_owned(),
+                fingerprint: None,
+            }
+        },
+        decoder: None,
+        codec_motion: None,
+        codec_motion_predecessor: None,
+        _still_source: None,
+        texture,
+        texture_view,
+        effects,
+        transform: layer_cfg.transform.sanitized(),
+        opacity: layer_cfg.opacity,
+        blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
+        bypass_master_fx: layer_cfg.bypass_master_fx,
+        matte: LayerMatte::default(),
+        reroll_on_loop: false,
+        consumed_loop_generation: 0,
+        transport,
+        speed: transport.authored.rate as f32,
+        visible: layer_cfg.visible,
+        paused: layer_cfg.paused,
+        fps,
+        width,
+        height,
+        pattern: None,
     })
 }
 
@@ -2986,6 +3176,7 @@ fn still_export_layer(
         fps,
         width,
         height,
+        pattern: None,
     })
 }
 
@@ -3543,6 +3734,7 @@ fn evaluate_export_morph_world(
                 visible: base.visible,
                 paused: base.paused,
                 bypass_master_fx: base.bypass_master_fx,
+                pattern: base.pattern.as_ref(),
             }),
     )
 }
@@ -4854,6 +5046,10 @@ fn run_export(
     // histories are admitted lazily only after the immutable planner selects
     // Advanced, preserving the established legacy allocation/render path.
     let mut composition_gpu: Option<CompositionGpuExecutor> = None;
+    // B7 pattern-synth executor, lazily constructed on the first pattern
+    // layer's first frame — modulation can wake nothing here (presence is
+    // authored), so a job with no pattern layer charges nothing.
+    let mut pattern_synth_gpu: Option<crate::renderer::pattern_synth::PatternSynthGpu> = None;
 
     // --- Composite textures (same 3-texture scheme as live renderer) ---
     let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -5007,6 +5203,21 @@ fn run_export(
                     &queue,
                     source_index,
                     layer_cfg,
+                )?);
+                continue;
+            }
+            Ok(crate::media_source::ResolvedVisualSource::PatternSynth) => {
+                layers.push(pattern_export_layer(&device, source_index, layer_cfg)?);
+                continue;
+            }
+            Ok(crate::media_source::ResolvedVisualSource::TextPage) => {
+                layers.push(text_page_export_layer(
+                    &device,
+                    &queue,
+                    source_index,
+                    layer_cfg,
+                    &config.media_safety_policy,
+                    media_device_limits,
                 )?);
                 continue;
             }
@@ -5237,6 +5448,7 @@ fn run_export(
             fps,
             width: lw,
             height: lh,
+            pattern: None,
         });
     }
 
@@ -5884,6 +6096,7 @@ fn run_export(
                         visible: base.visible,
                         paused: base.paused,
                         bypass_master_fx: base.bypass_master_fx,
+                        pattern: base.pattern.as_ref(),
                     },
                 ),
             );
@@ -5986,6 +6199,38 @@ fn run_export(
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Export Frame Encoder"),
         });
+
+        // B7 pattern-synth sources render first, into their own layer
+        // textures inside this same encoder — the identical seat the live
+        // frame uses, from the identical plan-owned uniforms, so there is no
+        // export-only synth path.
+        {
+            let pattern_jobs: Vec<(
+                crate::pattern_synth::PatternSynthGpuUniforms,
+                &wgpu::TextureView,
+            )> = evaluated_frame
+                .layers()
+                .iter()
+                .zip(layers.iter())
+                .filter_map(|(evaluated, layer)| {
+                    evaluated.pattern.map(|params| {
+                        (
+                            crate::pattern_synth::PatternSynthGpuUniforms::from_params(
+                                &params,
+                                evaluated_frame.context().time_seconds,
+                            ),
+                            &layer.texture_view,
+                        )
+                    })
+                })
+                .collect();
+            if !pattern_jobs.is_empty() {
+                let stage = pattern_synth_gpu.get_or_insert_with(|| {
+                    crate::renderer::pattern_synth::PatternSynthGpu::new(&device)
+                });
+                stage.encode(&device, &queue, &mut encoder, &pattern_jobs);
+            }
+        }
 
         let (selective_frame, advanced_history_staged) = match &evaluated_composition {
             EvaluatedCompositionPlan::Advanced(advanced) => {
@@ -8744,6 +8989,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }),
         );
         plan_export_composition(
@@ -8917,6 +9163,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }),
         );
         let plan = plan_export_composition(
@@ -9045,6 +9292,7 @@ layers:
                         visible: true,
                         paused: false,
                         bypass_master_fx: false,
+                        pattern: None,
                     }),
             );
             let planned = plan_export_composition(
@@ -9143,6 +9391,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: slot == 0,
+                    pattern: None,
                 }),
         );
         let selective_advanced = plan_export_composition(
@@ -9581,6 +9830,7 @@ layers:
                             visible: true,
                             paused: false,
                             bypass_master_fx: false,
+                            pattern: None,
                         }),
                 );
                 let planned = plan_export_composition(
@@ -9905,6 +10155,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }),
         )
     }
@@ -11354,6 +11605,7 @@ layers:
                         visible: true,
                         paused: false,
                         bypass_master_fx: false,
+                        pattern: None,
                     }),
             )
         };
@@ -11510,6 +11762,7 @@ layers:
                         visible: true,
                         paused: false,
                         bypass_master_fx: false,
+                        pattern: None,
                     }),
             )
         };
@@ -12587,6 +12840,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }],
             );
             let master_pass = *plan.master_pass();
@@ -13062,6 +13316,7 @@ layers:
                 fps: base.fps,
                 width: 4,
                 height: 3,
+                pattern: None,
             })
         }
 
@@ -13477,6 +13732,7 @@ layers:
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                pattern: None,
             }],
         );
         let params = MotionParams {
@@ -14554,6 +14810,7 @@ layers:
             visible: true,
             paused: false,
             bypass_master_fx: false,
+            pattern: None,
         }
     }
 
@@ -14585,6 +14842,7 @@ layers:
             visible: true,
             paused: false,
             bypass_master_fx: false,
+            pattern: None,
         }
     }
 
@@ -14857,6 +15115,7 @@ layers:
                 visible: layer.visible,
                 paused: layer.paused,
                 bypass_master_fx: layer.bypass_master_fx,
+                pattern: None,
             }],
         )
     }
@@ -14939,6 +15198,7 @@ layers:
                 visible: layer.visible,
                 paused: layer.paused,
                 bypass_master_fx: layer.bypass_master_fx,
+                pattern: None,
             }],
         )
     }
@@ -15064,6 +15324,7 @@ layers:
                     visible: layer.visible,
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    pattern: None,
                 }),
         );
         (plan, layers)
@@ -15126,6 +15387,7 @@ layers:
                     visible: layer.visible,
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    pattern: None,
                 }),
         );
         (plan, layers)
@@ -15193,6 +15455,7 @@ layers:
             visible,
             paused: false,
             bypass_master_fx: false,
+            pattern: None,
         }
     }
 
@@ -15236,6 +15499,7 @@ layers:
                     visible: visible[index],
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }),
         )
         .with_image_routing(mattes.iter().copied(), history_ready)
@@ -15346,6 +15610,7 @@ layers:
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                pattern: None,
             }],
         );
         assert!(oversized
@@ -15852,6 +16117,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }
             })
             .collect();
@@ -15892,6 +16158,7 @@ layers:
                     visible: layer.visible,
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    pattern: None,
                 }),
         );
         assert_eq!(plan.layer_passes().len(), 8);
@@ -17033,6 +17300,8 @@ layers:
                 ),
                 active_clip_slot: Some(crate::performance::ClipSlotId::LEGACY),
                 matte: crate::image_routing::LayerMatteConfig::default(),
+                pattern: None,
+                text_page: None,
             })
             .collect();
         let patch = PatchState {
@@ -17163,6 +17432,8 @@ mod effects_audit {
                 ),
                 active_clip_slot: Some(crate::performance::ClipSlotId::LEGACY),
                 matte: crate::image_routing::LayerMatteConfig::default(),
+                pattern: None,
+                text_page: None,
             }],
             ntsc: Some(NtscConfig::default()),
             modulation: None,
@@ -18351,6 +18622,109 @@ mod effects_audit {
             decoded_framemd5("renders/audit_program_reentry.mp4"),
             decoded_framemd5("renders/audit_program_reentry_repeat.mp4"),
             "the re-entry loop must replay deterministically"
+        );
+    }
+
+    /// B7's pattern labeled export case, and the self-containment proof: the
+    /// patch's only layer is a pattern synth — no file, no content
+    /// reference, no library — and the export must render it through the
+    /// same GPU pass live uses. The `_default` twin holds the identical
+    /// topology with default pattern values and must decode differently; the
+    /// `_repeat` render must decode identically, proving the frame-plan
+    /// clock deterministic offline.
+    #[test]
+    #[ignore = "requires a GPU and ffmpeg on PATH"]
+    fn render_pattern_synth_pipeline() {
+        std::fs::create_dir_all("renders").ok();
+        let with_pattern = |authored: bool| {
+            let mut patch = base_patch();
+            let mut config = crate::patch::PatternSynthConfig::default();
+            if authored {
+                config.shape = crate::patch::PatternShapeConfig::Tunnel;
+                config.wave = crate::patch::PatternWaveConfig::Saw;
+                config.color_mode = crate::patch::PatternColorModeConfig::HsvSweep;
+                config.cross_mod = 0.6;
+                config.wavefold = 0.5;
+                config.comparator = 0.4;
+                config.rate = 0.4;
+                config.warp = 0.3;
+            }
+            patch.layers[0].filename = "Pattern Synth".to_string();
+            patch.layers[0].source_path = crate::layers::PATTERN_SOURCE_PATH.to_string();
+            patch.layers[0].clip_slots = crate::performance::ClipSlots::singleton(
+                crate::performance::ClipSlotConfig::from_legacy(
+                    "Pattern Synth".to_string(),
+                    crate::layers::PATTERN_SOURCE_PATH.to_string(),
+                    1.0,
+                    30.0,
+                ),
+            );
+            patch.layers[0].pattern = Some(config);
+            patch
+        };
+        render("pattern_synth", with_pattern(true));
+        render("pattern_synth_default", with_pattern(false));
+        assert_ne!(
+            decoded_framemd5("renders/audit_pattern_synth.mp4"),
+            decoded_framemd5("renders/audit_pattern_synth_default.mp4"),
+            "authored pattern values must change the decoded frames"
+        );
+        render("pattern_synth_repeat", with_pattern(true));
+        assert_eq!(
+            decoded_framemd5("renders/audit_pattern_synth.mp4"),
+            decoded_framemd5("renders/audit_pattern_synth_repeat.mp4"),
+            "the pattern clock must replay deterministically"
+        );
+    }
+
+    /// B7's text-page labeled export case: the patch's only layer is a
+    /// typeset page rastered from its own authored values through the same
+    /// CPU raster live uses — no file, no font on the host, no library. The
+    /// `_alt` twin authors a different body and shape fan and must decode
+    /// differently; the `_repeat` render must decode identically.
+    #[test]
+    #[ignore = "requires a GPU and ffmpeg on PATH"]
+    fn render_text_page_pipeline() {
+        std::fs::create_dir_all("renders").ok();
+        let with_page = |alt: bool| {
+            let mut patch = base_patch();
+            let mut config = crate::patch::TextPageConfig::default();
+            if alt {
+                config.body = "OTHER\nPAGE".to_string();
+                config.font = crate::patch::TextPageFontConfig::Sans;
+                config.shape = crate::patch::TextPageShapeConfig::Rings;
+                config.rot_degrees = 20.0;
+                config.outline = 4.0;
+            } else {
+                config.body = "COLLIDE\nO SCOPE".to_string();
+                config.shape = crate::patch::TextPageShapeConfig::Circle;
+                config.shape_size = 0.4;
+            }
+            patch.layers[0].filename = "Text Page".to_string();
+            patch.layers[0].source_path = crate::layers::TEXT_PAGE_SOURCE_PATH.to_string();
+            patch.layers[0].clip_slots = crate::performance::ClipSlots::singleton(
+                crate::performance::ClipSlotConfig::from_legacy(
+                    "Text Page".to_string(),
+                    crate::layers::TEXT_PAGE_SOURCE_PATH.to_string(),
+                    1.0,
+                    30.0,
+                ),
+            );
+            patch.layers[0].text_page = Some(config);
+            patch
+        };
+        render("text_page", with_page(false));
+        render("text_page_alt", with_page(true));
+        assert_ne!(
+            decoded_framemd5("renders/audit_text_page.mp4"),
+            decoded_framemd5("renders/audit_text_page_alt.mp4"),
+            "a different authored page must decode differently"
+        );
+        render("text_page_repeat", with_page(false));
+        assert_eq!(
+            decoded_framemd5("renders/audit_text_page.mp4"),
+            decoded_framemd5("renders/audit_text_page_repeat.mp4"),
+            "the page raster must replay deterministically"
         );
     }
 

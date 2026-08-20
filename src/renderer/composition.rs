@@ -4839,6 +4839,7 @@ mod tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    pattern: None,
                 }),
         )
     }
@@ -5959,6 +5960,7 @@ mod tests {
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                pattern: None,
             }],
         );
         let composition = RuntimeComposition::try_from_parts(

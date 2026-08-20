@@ -292,7 +292,14 @@ pub struct ResolvedFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedVisualSource {
     File(ResolvedFile),
-    Spout { sender: String },
+    Spout {
+        sender: String,
+    },
+    /// B7 pattern synth: no file identity exists or could — the whole
+    /// authored state travels in the layer's own config.
+    PatternSynth,
+    /// B7 text page, the same self-contained law.
+    TextPage,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -357,6 +364,14 @@ where
         return Ok(ResolvedVisualSource::Spout {
             sender: sender.to_string(),
         });
+    }
+    // The B7 generator sentinels resolve before any filesystem work, like
+    // Spout: there is nothing on disk to find.
+    if source_path == crate::layers::PATTERN_SOURCE_PATH {
+        return Ok(ResolvedVisualSource::PatternSynth);
+    }
+    if source_path == crate::layers::TEXT_PAGE_SOURCE_PATH {
+        return Ok(ResolvedVisualSource::TextPage);
     }
     resolve_file_source(
         source_path,

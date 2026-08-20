@@ -23,6 +23,7 @@ mod motion;
 mod ntsc;
 mod osc;
 mod patch;
+mod pattern_synth;
 mod performance;
 mod performance_runtime;
 mod precision;
@@ -55,6 +56,7 @@ mod study_eval;
 )]
 mod symmetry;
 mod temporal;
+mod text_page;
 mod transform_gizmo;
 mod transport;
 mod video;
@@ -4472,6 +4474,7 @@ impl App {
                     visible: layer.visible && runtime.transport_visible(),
                     paused: runtime.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    pattern: runtime.pattern_params(),
                 }),
         );
         let mattes: Vec<_> = layers.iter().map(|layer| layer.matte).collect();
@@ -5509,6 +5512,68 @@ impl App {
             Err(error) => {
                 self.media_safety_status = format!("Rejected Spout sender {sender_name}: {error}");
                 log::error!("Failed to create Spout input layer: {error}");
+            }
+        }
+    }
+
+    /// Add a B7 pattern-synth layer with default authored values. The card
+    /// and wire edits author it from there.
+    fn add_pattern_layer(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            log::error!("Cannot add a pattern layer before the renderer is ready");
+            return;
+        };
+        match Layer::new_pattern_with_media_policy(
+            pattern_synth::PatternSynthParams::default(),
+            &renderer.device,
+            &self.media_safety_policy,
+        ) {
+            Ok(mut layer) => {
+                self.initialize_new_interactive_transform(&mut layer);
+                match self.commit_new_bottom_layer(layer) {
+                    Ok(_) => {
+                        self.media_safety_status = "Added pattern synth layer".to_string();
+                    }
+                    Err(error) => {
+                        self.composition_status = format!("Layer add rejected: {error}");
+                        self.media_safety_status = format!("Rejected pattern synth: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                self.media_safety_status = format!("Rejected pattern synth: {error}");
+                log::error!("Failed to create pattern synth layer: {error}");
+            }
+        }
+    }
+
+    /// Add a B7 text-page layer with the default page.
+    fn add_text_layer(&mut self) {
+        let Some(renderer) = self.renderer.as_ref() else {
+            log::error!("Cannot add a text layer before the renderer is ready");
+            return;
+        };
+        match Layer::new_text_page_with_media_policy(
+            text_page::TextPageParams::default(),
+            &renderer.device,
+            &self.media_safety_policy,
+            text_page::bundled_fonts(),
+        ) {
+            Ok(mut layer) => {
+                self.initialize_new_interactive_transform(&mut layer);
+                match self.commit_new_bottom_layer(layer) {
+                    Ok(_) => {
+                        self.media_safety_status = "Added text page layer".to_string();
+                    }
+                    Err(error) => {
+                        self.composition_status = format!("Layer add rejected: {error}");
+                        self.media_safety_status = format!("Rejected text page: {error}");
+                    }
+                }
+            }
+            Err(error) => {
+                self.media_safety_status = format!("Rejected text page: {error}");
+                log::error!("Failed to create text page layer: {error}");
             }
         }
     }
@@ -7151,8 +7216,40 @@ impl App {
                 rebuilt.push(layer);
                 continue;
             }
+            if let media_source::ResolvedVisualSource::PatternSynth = resolved {
+                let params = config
+                    .pattern
+                    .map(patch::PatternSynthConfig::to_params)
+                    .unwrap_or_default();
+                let mut layer = Layer::new_pattern_with_media_policy(
+                    params,
+                    &renderer.device,
+                    &self.media_safety_policy,
+                )
+                .map_err(|error| format!("{}: {error}", config.filename))?;
+                config.apply_to_layer(&mut layer);
+                rebuilt.push(layer);
+                continue;
+            }
+            if let media_source::ResolvedVisualSource::TextPage = resolved {
+                let params = config
+                    .text_page
+                    .as_ref()
+                    .map(patch::TextPageConfig::to_params)
+                    .unwrap_or_default();
+                let mut layer = Layer::new_text_page_with_media_policy(
+                    params,
+                    &renderer.device,
+                    &self.media_safety_policy,
+                    text_page::bundled_fonts(),
+                )
+                .map_err(|error| format!("{}: {error}", config.filename))?;
+                config.apply_to_layer(&mut layer);
+                rebuilt.push(layer);
+                continue;
+            }
             let media_source::ResolvedVisualSource::File(resolved) = resolved else {
-                unreachable!("Spout sources returned above")
+                unreachable!("Spout and generator sources returned above")
             };
             let path = resolved.path;
             // A content-referenced video source consults the proxy cache:
@@ -7495,6 +7592,13 @@ impl App {
             }
             | WebAction::ResetLayerFx { index, layer_id }
             | WebAction::SetLayerVisibility {
+                index, layer_id, ..
+            } => Self::layer_action_targets_look(*index, layer_id, &applied.mapped_layer_ids),
+            // A look moves pattern values onto a mapped pattern layer, so a
+            // stale queued pattern edit conflicts exactly as an effect edit
+            // does. Text-page state is not moved by a look and cannot
+            // conflict.
+            WebAction::SetLayerPattern {
                 index, layer_id, ..
             } => Self::layer_action_targets_look(*index, layer_id, &applied.mapped_layer_ids),
             WebAction::SetLayerParam {
@@ -7956,6 +8060,16 @@ impl App {
                 index,
                 layer_id: None,
                 ..
+            }
+            | web::state::WebAction::SetLayerPattern {
+                index,
+                layer_id: None,
+                ..
+            }
+            | web::state::WebAction::SetLayerText {
+                index,
+                layer_id: None,
+                ..
             } if *index == removed => false,
             web::state::WebAction::SetLayerParam {
                 index,
@@ -7963,6 +8077,16 @@ impl App {
                 ..
             }
             | web::state::WebAction::SetLayerEffect {
+                index,
+                layer_id: None,
+                ..
+            }
+            | web::state::WebAction::SetLayerPattern {
+                index,
+                layer_id: None,
+                ..
+            }
+            | web::state::WebAction::SetLayerText {
                 index,
                 layer_id: None,
                 ..
@@ -7985,6 +8109,16 @@ impl App {
                     ..
                 }
                 | web::state::WebAction::SetLayerEffect {
+                    index,
+                    layer_id: None,
+                    ..
+                }
+                | web::state::WebAction::SetLayerPattern {
+                    index,
+                    layer_id: None,
+                    ..
+                }
+                | web::state::WebAction::SetLayerText {
                     index,
                     layer_id: None,
                     ..
@@ -9570,6 +9704,20 @@ impl App {
                 self.resolve_layer_index(*index, layer_id)
                     .is_some_and(|resolved| self.morph.controls_layer_field(resolved, control))
             }
+            // A pattern edit onto Morph-owned pattern state transfers
+            // ownership exactly as an effect edit does; text-page state is
+            // never captured in a slot and cannot be owned.
+            WebAction::SetLayerPattern {
+                index,
+                layer_id,
+                param,
+                value,
+            } if pattern_synth::PatternSynthEdit::parse(param, value).is_some() => self
+                .resolve_layer_index(*index, layer_id)
+                .is_some_and(|resolved| {
+                    self.morph
+                        .controls_layer_field(resolved, morph::LayerMorphControl::Pattern)
+                }),
             WebAction::SetLayerTransform {
                 index: _,
                 layer_id,
@@ -16919,6 +17067,48 @@ impl App {
                     }
                 }
             }
+            WebAction::SetLayerPattern {
+                index,
+                layer_id,
+                param,
+                value,
+            } => {
+                // The same parse table the server gate consulted; a stale ID
+                // or a non-pattern layer is a safe no-op, never a positional
+                // guess at a different source.
+                if let Some(index) = self.resolve_layer_index(index, &layer_id) {
+                    if let Some(edit) = pattern_synth::PatternSynthEdit::parse(&param, &value) {
+                        if let Some(params) = self.layers[index].pattern_params_mut() {
+                            edit.apply(params);
+                        }
+                    }
+                }
+            }
+            WebAction::SetLayerText {
+                index,
+                layer_id,
+                param,
+                value,
+            } => {
+                if let Some(index) = self.resolve_layer_index(index, &layer_id) {
+                    if let Some(edit) = text_page::TextPageEdit::parse(&param, &value) {
+                        let layer = &mut self.layers[index];
+                        if let Some(current) = layer.text_page_params() {
+                            let mut next = current.clone();
+                            edit.apply(&mut next);
+                            // Re-raster only on actual authored change — the
+                            // still-cost law lives in the layer.
+                            layer.set_text_page_params(next, text_page::bundled_fonts());
+                        }
+                    }
+                }
+            }
+            WebAction::AddPatternLayer => {
+                self.add_pattern_layer();
+            }
+            WebAction::AddTextLayer => {
+                self.add_text_layer();
+            }
             WebAction::SetLayerTransform {
                 index: _,
                 layer_id,
@@ -18227,7 +18417,10 @@ impl App {
                         source_error: spout_status
                             .map(|status| status.error)
                             .unwrap_or(video_error),
-                        offline_export_policy: if layer.is_file_media() {
+                        // A generator source reconstructs perfectly offline,
+                        // so it carries no policy caveat — only live Spout
+                        // keeps the deterministic-black note.
+                        offline_export_policy: if layer.is_offline_reconstructable() {
                             String::new()
                         } else {
                             "Live Spout input renders as deterministic black offline".to_string()
@@ -18242,6 +18435,12 @@ impl App {
                             .cloned()
                             .unwrap_or_default(),
                         performance,
+                        pattern: layer
+                            .pattern_params()
+                            .map(patch::PatternSynthConfig::from_params),
+                        text_page: layer
+                            .text_page_params()
+                            .map(patch::TextPageConfig::from_params),
                     }
                 })
                 .collect(),
@@ -20269,6 +20468,7 @@ impl ApplicationHandler for App {
                                 visible: layer.visible && layer.transport_visible(),
                                 paused: layer.paused,
                                 bypass_master_fx: layer.bypass_master_fx,
+                                pattern: layer.pattern_params(),
                             }),
                     );
                     let authored_layer_mattes: Vec<_> =
@@ -20788,6 +20988,44 @@ impl ApplicationHandler for App {
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                                 label: Some("Frame Encoder"),
                             });
+
+                    // B7 pattern-synth sources render first, into their own
+                    // layer textures inside this same encoder, so both the
+                    // LegacyExact and Advanced paths sample a picture the
+                    // frame plan alone determined. Uniforms come from the
+                    // plan's modulated copies and frame-plan time — never
+                    // wall time, never authored state read back later.
+                    let pattern_jobs: Vec<(usize, pattern_synth::PatternSynthGpuUniforms)> =
+                        evaluated_frame
+                            .layers()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(index, layer)| {
+                                layer.pattern.map(|params| {
+                                    (
+                                        index,
+                                        pattern_synth::PatternSynthGpuUniforms::from_params(
+                                            &params,
+                                            evaluated_frame.context().time_seconds,
+                                        ),
+                                    )
+                                })
+                            })
+                            .collect();
+                    if !pattern_jobs.is_empty() {
+                        let job_refs: Vec<(
+                            pattern_synth::PatternSynthGpuUniforms,
+                            &wgpu::TextureView,
+                        )> = pattern_jobs
+                            .iter()
+                            .map(|(index, uniforms)| (*uniforms, &self.layers[*index].texture_view))
+                            .collect();
+                        renderer.encode_pattern_synth_layers(&mut encoder, &job_refs);
+                        drop(job_refs);
+                        for (index, _) in &pattern_jobs {
+                            self.layers[*index].mark_pattern_frame_encoded();
+                        }
+                    }
 
                     // Prepare and encode Advanced only into executor-owned
                     // RGBA16F surfaces plus compat slot0. Slot2 (the accepted
@@ -23091,6 +23329,7 @@ mod app_state_tests {
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                pattern: None,
             }],
         );
         let layer_motion = [LayerMotionPlanInput {
@@ -26002,6 +26241,7 @@ mod app_state_tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: true,
+                    pattern: None,
                 }],
             )
         };

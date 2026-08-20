@@ -793,6 +793,7 @@ dependencies = [
 name = "collide-o-scope"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "axum",
  "axum-server",
  "bytemuck",
@@ -801,6 +802,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "env_logger",
+ "epaint_default_fonts",
  "ffmpeg-next",
  "futures",
  "getrandom 0.3.4",

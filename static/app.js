@@ -89,6 +89,26 @@ spoutInForm?.addEventListener('submit', (event) => {
   }
 });
 
+const generatorAddStatus = document.getElementById('generator-add-status');
+document.getElementById('add-pattern-layer')?.addEventListener('click', () => {
+  if (generatorAddStatus) {
+    generatorAddStatus.textContent = sendAction({ action: 'add_pattern_layer' })
+      ? 'Adding pattern synth layer…'
+      : 'Control connection is offline; try again when connected.';
+  } else {
+    sendAction({ action: 'add_pattern_layer' });
+  }
+});
+document.getElementById('add-text-layer')?.addEventListener('click', () => {
+  if (generatorAddStatus) {
+    generatorAddStatus.textContent = sendAction({ action: 'add_text_layer' })
+      ? 'Adding text page layer…'
+      : 'Control connection is offline; try again when connected.';
+  } else {
+    sendAction({ action: 'add_text_layer' });
+  }
+});
+
 newLayerFit?.addEventListener('change', () => {
   const fit = ['stretch', 'fit', 'fill', 'native'].includes(newLayerFit.value)
     ? newLayerFit.value
@@ -3910,6 +3930,230 @@ function wireLayerEffects(card, layer, index) {
   });
 }
 
+// --- B7 pattern synth layer card section ---
+
+const LAYER_PATTERN_SELECT_OPTIONS = {
+  shape: [
+    ['scan', 'Scan'], ['radial', 'Radial'], ['spiral', 'Spiral'], ['plasma', 'Plasma'],
+    ['lissajous', 'Lissajous'], ['rings', 'Rings'], ['starburst', 'Starburst'], ['grid', 'Grid'],
+    ['tunnel', 'Tunnel'], ['cells', 'Cells'], ['interference', 'Interference'], ['polygon', 'Polygon'],
+  ],
+  wave: [
+    ['sine', 'Sine'], ['triangle', 'Triangle'], ['saw', 'Saw'],
+    ['square', 'Square'], ['pulse', 'Pulse'], ['sample_hold', 'S&H'],
+  ],
+  color_mode: [
+    ['mono', 'Mono'], ['rgb_phase', 'RGB Phase'], ['hsv_sweep', 'HSV Sweep'],
+    ['duotone', 'Duotone'], ['bands', 'Bands'],
+  ],
+};
+
+const LAYER_PATTERN_CONTROLS = [
+  ['shape', 'Shape', 'select', 0, 0, 0, 'scan'],
+  ['wave', 'Wave', 'select', 0, 0, 0, 'sine'],
+  ['color_mode', 'Colour', 'select', 0, 0, 0, 'rgb_phase'],
+  ['freq_x', 'Freq X', 'range', 0, 1, 0.001, 0.18],
+  ['freq_y', 'Freq Y', 'range', 0, 1, 0.001, 0.12],
+  ['phase', 'Phase', 'range', -1, 1, 0.001, 0],
+  ['rate', 'Rate', 'range', -1, 1, 0.001, 0.08],
+  ['cross_mod', 'Cross Mod', 'range', 0, 1, 0.001, 0],
+  ['wavefold', 'Wavefold', 'range', 0, 1, 0.001, 0],
+  ['pulse_width', 'Pulse Width', 'range', 0, 1, 0.001, 0.5],
+  ['comparator', 'Comparator', 'range', 0, 1, 0.001, 0],
+  ['comp_threshold', 'Comp Thresh', 'range', 0, 1, 0.001, 0.5],
+  ['comp_soft', 'Comp Soft', 'range', 0, 1, 0.001, 0.12],
+  ['symmetry', 'Symmetry', 'range', 1, 16, 1, 4],
+  ['zoom', 'Scale', 'range', -1, 1, 0.001, 0],
+  ['rotate', 'Rotate', 'range', -1, 1, 0.001, 0],
+  ['skew', 'Skew', 'range', -1, 1, 0.001, 0],
+  ['center_x', 'Centre X', 'range', -1, 1, 0.001, 0],
+  ['center_y', 'Centre Y', 'range', -1, 1, 0.001, 0],
+  ['warp', 'Domain Warp', 'range', 0, 1, 0.001, 0],
+  ['hue', 'Hue', 'range', 0, 1, 0.001, 0.55],
+  ['hue_spread', 'Hue Spread', 'range', 0, 2, 0.001, 1],
+  ['saturation', 'Saturation', 'range', 0, 1, 0.001, 0.9],
+  ['brightness', 'Brightness', 'range', 0, 1.5, 0.001, 1],
+  ['color_bands', 'Colour Bands', 'range', 2, 16, 1, 6],
+];
+
+function layerPatternHtml(pattern, index) {
+  const rows = LAYER_PATTERN_CONTROLS.map(([param, label, kind, min, max, step, fallback]) => {
+    const value = pattern?.[param] ?? fallback;
+    if (kind === 'select') {
+      const options = (LAYER_PATTERN_SELECT_OPTIONS[param] || [])
+        .map(([optionValue, optionLabel]) => `<option value="${optionValue}">${optionLabel}</option>`)
+        .join('');
+      return `<div class="param-row select-row layer-pattern-row" data-layer-pattern="${param}"><label>${label}</label><select aria-label="Layer ${index + 1} pattern ${label}">${options}</select></div>`;
+    }
+    return `<div class="param-row layer-pattern-row" data-layer-pattern="${param}" data-min="${min}" data-max="${max}" data-step="${step}"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-label="Layer ${index + 1} pattern ${label}"><span class="value">${formatValue(Number(value), min, max, step)}</span></div>`;
+  }).join('');
+  return `
+    <div class="layer-cellular-disclosure layer-pattern-section">
+      <button class="layer-cellular-toggle" type="button" aria-expanded="false" aria-controls="layer-pattern-body-${index}">
+        <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>PATTERN SYNTH</span>
+      </button>
+      <div class="layer-cellular-body" id="layer-pattern-body-${index}" role="region" aria-label="Layer ${index + 1} pattern synth" hidden>${rows}</div>
+    </div>`;
+}
+
+function wireLayerPattern(card, layer, index) {
+  card.querySelectorAll('[data-layer-pattern]').forEach((row) => {
+    const param = row.dataset.layerPattern;
+    const spec = LAYER_PATTERN_CONTROLS.find(([candidate]) => candidate === param);
+    if (!spec) return;
+    const [, , kind, , , , fallback] = spec;
+    const control = row.querySelector('input,select');
+    if (kind === 'select') control.value = String(layer.pattern?.[param] ?? fallback);
+    const send = () => {
+      const value = kind === 'select' ? control.value : parseFloat(control.value);
+      if (kind === 'range') {
+        row.querySelector('.value')?.replaceChildren(document.createTextNode(formatValue(Number(value), Number(control.min), Number(control.max), Number(control.step))));
+      }
+      sendAction({ action: 'set_layer_pattern', ...currentLayerSelector(card, layer, index), param, value });
+    };
+    control.addEventListener(kind === 'range' ? 'input' : 'change', send);
+    if (kind === 'range') resetRangeOnDoubleActivation(control, fallback);
+  });
+}
+
+function syncLayerPattern(card, layer) {
+  for (const [param, , kind, min, max, step, fallback] of LAYER_PATTERN_CONTROLS) {
+    const row = card.querySelector(`[data-layer-pattern="${param}"]`);
+    const control = row?.querySelector('input,select');
+    if (!control || !canSync(control)) continue;
+    const value = layer.pattern?.[param] ?? fallback;
+    control.value = String(value);
+    if (kind === 'range') row.querySelector('.value').textContent = formatValue(Number(value), min, max, step);
+  }
+}
+
+// --- B7 text page layer card section ---
+
+const LAYER_TEXT_SELECT_OPTIONS = {
+  font: [['mono', 'Mono'], ['sans', 'Sans']],
+  shape: [
+    ['none', 'None'], ['circle', 'Circle'], ['ring', 'Ring'], ['rect', 'Rect'], ['tri', 'Triangle'],
+    ['cross', 'Cross'], ['bars', 'Bars'], ['grid', 'Grid'], ['rings', 'Rings'], ['starburst', 'Starburst'],
+  ],
+};
+
+const LAYER_TEXT_CONTROLS = [
+  ['font', 'Font', 'select', 0, 0, 0, 'mono'],
+  ['size', 'Size', 'range', 0.03, 0.6, 0.005, 0.2],
+  ['track', 'Track', 'range', -0.1, 0.5, 0.005, 0],
+  ['x', 'X', 'range', 0, 1, 0.005, 0.5],
+  ['y', 'Y', 'range', 0, 1, 0.005, 0.5],
+  ['rot_degrees', 'Rotate', 'range', -180, 180, 1, 0],
+  ['repeat', 'Repeat', 'range', 1, 8, 1, 1],
+  ['outline', 'Outline', 'range', 0, 20, 0.5, 0],
+  ['shape', 'Shape', 'select', 0, 0, 0, 'none'],
+  ['shape_count', 'Shape Count', 'range', 1, 24, 1, 1],
+  ['shape_size', 'Shape Size', 'range', 0.02, 1, 0.005, 0.3],
+  ['shape_x', 'Shape X', 'range', 0, 1, 0.005, 0.5],
+  ['shape_y', 'Shape Y', 'range', 0, 1, 0.005, 0.5],
+  ['shape_stroke', 'Shape Stroke', 'range', 0, 40, 0.5, 0],
+];
+
+const LAYER_TEXT_COLORS = [
+  ['ink', 'Ink', ['ink_r', 'ink_g', 'ink_b'], [1, 1, 1]],
+  ['bg', 'Background', ['bg_r', 'bg_g', 'bg_b'], [0, 0, 0]],
+  ['shape_fill', 'Shape Fill', ['shape_fill_r', 'shape_fill_g', 'shape_fill_b'], [1, 0.184, 0.627]],
+];
+
+function rgbToHex(rgb) {
+  return `#${rgb.map((c) => Math.round(Math.min(1, Math.max(0, Number(c) || 0)) * 255).toString(16).padStart(2, '0')).join('')}`;
+}
+
+function layerTextHtml(text, index) {
+  const body = String(text?.body ?? '');
+  const rows = LAYER_TEXT_CONTROLS.map(([param, label, kind, min, max, step, fallback]) => {
+    const value = text?.[param] ?? fallback;
+    if (kind === 'select') {
+      const options = (LAYER_TEXT_SELECT_OPTIONS[param] || [])
+        .map(([optionValue, optionLabel]) => `<option value="${optionValue}">${optionLabel}</option>`)
+        .join('');
+      return `<div class="param-row select-row layer-text-row" data-layer-text="${param}"><label>${label}</label><select aria-label="Layer ${index + 1} text ${label}">${options}</select></div>`;
+    }
+    return `<div class="param-row layer-text-row" data-layer-text="${param}" data-min="${min}" data-max="${max}" data-step="${step}"><label>${label}</label><input type="range" min="${min}" max="${max}" step="${step}" value="${value}" aria-label="Layer ${index + 1} text ${label}"><span class="value">${formatValue(Number(value), min, max, step)}</span></div>`;
+  }).join('');
+  const colors = LAYER_TEXT_COLORS.map(([key, label, , fallback]) => {
+    const value = rgbToHex(Array.isArray(text?.[key]) ? text[key] : fallback);
+    return `<div class="param-row layer-text-color-row" data-layer-text-color="${key}"><label>${label}</label><input type="color" value="${value}" aria-label="Layer ${index + 1} text ${label} colour"></div>`;
+  }).join('');
+  return `
+    <div class="layer-cellular-disclosure layer-text-section">
+      <button class="layer-cellular-toggle" type="button" aria-expanded="false" aria-controls="layer-text-body-${index}">
+        <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>TEXT PAGE</span>
+      </button>
+      <div class="layer-cellular-body" id="layer-text-body-${index}" role="region" aria-label="Layer ${index + 1} text page" hidden>
+        <div class="param-row layer-text-body-row"><label for="layer-text-body-input-${index}">Body</label><textarea id="layer-text-body-input-${index}" class="layer-text-body-input" maxlength="4096" rows="3" aria-label="Layer ${index + 1} page text">${body.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</textarea></div>
+        ${rows}
+        ${colors}
+      </div>
+    </div>`;
+}
+
+function wireLayerText(card, layer, index) {
+  const bodyInput = card.querySelector('.layer-text-body-input');
+  bodyInput?.addEventListener('change', () => {
+    sendAction({ action: 'set_layer_text', ...currentLayerSelector(card, layer, index), param: 'body', value: bodyInput.value.slice(0, 4096) });
+  });
+  card.querySelectorAll('[data-layer-text]').forEach((row) => {
+    const param = row.dataset.layerText;
+    const spec = LAYER_TEXT_CONTROLS.find(([candidate]) => candidate === param);
+    if (!spec) return;
+    const [, , kind, , , , fallback] = spec;
+    const control = row.querySelector('input,select');
+    if (kind === 'select') control.value = String(layer.text_page?.[param] ?? fallback);
+    const send = () => {
+      const value = kind === 'select'
+        ? control.value
+        : (param === 'repeat' || param === 'shape_count')
+          ? parseInt(control.value, 10)
+          : parseFloat(control.value);
+      if (kind === 'range') {
+        row.querySelector('.value')?.replaceChildren(document.createTextNode(formatValue(Number(value), Number(control.min), Number(control.max), Number(control.step))));
+      }
+      sendAction({ action: 'set_layer_text', ...currentLayerSelector(card, layer, index), param, value });
+    };
+    control.addEventListener(kind === 'range' ? 'input' : 'change', send);
+    if (kind === 'range') resetRangeOnDoubleActivation(control, fallback);
+  });
+  card.querySelectorAll('[data-layer-text-color]').forEach((row) => {
+    const key = row.dataset.layerTextColor;
+    const spec = LAYER_TEXT_COLORS.find(([candidate]) => candidate === key);
+    if (!spec) return;
+    const [, , params] = spec;
+    const control = row.querySelector('input');
+    control.addEventListener('change', () => {
+      const hex = control.value;
+      const channels = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255);
+      channels.forEach((value, channel) => {
+        sendAction({ action: 'set_layer_text', ...currentLayerSelector(card, layer, index), param: params[channel], value });
+      });
+    });
+  });
+}
+
+function syncLayerText(card, layer) {
+  const bodyInput = card.querySelector('.layer-text-body-input');
+  if (bodyInput && canSync(bodyInput)) bodyInput.value = String(layer.text_page?.body ?? '');
+  for (const [param, , kind, min, max, step, fallback] of LAYER_TEXT_CONTROLS) {
+    const row = card.querySelector(`[data-layer-text="${param}"]`);
+    const control = row?.querySelector('input,select');
+    if (!control || !canSync(control)) continue;
+    const value = layer.text_page?.[param] ?? fallback;
+    control.value = String(value);
+    if (kind === 'range') row.querySelector('.value').textContent = formatValue(Number(value), min, max, step);
+  }
+  for (const [key, , , fallback] of LAYER_TEXT_COLORS) {
+    const row = card.querySelector(`[data-layer-text-color="${key}"]`);
+    const control = row?.querySelector('input');
+    if (!control || !canSync(control)) continue;
+    control.value = rgbToHex(Array.isArray(layer.text_page?.[key]) ? layer.text_page[key] : fallback);
+  }
+}
+
 function selectedSlotId(card, layer) {
   const selected = Number(card.querySelector('.clip-slot-select')?.value);
   if (Number.isInteger(selected) && selected > 0 && selected <= 65535) return selected;
@@ -4173,7 +4417,11 @@ function createLayerCard(layer, index) {
       <button class="layer-drag-btn" title="Drag or use arrow keys to reorder" aria-label="Move layer ${index + 1}; use arrow keys to reorder" aria-keyshortcuts="ArrowUp ArrowDown Home End">&#x2630;</button>
       ${layer.source_kind === 'spout'
         ? '<span class="layer-thumb lib-placeholder" aria-hidden="true">LIVE</span>'
-        : `<img class="layer-thumb" src="/thumb/${encodeURIComponent(layer.filename)}" alt="">`}
+        : layer.source_kind === 'pattern'
+          ? '<span class="layer-thumb lib-placeholder" aria-hidden="true">SYN</span>'
+          : layer.source_kind === 'text'
+            ? '<span class="layer-thumb lib-placeholder" aria-hidden="true">TXT</span>'
+            : `<img class="layer-thumb" src="/thumb/${encodeURIComponent(layer.filename)}" alt="">`}
       <span class="layer-num">${index + 1}</span>
       <button class="layer-play-btn" title="Play/Pause" aria-label="${layer.paused ? 'Play' : 'Pause'} layer ${index + 1}">${layer.paused ? '\u25B6' : '\u25A0'}</button>
       <span class="layer-title">${escapeHtml(layer.filename || 'Untitled')}</span>
@@ -4295,6 +4543,8 @@ function createLayerCard(layer, index) {
         <button class="layer-reroll" type="button" title="Advance this layer's deterministic pattern seed" aria-label="Reroll layer ${index + 1} pattern">&#x2684; Reroll</button>
         ${layer.source_kind === 'video' ? `<label class="layer-loop-reroll"><input type="checkbox" ${layer.reroll_on_loop ? 'checked' : ''}> each loop</label>` : ''}
       </div>
+      ${layer.source_kind === 'pattern' ? layerPatternHtml(layer.pattern || {}, index) : ''}
+      ${layer.source_kind === 'text' ? layerTextHtml(layer.text_page || {}, index) : ''}
       <div class="layer-fx-heading">
         <button class="layer-fx-toggle" type="button" aria-expanded="false" aria-controls="layer-fx-body-${index}">
           <span class="layer-disclosure-chevron" aria-hidden="true">&#x25B6;</span><span>Layer effects</span>
@@ -4467,6 +4717,8 @@ function createLayerCard(layer, index) {
     apply: (transform) => sendAction({ action: 'apply_layer_transform', ...currentLayerSelector(card, layer, index), transform }),
   });
   wireLayerEffects(card, layer, index);
+  if (layer.source_kind === 'pattern') wireLayerPattern(card, layer, index);
+  if (layer.source_kind === 'text') wireLayerText(card, layer, index);
   wireLayerMotion(card, layer, index);
   wireLayerPerformance(card, layer, index);
   bindRangeEditors(card);
@@ -4623,6 +4875,8 @@ function updateLayerCard(card, layer, index) {
   syncTransformPanel(card.querySelector('.layer-transform-body'), layer.transform);
   syncLayerMotion(card, layer);
   syncLayerPerformance(card, layer);
+  if (layer.pattern) syncLayerPattern(card, layer);
+  if (layer.text_page) syncLayerText(card, layer);
 }
 
 // --- Sync library ---
@@ -5465,6 +5719,17 @@ const LAYER_FX_TARGETS = [
   ['motion_shutter_phase', 'Motion Shutter Phase'],
   ['motion_shutter_curvature', 'Motion Shutter Curvature'],
   ['motion_shutter_chromatic_lag', 'Motion Shutter Chroma Lag'],
+  ['pattern_freq_x', 'Pattern Freq X'], ['pattern_freq_y', 'Pattern Freq Y'],
+  ['pattern_phase', 'Pattern Phase'], ['pattern_rate', 'Pattern Rate'],
+  ['pattern_cross_mod', 'Pattern Cross Mod'], ['pattern_wavefold', 'Pattern Wavefold'],
+  ['pattern_pulse_width', 'Pattern Pulse Width'], ['pattern_comparator', 'Pattern Comparator'],
+  ['pattern_comp_threshold', 'Pattern Comp Thresh'], ['pattern_comp_soft', 'Pattern Comp Soft'],
+  ['pattern_symmetry', 'Pattern Symmetry'], ['pattern_zoom', 'Pattern Scale'],
+  ['pattern_rotate', 'Pattern Rotate'], ['pattern_skew', 'Pattern Skew'],
+  ['pattern_center_x', 'Pattern Centre X'], ['pattern_center_y', 'Pattern Centre Y'],
+  ['pattern_warp', 'Pattern Warp'], ['pattern_hue', 'Pattern Hue'],
+  ['pattern_hue_spread', 'Pattern Hue Spread'], ['pattern_saturation', 'Pattern Saturation'],
+  ['pattern_brightness', 'Pattern Brightness'], ['pattern_color_bands', 'Pattern Colour Bands'],
 ];
 
 const ROUTING_CURVES = [
