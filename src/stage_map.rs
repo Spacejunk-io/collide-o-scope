@@ -283,6 +283,10 @@ pub struct StageCalibrationDecision {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StageToolState {
     health_hud: bool,
+    /// B11: the monitoring-bay overlay toggle. Host-session like the HUD;
+    /// deliberately independent of it, because an operator reading the
+    /// instruments does not want the timing HUD forced on beside them.
+    monitor_bay: bool,
     test_card: TestCardMode,
     test_card_endpoint: Option<OutputEndpointId>,
     output_identification: bool,
@@ -296,6 +300,14 @@ impl StageToolState {
 
     pub fn set_health_hud(&mut self, enabled: bool) {
         self.health_hud = enabled;
+    }
+
+    pub fn monitor_bay_enabled(&self) -> bool {
+        self.monitor_bay
+    }
+
+    pub fn set_monitor_bay(&mut self, enabled: bool) {
+        self.monitor_bay = enabled;
     }
 
     pub fn test_card(&self) -> TestCardMode {

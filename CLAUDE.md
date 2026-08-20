@@ -47,6 +47,7 @@ src/
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
 ├── renderer/display_physics.rs single-seam slot-0 display stage, lazy field/phosphor surfaces
 ├── renderer/melting_edge.rs B8 slot-0 master melt over the program's own coverage, lazy history
+├── renderer/monitor_bay.rs B11 armed-on-demand 128×72 probe reduction and bounded readback pool
 ├── renderer/pattern_synth.rs lazy per-layer pattern pass executor shared by live and export
 ├── renderer/scan_processor.rs dedicated instanced-ribbon executor and shared accumulator
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
@@ -60,6 +61,7 @@ src/
 ├── layers/mod.rs        video/Spout layer sources, texture upload, frame pacer
 ├── effects/params.rs    effect and temporal parameters/normalization
 ├── modulation/mod.rs    stable typed targets, clock/LFO/audio/MIDI routes, curves, slew
+├── monitor_bay.rs       B11 preview-only waveform/vectorscope/PROBE law, sealed permit, instrument bitmaps
 ├── audio/mod.rs         cpal capture, FFT sources, configurable edges/spectrum
 ├── controller_profile.rs bounded saved-position profiles and atomic persistence
 ├── midi/mod.rs          supervised typed MIDI events, hotplug, clock, feedback
@@ -92,6 +94,7 @@ src/
     ├── display_physics.wgsl field domain, N-1 phosphor store, beam/mask display pass
     ├── pattern_synth.wgsl B7 pattern source: shape/oscillator/wavefolder/comparator/colouriser, no texture
     ├── melting_edge.wgsl  B8 coverage-boundary probe, band drag, self-feeding hold
+    ├── monitor_bay.wgsl   B11 128×72 monitor reduction, 16 bilinear taps per cell
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── video_analysis.wgsl B10 32×18 content-analysis reduction, 16 bilinear taps per cell
@@ -2550,6 +2553,87 @@ wire-action seam and are not recorded. `render_performance_recorder_pipeline`
 is the labeled export case: the `_untaken` twin must decode differently and
 the `_repeat` render identically — the record/replay determinism claim.
 
+## The B11 monitoring bay
+
+Preview-only instruments over a low-resolution readback of an internal
+signal: the difference between "the picture is doing something odd" and
+knowing which part of the model is doing it. The law is derived from BENDR
+(MIT, © 2026 Steve Blythe), whose scope dock is this instrument whole;
+`src/monitor_bay.rs` is the independent CPU reference in the `gesture.rs`
+tradition, and the two presenters — native egui and the panel's first
+`<canvas>` pair — draw the identical CPU-derived bitmaps.
+
+**The readback.** One 128×72 reduction (BENDR's shipped scope size, inside
+the tranche's ≤160×90 bound) of the selected probe image, on the B10
+`video_analysis` machine verbatim: the same 16-tap linear-light reduction
+expression (CPU reference `modulation::reduce_analysis_grid`, the B10 law
+generalized over grid size — `reduce_video_analysis_grid` now delegates to
+it), a lazy stage with its own two-slot FIFO busy-drop readback pool
+(one 36,864-byte target + two 36,864-byte buffers, outside the full-frame
+floor, which stays 30; the three full-frame audience slots untouched), and
+the same 10 Hz cadence: three reference ticks on an accepted-program-seconds
+accumulator at the program-tap acceptance seam. Pause holds the instruments;
+under blackout the probed slot-2 image is the held pre-blackout picture
+(program memory, the tap's own law). The bay's bind group is rebuilt per
+10 Hz sample against the probe's view — cheaper than every epoch hazard a
+cached group would carry.
+
+**Zero cost hidden.** `App::monitor_bay_armed` is the one gate: the native
+overlay (bay toggle ∧ `native_controls_visible`) OR a fresh browser watcher.
+Unarmed, the stage is never constructed, no pass encodes, no buffer maps,
+the snapshot block is the empty default, and the disarm edge clears the
+instruments once so a re-arm never resurrects a stale picture. Browser
+watching is the `gyro_stream` socket-layer shape — `monitor_watch
+{ enabled }` per client, set without a queue round-trip, dropped on
+disconnect — hardened with `MONITOR_WATCH_TIMEOUT` (10 s): the panel
+re-asserts on a 4 s heartbeat exactly while its MONITORING BAY section is
+expanded and the tab visible, so a silently discarded tab expires instead of
+pinning the readback armed.
+
+**The instruments.** Computed on the CPU from the harvested grid: the
+waveform plots Rec.601 luma of the encoded bytes (the `VideoAnalysisState`
+constants — the instrument observes the stored picture, not a linear
+reconstruction), one column per grid column, additive saturating
+accumulation; the vectorscope plots BENDR's projection
+`u = (b−y)·0.565, v = (r−y)·0.713` at gain 1.4, and the six 75% colour-bar
+targets are derived from that same projection (`scope_targets()`), never
+restated as constants, so the graticule cannot drift from the cloud.
+
+**PROBE.** A closed append-only vocabulary of retained renderer-owned
+images: `program` (pre-blackout slot 2, default), `program_tap` (the honest
+N-1 image), `gesture_canvas` (the presented etch donor). An unavailable
+producer is the named `probe_status: "unavailable"` — instruments hold, the
+readback stays idle, and the probe never silently rebinds. The strip beside
+the scopes carries the modulation matrix's live source values
+(`modulation::MONITOR_SOURCE_LIST`, 45 sources, append-only order, pure
+reads). The named deferred probes — NTSC per-line state, the melt band mask,
+a motion-field visualizer — join by appending codes.
+
+**The sealed permit.** `MonitorBayPermit` is the transform-gizmo seal,
+deliberately not stage_health's weaker file-scope shape: declaration and the
+single mint live inside a private submodule, pinned by a source-audit test,
+and the token folds all three conditions — bay toggle,
+`native_controls_visible`, `StageSurface::EditorPreview` — so the painter
+cannot be reached for an audience surface even by a caller that got one
+condition wrong. `show_monitor_bay` joins the one-predicate block in
+`main.rs`. Native paint re-uploads its two egui textures only when a fresh
+sample lands (dirty-flag pre-resolve before the closure, the stage-health
+law).
+
+**Closure.** Nothing persists in patches: the bay toggle and probe are
+host-session state like the media-safety mode, absent from `PatchState`; a
+new process starts disabled on `program`. Wire: `set_monitor_bay` /
+`set_monitor_probe` (ordinary coalescible host operations outside manual
+history; the probe token validated at the gate and the applier through the
+one `MonitorProbe::try_from_str` table) and the never-queued
+`monitor_watch`. Snapshot: the additive `monitor_bay` block — probe and
+native-overlay always truthful, base64 instrument payloads only while
+armed, a `sample` counter so the panel redraws at the 10 Hz arrival rate.
+No modulation address, no Morph surface, no Dice/generator interaction
+(`GENERATOR_VERSION` stays "12"), no export arm — export has no observer,
+so there is no labeled export case of its own; the range pins (html 198,
+app.js template tags 24) did not move.
+
 ## Gesture-field etching
 
 A gesture is an ordered stream of quantized events addressed on the 30 Hz
@@ -3485,6 +3569,24 @@ mislead browser tests.
   within 4 code values, plus the two-slot saturation drop), and
   `render_mod_sources_pipeline` is the labeled export case with its
   `_unrouted` difference twin and `_repeat` determinism assertion.
+- Monitoring-bay (B11) tests must cover the Rec.601/vectorscope projection
+  fixtures with the six targets derived from the projection (complementary
+  bars mirrored through the centre), the flat-grey field reducing to one
+  saturated waveform row and one centred scope point, the two-tone split,
+  hostile short grids drawing nothing, the RFC 4648 base64 vectors, the
+  closed probe vocabulary with near-miss rejection, snapshot default
+  inactivity with fresh-sample publication and the additive back-compat
+  strip, the wire names/coalesce keys/history classification, the watch
+  registry's arm/disarm/disconnect lifecycle, the live panel strings
+  asserted in `app.js`/`index.html`, the 45-entry
+  `MONITOR_SOURCE_LIST` round trip with pure double reads, the permit
+  refused for every audience surface / a single-monitor audience output / a
+  disabled bay, and the source audit pinning exactly one sealed permit
+  constructor. `gpu_monitor_bay_reduction_matches_the_cpu_reference`
+  carries the physical-GPU claim (the B7 statistical contract at 128×72
+  plus the two-slot saturation drop). The bay has no export arm, so its
+  exactness claim is the pinned-worktree `framemd5` A/B of a pre-existing
+  labeled case, not a labeled case of its own.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

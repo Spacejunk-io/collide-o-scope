@@ -1743,6 +1743,30 @@
             </div>
           </div>
 
+          <!-- B11 MONITORING BAY -->
+          <div class="fx-group" id="monitor-bay-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">MONITORING BAY</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="param-row toggle-row">
+                <label for="monitor-bay-native">Preview instruments</label>
+                <label class="toggle"><input type="checkbox" id="monitor-bay-native"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row select-row">
+                <label for="monitor-bay-probe">Probe</label>
+                <select id="monitor-bay-probe"><option value="program">Program</option><option value="program_tap">Program tap (N-1)</option><option value="gesture_canvas">Gesture canvas</option></select>
+              </div>
+              <div class="monitor-bay-instruments">
+                <canvas id="monitor-bay-waveform" width="128" height="64" style="width:256px;height:128px;image-rendering:pixelated;background:#000" aria-label="Luma waveform"></canvas>
+                <canvas id="monitor-bay-scope" width="64" height="64" style="width:128px;height:128px;image-rendering:pixelated;background:#000" aria-label="Vectorscope"></canvas>
+              </div>
+              <div class="audio-status" id="monitor-bay-status" role="status" aria-live="polite">Instruments run only while this section is open and the tab is visible.</div>
+              <div class="audio-status" id="monitor-bay-sources"></div>
+            </div>
+          </div>
+
           <!-- RENDER EXPORT -->
           <div class="fx-group" id="export-group">
             <div class="fx-group-header">

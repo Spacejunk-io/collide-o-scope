@@ -2960,6 +2960,11 @@ pub struct Renderer {
     // plus two 4,608-byte staging buffers, charged in its own module doc.
     video_analysis: Option<crate::renderer::video_analysis::VideoAnalysisGpu>,
 
+    // The B11 monitoring-bay reduction, lazily constructed on the first
+    // armed sample. Not a full-frame surface owner: one 128×72 target plus
+    // two 36,864-byte staging buffers, charged in its own module doc.
+    monitor_bay: Option<crate::renderer::monitor_bay::MonitorBayGpu>,
+
     // Staging buffers for async NTSC readback (created lazily, reused)
     readback_slots: Vec<ReadbackSlot>,
     next_readback_sequence: u64,
@@ -3387,6 +3392,7 @@ impl Renderer {
             output_height,
             pattern_synth: None,
             video_analysis: None,
+            monitor_bay: None,
             readback_slots: Vec::new(),
             next_readback_sequence: 1,
             last_harvested_readback_sequence: 0,
@@ -3744,6 +3750,41 @@ impl Renderer {
     /// Harvest the oldest completed analysis grid, if any.
     pub fn poll_video_analysis(&mut self) -> Option<(Vec<u8>, f32)> {
         self.video_analysis.as_mut()?.poll()
+    }
+
+    /// B11: schedule one monitoring-bay reduction of the selected probe
+    /// image into its own encoder. The stage is lazily constructed on the
+    /// first armed sample and a busy pool drops the sample cleanly. The
+    /// caller has already answered the probe's availability; an unavailable
+    /// producer reaching this far is refused with `false` rather than a
+    /// silent rebind onto another view.
+    pub fn schedule_monitor_bay(
+        &mut self,
+        probe: crate::monitor_bay::MonitorProbe,
+        gesture_canvas_view: Option<&wgpu::TextureView>,
+    ) -> bool {
+        let view: &wgpu::TextureView = match probe {
+            crate::monitor_bay::MonitorProbe::Program => &self.composite_views[2],
+            crate::monitor_bay::MonitorProbe::ProgramTap => {
+                if !self.program_tap_valid {
+                    return false;
+                }
+                &self.program_tap_view
+            }
+            crate::monitor_bay::MonitorProbe::GestureCanvas => match gesture_canvas_view {
+                Some(view) => view,
+                None => return false,
+            },
+        };
+        let stage = self.monitor_bay.get_or_insert_with(|| {
+            crate::renderer::monitor_bay::MonitorBayGpu::new(&self.device, COMPOSITE_FORMAT)
+        });
+        stage.schedule(&self.device, &self.queue, view)
+    }
+
+    /// Harvest the oldest completed monitor grid, if any.
+    pub fn poll_monitor_bay(&mut self) -> Option<Vec<u8>> {
+        self.monitor_bay.as_mut()?.poll()
     }
 
     pub fn publish_program_tap(&mut self) {

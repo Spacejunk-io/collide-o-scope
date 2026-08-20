@@ -26,6 +26,7 @@ mod media_source;
 mod midi;
 mod mixing_boundary;
 mod modulation;
+mod monitor_bay;
 mod morph;
 mod motion;
 mod ntsc;
@@ -769,6 +770,21 @@ const fn show_native_gesture_surface(output_on_main: bool) -> bool {
 /// be painted by satisfying only one of them.
 const fn show_transform_gizmo(output_on_main: bool) -> bool {
     stage_map::native_controls_visible(output_on_main)
+}
+
+/// The B11 monitoring bay is a native control like every other one here. It
+/// additionally requires a [`monitor_bay::MonitorBayPermit`], which folds
+/// this predicate, the bay toggle, and the surface check into one sealed
+/// token — so the bay cannot be painted by satisfying only one of them.
+const fn show_monitor_bay(output_on_main: bool) -> bool {
+    stage_map::native_controls_visible(output_on_main)
+}
+
+/// The native bay painter's two retained egui textures, re-uploaded only
+/// when a fresh sample lands.
+struct MonitorBayTextures {
+    waveform: egui::TextureHandle,
+    vectorscope: egui::TextureHandle,
 }
 
 /// Stroke identities reserved for the host surfaces that have no stroke of
@@ -4392,6 +4408,16 @@ struct App {
     video_analysis_state: modulation::VideoAnalysisState,
     video_analysis_accumulator: f64,
     video_analysis_primed: bool,
+    /// B11 monitoring-bay host state: the derived instrument bitmaps both
+    /// presenters read, the 10 Hz cadence accumulator (the video-analysis
+    /// law), the authored PROBE, whether the bay was armed last frame (for
+    /// the one-shot disarm clear), and the native painter's two retained
+    /// egui textures.
+    monitor_bay_state: monitor_bay::MonitorBayState,
+    monitor_bay_accumulator: f64,
+    monitor_probe: monitor_bay::MonitorProbe,
+    monitor_bay_was_armed: bool,
+    monitor_bay_textures: Option<MonitorBayTextures>,
     /// Routes a completed authored stroke onto exactly one manual-history
     /// entry. Automation-driven origins never reach the store at all.
     gesture_history: history::GestureHistoryRouter,
@@ -4847,6 +4873,11 @@ impl App {
             video_analysis_state: modulation::VideoAnalysisState::default(),
             video_analysis_accumulator: 0.0,
             video_analysis_primed: false,
+            monitor_bay_state: monitor_bay::MonitorBayState::default(),
+            monitor_bay_accumulator: 0.0,
+            monitor_probe: monitor_bay::MonitorProbe::default(),
+            monitor_bay_was_armed: false,
+            monitor_bay_textures: None,
             gesture_history: history::GestureHistoryRouter::default(),
             gesture_history_open: None,
             transform_gizmo_drag: None,
@@ -13425,6 +13456,9 @@ impl App {
                 | WebAction::CaptureStill { .. }
                 | WebAction::StartResample { .. }
                 | WebAction::SetStageHealthHud { .. }
+                | WebAction::SetMonitorBay { .. }
+                | WebAction::SetMonitorProbe { .. }
+                | WebAction::MonitorWatch { .. }
                 | WebAction::SetStageTestCard { .. }
                 | WebAction::SetOutputIdentification { .. }
                 | WebAction::RequestLayerProxy { .. }
@@ -17869,6 +17903,31 @@ impl App {
             WebAction::SetStageHealthHud { enabled } => {
                 self.stage_tools.set_health_hud(enabled);
             }
+            WebAction::SetMonitorBay { enabled } => {
+                self.stage_tools.set_monitor_bay(enabled);
+            }
+            WebAction::SetMonitorProbe { probe } => {
+                // The one shared parse table: the gate accepted the token,
+                // the applier resolves it, and an unknown token (a legacy or
+                // hostile client) is a named refusal, never a fallback.
+                match monitor_bay::MonitorProbe::try_from_str(&probe) {
+                    Some(probe) => {
+                        if self.monitor_probe != probe {
+                            self.monitor_probe = probe;
+                            // A probe change is a new signal; the old
+                            // instruments must not present as the new probe.
+                            self.monitor_bay_state.clear();
+                        }
+                    }
+                    None => {
+                        log::warn!("Rejected unknown monitor probe token: {probe}");
+                    }
+                }
+            }
+            WebAction::MonitorWatch { .. } => {
+                // Handled at the socket layer (the gyro_stream law); reaching
+                // the queue is a deliberate no-op.
+            }
             WebAction::RequestLayerProxy { layer_id } => {
                 self.request_layer_proxy_from_browser(&layer_id);
             }
@@ -19026,6 +19085,69 @@ impl App {
         status
     }
 
+    /// B11: whether any observer keeps the monitoring bay armed — the native
+    /// preview overlay (bay enabled while the native controls are visible)
+    /// or a fresh browser watcher. Unarmed, the bay encodes nothing, reads
+    /// nothing back, and publishes the empty snapshot block: zero cost
+    /// hidden.
+    fn monitor_bay_armed(&self) -> bool {
+        (self.stage_tools.monitor_bay_enabled()
+            && stage_map::native_controls_visible(self.output_on_main))
+            || self.web_state.monitor_watch_active()
+    }
+
+    /// B11: the authored probe's availability, answered from the same
+    /// producers the schedule consults. Empty means available; a named
+    /// condition means the instruments hold and the readback stays idle.
+    fn monitor_probe_status(&self) -> &'static str {
+        let available = match self.monitor_probe {
+            monitor_bay::MonitorProbe::Program => true,
+            monitor_bay::MonitorProbe::ProgramTap => self
+                .renderer
+                .as_ref()
+                .is_some_and(|renderer| renderer.program_tap_valid()),
+            monitor_bay::MonitorProbe::GestureCanvas => self
+                .gesture_canvas_gpu
+                .as_ref()
+                .and_then(renderer::gesture_canvas::GestureCanvasResources::presented_view)
+                .is_some(),
+        };
+        if available {
+            ""
+        } else {
+            "unavailable"
+        }
+    }
+
+    /// B11: the monitoring-bay snapshot block. The probe token and the
+    /// native-overlay toggle are always truthful; the instrument payloads
+    /// exist only while an observer keeps the bay armed.
+    fn monitor_bay_snapshot(&self) -> monitor_bay::MonitorBaySnapshot {
+        let mut snapshot = if self.monitor_bay_armed() {
+            let sources = self
+                .mod_matrix
+                .monitor_source_values()
+                .into_iter()
+                .map(|(name, value)| monitor_bay::MonitorSourceSnapshot {
+                    name: name.to_string(),
+                    value,
+                })
+                .collect();
+            self.monitor_bay_state.snapshot(
+                self.monitor_probe,
+                self.monitor_probe_status(),
+                sources,
+            )
+        } else {
+            monitor_bay::MonitorBaySnapshot {
+                probe: self.monitor_probe.key().to_string(),
+                ..Default::default()
+            }
+        };
+        snapshot.native_overlay = self.stage_tools.monitor_bay_enabled();
+        snapshot
+    }
+
     fn stage_health_snapshot(&self) -> stage_health::StageHealthSnapshot {
         let decoder_telemetry: Vec<_> = self.layers.iter().map(Layer::video_telemetry).collect();
         let visible_layers = self
@@ -19749,6 +19871,7 @@ impl App {
             },
             recorder: self.recorder_snapshot.clone(),
             stage_health: self.stage_health_snapshot(),
+            monitor_bay: self.monitor_bay_snapshot(),
             remote_url: self
                 .web_state
                 .lan_url
@@ -20973,6 +21096,22 @@ impl ApplicationHandler for App {
                     }
                     self.video_analysis_primed = self.mod_matrix.video_analysis_armed();
 
+                    // B11 monitoring bay: harvest the oldest completed
+                    // monitor grid into the instrument bitmaps. On the
+                    // disarm edge the instruments clear once, so a later
+                    // re-arm never resurrects a stale picture.
+                    let monitor_armed = self.monitor_bay_armed();
+                    if monitor_armed {
+                        let harvested = self.renderer.as_mut().and_then(Renderer::poll_monitor_bay);
+                        if let Some(grid) = harvested {
+                            self.monitor_bay_state.ingest(&grid);
+                        }
+                    } else if self.monitor_bay_was_armed {
+                        self.monitor_bay_state.clear();
+                        self.monitor_bay_accumulator = 0.0;
+                    }
+                    self.monitor_bay_was_armed = monitor_armed;
+
                     // Process actions from web UI
                     let mut pending_actions: VecDeque<_> = self
                         .web_state
@@ -21050,6 +21189,43 @@ impl ApplicationHandler for App {
 
                     let egui_context = self.egui_ctx.clone();
                     let stage_health_snapshot = self.stage_health_snapshot();
+                    // B11: resolve the bay's paint inputs before the closure
+                    // (the stage-health pre-resolve law). The dirty flag is
+                    // consumed here, so textures re-upload only on a fresh
+                    // sample; `Some(None)` is the disarm clear.
+                    let monitor_bay_images = if self.monitor_bay_state.take_dirty() {
+                        Some(self.monitor_bay_state.instruments().map(|instruments| {
+                            (
+                                monitor_bay::instrument_color_image(
+                                    &instruments.waveform,
+                                    monitor_bay::WAVEFORM_WIDTH,
+                                    monitor_bay::WAVEFORM_HEIGHT,
+                                ),
+                                monitor_bay::instrument_color_image(
+                                    &instruments.vectorscope,
+                                    monitor_bay::SCOPE_SIZE,
+                                    monitor_bay::SCOPE_SIZE,
+                                ),
+                            )
+                        }))
+                    } else {
+                        None
+                    };
+                    let monitor_probe = self.monitor_probe;
+                    let monitor_probe_status = self.monitor_probe_status();
+                    let monitor_sources: Vec<monitor_bay::MonitorSourceSnapshot> =
+                        if self.stage_tools.monitor_bay_enabled() {
+                            self.mod_matrix
+                                .monitor_source_values()
+                                .into_iter()
+                                .map(|(name, value)| monitor_bay::MonitorSourceSnapshot {
+                                    name: name.to_string(),
+                                    value,
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
                     let stage_tools = &self.stage_tools;
                     let native_editor_blocked_by_browser = matches!(
                         self.manual_history.open_gesture(),
@@ -21073,6 +21249,7 @@ impl ApplicationHandler for App {
                     let yaml_editor = &mut self.yaml_editor;
                     let layers = &mut self.layers;
                     let master_effects = &mut self.master_effects;
+                    let monitor_bay_textures = &mut self.monitor_bay_textures;
                     let full_output = egui_context.run_ui(raw_input, |ctx| {
                         if show_native_recovery_strip(output_on_main) {
                             build_native_recovery_strip(
@@ -21238,6 +21415,73 @@ impl ApplicationHandler for App {
                                             permit,
                                             &stage_health_snapshot,
                                         );
+                                    }
+                                }
+                                if show_monitor_bay(output_on_main) {
+                                    if let Some(permit) = monitor_bay::monitor_bay_permit(
+                                        stage_tools,
+                                        &stage_map::StageSurface::EditorPreview,
+                                        output_on_main,
+                                    ) {
+                                        if let Some(update) = &monitor_bay_images {
+                                            match update {
+                                                Some((wave, scope)) => {
+                                                    let options = egui::TextureOptions::NEAREST;
+                                                    match monitor_bay_textures.as_mut() {
+                                                        Some(textures) => {
+                                                            textures
+                                                                .waveform
+                                                                .set(wave.clone(), options);
+                                                            textures
+                                                                .vectorscope
+                                                                .set(scope.clone(), options);
+                                                        }
+                                                        None => {
+                                                            *monitor_bay_textures =
+                                                                Some(MonitorBayTextures {
+                                                                    waveform: ui
+                                                                        .ctx()
+                                                                        .load_texture(
+                                                                        "monitor-bay-waveform",
+                                                                        wave.clone(),
+                                                                        options,
+                                                                    ),
+                                                                    vectorscope: ui
+                                                                        .ctx()
+                                                                        .load_texture(
+                                                                            "monitor-bay-scope",
+                                                                            scope.clone(),
+                                                                            options,
+                                                                        ),
+                                                                });
+                                                        }
+                                                    }
+                                                }
+                                                None => *monitor_bay_textures = None,
+                                            }
+                                        }
+                                        let view = monitor_bay::MonitorBayPaintInput {
+                                            waveform: monitor_bay_textures.as_ref().map(
+                                                |textures| {
+                                                    (
+                                                        textures.waveform.id(),
+                                                        egui::vec2(256.0, 128.0),
+                                                    )
+                                                },
+                                            ),
+                                            vectorscope: monitor_bay_textures.as_ref().map(
+                                                |textures| {
+                                                    (
+                                                        textures.vectorscope.id(),
+                                                        egui::vec2(128.0, 128.0),
+                                                    )
+                                                },
+                                            ),
+                                            probe: monitor_probe,
+                                            probe_status: monitor_probe_status,
+                                            sources: &monitor_sources,
+                                        };
+                                        monitor_bay::paint_monitor_bay(ui, &permit, &view);
                                     }
                                 }
                             });
@@ -23186,6 +23430,41 @@ impl ApplicationHandler for App {
                                     .schedule_video_analysis(self.video_analysis_accumulator as f32)
                             {
                                 self.video_analysis_accumulator = 0.0;
+                            }
+                        }
+                        // B11 monitoring bay shares the seam: the authored
+                        // probe reads a committed image (slot 2, the tap, or
+                        // the canvas donor) at the same 10 Hz reference
+                        // cadence, armed only while an observer watches
+                        // (`monitor_bay_was_armed` holds this frame's armed
+                        // fact, computed at the drain). An unavailable probe
+                        // schedules nothing — the instruments hold and the
+                        // snapshot names the condition — rather than
+                        // rebinding onto another producer.
+                        if temporal_frame_accepted
+                            && temporal_input.freeze.program_advances()
+                            && self.monitor_bay_was_armed
+                        {
+                            let canvas_view = self.gesture_canvas_gpu.as_ref().and_then(
+                                renderer::gesture_canvas::GestureCanvasResources::presented_view,
+                            );
+                            let available = match self.monitor_probe {
+                                monitor_bay::MonitorProbe::Program => true,
+                                monitor_bay::MonitorProbe::ProgramTap => {
+                                    renderer.program_tap_valid()
+                                }
+                                monitor_bay::MonitorProbe::GestureCanvas => canvas_view.is_some(),
+                            };
+                            if available {
+                                self.monitor_bay_accumulator += f64::from(program_delta);
+                                let interval = f64::from(monitor_bay::MONITOR_BAY_INTERVAL_TICKS)
+                                    / f64::from(crate::effects::params::TEMPORAL_REFERENCE_FPS);
+                                if self.monitor_bay_accumulator >= interval
+                                    && renderer
+                                        .schedule_monitor_bay(self.monitor_probe, canvas_view)
+                                {
+                                    self.monitor_bay_accumulator = 0.0;
+                                }
                             }
                         }
                         if advanced_audience_rendered {

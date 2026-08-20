@@ -2154,6 +2154,58 @@ pub enum ModSource {
     VideoCut,
 }
 
+/// B11: the canonical monitoring-bay source order. Every distinct live
+/// source once, legacy band aliases excluded (bands 1–3 are the same values
+/// under their own names). Append-only so a panel that indexes by position
+/// stays stable across builds.
+pub const MONITOR_SOURCE_LIST: &[ModSource] = &[
+    ModSource::Lfo(0),
+    ModSource::Lfo(1),
+    ModSource::Lfo(2),
+    ModSource::Lfo(3),
+    ModSource::AudioLevel,
+    ModSource::AudioBand(0),
+    ModSource::AudioBand(1),
+    ModSource::AudioBand(2),
+    ModSource::AudioBand(3),
+    ModSource::AudioBand(4),
+    ModSource::AudioBand(5),
+    ModSource::AudioBand(6),
+    ModSource::AudioBand(7),
+    ModSource::AudioOnset,
+    ModSource::AudioBright,
+    ModSource::AudioNoise,
+    ModSource::Midi(0),
+    ModSource::Midi(1),
+    ModSource::Midi(2),
+    ModSource::Midi(3),
+    ModSource::GyroYaw,
+    ModSource::GyroPitch,
+    ModSource::GyroRoll,
+    ModSource::PadX,
+    ModSource::PadY,
+    ModSource::Bend(0),
+    ModSource::Bend(1),
+    ModSource::Bend(2),
+    ModSource::Bend(3),
+    ModSource::Bend(4),
+    ModSource::Bend(5),
+    ModSource::Envelope(0),
+    ModSource::Envelope(1),
+    ModSource::Envelope(2),
+    ModSource::Envelope(3),
+    ModSource::Macro(0),
+    ModSource::Macro(1),
+    ModSource::Macro(2),
+    ModSource::Macro(3),
+    ModSource::Chaos,
+    ModSource::Drift,
+    ModSource::Spike,
+    ModSource::VideoMotion,
+    ModSource::VideoBrightness,
+    ModSource::VideoCut,
+];
+
 impl ModSource {
     pub fn try_from_str(s: &str) -> Option<Self> {
         Some(match s {
@@ -2990,13 +3042,22 @@ fn linear_to_srgb_code(value: f32) -> u8 {
     (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
-/// The one CPU reduction law shared by the export path and the GPU shader's
+/// The one CPU reduction law shared by the export path and the GPU shaders'
 /// reference tests: each analysis cell is the mean of a fixed 4×4 sub-grid of
 /// bilinear taps into the full-resolution image, sampled at the same UV
 /// addresses the shader uses and filtered in linear light exactly as the GPU
 /// filters an sRGB texture. Alpha is stored linearly and filters as-is.
-pub fn reduce_video_analysis_grid(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut grid = vec![0u8; VIDEO_ANALYSIS_CELLS * 4];
+/// B10's 32×18 analysis grid and B11's 128×72 monitor grid are the same law
+/// at two sizes, so the grid dimensions are parameters rather than a second
+/// copy of the expression.
+pub fn reduce_analysis_grid(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    grid_width: usize,
+    grid_height: usize,
+) -> Vec<u8> {
+    let mut grid = vec![0u8; grid_width * grid_height * 4];
     if width == 0 || height == 0 || pixels.len() < width * height * 4 {
         return grid;
     }
@@ -3021,17 +3082,15 @@ pub fn reduce_video_analysis_grid(pixels: &[u8], width: usize, height: usize) ->
         let bottom = sample(x0, y1) * (1.0 - fx) + sample(x1, y1) * fx;
         top * (1.0 - fy) + bottom * fy
     };
-    for cell_y in 0..VIDEO_ANALYSIS_HEIGHT {
-        for cell_x in 0..VIDEO_ANALYSIS_WIDTH {
-            let cell = cell_y * VIDEO_ANALYSIS_WIDTH + cell_x;
+    for cell_y in 0..grid_height {
+        for cell_x in 0..grid_width {
+            let cell = cell_y * grid_width + cell_x;
             for channel in 0..4 {
                 let mut sum = 0.0f32;
                 for tap_y in 0..4 {
                     for tap_x in 0..4 {
-                        let u = (cell_x as f32 + (tap_x as f32 + 0.5) / 4.0)
-                            / VIDEO_ANALYSIS_WIDTH as f32;
-                        let v = (cell_y as f32 + (tap_y as f32 + 0.5) / 4.0)
-                            / VIDEO_ANALYSIS_HEIGHT as f32;
+                        let u = (cell_x as f32 + (tap_x as f32 + 0.5) / 4.0) / grid_width as f32;
+                        let v = (cell_y as f32 + (tap_y as f32 + 0.5) / 4.0) / grid_height as f32;
                         sum += bilinear(u, v, channel);
                     }
                 }
@@ -3045,6 +3104,17 @@ pub fn reduce_video_analysis_grid(pixels: &[u8], width: usize, height: usize) ->
         }
     }
     grid
+}
+
+/// B10's 32×18 content-analysis reduction, expressed through the shared law.
+pub fn reduce_video_analysis_grid(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
+    reduce_analysis_grid(
+        pixels,
+        width,
+        height,
+        VIDEO_ANALYSIS_WIDTH,
+        VIDEO_ANALYSIS_HEIGHT,
+    )
 }
 
 /// BENDR's drift law verbatim: a fixed three-sine sum of incommensurate
@@ -3381,6 +3451,16 @@ impl ModMatrix {
             finite_or(y, 0.5).clamp(0.0, 1.0),
         ];
         self.pad_active = active;
+    }
+
+    /// B11: the live values of every canonical source, in the fixed
+    /// [`MONITOR_SOURCE_LIST`] order, for the monitoring bay's PROBE strip.
+    /// Pure reads — publishing the strip can never perturb the matrix.
+    pub fn monitor_source_values(&self) -> Vec<(&'static str, f32)> {
+        MONITOR_SOURCE_LIST
+            .iter()
+            .map(|source| (source.as_str(), self.source_value(*source)))
+            .collect()
     }
 
     /// Current value of a modulation source.
@@ -7471,5 +7551,29 @@ mod tests {
             modulated.brightness > base.brightness,
             "an envelope is an ordinary matrix source"
         );
+    }
+
+    #[test]
+    fn the_monitor_source_list_is_complete_stable_and_pure_to_read() {
+        // Every distinct live source exactly once (legacy band aliases
+        // excluded), every name round-tripping through the closed parser.
+        assert_eq!(MONITOR_SOURCE_LIST.len(), 45);
+        let mut names = std::collections::HashSet::new();
+        for source in MONITOR_SOURCE_LIST {
+            let name = source.as_str();
+            assert!(names.insert(name), "duplicate monitor source {name}");
+            assert_eq!(
+                ModSource::try_from_str(name),
+                Some(*source),
+                "monitor source {name} must round-trip"
+            );
+        }
+        // Reading the strip perturbs nothing: two reads of an untouched
+        // matrix are identical.
+        let matrix = ModMatrix::new();
+        let first = matrix.monitor_source_values();
+        let second = matrix.monitor_source_values();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), MONITOR_SOURCE_LIST.len());
     }
 }

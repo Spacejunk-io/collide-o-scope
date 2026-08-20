@@ -90,6 +90,11 @@ pub struct WebState {
     library_generation: AtomicU64,
     /// Server-owned phone-stream membership and monotonic sample freshness.
     gyro_streams: std::sync::Mutex<GyroStreamRegistry>,
+    /// B11: which clients currently declare themselves watching the
+    /// monitoring bay, by freshest declaration instant. Watchers re-assert on
+    /// a heartbeat, so a vanished tab expires by [`MONITOR_WATCH_TIMEOUT`]
+    /// instead of pinning the readback armed.
+    monitor_watchers: std::sync::Mutex<HashMap<u64, Instant>>,
     next_client_id: AtomicU64,
 }
 
@@ -105,6 +110,11 @@ struct BrowserHistoryGesture {
 /// mobile scheduling jitter without permitting a vanished pose to remain
 /// applied indefinitely.
 pub const GYRO_SAMPLE_TIMEOUT: Duration = Duration::from_millis(1_500);
+
+/// B11: a watching panel re-asserts its declaration every few seconds, so a
+/// crashed or silently discarded tab stops arming the monitor readback
+/// within this window even if its socket lingers.
+pub const MONITOR_WATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct GyroStreamRegistry {
@@ -1282,6 +1292,11 @@ pub struct AppSnapshot {
     /// The snapshot is informational and has no audience/composite pixels.
     #[serde(default)]
     pub stage_health: crate::stage_health::StageHealthSnapshot,
+    /// B11 monitoring bay: instrument bitmaps and the live source strip,
+    /// additive and defaulting to the inactive (empty-payload) bay. The
+    /// payloads are present only while an observer keeps the bay armed.
+    #[serde(default)]
+    pub monitor_bay: crate::monitor_bay::MonitorBaySnapshot,
     /// Remote control URL (LAN address with access token) for the QR code
     #[serde(default)]
     pub remote_url: String,
@@ -1371,6 +1386,7 @@ impl Default for AppSnapshot {
             spout: SpoutSnapshot::default(),
             recorder: ProgramRecorderSnapshot::default(),
             stage_health: crate::stage_health::StageHealthSnapshot::default(),
+            monitor_bay: crate::monitor_bay::MonitorBaySnapshot::default(),
             remote_url: String::new(),
             output_window: false,
             output_error: String::new(),
@@ -4828,6 +4844,20 @@ pub enum WebAction {
     /// Show/hide operator health telemetry in the editor preview only.
     #[serde(rename = "set_stage_health_hud")]
     SetStageHealthHud { enabled: bool },
+    /// B11: show/hide the monitoring-bay overlay in the editor preview only.
+    #[serde(rename = "set_monitor_bay")]
+    SetMonitorBay { enabled: bool },
+    /// B11: select the monitoring bay's PROBE signal. The token rides the
+    /// closed `MonitorProbe` vocabulary; an unknown token is refused at the
+    /// gate and again at the applier through the same parse table.
+    #[serde(rename = "set_monitor_probe")]
+    SetMonitorProbe { probe: String },
+    /// B11: per-client declaration that this panel is currently watching the
+    /// bay. Handled at the socket layer exactly like `gyro_stream` — never
+    /// queued, cleaned up on disconnect, and expired by the watch timeout so
+    /// a vanished tab cannot keep the readback armed.
+    #[serde(rename = "monitor_watch")]
+    MonitorWatch { enabled: bool },
     /// Substitute a test card only on one exact physical output endpoint.
     #[serde(rename = "set_stage_test_card")]
     SetStageTestCard {
@@ -5121,6 +5151,8 @@ impl WebAction {
             }),
             Self::SetSpout { .. } => Some("spout:enabled".into()),
             Self::SetStageHealthHud { .. } => Some("stage:health-hud".into()),
+            Self::SetMonitorBay { .. } => Some("stage:monitor-bay".into()),
+            Self::SetMonitorProbe { .. } => Some("stage:monitor-probe".into()),
             Self::SetStageTestCard { .. } => Some("stage:test-card".into()),
             Self::SetOutputIdentification { .. } => Some("stage:output-identification".into()),
             _ => None,
@@ -5166,6 +5198,9 @@ impl WebAction {
                 | Self::CaptureStill { .. }
                 | Self::StartResample { .. }
                 | Self::SetStageHealthHud { .. }
+                | Self::SetMonitorBay { .. }
+                | Self::SetMonitorProbe { .. }
+                | Self::MonitorWatch { .. }
                 | Self::SetStageTestCard { .. }
                 | Self::SetOutputIdentification { .. }
                 | Self::RescanLibrary
@@ -5791,6 +5826,7 @@ impl WebState {
             control_server: std::sync::RwLock::new(ControlServerInfo::default()),
             library_generation: AtomicU64::new(0),
             gyro_streams: std::sync::Mutex::new(GyroStreamRegistry::default()),
+            monitor_watchers: std::sync::Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(1),
         }))
     }
@@ -6111,6 +6147,42 @@ impl WebState {
         self.library_media_helper_gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// B11: record a client's monitor-watch declaration. `enabled` refreshes
+    /// the watcher's instant; `false` removes it immediately.
+    pub fn set_monitor_watch(&self, client_id: u64, enabled: bool) {
+        let mut watchers = self
+            .monitor_watchers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if enabled {
+            watchers.insert(client_id, Instant::now());
+        } else {
+            watchers.remove(&client_id);
+        }
+    }
+
+    /// B11: drop a disconnected client's watch, exactly as the gyro registry
+    /// forgets its streamers.
+    pub fn disconnect_monitor_client(&self, client_id: u64) {
+        self.monitor_watchers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&client_id);
+    }
+
+    /// B11: whether any browser watcher is fresh. Expired entries are pruned
+    /// here so the map stays bounded by live-ish clients.
+    pub fn monitor_watch_active(&self) -> bool {
+        let now = Instant::now();
+        let mut watchers = self
+            .monitor_watchers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        watchers
+            .retain(|_, instant| now.saturating_duration_since(*instant) <= MONITOR_WATCH_TIMEOUT);
+        !watchers.is_empty()
     }
 
     pub fn set_gyro_stream(&self, client_id: u64, enabled: bool) {
@@ -11102,6 +11174,67 @@ mod protocol_tests {
             !allowlist.contains("bend_pad"),
             "a bend edge must never be latchable"
         );
+    }
+
+    #[test]
+    fn the_monitor_bay_protocol_is_additive_gated_and_watch_reaches_the_registry() {
+        // An older snapshot without the block decodes as the inactive bay.
+        let legacy = serde_json::to_value(AppSnapshot::default())
+            .map(|mut value| {
+                value.as_object_mut().unwrap().remove("monitor_bay");
+                value
+            })
+            .unwrap();
+        let decoded: AppSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.monitor_bay,
+            crate::monitor_bay::MonitorBaySnapshot::default()
+        );
+        assert!(!decoded.monitor_bay.active);
+
+        // The three actions parse under their wire names; the two authored
+        // stage tools coalesce per control and every one is a host operation
+        // outside manual history.
+        let bay: WebAction =
+            serde_json::from_str(r#"{"action":"set_monitor_bay","enabled":true}"#).unwrap();
+        assert_eq!(bay.coalesce_key().as_deref(), Some("stage:monitor-bay"));
+        assert!(bay.is_performance_only_for_history());
+        let probe: WebAction =
+            serde_json::from_str(r#"{"action":"set_monitor_probe","probe":"program_tap"}"#)
+                .unwrap();
+        assert_eq!(probe.coalesce_key().as_deref(), Some("stage:monitor-probe"));
+        assert!(probe.is_performance_only_for_history());
+        let watch: WebAction =
+            serde_json::from_str(r#"{"action":"monitor_watch","enabled":true}"#).unwrap();
+        assert!(watch.coalesce_key().is_none());
+        assert!(watch.is_performance_only_for_history());
+
+        // The watch registry arms on a fresh declaration, disarms on an
+        // explicit stop, and forgets a disconnected client immediately —
+        // the gyro registry's lifecycle, without its implicit enrollment.
+        let state = WebState::new().expect("test web state");
+        assert!(!state.monitor_watch_active());
+        state.set_monitor_watch(7, true);
+        assert!(state.monitor_watch_active());
+        state.set_monitor_watch(7, false);
+        assert!(!state.monitor_watch_active());
+        state.set_monitor_watch(9, true);
+        state.disconnect_monitor_client(9);
+        assert!(!state.monitor_watch_active());
+
+        // The bundled panel actually sends the vocabulary and consumes the
+        // block, so the engine-side gates guard live strings, not intent.
+        let js = include_str!("../../static/app.js");
+        assert!(js.contains("sendAction({ action: 'monitor_watch', enabled: watching })"));
+        assert!(js.contains(
+            "sendAction({ action: 'set_monitor_bay', enabled: monitorBayNative.checked })"
+        ));
+        assert!(js.contains("sendAction({ action: 'set_monitor_probe', probe })"));
+        assert!(js.contains("syncMonitorBay(msg.monitor_bay)"));
+        let html = include_str!("../../static/index.html");
+        assert!(html.contains("id=\"monitor-bay-group\""));
+        assert!(html.contains("id=\"monitor-bay-waveform\""));
+        assert!(html.contains("id=\"monitor-bay-scope\""));
     }
 
     #[test]
