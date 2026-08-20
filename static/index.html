@@ -4,7 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>collide-o-scope</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230f0f12'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%235a8fe6' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='3.5' fill='%235a8fe6'/%3E%3C/svg%3E">
+  <link rel="icon" type="image/png" sizes="16x16" href="icon-16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="icon-32.png">
+  <link rel="icon" type="image/png" sizes="48x48" href="icon-48.png">
+  <link rel="apple-touch-icon" sizes="256x256" href="icon-256.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -92,6 +95,26 @@
           </div>
           <div class="lib-upload-status" id="generator-add-status"></div>
         </div>
+      <section class="scenes-panel" aria-labelledby="scenes-title">
+        <div class="scenes-heading">
+          <h3 class="panel-title" id="scenes-title">Scenes</h3>
+          <span class="dim">atomic source studies</span>
+        </div>
+        <form class="scene-capture-form" id="scene-capture-form" aria-label="Capture the current active slots as a scene">
+          <label for="scene-capture-name">Name <span class="dim">optional</span></label>
+          <input id="scene-capture-name" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="Untitled scene">
+          <label for="scene-capture-mode">Timing</label>
+          <select id="scene-capture-mode">
+            <option value="immediate">Immediate</option>
+            <option value="next_beat">Next beat</option>
+            <option value="next_bar">Next bar</option>
+          </select>
+          <button id="scene-capture-submit" type="submit">Capture Current</button>
+          <div class="scene-capture-help">Captures one active slot per live layer. Scene changes remain atomic.</div>
+        </form>
+        <div class="scene-list" id="scene-list" role="list"></div>
+        <div class="scene-status" id="scene-status" role="status" aria-live="polite">No authored scenes</div>
+      </section>
         <div class="library-grid" id="library-grid">
           <!-- Library items rendered by JS -->
         </div>
@@ -287,26 +310,6 @@
           </div>
         </details>
 
-        <section class="scenes-panel" aria-labelledby="scenes-title">
-          <div class="scenes-heading">
-            <h3 class="panel-title" id="scenes-title">Scenes</h3>
-            <span class="dim">atomic source studies</span>
-          </div>
-          <form class="scene-capture-form" id="scene-capture-form" aria-label="Capture the current active slots as a scene">
-            <label for="scene-capture-name">Name <span class="dim">optional</span></label>
-            <input id="scene-capture-name" type="text" maxlength="128" autocomplete="off" spellcheck="false" placeholder="Untitled scene">
-            <label for="scene-capture-mode">Timing</label>
-            <select id="scene-capture-mode">
-              <option value="immediate">Immediate</option>
-              <option value="next_beat">Next beat</option>
-              <option value="next_bar">Next bar</option>
-            </select>
-            <button id="scene-capture-submit" type="submit">Capture Current</button>
-            <div class="scene-capture-help">Captures one active slot per live layer. Scene changes remain atomic.</div>
-          </form>
-          <div class="scene-list" id="scene-list" role="list"></div>
-          <div class="scene-status" id="scene-status" role="status" aria-live="polite">No authored scenes</div>
-        </section>
         <div class="layers-section">
           <p id="layer-blend-policy" class="visually-hidden">Reordering changes the content below; the saved blend choice remains unchanged. Subtract computes below minus layer. Alpha Cut erases accumulated content; it is a no-op without content below.</p>
           <div class="layers-list" id="layers-list">
@@ -328,19 +331,21 @@
           <button class="transport-btn blackout-btn" id="btn-blackout" title="Blackout (B)">BLK</button>
           <span class="beat-light" id="beat-light" title="beat"></span>
           <span class="ws-dot" id="ws-status" title="connecting..."></span>
+          <!-- The search keeps its own landmark, but lays out as ribbon items
+               rather than a nested box, so it costs no line of its own. -->
+          <div class="control-search" role="search">
+            <input type="search" id="control-search" class="control-search-input"
+                   placeholder="Search controls" autocomplete="off" spellcheck="false"
+                   aria-label="Search master controls by name, section, or help text"
+                   aria-describedby="control-search-count">
+            <button type="button" class="control-filter" id="filter-moving" aria-pressed="false"
+                    title="Show only controls a modulation route currently drives">MOVING</button>
+            <button type="button" class="control-filter" id="filter-changed" aria-pressed="false"
+                    title="Show only controls sitting away from their default">CHANGED</button>
+            <span class="control-search-count" id="control-search-count" role="status"></span>
+          </div>
         </div>
         <h3 class="panel-title">Master Effects</h3>
-        <div class="control-search" role="search">
-          <input type="search" id="control-search" class="control-search-input"
-                 placeholder="Search controls" autocomplete="off" spellcheck="false"
-                 aria-label="Search master controls by name, section, or help text"
-                 aria-describedby="control-search-count">
-          <button type="button" class="control-filter" id="filter-moving" aria-pressed="false"
-                  title="Show only controls a modulation route currently drives">MOVING</button>
-          <button type="button" class="control-filter" id="filter-changed" aria-pressed="false"
-                  title="Show only controls sitting away from their default">CHANGED</button>
-          <span class="control-search-count" id="control-search-count" role="status"></span>
-        </div>
         <div class="fx-scroll" id="master-fx">
           <div class="fx-columns">
           <div class="fx-col" data-fx-column="video"><!-- video effects -->

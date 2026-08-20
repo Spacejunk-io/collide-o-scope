@@ -7317,6 +7317,104 @@ mod protocol_tests {
         );
     }
 
+    /// The panel's chrome: the program icon at every size a browser and a
+    /// desktop ask for, the search sharing the transport ribbon rather than a
+    /// line of its own, Scenes in the left column, and the static prose folded
+    /// into a `?` beside each section.
+    #[test]
+    fn panel_chrome_carries_the_icon_the_ribbon_search_and_the_folded_notes() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+        let files = include_str!("static_files.rs");
+
+        // The icon is served at every provided size and linked from the page.
+        for size in ["16", "32", "48", "256"] {
+            assert!(
+                files.contains(&format!("\"icon-{size}.png\"")),
+                "icon-{size}.png must be served"
+            );
+            assert!(
+                html.contains(&format!("href=\"icon-{size}.png\"")),
+                "icon-{size}.png must be linked from the panel"
+            );
+        }
+        assert!(
+            files.contains("image/png"),
+            "icons must be served with an image content type"
+        );
+        assert!(
+            !html.contains("data:image/svg+xml"),
+            "the placeholder inline favicon should be gone"
+        );
+
+        // The search shares the transport ribbon. Its markup must sit inside
+        // that row, and it must keep its own landmark while doing so.
+        let ribbon = html
+            .split("<div class=\"transport-row\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</div>\n        <h3").next())
+            .expect("the transport row must exist");
+        assert!(
+            ribbon.contains("id=\"control-search\""),
+            "the search belongs in the transport ribbon, not on a line of its own"
+        );
+        assert!(
+            ribbon.contains("role=\"search\""),
+            "moving the search must not cost it its landmark"
+        );
+        assert!(
+            css.contains(".transport-row .control-search {"),
+            "the ribbon search needs its own layout rule"
+        );
+        assert!(
+            css.contains("display: contents;"),
+            "the wrapper must not become a nested box inside the ribbon"
+        );
+
+        // Scenes lives in the left column, above the library grid.
+        let left = html
+            .split("<aside class=\"col-left\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</aside>").next())
+            .expect("the left column must exist");
+        assert!(
+            left.contains("class=\"scenes-panel\""),
+            "Scenes belongs in the left column"
+        );
+        let scenes_at = left.find("class=\"scenes-panel\"").expect("scenes");
+        let grid_at = left.find("id=\"library-grid\"").expect("library grid");
+        assert!(
+            scenes_at < grid_at,
+            "Scenes should sit above the library grid, which is the long scrolling surface"
+        );
+
+        // Static prose folds into a ? beside its section; live notes do not.
+        assert!(
+            js.contains(".audio-status:not([id])"),
+            "only notes without an id are static description"
+        );
+        assert!(js.contains("mark.className = 'group-help'"));
+        assert!(
+            js.contains("event.stopPropagation();"),
+            "the question mark must not collapse the section it explains"
+        );
+        assert!(css.contains(".group-help {"), "the ? needs a styling rule");
+        assert!(
+            css.contains(".audio-status:empty"),
+            "an empty live note must not reserve a blank line"
+        );
+        // Every note the engine writes into keeps its id, and therefore its place.
+        for live in [
+            "id=\"ntsc-metrics\"",
+            "id=\"morph-status\"",
+            "id=\"reroll-status\"",
+            "id=\"sync-latch-status\"",
+        ] {
+            assert!(html.contains(live), "live status note missing: {live}");
+        }
+    }
+
     /// The generated help asset must actually be reachable, or the panel's
     /// tooltips and its search corpus are both empty.
     #[test]

@@ -2560,9 +2560,12 @@ function syncTemporal(t) {
     const damaged = t.sync_damaged === true;
     syncStatus.classList.toggle('sync-damaged', damaged);
     syncStatus.dataset.damaged = damaged ? 'true' : 'false';
+    // Blank at rest: the explanation lives in the section's ? affordance, and
+    // this line exists to report the one fact a switch cannot — that damage is
+    // still held.
     syncStatus.textContent = damaged
-      ? 'DAMAGE HELD — the program is still carrying accumulated shear. Release the latch to unwind it.'
-      : syncStatus.dataset.baseText;
+      ? 'DAMAGE HELD — release the latch to unwind it.'
+      : '';
   }
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;
@@ -8177,5 +8180,38 @@ function syncControlFilters(modulation) {
     event.preventDefault();
     input.focus();
     input.select();
+  });
+})();
+
+// ===== B15: descriptive prose folds into a ? beside each section ==========
+// A column of controls should be controls. The static grey notes that explain
+// a section are moved into a `?` affordance in that section's own header, so
+// the explanation is one hover away instead of occupying a paragraph between
+// every group. Notes carrying live truth — counters, statuses, error text —
+// are identified by having an `id` the engine writes to, and are left exactly
+// where they are, because those have to be readable without hovering.
+(function foldStaticNotesIntoHeaders() {
+  document.querySelectorAll('.audio-status:not([id])').forEach((note) => {
+    const text = note.textContent.trim();
+    if (!text) return;
+    const details = note.closest('details');
+    const host = details
+      ? details.querySelector('summary')
+      : note.closest('.fx-group')?.querySelector('.fx-group-header');
+    if (!host) return;
+    const mark = document.createElement('button');
+    mark.type = 'button';
+    mark.className = 'group-help';
+    mark.textContent = '?';
+    mark.title = text;
+    mark.setAttribute('aria-label', `About this section: ${text}`);
+    // The header and the summary are both click targets of their own, so the
+    // question mark must not collapse the very section it explains.
+    mark.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    host.appendChild(mark);
+    note.remove();
   });
 })();

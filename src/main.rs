@@ -1470,6 +1470,19 @@ struct RerollRequest {
     include_group_controls: bool,
 }
 
+/// The program icon for every window this process opens.
+///
+/// Decoded once from the embedded 48px PNG — the size Windows asks for in a
+/// taskbar and alt-tab list, and small enough that decoding it costs nothing
+/// at startup. A failure here is cosmetic, so it degrades to the platform
+/// default rather than refusing to open a window.
+fn program_window_icon() -> Option<winit::window::Icon> {
+    static ICON_BYTES: &[u8] = include_bytes!("../assets/icon/collide-o-scope-48.png");
+    let decoded = image::load_from_memory(ICON_BYTES).ok()?.into_rgba8();
+    let (width, height) = decoded.dimensions();
+    winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreativeRackScope {
     Master,
@@ -7248,6 +7261,7 @@ impl App {
         let monitor = monitors[monitor_index].clone();
         let attributes = WindowAttributes::default()
             .with_title(format!("collide-o-scope — stage output {}", endpoint.id))
+            .with_window_icon(program_window_icon())
             .with_inner_size(winit::dpi::PhysicalSize::new(
                 endpoint.output_size[0],
                 endpoint.output_size[1],
@@ -7512,6 +7526,7 @@ impl App {
 
         let attrs = WindowAttributes::default()
             .with_title("collide-o-scope — output")
+            .with_window_icon(program_window_icon())
             .with_fullscreen(Some(Fullscreen::Borderless(Some(target_monitor))));
 
         match event_loop.create_window(attrs) {
@@ -20615,9 +20630,10 @@ impl ApplicationHandler for App {
         }
 
         let create_window = |width, height| {
-            let attrs = WindowAttributes::default()
+            let mut attrs = WindowAttributes::default()
                 .with_title("collide-o-scope")
                 .with_inner_size(winit::dpi::LogicalSize::new(width, height));
+            attrs = attrs.with_window_icon(program_window_icon());
             event_loop.create_window(attrs).map(Arc::new)
         };
         let requested_output = (output_width, output_height);

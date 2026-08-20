@@ -2528,12 +2528,18 @@ select:focus-visible,
 /* B15 control search and filters. Entirely client-side over data the panel
    already holds, so this is presentation only: no control it hides is
    disabled, and clearing the query restores every row untouched. */
-.control-search {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 6px 4px 6px;
-  flex-wrap: wrap;
+/* The search shares the transport ribbon rather than taking a line of its
+   own: it is a way of getting to a control, not a control. `display: contents`
+   keeps the search landmark for assistive technology while letting the input
+   and its two filters sit directly among the transport buttons. */
+.transport-row .control-search {
+  display: contents;
+}
+
+.transport-row .control-search-input {
+  flex: 1 1 90px;
+  min-width: 72px;
+  margin-left: 6px;
 }
 
 .control-search-input {
@@ -2588,3 +2594,33 @@ select:focus-visible,
   line-height: 1.35;
   padding: 2px 0 4px 0;
 }
+
+/* B15: the per-section explanation, folded out of the column and into its
+   header. Sized to the existing header line so it never grows it. */
+.group-help {
+  background: transparent;
+  border: 1px solid var(--border, #2a2a35);
+  border-radius: 50%;
+  color: var(--text-dim, #6a6a78);
+  cursor: help;
+  flex: 0 0 auto;
+  font-size: 9px;
+  height: 13px;
+  line-height: 1;
+  margin-left: 4px;
+  padding: 0;
+  width: 13px;
+}
+
+.group-help:hover,
+.group-help:focus-visible {
+  border-color: #5a8fe6;
+  color: #7aa8f0;
+}
+
+/* A summary is a flex row already; keep the mark on the same line. */
+details > summary > .group-help { vertical-align: middle; }
+
+/* An empty live note takes no room, so a section with nothing to report does
+   not reserve a blank line for it. */
+.audio-status:empty { display: none; min-height: 0; }
