@@ -3729,6 +3729,10 @@ struct App {
     /// resources are rebuilt, which is what makes the composition executor
     /// re-prepare bind groups that would otherwise keep a destroyed view.
     gesture_canvas_gpu_epoch: u64,
+    /// Monotonic identity for the renderer-owned programme-tap texture: a
+    /// rebuilt renderer is a new tap surface, and the executor's prepared tap
+    /// bind groups must not keep a destroyed texture's view.
+    program_tap_gpu_epoch: u64,
     /// A typed reset cause reached the CPU canvas and the device half has not
     /// caught up yet. It is cleared by encoding the clear, so no reset can be
     /// observed by the CPU field and silently skipped on the GPU.
@@ -4129,6 +4133,7 @@ impl App {
             export_gesture_canvas: None,
             gesture_canvas_gpu: None,
             gesture_canvas_gpu_epoch: 0,
+            program_tap_gpu_epoch: 0,
             gesture_canvas_gpu_reset_pending: false,
             pending_motion_memory_clear: false,
             temporal_audio_onsets: temporal::TemporalAudioOnsetTracker::default(),
@@ -4476,6 +4481,11 @@ impl App {
         )
         .with_layer_mattes(&mattes, false)
         .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+        .with_program_tap(
+            self.renderer
+                .as_ref()
+                .is_some_and(renderer::Renderer::program_tap_valid),
+        )
         .with_studies(&self.study_library);
         let motion_limits = self.renderer.as_ref().map_or_else(
             || motion::MotionDeviceLimits::new(u32::MAX, u64::MAX),
@@ -5904,6 +5914,11 @@ impl App {
         self.blackout_presented = self.blackout;
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_visual_generation_for(temporal::TemporalResetCause::PatchGeneration);
+            // A new program generation must not composite its first frame
+            // through the previous program's audience image. The next
+            // accepted frame re-publishes; until then a routed tap is the
+            // named transparent diagnostic.
+            renderer.invalidate_program_tap();
         }
         if let Some(executor) = self.composition_gpu.as_mut() {
             executor.reset_history_for(temporal::TemporalResetCause::PatchGeneration);
@@ -19027,6 +19042,10 @@ impl ApplicationHandler for App {
         }
 
         self.window = Some(window);
+        // A new renderer owns a new programme-tap texture (starting invalid
+        // by construction); advance the epoch so a surviving executor's
+        // prepared tap bind groups rebuild instead of keeping the old view.
+        self.program_tap_gpu_epoch = self.program_tap_gpu_epoch.saturating_add(1);
         self.renderer = Some(renderer);
         self.egui_winit = Some(egui_winit);
         self.egui_renderer = Some(egui_renderer);
@@ -20196,6 +20215,7 @@ impl ApplicationHandler for App {
                             advanced_program_history_initialized,
                         )
                         .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+                        .with_program_tap(renderer.program_tap_valid())
                         .with_studies(&self.study_library)
                         .with_motion(
                             evaluated_master_motion,
@@ -20270,6 +20290,7 @@ impl ApplicationHandler for App {
                                 advanced_program_history_initialized,
                             )
                             .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+                            .with_program_tap(renderer.program_tap_valid())
                             .with_studies(&self.study_library)
                             .with_motion(
                                 evaluated_master_motion,
@@ -20358,6 +20379,7 @@ impl ApplicationHandler for App {
                                 )
                                 .with_layer_mattes(&authored_layer_mattes, false)
                                 .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
+                                .with_program_tap(renderer.program_tap_valid())
                                 .with_studies(&self.study_library)
                                 .with_motion(
                                     evaluated_master_motion,
@@ -20777,6 +20799,19 @@ impl ApplicationHandler for App {
                                     None => renderer::composition::GestureCanvasBinding::default(),
                                 },
                             );
+                            // Publish the programme tap the same way: the
+                            // renderer's committed copy when one exists, the
+                            // unbound default otherwise. The epoch is the
+                            // renderer generation, so a rebuilt renderer (and
+                            // therefore a new tap texture) re-prepares the tap
+                            // bind groups exactly once.
+                            executor.bind_program_tap(match renderer.program_tap_view() {
+                                Some(view) => renderer::composition::ProgramTapBinding::bound(
+                                    view.clone(),
+                                    self.program_tap_gpu_epoch,
+                                ),
+                                None => renderer::composition::ProgramTapBinding::default(),
+                            });
                             executor
                                 .prepare(&renderer.device, &renderer.queue, plan, &sources)
                                 .map_err(|error| error.to_string())?;
@@ -21521,6 +21556,23 @@ impl ApplicationHandler for App {
                             self.gesture_canvas.discard_staged();
                         }
                         self.pending_gesture_canvas_events.clear();
+                        // The programme tap shares the same acceptance seam.
+                        // Slot 2 still holds this frame's pre-blackout opaque
+                        // audience image here — the blackout clear runs later,
+                        // in the post-process encoder — so a copy submitted at
+                        // the acceptance decision is exactly the finished
+                        // programme at N, read by every routed tap at N+1: the
+                        // ProgramHistory N-1 law. Blackout suspends
+                        // publication instead of clearing: the tap holds the
+                        // last pre-blackout image (program memory, the
+                        // temporal-ring/melt precedent), so no frame rendered
+                        // under the emergency cut can enter a re-entry loop
+                        // and a release resumes from the picture the cut
+                        // interrupted. Export never takes this branch because
+                        // export has no blackout.
+                        if temporal_frame_accepted && !self.blackout {
+                            renderer.publish_program_tap();
+                        }
                         if advanced_audience_rendered {
                             if let Some(executor) = &mut self.composition_gpu {
                                 executor.commit_frame_history();
@@ -29846,6 +29898,79 @@ mod app_state_tests {
             .expect("the publisher exists");
         let body = &source[publisher..publisher + 2_000];
         assert!(body.contains("let encode_frame = accepted && state.has_staged_frame();"));
+    }
+
+    /// B16's ordering law, pinned in source text exactly as the canvas's is:
+    /// the programme tap binds before prepare, publishes only at the
+    /// acceptance decision (never inside the frame encoder), publishes only
+    /// while blackout is disengaged (the hold law), stays upstream of the
+    /// emergency cut, and is invalidated by a patch generation.
+    #[test]
+    fn the_live_loop_publishes_the_program_tap_at_the_acceptance_decision_and_holds_it_under_blackout(
+    ) {
+        let source = include_str!("main.rs");
+
+        // Bound before prepare, so the tap bind groups are built against the
+        // published copy exactly once.
+        let bind = source
+            .find("executor.bind_program_tap(")
+            .expect("the live executor binds the programme tap");
+        let prepare = source[bind..]
+            .find(".prepare(&renderer.device, &renderer.queue, plan, &sources)")
+            .expect("the live executor prepares after binding");
+        assert!(
+            prepare > 0,
+            "the tap must be bound before prepare builds the tap bind groups"
+        );
+
+        // Published at the acceptance decision — after the frame encoder is
+        // submitted and committed, because that is the only point at which
+        // acceptance is known — and gated on blackout, so the tap *holds* the
+        // last pre-blackout image while the emergency cut is engaged.
+        let publish = source
+            .find("renderer.publish_program_tap();")
+            .expect("the live loop publishes the programme tap");
+        assert!(
+            source[..publish].contains("renderer.commit_temporal_frame();"),
+            "publication belongs at the acceptance decision, not inside the frame encoder"
+        );
+        let guard = source[..publish]
+            .rfind("if temporal_frame_accepted && !self.blackout {")
+            .expect("publication is gated on acceptance and on blackout");
+        assert!(
+            publish - guard < 200,
+            "the acceptance-and-blackout gate must be the publish's own guard"
+        );
+
+        // The emergency cut stays downstream: the copy reads slot 2 before the
+        // blackout clear materializes, which is exactly what "the pre-blackout
+        // opaque audience image" means.
+        assert!(
+            source[publish..].contains("renderer.clear_composite(&mut encoder);"),
+            "blackout's clear must remain the absolute final audience operation, after the copy"
+        );
+
+        // Live admission is the renderer's published-validity fact at every
+        // in-loop plan construction, so the first accepted frame re-plans a
+        // routed tap from the named transparent diagnostic to the tap itself.
+        // (Concatenated so this test's own literal cannot count itself.)
+        let admission = concat!(".with_program_tap(renderer.", "program_tap_valid())");
+        assert_eq!(
+            source.matches(admission).count(),
+            3,
+            "all three in-loop plan constructions consult the renderer's tap validity"
+        );
+
+        // A new program generation invalidates the tap beside the renderer's
+        // own generation reset: the first frame of a loaded patch must not
+        // composite through the previous program's audience image.
+        let generation = source
+            .find("renderer.reset_visual_generation_for(temporal::TemporalResetCause::PatchGeneration);")
+            .expect("the patch-generation barrier resets the renderer");
+        assert!(
+            source[generation..generation + 600].contains("renderer.invalidate_program_tap();"),
+            "the patch-generation barrier must invalidate the programme tap"
+        );
     }
 
     /// §4 of this stage: a reset that stopped at the CPU field would leave the

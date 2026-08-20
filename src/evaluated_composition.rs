@@ -74,6 +74,18 @@ pub struct CompositionPlanInput<'a> {
     /// master-scope singleton, so this is a bare admission fact rather than an
     /// identity — there is nothing to name and no position to preserve.
     pub gesture_canvas_admitted: bool,
+    /// Whether the programme tap holds a committed frame.
+    ///
+    /// `false` is the pre-first-frame default: a route to the tap resolves to
+    /// a transparent field with a named diagnostic, exactly as an unadmitted
+    /// gesture canvas does, and never silently rebinds to a layer or a group.
+    /// The tap is a master-scope singleton, so this is a bare admission fact
+    /// rather than an identity — there is nothing to name and no position to
+    /// preserve. Live answers from the renderer's published-tap validity;
+    /// export admits unconditionally because its tap surface exists for the
+    /// whole job and frame zero reads its defined-transparent contents (the
+    /// `with_gesture_canvas(true)` precedent).
+    pub program_tap_admitted: bool,
     /// The host Study library. A Study node's digest resolves here at plan
     /// time; `None` (the default) or an absent digest plans an inert pass
     /// with the diagnostic surfaced host-side, never a fallback onto another
@@ -97,6 +109,7 @@ impl<'a> CompositionPlanInput<'a> {
             resource_limits: CreativeResourceLimits::default(),
             motion: None,
             gesture_canvas_admitted: false,
+            program_tap_admitted: false,
             studies: None,
         }
     }
@@ -115,6 +128,14 @@ impl<'a> CompositionPlanInput<'a> {
     /// both sides.
     pub const fn with_gesture_canvas(mut self, admitted: bool) -> Self {
         self.gesture_canvas_admitted = admitted;
+        self
+    }
+
+    /// Declare whether the programme tap holds a committed frame. Live and
+    /// export must supply the same admission law so a routed tap plans
+    /// identically on both sides once the first frame commits.
+    pub const fn with_program_tap(mut self, admitted: bool) -> Self {
+        self.program_tap_admitted = admitted;
         self
     }
 
@@ -565,6 +586,17 @@ pub enum PlannedImageSource {
     /// tap surface. That is what keeps a same-frame route to it from ever
     /// closing a cycle, including from the master scope that owns it.
     GestureCanvas,
+    /// The finished programme at N-1: the pre-blackout opaque audience image
+    /// published at the frame-acceptance decision.
+    ///
+    /// Like the gesture canvas it is a *producer with no scope*: nothing in
+    /// the composition graph makes it — the copy is published after the frame
+    /// encoder is accepted — so it contributes no dependency, no ordering
+    /// edge, and no retained tap surface, and no same-frame route to it can
+    /// close a cycle. It also has no N-1 parity of its own: the tap *is* the
+    /// N-1 image, so both timings read the same committed copy rather than
+    /// quietly claiming a history pair nothing writes.
+    ProgramTap,
     Transparent,
 }
 
@@ -627,6 +659,12 @@ pub enum CompositionPlanDiagnostic {
     /// resolves transparent and stays visible as this diagnostic; it is never
     /// repointed at some other producer.
     GestureCanvasUnavailable {
+        consumer: ImageTapConsumer,
+    },
+    /// A route named the programme tap before the first committed frame. The
+    /// tap resolves transparent and stays visible as this diagnostic; it is
+    /// never repointed at some other producer.
+    ProgramTapUnavailable {
         consumer: ImageTapConsumer,
     },
     RefreshGardenMatteNotSelected,
@@ -2316,6 +2354,7 @@ impl<'a> Planner<'a> {
 
         let below = below_topology(self.input.composition)?;
         let gesture_canvas_admitted = self.input.gesture_canvas_admitted;
+        let program_tap_admitted = self.input.program_tap_admitted;
         let mut taps = Vec::new();
         let mut diagnostics = Vec::new();
         let mut dependencies = Vec::new();
@@ -2338,6 +2377,7 @@ impl<'a> Planner<'a> {
                 &below,
                 &known_scopes,
                 gesture_canvas_admitted,
+                program_tap_admitted,
                 &mut taps,
                 &mut diagnostics,
                 &mut dependencies,
@@ -2356,6 +2396,7 @@ impl<'a> Planner<'a> {
                     &below,
                     &known_scopes,
                     gesture_canvas_admitted,
+                    program_tap_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -2379,6 +2420,7 @@ impl<'a> Planner<'a> {
                     &below,
                     &known_scopes,
                     gesture_canvas_admitted,
+                    program_tap_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -2392,6 +2434,7 @@ impl<'a> Planner<'a> {
                         &below,
                         &known_scopes,
                         gesture_canvas_admitted,
+                        program_tap_admitted,
                         &mut taps,
                         &mut diagnostics,
                         &mut dependencies,
@@ -2407,6 +2450,7 @@ impl<'a> Planner<'a> {
             &below,
             &known_scopes,
             gesture_canvas_admitted,
+            program_tap_admitted,
             &mut taps,
             &mut diagnostics,
             &mut dependencies,
@@ -2436,6 +2480,7 @@ impl<'a> Planner<'a> {
                     &below,
                     &known_scopes,
                     gesture_canvas_admitted,
+                    program_tap_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -2457,6 +2502,7 @@ impl<'a> Planner<'a> {
                     &below,
                     &known_scopes,
                     gesture_canvas_admitted,
+                    program_tap_admitted,
                     &mut taps,
                     &mut diagnostics,
                     &mut dependencies,
@@ -3521,6 +3567,7 @@ fn collect_rack_taps(
     below: &BelowTopology,
     known_scopes: &BTreeSet<VisualScopeId>,
     gesture_canvas_admitted: bool,
+    program_tap_admitted: bool,
     taps: &mut Vec<PlannedImageTap>,
     diagnostics: &mut Vec<CompositionPlanDiagnostic>,
     dependencies: &mut Vec<ImageDependency>,
@@ -3584,6 +3631,7 @@ fn collect_rack_taps(
                 below,
                 known_scopes,
                 gesture_canvas_admitted,
+                program_tap_admitted,
                 taps,
                 diagnostics,
                 dependencies,
@@ -3602,6 +3650,7 @@ fn collect_tap(
     below: &BelowTopology,
     known_scopes: &BTreeSet<VisualScopeId>,
     gesture_canvas_admitted: bool,
+    program_tap_admitted: bool,
     taps: &mut Vec<PlannedImageTap>,
     diagnostics: &mut Vec<CompositionPlanDiagnostic>,
     dependencies: &mut Vec<ImageDependency>,
@@ -3745,6 +3794,18 @@ fn collect_tap(
             diagnostics.push(CompositionPlanDiagnostic::GestureCanvasUnavailable { consumer });
             PlannedImageSource::Transparent
         }
+        // The programme tap is published outside the composition graph — the
+        // copy runs only after the frame encoder is accepted — so it is
+        // likewise a producer with no scope: no `dependency_producer`, no
+        // `current_edge`, no ordering constraint, and no cycle, even from the
+        // master scope whose resolve it copies. The tap *is* the N-1 image,
+        // so both timings read the same committed copy rather than claiming a
+        // history pair nothing writes.
+        TapRouteSource::ProgramTap if program_tap_admitted => PlannedImageSource::ProgramTap,
+        TapRouteSource::ProgramTap => {
+            diagnostics.push(CompositionPlanDiagnostic::ProgramTapUnavailable { consumer });
+            PlannedImageSource::Transparent
+        }
     };
     if let Some(producer) = dependency_producer {
         dependencies.push(ImageDependency {
@@ -3783,6 +3844,7 @@ enum TapRouteSource {
     ProgramHistory,
     ProgramHistoryUninitialized,
     GestureCanvas,
+    ProgramTap,
 }
 
 impl From<ResolvedImageSource> for TapRouteSource {
@@ -3800,6 +3862,7 @@ impl From<ResolvedImageSource> for TapRouteSource {
             ResolvedImageSource::MissingGroupOutput(group_id) => Self::MissingGroupOutput(group_id),
             ResolvedImageSource::CleanProgram => Self::CleanProgram,
             ResolvedImageSource::GestureCanvas => Self::GestureCanvas,
+            ResolvedImageSource::ProgramTap => Self::ProgramTap,
         }
     }
 }
@@ -4222,6 +4285,11 @@ fn resource_preflight(
                     // charging a parity pair here would put the declared and
                     // actual ledgers permanently one apart.
                     | PlannedImageSource::GestureCanvas
+                    // The programme tap is likewise a frame-committed
+                    // singleton with one image and no N-1 parity — the tap
+                    // *is* the N-1 image — so an N-1 route to it stages
+                    // nothing and the executor allocates nothing for it.
+                    | PlannedImageSource::ProgramTap
                     | PlannedImageSource::Transparent
             );
         count
@@ -4837,6 +4905,7 @@ fn hash_source(mut hash: u64, source: &PlannedImageSource) -> u64 {
         PlannedImageSource::Transparent => hash_value(hash, 5),
         // Append-only, exactly like the node kind codes: 6 is SelectedLayer.
         PlannedImageSource::GestureCanvas => hash_value(hash, 7),
+        PlannedImageSource::ProgramTap => hash_value(hash, 8),
     }
 }
 
@@ -7093,6 +7162,150 @@ mod tests {
         assert_eq!(
             displace_tap_for(&admitted, node).unwrap().resolved,
             PlannedImageSource::GestureCanvas
+        );
+    }
+
+    fn plan_with_program_tap(
+        base: &EvaluatedFramePlan,
+        composition: &RuntimeComposition,
+        master: &RuntimeVisualRack,
+        racks: &[(StableLayerId, RuntimeVisualRack)],
+        admitted: bool,
+    ) -> Result<EvaluatedCompositionPlan, CompositionPlanError> {
+        EvaluatedCompositionPlan::evaluate(
+            base,
+            CompositionPlanInput::new(composition, master, racks).with_program_tap(admitted),
+        )
+    }
+
+    #[test]
+    fn a_program_tap_donor_plans_outside_scope_ordering_and_charges_no_tap_surface() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+
+        // Baseline: the same topology, advanced for the same reason, but with
+        // no image route at all.
+        let mut bare_master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        bare_master
+            .push(RuntimeVisualNodeKind::DigitalColor(DigitalColorParams {
+                invert: 1.0,
+                ..DigitalColorParams::default()
+            }))
+            .unwrap();
+        let bare = advanced(
+            plan_with_program_tap(
+                &base,
+                &composition,
+                &bare_master,
+                &legacy_racks(&[1, 2]),
+                true,
+            )
+            .unwrap(),
+        );
+
+        // Every scope routes a same-frame donor at the tap at once — including
+        // the master, whose own resolve is the very image the tap copies and
+        // which would be the self-cycle if the tap were an ordinary producer.
+        // The tap is N-1 by construction, so no same-frame cycle is
+        // expressible.
+        let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let master_node = push_displace(
+            &mut master,
+            ResolvedImageSource::ProgramTap,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let mut racks = legacy_racks(&[1, 2]);
+        let lower_node = push_displace(
+            &mut racks[0].1,
+            ResolvedImageSource::ProgramTap,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+        let upper_node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::ProgramTap,
+            EdgeTiming::PreviousFrame,
+            -0.25,
+        );
+        let compiled =
+            advanced(plan_with_program_tap(&base, &composition, &master, &racks, true).unwrap());
+
+        for node in [master_node, lower_node, upper_node] {
+            let tap = displace_tap_for(&compiled, node).expect("the tap donor is admitted");
+            assert_eq!(tap.resolved, PlannedImageSource::ProgramTap);
+        }
+        assert!(!compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::ProgramTapUnavailable { .. }
+        )));
+
+        // A producer with no scope claims no dependency at either timing, so it
+        // takes part in no ordering and cannot close a cycle. An N-1 route to
+        // it also stages nothing: the tap *is* the N-1 image.
+        assert_eq!(compiled.graph().current_taps, 0);
+        assert_eq!(compiled.graph().previous_taps, 0);
+        assert_eq!(
+            compiled.graph().current_topological_order,
+            bare.graph().current_topological_order
+        );
+
+        // The tap surface is charged once, by the renderer-owned full-frame
+        // texture floor. Routing to it must not also claim a retained tap
+        // surface in the composition ledger, which
+        // `validate_actual_surface_ledger` reconciles exactly.
+        assert_eq!(
+            compiled.resources().rgba16_surface_layers,
+            bare.resources().rgba16_surface_layers,
+            "a programme-tap route must not add a retained tap surface"
+        );
+        assert_eq!(
+            compiled.resources().creative_bytes,
+            bare.resources().creative_bytes
+        );
+    }
+
+    #[test]
+    fn an_unavailable_program_tap_route_is_transparent_and_named_rather_than_rebound() {
+        let base = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        let node = push_displace(
+            &mut racks[1].1,
+            ResolvedImageSource::ProgramTap,
+            EdgeTiming::CurrentFrame,
+            0.5,
+        );
+
+        // Before the first committed frame the tap holds nothing, and the
+        // route must say so by name rather than borrowing another producer.
+        let compiled =
+            advanced(plan_with_program_tap(&base, &composition, &master, &racks, false).unwrap());
+        let tap = displace_tap_for(&compiled, node)
+            .expect("an unavailable tap still reports a diagnostic tap");
+        assert_eq!(
+            tap.resolved,
+            PlannedImageSource::Transparent,
+            "an uncommitted tap resolves transparent, exactly as a missing donor does"
+        );
+        assert!(compiled.diagnostics().iter().any(|diagnostic| matches!(
+            diagnostic,
+            CompositionPlanDiagnostic::ProgramTapUnavailable { consumer }
+                if matches!(consumer, ImageTapConsumer::RackNode { node_id, .. } if *node_id == node)
+        )));
+        // It is never quietly repointed at the layer below, a group, or the
+        // program scope: that is the whole reason the diagnostic exists.
+        assert_eq!(compiled.graph().current_taps, 0);
+        assert_eq!(compiled.graph().previous_taps, 0);
+
+        // Admission is the only difference. The identical rack, planned after
+        // the first committed frame, resolves to the tap.
+        let admitted =
+            advanced(plan_with_program_tap(&base, &composition, &master, &racks, true).unwrap());
+        assert_eq!(
+            displace_tap_for(&admitted, node).unwrap().resolved,
+            PlannedImageSource::ProgramTap
         );
     }
 

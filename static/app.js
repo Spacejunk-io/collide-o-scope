@@ -734,6 +734,7 @@ function creativeRouteToken(route) {
     case 'all_below': return 'all_below';
     case 'clean_program': return 'clean_program';
     case 'gesture_canvas': return 'gesture_canvas';
+    case 'program_tap': return 'program_tap';
     default: return 'one_below';
   }
 }
@@ -744,6 +745,7 @@ function creativeRouteOptions(route) {
     ['all_below', 'All below'],
     ['clean_program', 'Clean program (N−1)'],
     ['gesture_canvas', 'Gesture canvas (etched field)'],
+    ['program_tap', 'Program re-entry (N−1 audience)'],
   ];
   for (const layer of latestLayers) {
     const id = String(layer.layer_id);
@@ -774,6 +776,10 @@ function creativeRouteFromToken(token, timing) {
     // The etched field is a master-scope singleton: no ID, no saved position,
     // and no scope ordering, so both timings are authorable.
     input = { source: 'gesture_canvas' };
+  } else if (token === 'program_tap') {
+    // The programme tap is the same singleton shape, and it is N-1 by
+    // construction, so both timings read the same committed copy.
+    input = { source: 'program_tap' };
   } else {
     input = { source: 'one_below' };
   }

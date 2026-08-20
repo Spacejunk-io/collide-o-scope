@@ -4628,8 +4628,10 @@ fn collect_saved_tap_dependency(
         // The gesture canvas is not produced by any scope in this saved graph,
         // so a route to it claims no dependency edge and no ordering edge. A
         // dormant saved route and a woken one therefore agree by construction
-        // rather than by a second rule.
-        SavedImageSource::GestureCanvas => {}
+        // rather than by a second rule. The programme tap is published outside
+        // the graph — after the frame is accepted — so the identical law
+        // holds: N-1 by construction, no edge to claim.
+        SavedImageSource::GestureCanvas | SavedImageSource::ProgramTap => {}
     }
     Ok(())
 }
@@ -9033,6 +9035,62 @@ routings:
                     panic!("displace node")
                 };
                 assert_eq!(params.tap.source, SavedImageSource::GestureCanvas);
+                assert_eq!(params.tap.timing, timing);
+                assert!(rack.referenced_group_ids().next().is_none());
+                assert!(rack.selected_layer_positions().next().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_saved_program_tap_route_claims_no_edge_dormant_or_woken() {
+        use crate::visual_rack::{DisplaceBoundary, DisplaceParams};
+
+        let pos0 = SavedLayerPosition::new(0).unwrap();
+        let group_id = GroupId::new(1).unwrap();
+        let tap_route = |timing, amount_x| DisplaceParams {
+            tap: SavedImageTap {
+                source: SavedImageSource::ProgramTap,
+                timing,
+            },
+            amount_x,
+            boundary: DisplaceBoundary::Wrap,
+            ..DisplaceParams::default()
+        };
+        let patch_with = |params: DisplaceParams| {
+            let mut rack = VisualRack::empty();
+            rack.push(VisualNodeKind::Displace(params)).unwrap();
+            let mut patch = minimal_patch(1);
+            patch.composition = Some(
+                CompositionTree::try_from_parts(
+                    vec![saved_group(group_id, vec![pos0], rack)],
+                    vec![RootItem::Group { group_id }],
+                    Some(2),
+                    0.5,
+                )
+                .unwrap(),
+            );
+            patch
+        };
+
+        for timing in [EdgeTiming::CurrentFrame, EdgeTiming::PreviousFrame] {
+            for amount_x in [0.0, 0.25] {
+                let mut patch = patch_with(tap_route(timing, amount_x));
+                patch
+                    .validate_creative_persistence()
+                    .expect("a programme-tap route never closes a saved cycle");
+
+                // It survives the YAML round trip as itself: a positionless
+                // singleton has nothing to lose and nothing to tombstone.
+                let yaml = serde_yaml::to_string(&patch).unwrap();
+                assert!(yaml.contains("program_tap"), "{yaml}");
+                let restored = serde_yaml::from_str::<PatchState>(&yaml).unwrap();
+                let composition = restored.composition.unwrap();
+                let rack = &composition.group(group_id).unwrap().rack;
+                let VisualNodeKind::Displace(params) = rack.iter().next().unwrap().kind else {
+                    panic!("displace node")
+                };
+                assert_eq!(params.tap.source, SavedImageSource::ProgramTap);
                 assert_eq!(params.tap.timing, timing);
                 assert!(rack.referenced_group_ids().next().is_none());
                 assert!(rack.selected_layer_positions().next().is_none());

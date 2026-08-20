@@ -234,6 +234,10 @@ pub enum CreativeImageSourceSnapshot {
     /// no saved position, and it is authorable from the browser at either
     /// timing.
     GestureCanvas,
+    /// The finished programme at N-1 (the pre-blackout opaque audience image).
+    /// The same master-scope singleton shape: no ID, no saved position,
+    /// authorable at either timing because the tap is N-1 by construction.
+    ProgramTap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +439,7 @@ impl CreativeImageTapSnapshot {
             }
             ResolvedImageSource::CleanProgram => CreativeImageSourceSnapshot::CleanProgram,
             ResolvedImageSource::GestureCanvas => CreativeImageSourceSnapshot::GestureCanvas,
+            ResolvedImageSource::ProgramTap => CreativeImageSourceSnapshot::ProgramTap,
         };
         Self {
             input,
@@ -495,10 +500,11 @@ impl CreativeImageTapSnapshot {
                 }
                 ResolvedImageSource::CleanProgram
             }
-            // No ID to parse and no position to invent: the singleton resolves
-            // to itself, and its availability is a planner fact rather than an
-            // ingress one.
+            // No ID to parse and no position to invent: the singletons resolve
+            // to themselves, and their availability is a planner fact rather
+            // than an ingress one.
             CreativeImageSourceSnapshot::GestureCanvas => ResolvedImageSource::GestureCanvas,
+            CreativeImageSourceSnapshot::ProgramTap => ResolvedImageSource::ProgramTap,
             CreativeImageSourceSnapshot::MissingSelectedLayer { .. }
             | CreativeImageSourceSnapshot::MissingGroupOutput { .. } => {
                 return Err("missing creative image sources are output-only diagnostics".into());
