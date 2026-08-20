@@ -394,6 +394,16 @@ pub enum ControlParameter {
     GestureY,
     GesturePressure,
     GestureContact,
+    /// B10 bend pads. Momentary engine surfaces on the gesture-contact law: a
+    /// profile binds a note or button with `Gate` mode and the press/release
+    /// edges drive the pad directly, never a `WebAction`. Appended, never
+    /// renumbered.
+    Bend1,
+    Bend2,
+    Bend3,
+    Bend4,
+    Bend5,
+    Bend6,
 }
 
 impl ControlParameter {
@@ -436,6 +446,12 @@ impl ControlParameter {
             Self::GestureY => "gesture_y",
             Self::GesturePressure => "gesture_pressure",
             Self::GestureContact => "gesture_contact",
+            Self::Bend1 => "bend1",
+            Self::Bend2 => "bend2",
+            Self::Bend3 => "bend3",
+            Self::Bend4 => "bend4",
+            Self::Bend5 => "bend5",
+            Self::Bend6 => "bend6",
         }
     }
 
@@ -478,8 +494,27 @@ impl ControlParameter {
             "gesture_y" => Self::GestureY,
             "gesture_pressure" => Self::GesturePressure,
             "gesture_contact" => Self::GestureContact,
+            "bend1" => Self::Bend1,
+            "bend2" => Self::Bend2,
+            "bend3" => Self::Bend3,
+            "bend4" => Self::Bend4,
+            "bend5" => Self::Bend5,
+            "bend6" => Self::Bend6,
             _ => return None,
         })
+    }
+
+    /// The B10 bend pad this parameter drives, if any.
+    pub const fn bend_index(self) -> Option<usize> {
+        match self {
+            Self::Bend1 => Some(0),
+            Self::Bend2 => Some(1),
+            Self::Bend3 => Some(2),
+            Self::Bend4 => Some(3),
+            Self::Bend5 => Some(4),
+            Self::Bend6 => Some(5),
+            _ => None,
+        }
     }
 }
 

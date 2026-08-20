@@ -2955,6 +2955,11 @@ pub struct Renderer {
     // layer-owned textures, so it never enters the texture-floor accounting.
     pattern_synth: Option<crate::renderer::pattern_synth::PatternSynthGpu>,
 
+    // The B10 video content-analysis reduction, lazily constructed on the
+    // first armed sample. Not a full-frame surface owner: one 32×18 target
+    // plus two 4,608-byte staging buffers, charged in its own module doc.
+    video_analysis: Option<crate::renderer::video_analysis::VideoAnalysisGpu>,
+
     // Staging buffers for async NTSC readback (created lazily, reused)
     readback_slots: Vec<ReadbackSlot>,
     next_readback_sequence: u64,
@@ -3381,6 +3386,7 @@ impl Renderer {
             output_width,
             output_height,
             pattern_synth: None,
+            video_analysis: None,
             readback_slots: Vec::new(),
             next_readback_sequence: 1,
             last_harvested_readback_sequence: 0,
@@ -3718,6 +3724,26 @@ impl Renderer {
             crate::renderer::pattern_synth::PatternSynthGpu::new(&self.device)
         });
         stage.encode(&self.device, &self.queue, encoder, jobs);
+    }
+
+    /// B10: schedule one video-analysis reduction of the pre-blackout opaque
+    /// audience image (slot 2, the program-tap seam) into its own encoder.
+    /// The stage is lazily constructed on the first armed sample and a busy
+    /// pool drops the sample cleanly — freshness, never a backlog.
+    pub fn schedule_video_analysis(&mut self, dt: f32) -> bool {
+        let stage = self.video_analysis.get_or_insert_with(|| {
+            crate::renderer::video_analysis::VideoAnalysisGpu::new(
+                &self.device,
+                COMPOSITE_FORMAT,
+                &self.composite_views[2],
+            )
+        });
+        stage.schedule(&self.device, &self.queue, dt)
+    }
+
+    /// Harvest the oldest completed analysis grid, if any.
+    pub fn poll_video_analysis(&mut self) -> Option<(Vec<u8>, f32)> {
+        self.video_analysis.as_mut()?.poll()
     }
 
     pub fn publish_program_tap(&mut self) {

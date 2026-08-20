@@ -14,5 +14,6 @@ pub(crate) mod stage_map;
 pub mod state;
 pub(crate) mod study;
 pub(crate) mod symmetry_field;
+pub(crate) mod video_analysis;
 
 pub use state::{LiveFrameResources, Renderer};

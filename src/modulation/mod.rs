@@ -43,6 +43,35 @@ pub const MAX_ROUTINGS: usize = 64;
 pub const AUDIO_SOURCE_LIVE: &str = "live";
 pub const AUDIO_SOURCE_FILE: &str = "file";
 
+/// B10 momentary bend pads, envelopes, and macro knobs. The counts are part
+/// of the wire vocabulary (`bend1..bend6`, `env1..env4`, `macro1..macro4`),
+/// so widening one is an append-only vocabulary change, never a renumbering.
+pub const NUM_BENDS: usize = 6;
+pub const NUM_ENVELOPES: usize = 4;
+pub const NUM_MACROS: usize = 4;
+
+/// BENDR's bend-mix ramp rates (per second toward held, per second toward
+/// released). The pads are momentary sources: the smoothed mix is the source
+/// value, so a tap reads as a fast attack and a natural release tail.
+const BEND_ATTACK_RATE: f32 = 24.0;
+const BEND_RELEASE_RATE: f32 = 7.0;
+
+/// The deterministic generators evaluate their stochastic decisions on the
+/// program's own 30 Hz authoring reference grid, so the same patch replays
+/// the same chaos and spikes at any render rate. This is that constant, not
+/// a second literal.
+const GENERATOR_REFERENCE_FPS: f32 = crate::effects::params::TEMPORAL_REFERENCE_FPS;
+
+/// BENDR's generator laws, held as fixed law rather than authored controls
+/// (the B2 trash-clock precedent): chaos holds a hashed target for
+/// 0.12..=0.62 s and eases toward it at 7/s; spike fires at an expected 1.6
+/// events/second and decays at 9/s; drift is the fixed three-sine sum.
+const CHAOS_HOLD_MIN_SECONDS: f64 = 0.12;
+const CHAOS_HOLD_SPAN_SECONDS: f64 = 0.5;
+const CHAOS_EASE_RATE: f32 = 7.0;
+const SPIKE_EVENTS_PER_SECOND: f32 = 1.6;
+const SPIKE_DECAY_RATE: f32 = 9.0;
+
 pub fn normalize_audio_source_kind(value: &str) -> &'static str {
     if value.eq_ignore_ascii_case(AUDIO_SOURCE_FILE) {
         AUDIO_SOURCE_FILE
@@ -2106,6 +2135,23 @@ pub enum ModSource {
     GyroRoll,
     PadX,
     PadY,
+    /// B10 momentary bend pad (smoothed 0..1), zero-indexed internally and
+    /// serialized as `bend1` through `bend6`.
+    Bend(usize),
+    /// B10 triggered envelope level (0..1), serialized `env1` through `env4`.
+    Envelope(usize),
+    /// B10 authored macro knob (0..1), serialized `macro1` through `macro4`.
+    Macro(usize),
+    /// B10 deterministic generators. Chaos and drift are bipolar like an LFO;
+    /// spike is a unipolar decaying impulse.
+    Chaos,
+    Drift,
+    Spike,
+    /// B10 video-reactive observations (0..1), pushed by the host and honest
+    /// zeros until their producer arms.
+    VideoMotion,
+    VideoBrightness,
+    VideoCut,
 }
 
 impl ModSource {
@@ -2139,6 +2185,26 @@ impl ModSource {
             "gyro_roll" => Self::GyroRoll,
             "pad_x" => Self::PadX,
             "pad_y" => Self::PadY,
+            "bend1" => Self::Bend(0),
+            "bend2" => Self::Bend(1),
+            "bend3" => Self::Bend(2),
+            "bend4" => Self::Bend(3),
+            "bend5" => Self::Bend(4),
+            "bend6" => Self::Bend(5),
+            "env1" => Self::Envelope(0),
+            "env2" => Self::Envelope(1),
+            "env3" => Self::Envelope(2),
+            "env4" => Self::Envelope(3),
+            "macro1" => Self::Macro(0),
+            "macro2" => Self::Macro(1),
+            "macro3" => Self::Macro(2),
+            "macro4" => Self::Macro(3),
+            "chaos" => Self::Chaos,
+            "drift" => Self::Drift,
+            "spike" => Self::Spike,
+            "video_motion" => Self::VideoMotion,
+            "video_brightness" => Self::VideoBrightness,
+            "video_cut" => Self::VideoCut,
             _ => return None,
         })
     }
@@ -2173,6 +2239,26 @@ impl ModSource {
             Self::GyroRoll => "gyro_roll",
             Self::PadX => "pad_x",
             Self::PadY => "pad_y",
+            Self::Bend(0) => "bend1",
+            Self::Bend(1) => "bend2",
+            Self::Bend(2) => "bend3",
+            Self::Bend(3) => "bend4",
+            Self::Bend(4) => "bend5",
+            Self::Bend(_) => "bend6",
+            Self::Envelope(0) => "env1",
+            Self::Envelope(1) => "env2",
+            Self::Envelope(2) => "env3",
+            Self::Envelope(_) => "env4",
+            Self::Macro(0) => "macro1",
+            Self::Macro(1) => "macro2",
+            Self::Macro(2) => "macro3",
+            Self::Macro(_) => "macro4",
+            Self::Chaos => "chaos",
+            Self::Drift => "drift",
+            Self::Spike => "spike",
+            Self::VideoMotion => "video_motion",
+            Self::VideoBrightness => "video_brightness",
+            Self::VideoCut => "video_cut",
         }
     }
 }
@@ -2554,6 +2640,460 @@ impl Clock {
     }
 }
 
+/// B10 envelope trigger vocabulary. Closed and append-only; wire tokens are
+/// permanent. `Beat(n)` fires when the global beat crosses a multiple of `n`
+/// (1 = every beat, 2 = every two beats, 4 = every bar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeTrigger {
+    Bend(usize),
+    AudioOnset,
+    SceneCut,
+    Beat(u8),
+}
+
+impl EnvelopeTrigger {
+    pub fn try_from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "bend1" => Self::Bend(0),
+            "bend2" => Self::Bend(1),
+            "bend3" => Self::Bend(2),
+            "bend4" => Self::Bend(3),
+            "bend5" => Self::Bend(4),
+            "bend6" => Self::Bend(5),
+            "audio_onset" => Self::AudioOnset,
+            "scene_cut" => Self::SceneCut,
+            "beat" => Self::Beat(1),
+            "beat2" => Self::Beat(2),
+            "bar" => Self::Beat(4),
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bend(0) => "bend1",
+            Self::Bend(1) => "bend2",
+            Self::Bend(2) => "bend3",
+            Self::Bend(3) => "bend4",
+            Self::Bend(4) => "bend5",
+            Self::Bend(_) => "bend6",
+            Self::AudioOnset => "audio_onset",
+            Self::SceneCut => "scene_cut",
+            Self::Beat(1) => "beat",
+            Self::Beat(2) => "beat2",
+            Self::Beat(_) => "bar",
+        }
+    }
+}
+
+/// B10 envelope mode. `Once` decays freely after the attack; `Gate` holds
+/// full level while the trigger's gate stays on; `Loop` re-enters the attack
+/// when the decay reaches silence — BENDR's exact mode set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvelopeMode {
+    #[default]
+    Once,
+    Gate,
+    Loop,
+}
+
+impl EnvelopeMode {
+    pub fn try_from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "once" => Self::Once,
+            "gate" => Self::Gate,
+            "loop" => Self::Loop,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Gate => "gate",
+            Self::Loop => "loop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeStage {
+    Attack,
+    Decay,
+}
+
+/// One B10 triggered envelope: authored attack/decay/trigger/mode plus the
+/// running level. The laws are BENDR's, transcribed: a linear attack that
+/// resumes from the current level on retrigger (never a reset to zero, so a
+/// fast retrigger stays a swell rather than a click), an exponential decay,
+/// and the three modes above. Output is unipolar 0..1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnvelopeGen {
+    pub attack: f32,
+    pub decay: f32,
+    pub trigger: EnvelopeTrigger,
+    pub mode: EnvelopeMode,
+    level: f32,
+    stage: EnvelopeStage,
+    prev_gate: bool,
+    /// Last observed whole-multiple ordinal for a Beat trigger, `None` until
+    /// the first update so loading a patch mid-bar never fires spuriously.
+    prev_beat_ordinal: Option<i64>,
+}
+
+pub const ENVELOPE_ATTACK_RANGE: (f32, f32) = (0.005, 10.0);
+pub const ENVELOPE_DECAY_RANGE: (f32, f32) = (0.02, 30.0);
+
+impl Default for EnvelopeGen {
+    fn default() -> Self {
+        Self {
+            attack: 0.02,
+            decay: 0.5,
+            trigger: EnvelopeTrigger::Bend(0),
+            mode: EnvelopeMode::Once,
+            level: 0.0,
+            stage: EnvelopeStage::Decay,
+            prev_gate: false,
+            prev_beat_ordinal: None,
+        }
+    }
+}
+
+impl EnvelopeGen {
+    pub fn sanitize(&mut self) {
+        self.attack =
+            finite_or(self.attack, 0.02).clamp(ENVELOPE_ATTACK_RANGE.0, ENVELOPE_ATTACK_RANGE.1);
+        self.decay =
+            finite_or(self.decay, 0.5).clamp(ENVELOPE_DECAY_RANGE.0, ENVELOPE_DECAY_RANGE.1);
+    }
+
+    pub const fn level(&self) -> f32 {
+        self.level
+    }
+
+    /// Reset runtime state without touching authored configuration. Called at
+    /// patch apply so a restored program starts silent and deterministic.
+    fn reset_runtime(&mut self) {
+        self.level = 0.0;
+        self.stage = EnvelopeStage::Decay;
+        self.prev_gate = false;
+        self.prev_beat_ordinal = None;
+    }
+
+    /// Advance one frame given the trigger's current gate level and the
+    /// global beat. Returns nothing; `level` is the source value.
+    fn advance(&mut self, gate_on: bool, beat: f64, dt: f32) {
+        let fired = match self.trigger {
+            EnvelopeTrigger::Beat(every) => {
+                let every = f64::from(every.max(1));
+                let ordinal = (beat / every).floor() as i64;
+                let fired = match self.prev_beat_ordinal {
+                    Some(previous) => ordinal > previous,
+                    // The first observation anchors without firing.
+                    None => false,
+                };
+                self.prev_beat_ordinal = Some(ordinal);
+                self.prev_gate = fired;
+                fired
+            }
+            _ => {
+                let fired = gate_on && !self.prev_gate;
+                self.prev_gate = gate_on;
+                fired
+            }
+        };
+        if fired {
+            self.stage = EnvelopeStage::Attack;
+        }
+        match self.stage {
+            EnvelopeStage::Attack => {
+                self.level = (self.level + dt / self.attack.max(0.005)).min(1.0);
+                if self.level >= 1.0 {
+                    self.stage = EnvelopeStage::Decay;
+                }
+            }
+            EnvelopeStage::Decay => {
+                let hold = self.mode == EnvelopeMode::Gate && self.prev_gate;
+                if !hold {
+                    self.level *= (-dt / self.decay.max(0.02)).exp();
+                    if self.mode == EnvelopeMode::Loop && self.level < 0.02 {
+                        self.stage = EnvelopeStage::Attack;
+                    }
+                }
+            }
+        }
+        self.level = finite_or(self.level, 0.0).clamp(0.0, 1.0);
+    }
+}
+
+/// Domain constants for the deterministic generators' hash lanes. Fixed law:
+/// no wall time, no per-frame randomness, only the generator seed, the
+/// interval/tick ordinal, and the lane.
+const CHAOS_HASH_DOMAIN: u64 = 0x4d43_4853; // "MCHS"
+const SPIKE_HASH_DOMAIN: u64 = 0x4d53_504b; // "MSPK"
+
+/// Unit-interval hash on the LFO sample-and-hold law's exact mixing shape,
+/// with a domain word so chaos and spike draw from independent streams.
+fn generator_unit(seed: u32, domain: u64, ordinal: u64, lane: u64) -> f32 {
+    let mut h = ordinal
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(domain.wrapping_mul(0x2545_F491_4F6C_DD1D))
+        .wrapping_add(lane.wrapping_add(1));
+    if seed != 0 {
+        h ^= u64::from(seed).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    (h as f64 / u64::MAX as f64) as f32
+}
+
+/// B10 video content analysis: BENDR's law transcribed whole
+/// (`p43_render.js`'s `updateContentAnalysis`). One 32×18 luma grid serves
+/// all three sources — `video_brightness` is the mean, `video_cut` is an
+/// onset against a slow EMA with an exponential release, and `video_motion`
+/// is peak-normalized frame difference. The house deliberately keeps BENDR's
+/// frame-difference motion rather than reading back the GPU Motion lattice:
+/// it is the shipped law the constants are tuned to, it costs nothing beyond
+/// the one reduction all three sources share, and the lattice would add a
+/// readback the budget does not want.
+pub const VIDEO_ANALYSIS_WIDTH: usize = 32;
+pub const VIDEO_ANALYSIS_HEIGHT: usize = 18;
+pub const VIDEO_ANALYSIS_CELLS: usize = VIDEO_ANALYSIS_WIDTH * VIDEO_ANALYSIS_HEIGHT;
+
+/// One published analysis sample, each value 0..1.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct VideoAnalysisSample {
+    pub brightness: f32,
+    pub motion: f32,
+    pub cut: f32,
+}
+
+/// The analysis state machine. Pure CPU in the `gesture.rs` tradition: the
+/// live host feeds it reduced readback bytes and the export loop feeds it the
+/// same reduction computed from its own frame pixels, so both run identical
+/// code on identical inputs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoAnalysisState {
+    prev_luma: Vec<f32>,
+    motion_peak: f32,
+    md_avg: f32,
+    motion: f32,
+    cut: f32,
+    /// False until a first grid lands after a gap: the first frame has
+    /// nothing to difference against, so it publishes brightness only and
+    /// zeroes motion/cut rather than reading as one enormous cut.
+    primed: bool,
+}
+
+impl Default for VideoAnalysisState {
+    fn default() -> Self {
+        Self {
+            prev_luma: vec![0.0; VIDEO_ANALYSIS_CELLS],
+            motion_peak: 0.02,
+            md_avg: 0.0,
+            motion: 0.0,
+            cut: 0.0,
+            primed: false,
+        }
+    }
+}
+
+impl VideoAnalysisState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Feed one reduced RGBA8 grid (32×18×4 bytes, sRGB-encoded values) with
+    /// the accepted program seconds since the previous grid. BENDR's law
+    /// expression for expression, including the Rec.601 luma on encoded
+    /// values — this is luma (Y′), deliberately not linear luminance.
+    pub fn analyze(&mut self, grid_rgba: &[u8], dt: f32) -> VideoAnalysisSample {
+        if grid_rgba.len() < VIDEO_ANALYSIS_CELLS * 4 {
+            return self.decay_without_source(dt);
+        }
+        let dt = finite_or(dt, 0.0).max(0.0);
+        let mut sum = 0.0f32;
+        let mut diff = 0.0f32;
+        for (cell, previous) in self.prev_luma.iter_mut().enumerate() {
+            let base = cell * 4;
+            let luma = (f32::from(grid_rgba[base]) * 0.299
+                + f32::from(grid_rgba[base + 1]) * 0.587
+                + f32::from(grid_rgba[base + 2]) * 0.114)
+                / 255.0;
+            sum += luma;
+            diff += (luma - *previous).abs();
+            *previous = luma;
+        }
+        let mean = sum / VIDEO_ANALYSIS_CELLS as f32;
+        let md = diff / VIDEO_ANALYSIS_CELLS as f32;
+        if !self.primed {
+            self.primed = true;
+            self.motion = 0.0;
+            self.cut = 0.0;
+            return VideoAnalysisSample {
+                brightness: mean,
+                motion: 0.0,
+                cut: 0.0,
+            };
+        }
+        self.motion_peak = (self.motion_peak * (1.0 - dt * 0.05)).max(md).max(0.02);
+        self.motion += ((md / self.motion_peak).min(1.0) - self.motion) * (dt * 10.0).min(1.0);
+        if md > (self.md_avg * 3.5).max(0.06) {
+            self.cut = 1.0;
+        }
+        self.md_avg = self.md_avg * 0.95 + md * 0.05;
+        self.cut *= (-dt * 5.0).exp();
+        self.motion = finite_or(self.motion, 0.0).clamp(0.0, 1.0);
+        self.cut = finite_or(self.cut, 0.0).clamp(0.0, 1.0);
+        VideoAnalysisSample {
+            brightness: finite_or(mean, 0.0).clamp(0.0, 1.0),
+            motion: self.motion,
+            cut: self.cut,
+        }
+    }
+
+    /// The no-source law: motion and cut decay, and the next real grid is a
+    /// first frame again.
+    pub fn decay_without_source(&mut self, dt: f32) -> VideoAnalysisSample {
+        let dt = finite_or(dt, 0.0).max(0.0);
+        self.motion *= 1.0 - (dt * 4.0).min(1.0);
+        self.cut *= (-dt * 5.0).exp();
+        self.primed = false;
+        VideoAnalysisSample {
+            brightness: 0.0,
+            motion: self.motion,
+            cut: self.cut,
+        }
+    }
+}
+
+/// The standard sRGB transfer pair, needed because the GPU reduction filters
+/// in linear light (sampling an `Srgb` texture decodes, writing one
+/// re-encodes) and the CPU reference must filter in the same space.
+fn srgb_code_to_linear(code: u8) -> f32 {
+    let value = f32::from(code) / 255.0;
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb_code(value: f32) -> u8 {
+    let value = finite_or(value, 0.0).clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// The one CPU reduction law shared by the export path and the GPU shader's
+/// reference tests: each analysis cell is the mean of a fixed 4×4 sub-grid of
+/// bilinear taps into the full-resolution image, sampled at the same UV
+/// addresses the shader uses and filtered in linear light exactly as the GPU
+/// filters an sRGB texture. Alpha is stored linearly and filters as-is.
+pub fn reduce_video_analysis_grid(pixels: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut grid = vec![0u8; VIDEO_ANALYSIS_CELLS * 4];
+    if width == 0 || height == 0 || pixels.len() < width * height * 4 {
+        return grid;
+    }
+    let bilinear = |u: f32, v: f32, channel: usize| -> f32 {
+        let x = (u * width as f32 - 0.5).clamp(0.0, (width - 1) as f32);
+        let y = (v * height as f32 - 0.5).clamp(0.0, (height - 1) as f32);
+        let x0 = x.floor() as usize;
+        let y0 = y.floor() as usize;
+        let x1 = (x0 + 1).min(width - 1);
+        let y1 = (y0 + 1).min(height - 1);
+        let fx = x - x0 as f32;
+        let fy = y - y0 as f32;
+        let sample = |px: usize, py: usize| -> f32 {
+            let code = pixels[(py * width + px) * 4 + channel];
+            if channel == 3 {
+                f32::from(code) / 255.0
+            } else {
+                srgb_code_to_linear(code)
+            }
+        };
+        let top = sample(x0, y0) * (1.0 - fx) + sample(x1, y0) * fx;
+        let bottom = sample(x0, y1) * (1.0 - fx) + sample(x1, y1) * fx;
+        top * (1.0 - fy) + bottom * fy
+    };
+    for cell_y in 0..VIDEO_ANALYSIS_HEIGHT {
+        for cell_x in 0..VIDEO_ANALYSIS_WIDTH {
+            let cell = cell_y * VIDEO_ANALYSIS_WIDTH + cell_x;
+            for channel in 0..4 {
+                let mut sum = 0.0f32;
+                for tap_y in 0..4 {
+                    for tap_x in 0..4 {
+                        let u = (cell_x as f32 + (tap_x as f32 + 0.5) / 4.0)
+                            / VIDEO_ANALYSIS_WIDTH as f32;
+                        let v = (cell_y as f32 + (tap_y as f32 + 0.5) / 4.0)
+                            / VIDEO_ANALYSIS_HEIGHT as f32;
+                        sum += bilinear(u, v, channel);
+                    }
+                }
+                let mean = sum / 16.0;
+                grid[cell * 4 + channel] = if channel == 3 {
+                    (mean * 255.0).round().clamp(0.0, 255.0) as u8
+                } else {
+                    linear_to_srgb_code(mean)
+                };
+            }
+        }
+    }
+    grid
+}
+
+/// BENDR's drift law verbatim: a fixed three-sine sum of incommensurate
+/// frequencies, already deterministic, evaluated on accumulated program
+/// seconds. Bipolar with |value| <= 1 by construction of the amplitudes.
+fn drift_value(generator_seconds: f64) -> f32 {
+    let t = generator_seconds;
+    (0.55 * (t * 0.31).sin() + 0.3 * (t * 0.113 + 1.7).sin() + 0.15 * (t * 0.53 + 4.1).sin()) as f32
+}
+
+/// Deterministic chaos state: a hashed target held for a hashed interval,
+/// eased toward at a fixed rate. Both the hold duration and the target come
+/// from the interval ordinal, so the whole trajectory is a pure function of
+/// accumulated program seconds and the seed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ChaosState {
+    ordinal: u64,
+    interval_end: f64,
+    current: f32,
+}
+
+impl ChaosState {
+    fn new(seed: u32) -> Self {
+        Self {
+            ordinal: 0,
+            interval_end: CHAOS_HOLD_MIN_SECONDS
+                + CHAOS_HOLD_SPAN_SECONDS
+                    * f64::from(generator_unit(seed, CHAOS_HASH_DOMAIN, 0, 0)),
+            current: 0.0,
+        }
+    }
+
+    fn target(&self, seed: u32) -> f32 {
+        generator_unit(seed, CHAOS_HASH_DOMAIN, self.ordinal, 1) * 2.0 - 1.0
+    }
+
+    fn advance(&mut self, seed: u32, generator_seconds: f64, dt: f32) {
+        while generator_seconds >= self.interval_end {
+            self.ordinal = self.ordinal.wrapping_add(1);
+            self.interval_end += CHAOS_HOLD_MIN_SECONDS
+                + CHAOS_HOLD_SPAN_SECONDS
+                    * f64::from(generator_unit(seed, CHAOS_HASH_DOMAIN, self.ordinal, 0));
+        }
+        let target = self.target(seed);
+        self.current += (target - self.current) * (dt * CHAOS_EASE_RATE).min(1.0);
+        self.current = finite_or(self.current, 0.0).clamp(-1.0, 1.0);
+    }
+}
+
 pub struct ModMatrix {
     pub clock: Clock,
     pub lfos: [Lfo; NUM_LFOS],
@@ -2603,6 +3143,32 @@ pub struct ModMatrix {
     pub pad: [f32; 2],
     pub pad_active: bool,
     pub pad_config: PadConfig,
+    /// B10 momentary bend pads: held flags pushed by keyboard/panel/MIDI/OSC,
+    /// and the smoothed mix that is the actual source value. Held state is
+    /// runtime-only and never persists — a patch cannot restore a held pad.
+    pub bend_held: [bool; NUM_BENDS],
+    bend_mix: [f32; NUM_BENDS],
+    /// B10 envelopes: authored configuration plus running level.
+    pub envelopes: [EnvelopeGen; NUM_ENVELOPES],
+    /// B10 authored macro knobs, each 0..1.
+    pub macros: [f32; NUM_MACROS],
+    /// B10 deterministic-generator seed, persisted so a patch replays the
+    /// same chaos and spikes. Zero is a valid (default) seed.
+    pub generator_seed: u32,
+    /// Program seconds accumulated by `update_at_beat` for the generators.
+    /// Deterministic offline because dt is exactly 1/fps there; reset at
+    /// patch apply so a restored program replays from its own zero.
+    generator_seconds: f64,
+    chaos: ChaosState,
+    spike_level: f32,
+    /// Last processed 30 Hz virtual tick for the spike generator, so firing
+    /// decisions are frame-rate independent.
+    spike_tick: u64,
+    /// B10 video-reactive observations, pushed by the host while armed.
+    /// Honest zeros otherwise (and offline where the producer cannot run).
+    pub video_motion: f32,
+    pub video_brightness: f32,
+    pub video_cut: f32,
 }
 
 impl ModMatrix {
@@ -2638,6 +3204,18 @@ impl ModMatrix {
             pad: [0.5; 2],
             pad_active: false,
             pad_config: PadConfig::default(),
+            bend_held: [false; NUM_BENDS],
+            bend_mix: [0.0; NUM_BENDS],
+            envelopes: [EnvelopeGen::default(); NUM_ENVELOPES],
+            macros: [0.0; NUM_MACROS],
+            generator_seed: 0,
+            generator_seconds: 0.0,
+            chaos: ChaosState::new(0),
+            spike_level: 0.0,
+            spike_tick: 0,
+            video_motion: 0.0,
+            video_brightness: 0.0,
+            video_cut: 0.0,
         }
     }
 
@@ -2679,6 +3257,62 @@ impl ModMatrix {
                     *value = (*value).clamp(0.0, 1.0);
                 }
             }
+        }
+
+        // B10 bend pads: the smoothed mix is the source. BENDR's asymmetric
+        // ramp — fast toward held, slower toward released — is what makes a
+        // tap read as an attack with a natural tail.
+        for (mix, held) in self.bend_mix.iter_mut().zip(self.bend_held) {
+            let target = if held { 1.0 } else { 0.0 };
+            let rate = if held {
+                BEND_ATTACK_RATE
+            } else {
+                BEND_RELEASE_RATE
+            };
+            *mix += (target - *mix) * (dt * rate).min(1.0);
+            *mix = finite_or(*mix, 0.0).clamp(0.0, 1.0);
+        }
+
+        // B10 deterministic generators. The clock is accumulated accepted
+        // program seconds: Pause holds it (update is not called while the
+        // transport is paused), and offline it is a pure function of the
+        // frame index, so the same patch replays the same trajectory.
+        self.generator_seconds += f64::from(dt);
+        self.chaos
+            .advance(self.generator_seed, self.generator_seconds, dt);
+        let spike_tick_now = (self.generator_seconds * f64::from(GENERATOR_REFERENCE_FPS))
+            .floor()
+            .max(0.0) as u64;
+        while self.spike_tick < spike_tick_now {
+            self.spike_tick += 1;
+            let fires = generator_unit(self.generator_seed, SPIKE_HASH_DOMAIN, self.spike_tick, 0)
+                < SPIKE_EVENTS_PER_SECOND / GENERATOR_REFERENCE_FPS;
+            if fires {
+                let amplitude = 0.7
+                    + 0.3
+                        * generator_unit(
+                            self.generator_seed,
+                            SPIKE_HASH_DOMAIN,
+                            self.spike_tick,
+                            1,
+                        );
+                self.spike_level = self.spike_level.max(amplitude);
+            }
+        }
+        self.spike_level = (self.spike_level * (-dt * SPIKE_DECAY_RATE).exp()).clamp(0.0, 1.0);
+
+        // B10 envelopes, after the bends so a bend-triggered envelope sees
+        // this frame's edge.
+        let onset_gate = self.audio.onset > 0.5;
+        let cut_gate = self.video_cut > 0.45;
+        for envelope in &mut self.envelopes {
+            let gate_on = match envelope.trigger {
+                EnvelopeTrigger::Bend(index) => self.bend_held[index.min(NUM_BENDS - 1)],
+                EnvelopeTrigger::AudioOnset => onset_gate,
+                EnvelopeTrigger::SceneCut => cut_gate,
+                EnvelopeTrigger::Beat(_) => false,
+            };
+            envelope.advance(gate_on, beat, dt);
         }
 
         // Source state is independent of routing response caches, so each
@@ -2767,7 +3401,76 @@ impl ModMatrix {
             ModSource::GyroRoll => finite_or(self.gyro[2], 0.5).clamp(0.0, 1.0) * 2.0 - 1.0,
             ModSource::PadX => self.pad_source_value(0),
             ModSource::PadY => self.pad_source_value(1),
+            ModSource::Bend(i) => self.bend_mix[i.min(NUM_BENDS - 1)],
+            ModSource::Envelope(i) => self.envelopes[i.min(NUM_ENVELOPES - 1)].level(),
+            ModSource::Macro(i) => self.macros[i.min(NUM_MACROS - 1)],
+            ModSource::Chaos => self.chaos.current,
+            ModSource::Drift => drift_value(self.generator_seconds),
+            ModSource::Spike => self.spike_level,
+            ModSource::VideoMotion => self.video_motion,
+            ModSource::VideoBrightness => self.video_brightness,
+            ModSource::VideoCut => self.video_cut,
         }
+    }
+
+    /// Push one bend pad's held state. Edges are what matter: the smoothed
+    /// mix and any bend-triggered envelope observe them on the next update.
+    pub fn set_bend(&mut self, index: usize, held: bool) {
+        if index < NUM_BENDS {
+            self.bend_held[index] = held;
+        }
+    }
+
+    /// Release every bend pad. Called on focus loss and patch apply so a
+    /// swallowed key-up can never latch a pad on.
+    pub fn release_all_bends(&mut self) {
+        self.bend_held = [false; NUM_BENDS];
+    }
+
+    pub fn set_macro(&mut self, index: usize, value: f32) {
+        if index < NUM_MACROS {
+            self.macros[index] = finite_or(value, 0.0).clamp(0.0, 1.0);
+        }
+    }
+
+    /// BENDR's arm-on-demand law for the video content analysis: it runs only
+    /// while something consumes it — a route sourcing any video value, or an
+    /// envelope firing on the scene cut. Everything else costs nothing.
+    pub fn video_analysis_armed(&self) -> bool {
+        self.routings.iter().any(|routing| {
+            matches!(
+                routing.source,
+                ModSource::VideoMotion | ModSource::VideoBrightness | ModSource::VideoCut
+            )
+        }) || self
+            .envelopes
+            .iter()
+            .any(|envelope| envelope.trigger == EnvelopeTrigger::SceneCut)
+    }
+
+    /// Publish one analysis sample into the source values.
+    pub fn set_video_analysis(&mut self, sample: VideoAnalysisSample) {
+        self.video_brightness = finite_or(sample.brightness, 0.0).clamp(0.0, 1.0);
+        self.video_motion = finite_or(sample.motion, 0.0).clamp(0.0, 1.0);
+        self.video_cut = finite_or(sample.cut, 0.0).clamp(0.0, 1.0);
+    }
+
+    /// Reset every B10 generator's and envelope's runtime state without
+    /// touching authored configuration. A patch apply calls this so the
+    /// restored program replays deterministically from its own zero.
+    pub fn reset_performance_sources(&mut self) {
+        self.bend_held = [false; NUM_BENDS];
+        self.bend_mix = [0.0; NUM_BENDS];
+        for envelope in &mut self.envelopes {
+            envelope.reset_runtime();
+        }
+        self.generator_seconds = 0.0;
+        self.chaos = ChaosState::new(self.generator_seed);
+        self.spike_level = 0.0;
+        self.spike_tick = 0;
+        self.video_motion = 0.0;
+        self.video_brightness = 0.0;
+        self.video_cut = 0.0;
     }
 
     fn pad_source_value(&self, axis: usize) -> f32 {
@@ -6360,5 +7063,413 @@ mod tests {
         // A dormant frame is the sanitized identity.
         let inert = ModMatrix::new().frame(1).modulate_layer_pattern(0, &base);
         assert_eq!(inert, base.sanitized());
+    }
+
+    // ===== B10 performance sources =====
+
+    #[test]
+    fn b10_source_vocabulary_round_trips_and_is_closed() {
+        let names = [
+            "bend1",
+            "bend2",
+            "bend3",
+            "bend4",
+            "bend5",
+            "bend6",
+            "env1",
+            "env2",
+            "env3",
+            "env4",
+            "macro1",
+            "macro2",
+            "macro3",
+            "macro4",
+            "chaos",
+            "drift",
+            "spike",
+            "video_motion",
+            "video_brightness",
+            "video_cut",
+        ];
+        for name in names {
+            let source =
+                ModSource::try_from_str(name).unwrap_or_else(|| panic!("{name} must parse"));
+            assert_eq!(source.as_str(), name);
+        }
+        assert!(ModSource::try_from_str("bend7").is_none());
+        assert!(ModSource::try_from_str("env5").is_none());
+        assert!(ModSource::try_from_str("macro5").is_none());
+        for token in ["bend1", "audio_onset", "scene_cut", "beat", "beat2", "bar"] {
+            let trigger = EnvelopeTrigger::try_from_str(token)
+                .unwrap_or_else(|| panic!("{token} must parse"));
+            assert_eq!(trigger.as_str(), token);
+        }
+        assert!(EnvelopeTrigger::try_from_str("beat3").is_none());
+        for token in ["once", "gate", "loop"] {
+            assert_eq!(EnvelopeMode::try_from_str(token).unwrap().as_str(), token);
+        }
+    }
+
+    #[test]
+    fn envelope_laws_follow_the_closed_forms() {
+        // Linear attack: half the attack time reaches half level.
+        let mut envelope = EnvelopeGen {
+            attack: 0.5,
+            decay: 1.0,
+            trigger: EnvelopeTrigger::Bend(0),
+            mode: EnvelopeMode::Once,
+            ..EnvelopeGen::default()
+        };
+        envelope.advance(true, 0.0, 0.0); // rising edge fires, no time passes
+        for _ in 0..25 {
+            envelope.advance(true, 0.0, 0.01);
+        }
+        assert!(
+            (envelope.level() - 0.5).abs() < 1.0e-3,
+            "{}",
+            envelope.level()
+        );
+        // The attack completes at exactly the attack time; the completing
+        // frame ends at full level and only later frames decay (Once mode
+        // decays freely even while the trigger stays held — BENDR's law).
+        for _ in 0..25 {
+            envelope.advance(true, 0.0, 0.01);
+        }
+        assert!(
+            (envelope.level() - 1.0).abs() < 1.0e-3,
+            "{}",
+            envelope.level()
+        );
+        // From full, the stepped exponential decay is the closed form,
+        // because the per-frame factors multiply.
+        let full = envelope.level();
+        for _ in 0..100 {
+            envelope.advance(false, 0.0, 0.01);
+        }
+        let expected = full * (-1.0_f32 / 1.0).exp();
+        // One step of slack: f32 accumulation can leave the attack a hair
+        // short of full, spending the first nominal decay step completing it.
+        assert!(
+            (envelope.level() - expected).abs() < 6.0e-3,
+            "decay must be the closed exponential: {} vs {expected}",
+            envelope.level()
+        );
+
+        // Retrigger resumes the attack from the current level, never zero.
+        let mid = envelope.level();
+        envelope.advance(true, 0.0, 0.0);
+        assert!(
+            envelope.level() >= mid,
+            "a retrigger must not reset to zero"
+        );
+
+        // Gate mode holds full level while the gate stays on.
+        let mut gate = EnvelopeGen {
+            attack: 0.01,
+            decay: 0.1,
+            mode: EnvelopeMode::Gate,
+            ..EnvelopeGen::default()
+        };
+        for _ in 0..10 {
+            gate.advance(true, 0.0, 0.01);
+        }
+        assert!((gate.level() - 1.0).abs() < 1.0e-6);
+        for _ in 0..10 {
+            gate.advance(true, 0.0, 0.05);
+        }
+        assert!((gate.level() - 1.0).abs() < 1.0e-6, "gate holds while held");
+        for _ in 0..200 {
+            gate.advance(false, 0.0, 0.05);
+        }
+        assert!(gate.level() < 0.01, "release decays");
+
+        // Loop mode re-enters the attack when the decay reaches silence.
+        let mut looped = EnvelopeGen {
+            attack: 0.05,
+            decay: 0.05,
+            mode: EnvelopeMode::Loop,
+            ..EnvelopeGen::default()
+        };
+        looped.advance(true, 0.0, 0.0);
+        let mut rises = 0;
+        let mut previous = 0.0;
+        for _ in 0..400 {
+            looped.advance(false, 0.0, 0.01);
+            if looped.level() > previous + 0.05 {
+                rises += 1;
+            }
+            previous = looped.level();
+        }
+        assert!(rises >= 2, "a loop envelope must keep re-firing: {rises}");
+    }
+
+    #[test]
+    fn beat_triggers_fire_on_whole_multiples_and_anchor_without_firing() {
+        let mut envelope = EnvelopeGen {
+            attack: 0.001,
+            decay: 10.0,
+            trigger: EnvelopeTrigger::Beat(2),
+            ..EnvelopeGen::default()
+        };
+        // The first observation anchors mid-bar without firing.
+        envelope.advance(false, 3.7, 0.01);
+        assert!(envelope.level() < 1.0e-6, "loading mid-bar must not fire");
+        // Crossing the next multiple of two fires exactly once.
+        envelope.advance(false, 3.9, 0.01);
+        assert!(envelope.level() < 1.0e-6);
+        envelope.advance(false, 4.1, 0.01);
+        assert!(envelope.level() > 0.5, "the crossing fires the attack");
+        let after_fire = envelope.level();
+        envelope.advance(false, 5.9, 0.01);
+        assert!(
+            envelope.level() <= after_fire.max(1.0),
+            "no second fire before the next multiple"
+        );
+    }
+
+    #[test]
+    fn chaos_is_deterministic_per_seed_and_bounded() {
+        let run = |seed: u32| -> Vec<f32> {
+            let mut matrix = ModMatrix::new();
+            matrix.generator_seed = seed;
+            matrix.reset_performance_sources();
+            (0..300)
+                .map(|_| {
+                    matrix.update_at_beat(0.0, 1.0 / 30.0);
+                    matrix.source_value(ModSource::Chaos)
+                })
+                .collect()
+        };
+        let a = run(7);
+        let b = run(7);
+        let c = run(8);
+        assert_eq!(a, b, "the same seed replays the same trajectory");
+        assert_ne!(a, c, "a different seed is a different trajectory");
+        assert!(a.iter().all(|v| (-1.0..=1.0).contains(v)));
+        assert!(a.iter().any(|v| v.abs() > 0.05), "chaos must actually move");
+    }
+
+    #[test]
+    fn spike_firing_is_tick_addressed_and_frame_rate_invariant() {
+        // The same accumulated seconds cross the same 30 Hz virtual ticks
+        // whether stepped once or twice, so the firing decisions are equal
+        // and the decay factors multiply across the split.
+        let run = |steps: usize, dt: f32| -> f32 {
+            let mut matrix = ModMatrix::new();
+            matrix.generator_seed = 3;
+            matrix.reset_performance_sources();
+            for _ in 0..steps {
+                matrix.update_at_beat(0.0, dt);
+            }
+            matrix.source_value(ModSource::Spike)
+        };
+        let coarse = run(150, 1.0 / 30.0);
+        let fine = run(300, 1.0 / 60.0);
+        assert!(
+            (coarse - fine).abs() < 0.05,
+            "tick-addressed firing must not depend on the frame rate: {coarse} vs {fine}"
+        );
+        // Over five seconds at 1.6 events/second something fires.
+        assert!(run(150, 1.0 / 30.0) >= 0.0);
+        let mut matrix = ModMatrix::new();
+        matrix.generator_seed = 3;
+        matrix.reset_performance_sources();
+        let mut peak = 0.0f32;
+        for _ in 0..300 {
+            matrix.update_at_beat(0.0, 1.0 / 30.0);
+            peak = peak.max(matrix.source_value(ModSource::Spike));
+        }
+        assert!(peak > 0.5, "spikes must fire: peak {peak}");
+    }
+
+    #[test]
+    fn drift_is_the_analytic_three_sine() {
+        let mut matrix = ModMatrix::new();
+        matrix.reset_performance_sources();
+        for _ in 0..90 {
+            matrix.update_at_beat(0.0, 1.0 / 30.0);
+        }
+        let t = 3.0_f64;
+        let expected = (0.55 * (t * 0.31).sin()
+            + 0.3 * (t * 0.113 + 1.7).sin()
+            + 0.15 * (t * 0.53 + 4.1).sin()) as f32;
+        let actual = matrix.source_value(ModSource::Drift);
+        assert!(
+            (actual - expected).abs() < 1.0e-4,
+            "drift must be the fixed three-sine sum: {actual} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn bends_ramp_asymmetrically_and_are_released_by_reset() {
+        let mut matrix = ModMatrix::new();
+        matrix.set_bend(2, true);
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        let after_one = matrix.source_value(ModSource::Bend(2));
+        assert!(after_one > 0.5, "the attack ramp is fast: {after_one}");
+        for _ in 0..30 {
+            matrix.update_at_beat(0.0, 1.0 / 30.0);
+        }
+        assert!((matrix.source_value(ModSource::Bend(2)) - 1.0).abs() < 1.0e-3);
+        matrix.set_bend(2, false);
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        let after_release = matrix.source_value(ModSource::Bend(2));
+        assert!(
+            after_release > 0.5 && after_release < 1.0,
+            "the release tail is slower than the attack: {after_release}"
+        );
+        matrix.set_bend(4, true);
+        matrix.reset_performance_sources();
+        assert_eq!(matrix.bend_held, [false; NUM_BENDS]);
+        assert!(matrix.source_value(ModSource::Bend(4)).abs() < 1.0e-6);
+        // Out-of-range pushes are ignored, never a panic.
+        matrix.set_bend(NUM_BENDS + 3, true);
+        assert_eq!(matrix.bend_held, [false; NUM_BENDS]);
+    }
+
+    #[test]
+    fn macros_and_video_sources_are_clamped_pushed_values() {
+        let mut matrix = ModMatrix::new();
+        matrix.set_macro(1, 0.75);
+        assert!((matrix.source_value(ModSource::Macro(1)) - 0.75).abs() < 1.0e-6);
+        matrix.set_macro(1, f32::NAN);
+        assert_eq!(matrix.source_value(ModSource::Macro(1)), 0.0);
+        matrix.set_macro(2, 9.0);
+        assert_eq!(matrix.source_value(ModSource::Macro(2)), 1.0);
+        matrix.video_brightness = 0.4;
+        matrix.video_cut = 0.9;
+        matrix.video_motion = 0.2;
+        assert_eq!(matrix.source_value(ModSource::VideoBrightness), 0.4);
+        assert_eq!(matrix.source_value(ModSource::VideoCut), 0.9);
+        assert_eq!(matrix.source_value(ModSource::VideoMotion), 0.2);
+        matrix.reset_performance_sources();
+        assert_eq!(matrix.source_value(ModSource::VideoBrightness), 0.0);
+    }
+
+    #[test]
+    fn video_analysis_follows_bendrs_content_law() {
+        let mut state = VideoAnalysisState::default();
+        let grid = |luma: u8| -> Vec<u8> {
+            let mut grid = Vec::with_capacity(VIDEO_ANALYSIS_CELLS * 4);
+            for _ in 0..VIDEO_ANALYSIS_CELLS {
+                grid.extend_from_slice(&[luma, luma, luma, 255]);
+            }
+            grid
+        };
+        // A uniform grid's brightness is its luma exactly; the first frame
+        // after a gap publishes brightness but zero motion and cut.
+        let first = state.analyze(&grid(128), 0.1);
+        assert!((first.brightness - 128.0 / 255.0).abs() < 1.0e-3);
+        assert_eq!(first.motion, 0.0);
+        assert_eq!(first.cut, 0.0);
+        // No change: still no motion, no cut.
+        let steady = state.analyze(&grid(128), 0.1);
+        assert!(steady.motion < 1.0e-3);
+        assert!(steady.cut < 1.0e-3);
+        // A hard change fires the cut to full, then it decays exponentially.
+        let cut = state.analyze(&grid(250), 0.1);
+        assert!(cut.cut > 0.5, "a hard change is a cut: {}", cut.cut);
+        assert!(cut.motion > 0.0, "a change is motion");
+        let mut level = cut.cut;
+        for _ in 0..5 {
+            let sample = state.analyze(&grid(250), 0.1);
+            assert!(sample.cut < level, "the cut envelope decays");
+            level = sample.cut;
+        }
+        // The no-source law decays motion and cut and re-primes.
+        let decayed = state.decay_without_source(0.5);
+        assert_eq!(decayed.brightness, 0.0);
+        let after_gap = state.analyze(&grid(10), 0.1);
+        assert_eq!(
+            after_gap.cut, 0.0,
+            "the first grid after a gap must not read as one enormous cut"
+        );
+        // A short grid is the no-source path, never a panic.
+        let hostile = state.analyze(&[0u8; 8], 0.1);
+        assert_eq!(hostile.brightness, 0.0);
+    }
+
+    #[test]
+    fn the_video_reduction_reference_is_exact_on_flat_fields_and_monotone_on_gradients() {
+        // A flat field reduces to itself exactly (bilinear taps of a constant
+        // are the constant, in any space).
+        let width = 64usize;
+        let height = 36usize;
+        let mut flat = Vec::with_capacity(width * height * 4);
+        for _ in 0..width * height {
+            flat.extend_from_slice(&[90, 140, 200, 255]);
+        }
+        let grid = reduce_video_analysis_grid(&flat, width, height);
+        for cell in 0..VIDEO_ANALYSIS_CELLS {
+            assert_eq!(&grid[cell * 4..cell * 4 + 4], &[90, 140, 200, 255]);
+        }
+        // A horizontal gradient reduces to a monotone row.
+        let mut gradient = Vec::with_capacity(width * height * 4);
+        for _ in 0..height {
+            for x in 0..width {
+                let code = (x * 255 / (width - 1)) as u8;
+                gradient.extend_from_slice(&[code, code, code, 255]);
+            }
+        }
+        let grid = reduce_video_analysis_grid(&gradient, width, height);
+        for cell_x in 1..VIDEO_ANALYSIS_WIDTH {
+            assert!(
+                grid[cell_x * 4] >= grid[(cell_x - 1) * 4],
+                "a gradient must reduce monotonically"
+            );
+        }
+        // Hostile dimensions produce the defined zero grid, never a panic.
+        assert_eq!(
+            reduce_video_analysis_grid(&flat, 0, 0),
+            vec![0u8; VIDEO_ANALYSIS_CELLS * 4]
+        );
+    }
+
+    #[test]
+    fn the_analysis_arms_on_demand_exactly_as_bendr_arms_it() {
+        let mut matrix = ModMatrix::new();
+        assert!(!matrix.video_analysis_armed(), "nothing consumes it yet");
+        matrix.routings = vec![Routing::new(ModSource::VideoBrightness, "brightness", 0.5)];
+        assert!(matrix.video_analysis_armed(), "a route arms it");
+        matrix.routings.clear();
+        matrix.envelopes[2].trigger = EnvelopeTrigger::SceneCut;
+        assert!(
+            matrix.video_analysis_armed(),
+            "a scene-cut envelope trigger arms it"
+        );
+        matrix.envelopes[2].trigger = EnvelopeTrigger::Beat(1);
+        assert!(!matrix.video_analysis_armed());
+    }
+
+    #[test]
+    fn a_scene_cut_gate_fires_an_envelope_through_the_matrix() {
+        let mut matrix = ModMatrix::new();
+        matrix.envelopes[0].trigger = EnvelopeTrigger::SceneCut;
+        matrix.envelopes[0].attack = 0.001;
+        matrix.envelopes[0].decay = 5.0;
+        matrix.routings = vec![Routing::new(ModSource::Envelope(0), "brightness", 1.0)];
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        assert!(matrix.source_value(ModSource::Envelope(0)) < 1.0e-6);
+        matrix.video_cut = 0.9;
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        assert!(
+            matrix.source_value(ModSource::Envelope(0)) > 0.5,
+            "the cut edge fires the envelope"
+        );
+        // The envelope reaches the routed frame like any other source.
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        let frame = matrix.frame(0);
+        let base = EffectUniforms::default();
+        let (modulated, _, _, _) = matrix.modulate(
+            &base,
+            &SpatialTransform::default(),
+            &NtscParams::default(),
+            &TemporalParams::default(),
+        );
+        let _ = frame;
+        assert!(
+            modulated.brightness > base.brightness,
+            "an envelope is an ordinary matrix source"
+        );
     }
 }

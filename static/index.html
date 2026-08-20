@@ -1564,6 +1564,35 @@
             </div>
           </div>
 
+          <div class="fx-group" id="perform-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">PERFORM SOURCES</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="bend-pads" id="bend-pads" role="group" aria-label="Bend pads">
+                <button type="button" class="bend-pad" data-bend="0" aria-pressed="false">1</button>
+                <button type="button" class="bend-pad" data-bend="1" aria-pressed="false">2</button>
+                <button type="button" class="bend-pad" data-bend="2" aria-pressed="false">3</button>
+                <button type="button" class="bend-pad" data-bend="3" aria-pressed="false">4</button>
+                <button type="button" class="bend-pad" data-bend="4" aria-pressed="false">5</button>
+                <button type="button" class="bend-pad" data-bend="5" aria-pressed="false">6</button>
+              </div>
+              <div class="audio-status">Hold to bend. Keys 1–6 in the native window play the same pads; route bend1–bend6 or fire an envelope from them.</div>
+              <div id="envelope-list">
+                <!-- 4 envelope rows rendered by JS -->
+              </div>
+              <div id="macro-list">
+                <!-- 4 macro rows rendered by JS -->
+              </div>
+              <div class="param-row compact-config-row">
+                <label for="mod-seed">Seed</label>
+                <input type="number" id="mod-seed" min="0" max="4294967295" step="1" value="0" aria-label="Chaos and spike generator seed">
+              </div>
+              <div class="audio-status">chaos / drift / spike are deterministic: the same seed replays the same trajectory, live and offline.</div>
+            </div>
+          </div>
+
           <div class="fx-group" id="midi-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>

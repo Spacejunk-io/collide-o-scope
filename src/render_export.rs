@@ -5825,6 +5825,13 @@ fn run_export(
             "The recorded gesture track has unclosed strokes; export replays it exactly as recorded and never closes them.",
         );
     }
+    // --- B10 video content analysis, offline half ---
+    // The same CPU law the live host runs on its readbacks, fed from the
+    // export's own frame bytes at the same reference cadence.
+    let mut video_analysis_state = crate::modulation::VideoAnalysisState::default();
+    let mut video_analysis_accumulator = 0.0f64;
+    let mut video_analysis_primed = false;
+
     // --- B9 recorded performance take, replayed by reference tick ---
     // The checksum is verified before the first frame renders, exactly as the
     // gesture track's is; export replays the take once, straight through — the
@@ -6914,6 +6921,30 @@ fn run_export(
                 break;
             }
         };
+        // B10 video analysis, from the exact bytes live reduces: the
+        // pre-VHS/pre-mosh program image (the pre-blackout slot-2 seam the
+        // live reduction and the program tap both observe). The sample lands
+        // in the matrix now and is consumed by the NEXT frame's modulation
+        // update — the same N-1 law the live readback obeys — on the same
+        // 10 Hz reference cadence, so a take of chaos, envelopes, and video
+        // reactivity replays identically for the same job.
+        if mod_matrix.video_analysis_armed() {
+            video_analysis_accumulator += f64::from(program_dt);
+            let interval = 3.0 / f64::from(crate::effects::params::TEMPORAL_REFERENCE_FPS);
+            if video_analysis_accumulator >= interval {
+                let grid =
+                    crate::modulation::reduce_video_analysis_grid(&pixels, w as usize, h as usize);
+                let sample = video_analysis_state.analyze(&grid, video_analysis_accumulator as f32);
+                mod_matrix.set_video_analysis(sample);
+                video_analysis_accumulator = 0.0;
+            }
+        } else if video_analysis_primed {
+            video_analysis_state.reset();
+            mod_matrix.set_video_analysis(crate::modulation::VideoAnalysisSample::default());
+            video_analysis_accumulator = 0.0;
+        }
+        video_analysis_primed = mod_matrix.video_analysis_armed();
+
         // Selective mode has already applied VHS to inherited slices before
         // Temporal. Every other frame retains the established global
         // post-composite VHS call exactly once.
@@ -19637,6 +19668,79 @@ mod effects_audit {
             crate::mixing_boundary::WipePattern::Circle
         );
         assert!((gesture_canvas.radius - 0.9).abs() < 1.0e-6);
+    }
+
+    /// B10's labeled export case: the new sources drive the picture through
+    /// the one matrix law — an envelope fired every beat into brightness,
+    /// deterministic chaos into hue, drift into position, and the
+    /// video-reactive brightness (computed offline from the job's own frame
+    /// bytes) into contrast. The `_unrouted` twin is the identical patch with
+    /// no routes and must decode differently — the sources demonstrably reach
+    /// the pixels — and the `_repeat` render must decode identically, which
+    /// is the whole deterministic-replay claim BENDR never made: seeded,
+    /// frame-indexed chaos and video analysis replay the same trajectory.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_mod_sources_pipeline() {
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let modulation = {
+            let mut matrix = crate::modulation::ModMatrix::new();
+            matrix.envelopes[0].trigger = crate::modulation::EnvelopeTrigger::Beat(1);
+            matrix.envelopes[0].attack = 0.02;
+            matrix.envelopes[0].decay = 0.3;
+            matrix.generator_seed = 11;
+            matrix.routings = vec![
+                crate::modulation::Routing::new(
+                    crate::modulation::ModSource::Envelope(0),
+                    "brightness",
+                    0.8,
+                ),
+                crate::modulation::Routing::new(
+                    crate::modulation::ModSource::Chaos,
+                    "hue_shift",
+                    1.0,
+                ),
+                crate::modulation::Routing::new(
+                    crate::modulation::ModSource::Drift,
+                    "position_x",
+                    0.6,
+                ),
+                crate::modulation::Routing::new(
+                    crate::modulation::ModSource::VideoBrightness,
+                    "contrast",
+                    0.9,
+                ),
+            ];
+            crate::patch::ModConfig::from_matrix(&matrix)
+        };
+        let mut routed = base_patch();
+        routed.modulation = Some(modulation.clone());
+        render("mod_sources", routed);
+
+        let mut unrouted = base_patch();
+        let mut silent = modulation.clone();
+        silent.routings = Vec::new();
+        unrouted.modulation = Some(silent);
+        render("mod_sources_unrouted", unrouted);
+        assert_ne!(
+            decoded_framemd5("renders/audit_mod_sources.mp4"),
+            decoded_framemd5("renders/audit_mod_sources_unrouted.mp4"),
+            "the routed sources must change the decoded frames"
+        );
+
+        let mut repeat = base_patch();
+        repeat.modulation = Some(modulation);
+        render("mod_sources_repeat", repeat);
+        assert_eq!(
+            decoded_framemd5("renders/audit_mod_sources.mp4"),
+            decoded_framemd5("renders/audit_mod_sources_repeat.mp4"),
+            "seeded generators and offline video analysis must replay identically"
+        );
     }
 
     /// B9's labeled export case: a recorded take rides beside the patch and

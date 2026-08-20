@@ -2430,6 +2430,81 @@ pub struct ModConfig {
     /// pointer, so spring return (when enabled) resumes from this position.
     #[serde(default = "default_pad_position")]
     pub pad_position: Vec<f32>,
+    /// B10 envelope configurations. Skip-serialized while all four sit at
+    /// their defaults so pre-B10 patches keep their bytes and canonical
+    /// hashes; an emitted section always carries all four slots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub envelopes: Vec<EnvelopeConfig>,
+    /// B10 macro knob values, skip-serialized while all are zero.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macros: Vec<f32>,
+    /// B10 deterministic-generator seed; zero (the default) is omitted.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub generator_seed: u32,
+}
+
+/// One B10 envelope's authored configuration. Bend held state is
+/// deliberately absent: a patch can never restore a held pad.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct EnvelopeConfig {
+    #[serde(default = "default_envelope_attack")]
+    pub attack: f32,
+    #[serde(default = "default_envelope_decay")]
+    pub decay: f32,
+    #[serde(default = "default_envelope_trigger")]
+    pub trigger: String,
+    #[serde(default = "default_envelope_mode")]
+    pub mode: String,
+}
+
+fn default_envelope_attack() -> f32 {
+    0.02
+}
+fn default_envelope_decay() -> f32 {
+    0.5
+}
+fn default_envelope_trigger() -> String {
+    "bend1".to_string()
+}
+fn default_envelope_mode() -> String {
+    "once".to_string()
+}
+
+impl Default for EnvelopeConfig {
+    fn default() -> Self {
+        Self {
+            attack: default_envelope_attack(),
+            decay: default_envelope_decay(),
+            trigger: default_envelope_trigger(),
+            mode: default_envelope_mode(),
+        }
+    }
+}
+
+impl EnvelopeConfig {
+    fn from_generator(envelope: &crate::modulation::EnvelopeGen) -> Self {
+        Self {
+            attack: envelope.attack,
+            decay: envelope.decay,
+            trigger: envelope.trigger.as_str().to_string(),
+            mode: envelope.mode.as_str().to_string(),
+        }
+    }
+
+    /// Apply onto one generator slot. Unknown trigger/mode tokens keep the
+    /// slot's defaults rather than guessing; scalars sanitize to the
+    /// documented ranges.
+    fn apply_to(&self, envelope: &mut crate::modulation::EnvelopeGen) {
+        envelope.attack = self.attack;
+        envelope.decay = self.decay;
+        if let Some(trigger) = crate::modulation::EnvelopeTrigger::try_from_str(&self.trigger) {
+            envelope.trigger = trigger;
+        }
+        if let Some(mode) = crate::modulation::EnvelopeMode::try_from_str(&self.mode) {
+            envelope.mode = mode;
+        }
+        envelope.sanitize();
+    }
 }
 
 fn default_midi_ccs() -> Vec<u8> {
@@ -2646,6 +2721,29 @@ impl ModConfig {
                 spring_rate: m.pad_config.spring_rate,
             },
             pad_position: m.pad.to_vec(),
+            envelopes: {
+                // Emit the section only once any slot moved off its default,
+                // so pre-B10 patches keep their bytes and canonical hashes.
+                let captured: Vec<EnvelopeConfig> = m
+                    .envelopes
+                    .iter()
+                    .map(EnvelopeConfig::from_generator)
+                    .collect();
+                if captured
+                    .iter()
+                    .all(|slot| *slot == EnvelopeConfig::default())
+                {
+                    Vec::new()
+                } else {
+                    captured
+                }
+            },
+            macros: if m.macros.iter().all(|value| *value == 0.0) {
+                Vec::new()
+            } else {
+                m.macros.to_vec()
+            },
+            generator_seed: m.generator_seed,
         }
     }
 
@@ -2801,6 +2899,28 @@ impl ModConfig {
         // A saved patch has no owning browser pointer. Marking it released is
         // what lets deterministic spring return advance in live and export.
         m.pad_active = false;
+        // B10 authored sources. An absent section is exactly the pre-B10
+        // path: default envelopes, zero macros, seed zero. Runtime state
+        // (bend holds, envelope levels, the generator clocks) resets below so
+        // the restored program replays deterministically from its own zero.
+        m.envelopes = std::array::from_fn(|_| crate::modulation::EnvelopeGen::default());
+        for (slot, config) in m
+            .envelopes
+            .iter_mut()
+            .zip(self.envelopes.iter().take(crate::modulation::NUM_ENVELOPES))
+        {
+            config.apply_to(slot);
+        }
+        m.macros = [0.0; crate::modulation::NUM_MACROS];
+        for (slot, value) in m
+            .macros
+            .iter_mut()
+            .zip(self.macros.iter().take(crate::modulation::NUM_MACROS))
+        {
+            *slot = finite_or(*value, 0.0).clamp(0.0, 1.0);
+        }
+        m.generator_seed = self.generator_seed;
+        m.reset_performance_sources();
         m.recompute_gyro();
     }
 
@@ -10689,6 +10809,74 @@ routings:
             serde_yaml::from_str::<PatchState>(&tampered).is_err(),
             "a mismatched take digest must reject the patch section"
         );
+    }
+
+    /// The B10 sections are additive: a matrix that never authored an
+    /// envelope, macro, or seed emits no section at all, and an authored one
+    /// round-trips with hostile scalars sanitized and unknown tokens keeping
+    /// the slot's defaults.
+    #[test]
+    fn b10_mod_sections_are_additive_and_sanitize_on_load() {
+        let default_config = ModConfig::from_matrix(&crate::modulation::ModMatrix::new());
+        assert!(default_config.envelopes.is_empty());
+        assert!(default_config.macros.is_empty());
+        assert_eq!(default_config.generator_seed, 0);
+        let yaml = serde_yaml::to_string(&default_config).unwrap();
+        assert!(!yaml.contains("envelopes:"));
+        assert!(!yaml.contains("macros:"));
+        assert!(!yaml.contains("generator_seed:"));
+
+        let mut matrix = crate::modulation::ModMatrix::new();
+        matrix.envelopes[1].attack = 0.25;
+        matrix.envelopes[1].trigger = crate::modulation::EnvelopeTrigger::Beat(2);
+        matrix.envelopes[1].mode = crate::modulation::EnvelopeMode::Gate;
+        matrix.set_macro(2, 0.6);
+        matrix.generator_seed = 41;
+        let captured = ModConfig::from_matrix(&matrix);
+        assert_eq!(captured.envelopes.len(), 4, "an emitted section is whole");
+        assert_eq!(captured.macros.len(), 4);
+        assert_eq!(captured.generator_seed, 41);
+        let yaml = serde_yaml::to_string(&captured).unwrap();
+        let restored: ModConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut fresh = crate::modulation::ModMatrix::new();
+        restored.apply_to_matrix(&mut fresh);
+        assert_eq!(fresh.envelopes[1].attack, 0.25);
+        assert_eq!(
+            fresh.envelopes[1].trigger,
+            crate::modulation::EnvelopeTrigger::Beat(2)
+        );
+        assert_eq!(
+            fresh.envelopes[1].mode,
+            crate::modulation::EnvelopeMode::Gate
+        );
+        assert!((fresh.macros[2] - 0.6).abs() < 1.0e-6);
+        assert_eq!(fresh.generator_seed, 41);
+        // Runtime state never persists: bends released, levels silent.
+        assert_eq!(fresh.bend_held, [false; crate::modulation::NUM_BENDS]);
+        assert_eq!(fresh.envelopes[1].level(), 0.0);
+
+        // Hostile scalars sanitize; unknown tokens keep the defaults.
+        let hostile: ModConfig = serde_yaml::from_str(
+            "bpm: 120\nenvelopes:\n  - attack: .nan\n    decay: 900\n    trigger: bend9\n    mode: sideways\nmacros: [9.0, -3.0, .nan, 0.5]\ngenerator_seed: 7\n",
+        )
+        .unwrap();
+        let mut sanitized = crate::modulation::ModMatrix::new();
+        hostile.apply_to_matrix(&mut sanitized);
+        assert!((sanitized.envelopes[0].attack - 0.02).abs() < 1.0e-6);
+        assert!(
+            (sanitized.envelopes[0].decay - 30.0).abs() < 1.0e-6,
+            "an oversized decay clamps to the documented range"
+        );
+        assert_eq!(
+            sanitized.envelopes[0].trigger,
+            crate::modulation::EnvelopeTrigger::Bend(0),
+            "an unknown trigger token keeps the default"
+        );
+        assert_eq!(sanitized.macros[0], 1.0);
+        assert_eq!(sanitized.macros[1], 0.0);
+        assert_eq!(sanitized.macros[2], 0.0);
+        assert!((sanitized.macros[3] - 0.5).abs() < 1.0e-6);
+        assert_eq!(sanitized.generator_seed, 7);
     }
 
     /// Hostile canvas values sanitize on load and an unknown key inside the
