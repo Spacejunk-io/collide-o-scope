@@ -136,6 +136,26 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("temporal_garden_threshold", 0.0, 1.0),
     ("temporal_garden_softness", 0.0, 0.5),
     ("temporal_garden_decay", 0.0, 1.0),
+    // B4 display physics: the seventeen continuous controls. The interlace
+    // mode, the field-order fault, and the display model are discrete
+    // authored laws with no address.
+    ("display_il_amount", 0.0, 1.0),
+    ("display_il_twitter", 0.0, 1.0),
+    ("display_il_judder", 0.0, 1.0),
+    ("display_phosphor", 0.0, 0.95),
+    ("display_phos_r", 0.0, 1.0),
+    ("display_phos_g", 0.0, 1.0),
+    ("display_phos_b", 0.0, 1.0),
+    ("display_scanlines", 0.0, 1.0),
+    ("display_beam_width", 0.1, 3.0),
+    ("display_beam_shape", 0.0, 1.0),
+    ("display_mask_strength", 0.0, 1.0),
+    ("display_mask_dark", 0.0, 1.0),
+    ("display_bloom", 0.0, 1.0),
+    ("display_bloom_radius", 0.0, 1.0),
+    ("display_halation", 0.0, 1.0),
+    ("display_defocus", 0.0, 1.0),
+    ("display_sag", 0.0, 1.0),
     // Program-wide spatial controls. Continuous geometry is modulatable;
     // discrete fit/edge/sampling choices remain explicitly authored.
     ("position_x", POSITION_MIN, POSITION_MAX),
@@ -3557,6 +3577,23 @@ fn apply_offset(
         "temporal_garden_threshold" => &mut tp.originals.garden.threshold,
         "temporal_garden_softness" => &mut tp.originals.garden.softness,
         "temporal_garden_decay" => &mut tp.originals.garden.decay,
+        "display_il_amount" => &mut tp.display.il_amount,
+        "display_il_twitter" => &mut tp.display.il_twitter,
+        "display_il_judder" => &mut tp.display.il_judder,
+        "display_phosphor" => &mut tp.display.phosphor,
+        "display_phos_r" => &mut tp.display.phos_r,
+        "display_phos_g" => &mut tp.display.phos_g,
+        "display_phos_b" => &mut tp.display.phos_b,
+        "display_scanlines" => &mut tp.display.scanlines,
+        "display_beam_width" => &mut tp.display.beam_width,
+        "display_beam_shape" => &mut tp.display.beam_shape,
+        "display_mask_strength" => &mut tp.display.mask_strength,
+        "display_mask_dark" => &mut tp.display.mask_dark,
+        "display_bloom" => &mut tp.display.bloom,
+        "display_bloom_radius" => &mut tp.display.bloom_radius,
+        "display_halation" => &mut tp.display.halation,
+        "display_defocus" => &mut tp.display.defocus,
+        "display_sag" => &mut tp.display.sag,
         _ => return,
     };
     *slot = (*slot + offset).clamp(min, max);
@@ -4546,6 +4583,63 @@ mod tests {
         assert!(!tp.rig.reflect_x);
         assert_eq!(tp.rig.shape, crate::effects::params::FeedbackShape::Clamp);
         assert!(!tp.rig.servo);
+    }
+
+    #[test]
+    fn display_physics_modulation_is_bounded_and_leaves_discrete_laws_untouched() {
+        for (target, range) in [
+            ("display_il_amount", (0.0, 1.0)),
+            ("display_il_twitter", (0.0, 1.0)),
+            ("display_il_judder", (0.0, 1.0)),
+            ("display_phosphor", (0.0, 0.95)),
+            ("display_phos_r", (0.0, 1.0)),
+            ("display_phos_g", (0.0, 1.0)),
+            ("display_phos_b", (0.0, 1.0)),
+            ("display_scanlines", (0.0, 1.0)),
+            ("display_beam_width", (0.1, 3.0)),
+            ("display_beam_shape", (0.0, 1.0)),
+            ("display_mask_strength", (0.0, 1.0)),
+            ("display_mask_dark", (0.0, 1.0)),
+            ("display_bloom", (0.0, 1.0)),
+            ("display_bloom_radius", (0.0, 1.0)),
+            ("display_halation", (0.0, 1.0)),
+            ("display_defocus", (0.0, 1.0)),
+            ("display_sag", (0.0, 1.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+        for discrete in ["display_il_mode", "display_il_order", "display_model"] {
+            assert_eq!(target_range(discrete), None, "{discrete}");
+        }
+
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = [
+            ("display_il_amount", 1.0),
+            ("display_phosphor", 1.0),
+            ("display_beam_width", 0.5),
+        ]
+        .into_iter()
+        .map(|(target, depth)| Routing::new(ModSource::Midi(0), target, depth))
+        .collect();
+        matrix.update_at_beat(0.0, 0.0);
+        let frame = matrix.frame(0);
+        let (_fx, _spatial, _np, tp) = frame.modulate(
+            &crate::effects::EffectUniforms::default(),
+            &crate::spatial::SpatialTransform::default(),
+            &crate::ntsc::NtscParams::default(),
+            &crate::effects::params::TemporalParams::default(),
+        );
+        approx(tp.display.il_amount, 0.5);
+        approx(tp.display.phosphor, 0.475);
+        approx(tp.display.beam_width, 1.0 + (3.0 - 0.1) * 0.25);
+        // Discrete display state never moves under modulation.
+        assert_eq!(
+            tp.display.il_mode,
+            crate::display_physics::InterlaceMode::Weave
+        );
+        assert!(!tp.display.il_order);
+        assert_eq!(tp.display.model, crate::display_physics::DisplayModel::Flat);
     }
 
     #[test]

@@ -4841,6 +4841,14 @@ fn run_export(
         &composite_views[0],
         &sampler,
     );
+    // The B4 display stage rides the same slot-0 seam offline. Pipelines are
+    // cheap; its surfaces stay lazy, so a patch that never arms the stage
+    // (and is never modulated awake) allocates nothing here either.
+    let mut display_physics_gpu = crate::renderer::display_physics::DisplayPhysicsGpu::new(
+        &device,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        [w, h],
+    );
 
     // Temporal history is the largest mandatory output-sized allocation. It
     // belongs to the setup scope above even when a saved patch currently has
@@ -6013,8 +6021,18 @@ fn run_export(
 
                 // The shared executor owns LegacyTemporal for Advanced and
                 // presents one straight-alpha compatibility image into slot
-                // zero. Reuse the established sole opaque boundary before
+                // zero. The B4 display stage rides the shared slot-0 seam,
+                // then reuse the established sole opaque boundary before
                 // readback/NTSC, exactly as the live advanced handoff does.
+                display_physics_gpu.encode(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    &composite_textures,
+                    &composite_views,
+                    &mod_temporal.display,
+                    temporal_input.program_advancing_delta(),
+                );
                 crate::renderer::state::encode_opaque_output(
                     &mut encoder,
                     &opaque_output_pipeline,
@@ -6203,6 +6221,17 @@ fn run_export(
                     h,
                 );
 
+                // The B4 display stage rides the shared slot-0 seam offline,
+                // exactly where live encodes it.
+                display_physics_gpu.encode(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    &composite_textures,
+                    &composite_views,
+                    &mod_temporal.display,
+                    temporal_input.program_advancing_delta(),
+                );
                 // Export consumes the same opaque SDR program image as live preview,
                 // projector, Spout, and NTSC. Keep key alpha inside the engine and
                 // flatten it over black exactly once at this boundary.
@@ -17876,6 +17905,63 @@ mod effects_audit {
             decoded_framemd5("renders/audit_scan_processor.mp4"),
             decoded_framemd5("renders/audit_scan_processor_repeat.mp4"),
             "the drawn raster must replay deterministically"
+        );
+    }
+
+    /// B4's labeled export case: a display stage authoring real fields (Bob
+    /// with 3:2 judder), phosphor persistence, and an aperture-grille model
+    /// with scanlines, bloom, and sag renders through the real export path —
+    /// the same slot-0 seam and the same `display_physics.wgsl` live uses,
+    /// no export-only path. The `_flat` twin carries the stage at its
+    /// exact-off default and must decode differently; the `_repeat` render
+    /// must decode identically, proving the stage's own reference clock and
+    /// the phosphor store deterministic frame-indexed offline.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_display_physics_pipeline() {
+        use crate::display_physics::{DisplayModel, DisplayPhysicsParams, InterlaceMode};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_display = |display: DisplayPhysicsParams| {
+            let mut patch = base_patch();
+            patch.temporal = Some(crate::patch::TemporalConfig {
+                display,
+                ..crate::patch::TemporalConfig::default()
+            });
+            patch
+        };
+        let authored = DisplayPhysicsParams {
+            il_amount: 0.8,
+            il_mode: InterlaceMode::Bob,
+            il_judder: 0.5,
+            phosphor: 0.85,
+            model: DisplayModel::ApertureGrille,
+            scanlines: 0.7,
+            mask_strength: 0.5,
+            bloom: 0.4,
+            sag: 0.3,
+            ..DisplayPhysicsParams::default()
+        };
+        render("display_physics", with_display(authored));
+        render(
+            "display_physics_flat",
+            with_display(DisplayPhysicsParams::default()),
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_display_physics.mp4"),
+            decoded_framemd5("renders/audit_display_physics_flat.mp4"),
+            "an authored display stage must change the decoded frames"
+        );
+        render("display_physics_repeat", with_display(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_display_physics.mp4"),
+            decoded_framemd5("renders/audit_display_physics_repeat.mp4"),
+            "the display stage must replay deterministically"
         );
     }
 

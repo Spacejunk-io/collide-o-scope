@@ -2954,6 +2954,10 @@ pub struct Renderer {
     feedback_texture: wgpu::Texture,
     /// Fixed-rate history clock and validity for temporal GPU memories.
     temporal_state: TemporalState,
+    /// The B4 display-physics stage (fields, phosphor, display model) on the
+    /// slot-0 seam between temporal and the opaque resolve. Its surfaces are
+    /// lazy: a default session charges nothing.
+    display_physics: crate::renderer::display_physics::DisplayPhysicsGpu,
 
     // Instance + adapter kept for creating additional surfaces (output
     // window). Capabilities must be queried against the SAME adapter the
@@ -3201,6 +3205,11 @@ impl Renderer {
             build_history_texture(&device, output_width, output_height);
         let (feedback_texture, feedback_view) =
             build_feedback_texture(&device, output_width, output_height);
+        let display_physics = crate::renderer::display_physics::DisplayPhysicsGpu::new(
+            &device,
+            COMPOSITE_FORMAT,
+            [output_width, output_height],
+        );
 
         // --- Three composite textures ---
         let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -3327,6 +3336,7 @@ impl Renderer {
             history_texture,
             feedback_texture,
             temporal_state: TemporalState::default(),
+            display_physics,
             instance,
             adapter,
             output: None,
@@ -3626,7 +3636,14 @@ impl Renderer {
 
     /// Blackout: clear the final composite to black. Everything downstream
     /// — panel preview, output window, Spout, NTSC — goes dark together.
-    pub fn clear_composite(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// The display-physics memories go dark with it: a blacked-out audience
+    /// must not retain a glowing phosphor wake or a held field.
+    pub fn clear_composite(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.display_physics.clear_for_blackout(encoder);
+        self.clear_composite_slots(encoder);
+    }
+
+    fn clear_composite_slots(&self, encoder: &mut wgpu::CommandEncoder) {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blackout"),
             color_attachments: &[
@@ -3878,6 +3895,30 @@ impl Renderer {
                 state.slot.capacity,
             )
         })
+    }
+
+    /// The B4 display-physics stage — fields, phosphor, display model — on
+    /// the slot-0 seam between the temporal pass and the opaque resolve, the
+    /// one adjacency every audience path shares. A dormant stage (all three
+    /// sub-blocks off) encodes nothing and slot 0 reaches the resolve
+    /// untouched. `delta_seconds` is the program-advancing delta (zero while
+    /// frozen), so Pause holds the trail and the field clock exactly as it
+    /// holds everything.
+    pub(crate) fn render_display_physics(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        display: &crate::display_physics::DisplayPhysicsParams,
+        delta_seconds: f32,
+    ) -> bool {
+        self.display_physics.encode(
+            &self.device,
+            &self.queue,
+            encoder,
+            &self.composite_textures,
+            &self.composite_views,
+            display,
+            delta_seconds,
+        )
     }
 
     /// Resolve the straight-alpha engine image into one opaque audience image.

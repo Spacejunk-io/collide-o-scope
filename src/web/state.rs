@@ -2289,6 +2289,10 @@ pub struct TemporalSnapshot {
     /// Additive B3 feedback rig. The default is the exact historical path.
     #[serde(default)]
     pub rig: TemporalRigSnapshot,
+    /// Additive B4 display physics. The params struct is its own sanitizing
+    /// serde block with snake_case discrete tokens; absent means exact-off.
+    #[serde(default)]
+    pub display: crate::display_physics::DisplayPhysicsParams,
     /// Read-only renderer truth. Main fills this DTO when the active executor
     /// exposes metrics; older/exact paths safely report the zero placeholder.
     #[serde(default)]
@@ -2576,6 +2580,7 @@ impl Default for TemporalSnapshot {
             key_history: default_temporal_key_history(),
             originals: TemporalOriginalsSnapshot::default(),
             rig: TemporalRigSnapshot::default(),
+            display: crate::display_physics::DisplayPhysicsParams::default(),
             telemetry: TemporalTelemetrySnapshot::default(),
         }
     }
@@ -2769,6 +2774,7 @@ impl TemporalSnapshot {
             key_softness: p.key_softness,
             key_history: p.key_history,
             rig: TemporalRigSnapshot::from_params(p.rig),
+            display: p.display.sanitized(),
             originals: TemporalOriginalsSnapshot {
                 loom: TemporalLoomSnapshot {
                     amount: p.originals.loom.amount,
@@ -7478,8 +7484,9 @@ mod protocol_tests {
         // generated range under this universal contract. B13 added 31 master
         // sliders (28 small effects plus the 3 master-only optics). B1's Scan
         // Processor rows render through the existing generated-card template,
-        // so the literal tag counts do not move.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 148);
+        // so the literal tag counts do not move. B4 added the 17 display-
+        // physics sliders to the temporal group.
+        assert_eq!(assert_range_tags_are_bounded(html, true), 165);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
         for contract in [

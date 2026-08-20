@@ -2132,6 +2132,14 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
       garden_softness: 0.03,
       garden_decay: 1,
       score_state_count: 4,
+      disp_il_twitter: 0.4,
+      disp_phos_r: 0.86,
+      disp_phos_g: 1,
+      disp_phos_b: 0.66,
+      disp_beam_width: 1,
+      disp_beam_shape: 0.5,
+      disp_mask_dark: 0.5,
+      disp_bloom_radius: 0.4,
     };
     slider.value = defaults[param] ?? min;
 
@@ -2264,6 +2272,7 @@ function syncTemporal(t) {
   const score = originals.score || {};
   const reset = originals.reset || {};
   const rig = t.rig || {};
+  const display = t.display || {};
   const values = {
     feedback: t.feedback,
     fb_zoom: t.fb_zoom,
@@ -2321,6 +2330,26 @@ function syncTemporal(t) {
     score_trigger: score.trigger,
     reset_loop_boundary: reset.loop_boundary,
     reset_downbeat: reset.downbeat,
+    disp_il_amount: display.il_amount,
+    disp_il_mode: display.il_mode,
+    disp_il_order: display.il_order,
+    disp_il_twitter: display.il_twitter,
+    disp_il_judder: display.il_judder,
+    disp_phosphor: display.phosphor,
+    disp_phos_r: display.phos_r,
+    disp_phos_g: display.phos_g,
+    disp_phos_b: display.phos_b,
+    disp_model: display.model,
+    disp_scanlines: display.scanlines,
+    disp_beam_width: display.beam_width,
+    disp_beam_shape: display.beam_shape,
+    disp_mask_strength: display.mask_strength,
+    disp_mask_dark: display.mask_dark,
+    disp_bloom: display.bloom,
+    disp_bloom_radius: display.bloom_radius,
+    disp_halation: display.halation,
+    disp_defocus: display.defocus,
+    disp_sag: display.sag,
   };
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;

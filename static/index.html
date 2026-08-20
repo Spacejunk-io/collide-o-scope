@@ -1025,6 +1025,75 @@
                     <div class="audio-status">Clear is an ordered memory barrier. It preserves authored controls and a paused audience hold.</div>
                   </div>
                 </details>
+
+                <details class="temporal-study">
+                  <summary>DISPLAY PHYSICS</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="disp_il_amount" data-min="0" data-max="1" data-step="0.01">
+                      <label>Interlace</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row select-row" data-temporal="disp_il_mode">
+                      <label>Field Mode</label>
+                      <select aria-label="Interlace field mode"><option value="weave">Weave</option><option value="bob">Bob</option><option value="blend">Blend</option></select>
+                    </div>
+                    <div class="param-row toggle-row" data-temporal="disp_il_order">
+                      <label>Order Fault</label><label class="toggle"><input type="checkbox" aria-label="Field order swap"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="param-row" data-temporal="disp_il_twitter" data-min="0" data-max="1" data-step="0.01">
+                      <label>Twitter</label><input type="range"><span class="value">0.4</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_il_judder" data-min="0" data-max="1" data-step="0.01">
+                      <label>3:2 Judder</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_phosphor" data-min="0" data-max="0.95" data-step="0.01">
+                      <label>Persistence</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_phos_r" data-min="0" data-max="1" data-step="0.01">
+                      <label>Persist Red</label><input type="range"><span class="value">0.86</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_phos_g" data-min="0" data-max="1" data-step="0.01">
+                      <label>Persist Green</label><input type="range"><span class="value">1</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_phos_b" data-min="0" data-max="1" data-step="0.01">
+                      <label>Persist Blue</label><input type="range"><span class="value">0.66</span>
+                    </div>
+                    <div class="param-row select-row" data-temporal="disp_model">
+                      <label>Model</label>
+                      <select aria-label="Display model"><option value="flat">Flat</option><option value="aperture_grille">Aperture grille</option><option value="slot_mask">Slot mask</option><option value="shadow_mask">Shadow mask</option><option value="lcd_stripe">LCD stripe</option><option value="mono">Mono</option><option value="green_screen">Green screen</option></select>
+                    </div>
+                    <div class="param-row" data-temporal="disp_scanlines" data-min="0" data-max="1" data-step="0.01">
+                      <label>Scanlines</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_beam_width" data-min="0.1" data-max="3" data-step="0.01">
+                      <label>Beam Width</label><input type="range"><span class="value">1</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_beam_shape" data-min="0" data-max="1" data-step="0.01">
+                      <label>Beam Shape</label><input type="range"><span class="value">0.5</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_mask_strength" data-min="0" data-max="1" data-step="0.01">
+                      <label>Mask</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_mask_dark" data-min="0" data-max="1" data-step="0.01">
+                      <label>Mask Dark</label><input type="range"><span class="value">0.5</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_bloom" data-min="0" data-max="1" data-step="0.01">
+                      <label>Bloom</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_bloom_radius" data-min="0" data-max="1" data-step="0.01">
+                      <label>Bloom Size</label><input type="range"><span class="value">0.4</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_halation" data-min="0" data-max="1" data-step="0.01">
+                      <label>Halation</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_defocus" data-min="0" data-max="1" data-step="0.01">
+                      <label>Defocus</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="disp_sag" data-min="0" data-max="1" data-step="0.01">
+                      <label>HV Sag</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="audio-status">The screen the program is watched through: real fields against a held field, per-primary phosphor decay, and the mask/beam models. Blackout clears the glowing wake.</div>
+                  </div>
+                </details>
               </div>
             </div>
           </div>

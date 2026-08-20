@@ -23,8 +23,9 @@ second full-frame history ring.
 | B12 — time-displace maps | **Complete** | PR #33/#34 (merged); `docs/evidence/b12-time-displace-note.md`; CLAUDE.md "B12 time-displace maps" |
 | B13 — the small-effects tranche | **Complete** | `docs/evidence/b13-small-effects-note.md`; CLAUDE.md "B13 small effects" |
 | B1 — the Scan Processor | **Complete** | `docs/evidence/b1-scan-processor-note.md`; CLAUDE.md "The B1 Scan Processor" |
+| B4 — display physics | **Complete** | `docs/evidence/b4-display-physics-note.md`; CLAUDE.md "B4 display physics" |
 | B14 — failure switches | **Partially landed early** | `servo_defeated` shipped inside B3; the remaining piece is `sync_latched` on the tape/NTSC-adjacent shear model |
-| B4, B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
+| B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -32,14 +33,15 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-Wave 2 opened with B1 (landed). Next is **B4, display physics** — a
-master-scope display stage after Temporal, before opaque resolve: real
-interlace fields (one retained full-res field surface, parity on the 30 Hz
-reference clock), per-primary phosphor persistence (one `Rgba16Float`
-accumulator, three decay constants — an accumulator in the established
-feedback shape, explicitly not a second history ring), and the closed
-display-model vocabulary. Blackout must clear the phosphor accumulator, and
-all three sub-blocks default to exact-off. Fetch the plan document before
+Wave 2 continues with **B8, the mixing boundary** — the melting edge over
+every coverage matte (evaluate the matte four points out; disagreement is
+the edge, its direction the normal; drag the incoming picture along it and
+dissolve the stage's own previous frame back in, so the smear creeps), the
+dirty-mixer fault stage on buses (event clock, four fault laws, hashed like
+Shift in a fresh RNG domain), and the blend/wipe audit (the classic blend
+family as a closed append-only enum with existing laws keeping their
+indices, plus the wipe-pattern vocabulary and key dressing). Melt at zero
+never allocates — the delegation law. Fetch the plan document before
 starting it.
 
 ## The working method every tranche follows

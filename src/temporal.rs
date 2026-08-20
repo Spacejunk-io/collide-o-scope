@@ -843,6 +843,17 @@ impl TemporalFrameInput {
         self
     }
 
+    /// The program-advancing delta: zero while the program is frozen, so a
+    /// consumer clocked by this (the B4 display stage's phosphor decay and
+    /// field clock) holds exactly as the program holds.
+    pub(crate) fn program_advancing_delta(&self) -> f32 {
+        if self.freeze.program_advances() {
+            self.delta_seconds
+        } else {
+            0.0
+        }
+    }
+
     /// Compatibility adapter for current Exact/Advanced call sites.
     pub(crate) fn legacy(delta_seconds: f32, advance_program: bool) -> Self {
         let freeze = if advance_program {

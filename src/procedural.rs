@@ -38,11 +38,13 @@ use crate::visual_rack::{
 
 /// v6 records the M3 Temporal Originals generation law; v7 adds M4 Motion in
 /// new isolated domains; v8 adds the B2 procedural field scalars and the four
-/// flow-shaping controls in fresh domains — every field mutated by v7 keeps
-/// its byte-identical stream, but a generated piece now carries the new
-/// values, so the version names the difference. Manifest readers remain
-/// data-driven and accept every earlier version string.
-pub const GENERATOR_VERSION: &str = "9";
+/// flow-shaping controls in fresh domains; v9 adds the B13 small-effects
+/// families in fresh per-scope domains; v10 adds the B4 display-physics
+/// continuous values in fresh field-isolated domains — every field mutated by
+/// an earlier version keeps its byte-identical stream, but a generated piece
+/// now carries the new values, so the version names the difference. Manifest
+/// readers remain data-driven and accept every earlier version string.
+pub const GENERATOR_VERSION: &str = "10";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -749,6 +751,89 @@ fn mutate_temporal_rig(
     linear!(pivot, 0.0, 1.0, 0.05, PROCEDURAL_RIG_PIVOT);
     linear!(threshold, 0.0, 1.0, 0.08, PROCEDURAL_RIG_THRESHOLD);
     linear!(noise, 0.0, 1.0, 0.08, PROCEDURAL_RIG_NOISE);
+    *value = value.sanitized();
+}
+
+// B4 display-physics values live in field-isolated streams like the rig's,
+// so appending them cannot shift any earlier generator draw. The interlace
+// mode, the field-order fault, and the display model are discrete authored
+// laws and never change.
+const PROCEDURAL_DISPLAY_DOMAIN: u64 = 0x4234_4449_5350_0001;
+const PROCEDURAL_DISPLAY_IL_AMOUNT: u64 = 0x494c_414d_4f55_4e54;
+const PROCEDURAL_DISPLAY_IL_TWITTER: u64 = 0x494c_5457_4954_5445;
+const PROCEDURAL_DISPLAY_IL_JUDDER: u64 = 0x494c_4a55_4444_4552;
+const PROCEDURAL_DISPLAY_PHOSPHOR: u64 = 0x5048_4f53_5048_4f52;
+const PROCEDURAL_DISPLAY_PHOS_R: u64 = 0x5048_4f53_5200_0001;
+const PROCEDURAL_DISPLAY_PHOS_G: u64 = 0x5048_4f53_4700_0001;
+const PROCEDURAL_DISPLAY_PHOS_B: u64 = 0x5048_4f53_4200_0001;
+const PROCEDURAL_DISPLAY_SCANLINES: u64 = 0x5343_414e_4c49_4e45;
+const PROCEDURAL_DISPLAY_BEAM_WIDTH: u64 = 0x4245_414d_5749_4454;
+const PROCEDURAL_DISPLAY_BEAM_SHAPE: u64 = 0x4245_414d_5348_4150;
+const PROCEDURAL_DISPLAY_MASK_STRENGTH: u64 = 0x4d41_534b_5354_5245;
+const PROCEDURAL_DISPLAY_MASK_DARK: u64 = 0x4d41_534b_4441_524b;
+const PROCEDURAL_DISPLAY_BLOOM: u64 = 0x424c_4f4f_4d00_0001;
+const PROCEDURAL_DISPLAY_BLOOM_RADIUS: u64 = 0x424c_4f4f_4d52_4144;
+const PROCEDURAL_DISPLAY_HALATION: u64 = 0x4841_4c41_5449_4f4e;
+const PROCEDURAL_DISPLAY_DEFOCUS: u64 = 0x4445_464f_4355_5300;
+const PROCEDURAL_DISPLAY_SAG: u64 = 0x4856_5341_4700_0001;
+
+/// Vary only the display stage's seventeen bounded continuous values.
+fn mutate_display_physics(
+    anchor: &crate::display_physics::DisplayPhysicsParams,
+    value: &mut crate::display_physics::DisplayPhysicsParams,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    macro_rules! linear {
+        ($field:ident, $min:expr, $max:expr, $scale:expr, $domain:expr) => {{
+            let mut rng = SplitMix64::new(domain_seed(
+                seed,
+                index,
+                PROCEDURAL_DISPLAY_DOMAIN ^ $domain,
+            ));
+            value.$field = mutate_linear(
+                anchor.$field,
+                value.$field,
+                $min,
+                $max,
+                temperature * $scale,
+                &mut rng,
+            );
+        }};
+    }
+    linear!(il_amount, 0.0, 1.0, 0.1, PROCEDURAL_DISPLAY_IL_AMOUNT);
+    linear!(il_twitter, 0.0, 1.0, 0.1, PROCEDURAL_DISPLAY_IL_TWITTER);
+    linear!(il_judder, 0.0, 1.0, 0.1, PROCEDURAL_DISPLAY_IL_JUDDER);
+    linear!(phosphor, 0.0, 0.95, 0.1, PROCEDURAL_DISPLAY_PHOSPHOR);
+    linear!(phos_r, 0.0, 1.0, 0.05, PROCEDURAL_DISPLAY_PHOS_R);
+    linear!(phos_g, 0.0, 1.0, 0.05, PROCEDURAL_DISPLAY_PHOS_G);
+    linear!(phos_b, 0.0, 1.0, 0.05, PROCEDURAL_DISPLAY_PHOS_B);
+    linear!(scanlines, 0.0, 1.0, 0.1, PROCEDURAL_DISPLAY_SCANLINES);
+    linear!(beam_width, 0.1, 3.0, 0.15, PROCEDURAL_DISPLAY_BEAM_WIDTH);
+    linear!(beam_shape, 0.0, 1.0, 0.1, PROCEDURAL_DISPLAY_BEAM_SHAPE);
+    linear!(
+        mask_strength,
+        0.0,
+        1.0,
+        0.1,
+        PROCEDURAL_DISPLAY_MASK_STRENGTH
+    );
+    linear!(mask_dark, 0.0, 1.0, 0.1, PROCEDURAL_DISPLAY_MASK_DARK);
+    linear!(bloom, 0.0, 1.0, 0.08, PROCEDURAL_DISPLAY_BLOOM);
+    linear!(
+        bloom_radius,
+        0.0,
+        1.0,
+        0.08,
+        PROCEDURAL_DISPLAY_BLOOM_RADIUS
+    );
+    linear!(halation, 0.0, 1.0, 0.08, PROCEDURAL_DISPLAY_HALATION);
+    linear!(defocus, 0.0, 1.0, 0.08, PROCEDURAL_DISPLAY_DEFOCUS);
+    linear!(sag, 0.0, 1.0, 0.08, PROCEDURAL_DISPLAY_SAG);
     *value = value.sanitized();
 }
 
@@ -3007,6 +3092,13 @@ pub fn generate_with_inventory(
                 config.seed,
                 index,
             );
+            mutate_display_physics(
+                &anchor_temporal.display,
+                &mut temporal.display,
+                temperature,
+                config.seed,
+                index,
+            );
         }
         if let (Some(anchor_modulation), Some(modulation)) =
             (normalized.modulation.as_ref(), patch.modulation.as_mut())
@@ -3983,6 +4075,42 @@ mod tests {
             crate::patch::CollisionScoreLoopDriverConfig::SelectedLayer { saved_position }
                 if saved_position.get() == 0
         ));
+    }
+
+    #[test]
+    fn display_physics_generation_is_deterministic_bounded_and_preserves_discrete_laws() {
+        use crate::display_physics::{DisplayModel, DisplayPhysicsParams, InterlaceMode};
+        let authored = DisplayPhysicsParams {
+            il_amount: 0.3,
+            il_mode: InterlaceMode::Blend,
+            il_order: true,
+            phosphor: 0.5,
+            model: DisplayModel::ApertureGrille,
+            scanlines: 0.4,
+            ..DisplayPhysicsParams::default()
+        };
+        let mut left = authored;
+        let mut right = authored;
+        mutate_display_physics(&authored, &mut left, 2.0, 77, 3);
+        mutate_display_physics(&authored, &mut right, 2.0, 77, 3);
+        assert_eq!(left, right, "display mutation replays deterministically");
+        assert_ne!(
+            left.il_amount, authored.il_amount,
+            "temperature moves the values"
+        );
+        // Discrete laws never change.
+        assert_eq!(left.il_mode, InterlaceMode::Blend);
+        assert!(left.il_order);
+        assert_eq!(left.model, DisplayModel::ApertureGrille);
+        // Every mutated value stays inside its declared range.
+        assert!((0.0..=1.0).contains(&left.il_amount));
+        assert!((0.0..=0.95).contains(&left.phosphor));
+        assert!((0.1..=3.0).contains(&left.beam_width));
+        assert!((0.0..=1.0).contains(&left.sag));
+        // Zero temperature is byte-exact.
+        let mut untouched = authored;
+        mutate_display_physics(&authored, &mut untouched, 0.0, 77, 3);
+        assert_eq!(untouched, authored);
     }
 
     #[test]
