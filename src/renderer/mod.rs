@@ -5,6 +5,7 @@ pub(crate) mod compositor;
 pub(crate) mod display_physics;
 pub(crate) mod gesture_canvas;
 pub(crate) mod melting_edge;
+pub(crate) mod monitor_bay;
 pub(crate) mod motion;
 pub(crate) mod pattern_synth;
 pub(crate) mod rack;

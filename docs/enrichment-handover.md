@@ -31,7 +31,8 @@ second full-frame history ring.
 | B7 — generator sources | **Complete** | `docs/evidence/b7-generator-sources-note.md`; CLAUDE.md "B7 generator sources" |
 | B9 — the performance recorder | **Complete** | `docs/evidence/b9-performance-recorder-note.md`; CLAUDE.md "The B9 performance recorder" |
 | B10 — modulation source expansion | **Complete** | `docs/evidence/b10-mod-sources-note.md`; CLAUDE.md "B10 performance sources" |
-| B11, B6, B15 | Open | — |
+| B11 — the monitoring bay | **Complete** | `docs/evidence/b11-monitoring-bay-note.md`; CLAUDE.md "The B11 monitoring bay" |
+| B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -39,15 +40,14 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-**Wave 3 continues with B11, the monitoring bay** — stage_health's exact
-shape: a sealed preview permit (`native_controls_visible` + surface check,
-sealed in a private submodule per the gizmo precedent), low-res readback
-(≤ 160×90) at 10 Hz only while the panel tab or native pane is visible, zero
-cost otherwise. Three instruments: waveform (luma vs. x with graticule),
-vectorscope (U/V cloud with the six colour-bar targets), and PROBE —
-internal signals rendered to the preview surface only, never audience. The
-web panel gets the same data over the snapshot at the same gated rate.
-Fetch the plan document before starting it.
+**Wave 3 continues with B6, the block-domain corruption trio** — three
+Recipe-A rack nodes: block DCT (real separable 8-point DCT + inverse, two
+passes one per axis, quantizer with HF penalty, chroma quantized harder),
+pixel sort (threshold-gated bright-run stretch, ≤ 64 taps charged
+honestly), and avalanche (PNG-style row-filter corruption propagating one
+row-band per frame through the node's own previous output — one retained
+surface, charged). Next rack kind codes start at 15. Fetch the plan
+document before starting it.
 
 ## The working method every tranche follows
 

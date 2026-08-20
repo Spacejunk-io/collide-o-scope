@@ -2119,7 +2119,12 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         WebAction::StartProgramRecording { .. }
         | WebAction::FinishProgramRecording
         | WebAction::CancelProgramRecording
-        | WebAction::SetStageHealthHud { .. } => true,
+        | WebAction::SetStageHealthHud { .. }
+        | WebAction::SetMonitorBay { .. }
+        | WebAction::MonitorWatch { .. } => true,
+        WebAction::SetMonitorProbe { probe } => {
+            crate::monitor_bay::MonitorProbe::try_from_str(probe).is_some()
+        }
         WebAction::CaptureStill { target, .. } => valid_capture_target(target),
         WebAction::StartResample {
             target,
@@ -2279,6 +2284,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
                         WebAction::GyroStream { enabled } => {
                             state_clone.set_gyro_stream(client_id, enabled);
                         }
+                        WebAction::MonitorWatch { enabled } => {
+                            state_clone.set_monitor_watch(client_id, enabled);
+                        }
                         action @ WebAction::Gyro { .. } => {
                             let outcome = state_clone.enqueue_action(action).await;
                             if outcome != EnqueueOutcome::Dropped {
@@ -2355,6 +2363,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<WebState>) {
     // after that ordered barrier exists may another client acquire Begin(new).
     let _ = state.disconnect_browser_history_gesture(client_id).await;
     state.disconnect_gyro_client(client_id);
+    state.disconnect_monitor_client(client_id);
 }
 
 #[cfg(test)]

@@ -242,6 +242,9 @@ function connect() {
     }
     reconcileInterruptedHistoryGestures();
     reconcileGyroStreamConnection();
+    // B11: a fresh socket is a fresh client id, so the watch declaration
+    // must be re-asserted or the bay stays unarmed for this panel.
+    if (typeof sendMonitorWatch === 'function') sendMonitorWatch();
   };
 
   ws.onclose = () => {
@@ -311,6 +314,7 @@ function connect() {
         syncOutputWindow(msg.output_window, msg.output_error);
         syncRecorder(msg.recorder);
         syncStageHealth(msg.stage_health);
+        syncMonitorBay(msg.monitor_bay);
         syncBlackout(msg.blackout);
         syncQuantize(msg.quantized_pending || 0);
         syncRangeEditors(document);
@@ -7639,6 +7643,156 @@ function syncStageHealth(health = {}) {
     return row;
   });
   document.getElementById('stage-health-layers').replaceChildren(...rows);
+}
+
+// --- B11 Monitoring bay ---
+//
+// The instruments run only while an observer watches. This panel declares
+// itself a watcher exactly while its MONITORING BAY section is expanded and
+// the tab is visible; the declaration is re-asserted on a heartbeat so a
+// silently discarded tab expires server-side instead of pinning the
+// readback armed.
+
+const monitorBayGroup = document.getElementById('monitor-bay-group');
+const monitorBayNative = document.getElementById('monitor-bay-native');
+const monitorBayProbe = document.getElementById('monitor-bay-probe');
+const monitorBayWaveform = document.getElementById('monitor-bay-waveform');
+const monitorBayScope = document.getElementById('monitor-bay-scope');
+const monitorBayStatus = document.getElementById('monitor-bay-status');
+const monitorBaySources = document.getElementById('monitor-bay-sources');
+let monitorBayLastSample = -1;
+let monitorBayWatching = false;
+
+function monitorBayIsWatching() {
+  return !document.hidden && !monitorBayGroup.classList.contains('collapsed');
+}
+
+function sendMonitorWatch() {
+  const watching = monitorBayIsWatching();
+  // A repeated `true` is the heartbeat; a repeated `false` is elided so a
+  // closed section costs no traffic at all.
+  if (watching || monitorBayWatching) {
+    sendAction({ action: 'monitor_watch', enabled: watching });
+  }
+  monitorBayWatching = watching;
+}
+
+monitorBayGroup.querySelector('.fx-group-header').addEventListener('click', () => {
+  // The collapse handler toggles the class on this same click; observe the
+  // final state after it has run.
+  setTimeout(sendMonitorWatch, 0);
+});
+document.addEventListener('visibilitychange', sendMonitorWatch);
+setInterval(() => {
+  if (monitorBayIsWatching()) sendMonitorWatch();
+}, 4000);
+
+monitorBayNative.addEventListener('change', () => {
+  sendAction({ action: 'set_monitor_bay', enabled: monitorBayNative.checked });
+});
+
+monitorBayProbe.addEventListener('change', () => {
+  const probe = ['program', 'program_tap', 'gesture_canvas'].includes(monitorBayProbe.value)
+    ? monitorBayProbe.value : 'program';
+  sendAction({ action: 'set_monitor_probe', probe });
+});
+
+// The six 75% colour-bar targets, presentation-only: the engine's law module
+// derives the authoritative positions from the same projection.
+function monitorScopeTargets() {
+  const bars = [[0.75, 0, 0], [0, 0.75, 0], [0, 0, 0.75], [0.75, 0.75, 0], [0, 0.75, 0.75], [0.75, 0, 0.75]];
+  return bars.map(([r, g, b]) => {
+    const y = 0.299 * r + 0.587 * g + 0.114 * b;
+    const u = (b - y) * 0.565;
+    const v = (r - y) * 0.713;
+    return [0.5 + u * 1.4 * 0.5, 0.5 - v * 1.4 * 0.5];
+  });
+}
+
+function drawMonitorBitmap(canvas, b64, width, height, decorate) {
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (b64 && width > 0 && height > 0 && canvas.width === width && canvas.height === height) {
+    let bytes;
+    try {
+      bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    } catch {
+      bytes = null;
+    }
+    if (bytes && bytes.length >= width * height) {
+      const image = ctx.createImageData(width, height);
+      for (let i = 0; i < width * height; i++) {
+        const v = bytes[i];
+        image.data[i * 4] = v / 5 | 0;
+        image.data[i * 4 + 1] = v;
+        image.data[i * 4 + 2] = v / 3 | 0;
+        image.data[i * 4 + 3] = 255;
+      }
+      ctx.putImageData(image, 0, 0);
+    }
+  }
+  if (decorate) decorate(ctx);
+}
+
+function syncMonitorBay(bay = {}) {
+  if (!monitorBayGroup) return;
+  if (canSync(monitorBayNative)) monitorBayNative.checked = !!bay.native_overlay;
+  const probe = ['program', 'program_tap', 'gesture_canvas'].includes(bay.probe) ? bay.probe : 'program';
+  if (canSync(monitorBayProbe)) monitorBayProbe.value = probe;
+  if (!bay.active) {
+    if (monitorBayLastSample !== -1) {
+      monitorBayLastSample = -1;
+      drawMonitorBitmap(monitorBayWaveform, '', 0, 0);
+      drawMonitorBitmap(monitorBayScope, '', 0, 0);
+      monitorBaySources.replaceChildren();
+    }
+    monitorBayStatus.textContent = 'Instruments run only while this section is open and the tab is visible.';
+    return;
+  }
+  const status = String(bay.probe_status || '').slice(0, 64);
+  monitorBayStatus.textContent = status ? `Probe ${probe}: ${status} — instruments hold.` : `Probe ${probe} · sample ${Math.max(0, Number(bay.sample) || 0)}`;
+  const sample = Math.max(0, Number(bay.sample) || 0);
+  if (sample === monitorBayLastSample) return;
+  monitorBayLastSample = sample;
+  drawMonitorBitmap(
+    monitorBayWaveform,
+    String(bay.waveform_b64 || ''),
+    Math.max(0, Number(bay.waveform_width) || 0),
+    Math.max(0, Number(bay.waveform_height) || 0),
+    (ctx) => {
+      ctx.strokeStyle = 'rgba(160,160,160,0.6)';
+      ctx.beginPath();
+      ctx.moveTo(0, 0.5);
+      ctx.lineTo(monitorBayWaveform.width, 0.5);
+      ctx.moveTo(0, monitorBayWaveform.height - 0.5);
+      ctx.lineTo(monitorBayWaveform.width, monitorBayWaveform.height - 0.5);
+      ctx.stroke();
+    },
+  );
+  drawMonitorBitmap(
+    monitorBayScope,
+    String(bay.scope_b64 || ''),
+    Math.max(0, Number(bay.scope_size) || 0),
+    Math.max(0, Number(bay.scope_size) || 0),
+    (ctx) => {
+      const size = monitorBayScope.width;
+      ctx.strokeStyle = 'rgba(140,140,140,0.5)';
+      for (const radius of [0.33, 0.66, 1.0]) {
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, radius * size / 2, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = 'rgba(200,200,200,0.8)';
+      for (const [x, y] of monitorScopeTargets()) {
+        ctx.strokeRect(x * (size - 1) - 1.5, y * (size - 1) - 1.5, 3, 3);
+      }
+    },
+  );
+  const sources = Array.isArray(bay.sources) ? bay.sources.slice(0, 64) : [];
+  monitorBaySources.textContent = sources
+    .map((s) => `${String(s.name || '').slice(0, 24)} ${(Number(s.value) || 0).toFixed(2)}`)
+    .join(' · ');
 }
 
 // --- Remote / QR ---
