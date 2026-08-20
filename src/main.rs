@@ -32,6 +32,7 @@ mod randomization;
 mod recovery_journal;
 mod render_export;
 mod renderer;
+mod scan_processor;
 mod spatial;
 mod spout_in;
 mod spout_out;
@@ -1633,6 +1634,10 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         // No document, no pass: an inserted Study is an exact bypass until a
         // validated document is assigned through its dedicated action.
         "study" => Kind::Study(visual_rack::StudyRackParams::default()),
+        // No deflection authored, no pass: an inserted Scan Processor is an
+        // exact bypass until amount, collapse, oscillator, S-curve, skew,
+        // tilt, or a reversal wakes it.
+        "scan_processor" => Kind::ScanProcessor(scan_processor::ScanProcessorParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -1883,6 +1888,31 @@ fn set_runtime_node_param(
                     "unsupported study parameter {param}; assign the document through                      set_visual_node_study_document"
                 ));
             }
+            // Every Scan Processor field is a value: no routes exist, so the
+            // whole surface rides the ordinary coalescible parameter action
+            // and `normalize_runtime_rack` clamps geometry and scalars alike.
+            Kind::ScanProcessor(params) => match param {
+                "scan_lines" => params.lines = json_u32(value)?,
+                "scan_samples" => params.samples_per_line = json_u32(value)?,
+                "scan_amount" => params.amount = finite_json_f32(value)?,
+                "scan_ribbon_width" => params.ribbon_width = finite_json_f32(value)?,
+                "scan_velocity_mix" => params.velocity_mix = finite_json_f32(value)?,
+                "scan_tilt_x" => params.tilt_x = finite_json_f32(value)?,
+                "scan_tilt_y" => params.tilt_y = finite_json_f32(value)?,
+                "scan_perspective" => params.perspective = finite_json_f32(value)?,
+                "scan_s_curve" => params.s_curve = finite_json_f32(value)?,
+                "scan_skew" => params.skew = finite_json_f32(value)?,
+                "scan_collapse" => params.collapse = finite_json_f32(value)?,
+                "scan_reverse_h" => params.reverse_h = json_bool(value, "scan reverse h")?,
+                "scan_reverse_v" => params.reverse_v = json_bool(value, "scan reverse v")?,
+                "scan_osc_amount" => params.osc_amount = finite_json_f32(value)?,
+                "scan_osc_freq" => params.osc_freq = finite_json_f32(value)?,
+                "scan_osc_lock" => params.osc_lock = finite_json_f32(value)?,
+                "scan_lissajous" => params.lissajous = finite_json_f32(value)?,
+                "scan_mono" => params.mono = finite_json_f32(value)?,
+                "scan_hue" => params.hue = finite_json_f32(value)?,
+                _ => return Err(format!("unsupported scan processor parameter {param}")),
+            },
         },
     }
     normalize_runtime_rack(rack)

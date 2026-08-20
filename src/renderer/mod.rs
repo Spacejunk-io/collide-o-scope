@@ -6,6 +6,7 @@ pub(crate) mod gesture_canvas;
 pub(crate) mod motion;
 pub(crate) mod rack;
 pub(crate) mod readback;
+pub(crate) mod scan_processor;
 pub(crate) mod stage_map;
 pub mod state;
 pub(crate) mod study;

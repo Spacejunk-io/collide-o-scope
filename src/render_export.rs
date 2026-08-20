@@ -17818,6 +17818,67 @@ mod effects_audit {
         render("residual_counterpoint", patch);
     }
 
+    /// B1's labeled export case: a layer-scope Scan Processor authoring
+    /// deflection, a locked oscillator, tilt, and colourise renders through
+    /// the real export path — the same evaluated plan and the same
+    /// `scan_processor.wgsl`, no export-only path. The `_bypass` twin
+    /// carries the node at its exact default on the identical topology and
+    /// must decode differently from the authored render (the deflection
+    /// demonstrably reaches the pixels), and the `_repeat` render must
+    /// decode identically, proving the frame-plan oscillator clock
+    /// deterministic. The bypass-equals-no-node byte identity is
+    /// deliberately claimed inside one plan variant by the production GPU
+    /// fixture, not here: adding any node flips the plan from the frozen
+    /// LegacyExact path to Advanced, and the two paths are equivalent, not
+    /// byte-equal.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_scan_processor_pipeline() {
+        use crate::scan_processor::ScanProcessorParams;
+        use crate::visual_rack::{LegacyRackScope, VisualNodeKind, VisualRack};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_scan = |params: ScanProcessorParams| {
+            let mut patch = base_patch();
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            rack.push(VisualNodeKind::ScanProcessor(params)).unwrap();
+            patch.layers[0].rack = Some(rack);
+            patch
+        };
+        let authored = ScanProcessorParams {
+            amount: 0.7,
+            osc_amount: 0.3,
+            osc_freq: 0.5,
+            osc_lock: 1.0,
+            tilt_y: 0.25,
+            hue: 0.4,
+            lines: 240,
+            samples_per_line: 128,
+            ..ScanProcessorParams::default()
+        };
+        render("scan_processor", with_scan(authored));
+        render(
+            "scan_processor_bypass",
+            with_scan(ScanProcessorParams::default()),
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_scan_processor.mp4"),
+            decoded_framemd5("renders/audit_scan_processor_bypass.mp4"),
+            "an authored deflection must change the decoded frames"
+        );
+        render("scan_processor_repeat", with_scan(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_scan_processor.mp4"),
+            decoded_framemd5("renders/audit_scan_processor_repeat.mp4"),
+            "the drawn raster must replay deterministically"
+        );
+    }
+
     /// S3b's labeled export case. It is the one that renders a job carrying a
     /// recorded gesture performance end to end: the track's canonical checksum
     /// is verified before the first frame, the events replay on the offline 30 Hz

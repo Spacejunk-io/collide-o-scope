@@ -22,8 +22,9 @@ second full-frame history ring.
 | B3 — the feedback rig | **Complete** | PR #32 (merged); `docs/evidence/b3-feedback-rig-note.md` |
 | B12 — time-displace maps | **Complete** | PR #33/#34 (merged); `docs/evidence/b12-time-displace-note.md`; CLAUDE.md "B12 time-displace maps" |
 | B13 — the small-effects tranche | **Complete** | `docs/evidence/b13-small-effects-note.md`; CLAUDE.md "B13 small effects" |
+| B1 — the Scan Processor | **Complete** | `docs/evidence/b1-scan-processor-note.md`; CLAUDE.md "The B1 Scan Processor" |
 | B14 — failure switches | **Partially landed early** | `servo_defeated` shipped inside B3; the remaining piece is `sync_latched` on the tape/NTSC-adjacent shear model |
-| B1, B4, B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
+| B4, B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -31,12 +32,15 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-Wave 1 is complete. Wave 2 opens with **B1, the Scan Processor** — the plan's flagship:
-the tree's first non-fullscreen-triangle pass (instanced ribbon per scanline,
-carrier fetched in the vertex stage, additive accumulation, beam-energy
-brightness `gain = 2/speed`), a Collision Rack node with
-`occupies_dedicated_pass = true` on the Symmetry/Study precedent and its own
-named vertex budget. Fetch the plan document before starting it.
+Wave 2 opened with B1 (landed). Next is **B4, display physics** — a
+master-scope display stage after Temporal, before opaque resolve: real
+interlace fields (one retained full-res field surface, parity on the 30 Hz
+reference clock), per-primary phosphor persistence (one `Rgba16Float`
+accumulator, three decay constants — an accumulator in the established
+feedback shape, explicitly not a second history ring), and the closed
+display-model vocabulary. Blackout must clear the phosphor accumulator, and
+all three sub-blocks default to exact-off. Fetch the plan document before
+starting it.
 
 ## The working method every tranche follows
 

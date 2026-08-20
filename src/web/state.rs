@@ -644,6 +644,31 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "document_digest": value.digest_hex(),
             "study_exact_bypass": value.is_exact_bypass(),
         }),
+        RuntimeVisualNodeKind::ScanProcessor(value) => serde_json::json!({
+            "scan_lines": value.lines,
+            "scan_samples": value.samples_per_line,
+            "scan_amount": value.amount,
+            "scan_ribbon_width": value.ribbon_width,
+            "scan_velocity_mix": value.velocity_mix,
+            "scan_tilt_x": value.tilt_x,
+            "scan_tilt_y": value.tilt_y,
+            "scan_perspective": value.perspective,
+            "scan_s_curve": value.s_curve,
+            "scan_skew": value.skew,
+            "scan_collapse": value.collapse,
+            "scan_reverse_h": value.reverse_h,
+            "scan_reverse_v": value.reverse_v,
+            "scan_osc_amount": value.osc_amount,
+            "scan_osc_freq": value.osc_freq,
+            "scan_osc_lock": value.osc_lock,
+            "scan_lissajous": value.lissajous,
+            "scan_mono": value.mono,
+            "scan_hue": value.hue,
+            // Derived, read-only: the deflection wake law and the instanced
+            // draw the authored geometry requests.
+            "scan_exact_bypass": value.is_exact_bypass(),
+            "scan_vertex_count": value.vertex_count(),
+        }),
     }
 }
 
@@ -7451,7 +7476,9 @@ mod protocol_tests {
 
         // Exact declaration counts keep every currently shipped static and
         // generated range under this universal contract. B13 added 31 master
-        // sliders (28 small effects plus the 3 master-only optics).
+        // sliders (28 small effects plus the 3 master-only optics). B1's Scan
+        // Processor rows render through the existing generated-card template,
+        // so the literal tag counts do not move.
         assert_eq!(assert_range_tags_are_bounded(html, true), 148);
         assert_eq!(assert_range_tags_are_bounded(js, false), 17);
 
@@ -9919,6 +9946,43 @@ mod protocol_tests {
         assert_eq!(neutral["symmetry_exact_bypass"], true);
         assert_eq!(neutral["symmetry_motion0_donor"]["kind"], "none");
         assert_eq!(neutral["symmetry_effective_folds"], 1);
+    }
+
+    /// The Scan Processor snapshot publishes all nineteen authored values
+    /// plus the derived read-only wake law and the vertex request; the
+    /// default reads as an exact bypass.
+    #[test]
+    fn scan_processor_snapshot_publishes_every_value_and_the_derived_wake_law() {
+        use crate::scan_processor::ScanProcessorParams;
+        use crate::visual_rack::RuntimeVisualNodeKind;
+
+        let live =
+            creative_node_params(RuntimeVisualNodeKind::ScanProcessor(ScanProcessorParams {
+                amount: 0.5,
+                lines: 240,
+                samples_per_line: 96,
+                reverse_h: true,
+                osc_freq: 0.75,
+                mono: 0.25,
+                ..ScanProcessorParams::default()
+            }));
+        assert_eq!(live["scan_lines"], 240);
+        assert_eq!(live["scan_samples"], 96);
+        assert_eq!(live["scan_amount"], 0.5);
+        assert_eq!(live["scan_reverse_h"], true);
+        assert_eq!(live["scan_reverse_v"], false);
+        assert_eq!(live["scan_osc_freq"], 0.75);
+        assert_eq!(live["scan_mono"], 0.25);
+        assert_eq!(live["scan_ribbon_width"], f64::from(0.12_f32));
+        assert_eq!(live["scan_velocity_mix"], f64::from(0.8_f32));
+        assert_eq!(live["scan_exact_bypass"], false);
+        assert_eq!(live["scan_vertex_count"], 240 * 96 * 2);
+
+        let neutral = creative_node_params(RuntimeVisualNodeKind::ScanProcessor(
+            ScanProcessorParams::default(),
+        ));
+        assert_eq!(neutral["scan_exact_bypass"], true);
+        assert_eq!(neutral["scan_vertex_count"], 320 * 256 * 2);
     }
 
     /// Closes `is_priority` and `coalesce_key` for the Symmetry route action.

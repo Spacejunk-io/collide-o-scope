@@ -1676,6 +1676,38 @@ pub(crate) fn mutate_runtime_rack_values(
             // document and there is no continuous value to move. The node's
             // common wet was already diced above like every other node's.
             RuntimeVisualNodeKind::Study(_) => {}
+            RuntimeVisualNodeKind::ScanProcessor(value) => {
+                // `lines`, `samples_per_line`, and the two reversals are
+                // plan-time geometry and discrete laws — stable authored
+                // topology for Dice's purposes. Dice moves only the fifteen
+                // continuous controls, and this node draws from its own
+                // stable domain so appending the arm cannot perturb any
+                // previously authored node's stream.
+                value.amount = mutate_linear(0.0, value.amount, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.ribbon_width =
+                    mutate_linear(0.12, value.ribbon_width, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.velocity_mix =
+                    mutate_linear(0.8, value.velocity_mix, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.tilt_x = mutate_linear(0.0, value.tilt_x, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.tilt_y = mutate_linear(0.0, value.tilt_y, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.perspective =
+                    mutate_linear(0.3, value.perspective, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.s_curve =
+                    mutate_linear(0.0, value.s_curve, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.skew = mutate_linear(0.0, value.skew, -1.0, 1.0, amount * 0.2, &mut rng);
+                value.collapse =
+                    mutate_linear(0.0, value.collapse, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.osc_amount =
+                    mutate_linear(0.0, value.osc_amount, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.osc_freq =
+                    mutate_linear(0.25, value.osc_freq, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.osc_lock =
+                    mutate_linear(1.0, value.osc_lock, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.lissajous =
+                    mutate_linear(0.0, value.lissajous, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.mono = mutate_linear(0.0, value.mono, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.hue = mutate_linear(0.0, value.hue, 0.0, 1.0, amount * 0.2, &mut rng);
+            }
         }
     }
 }
@@ -2696,6 +2728,81 @@ mod tests {
         assert_eq!(
             with_symmetry.get(neighbour).unwrap().kind,
             without_symmetry.get(neighbour).unwrap().kind
+        );
+    }
+
+    /// Dice moves the Scan Processor's fifteen continuous controls only. The
+    /// two geometry counts and the two reversals are stable authored
+    /// topology for Dice's purposes, the same seed and stream reproduce
+    /// exactly, amount zero is a whole-rack no-op, and a neighbouring node is
+    /// byte-identical with and without the scan present because every node
+    /// draws from its own stable domain.
+    #[test]
+    fn dice_moves_scan_processor_continuous_values_only_and_never_its_geometry_or_reversals() {
+        use crate::scan_processor::ScanProcessorParams;
+        use crate::visual_rack::{RuntimeVisualNodeKind, RuntimeVisualRack};
+
+        let authored = ScanProcessorParams {
+            amount: 0.4,
+            lines: 240,
+            samples_per_line: 96,
+            reverse_h: true,
+            reverse_v: false,
+            ..ScanProcessorParams::default()
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::ScanProcessor(authored))
+            .unwrap();
+
+        let scope = DiceRackScope::Master;
+        let mut diced = rack.clone();
+        mutate_runtime_rack_values(&mut diced, 1.0, 4_242, 11, scope);
+        let RuntimeVisualNodeKind::ScanProcessor(params) = diced.get(node_id).unwrap().kind else {
+            panic!("scan processor node")
+        };
+        assert!(
+            params.amount != authored.amount
+                || params.s_curve != authored.s_curve
+                || params.hue != authored.hue,
+            "at least one continuous control must move at amount 1.0"
+        );
+        assert!(params.amount >= 0.0 && params.amount <= 1.0);
+        assert!(params.tilt_x >= -1.0 && params.tilt_x <= 1.0);
+        assert!(params.osc_lock >= 0.0 && params.osc_lock <= 1.0);
+        assert_eq!(params.lines, authored.lines);
+        assert_eq!(params.samples_per_line, authored.samples_per_line);
+        assert_eq!(params.reverse_h, authored.reverse_h);
+        assert_eq!(params.reverse_v, authored.reverse_v);
+
+        let mut repeat = rack.clone();
+        mutate_runtime_rack_values(&mut repeat, 1.0, 4_242, 11, scope);
+        assert_eq!(repeat, diced);
+        let mut untouched = rack.clone();
+        mutate_runtime_rack_values(&mut untouched, 0.0, 4_242, 11, scope);
+        assert_eq!(untouched, rack);
+
+        let grain = crate::visual_rack::GrainParams::default();
+        let mut with_scan = RuntimeVisualRack::empty();
+        with_scan
+            .push(RuntimeVisualNodeKind::ScanProcessor(authored))
+            .unwrap();
+        let neighbour = with_scan.push(RuntimeVisualNodeKind::Grain(grain)).unwrap();
+        let mut without_scan = RuntimeVisualRack::empty();
+        without_scan
+            .push(RuntimeVisualNodeKind::Displace(
+                crate::visual_rack::RuntimeDisplaceParams::default(),
+            ))
+            .unwrap();
+        let same_slot = without_scan
+            .push(RuntimeVisualNodeKind::Grain(grain))
+            .unwrap();
+        assert_eq!(same_slot, neighbour, "the neighbour keeps its stable id");
+        mutate_runtime_rack_values(&mut with_scan, 1.0, 4_242, 11, scope);
+        mutate_runtime_rack_values(&mut without_scan, 1.0, 4_242, 11, scope);
+        assert_eq!(
+            with_scan.get(neighbour).unwrap().kind,
+            without_scan.get(neighbour).unwrap().kind
         );
     }
 

@@ -1389,6 +1389,29 @@ fn apply_stable_node_offset(
         // Collider v1 precedent): its document digest is opaque authored
         // topology and its inputs arrive through the Study's own opcodes.
         RuntimeVisualNodeKind::Study(_) => None,
+        // The Scan Processor exposes its fifteen continuous controls and
+        // nothing else: `scan_lines`/`scan_samples` are plan-time geometry
+        // (they size the instanced draw and the vertex ledger) and the two
+        // reversals are discrete laws, so none of them has a modulatable
+        // address.
+        RuntimeVisualNodeKind::ScanProcessor(value) => match descriptor.key {
+            "scan_amount" => Some(&mut value.amount),
+            "scan_ribbon_width" => Some(&mut value.ribbon_width),
+            "scan_velocity_mix" => Some(&mut value.velocity_mix),
+            "scan_tilt_x" => Some(&mut value.tilt_x),
+            "scan_tilt_y" => Some(&mut value.tilt_y),
+            "scan_perspective" => Some(&mut value.perspective),
+            "scan_s_curve" => Some(&mut value.s_curve),
+            "scan_skew" => Some(&mut value.skew),
+            "scan_collapse" => Some(&mut value.collapse),
+            "scan_osc_amount" => Some(&mut value.osc_amount),
+            "scan_osc_freq" => Some(&mut value.osc_freq),
+            "scan_osc_lock" => Some(&mut value.osc_lock),
+            "scan_lissajous" => Some(&mut value.lissajous),
+            "scan_mono" => Some(&mut value.mono),
+            "scan_hue" => Some(&mut value.hue),
+            _ => None,
+        },
     };
     if let Some(slot) = slot {
         if matches!(
@@ -5450,6 +5473,124 @@ mod tests {
                 component: StableModComponent::Scalar,
             };
             assert!(!parameter.is_valid_for_kind(NodeKindTag::Symmetry), "{key}");
+        }
+    }
+
+    /// The Scan Processor mints one stable address per continuous control —
+    /// fifteen, none angular — while the two geometry counts and the two
+    /// reversal laws are unreachable by any modulation route. Offsets clamp
+    /// into the declared ranges with no wrap.
+    #[test]
+    fn scan_processor_exposes_stable_addresses_for_its_fifteen_continuous_controls_only() {
+        use crate::scan_processor::ScanProcessorParams;
+        use crate::visual_rack::{RuntimeVisualNodeKind, RuntimeVisualRack};
+
+        let authored = ScanProcessorParams {
+            amount: 0.2,
+            lines: 200,
+            reverse_h: true,
+            ..ScanProcessorParams::default()
+        };
+        let mut rack = RuntimeVisualRack::empty();
+        let node_id = rack
+            .push(RuntimeVisualNodeKind::ScanProcessor(authored))
+            .unwrap();
+
+        let mut book = StableModAddressBook::default();
+        book.add_rack(StableModScope::Master, &rack).unwrap();
+
+        let keys: Vec<_> = book
+            .targets
+            .iter()
+            .filter_map(|target| match target {
+                StableModTarget::Node { parameter, .. } => match parameter {
+                    StableNodeParameter::Wet => Some("wet".to_string()),
+                    StableNodeParameter::Descriptor {
+                        descriptor_index, ..
+                    } => NODE_PARAM_DESCRIPTORS
+                        .get(usize::from(*descriptor_index))
+                        .map(|descriptor| descriptor.key.to_string()),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "wet",
+                "scan_amount",
+                "scan_ribbon_width",
+                "scan_velocity_mix",
+                "scan_tilt_x",
+                "scan_tilt_y",
+                "scan_perspective",
+                "scan_s_curve",
+                "scan_skew",
+                "scan_collapse",
+                "scan_osc_amount",
+                "scan_osc_freq",
+                "scan_osc_lock",
+                "scan_lissajous",
+                "scan_mono",
+                "scan_hue",
+            ]
+        );
+
+        let address_of = |key: &str| {
+            book.targets
+                .iter()
+                .position(|target| {
+                    matches!(
+                        target,
+                        StableModTarget::Node {
+                            parameter: StableNodeParameter::Descriptor { descriptor_index, .. },
+                            ..
+                        } if NODE_PARAM_DESCRIPTORS[usize::from(*descriptor_index)].key == key
+                    )
+                })
+                .unwrap()
+        };
+        let mut offsets = vec![0.0_f32; book.targets.len()];
+        offsets[address_of("scan_amount")] = 0.5;
+        offsets[address_of("scan_tilt_x")] = -3.0;
+        offsets[address_of("scan_osc_lock")] = -2.0;
+        let frame = StableModulationFrame { offsets };
+
+        let mut modulated = rack.clone();
+        apply_stable_rack_modulation(&book, &frame, StableModScope::Master, &mut modulated);
+        let RuntimeVisualNodeKind::ScanProcessor(params) = modulated.get(node_id).unwrap().kind
+        else {
+            panic!("scan processor node")
+        };
+        assert!((params.amount - 0.7).abs() < 1e-5);
+        assert_eq!(params.tilt_x, -1.0, "offsets clamp into the declared range");
+        assert_eq!(params.osc_lock, 0.0, "offsets clamp, never wrap");
+        assert_eq!(params.lines, authored.lines, "geometry is never modulated");
+        assert_eq!(
+            params.reverse_h, authored.reverse_h,
+            "a discrete law is never modulated"
+        );
+
+        for key in [
+            "scan_lines",
+            "scan_samples",
+            "scan_reverse_h",
+            "scan_reverse_v",
+        ] {
+            let index = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .position(|descriptor| {
+                    descriptor.kind == NodeKindTag::ScanProcessor && descriptor.key == key
+                })
+                .unwrap();
+            let parameter = StableNodeParameter::Descriptor {
+                descriptor_index: index as u16,
+                component: StableModComponent::Scalar,
+            };
+            assert!(
+                !parameter.is_valid_for_kind(NodeKindTag::ScanProcessor),
+                "{key}"
+            );
         }
     }
 

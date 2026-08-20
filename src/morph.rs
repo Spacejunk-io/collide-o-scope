@@ -25,6 +25,7 @@ use crate::patch::{
     RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
     TemporalResetPolicyConfig, TemporalRigConfig, TimeDisplaceMapConfig,
 };
+use crate::scan_processor::ScanProcessorParams;
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{
     SavedMotionDonor, SymmetryParams, SYMMETRY_IMAGE_SLOTS, SYMMETRY_MOTION_SLOTS,
@@ -1471,6 +1472,7 @@ fn saved_node_image_taps_mut(
         | VisualNodeKind::Shift(_)
         | VisualNodeKind::Grain(_)
         | VisualNodeKind::Study(_)
+        | VisualNodeKind::ScanProcessor(_)
         | VisualNodeKind::Mask(MaskParams::Rectangle(_) | MaskParams::Ellipse(_)) => [None, None],
     }
 }
@@ -1497,6 +1499,7 @@ fn saved_node_motion_donors_mut(
         | VisualNodeKind::Mask(_)
         | VisualNodeKind::Residual(_)
         | VisualNodeKind::Study(_)
+        | VisualNodeKind::ScanProcessor(_)
         | VisualNodeKind::Displace(_) => [None, None],
     }
 }
@@ -2869,8 +2872,44 @@ fn interpolate_node_kind(
         (VisualNodeKind::Study(a), VisualNodeKind::Study(b)) => {
             VisualNodeKind::Study(pick(a, b, choose_b))
         }
+        (VisualNodeKind::ScanProcessor(a), VisualNodeKind::ScanProcessor(b)) => {
+            VisualNodeKind::ScanProcessor(interpolate_scan_processor(a, b, weights, choose_b))
+        }
         _ => return None,
     })
+}
+
+/// The Scan Processor's fifteen continuous controls blend; the two geometry
+/// counts are plan-time draw sizes and the two reversals are discrete laws, so
+/// all four recall an endpoint at the midpoint like every other authored
+/// discrete choice. No route exists, so any pair of scan nodes interpolates.
+fn interpolate_scan_processor(
+    a: ScanProcessorParams,
+    b: ScanProcessorParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> ScanProcessorParams {
+    ScanProcessorParams {
+        lines: pick(a.lines, b.lines, choose_b),
+        samples_per_line: pick(a.samples_per_line, b.samples_per_line, choose_b),
+        amount: blend_finite(a.amount, b.amount, weights),
+        ribbon_width: blend_finite(a.ribbon_width, b.ribbon_width, weights),
+        velocity_mix: blend_finite(a.velocity_mix, b.velocity_mix, weights),
+        tilt_x: blend_finite(a.tilt_x, b.tilt_x, weights),
+        tilt_y: blend_finite(a.tilt_y, b.tilt_y, weights),
+        perspective: blend_finite(a.perspective, b.perspective, weights),
+        s_curve: blend_finite(a.s_curve, b.s_curve, weights),
+        skew: blend_finite(a.skew, b.skew, weights),
+        collapse: blend_finite(a.collapse, b.collapse, weights),
+        reverse_h: pick(a.reverse_h, b.reverse_h, choose_b),
+        reverse_v: pick(a.reverse_v, b.reverse_v, choose_b),
+        osc_amount: blend_finite(a.osc_amount, b.osc_amount, weights),
+        osc_freq: blend_finite(a.osc_freq, b.osc_freq, weights),
+        osc_lock: blend_finite(a.osc_lock, b.osc_lock, weights),
+        lissajous: blend_finite(a.lissajous, b.lissajous, weights),
+        mono: blend_finite(a.mono, b.mono, weights),
+        hue: blend_finite(a.hue, b.hue, weights),
+    }
 }
 
 /// Amounts blend continuously; the boundary law is discrete and switches at the
@@ -3266,6 +3305,13 @@ fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKi
             apply_saved_residual_values(value, live);
             true
         }
+        // Every Scan Processor field is a value — no route exists — so the
+        // whole params bundle transfers, geometry counts and reversals
+        // included, exactly like Cellular or Shift.
+        (VisualNodeKind::ScanProcessor(value), VisualNodeKind::ScanProcessor(live)) => {
+            *live = value;
+            true
+        }
         _ => false,
     }
 }
@@ -3549,6 +3595,12 @@ fn apply_saved_node_kind_values_to_runtime(
             live.seed = value.seed;
             true
         }
+        // Every Scan Processor field is a value — no route exists — so the
+        // whole params bundle transfers.
+        (VisualNodeKind::ScanProcessor(value), RuntimeVisualNodeKind::ScanProcessor(live)) => {
+            *live = value;
+            true
+        }
         _ => false,
     }
 }
@@ -3695,6 +3747,15 @@ fn apply_runtime_node_kind_values(
             live.mix = value.mix;
             live.detail_gain = value.detail_gain;
             live.seed = value.seed;
+            true
+        }
+        // Every Scan Processor field is a value — no route exists — so the
+        // whole params bundle transfers.
+        (
+            RuntimeVisualNodeKind::ScanProcessor(value),
+            RuntimeVisualNodeKind::ScanProcessor(live),
+        ) => {
+            *live = value;
             true
         }
         _ => false,
@@ -3953,6 +4014,51 @@ mod tests {
         // Equal documents are trivially carried.
         let same = interpolate_node_kind(a, a, [0.5, 0.5], true).unwrap();
         assert_eq!(same, a);
+    }
+
+    /// A Scan Processor pair blends its fifteen continuous controls while
+    /// the two geometry counts and the two reversals — plan-time geometry
+    /// and discrete laws — recall an endpoint at the midpoint. No route
+    /// exists, so any pair interpolates.
+    #[test]
+    fn a_scan_processor_pair_blends_values_and_recalls_discrete_laws_at_the_midpoint() {
+        use crate::scan_processor::ScanProcessorParams;
+        use crate::visual_rack::VisualNodeKind;
+        let a = VisualNodeKind::ScanProcessor(ScanProcessorParams {
+            amount: 0.2,
+            tilt_x: -0.5,
+            lines: 100,
+            samples_per_line: 64,
+            reverse_h: false,
+            ..ScanProcessorParams::default()
+        });
+        let b = VisualNodeKind::ScanProcessor(ScanProcessorParams {
+            amount: 0.8,
+            tilt_x: 0.5,
+            lines: 400,
+            samples_per_line: 128,
+            reverse_h: true,
+            ..ScanProcessorParams::default()
+        });
+        let VisualNodeKind::ScanProcessor(early) =
+            interpolate_node_kind(a, b, [0.75, 0.25], false).unwrap()
+        else {
+            panic!("scan processor kind")
+        };
+        assert!((early.amount - 0.35).abs() < 1e-6);
+        assert!((early.tilt_x - (-0.25)).abs() < 1e-6);
+        assert_eq!(early.lines, 100);
+        assert_eq!(early.samples_per_line, 64);
+        assert!(!early.reverse_h);
+        let VisualNodeKind::ScanProcessor(late) =
+            interpolate_node_kind(a, b, [0.25, 0.75], true).unwrap()
+        else {
+            panic!("scan processor kind")
+        };
+        assert!((late.amount - 0.65).abs() < 1e-6);
+        assert_eq!(late.lines, 400);
+        assert_eq!(late.samples_per_line, 128);
+        assert!(late.reverse_h);
     }
 
     #[test]

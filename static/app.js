@@ -478,6 +478,7 @@ const CREATIVE_NODE_INFO = Object.freeze({
   symmetry: { label: 'Symmetry Field' },
   residual: { label: 'Residual' },
   study: { label: 'Study' },
+  scan_processor: { label: 'Scan Processor' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -605,6 +606,30 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
   // dedicated document action rather than a generic parameter row; the card
   // renders its own paste surface.
   study: [
+  ],
+  // Ranges here must equal the NODE_PARAM_DESCRIPTORS ranges the server
+  // validates against. Lines/samples are plan-time geometry (number inputs,
+  // engine-clamped 16-1080 / 64-512); the reversals are discrete laws.
+  scan_processor: [
+    uintDef('scan_lines', 'Lines'),
+    uintDef('scan_samples', 'Samples'),
+    floatDef('scan_amount', 'Displace', 0, 1, 0.001),
+    floatDef('scan_ribbon_width', 'Beam width', 0, 1, 0.001),
+    floatDef('scan_velocity_mix', 'Velocity gain', 0, 1, 0.001),
+    floatDef('scan_tilt_x', 'Tilt X', -1, 1, 0.001),
+    floatDef('scan_tilt_y', 'Tilt Y', -1, 1, 0.001),
+    floatDef('scan_perspective', 'Perspective', 0, 1, 0.001),
+    floatDef('scan_s_curve', 'S-curve', -1, 1, 0.001),
+    floatDef('scan_skew', 'Raster skew', -1, 1, 0.001),
+    floatDef('scan_collapse', 'Collapse', 0, 1, 0.001),
+    boolDef('scan_reverse_h', 'Reverse sweep'),
+    boolDef('scan_reverse_v', 'Reverse field'),
+    floatDef('scan_osc_amount', 'Wobble', 0, 1, 0.001),
+    floatDef('scan_osc_freq', 'Wobble freq', 0, 1, 0.001),
+    floatDef('scan_osc_lock', 'Wobble lock', 0, 1, 0.001),
+    floatDef('scan_lissajous', 'Lissajous', 0, 1, 0.001),
+    floatDef('scan_mono', 'Mono', 0, 1, 0.001),
+    floatDef('scan_hue', 'Colourise', 0, 1, 0.001),
   ],
 });
 
