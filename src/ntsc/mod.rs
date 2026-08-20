@@ -798,8 +798,9 @@ pub(crate) fn composite_selective_ntsc_layers(
         .map(|(index, layer)| {
             BlendMode::from_u32(layer.blend_mode).ok_or_else(|| {
                 format!(
-                    "selective NTSC layer {index} has unknown blend mode code {}; expected 0..=14",
-                    layer.blend_mode
+                    "selective NTSC layer {index} has unknown blend mode code {}; expected 0..={}",
+                    layer.blend_mode,
+                    BlendMode::ALL.len() - 1
                 )
             })
         })
@@ -1990,15 +1991,17 @@ mod tests {
 
     #[test]
     fn selective_compositor_rejects_unknown_blend_codes_without_fallback() {
+        // Code 15 became Vivid Light in the B8 blend audit; the rejection
+        // boundary is the first code past the appended family.
         let plan = plan_selective_ntsc(
             generation(1, 1),
             enabled_metadata(),
-            [descriptor(1, true, true, 1.0, 15)],
+            [descriptor(1, true, true, 1.0, 25)],
         )
         .unwrap();
         let error = composite_selective_ntsc_layers(&plan, &[vec![1, 2, 3, 255]]).unwrap_err();
-        assert!(error.contains("unknown blend mode code 15"));
-        assert!(error.contains("expected 0..=14"));
+        assert!(error.contains("unknown blend mode code 25"));
+        assert!(error.contains("expected 0..=24"));
     }
 
     #[test]

@@ -62,8 +62,8 @@
     "workload": "production feedback shader over a moving pulse; analytic f32 max/decay reference"
   },
   "measured_at": {
-    "branch": "feat/proxy-authored-settings",
-    "commit": "124f7cf03d90ce91dd8b70aa04f8cda0f5e72875",
+    "branch": "feat/mixing-boundary",
+    "commit": "942c41597f90a669d2f0a5d4f068f99d965bc146",
     "tree": "dirty"
   },
   "resource_delta": {

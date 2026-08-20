@@ -360,14 +360,13 @@ pub fn param_meta(name: &str) -> Option<ParamMeta> {
         "contour" | "flatten" | "contour_dither" | "solarize" | "negative" | "colourpass"
         | "edge_amount" | "emboss" | "halftone" | "moire" | "row_smear" | "bitcrush"
         | "bitcrush_dither" | "contour_hue" | "contour_fill" | "colourpass_width"
-        | "halftone_pitch" | "moire_freq" | "chroma_aberration" | "anamorphic_streak" => {
-            Some(ParamMeta {
-                step: 0.05,
-                min: 0.0,
-                max: 1.0,
-                desc: "normalized small-effect control",
-            })
-        }
+        | "halftone_pitch" | "moire_freq" | "chroma_aberration" | "anamorphic_streak"
+        | "key_border" | "key_shadow" => Some(ParamMeta {
+            step: 0.05,
+            min: 0.0,
+            max: 1.0,
+            desc: "normalized small-effect control",
+        }),
         "contour_bands" => Some(ParamMeta {
             step: 1.0,
             min: 2.0,
@@ -697,10 +696,19 @@ pub struct TemporalConfig {
     /// scalars sanitize on load and unknown fields are rejected.
     #[serde(default, skip_serializing_if = "display_config_is_default")]
     pub display: crate::display_physics::DisplayPhysicsParams,
+    /// Additive B8 melting edge. Skipped at the exact-off default so
+    /// earlier patches keep their bytes and canonical hashes; hostile
+    /// scalars sanitize on load and unknown fields are rejected.
+    #[serde(default, skip_serializing_if = "melt_config_is_default")]
+    pub melt: crate::mixing_boundary::MeltParams,
 }
 
 fn display_config_is_default(value: &crate::display_physics::DisplayPhysicsParams) -> bool {
     *value == crate::display_physics::DisplayPhysicsParams::default()
+}
+
+fn melt_config_is_default(value: &crate::mixing_boundary::MeltParams) -> bool {
+    *value == crate::mixing_boundary::MeltParams::default()
 }
 
 /// Stable serialized vocabulary for the B12 time-displace map.
@@ -1570,6 +1578,7 @@ impl TemporalConfig {
             originals: (!originals.is_default()).then_some(originals),
             rig: TemporalRigConfig::from_params(p.rig),
             display: p.display.sanitized(),
+            melt: p.melt.sanitized(),
         }
     }
 
@@ -1627,6 +1636,7 @@ impl TemporalConfig {
             originals: self.originals.unwrap_or_default().to_params(),
             rig: self.rig.to_params(),
             display: self.display.sanitized(),
+            melt: self.melt.sanitized(),
         }
     }
 }
@@ -3294,6 +3304,13 @@ pub struct EffectsConfig {
     pub chroma_aberration: f32,
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub anamorphic_streak: f32,
+    /// B8 key dressing: border and shadow join the key signal.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub key_border: f32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub key_border_color: u32,
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub key_shadow: f32,
 }
 
 fn default_key_threshold() -> f32 {
@@ -3373,6 +3390,9 @@ impl Default for EffectsConfig {
             barrel: 0.0,
             chroma_aberration: 0.0,
             anamorphic_streak: 0.0,
+            key_border: 0.0,
+            key_border_color: 0,
+            key_shadow: 0.0,
         }
     }
 }
@@ -3449,6 +3469,9 @@ impl EffectsConfig {
             barrel: u.barrel,
             chroma_aberration: u.chroma_aberration,
             anamorphic_streak: u.anamorphic_streak,
+            key_border: u.key_border,
+            key_border_color: (u.key_border_color.max(0.0) as u32).min(7),
+            key_shadow: u.key_shadow,
         }
     }
 
@@ -3524,6 +3547,9 @@ impl EffectsConfig {
         u.barrel = finite_or(self.barrel, 0.0).clamp(-1.0, 1.0);
         u.chroma_aberration = finite_or(self.chroma_aberration, 0.0).clamp(0.0, 1.0);
         u.anamorphic_streak = finite_or(self.anamorphic_streak, 0.0).clamp(0.0, 1.0);
+        u.key_border = finite_or(self.key_border, 0.0).clamp(0.0, 1.0);
+        u.key_border_color = self.key_border_color.min(7) as f32;
+        u.key_shadow = finite_or(self.key_shadow, 0.0).clamp(0.0, 1.0);
     }
 
     /// Get fields organized into groups for display.
@@ -3602,6 +3628,9 @@ impl EffectsConfig {
                     ("key_color_g", format!("{:.3}", self.key_color[1])),
                     ("key_color_b", format!("{:.3}", self.key_color[2])),
                     ("key_tolerance", format!("{:.2}", self.key_tolerance)),
+                    ("key_border", format!("{:.2}", self.key_border)),
+                    ("key_border_color", self.key_border_color.to_string()),
+                    ("key_shadow", format!("{:.2}", self.key_shadow)),
                 ],
             ),
             (
@@ -3880,7 +3909,7 @@ impl EffectsConfig {
             | "emboss" | "emboss_angle" | "halftone" | "halftone_pitch" | "halftone_angle"
             | "moire" | "moire_freq" | "row_smear" | "bitcrush" | "bitcrush_levels"
             | "bitcrush_dither" | "multi_grid_x" | "multi_grid_y" | "barrel"
-            | "chroma_aberration" | "anamorphic_streak" => {
+            | "chroma_aberration" | "anamorphic_streak" | "key_border" | "key_shadow" => {
                 if let Ok(v) = value.parse::<f32>() {
                     let slot = match key {
                         "contour" => &mut self.contour,
@@ -3913,9 +3942,17 @@ impl EffectsConfig {
                         "multi_grid_y" => &mut self.multi_grid_y,
                         "barrel" => &mut self.barrel,
                         "chroma_aberration" => &mut self.chroma_aberration,
+                        "key_border" => &mut self.key_border,
+                        "key_shadow" => &mut self.key_shadow,
                         _ => &mut self.anamorphic_streak,
                     };
                     *slot = v;
+                    return true;
+                }
+            }
+            "key_border_color" => {
+                if let Ok(v) = value.parse::<u32>() {
+                    self.key_border_color = v.min(7);
                     return true;
                 }
             }
@@ -4391,6 +4428,9 @@ fn apply_saved_composition_look(
 ) {
     if look_root_identity_matches(saved, live, layer_ids) {
         live.set_bus_crossfade(saved.bus_crossfade());
+        // The B8 bus mixer is a composition-level value bundle and travels
+        // with the crossfade under the same identity gate.
+        live.set_mixer(saved.mixer());
         summary.applied_bus_crossfade = true;
     } else {
         summary.skipped_bus_crossfade = true;

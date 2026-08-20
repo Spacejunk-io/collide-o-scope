@@ -376,6 +376,10 @@ pub struct CreativeCompositionSnapshot {
     pub root: Vec<CompositionRootSnapshot>,
     #[serde(default = "default_matte_threshold")]
     pub bus_crossfade: f32,
+    /// The B8 bus-mixer state. Additive: an absent block decodes to the
+    /// exact pre-B8 dissolve bus.
+    #[serde(default)]
+    pub mixer: crate::mixing_boundary::BusMixerState,
     pub next_group_id: String,
 }
 
@@ -824,6 +828,7 @@ impl CreativeCompositionSnapshot {
             groups,
             root,
             bus_crossfade: composition.bus_crossfade(),
+            mixer: composition.mixer(),
             next_group_id: composition.next_group_id_raw().to_string(),
         }
     }
@@ -1491,6 +1496,13 @@ pub struct EffectsSnapshot {
     pub chroma_aberration: f32,
     #[serde(default)]
     pub anamorphic_streak: f32,
+    /// B8 key dressing: border/shadow join the key signal at both scopes.
+    #[serde(default)]
+    pub key_border: f32,
+    #[serde(default)]
+    pub key_border_color: u32,
+    #[serde(default)]
+    pub key_shadow: f32,
 }
 
 fn default_cellular_scale() -> f32 {
@@ -1663,6 +1675,9 @@ impl Default for EffectsSnapshot {
             barrel: 0.0,
             chroma_aberration: 0.0,
             anamorphic_streak: 0.0,
+            key_border: 0.0,
+            key_border_color: 0,
+            key_shadow: 0.0,
         }
     }
 }
@@ -2293,6 +2308,10 @@ pub struct TemporalSnapshot {
     /// serde block with snake_case discrete tokens; absent means exact-off.
     #[serde(default)]
     pub display: crate::display_physics::DisplayPhysicsParams,
+    /// Additive B8 melting edge. The params struct is its own sanitizing
+    /// serde block; absent means exact-off.
+    #[serde(default)]
+    pub melt: crate::mixing_boundary::MeltParams,
     /// Read-only renderer truth. Main fills this DTO when the active executor
     /// exposes metrics; older/exact paths safely report the zero placeholder.
     #[serde(default)]
@@ -2581,6 +2600,7 @@ impl Default for TemporalSnapshot {
             originals: TemporalOriginalsSnapshot::default(),
             rig: TemporalRigSnapshot::default(),
             display: crate::display_physics::DisplayPhysicsParams::default(),
+            melt: crate::mixing_boundary::MeltParams::default(),
             telemetry: TemporalTelemetrySnapshot::default(),
         }
     }
@@ -2775,6 +2795,7 @@ impl TemporalSnapshot {
             key_history: p.key_history,
             rig: TemporalRigSnapshot::from_params(p.rig),
             display: p.display.sanitized(),
+            melt: p.melt.sanitized(),
             originals: TemporalOriginalsSnapshot {
                 loom: TemporalLoomSnapshot {
                     amount: p.originals.loom.amount,
@@ -3950,6 +3971,15 @@ pub enum WebAction {
     /// advance the optimistic composition revision.
     #[serde(rename = "set_composition_bus_crossfade")]
     SetCompositionBusCrossfade { value: f32 },
+    /// One B8 bus-mixer value (wipe, blend, dirt, or melt). Like the
+    /// crossfade it is an ordinary coalescible value edit: no topology, no
+    /// revision. The closed param vocabulary lives in
+    /// `mixing_boundary::BusMixerEdit`.
+    #[serde(rename = "set_composition_bus_mix")]
+    SetCompositionBusMixParam {
+        param: String,
+        value: serde_json::Value,
+    },
     /// Stable direct-layer bus assignment is an ordered topology edit.
     #[serde(rename = "set_composition_layer_bus")]
     SetCompositionLayerBus {
@@ -4755,6 +4785,9 @@ impl WebAction {
             Self::SetCompositionBusCrossfade { .. } => {
                 Some("creative:composition:bus-crossfade".into())
             }
+            Self::SetCompositionBusMixParam { param, .. } => {
+                Some(format!("creative:composition:bus-mix:{param}"))
+            }
             Self::SetLayerParam {
                 index,
                 layer_id,
@@ -5159,6 +5192,9 @@ impl EffectsSnapshot {
             barrel: u.barrel,
             chroma_aberration: u.chroma_aberration,
             anamorphic_streak: u.anamorphic_streak,
+            key_border: u.key_border,
+            key_border_color: (u.key_border_color.max(0.0) as u32).min(7),
+            key_shadow: u.key_shadow,
         }
     }
 
@@ -5230,6 +5266,9 @@ impl EffectsSnapshot {
         u.barrel = finite_effect_value(self.barrel, 0.0).clamp(-1.0, 1.0);
         u.chroma_aberration = finite_effect_value(self.chroma_aberration, 0.0).clamp(0.0, 1.0);
         u.anamorphic_streak = finite_effect_value(self.anamorphic_streak, 0.0).clamp(0.0, 1.0);
+        u.key_border = finite_effect_value(self.key_border, 0.0).clamp(0.0, 1.0);
+        u.key_border_color = self.key_border_color.min(7) as f32;
+        u.key_shadow = finite_effect_value(self.key_shadow, 0.0).clamp(0.0, 1.0);
     }
 
     pub fn apply_param(&mut self, param: &str, value: &serde_json::Value) {
@@ -5418,6 +5457,21 @@ impl EffectsSnapshot {
             "negative_mode" => {
                 if let Some(n) = v.as_u64() {
                     self.negative_mode = (n as u32).min(2);
+                }
+            }
+            "key_border_color" => {
+                if let Some(n) = v.as_u64() {
+                    self.key_border_color = (n as u32).min(7);
+                }
+            }
+            "key_border" => {
+                if let Some(n) = v.as_f64() {
+                    self.key_border = n as f32;
+                }
+            }
+            "key_shadow" => {
+                if let Some(n) = v.as_f64() {
+                    self.key_shadow = n as f32;
                 }
             }
             // B13 small effects: every remaining control is a plain float.
@@ -7486,8 +7540,11 @@ mod protocol_tests {
         // Processor rows render through the existing generated-card template,
         // so the literal tag counts do not move. B4 added the 17 display-
         // physics sliders to the temporal group.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 165);
-        assert_eq!(assert_range_tags_are_bounded(js, false), 17);
+        // B8 added the seventeen bus-mixer sliders (wipe 5, dirt 6, melt 6),
+        // the six master melting-edge sliders, and the key-dressing pair at
+        // both scopes (two static master rows, two layer template rows).
+        assert_eq!(assert_range_tags_are_bounded(html, true), 190);
+        assert_eq!(assert_range_tags_are_bounded(js, false), 19);
 
         for contract in [
             "function normalizeRangeValue(slider, rawValue)",
@@ -7699,7 +7756,7 @@ mod protocol_tests {
         let block_tail = &js[block_start..];
         let block_end = block_tail.find("]);\n").unwrap() + 3;
         let block = &block_tail[..block_end];
-        assert_eq!(block.matches("{ key: '").count(), 15);
+        assert_eq!(block.matches("{ key: '").count(), 25);
 
         for (key, label) in [
             ("normal", "Normal"),
@@ -7717,6 +7774,16 @@ mod protocol_tests {
             ("dodge", "Dodge"),
             ("burn", "Burn"),
             ("alpha_cut", "Alpha Cut"),
+            ("vivid_light", "Vivid Light"),
+            ("pin_light", "Pin Light"),
+            ("divide", "Divide"),
+            ("wrap_add", "Wrap Add"),
+            ("xor", "Xor Bits"),
+            ("and", "And Bits"),
+            ("hue", "Hue"),
+            ("saturation", "Saturation"),
+            ("color", "Color"),
+            ("luminosity", "Luminosity"),
         ] {
             let contract = format!("key: '{key}', label: '{label}'");
             assert!(block.contains(&contract), "missing blend option {contract}");

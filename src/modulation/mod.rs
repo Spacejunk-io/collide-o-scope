@@ -156,6 +156,13 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("display_halation", 0.0, 1.0),
     ("display_defocus", 0.0, 1.0),
     ("display_sag", 0.0, 1.0),
+    // B8 master melting edge: all six controls are continuous.
+    ("melt_amount", 0.0, 2.0),
+    ("melt_width", 0.0, 2.0),
+    ("melt_hold", 0.0, 1.5),
+    ("melt_swirl", -1.0, 1.0),
+    ("melt_chroma", 0.0, 1.0),
+    ("melt_creep", 0.0, 1.0),
     // Program-wide spatial controls. Continuous geometry is modulatable;
     // discrete fit/edge/sampling choices remain explicitly authored.
     ("position_x", POSITION_MIN, POSITION_MAX),
@@ -231,6 +238,10 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("barrel", -1.0, 1.0),
     ("chroma_aberration", 0.0, 1.0),
     ("anamorphic_streak", 0.0, 1.0),
+    // B8 key dressing: border and shadow are continuous at both scopes;
+    // the border colour is a discrete closed table with no address.
+    ("key_border", 0.0, 1.0),
+    ("key_shadow", 0.0, 1.0),
     // The patch-morph crossfader; applied by the app, not apply_offset.
     ("morph", 0.0, 1.0),
 ];
@@ -503,28 +514,98 @@ impl GroupModParameter {
 }
 
 /// Composition-wide continuous values which are not owned by a group or rack.
+/// The B8 bus-mixer additions cover every continuous mixer control; the
+/// discrete laws (wipe pattern, invert, rep, border colour, blend mode) are
+/// closed vocabularies and deliberately have no modulatable address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CompositionModParameter {
     BusCrossfade,
+    BusWipeSoft,
+    BusWipeX,
+    BusWipeY,
+    BusWipeDetail,
+    BusWipeBorder,
+    BusDirt,
+    BusDirtRate,
+    BusDirtDrop,
+    BusDirtCut,
+    BusDirtKnock,
+    BusDirtNoise,
+    BusMelt,
+    BusMeltWidth,
+    BusMeltHold,
+    BusMeltSwirl,
+    BusMeltChroma,
+    BusMeltCreep,
 }
 
 impl CompositionModParameter {
+    /// Every address in a stable order for enumeration surfaces.
+    pub const ALL: [Self; 18] = [
+        Self::BusCrossfade,
+        Self::BusWipeSoft,
+        Self::BusWipeX,
+        Self::BusWipeY,
+        Self::BusWipeDetail,
+        Self::BusWipeBorder,
+        Self::BusDirt,
+        Self::BusDirtRate,
+        Self::BusDirtDrop,
+        Self::BusDirtCut,
+        Self::BusDirtKnock,
+        Self::BusDirtNoise,
+        Self::BusMelt,
+        Self::BusMeltWidth,
+        Self::BusMeltHold,
+        Self::BusMeltSwirl,
+        Self::BusMeltChroma,
+        Self::BusMeltCreep,
+    ];
+
     fn parse(value: &str) -> Option<Self> {
-        match value {
-            "bus_crossfade" => Some(Self::BusCrossfade),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|param| param.key() == value)
     }
 
     pub const fn key(self) -> &'static str {
         match self {
             Self::BusCrossfade => "bus_crossfade",
+            Self::BusWipeSoft => "bus_wipe_soft",
+            Self::BusWipeX => "bus_wipe_x",
+            Self::BusWipeY => "bus_wipe_y",
+            Self::BusWipeDetail => "bus_wipe_detail",
+            Self::BusWipeBorder => "bus_wipe_border",
+            Self::BusDirt => "bus_dirt",
+            Self::BusDirtRate => "bus_dirt_rate",
+            Self::BusDirtDrop => "bus_dirt_drop",
+            Self::BusDirtCut => "bus_dirt_cut",
+            Self::BusDirtKnock => "bus_dirt_knock",
+            Self::BusDirtNoise => "bus_dirt_noise",
+            Self::BusMelt => "bus_melt",
+            Self::BusMeltWidth => "bus_melt_width",
+            Self::BusMeltHold => "bus_melt_hold",
+            Self::BusMeltSwirl => "bus_melt_swirl",
+            Self::BusMeltChroma => "bus_melt_chroma",
+            Self::BusMeltCreep => "bus_melt_creep",
         }
     }
 
     pub const fn range(self) -> [f32; 2] {
         match self {
-            Self::BusCrossfade => [0.0, 1.0],
+            Self::BusCrossfade
+            | Self::BusWipeSoft
+            | Self::BusWipeDetail
+            | Self::BusWipeBorder
+            | Self::BusDirt
+            | Self::BusDirtRate
+            | Self::BusDirtDrop
+            | Self::BusDirtCut
+            | Self::BusDirtKnock
+            | Self::BusDirtNoise
+            | Self::BusMeltChroma
+            | Self::BusMeltCreep => [0.0, 1.0],
+            Self::BusWipeX | Self::BusWipeY | Self::BusMeltSwirl => [-1.0, 1.0],
+            Self::BusMelt | Self::BusMeltWidth => [0.0, 2.0],
+            Self::BusMeltHold => [0.0, 1.5],
         }
     }
 }
@@ -1511,6 +1592,37 @@ pub fn apply_stable_modulation(
             CompositionModParameter::BusCrossfade => composition.set_bus_crossfade(
                 finite_or(composition.bus_crossfade(), 0.5) + finite_or(offset, 0.0),
             ),
+            // Every continuous bus-mixer address contributes an additive
+            // offset to the frame copy; `set_mixer` sanitizes, so the
+            // result lands inside the declared range.
+            _ => {
+                let mut mixer = composition.mixer();
+                let offset = finite_or(offset, 0.0);
+                {
+                    let slot = match parameter {
+                        CompositionModParameter::BusCrossfade => unreachable!(),
+                        CompositionModParameter::BusWipeSoft => &mut mixer.mix.soft,
+                        CompositionModParameter::BusWipeX => &mut mixer.mix.origin_x,
+                        CompositionModParameter::BusWipeY => &mut mixer.mix.origin_y,
+                        CompositionModParameter::BusWipeDetail => &mut mixer.mix.detail,
+                        CompositionModParameter::BusWipeBorder => &mut mixer.mix.border,
+                        CompositionModParameter::BusDirt => &mut mixer.dirt.dirt,
+                        CompositionModParameter::BusDirtRate => &mut mixer.dirt.rate,
+                        CompositionModParameter::BusDirtDrop => &mut mixer.dirt.drop,
+                        CompositionModParameter::BusDirtCut => &mut mixer.dirt.cut,
+                        CompositionModParameter::BusDirtKnock => &mut mixer.dirt.knock,
+                        CompositionModParameter::BusDirtNoise => &mut mixer.dirt.noise,
+                        CompositionModParameter::BusMelt => &mut mixer.melt.melt,
+                        CompositionModParameter::BusMeltWidth => &mut mixer.melt.width,
+                        CompositionModParameter::BusMeltHold => &mut mixer.melt.hold,
+                        CompositionModParameter::BusMeltSwirl => &mut mixer.melt.swirl,
+                        CompositionModParameter::BusMeltChroma => &mut mixer.melt.chroma,
+                        CompositionModParameter::BusMeltCreep => &mut mixer.melt.creep,
+                    };
+                    *slot = finite_or(*slot, 0.0) + offset;
+                }
+                composition.set_mixer(mixer);
+            }
         }
     }
     let group_ids: Vec<_> = composition.groups().map(|group| group.id).collect();
@@ -1653,7 +1765,7 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "contour" | "contour_hue" | "contour_fill" | "flatten" | "contour_dither" | "solarize"
         | "negative" | "colourpass" | "colourpass_width" | "edge_amount" | "emboss"
         | "halftone" | "halftone_pitch" | "moire" | "moire_freq" | "row_smear" | "bitcrush"
-        | "bitcrush_dither" => Some((0.0, 1.0)),
+        | "bitcrush_dither" | "key_border" | "key_shadow" => Some((0.0, 1.0)),
         "contour_bands" => Some((2.0, 40.0)),
         "contour_width" => Some((0.2, 6.0)),
         "flatten_levels" | "bitcrush_levels" => Some((2.0, 16.0)),
@@ -2813,6 +2925,8 @@ impl ModMatrix {
         apply!(bitcrush_dither, "bitcrush_dither", 0.0, 1.0);
         apply!(multi_grid_x, "multi_grid_x", 1.0, 8.0);
         apply!(multi_grid_y, "multi_grid_y", 1.0, 8.0);
+        apply!(key_border, "key_border", 0.0, 1.0);
+        apply!(key_shadow, "key_shadow", 0.0, 1.0);
 
         apply_spatial_offsets(&mut transform, offset);
 
@@ -3170,6 +3284,9 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     "bitcrush_dither",
     "multi_grid_x",
     "multi_grid_y",
+    // B8 key dressing, appended so every compiled suffix index is stable.
+    "key_border",
+    "key_shadow",
 ];
 
 impl RoutingOffsets {
@@ -3322,6 +3439,8 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "bitcrush_dither" => 89,
         "multi_grid_x" => 90,
         "multi_grid_y" => 91,
+        "key_border" => 92,
+        "key_shadow" => 93,
         _ => return None,
     })
 }
@@ -3532,6 +3651,8 @@ fn apply_offset(
         "barrel" => &mut fx.barrel,
         "chroma_aberration" => &mut fx.chroma_aberration,
         "anamorphic_streak" => &mut fx.anamorphic_streak,
+        "key_border" => &mut fx.key_border,
+        "key_shadow" => &mut fx.key_shadow,
         "ntsc_snow" => &mut np.snow_intensity,
         "ntsc_tracking_snow" => &mut np.tracking_noise_snow,
         "ntsc_edge_wave" => &mut np.edge_wave_intensity,
@@ -3594,6 +3715,12 @@ fn apply_offset(
         "display_halation" => &mut tp.display.halation,
         "display_defocus" => &mut tp.display.defocus,
         "display_sag" => &mut tp.display.sag,
+        "melt_amount" => &mut tp.melt.melt,
+        "melt_width" => &mut tp.melt.width,
+        "melt_hold" => &mut tp.melt.hold,
+        "melt_swirl" => &mut tp.melt.swirl,
+        "melt_chroma" => &mut tp.melt.chroma,
+        "melt_creep" => &mut tp.melt.creep,
         _ => return,
     };
     *slot = (*slot + offset).clamp(min, max);
@@ -4609,6 +4736,54 @@ mod tests {
             assert_eq!(target_range(target), Some(range), "{target}");
         }
         for discrete in ["display_il_mode", "display_il_order", "display_model"] {
+            assert_eq!(target_range(discrete), None, "{discrete}");
+        }
+    }
+
+    #[test]
+    fn mixing_boundary_modulation_is_bounded_and_leaves_discrete_laws_untouched() {
+        // The master melting edge: six continuous addresses.
+        for (target, range) in [
+            ("melt_amount", (0.0, 2.0)),
+            ("melt_width", (0.0, 2.0)),
+            ("melt_hold", (0.0, 1.5)),
+            ("melt_swirl", (-1.0, 1.0)),
+            ("melt_chroma", (0.0, 1.0)),
+            ("melt_creep", (0.0, 1.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+        // The bus mixer: seventeen composition addresses beside the
+        // crossfade, and no address for any discrete law.
+        for parameter in CompositionModParameter::ALL {
+            let target = format!("composition/{}", parameter.key());
+            assert_eq!(
+                target_range(&target),
+                Some((parameter.range()[0], parameter.range()[1])),
+                "{target}"
+            );
+        }
+        assert_eq!(CompositionModParameter::ALL.len(), 18);
+        for discrete in [
+            "composition/bus_wipe_pattern",
+            "composition/bus_wipe_invert",
+            "composition/bus_wipe_rep",
+            "composition/bus_wipe_border_color",
+            "composition/bus_blend",
+        ] {
+            assert_eq!(target_range(discrete), None, "{discrete}");
+        }
+        // Key dressing: continuous at both scopes, the colour table at
+        // neither.
+        for target in [
+            "key_border",
+            "key_shadow",
+            "layer1_key_border",
+            "layer1_key_shadow",
+        ] {
+            assert_eq!(target_range(target), Some((0.0, 1.0)), "{target}");
+        }
+        for discrete in ["key_border_color", "layer1_key_border_color"] {
             assert_eq!(target_range(discrete), None, "{discrete}");
         }
 

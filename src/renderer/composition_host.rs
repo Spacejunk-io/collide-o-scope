@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::effects::params::TemporalParams;
 use crate::layers::BlendMode;
-use crate::renderer::blend::{composite_shader_source, matte_composite_shader_source};
+use crate::renderer::blend::{
+    composite_shader_source, composition_host_shader_source, matte_composite_shader_source,
+};
 use crate::renderer::compositor::MatteCompositeUniforms;
 use crate::spatial::EffectPassUniforms;
 use crate::temporal::{
@@ -359,11 +361,58 @@ impl HostCompositeUniforms {
     }
 }
 
+/// The B8 bus-law uniform: crossfade plus the mixing-boundary state (wipe,
+/// blend, dirt, melt). Field order mirrors `BusUniforms` in
+/// `composition_host.wgsl` exactly.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct HostBusUniforms {
     crossfade: f32,
+    mix_mode: u32,
+    wipe_invert: u32,
+    wipe_rep: u32,
+    wipe_soft: f32,
+    wipe_x: f32,
+    wipe_y: f32,
+    wipe_detail: f32,
+    wipe_border: f32,
+    wipe_border_color: u32,
+    bus_blend: u32,
+    dirt: f32,
+    dirt_rate: f32,
+    dirt_drop: f32,
+    dirt_cut: f32,
+    dirt_knock: f32,
+    dirt_noise: f32,
+    time: f32,
+    random_seed: u32,
+    hist_valid: u32,
+    melt: f32,
+    melt_width: f32,
+    melt_hold: f32,
+    melt_swirl: f32,
+    melt_chroma: f32,
+    melt_creep: f32,
+    resolution: [f32; 2],
+    output_aspect: f32,
     _pad: [f32; 3],
+}
+
+/// Everything one bus pass needs from the evaluated frame: the crossfade,
+/// the sanitized mixing-boundary state, and the frame-plan context values
+/// the dirty mixer's event clock and the wipe hash derive from. Time comes
+/// from the shared frame plan only, never wall time, so Pause holds every
+/// fault still and export replays them structurally.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BusFrameParams {
+    pub crossfade: f32,
+    pub mixer: crate::mixing_boundary::BusMixerState,
+    pub time_seconds: f32,
+    pub random_seed: u32,
+    pub output_size: [u32; 2],
+    /// The bus melt history is valid and bound. False encodes the exact
+    /// hold-free law regardless of the authored hold.
+    pub history_valid: bool,
 }
 
 /// Dedicated post-temporal Refresh Garden ABI. Keeping this independent from
@@ -381,7 +430,7 @@ struct HostRoutedGardenUniforms {
 }
 
 const _: () = assert!(std::mem::size_of::<HostCompositeUniforms>() == 16);
-const _: () = assert!(std::mem::size_of::<HostBusUniforms>() == 16);
+const _: () = assert!(std::mem::size_of::<HostBusUniforms>() == 128);
 const _: () = assert!(std::mem::size_of::<HostRoutedGardenUniforms>() == 48);
 
 pub(crate) struct HostEffectSource {
@@ -464,6 +513,9 @@ pub(crate) struct CompositionHost {
     matte_uniforms: HostUniformArena,
     bus_uniform_buffer: wgpu::Buffer,
     bus_uniform_group: wgpu::BindGroup,
+    bus_history_layout: wgpu::BindGroupLayout,
+    _bus_neutral_history_texture: wgpu::Texture,
+    bus_neutral_history_group: wgpu::BindGroup,
     temporal_uniform_buffer: wgpu::Buffer,
     temporal_uniform_group: wgpu::BindGroup,
     temporal_originals_uniform_buffer: wgpu::Buffer,
@@ -965,6 +1017,14 @@ impl CompositionHost {
             )],
             &counters,
         );
+        // The bus melt's history tap owns its own group so the shared
+        // universal copy/bus texture layout keeps its exact prior shape.
+        let bus_history_layout = create_layout(
+            device,
+            "Advanced composition bus melt history",
+            &[sampled_texture_entry(0)],
+            &counters,
+        );
         let temporal_uniform_layout = create_layout(
             device,
             "Advanced composition legacy temporal uniform",
@@ -1043,7 +1103,7 @@ impl CompositionHost {
         let host = create_shader(
             device,
             "Advanced composition host",
-            wgpu::ShaderSource::Wgsl(include_str!("../shaders/composition_host.wgsl").into()),
+            wgpu::ShaderSource::Wgsl(composition_host_shader_source()),
             &counters,
         );
         let temporal = create_shader(
@@ -1092,7 +1152,11 @@ impl CompositionHost {
         let bus_pipeline_layout = create_pipeline_layout(
             device,
             "Advanced composition bus pipeline layout",
-            &[&universal_texture_layout, &bus_uniform_layout],
+            &[
+                &universal_texture_layout,
+                &bus_uniform_layout,
+                &bus_history_layout,
+            ],
             &counters,
         );
         let temporal_pipeline_layout = create_pipeline_layout(
@@ -1250,6 +1314,35 @@ impl CompositionHost {
             "Advanced composition bus uniform",
             &counters,
         );
+        // A defined-zero 1x1 stands in for the bus melt history whenever the
+        // melt is unarmed; `hist_valid` keeps the read closed either way.
+        let bus_neutral_history_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Advanced composition bus melt neutral history"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HOST_WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        counters.textures.fetch_add(1, Ordering::Relaxed);
+        let bus_neutral_history_view =
+            bus_neutral_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        counters.texture_views.fetch_add(1, Ordering::Relaxed);
+        let bus_neutral_history_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Advanced composition bus melt neutral history group"),
+            layout: &bus_history_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&bus_neutral_history_view),
+            }],
+        });
+        counters.bind_groups.fetch_add(1, Ordering::Relaxed);
         let temporal_rig_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Advanced composition temporal rig uniform"),
             size: std::mem::size_of::<TemporalRigGpuUniforms>() as u64,
@@ -1418,6 +1511,9 @@ impl CompositionHost {
             matte_uniforms,
             bus_uniform_buffer,
             bus_uniform_group,
+            bus_history_layout,
+            _bus_neutral_history_texture: bus_neutral_history_texture,
+            bus_neutral_history_group,
             temporal_uniform_buffer,
             temporal_uniform_group,
             temporal_originals_uniform_buffer,
@@ -1495,6 +1591,13 @@ impl CompositionHost {
         source: &wgpu::TextureView,
     ) -> HostTextureInputs {
         self.prepare_universal_inputs(device, source, source, source)
+    }
+
+    /// The single-texture layout the bus melt's history bind group is built
+    /// against. The executor owns the lazily allocated surface; the layout
+    /// stays host state so pipeline and group can never disagree.
+    pub(crate) fn bus_history_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bus_history_layout
     }
 
     pub fn prepare_bus_inputs(
@@ -1802,18 +1905,58 @@ impl CompositionHost {
         encoder: &mut wgpu::CommandEncoder,
         inputs: &HostTextureInputs,
         target: &wgpu::TextureView,
-        crossfade: f32,
+        params: &BusFrameParams,
+        history: Option<&wgpu::BindGroup>,
     ) {
-        let crossfade = if crossfade.is_finite() {
-            crossfade.clamp(0.0, 1.0)
+        let crossfade = if params.crossfade.is_finite() {
+            params.crossfade.clamp(0.0, 1.0)
         } else {
             0.5
         };
+        let mixer = params.mixer.sanitized();
+        let time_seconds = if params.time_seconds.is_finite() {
+            params.time_seconds.max(0.0)
+        } else {
+            0.0
+        };
+        let width = params.output_size[0].max(1) as f32;
+        let height = params.output_size[1].max(1) as f32;
+        // A valid history only counts when an armed melt actually reads it;
+        // an unarmed melt keeps the read closed so the neutral binding can
+        // never contribute.
+        let hist_valid = params.history_valid && history.is_some() && mixer.melt.is_armed();
         queue.write_buffer(
             &self.bus_uniform_buffer,
             0,
             bytemuck::bytes_of(&HostBusUniforms {
                 crossfade,
+                mix_mode: mixer.mix.pattern.code(),
+                wipe_invert: u32::from(mixer.mix.invert),
+                wipe_rep: mixer.mix.rep,
+                wipe_soft: mixer.mix.soft,
+                wipe_x: mixer.mix.origin_x,
+                wipe_y: mixer.mix.origin_y,
+                wipe_detail: mixer.mix.detail,
+                wipe_border: mixer.mix.border,
+                wipe_border_color: mixer.mix.border_color.code(),
+                bus_blend: mixer.mix.blend.as_u32(),
+                dirt: mixer.dirt.dirt,
+                dirt_rate: mixer.dirt.rate,
+                dirt_drop: mixer.dirt.drop,
+                dirt_cut: mixer.dirt.cut,
+                dirt_knock: mixer.dirt.knock,
+                dirt_noise: mixer.dirt.noise,
+                time: time_seconds,
+                random_seed: params.random_seed,
+                hist_valid: u32::from(hist_valid),
+                melt: mixer.melt.melt,
+                melt_width: mixer.melt.width,
+                melt_hold: mixer.melt.hold,
+                melt_swirl: mixer.melt.swirl,
+                melt_chroma: mixer.melt.chroma,
+                melt_creep: mixer.melt.creep,
+                resolution: [width, height],
+                output_aspect: width / height,
                 _pad: [0.0; 3],
             }),
         );
@@ -1821,6 +1964,7 @@ impl CompositionHost {
         pass.set_pipeline(&self.bus_pipeline);
         pass.set_bind_group(0, &inputs.bind_group, &[]);
         pass.set_bind_group(1, &self.bus_uniform_group, &[]);
+        pass.set_bind_group(2, history.unwrap_or(&self.bus_neutral_history_group), &[]);
         pass.draw(0..3, 0..1);
     }
 
@@ -3504,11 +3648,30 @@ mod tests {
         let shader = include_str!("../shaders/composition_host.wgsl");
         for law in [
             "fn premultiply",
-            "let ab = mix",
+            // The exact-legacy meet survives B8 as a textually explicit
+            // branch: a default bus state runs the historical premultiplied
+            // crossfade expression byte for byte.
+            "ab = mix(a, b, m);",
             "premultiplied_over(program, ab)",
             "straight_from_premultiplied",
         ] {
             assert!(shader.contains(law), "missing host shader law: {law}");
+        }
+        // The B8 mixing boundary rides this one shader: the wake gates for
+        // dirt and melt, the appended blend meet, and the closed melt-hold
+        // read must all be present exactly once.
+        for law in [
+            "if bus.dirt > 0.002",
+            "if bus.melt > 0.002",
+            "if bus.bus_blend == 0u",
+            "blend_rgb(bus.bus_blend",
+            "if bus.hist_valid != 0u && band > 0.001 && bus.melt_hold > 0.002",
+        ] {
+            assert_eq!(
+                shader.matches(law).count(),
+                1,
+                "B8 bus law must appear exactly once: {law}"
+            );
         }
         for law in [
             "const BAYER_8X8",
@@ -4507,20 +4670,23 @@ mod tests {
         let temporal_compat8_sha256 = sha256(&temporal_exact_output);
         let temporal_advanced_working_sha256 = sha256(&temporal_advanced_working_output);
         let temporal_advanced_presented_sha256 = sha256(&temporal_advanced_presented_output);
-        // B13 re-pinned this digest: the small-effects tranche grew the
-        // shared effects shader by eight amount-gated vec4 slots. The six
-        // output SHAs below did not move, which is the byte-exactness proof
-        // for every default-off branch.
+        // B8 re-pinned this digest: the mixing-boundary tranche rewrote the
+        // host bus law (wipes, blend meet, dirty mixer, melt) behind
+        // textually explicit default branches. The six output SHAs below did
+        // not move, which is the byte-exactness proof for the default bus
+        // state. (B13's re-pin note: the small-effects tranche grew the
+        // shared effects shader by eight amount-gated vec4 slots.)
         assert_eq!(
             shader_bundle_sha256,
-            "3e280fd7861956d6e363079b14b06b81c8a853ddf9a3763031c3a15d1b0387f4"
+            "a96d5545702edd6803961e24a7ddfe428316366237c2b53913d89c080a7b7fbc"
         );
-        // B13 re-pinned this input-identity lane: the still fixture hash
-        // covers the raw EffectPassUniforms bytes, which grew 224 -> 352.
-        // The output SHAs below are the pixel claim and did not move.
+        // B8 re-pinned this input-identity lane: the still fixture hash
+        // covers the raw EffectPassUniforms bytes, which grew 352 -> 368
+        // (key dressing). The output SHAs below are the pixel claim and did
+        // not move. (B13's re-pin note: the block grew 224 -> 352.)
         assert_eq!(
             still_fixture_sha256,
-            "0aeb411e29b0d88a10ddd3e0a7cbb55f91f409da8cd705568f93bf7ecc475f4a"
+            "c028269cbbbf4600e2681146c384c201796456db79f4fcb5e19de836e8cbf562"
         );
         assert_eq!(
             temporal_fixture_sha256,
@@ -5189,7 +5355,21 @@ mod tests {
             .unwrap();
         host.encode_matte(&mut encoder, &matte, program.view, HostUniformSlot(0))
             .unwrap();
-        host.encode_bus(&queue, &mut encoder, &bus, group.view, 0.4);
+        host.encode_bus(
+            &queue,
+            &mut encoder,
+            &bus,
+            group.view,
+            &BusFrameParams {
+                crossfade: 0.4,
+                mixer: crate::mixing_boundary::BusMixerState::default(),
+                time_seconds: 0.0,
+                random_seed: 0,
+                output_size: host.dimensions(),
+                history_valid: false,
+            },
+            None,
+        );
         host.encode_temporal(
             &queue,
             &mut encoder,

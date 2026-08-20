@@ -80,7 +80,11 @@ fn take_matching_codec_motion(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The serde tokens are `rename_all = "snake_case"` of the variant names and
+// are asserted equal to `key()` for every mode, so a patch or wire value
+// written through serde and one written through `key()` can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BlendMode {
     Normal,
     Screen,
@@ -97,11 +101,25 @@ pub enum BlendMode {
     Dodge,
     Burn,
     AlphaCut,
+    // The B8 blend audit appends the remaining classic family below the
+    // frozen codes 0..=14. Laws are derived from BENDR (MIT, © 2026 Steve
+    // Blythe), rewritten in linear light; existing modes keep their exact
+    // laws and indices.
+    VividLight,
+    PinLight,
+    Divide,
+    WrapAdd,
+    Xor,
+    And,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 impl BlendMode {
     /// Every protocol value in its permanent append-only numeric order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 25] = [
         Self::Normal,
         Self::Screen,
         Self::Multiply,
@@ -117,6 +135,16 @@ impl BlendMode {
         Self::Dodge,
         Self::Burn,
         Self::AlphaCut,
+        Self::VividLight,
+        Self::PinLight,
+        Self::Divide,
+        Self::WrapAdd,
+        Self::Xor,
+        Self::And,
+        Self::Hue,
+        Self::Saturation,
+        Self::Color,
+        Self::Luminosity,
     ];
 
     /// Stable append-only shader/protocol code. Never reorder or recycle one.
@@ -137,6 +165,16 @@ impl BlendMode {
             Self::Dodge => 12,
             Self::Burn => 13,
             Self::AlphaCut => 14,
+            Self::VividLight => 15,
+            Self::PinLight => 16,
+            Self::Divide => 17,
+            Self::WrapAdd => 18,
+            Self::Xor => 19,
+            Self::And => 20,
+            Self::Hue => 21,
+            Self::Saturation => 22,
+            Self::Color => 23,
+            Self::Luminosity => 24,
         }
     }
 
@@ -166,6 +204,16 @@ impl BlendMode {
             Self::Dodge => "dodge",
             Self::Burn => "burn",
             Self::AlphaCut => "alpha_cut",
+            Self::VividLight => "vivid_light",
+            Self::PinLight => "pin_light",
+            Self::Divide => "divide",
+            Self::WrapAdd => "wrap_add",
+            Self::Xor => "xor",
+            Self::And => "and",
+            Self::Hue => "hue",
+            Self::Saturation => "saturation",
+            Self::Color => "color",
+            Self::Luminosity => "luminosity",
         }
     }
 
@@ -187,6 +235,16 @@ impl BlendMode {
             "dodge" => Self::Dodge,
             "burn" => Self::Burn,
             "alpha_cut" => Self::AlphaCut,
+            "vivid_light" => Self::VividLight,
+            "pin_light" => Self::PinLight,
+            "divide" => Self::Divide,
+            "wrap_add" => Self::WrapAdd,
+            "xor" => Self::Xor,
+            "and" => Self::And,
+            "hue" => Self::Hue,
+            "saturation" => Self::Saturation,
+            "color" => Self::Color,
+            "luminosity" => Self::Luminosity,
             _ => return None,
         })
     }
@@ -1705,16 +1763,30 @@ mod tests {
             "dodge",
             "burn",
             "alpha_cut",
+            "vivid_light",
+            "pin_light",
+            "divide",
+            "wrap_add",
+            "xor",
+            "and",
+            "hue",
+            "saturation",
+            "color",
+            "luminosity",
         ];
+        assert_eq!(keys.len(), BlendMode::ALL.len());
         for (code, (mode, key)) in BlendMode::ALL.into_iter().zip(keys).enumerate() {
             assert_eq!(mode.as_u32(), code as u32);
             assert_eq!(BlendMode::from_u32(code as u32), Some(mode));
             assert_eq!(mode.key(), key);
             assert_eq!(BlendMode::from_key(key), Some(mode));
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, format!("\"{key}\""), "serde token must equal key()");
+            assert_eq!(serde_json::from_str::<BlendMode>(&json).unwrap(), mode);
         }
         assert_eq!(BlendMode::from_key("Soft Light"), None);
         assert_eq!(BlendMode::from_key("unknown"), None);
-        assert_eq!(BlendMode::from_u32(15), None);
+        assert_eq!(BlendMode::from_u32(25), None);
         assert_eq!(BlendMode::from_u32(u32::MAX), None);
     }
 

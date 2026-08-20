@@ -1355,6 +1355,8 @@ pub struct AdvancedCompositionPlan {
     groups: Box<[EvaluatedGroupScopePlan]>,
     root: Box<[RuntimeRootItem]>,
     bus_crossfade: f32,
+    /// The sanitized frame copy of the B8 mixing-boundary state.
+    mixer: crate::mixing_boundary::BusMixerState,
     image_taps: Box<[PlannedImageTap]>,
     diagnostics: Box<[CompositionPlanDiagnostic]>,
     #[cfg_attr(
@@ -1448,6 +1450,10 @@ impl AdvancedCompositionPlan {
 
     pub const fn bus_crossfade(&self) -> f32 {
         self.bus_crossfade
+    }
+
+    pub const fn mixer(&self) -> crate::mixing_boundary::BusMixerState {
+        self.mixer
     }
 
     pub fn image_taps(&self) -> &[PlannedImageTap] {
@@ -2233,6 +2239,7 @@ impl<'a> Planner<'a> {
                 evaluated,
                 &group_plans,
                 self.input.composition.bus_crossfade(),
+                self.input.composition.mixer(),
             ) {
                 continue;
             }
@@ -2569,6 +2576,7 @@ impl<'a> Planner<'a> {
                 groups: group_plans.into_boxed_slice(),
                 root: self.input.composition.root().to_vec().into_boxed_slice(),
                 bus_crossfade: self.input.composition.bus_crossfade(),
+                mixer: self.input.composition.mixer().sanitized(),
                 image_taps: taps.into_boxed_slice(),
                 diagnostics: diagnostics.into_boxed_slice(),
                 below,
@@ -3921,6 +3929,7 @@ fn layer_effectively_contributes(
     evaluated: &crate::evaluated_frame::EvaluatedLayer,
     groups: &[EvaluatedGroupScopePlan],
     bus_crossfade: f32,
+    mixer: crate::mixing_boundary::BusMixerState,
 ) -> bool {
     if !evaluated.visible
         || !layer.admitted_to_program
@@ -3942,6 +3951,12 @@ fn layer_effectively_contributes(
     } else {
         0.5
     };
+    // An armed dirty mixer can throw the crossbar to either input or drop
+    // line bands through to it mid-firing, so neither lane can be culled on
+    // the fader position alone while dirt is authored.
+    if !mixer.dirt.is_exact_off() && layer.bus != BusAssignment::Program {
+        return true;
+    }
     match layer.bus {
         BusAssignment::A => crossfade < 1.0,
         BusAssignment::B => crossfade > 0.0,

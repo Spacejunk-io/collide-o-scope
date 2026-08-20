@@ -11,6 +11,7 @@ use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::image_routing::StableLayerId;
+use crate::mixing_boundary::BusMixerState;
 use crate::performance::SavedLayerPosition;
 use crate::spatial::SpatialTransform;
 use crate::visual_rack::{
@@ -565,6 +566,10 @@ pub struct CompositionTree {
     /// missing-referenced group ID observed by this composition.
     next_group_id: u64,
     bus_crossfade: f32,
+    /// The B8 mixing boundary: wipe/blend mix laws, the dirty-mixer fault
+    /// stage, and the bus melt. Values, never topology; skip-serialized at
+    /// the exact-legacy default so pre-B8 patches keep their bytes.
+    mixer: BusMixerState,
 }
 
 impl CompositionTree {
@@ -584,6 +589,7 @@ impl CompositionTree {
             root,
             next_group_id: 1,
             bus_crossfade: 0.5,
+            mixer: BusMixerState::default(),
         };
         tree.validate_for_layers(layers_back_to_front)?;
         Ok(tree)
@@ -631,9 +637,17 @@ impl CompositionTree {
             root,
             next_group_id,
             bus_crossfade: finite_unit(bus_crossfade, 0.5),
+            mixer: BusMixerState::default(),
         };
         tree.validate_structure()?;
         Ok(tree)
+    }
+
+    /// Install the mixing-boundary state on a constructed tree. Sanitizes on
+    /// entry, so no construction path can carry hostile values.
+    pub fn with_mixer(mut self, mixer: BusMixerState) -> Self {
+        self.mixer = mixer.sanitized();
+        self
     }
 
     pub fn groups(&self) -> impl ExactSizeIterator<Item = &Group> {
@@ -673,6 +687,14 @@ impl CompositionTree {
 
     pub fn set_bus_crossfade(&mut self, value: f32) {
         self.bus_crossfade = finite_unit(value, 0.5);
+    }
+
+    pub fn mixer(&self) -> BusMixerState {
+        self.mixer
+    }
+
+    pub fn set_mixer(&mut self, mixer: BusMixerState) {
+        self.mixer = mixer.sanitized();
     }
 
     /// Advance the cursor for a reference found outside this tree (for example
@@ -939,11 +961,18 @@ impl Serialize for CompositionTree {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("CompositionTree", 4)?;
+        // The mixer block is skip-serialized at the exact-legacy default so
+        // every pre-B8 patch keeps its bytes and canonical hash.
+        let mixer_authored = self.mixer != BusMixerState::default();
+        let mut state =
+            serializer.serialize_struct("CompositionTree", if mixer_authored { 5 } else { 4 })?;
         state.serialize_field("groups", &Groups(self.groups.clone()))?;
         state.serialize_field("root", &RootItems(self.root.clone()))?;
         state.serialize_field("next_group_id", &self.next_group_id)?;
         state.serialize_field("bus_crossfade", &self.bus_crossfade)?;
+        if mixer_authored {
+            state.serialize_field("mixer", &self.mixer)?;
+        }
         state.end()
     }
 }
@@ -963,6 +992,8 @@ impl<'de> Deserialize<'de> for CompositionTree {
             next_group_id: Option<u64>,
             #[serde(default = "half")]
             bus_crossfade: f32,
+            #[serde(default)]
+            mixer: BusMixerState,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -972,6 +1003,7 @@ impl<'de> Deserialize<'de> for CompositionTree {
             raw.next_group_id,
             raw.bus_crossfade,
         )
+        .map(|tree| tree.with_mixer(raw.mixer))
         .map_err(de::Error::custom)
     }
 }
@@ -1320,6 +1352,7 @@ pub struct RuntimeComposition {
     root: Vec<RuntimeRootItem>,
     next_group_id: u64,
     bus_crossfade: f32,
+    mixer: BusMixerState,
 }
 
 impl CompositionTree {
@@ -1423,6 +1456,7 @@ impl CompositionTree {
             Some(self.next_group_id),
             self.bus_crossfade,
         )
+        .map(|runtime| runtime.with_mixer(self.mixer))
         .map_err(CompositionResolveError::InvalidRuntime)
     }
 }
@@ -1470,9 +1504,17 @@ impl RuntimeComposition {
             root,
             next_group_id,
             bus_crossfade: finite_unit(bus_crossfade, 0.5),
+            mixer: BusMixerState::default(),
         };
         runtime.validate_structure()?;
         Ok(runtime)
+    }
+
+    /// Install the mixing-boundary state on a constructed runtime tree.
+    /// Sanitizes on entry, so no construction path can carry hostile values.
+    pub fn with_mixer(mut self, mixer: BusMixerState) -> Self {
+        self.mixer = mixer.sanitized();
+        self
     }
 
     pub fn groups(&self) -> impl ExactSizeIterator<Item = &RuntimeGroup> {
@@ -1505,6 +1547,14 @@ impl RuntimeComposition {
 
     pub fn set_bus_crossfade(&mut self, value: f32) {
         self.bus_crossfade = finite_unit(value, 0.5);
+    }
+
+    pub fn mixer(&self) -> BusMixerState {
+        self.mixer
+    }
+
+    pub fn set_mixer(&mut self, mixer: BusMixerState) {
+        self.mixer = mixer.sanitized();
     }
 
     #[allow(
@@ -1880,6 +1930,7 @@ impl RuntimeComposition {
             })
             .collect();
         CompositionTree::try_from_parts(groups, root, Some(self.next_group_id), self.bus_crossfade)
+            .map(|tree| tree.with_mixer(self.mixer))
             .map_err(CompositionResolveError::InvalidSaved)
     }
 }
@@ -2310,6 +2361,56 @@ mod tests {
         assert_eq!(tree.group(id(4)).unwrap().opacity, 1.0);
         assert_eq!(tree.bus_crossfade(), 0.5);
         assert!(tree.group(id(4)).unwrap().members.is_empty());
+    }
+
+    #[test]
+    fn mixer_is_skip_serialized_at_default_and_travels_through_every_carry() {
+        use crate::mixing_boundary::{BusMixerState, MeltParams, WipePattern};
+
+        // A default tree serializes without a mixer block, so every pre-B8
+        // patch keeps its bytes and canonical hash; an absent block decodes
+        // to the exact-legacy bus.
+        let default_tree = CompositionTree::legacy_for_layers(&[]).unwrap();
+        let yaml = serde_yaml::to_string(&default_tree).unwrap();
+        assert!(
+            !yaml.contains("mixer"),
+            "default must omit the block: {yaml}"
+        );
+        let restored = serde_yaml::from_str::<CompositionTree>(&yaml).unwrap();
+        assert!(restored.mixer().is_exact_legacy_bus());
+
+        // An authored mixer round-trips through serde, the runtime resolve,
+        // and the runtime capture without losing a value.
+        let mut authored = default_tree.clone();
+        authored.set_mixer(BusMixerState {
+            mix: crate::mixing_boundary::BusMixParams {
+                pattern: WipePattern::Circle,
+                border: 0.4,
+                ..Default::default()
+            },
+            dirt: crate::mixing_boundary::DirtParams {
+                dirt: 0.6,
+                ..Default::default()
+            },
+            melt: MeltParams {
+                melt: 1.2,
+                hold: 1.5,
+                ..Default::default()
+            },
+        });
+        let yaml = serde_yaml::to_string(&authored).unwrap();
+        let restored = serde_yaml::from_str::<CompositionTree>(&yaml).unwrap();
+        assert_eq!(restored.mixer(), authored.mixer());
+        let runtime = restored.resolve(|_| None).unwrap();
+        assert_eq!(runtime.mixer(), authored.mixer());
+        let captured = runtime.capture(|_| None).unwrap();
+        assert_eq!(captured.mixer(), authored.mixer());
+
+        // Hostile scalars in a saved block sanitize to neutral values.
+        let hostile = "next_group_id: 1\nbus_crossfade: 0.5\nmixer:\n  melt:\n    melt: .nan\n    hold: .inf\n";
+        let tree = serde_yaml::from_str::<CompositionTree>(hostile).unwrap();
+        assert_eq!(tree.mixer().melt.melt, 0.0);
+        assert_eq!(tree.mixer().melt.hold, MeltParams::default().hold);
     }
 
     #[test]

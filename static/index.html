@@ -105,6 +105,137 @@
               <output id="creative-bus-crossfade-value" for="creative-bus-crossfade">0.50</output>
             </div>
 
+            <details class="fx-group" id="bus-mixer-group">
+              <summary>BUS MIXER</summary>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe-pattern">Wipe</label>
+                <select id="bus-mix-wipe-pattern" data-bus-mix-select="wipe_pattern" aria-label="Bus wipe pattern">
+                  <option value="dissolve">Dissolve</option>
+                  <option value="wipe_h">Wipe H</option>
+                  <option value="wipe_v">Wipe V</option>
+                  <option value="diagonal">Diagonal</option>
+                  <option value="box">Box</option>
+                  <option value="circle">Circle</option>
+                  <option value="split_h">Split H</option>
+                  <option value="split_v">Split V</option>
+                  <option value="blinds_v">Blinds V</option>
+                  <option value="blinds_h">Blinds H</option>
+                  <option value="clock">Clock</option>
+                  <option value="diag_bars">Diag Bars</option>
+                  <option value="blocks">Blocks</option>
+                </select>
+                <label for="bus-mix-blend">Blend</label>
+                <select id="bus-mix-blend" data-bus-mix-select="blend" aria-label="Bus blend mode"></select>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe-invert">Invert</label>
+                <input id="bus-mix-wipe-invert" type="checkbox" data-bus-mix-toggle="wipe_invert" aria-label="Invert the bus wipe field">
+                <label for="bus-mix-wipe-rep">Multi</label>
+                <select id="bus-mix-wipe-rep" data-bus-mix-int="wipe_rep" aria-label="Bus wipe MULTI tiling">
+                  <option value="1">Off</option>
+                  <option value="2">x4</option>
+                  <option value="3">x9</option>
+                  <option value="4">x16</option>
+                </select>
+                <label for="bus-mix-wipe-border-color">Border Col</label>
+                <select id="bus-mix-wipe-border-color" data-bus-mix-select="wipe_border_color" aria-label="Bus wipe border colour">
+                  <option value="white">White</option>
+                  <option value="yellow">Yellow</option>
+                  <option value="cyan">Cyan</option>
+                  <option value="green">Green</option>
+                  <option value="magenta">Magenta</option>
+                  <option value="red">Red</option>
+                  <option value="blue">Blue</option>
+                  <option value="black">Black</option>
+                </select>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe_soft">Soft</label>
+                <input type="range" id="bus-mix-wipe_soft" min="0" max="1" step="0.01" value="0.03" data-bus-mix="wipe_soft" data-default="0.03" aria-label="Bus wipe softness">
+                <output for="bus-mix-wipe_soft">0.03</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe_x">Ctr X</label>
+                <input type="range" id="bus-mix-wipe_x" min="-1" max="1" step="0.01" value="0" data-bus-mix="wipe_x" data-default="0" aria-label="Bus wipe center X">
+                <output for="bus-mix-wipe_x">0.00</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe_y">Ctr Y</label>
+                <input type="range" id="bus-mix-wipe_y" min="-1" max="1" step="0.01" value="0" data-bus-mix="wipe_y" data-default="0" aria-label="Bus wipe center Y">
+                <output for="bus-mix-wipe_y">0.00</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe_detail">Detail</label>
+                <input type="range" id="bus-mix-wipe_detail" min="0" max="1" step="0.01" value="0.3" data-bus-mix="wipe_detail" data-default="0.3" aria-label="Bus wipe detail">
+                <output for="bus-mix-wipe_detail">0.30</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-wipe_border">Border</label>
+                <input type="range" id="bus-mix-wipe_border" min="0" max="1" step="0.01" value="0" data-bus-mix="wipe_border" data-default="0" aria-label="Bus wipe border amount">
+                <output for="bus-mix-wipe_border">0.00</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-dirt">Dirt</label>
+                <input type="range" id="bus-mix-dirt" min="0" max="1" step="0.01" value="0" data-bus-mix="dirt" data-default="0" aria-label="Dirty mixer amount">
+                <output for="bus-mix-dirt">0.00</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-dirt_rate">Rate</label>
+                <input type="range" id="bus-mix-dirt_rate" min="0" max="1" step="0.01" value="0.3" data-bus-mix="dirt_rate" data-default="0.3" aria-label="Dirty mixer clock rate">
+                <output for="bus-mix-dirt_rate">0.30</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-dirt_drop">Dropout</label>
+                <input type="range" id="bus-mix-dirt_drop" min="0" max="1" step="0.01" value="0.5" data-bus-mix="dirt_drop" data-default="0.5" aria-label="Dirty mixer dropout">
+                <output for="bus-mix-dirt_drop">0.50</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-dirt_cut">Cut</label>
+                <input type="range" id="bus-mix-dirt_cut" min="0" max="1" step="0.01" value="0.4" data-bus-mix="dirt_cut" data-default="0.4" aria-label="Dirty mixer cut">
+                <output for="bus-mix-dirt_cut">0.40</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-dirt_knock">Knock</label>
+                <input type="range" id="bus-mix-dirt_knock" min="0" max="1" step="0.01" value="0.5" data-bus-mix="dirt_knock" data-default="0.5" aria-label="Dirty mixer knock">
+                <output for="bus-mix-dirt_knock">0.50</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-dirt_noise">Noise</label>
+                <input type="range" id="bus-mix-dirt_noise" min="0" max="1" step="0.01" value="0.35" data-bus-mix="dirt_noise" data-default="0.35" aria-label="Dirty mixer noise">
+                <output for="bus-mix-dirt_noise">0.35</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-melt">Melt</label>
+                <input type="range" id="bus-mix-melt" min="0" max="2" step="0.01" value="0" data-bus-mix="melt" data-default="0" aria-label="Edge melt amount">
+                <output for="bus-mix-melt">0.00</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-melt_width">Width</label>
+                <input type="range" id="bus-mix-melt_width" min="0" max="2" step="0.01" value="0.3" data-bus-mix="melt_width" data-default="0.3" aria-label="Edge melt width">
+                <output for="bus-mix-melt_width">0.30</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-melt_hold">Hold</label>
+                <input type="range" id="bus-mix-melt_hold" min="0" max="1.5" step="0.01" value="0.6" data-bus-mix="melt_hold" data-default="0.6" aria-label="Edge melt hold">
+                <output for="bus-mix-melt_hold">0.60</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-melt_swirl">Swirl</label>
+                <input type="range" id="bus-mix-melt_swirl" min="-1" max="1" step="0.01" value="0" data-bus-mix="melt_swirl" data-default="0" aria-label="Edge melt swirl">
+                <output for="bus-mix-melt_swirl">0.00</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-melt_chroma">Chroma</label>
+                <input type="range" id="bus-mix-melt_chroma" min="0" max="1" step="0.01" value="0.5" data-bus-mix="melt_chroma" data-default="0.5" aria-label="Edge melt chroma">
+                <output for="bus-mix-melt_chroma">0.50</output>
+              </div>
+              <div class="creative-bus-row">
+                <label for="bus-mix-melt_creep">Creep</label>
+                <input type="range" id="bus-mix-melt_creep" min="0" max="1" step="0.01" value="0.35" data-bus-mix="melt_creep" data-default="0.35" aria-label="Edge melt creep">
+                <output for="bus-mix-melt_creep">0.35</output>
+              </div>
+            </details>
+
             <div class="creative-rack-toolbar">
               <label for="creative-rack-scope">Rack</label>
               <select id="creative-rack-scope" aria-label="Collision Rack scope">
@@ -525,7 +656,26 @@
               <div class="param-row" data-param="key_tolerance" data-min="0" data-max="1" data-step="0.01">
                 <label>Chroma Tol.</label><input type="range"><span class="value">0.15</span>
               </div>
-              <div class="audio-status">Program keying cuts the final flattened image to black. Layer keying instead reveals lower layers.</div>
+              <div class="param-row" data-param="key_border" data-min="0" data-max="1" data-step="0.01">
+                <label>Border</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="param-row select-row" data-param="key_border_color">
+                <label>Border Col</label>
+                <select aria-label="Program key border colour">
+                  <option value="0">White</option>
+                  <option value="1">Yellow</option>
+                  <option value="2">Cyan</option>
+                  <option value="3">Green</option>
+                  <option value="4">Magenta</option>
+                  <option value="5">Red</option>
+                  <option value="6">Blue</option>
+                  <option value="7">Black</option>
+                </select>
+              </div>
+              <div class="param-row" data-param="key_shadow" data-min="0" data-max="1" data-step="0.01">
+                <label>Shadow</label><input type="range"><span class="value">0</span>
+              </div>
+              <div class="audio-status">Program keying cuts the final flattened image to black. Layer keying instead reveals lower layers. Border and shadow dress the key signal itself.</div>
             </div>
           </div>
 
@@ -1092,6 +1242,30 @@
                       <label>HV Sag</label><input type="range"><span class="value">0</span>
                     </div>
                     <div class="audio-status">The screen the program is watched through: real fields against a held field, per-primary phosphor decay, and the mask/beam models. Blackout clears the glowing wake.</div>
+                  </div>
+                </details>
+                <details class="temporal-study" id="melting-edge-group">
+                  <summary>MELTING EDGE</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="melt_amount" data-min="0" data-max="2" data-step="0.01">
+                      <label>Melt</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="melt_width" data-min="0" data-max="2" data-step="0.01">
+                      <label>Width</label><input type="range"><span class="value">0.3</span>
+                    </div>
+                    <div class="param-row" data-temporal="melt_hold" data-min="0" data-max="1.5" data-step="0.01">
+                      <label>Hold</label><input type="range"><span class="value">0.6</span>
+                    </div>
+                    <div class="param-row" data-temporal="melt_swirl" data-min="-1" data-max="1" data-step="0.01">
+                      <label>Swirl</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="melt_chroma" data-min="0" data-max="1" data-step="0.01">
+                      <label>Chroma</label><input type="range"><span class="value">0.5</span>
+                    </div>
+                    <div class="param-row" data-temporal="melt_creep" data-min="0" data-max="1" data-step="0.01">
+                      <label>Creep</label><input type="range"><span class="value">0.35</span>
+                    </div>
+                    <div class="audio-status">The coverage boundary as a feedback region: the program's own edges smear along their normals and the smear creeps outward while Hold is up.</div>
                   </div>
                 </details>
               </div>

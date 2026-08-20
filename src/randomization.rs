@@ -697,6 +697,26 @@ pub(crate) fn mutate_live_effects(
         amount * 0.1,
         &mut small_fx_rng,
     );
+    // B8 key dressing, appended to the end of the domain-separated stream so
+    // every earlier draw stays byte-for-byte stable for the same seed and
+    // stream. The border colour is a discrete closed table and is
+    // deliberately not rerolled.
+    effects.key_border = mutate_linear(
+        defaults.key_border,
+        effects.key_border,
+        0.0,
+        1.0,
+        amount * 0.12,
+        &mut small_fx_rng,
+    );
+    effects.key_shadow = mutate_linear(
+        defaults.key_shadow,
+        effects.key_shadow,
+        0.0,
+        1.0,
+        amount * 0.12,
+        &mut small_fx_rng,
+    );
 }
 
 /// Bounded opt-in Dice mutation for authored geometry.
@@ -1198,6 +1218,9 @@ const DICE_GROUP_MATTE_AMOUNT_DOMAIN: u64 = 0x4d41_5454_455f_414d;
 const DICE_GROUP_MATTE_THRESHOLD_DOMAIN: u64 = 0x4d41_5454_455f_5448;
 const DICE_GROUP_MATTE_SOFTNESS_DOMAIN: u64 = 0x4d41_5454_455f_534f;
 const DICE_BUS_CROSSFADE_DOMAIN: u64 = 0x4255_535f_4352_4f53;
+/// B8 bus-mixer values: one shared domain, field-separated by the `owner`
+/// index so every value recomputes alone.
+const DICE_BUS_MIXER_DOMAIN: u64 = 0x4255_535f_4d49_5845;
 
 pub(crate) const fn dice_rack_owner_domain(scope: DiceRackScope) -> u64 {
     match scope {
@@ -1806,6 +1829,35 @@ pub(crate) fn mutate_runtime_composition_values(
             clean_amount(amount) * 0.2,
             &mut bus_rng,
         ));
+        // B8: the bus mixer's seventeen continuous values, each drawn from
+        // its own fresh domain-separated stream, so every pre-B8 field —
+        // including the crossfade draw above — stays byte-stable for the
+        // same seed and stream. Discrete laws (pattern, invert, rep, border
+        // colour, blend mode) are never mutated.
+        let mut mixer = composition.mixer();
+        let scaled = clean_amount(amount);
+        let field = |index: u64, anchor: f32, value: f32, min: f32, max: f32, scale: f32| -> f32 {
+            let mut rng = composition_value_rng(seed, stream, index, DICE_BUS_MIXER_DOMAIN);
+            mutate_linear(anchor, value, min, max, scaled * scale, &mut rng)
+        };
+        mixer.mix.soft = field(1, 0.03, mixer.mix.soft, 0.0, 1.0, 0.15);
+        mixer.mix.origin_x = field(2, 0.0, mixer.mix.origin_x, -1.0, 1.0, 0.2);
+        mixer.mix.origin_y = field(3, 0.0, mixer.mix.origin_y, -1.0, 1.0, 0.2);
+        mixer.mix.detail = field(4, 0.3, mixer.mix.detail, 0.0, 1.0, 0.2);
+        mixer.mix.border = field(5, 0.0, mixer.mix.border, 0.0, 1.0, 0.15);
+        mixer.dirt.dirt = field(6, 0.0, mixer.dirt.dirt, 0.0, 1.0, 0.2);
+        mixer.dirt.rate = field(7, 0.3, mixer.dirt.rate, 0.0, 1.0, 0.2);
+        mixer.dirt.drop = field(8, 0.5, mixer.dirt.drop, 0.0, 1.0, 0.2);
+        mixer.dirt.cut = field(9, 0.4, mixer.dirt.cut, 0.0, 1.0, 0.2);
+        mixer.dirt.knock = field(10, 0.5, mixer.dirt.knock, 0.0, 1.0, 0.2);
+        mixer.dirt.noise = field(11, 0.35, mixer.dirt.noise, 0.0, 1.0, 0.2);
+        mixer.melt.melt = field(12, 0.0, mixer.melt.melt, 0.0, 2.0, 0.3);
+        mixer.melt.width = field(13, 0.3, mixer.melt.width, 0.0, 2.0, 0.2);
+        mixer.melt.hold = field(14, 0.6, mixer.melt.hold, 0.0, 1.5, 0.15);
+        mixer.melt.swirl = field(15, 0.0, mixer.melt.swirl, -1.0, 1.0, 0.3);
+        mixer.melt.chroma = field(16, 0.5, mixer.melt.chroma, 0.0, 1.0, 0.2);
+        mixer.melt.creep = field(17, 0.35, mixer.melt.creep, 0.0, 1.0, 0.2);
+        composition.set_mixer(mixer);
     }
 }
 

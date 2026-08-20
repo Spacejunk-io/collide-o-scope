@@ -44,7 +44,12 @@ use crate::visual_rack::{
 /// an earlier version keeps its byte-identical stream, but a generated piece
 /// now carries the new values, so the version names the difference. Manifest
 /// readers remain data-driven and accept every earlier version string.
-pub const GENERATOR_VERSION: &str = "10";
+// "11": the B8 blend audit widened `BlendMode::ALL` from 15 to 25 modes.
+// `mutate_blend_mode` draws its selection modulo the choice count, so a
+// firing seed can now land on a different mode; the draw count itself is
+// unchanged (`expanded_blend_mutation_reaches_all_modes_without_advancing_
+// the_legacy_rng_stream`), so every other field in the stream is unmoved.
+pub const GENERATOR_VERSION: &str = "11";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -507,6 +512,11 @@ fn mutate_small_effects(
             rng,
         );
     }
+    // B8 key dressing, appended after every established draw so the
+    // per-scope stream stays byte-stable; the border colour is a discrete
+    // closed table and never rerolls.
+    e.key_border = mutate_linear(anchor.key_border, e.key_border, 0.0, 1.0, t * 0.1, rng);
+    e.key_shadow = mutate_linear(anchor.key_shadow, e.key_shadow, 0.0, 1.0, t * 0.1, rng);
 }
 
 // Appended M3 streams. Every numeric value is isolated so introducing a new
@@ -759,6 +769,14 @@ fn mutate_temporal_rig(
 // mode, the field-order fault, and the display model are discrete authored
 // laws and never change.
 const PROCEDURAL_DISPLAY_DOMAIN: u64 = 0x4234_4449_5350_0001;
+/// B8 master melting edge: one domain, field-separated below.
+const PROCEDURAL_MELT_DOMAIN: u64 = 0x4238_4d45_4c54_0001;
+const PROCEDURAL_MELT_AMOUNT: u64 = 0x4d45_4c54_414d_5401;
+const PROCEDURAL_MELT_WIDTH: u64 = 0x4d45_4c54_5749_4401;
+const PROCEDURAL_MELT_HOLD: u64 = 0x4d45_4c54_484f_4c01;
+const PROCEDURAL_MELT_SWIRL: u64 = 0x4d45_4c54_5357_4901;
+const PROCEDURAL_MELT_CHROMA: u64 = 0x4d45_4c54_4348_5201;
+const PROCEDURAL_MELT_CREEP: u64 = 0x4d45_4c54_4352_5001;
 const PROCEDURAL_DISPLAY_IL_AMOUNT: u64 = 0x494c_414d_4f55_4e54;
 const PROCEDURAL_DISPLAY_IL_TWITTER: u64 = 0x494c_5457_4954_5445;
 const PROCEDURAL_DISPLAY_IL_JUDDER: u64 = 0x494c_4a55_4444_4552;
@@ -778,6 +796,42 @@ const PROCEDURAL_DISPLAY_DEFOCUS: u64 = 0x4445_464f_4355_5300;
 const PROCEDURAL_DISPLAY_SAG: u64 = 0x4856_5341_4700_0001;
 
 /// Vary only the display stage's seventeen bounded continuous values.
+/// B8 master melting edge: mutate the six continuous values in fresh
+/// field-isolated domains. Everything is continuous, so nothing discrete
+/// can reroll here.
+fn mutate_master_melt(
+    anchor: &crate::mixing_boundary::MeltParams,
+    value: &mut crate::mixing_boundary::MeltParams,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    macro_rules! linear {
+        ($field:ident, $min:expr, $max:expr, $scale:expr, $domain:expr) => {{
+            let mut rng =
+                SplitMix64::new(domain_seed(seed, index, PROCEDURAL_MELT_DOMAIN ^ $domain));
+            value.$field = mutate_linear(
+                anchor.$field,
+                value.$field,
+                $min,
+                $max,
+                temperature * $scale,
+                &mut rng,
+            );
+        }};
+    }
+    linear!(melt, 0.0, 2.0, 0.15, PROCEDURAL_MELT_AMOUNT);
+    linear!(width, 0.0, 2.0, 0.1, PROCEDURAL_MELT_WIDTH);
+    linear!(hold, 0.0, 1.5, 0.1, PROCEDURAL_MELT_HOLD);
+    linear!(swirl, -1.0, 1.0, 0.15, PROCEDURAL_MELT_SWIRL);
+    linear!(chroma, 0.0, 1.0, 0.1, PROCEDURAL_MELT_CHROMA);
+    linear!(creep, 0.0, 1.0, 0.1, PROCEDURAL_MELT_CREEP);
+    *value = value.sanitized();
+}
+
 fn mutate_display_physics(
     anchor: &crate::display_physics::DisplayPhysicsParams,
     value: &mut crate::display_physics::DisplayPhysicsParams,
@@ -3095,6 +3149,13 @@ pub fn generate_with_inventory(
             mutate_display_physics(
                 &anchor_temporal.display,
                 &mut temporal.display,
+                temperature,
+                config.seed,
+                index,
+            );
+            mutate_master_melt(
+                &anchor_temporal.melt,
+                &mut temporal.melt,
                 temperature,
                 config.seed,
                 index,
