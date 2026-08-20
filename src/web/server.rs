@@ -1180,6 +1180,17 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         "melt_hold" => number_in(value, 0.0, 1.5),
         "melt_swirl" => number_in(value, -1.0, 1.0),
         "melt_chroma" | "melt_creep" => number_in(value, 0.0, 1.0),
+        // The B5 codec mosh's eight continuous wire params plus its one
+        // discrete recycle law.
+        "mosh_amount"
+        | "mosh_key_removal"
+        | "mosh_hold"
+        | "mosh_drop"
+        | "mosh_shuffle"
+        | "mosh_rate"
+        | "mosh_bitrate_starve"
+        | "mosh_resync" => number_in(value, 0.0, 1.0),
+        "mosh_recycle" => value.is_boolean(),
         "slitscan" | "slit_axis" => number_in(value, 0.0, 1.0),
         "slit_angle" | "loom_angle" => number_in(value, -180.0, 180.0),
         "slit_map" => matches!(
@@ -4043,6 +4054,16 @@ mod tests {
             ("score_loop_driver", serde_json::json!("none")),
             ("reset_loop_boundary", serde_json::json!("memory")),
             ("reset_downbeat", serde_json::json!("all")),
+            ("mosh_amount", serde_json::json!(1.0)),
+            ("mosh_key_removal", serde_json::json!(0.0)),
+            ("mosh_hold", serde_json::json!(0.5)),
+            ("mosh_drop", serde_json::json!(1.0)),
+            ("mosh_shuffle", serde_json::json!(0.25)),
+            ("mosh_rate", serde_json::json!(0.5)),
+            ("mosh_bitrate_starve", serde_json::json!(1.0)),
+            ("mosh_resync", serde_json::json!(0.3)),
+            ("mosh_recycle", serde_json::json!(true)),
+            ("mosh_recycle", serde_json::json!(false)),
         ] {
             let action = WebAction::SetTemporal {
                 param: param.into(),
@@ -4075,6 +4096,9 @@ mod tests {
             ("score_loop_driver", serde_json::json!("0")),
             ("score_loop_driver", serde_json::json!("missing:3")),
             ("reset_downbeat", serde_json::json!("carrier")),
+            ("mosh_amount", serde_json::json!(1.001)),
+            ("mosh_key_removal", serde_json::json!(-0.1)),
+            ("mosh_recycle", serde_json::json!(1)),
             ("unknown_original", serde_json::json!(0.5)),
         ] {
             let action = WebAction::SetTemporal {

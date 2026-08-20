@@ -780,6 +780,11 @@ pub struct MorphTemporalSnapshot {
     /// sanitizing serde block. All six controls are continuous and blend.
     #[serde(default)]
     pub melt: crate::mixing_boundary::MeltParams,
+    /// B5 codec mosh, captured whole: the params struct is its own
+    /// sanitizing serde block. The eight continuous controls blend; the
+    /// discrete recycle law recalls an endpoint at the midpoint.
+    #[serde(default)]
+    pub mosh: crate::codec_mosh::CodecMoshParams,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -807,6 +812,7 @@ impl MorphTemporalSnapshot {
             rig: TemporalRigConfig::from_params(value.rig),
             display: value.display,
             melt: value.melt,
+            mosh: value.mosh,
         }
         .sanitized()
     }
@@ -829,6 +835,7 @@ impl MorphTemporalSnapshot {
             rig: self.rig.sanitized(),
             display: self.display.sanitized(),
             melt: self.melt.sanitized(),
+            mosh: self.mosh.sanitized(),
         }
     }
 
@@ -850,6 +857,7 @@ impl MorphTemporalSnapshot {
             originals: clean.originals.to_params(),
             display: clean.display,
             melt: clean.melt,
+            mosh: clean.mosh,
             rig: clean.rig.to_params(),
         }
     }
@@ -878,9 +886,34 @@ impl MorphTemporalSnapshot {
             rig: interpolate_temporal_rig(a.rig, b.rig, weights, choose_b),
             display: interpolate_display_physics(a.display, b.display, weights, choose_b),
             melt: interpolate_master_melt(a.melt, b.melt, weights),
+            mosh: interpolate_codec_mosh(a.mosh, b.mosh, weights, choose_b),
         }
         .sanitized()
     }
+}
+
+/// B5 codec-mosh morphing: the eight continuous controls blend, and the
+/// discrete recycle law recalls an endpoint at the midpoint.
+fn interpolate_codec_mosh(
+    a: crate::codec_mosh::CodecMoshParams,
+    b: crate::codec_mosh::CodecMoshParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> crate::codec_mosh::CodecMoshParams {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    crate::codec_mosh::CodecMoshParams {
+        amount: blend_finite(a.amount, b.amount, weights),
+        key_removal: blend_finite(a.key_removal, b.key_removal, weights),
+        hold: blend_finite(a.hold, b.hold, weights),
+        drop: blend_finite(a.drop, b.drop, weights),
+        shuffle: blend_finite(a.shuffle, b.shuffle, weights),
+        rate: blend_finite(a.rate, b.rate, weights),
+        bitrate_starve: blend_finite(a.bitrate_starve, b.bitrate_starve, weights),
+        resync: blend_finite(a.resync, b.resync, weights),
+        recycle: if choose_b { b.recycle } else { a.recycle },
+    }
+    .sanitized()
 }
 
 /// B8 master-melt morphing: all six controls are continuous and blend.
@@ -4660,6 +4693,49 @@ mod tests {
         assert_eq!(
             MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).display,
             b.display.sanitized()
+        );
+    }
+
+    #[test]
+    fn codec_mosh_morphs_values_continuously_and_recalls_the_recycle_law() {
+        use crate::codec_mosh::CodecMoshParams;
+        let a = MorphTemporalSnapshot {
+            mosh: CodecMoshParams {
+                amount: 0.2,
+                hold: 0.4,
+                bitrate_starve: 0.2,
+                recycle: false,
+                ..CodecMoshParams::default()
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+        let b = MorphTemporalSnapshot {
+            mosh: CodecMoshParams {
+                amount: 0.8,
+                hold: 0.8,
+                bitrate_starve: 0.6,
+                recycle: true,
+                ..CodecMoshParams::default()
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+
+        let quarter = MorphTemporalSnapshot::interpolate(&a, &b, [0.75, 0.25], false);
+        assert!((quarter.mosh.amount - 0.35).abs() < 1.0e-6);
+        assert!((quarter.mosh.hold - 0.5).abs() < 1.0e-6);
+        assert!((quarter.mosh.bitrate_starve - 0.3).abs() < 1.0e-6);
+        // The discrete recycle law recalls an endpoint, never a blend.
+        assert!(!quarter.mosh.recycle);
+        let past = MorphTemporalSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
+        assert!(past.mosh.recycle);
+        // Endpoints recall the authored blocks exactly.
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [1.0, 0.0], false).mosh,
+            a.mosh.sanitized()
+        );
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).mosh,
+            b.mosh.sanitized()
         );
     }
 

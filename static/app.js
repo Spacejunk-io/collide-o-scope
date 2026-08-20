@@ -2223,6 +2223,10 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
       melt_swirl: 0,
       melt_chroma: 0.5,
       melt_creep: 0.35,
+      mosh_key_removal: 0.95,
+      mosh_hold: 0.25,
+      mosh_rate: 0.5,
+      mosh_bitrate_starve: 0.35,
     };
     slider.value = defaults[param] ?? min;
 
@@ -2357,6 +2361,7 @@ function syncTemporal(t) {
   const rig = t.rig || {};
   const display = t.display || {};
   const masterMelt = t.melt || {};
+  const mosh = t.mosh || {};
   const values = {
     feedback: t.feedback,
     fb_zoom: t.fb_zoom,
@@ -2440,6 +2445,15 @@ function syncTemporal(t) {
     melt_swirl: masterMelt.swirl,
     melt_chroma: masterMelt.chroma,
     melt_creep: masterMelt.creep,
+    mosh_amount: mosh.amount,
+    mosh_key_removal: mosh.key_removal,
+    mosh_hold: mosh.hold,
+    mosh_drop: mosh.drop,
+    mosh_shuffle: mosh.shuffle,
+    mosh_rate: mosh.rate,
+    mosh_bitrate_starve: mosh.bitrate_starve,
+    mosh_resync: mosh.resync,
+    mosh_recycle: mosh.recycle,
   };
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;

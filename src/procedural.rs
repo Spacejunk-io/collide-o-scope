@@ -49,7 +49,10 @@ use crate::visual_rack::{
 // firing seed can now land on a different mode; the draw count itself is
 // unchanged (`expanded_blend_mutation_reaches_all_modes_without_advancing_
 // the_legacy_rng_stream`), so every other field in the stream is unmoved.
-pub const GENERATOR_VERSION: &str = "11";
+// "12": B5 adds the eight codec-mosh continuous values in fresh
+// field-isolated domains; every earlier stream is byte-stable, but a
+// generated piece now carries the new values.
+pub const GENERATOR_VERSION: &str = "12";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -794,6 +797,17 @@ const PROCEDURAL_DISPLAY_BLOOM_RADIUS: u64 = 0x424c_4f4f_4d52_4144;
 const PROCEDURAL_DISPLAY_HALATION: u64 = 0x4841_4c41_5449_4f4e;
 const PROCEDURAL_DISPLAY_DEFOCUS: u64 = 0x4445_464f_4355_5300;
 const PROCEDURAL_DISPLAY_SAG: u64 = 0x4856_5341_4700_0001;
+/// B5 codec mosh: one domain, field-separated below. The recycle law is
+/// discrete and never rerolls.
+const PROCEDURAL_MOSH_DOMAIN: u64 = 0x4235_4d4f_5348_0001;
+const PROCEDURAL_MOSH_AMOUNT: u64 = 0x4d4f_5348_414d_5401;
+const PROCEDURAL_MOSH_KEY: u64 = 0x4d4f_5348_4b45_5901;
+const PROCEDURAL_MOSH_HOLD: u64 = 0x4d4f_5348_484f_4c01;
+const PROCEDURAL_MOSH_DROP: u64 = 0x4d4f_5348_4452_5001;
+const PROCEDURAL_MOSH_SHUFFLE: u64 = 0x4d4f_5348_5348_5501;
+const PROCEDURAL_MOSH_RATE: u64 = 0x4d4f_5348_5241_5401;
+const PROCEDURAL_MOSH_BITRATE: u64 = 0x4d4f_5348_4249_5401;
+const PROCEDURAL_MOSH_RESYNC: u64 = 0x4d4f_5348_5253_5901;
 
 /// Vary only the display stage's seventeen bounded continuous values.
 /// B8 master melting edge: mutate the six continuous values in fresh
@@ -829,6 +843,43 @@ fn mutate_master_melt(
     linear!(swirl, -1.0, 1.0, 0.15, PROCEDURAL_MELT_SWIRL);
     linear!(chroma, 0.0, 1.0, 0.1, PROCEDURAL_MELT_CHROMA);
     linear!(creep, 0.0, 1.0, 0.1, PROCEDURAL_MELT_CREEP);
+    *value = value.sanitized();
+}
+
+/// B5 codec mosh: mutate the eight continuous values in fresh
+/// field-isolated domains. The recycle law is discrete and never rerolls.
+fn mutate_codec_mosh(
+    anchor: &crate::codec_mosh::CodecMoshParams,
+    value: &mut crate::codec_mosh::CodecMoshParams,
+    temperature: f32,
+    seed: u64,
+    index: usize,
+) {
+    if temperature == 0.0 {
+        return;
+    }
+    macro_rules! linear {
+        ($field:ident, $scale:expr, $domain:expr) => {{
+            let mut rng =
+                SplitMix64::new(domain_seed(seed, index, PROCEDURAL_MOSH_DOMAIN ^ $domain));
+            value.$field = mutate_linear(
+                anchor.$field,
+                value.$field,
+                0.0,
+                1.0,
+                temperature * $scale,
+                &mut rng,
+            );
+        }};
+    }
+    linear!(amount, 0.1, PROCEDURAL_MOSH_AMOUNT);
+    linear!(key_removal, 0.08, PROCEDURAL_MOSH_KEY);
+    linear!(hold, 0.1, PROCEDURAL_MOSH_HOLD);
+    linear!(drop, 0.08, PROCEDURAL_MOSH_DROP);
+    linear!(shuffle, 0.08, PROCEDURAL_MOSH_SHUFFLE);
+    linear!(rate, 0.1, PROCEDURAL_MOSH_RATE);
+    linear!(bitrate_starve, 0.1, PROCEDURAL_MOSH_BITRATE);
+    linear!(resync, 0.08, PROCEDURAL_MOSH_RESYNC);
     *value = value.sanitized();
 }
 
@@ -3160,6 +3211,13 @@ pub fn generate_with_inventory(
                 config.seed,
                 index,
             );
+            mutate_codec_mosh(
+                &anchor_temporal.mosh,
+                &mut temporal.mosh,
+                temperature,
+                config.seed,
+                index,
+            );
         }
         if let (Some(anchor_modulation), Some(modulation)) =
             (normalized.modulation.as_ref(), patch.modulation.as_mut())
@@ -4171,6 +4229,44 @@ mod tests {
         // Zero temperature is byte-exact.
         let mut untouched = authored;
         mutate_display_physics(&authored, &mut untouched, 0.0, 77, 3);
+        assert_eq!(untouched, authored);
+    }
+
+    #[test]
+    fn codec_mosh_generation_is_deterministic_bounded_and_preserves_the_recycle_law() {
+        use crate::codec_mosh::CodecMoshParams;
+        let authored = CodecMoshParams {
+            amount: 0.4,
+            key_removal: 0.9,
+            hold: 0.3,
+            resync: 0.2,
+            recycle: true,
+            ..CodecMoshParams::default()
+        };
+        let mut left = authored;
+        let mut right = authored;
+        mutate_codec_mosh(&authored, &mut left, 2.0, 77, 3);
+        mutate_codec_mosh(&authored, &mut right, 2.0, 77, 3);
+        assert_eq!(left, right, "mosh mutation replays deterministically");
+        assert_ne!(left.amount, authored.amount, "temperature moves the values");
+        // The discrete recycle law never changes.
+        assert!(left.recycle);
+        // Every mutated value stays inside the unit interval.
+        for value in [
+            left.amount,
+            left.key_removal,
+            left.hold,
+            left.drop,
+            left.shuffle,
+            left.rate,
+            left.bitrate_starve,
+            left.resync,
+        ] {
+            assert!((0.0..=1.0).contains(&value));
+        }
+        // Zero temperature is byte-exact.
+        let mut untouched = authored;
+        mutate_codec_mosh(&authored, &mut untouched, 0.0, 77, 3);
         assert_eq!(untouched, authored);
     }
 

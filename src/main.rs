@@ -1,6 +1,7 @@
 #![allow(deprecated)] // egui 0.34 deprecation warnings for panel API renames
 
 mod audio;
+mod codec_mosh;
 mod composition;
 mod controller_profile;
 mod display_physics;
@@ -1267,10 +1268,17 @@ fn raw_audience_readback_required(
     selective_transition_holding: bool,
     path: LiveNtscPath,
     spout_active: bool,
+    mosh_active: bool,
 ) -> bool {
     !blackout
         && !selective_transition_holding
-        && (path == LiveNtscPath::LegacyGlobal || (path == LiveNtscPath::Disabled && spout_active))
+        && (path == LiveNtscPath::LegacyGlobal
+            // B5: an armed codec mosh eats the finished programme on every
+            // path — slot 2 already holds the selective recomposite when
+            // that path is active, exactly as it holds the plain composite
+            // on the disabled path.
+            || mosh_active
+            || (path == LiveNtscPath::Disabled && spout_active))
 }
 
 /// Piece-local time advances only while the master transport is playing.
@@ -3596,6 +3604,16 @@ struct App {
     // NTSC/VHS effects (params live here; processing runs on a worker thread)
     ntsc_params: ntsc::NtscParams,
     ntsc_worker: ntsc::NtscWorker,
+    /// B5 codec mosh: lazily constructed on the first armed frame (the
+    /// selective-worker precedent), terminal on failure like the NTSC
+    /// worker. It owns the codec pair and, on the global-VHS path, runs the
+    /// VHS kernel in the same hop.
+    mosh_worker: Option<codec_mosh::MoshWorker>,
+    /// Newest moshed frame retained between CPU completions so the mosh does
+    /// not alternate with raw frames.
+    mosh_presented: Option<(u64, Vec<u8>)>,
+    /// The mosh path's admission/stale counters, on the NTSC counter law.
+    mosh_live_metrics: ntsc::NtscPathMetrics,
     /// Process-lifetime diagnostics stay path-specific because global and
     /// selective VHS shed work at different bounded pipeline stages.
     ntsc_live_metrics: ntsc::LiveNtscMetrics,
@@ -4084,6 +4102,9 @@ impl App {
             video_egui_texture_id: None,
             ntsc_params: ntsc::NtscParams::default(),
             ntsc_worker: ntsc::NtscWorker::new(),
+            mosh_worker: None,
+            mosh_presented: None,
+            mosh_live_metrics: ntsc::NtscPathMetrics::default(),
             ntsc_live_metrics: ntsc::LiveNtscMetrics::default(),
             ntsc_presented: None,
             ntsc_pipeline_path: LiveNtscPath::Disabled,
@@ -5904,6 +5925,7 @@ impl App {
         self.bump_composition_revision();
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
+        self.mosh_presented = None;
         self.selective_temporal_debt = 0.0;
         self.selective_transition_holding = false;
         self.selective_hold_snapshot_valid = false;
@@ -7561,6 +7583,7 @@ impl App {
             .retain(|action| !Self::action_conflicts_with_applied_look(action, applied));
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
+        self.mosh_presented = None;
         self.selective_temporal_debt = 0.0;
         self.selective_transition_holding = false;
         self.selective_hold_snapshot_valid = false;
@@ -7592,6 +7615,7 @@ impl App {
     fn invalidate_source_cut_generation(&mut self) {
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
+        self.mosh_presented = None;
         self.selective_temporal_debt = 0.0;
         self.selective_transition_holding = false;
         self.selective_hold_snapshot_valid = false;
@@ -9345,6 +9369,19 @@ impl App {
             "melt_chroma" | "melt_creep" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            // The B5 codec mosh's wire vocabulary, mirroring the server-side
+            // gate exactly.
+            "mosh_amount"
+            | "mosh_key_removal"
+            | "mosh_hold"
+            | "mosh_drop"
+            | "mosh_shuffle"
+            | "mosh_rate"
+            | "mosh_bitrate_starve"
+            | "mosh_resync" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            "mosh_recycle" => value.is_boolean(),
             "slitscan" | "slit_axis" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
@@ -9732,6 +9769,7 @@ impl App {
         // the pre-revert visual generation.
         self.visual_epoch = self.visual_epoch.wrapping_add(1);
         self.ntsc_presented = None;
+        self.mosh_presented = None;
         self.selective_temporal_debt = 0.0;
         self.selective_transition_holding = false;
         self.selective_hold_snapshot_valid = false;
@@ -9769,6 +9807,7 @@ impl App {
         self.blackout = enabled;
         self.visual_epoch = self.visual_epoch.saturating_add(1);
         self.ntsc_presented = None;
+        self.mosh_presented = None;
         self.selective_temporal_debt = 0.0;
 
         self.ensure_spout_black();
@@ -16050,6 +16089,53 @@ impl App {
                             p.melt.creep = (n as f32).clamp(0.0, 1.0);
                         }
                     }
+                    // The B5 codec mosh's eight continuous values plus the
+                    // discrete recycle law.
+                    "mosh_amount" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.amount = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_key_removal" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.key_removal = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_hold" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.hold = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_drop" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.drop = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_shuffle" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.shuffle = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_rate" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.rate = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_bitrate_starve" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.bitrate_starve = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_resync" => {
+                        if let Some(n) = value.as_f64() {
+                            p.mosh.resync = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "mosh_recycle" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.mosh.recycle = flag;
+                        }
+                    }
                     "disp_il_mode" => {
                         p.display.il_mode = match value.as_str() {
                             Some("bob") => display_physics::InterlaceMode::Bob,
@@ -18008,6 +18094,19 @@ impl App {
                 snapshot
             },
             ntsc: ntsc_snapshot,
+            codec_mosh: web::state::CodecMoshLiveSnapshot {
+                active: self.temporal_params.mosh.is_active(),
+                busy: self
+                    .mosh_worker
+                    .as_ref()
+                    .is_some_and(codec_mosh::MoshWorker::is_busy),
+                error: self
+                    .mosh_worker
+                    .as_ref()
+                    .map(|worker| worker.error().to_string())
+                    .unwrap_or_default(),
+                metrics: self.mosh_live_metrics,
+            },
             media_safety: media_safety_snapshot,
             new_layer_fit: self.new_layer_fit,
             proxy_settings: web::state::ProxySettingsSnapshot::from_settings(self.proxy_settings),
@@ -21029,6 +21128,7 @@ impl ApplicationHandler for App {
                         ) {
                             self.visual_epoch = self.visual_epoch.wrapping_add(1);
                             self.ntsc_presented = None;
+                            self.mosh_presented = None;
                         }
                         if ntsc_path_changed {
                             self.ntsc_pipeline_path = requested_ntsc_path;
@@ -21716,6 +21816,10 @@ impl ApplicationHandler for App {
                             );
                         }
                         let spout_active = self.spout_enabled && self.spout.is_running();
+                        // B5: the mosh wake law, sampled from this frame's
+                        // modulated temporal copy. Blackout disables the path
+                        // exactly as it disables NTSC.
+                        let mosh_active = mod_temporal.mosh.is_active() && !self.blackout;
                         // Harvest a completed raw readback. The generation tag
                         // rejects both pre-blackout content and delayed blackout
                         // frames that finish after the cut is released.
@@ -21740,6 +21844,9 @@ impl ApplicationHandler for App {
                                 // Stale visual generation; deliberately discarded.
                                 if frame.ntsc_metadata.is_some() {
                                     self.ntsc_live_metrics.global.record_stale();
+                                }
+                                if frame.mosh_metadata.is_some() {
+                                    self.mosh_live_metrics.record_stale();
                                 }
                                 if frame.selective_sample.is_some() {
                                     self.ntsc_live_metrics.selective.record_stale();
@@ -21771,6 +21878,25 @@ impl ApplicationHandler for App {
                                     // nonblocking and may lose a lock race.
                                     self.selective_hold_spout_readback_epoch = None;
                                 }
+                            } else if let Some(metadata) = frame.mosh_metadata {
+                                // B5: the mosh eats the finished programme.
+                                // On the global-VHS path the metadata carries
+                                // the sampled NTSC params and the worker runs
+                                // the VHS kernel first in the same hop, so
+                                // the NTSC worker is deliberately unfed while
+                                // the mosh is armed — one admission, one
+                                // frame of latency, the exact offline order.
+                                let worker = self
+                                    .mosh_worker
+                                    .get_or_insert_with(codec_mosh::MoshWorker::new);
+                                let outcome = worker.try_submit_outcome(
+                                    frame.pixels,
+                                    renderer.output_width,
+                                    renderer.output_height,
+                                    metadata,
+                                    frame.epoch,
+                                );
+                                self.mosh_live_metrics.record_admission(outcome);
                             } else if ntsc_path == LiveNtscPath::LegacyGlobal {
                                 if let Some(metadata) = frame.ntsc_metadata {
                                     let outcome = self.ntsc_worker.try_submit_outcome(
@@ -21838,6 +21964,26 @@ impl ApplicationHandler for App {
                                 self.ntsc_live_metrics.global.record_stale();
                             }
                         }
+                        // The mosh result obeys the identical retention and
+                        // stale laws: validated by generation AND by the
+                        // stage still being armed this frame.
+                        if let Some(worker) = self.mosh_worker.as_mut() {
+                            if let Some(processed) = worker.try_recv() {
+                                if processed.epoch == self.visual_epoch && mosh_active {
+                                    if spout_active {
+                                        self.spout.try_submit(
+                                            processed.pixels.clone(),
+                                            renderer.output_width,
+                                            renderer.output_height,
+                                            processed.epoch,
+                                        );
+                                    }
+                                    self.mosh_presented = Some((processed.epoch, processed.pixels));
+                                } else {
+                                    self.mosh_live_metrics.record_stale();
+                                }
+                            }
+                        }
 
                         // Read back the clean raw composite before overlaying the
                         // delayed NTSC result, preventing recursive reprocessing.
@@ -21846,9 +21992,10 @@ impl ApplicationHandler for App {
                             self.selective_transition_holding,
                             ntsc_path,
                             spout_active,
+                            mosh_active,
                         );
                         if need_raw_readback {
-                            let ntsc_metadata =
+                            let mut ntsc_metadata =
                                 (ntsc_path == LiveNtscPath::LegacyGlobal).then(|| {
                                     ntsc::NtscFrameMetadata {
                                         params: mod_ntsc.clone(),
@@ -21857,16 +22004,34 @@ impl ApplicationHandler for App {
                                         ),
                                     }
                                 });
+                            // An armed mosh takes the NTSC metadata into its
+                            // own tag: the combined hop processes both with
+                            // the values sampled at this readback, and the
+                            // frame can never be double-fed.
+                            let mosh_metadata =
+                                mosh_active.then(|| codec_mosh::MoshFrameMetadata {
+                                    params: mod_temporal.mosh.sanitized(),
+                                    ordinal: ntsc::reference_frame_for_time(
+                                        elapsed_duration.as_secs_f64(),
+                                    ) as u64,
+                                    seed: self.master_effects.random_seed,
+                                    ntsc: ntsc_metadata.take(),
+                                });
                             let slot = match renderer.begin_readback(
                                 &mut encoder,
                                 self.visual_epoch,
                                 ntsc_metadata,
+                                mosh_metadata,
                             ) {
                                 Ok(slot) => slot,
                                 Err(error) => {
-                                    if ntsc_path == LiveNtscPath::LegacyGlobal {
+                                    if ntsc_path == LiveNtscPath::LegacyGlobal && !mosh_active {
                                         self.ntsc_live_metrics
                                             .global
+                                            .record_admission(ntsc::NtscSubmitOutcome::Unavailable);
+                                    }
+                                    if mosh_active {
+                                        self.mosh_live_metrics
                                             .record_admission(ntsc::NtscSubmitOutcome::Unavailable);
                                     }
                                     self.output_error = format!(
@@ -21901,11 +22066,22 @@ impl ApplicationHandler for App {
                             );
                         }
 
-                        if ntsc_path == LiveNtscPath::LegacyGlobal {
+                        if ntsc_path == LiveNtscPath::LegacyGlobal && !mosh_active {
                             if let Some((epoch, pixels)) = self.ntsc_presented.as_ref() {
                                 if *epoch == self.visual_epoch {
                                     // Ordered after submitted raw render/readback
                                     // and before all audience presentation passes.
+                                    renderer.write_composite(pixels);
+                                }
+                            }
+                        }
+                        // The mosh replacement sits downstream of the VHS one
+                        // and owns the write while armed: until its first
+                        // result lands the audience keeps the clean composite
+                        // rather than a frozen VHS-only frame.
+                        if mosh_active {
+                            if let Some((epoch, pixels)) = self.mosh_presented.as_ref() {
+                                if *epoch == self.visual_epoch {
                                     renderer.write_composite(pixels);
                                 }
                             }
@@ -25655,17 +25831,40 @@ mod app_state_tests {
             // redraws, and cannot tag those held pixels as new direct/legacy
             // output for Spout or the global NTSC worker.
             assert!(!direct_path_may_replace_selective_hold(true, true));
-            assert!(!raw_audience_readback_required(false, true, direct, true));
+            assert!(!raw_audience_readback_required(
+                false, true, direct, true, false
+            ));
 
             // Resume permits the first proper direct render. Only after that
             // logical hold release may the matching path schedule readback.
             assert!(direct_path_may_replace_selective_hold(false, true));
-            assert!(raw_audience_readback_required(false, false, direct, true));
+            assert!(raw_audience_readback_required(
+                false, false, direct, true, false
+            ));
             assert_eq!(
-                raw_audience_readback_required(false, false, direct, false),
+                raw_audience_readback_required(false, false, direct, false, false),
                 direct == LiveNtscPath::LegacyGlobal
             );
+            // B5: an armed mosh requires the readback on every path, even
+            // with Spout off — but never through a hold and never under
+            // blackout.
+            assert!(raw_audience_readback_required(
+                false, false, direct, false, true
+            ));
+            assert!(!raw_audience_readback_required(
+                false, true, direct, false, true
+            ));
+            assert!(!raw_audience_readback_required(
+                true, false, direct, false, true
+            ));
         }
+        assert!(raw_audience_readback_required(
+            false,
+            false,
+            LiveNtscPath::SelectivePerLayer,
+            false,
+            true
+        ));
         assert!(!is_selective_path_edge(
             LiveNtscPath::Disabled,
             LiveNtscPath::LegacyGlobal
@@ -25678,7 +25877,8 @@ mod app_state_tests {
             true,
             false,
             LiveNtscPath::Disabled,
-            true
+            true,
+            false
         ));
         let current = ntsc::SelectiveNtscGeneration {
             visual_epoch: 2,

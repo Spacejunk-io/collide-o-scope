@@ -163,6 +163,16 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("melt_swirl", -1.0, 1.0),
     ("melt_chroma", 0.0, 1.0),
     ("melt_creep", 0.0, 1.0),
+    // B5 codec mosh: the eight continuous controls. The recycle law is
+    // discrete and has no address.
+    ("mosh_amount", 0.0, 1.0),
+    ("mosh_key_removal", 0.0, 1.0),
+    ("mosh_hold", 0.0, 1.0),
+    ("mosh_drop", 0.0, 1.0),
+    ("mosh_shuffle", 0.0, 1.0),
+    ("mosh_rate", 0.0, 1.0),
+    ("mosh_bitrate_starve", 0.0, 1.0),
+    ("mosh_resync", 0.0, 1.0),
     // Program-wide spatial controls. Continuous geometry is modulatable;
     // discrete fit/edge/sampling choices remain explicitly authored.
     ("position_x", POSITION_MIN, POSITION_MAX),
@@ -3721,6 +3731,14 @@ fn apply_offset(
         "melt_swirl" => &mut tp.melt.swirl,
         "melt_chroma" => &mut tp.melt.chroma,
         "melt_creep" => &mut tp.melt.creep,
+        "mosh_amount" => &mut tp.mosh.amount,
+        "mosh_key_removal" => &mut tp.mosh.key_removal,
+        "mosh_hold" => &mut tp.mosh.hold,
+        "mosh_drop" => &mut tp.mosh.drop,
+        "mosh_shuffle" => &mut tp.mosh.shuffle,
+        "mosh_rate" => &mut tp.mosh.rate,
+        "mosh_bitrate_starve" => &mut tp.mosh.bitrate_starve,
+        "mosh_resync" => &mut tp.mosh.resync,
         _ => return,
     };
     *slot = (*slot + offset).clamp(min, max);
@@ -4738,6 +4756,45 @@ mod tests {
         for discrete in ["display_il_mode", "display_il_order", "display_model"] {
             assert_eq!(target_range(discrete), None, "{discrete}");
         }
+    }
+
+    #[test]
+    fn codec_mosh_modulation_is_bounded_and_the_recycle_law_has_no_address() {
+        for target in [
+            "mosh_amount",
+            "mosh_key_removal",
+            "mosh_hold",
+            "mosh_drop",
+            "mosh_shuffle",
+            "mosh_rate",
+            "mosh_bitrate_starve",
+            "mosh_resync",
+        ] {
+            assert_eq!(target_range(target), Some((0.0, 1.0)), "{target}");
+        }
+        // The discrete law has no modulatable address, and `morph` stays the
+        // final master target.
+        assert_eq!(target_range("mosh_recycle"), None);
+        assert_eq!(TARGETS.last().map(|(name, _, _)| *name), Some("morph"));
+
+        // An applied offset lands in the frame's temporal copy, never the
+        // authored base.
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = vec![Routing::new(ModSource::Midi(0), "mosh_amount", 1.0)];
+        matrix.update_at_beat(0.0, 0.0);
+        let frame = matrix.frame(0);
+        let base = crate::effects::params::TemporalParams::default();
+        let (_fx, _spatial, _np, tp) = frame.modulate(
+            &crate::effects::EffectUniforms::default(),
+            &crate::spatial::SpatialTransform::default(),
+            &crate::ntsc::NtscParams::default(),
+            &base,
+        );
+        approx(tp.mosh.amount, 0.5);
+        assert_eq!(base.mosh.amount, 0.0, "the authored base is immutable");
+        // Discrete mosh state never moves under modulation.
+        assert!(!tp.mosh.recycle);
     }
 
     #[test]

@@ -1197,6 +1197,10 @@ pub struct AppSnapshot {
     #[serde(default)]
     pub master_transform: SpatialTransform,
     pub ntsc: NtscSnapshot,
+    /// B5 codec mosh live diagnostics: additive, defaulting to the inactive
+    /// stage for older snapshots.
+    #[serde(default)]
+    pub codec_mosh: CodecMoshLiveSnapshot,
     /// Host-local admission limits for future media source allocations. This is
     /// deliberately independent from patches and output/export dimensions.
     #[serde(default)]
@@ -1336,6 +1340,7 @@ impl Default for AppSnapshot {
             effects: EffectsSnapshot::default(),
             master_transform: SpatialTransform::default(),
             ntsc: NtscSnapshot::default(),
+            codec_mosh: CodecMoshLiveSnapshot::default(),
             media_safety: MediaSafetySnapshot::default(),
             new_layer_fit: default_new_layer_fit(),
             proxy_settings: ProxySettingsSnapshot::default(),
@@ -1732,6 +1737,24 @@ pub struct NtscLiveMetricsSnapshot {
     /// a GPU staging readback.
     #[serde(default)]
     pub busy: bool,
+}
+
+/// B5 codec-mosh live diagnostics: the same counter law as the NTSC paths
+/// (`attempted`/`accepted`/`skipped`/`unavailable`/`stale`, with `skipped`
+/// reserved for healthy bounded backpressure) plus the stage's own error
+/// channel — failure surfaces through this status, never a silent bypass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodecMoshLiveSnapshot {
+    /// Whether the authored stage is armed (the amount deadband law).
+    pub active: bool,
+    /// True while the bounded worker owns an in-flight round trip.
+    pub busy: bool,
+    /// Last worker error, if any. A failed worker is terminal and this is
+    /// its named record.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    pub metrics: crate::ntsc::NtscPathMetrics,
 }
 
 /// Browser-facing view of the host's bounded source-admission policy. Keeping
@@ -2318,6 +2341,10 @@ pub struct TemporalSnapshot {
     /// serde block; absent means exact-off.
     #[serde(default)]
     pub melt: crate::mixing_boundary::MeltParams,
+    /// Additive B5 codec mosh. The params struct is its own sanitizing
+    /// serde block; absent means exact bypass.
+    #[serde(default)]
+    pub mosh: crate::codec_mosh::CodecMoshParams,
     /// Read-only renderer truth. Main fills this DTO when the active executor
     /// exposes metrics; older/exact paths safely report the zero placeholder.
     #[serde(default)]
@@ -2607,6 +2634,7 @@ impl Default for TemporalSnapshot {
             rig: TemporalRigSnapshot::default(),
             display: crate::display_physics::DisplayPhysicsParams::default(),
             melt: crate::mixing_boundary::MeltParams::default(),
+            mosh: crate::codec_mosh::CodecMoshParams::default(),
             telemetry: TemporalTelemetrySnapshot::default(),
         }
     }
@@ -2802,6 +2830,7 @@ impl TemporalSnapshot {
             rig: TemporalRigSnapshot::from_params(p.rig),
             display: p.display.sanitized(),
             melt: p.melt.sanitized(),
+            mosh: p.mosh.sanitized(),
             originals: TemporalOriginalsSnapshot {
                 loom: TemporalLoomSnapshot {
                     amount: p.originals.loom.amount,
@@ -7545,11 +7574,12 @@ mod protocol_tests {
         // sliders (28 small effects plus the 3 master-only optics). B1's Scan
         // Processor rows render through the existing generated-card template,
         // so the literal tag counts do not move. B4 added the 17 display-
-        // physics sliders to the temporal group.
+        // physics sliders to the temporal group. B5 added the 8 codec-mosh
+        // sliders there too (the recycle law is a toggle, not a range).
         // B8 added the seventeen bus-mixer sliders (wipe 5, dirt 6, melt 6),
         // the six master melting-edge sliders, and the key-dressing pair at
         // both scopes (two static master rows, two layer template rows).
-        assert_eq!(assert_range_tags_are_bounded(html, true), 190);
+        assert_eq!(assert_range_tags_are_bounded(html, true), 198);
         assert_eq!(assert_range_tags_are_bounded(js, false), 19);
 
         for contract in [

@@ -27,7 +27,8 @@ second full-frame history ring.
 | B14 — failure switches | **Partially landed early** | `servo_defeated` shipped inside B3; the remaining piece is `sync_latched` on the tape/NTSC-adjacent shear model |
 | B8 — the mixing boundary | **Complete** | `docs/evidence/b8-mixing-boundary-note.md`; CLAUDE.md "B8 the mixing boundary" |
 | B16 — program re-entry | **Complete** | `docs/evidence/b16-program-reentry-note.md`; CLAUDE.md "B16 program re-entry" |
-| B5, B7, B9, B10, B11, B6, B15 | Open | — |
+| B5 — codec mosh | **Complete** | `docs/evidence/b5-codec-mosh-note.md`; CLAUDE.md "B5 codec mosh" |
+| B7, B9, B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -35,15 +36,15 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-Wave 2 continues with **B5, codec mosh** — a master-scope stage backed by a
-bounded worker in the selective-NTSC shape verbatim (one in-flight,
-drop-new-while-busy, generation/topology/dimension tags travelling with the
-pixels, stale results rejected by name), running a real ffmpeg-next *library*
-encoder/decoder round trip (prefer mpeg4/mpeg2video with `threads=1`) with
-the bitstream broken between them. Export runs the round trip synchronously
-per frame; the repeatability claim is per host, and the encoder identity is
-recorded in the `.motion.json` sidecar (its first additive schema bump since
-v5). Fetch the plan document before starting it.
+Wave 2 closes with **B7, generator sources** — two new `LayerSource` arms
+(`synth://` and `text://` sentinels on the `spout://` stability rules): a
+Pattern synth rendered as one GPU pass per frame clocked by frame-plan time
+(shape → oscillator → cross-modulation → wavefolder → comparator →
+colouriser, every continuous control a modulation destination), and a
+TextPage rastered on CPU into a bounded RGBA upload re-rendered only on
+authored change. Both serialize wholly in `LayerConfig` — the first sources
+with perfect offline reconstruction. Fetch the plan document before
+starting it.
 
 ## The working method every tranche follows
 
