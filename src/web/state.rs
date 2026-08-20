@@ -7152,23 +7152,35 @@ mod protocol_tests {
     }
 
     #[test]
-    fn every_temporal_default_agrees_between_the_markup_and_the_reset_table() {
+    fn every_panel_default_agrees_between_the_markup_and_the_reset_table() {
         let html = include_str!("../../static/index.html");
         let js = include_str!("../../static/app.js");
 
-        // The reset table the temporal binder uses.
-        let table = js
-            .split("const TEMPORAL_PARAM_DEFAULTS = Object.freeze({")
-            .nth(1)
-            .and_then(|chunk| chunk.split("});").next())
-            .expect("the temporal defaults table must exist");
-        let listed = |param: &str| -> Option<f64> {
-            table.lines().find_map(|line| {
-                let line = line.trim();
-                let rest = line.strip_prefix(param)?.strip_prefix(':')?;
-                rest.trim().trim_end_matches(',').parse::<f64>().ok()
-            })
+        let table_for = |name: &str| -> &str {
+            js.split(&format!("const {name} = Object.freeze({{"))
+                .nth(1)
+                .and_then(|chunk| chunk.split("});").next())
+                .unwrap_or_else(|| panic!("the {name} table must exist"))
         };
+        // The tables pack several entries per line and carry comments, so parse
+        // comma-separated pairs rather than lines. The `:` guard stops a short
+        // key matching the prefix of a longer one.
+        let listed_in = |table: &str, param: &str| -> Option<f64> {
+            table
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .flat_map(|line| line.split(','))
+                .find_map(|chunk| {
+                    let rest = chunk.trim().strip_prefix(param)?.strip_prefix(':')?;
+                    rest.trim().parse::<f64>().ok()
+                })
+        };
+
+        let families = [
+            ("data-param", "MASTER_PARAM_DEFAULTS"),
+            ("data-temporal", "TEMPORAL_PARAM_DEFAULTS"),
+            ("data-ntsc", "NTSC_PARAM_DEFAULTS"),
+        ];
 
         let mut compared = 0usize;
         let mut disagreements: Vec<String> = Vec::new();
@@ -7177,7 +7189,14 @@ mod protocol_tests {
                 Some(end) => &row[..end],
                 None => continue,
             };
-            let Some(param) = attribute(row, "data-temporal") else {
+            let Some((attr, table_name)) = families
+                .iter()
+                .find(|(attr, _)| attribute(row, attr).is_some())
+            else {
+                continue;
+            };
+            let table = table_for(table_name);
+            let Some(param) = attribute(row, attr) else {
                 continue;
             };
             // Only range rows have a reset fallback at all.
@@ -7201,22 +7220,22 @@ mod protocol_tests {
                 continue;
             };
 
-            let effective = listed(&param).unwrap_or(min);
+            let effective = listed_in(table, &param).unwrap_or(min);
             if (effective - shown).abs() >= 1.0e-6 {
                 disagreements.push(format!(
-                    "{param}: panel shows {shown}, reset would send {effective} (min {min})"
+                    "{attr} {param}: panel shows {shown}, reset would send {effective} (min {min})"
                 ));
             }
             compared += 1;
         }
         assert!(
-            compared > 40,
-            "only {compared} temporal rows were compared; the parser stopped matching the markup"
+            compared > 100,
+            "only {compared} rows were compared; the parser stopped matching the markup"
         );
         assert!(
             disagreements.is_empty(),
-            "these temporal controls reset to the wrong value; add them to \
-             the defaults table:\n  {}",
+            "these controls reset to the wrong value; add them to their \
+             defaults table:\n  {}",
             disagreements.join("\n  ")
         );
     }

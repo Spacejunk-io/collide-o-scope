@@ -1822,6 +1822,9 @@ const MASTER_PARAM_DEFAULTS = Object.freeze({
 const NTSC_PARAM_DEFAULTS = Object.freeze({
       head_switching_height: 8, tracking_noise_height: 24,
       edge_wave_speed: 0.5,
+      // Bipolar controls whose default is zero while their minimum is not.
+      // Without these a double-click reset authors the extreme.
+      head_switching_shift: 0, composite_sharpening: 0,
     });
 
 // Temporal defaults, shared by the reset path and the CHANGED filter.
@@ -7911,12 +7914,18 @@ rangeEditorObserver.observe(document.body, { childList: true, subtree: true });
 
 const CONTROL_SEARCH = { query: '', moving: false, changed: false };
 
-// The panel's row families, paired with the help table's scope keys.
-const CONTROL_SCOPE_ATTRS = [
-  ['param', 'master'],
-  ['temporal', 'temporal'],
-  ['ntsc', 'ntsc'],
-];
+// The three families that carry help. Every other row is still indexed and
+// still filtered — it simply has no help sentence to search over, which is
+// better than leaving it on screen while the operator is trying to narrow
+// the view.
+const CONTROL_HELP_SCOPES = {
+  param: 'master',
+  temporal: 'temporal',
+  ntsc: 'ntsc',
+};
+
+// Dataset keys that describe a row's layout rather than name its control.
+const CONTROL_LAYOUT_KEYS = new Set(['min', 'max', 'step', 'default', 'group']);
 
 const CONTROL_DEFAULT_TABLES = {
   master: () => MASTER_PARAM_DEFAULTS,
@@ -7936,30 +7945,59 @@ function controlHelpFor(scope, param) {
 // lights nothing — they never light the wrong row, because every rule is an
 // exact string equality.
 function routeDrivesControl(target, scope, param) {
+  if (!scope) return false;
   if (target === param) return true;
   if (scope !== 'temporal') return false;
   if (target === `temporal_${param}`) return true;
   return param.startsWith('disp_') && target === `display_${param.slice(5)}`;
 }
 
+// The row's default, or null when the panel genuinely does not know it. A
+// null is reported as "not changed" rather than guessed: a filter that
+// invents differences is worse than one that admits a blind spot.
+function controlDefaultFor(entry) {
+  const table = entry.scope ? CONTROL_DEFAULT_TABLES[entry.scope]?.() : null;
+  if (table && table[entry.param] !== undefined) return Number(table[entry.param]);
+  const authored = entry.row.querySelector('[data-default]');
+  if (authored) return Number(authored.dataset.default);
+  if (table) {
+    // A known family with an unlisted key falls back to the slider minimum,
+    // exactly as the double-click reset does.
+    const slider = entry.row.querySelector('input[type="range"]');
+    if (slider) return Number(entry.row.dataset.min ?? slider.min ?? 0);
+  }
+  return null;
+}
+
 function controlRowIsChanged(entry) {
-  const table = CONTROL_DEFAULT_TABLES[entry.scope]?.() || {};
   const slider = entry.row.querySelector('input[type="range"]');
   if (slider) {
-    const min = Number(entry.row.dataset.min ?? slider.min ?? 0);
-    const fallback = Number(table[entry.param] ?? min);
+    const fallback = controlDefaultFor(entry);
+    if (fallback === null || Number.isNaN(fallback)) return false;
     return Math.abs(Number(slider.value) - fallback) > 1e-6;
   }
   const checkbox = entry.row.querySelector('input[type="checkbox"]');
-  if (checkbox) return checkbox.checked !== Boolean(table[entry.param] ?? false);
+  if (checkbox) {
+    // The authored default is what the markup ships checked, exactly as a
+    // select's default is its `selected` option. Assuming "off" would report
+    // every checkbox that ships on as permanently changed.
+    const table = entry.scope ? CONTROL_DEFAULT_TABLES[entry.scope]?.() : null;
+    const listed = table ? table[entry.param] : undefined;
+    const fallback = listed !== undefined
+      ? Boolean(listed)
+      : checkbox.hasAttribute('checked');
+    return checkbox.checked !== fallback;
+  }
   const select = entry.row.querySelector('select');
   if (select) {
     const authored = select.querySelector('option[selected]');
     return authored ? select.value !== authored.value : false;
   }
   const number = entry.row.querySelector('input[type="number"]');
-  if (number && table[entry.param] !== undefined) {
-    return Math.abs(Number(number.value) - Number(table[entry.param])) > 1e-6;
+  if (number) {
+    const fallback = controlDefaultFor(entry);
+    if (fallback === null || Number.isNaN(fallback)) return false;
+    return Math.abs(Number(number.value) - fallback) > 1e-6;
   }
   return false;
 }
@@ -7967,16 +8005,24 @@ function controlRowIsChanged(entry) {
 function buildControlIndex() {
   const rows = [];
   document.querySelectorAll('#master-fx .param-row').forEach((row) => {
-    let scope = null;
+    // A row is named by its first dataset key that is not a layout hint, so
+    // families the help table does not cover are still indexed and filtered.
+    let family = null;
     let param = null;
-    for (const [attr, name] of CONTROL_SCOPE_ATTRS) {
-      if (row.dataset[attr]) {
-        scope = name;
-        param = row.dataset[attr];
-        break;
-      }
+    for (const key of Object.keys(row.dataset)) {
+      if (CONTROL_LAYOUT_KEYS.has(key)) continue;
+      if (!row.dataset[key]) continue;
+      family = key;
+      param = row.dataset[key];
+      break;
     }
-    if (!scope) return;
+    // Rows bound by element id rather than a data attribute (Audio Gain, the
+    // Dice scope selectors, Morph Law) carry no identity, but they are real
+    // labelled controls and must still filter. They match on their label and
+    // section, and they never claim MOVING or CHANGED, because without an
+    // identity the panel genuinely cannot tell.
+    if (!family) param = '';
+    const scope = family ? CONTROL_HELP_SCOPES[family] || null : null;
     const group = row.closest('.fx-group');
     const section = row.closest('details.temporal-study');
     const groupLabel =
@@ -7985,7 +8031,7 @@ function buildControlIndex() {
       || '';
     const sectionLabel = section?.querySelector('summary')?.textContent || '';
     const label = row.querySelector('label')?.textContent || '';
-    const help = controlHelpFor(scope, param);
+    const help = scope ? controlHelpFor(scope, param) : '';
     // The help sentence rides the row as a native tooltip. It costs no layout
     // and screen readers announce it, which an inline expander would not do
     // for a control the operator is already focused on.
@@ -7995,7 +8041,12 @@ function buildControlIndex() {
       group,
       scope,
       param,
-      haystack: `${label} ${groupLabel} ${sectionLabel} ${param} ${help}`.toLowerCase(),
+      // Two corpora, deliberately matched differently. Identity text takes a
+      // plain substring so "phos" finds Persistence Red; help prose takes a
+      // word-start match, because a substring over sentences is noise —
+      // "gain" would otherwise match "against".
+      identity: `${label} ${groupLabel} ${sectionLabel} ${param}`.toLowerCase(),
+      help: help.toLowerCase(),
     });
   });
   return rows;
@@ -8026,10 +8077,18 @@ function applyControlFilter() {
   }
 
   const query = CONTROL_SEARCH.query.trim().toLowerCase();
+  // One regex per pass, not one per row: the word-start test runs over every
+  // indexed control on every keystroke.
+  const helpPattern = query
+    ? new RegExp(`\\b${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
+    : null;
   let shown = 0;
   for (const entry of index) {
     let visible = true;
-    if (query && !entry.haystack.includes(query)) visible = false;
+    if (query) {
+      visible = entry.identity.includes(query)
+        || (entry.help !== '' && helpPattern.test(entry.help));
+    }
     if (visible && CONTROL_SEARCH.moving) {
       visible = controlRouteTargets.some((target) =>
         routeDrivesControl(target, entry.scope, entry.param));
@@ -8098,6 +8157,11 @@ function syncControlFilters(modulation) {
   };
   toggle(moving, 'moving');
   toggle(changed, 'changed');
+
+  // Build the index once at startup: filtering is lazy, but the help
+  // tooltips it attaches should be there from the first hover, not only
+  // after the operator happens to search for something.
+  applyControlFilter();
 
   // `/` focuses the search, unless the operator is already typing somewhere.
   document.addEventListener('keydown', (event) => {
