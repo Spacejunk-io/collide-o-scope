@@ -2279,6 +2279,23 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
       mosh_hold: 0.25,
       mosh_rate: 0.5,
       mosh_bitrate_starve: 0.35,
+      sync_rate: 0.35,
+      sync_spread: 0.25,
+      // Every bipolar control below defaults to zero while its slider minimum
+      // is negative. An unlisted key falls back to that minimum, so omitting
+      // any of these makes a double-click "reset" author a hard negative
+      // extreme instead of the neutral value.
+      fb_rotate: 0,
+      fb_offset_x: 0,
+      fb_offset_y: 0,
+      fb_hue_rotate: 0,
+      slit_angle: 0,
+      loom_phase: 0,
+      loom_angle: 0,
+      // Explicitly zero: the fallback for an unlisted key is the slider's
+      // minimum, and this control's minimum is -1, so omitting it would make
+      // a double-click reset author full negative bias.
+      sync_bias: 0,
     };
     slider.value = defaults[param] ?? min;
 

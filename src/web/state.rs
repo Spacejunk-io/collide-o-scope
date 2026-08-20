@@ -7131,6 +7131,96 @@ mod protocol_tests {
     /// invisible is the same as not publishing it, so this pins the styling
     /// rule *and* the text swap — the state must be readable without relying
     /// on colour perception.
+    /// The panel carries a control's default in two places: the value span
+    /// authored in `index.html`, which is what the operator first sees, and
+    /// the JavaScript defaults table, which is what a double-click reset
+    /// actually sends. An unlisted key falls back to the slider's *minimum*,
+    /// so whenever a default is not the minimum the two silently disagree and
+    /// a reset authors the wrong value — which is exactly what B14's
+    /// `sync_bias` did, resetting to -1 instead of 0.
+    ///
+    /// This compares the two sources for every temporal row rather than
+    /// pinning a hand list, so the whole class is caught for future tranches
+    /// too.
+    /// Read one attribute value out of a fragment of the served markup.
+    fn attribute(fragment: &str, name: &str) -> Option<String> {
+        let needle = format!("{name}=\"");
+        let start = fragment.find(&needle)? + needle.len();
+        let rest = &fragment[start..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    }
+
+    #[test]
+    fn every_temporal_default_agrees_between_the_markup_and_the_reset_table() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+
+        // The reset table the temporal binder uses.
+        let table = js
+            .split("const defaults = {")
+            .find(|chunk| chunk.contains("fb_zoom: 1,"))
+            .and_then(|chunk| chunk.split("};").next())
+            .expect("the temporal defaults table must exist");
+        let listed = |param: &str| -> Option<f64> {
+            table.lines().find_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix(param)?.strip_prefix(':')?;
+                rest.trim().trim_end_matches(',').parse::<f64>().ok()
+            })
+        };
+
+        let mut compared = 0usize;
+        let mut disagreements: Vec<String> = Vec::new();
+        for row in html.split("<div class=\"param-row\"").skip(1) {
+            let row = match row.find("</div>") {
+                Some(end) => &row[..end],
+                None => continue,
+            };
+            let Some(param) = attribute(row, "data-temporal") else {
+                continue;
+            };
+            // Only range rows have a reset fallback at all.
+            if !row.contains("<input type=\"range\">") {
+                continue;
+            }
+            let Some(min) = attribute(row, "data-min").and_then(|v| v.parse::<f64>().ok()) else {
+                continue;
+            };
+            let Some(shown) = row
+                .split("<span class=\"value\">")
+                .nth(1)
+                .and_then(|rest| rest.split('<').next())
+                .map(|text| {
+                    text.trim()
+                        .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+                        .to_string()
+                })
+                .and_then(|text| text.parse::<f64>().ok())
+            else {
+                continue;
+            };
+
+            let effective = listed(&param).unwrap_or(min);
+            if (effective - shown).abs() >= 1.0e-6 {
+                disagreements.push(format!(
+                    "{param}: panel shows {shown}, reset would send {effective} (min {min})"
+                ));
+            }
+            compared += 1;
+        }
+        assert!(
+            compared > 40,
+            "only {compared} temporal rows were compared; the parser stopped matching the markup"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "these temporal controls reset to the wrong value; add them to \
+             the defaults table:\n  {}",
+            disagreements.join("\n  ")
+        );
+    }
+
     #[test]
     fn the_sync_latch_damage_state_is_visible_and_not_colour_only() {
         let html = include_str!("../../static/index.html");
