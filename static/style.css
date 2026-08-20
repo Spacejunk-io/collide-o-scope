@@ -1649,6 +1649,15 @@ select:focus-visible,
 
 .audio-status.error { color: #e65a5a; }
 
+/* The B14 sync latch's honest state. The authored switch says what the
+   operator asked for; this says whether the program is actually still
+   carrying accumulated shear. Amber, not the error red: held damage is a
+   deliberate performance state, not a fault. */
+.audio-status.sync-damaged {
+  color: #e6b85a;
+  font-weight: 600;
+}
+
 .audio-import-status:empty { display: none; }
 
 #audio-clip-row {

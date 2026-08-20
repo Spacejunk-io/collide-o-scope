@@ -2279,6 +2279,23 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
       mosh_hold: 0.25,
       mosh_rate: 0.5,
       mosh_bitrate_starve: 0.35,
+      sync_rate: 0.35,
+      sync_spread: 0.25,
+      // Every bipolar control below defaults to zero while its slider minimum
+      // is negative. An unlisted key falls back to that minimum, so omitting
+      // any of these makes a double-click "reset" author a hard negative
+      // extreme instead of the neutral value.
+      fb_rotate: 0,
+      fb_offset_x: 0,
+      fb_offset_y: 0,
+      fb_hue_rotate: 0,
+      slit_angle: 0,
+      loom_phase: 0,
+      loom_angle: 0,
+      // Explicitly zero: the fallback for an unlisted key is the slider's
+      // minimum, and this control's minimum is -1, so omitting it would make
+      // a double-click reset author full negative bias.
+      sync_bias: 0,
     };
     slider.value = defaults[param] ?? min;
 
@@ -2514,11 +2531,20 @@ function syncTemporal(t) {
     sync_latched: syncLatch.latched,
   };
   // The latch's honest state: the switch says what was asked for, this says
-  // whether the program is actually still carrying accumulated shear.
+  // whether the program is actually still carrying accumulated shear. The
+  // fact is carried by the text as well as the colour, so it does not depend
+  // on colour perception to be readable.
   const syncStatus = document.getElementById('sync-latch-status');
   if (syncStatus) {
-    syncStatus.classList.toggle('sync-damaged', t.sync_damaged === true);
-    syncStatus.dataset.damaged = t.sync_damaged === true ? 'true' : 'false';
+    if (!syncStatus.dataset.baseText) {
+      syncStatus.dataset.baseText = syncStatus.textContent;
+    }
+    const damaged = t.sync_damaged === true;
+    syncStatus.classList.toggle('sync-damaged', damaged);
+    syncStatus.dataset.damaged = damaged ? 'true' : 'false';
+    syncStatus.textContent = damaged
+      ? 'DAMAGE HELD — the program is still carrying accumulated shear. Release the latch to unwind it.'
+      : syncStatus.dataset.baseText;
   }
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;
