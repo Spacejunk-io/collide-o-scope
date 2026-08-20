@@ -178,6 +178,11 @@ pub struct ExportConfig {
     /// is published, and the honesty law holds by construction because an
     /// unrecorded live gesture never reaches this field.
     pub(crate) gesture_track: Option<crate::gesture::GestureTrackDocument>,
+    /// The B9 performance take this job replays by reference tick, carried as
+    /// its portable checksummed document exactly as the gesture track is.
+    /// `None` is the pre-recorder path: nothing is replayed and no
+    /// performance sidecar is published.
+    pub(crate) performance_take: Option<crate::performance_track::PerformanceTakeDocument>,
 }
 
 /// Closed offline Curved Shutter sample policy. The explicit variants name
@@ -1036,6 +1041,10 @@ fn remove_started_output(progress: &ExportProgress, output_path: Option<&str>) -
     if let Err(error) = remove_partial_path(&gesture, "gesture sidecar") {
         errors.push(error);
     }
+    let performance = performance_sidecar_path(path);
+    if let Err(error) = remove_partial_path(&performance, "performance sidecar") {
+        errors.push(error);
+    }
     (!errors.is_empty()).then(|| errors.join("; "))
 }
 
@@ -1139,6 +1148,53 @@ fn write_gesture_sidecar_noreplace(
     crate::procedural::sync_parent(&sidecar_path).map_err(|error| {
         format!(
             "export gesture sidecar committed at '{}', but synchronizing its parent directory failed: {error}",
+            sidecar_path.display()
+        )
+    })
+}
+
+/// The B9 performance sidecar sits beside the rendered video exactly as the
+/// gesture recording does; its name is derived from the output path and
+/// nothing about that path enters the file.
+fn performance_sidecar_path(output_path: &str) -> std::path::PathBuf {
+    let mut path = std::ffi::OsString::from(output_path);
+    path.push(".performance.json");
+    std::path::PathBuf::from(path)
+}
+
+/// Publish the replayed performance take beside its render, through the same
+/// staged no-replace commit the gesture sidecar uses. `to_json_bytes`
+/// revalidates the whole stream and re-derives its canonical checksum before
+/// a byte is staged.
+fn write_performance_sidecar_noreplace(
+    output_path: &str,
+    document: &crate::performance_track::PerformanceTakeDocument,
+) -> Result<(), String> {
+    let bytes = document
+        .to_json_bytes()
+        .map_err(|error| format!("serialize export performance sidecar: {error}"))?;
+    let sidecar_path = performance_sidecar_path(output_path);
+    if sidecar_path.exists() {
+        return Err(format!(
+            "refusing to overwrite export performance sidecar '{}'",
+            sidecar_path.display()
+        ));
+    }
+    let temp_path = sidecar_temp_path(&sidecar_path);
+    if let Err(error) = crate::procedural::write_new_file(&temp_path, &bytes) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!("stage export performance sidecar: {error}"));
+    }
+    if let Err(error) = crate::procedural::rename_noreplace(&temp_path, &sidecar_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "commit export performance sidecar '{}': {error}",
+            sidecar_path.display()
+        ));
+    }
+    crate::procedural::sync_parent(&sidecar_path).map_err(|error| {
+        format!(
+            "export performance sidecar committed at '{}', but synchronizing its parent directory failed: {error}",
             sidecar_path.display()
         )
     })
@@ -1399,6 +1455,10 @@ fn start_encoder_supervisor(
             // replaces its own stale receipt, while a second job racing for the
             // same destination still fails closed at the rename.
             let _ = remove_partial_path(&gesture_sidecar_path(&output_path), "gesture sidecar");
+            let _ = remove_partial_path(
+                &performance_sidecar_path(&output_path),
+                "performance sidecar",
+            );
 
             let Some(stdin) = child.stdin.take() else {
                 let _ = force_reap_ffmpeg(&mut child);
@@ -4690,6 +4750,181 @@ fn export_recorded_gesture_track(
         .map_err(|error| format!("recorded gesture track rejected before rendering: {error}"))
 }
 
+/// Apply one replayed B9 performance event to the export job's authored
+/// bases.
+///
+/// Every family routes through the same applier the live action arm uses —
+/// `EffectsSnapshot`, `apply_spatial_transform_edit`, `apply_motion_param`,
+/// `apply_temporal_wire_edit`, `BusMixerEdit`, `PatternSynthEdit` — on the
+/// export's own copies of the same engine types, so an offline take mutates
+/// state through identical code and identical clamps. Layer addresses resolve
+/// by saved stack position, which *is* the export layer identity; a position
+/// the job does not hold is a safe no-op exactly as a vanished stable ID is
+/// live. The Collision Score loop driver never has an address here, so the
+/// temporal applier's live-only context is always `None`.
+#[allow(clippy::too_many_arguments)]
+fn apply_export_performance_event(
+    control: &crate::performance_track::PerformanceControl,
+    raw: &crate::performance_track::PerformanceRawValue,
+    master_effects: &mut EffectUniforms,
+    master_transform: &mut SpatialTransform,
+    master_motion: &mut crate::motion::MotionParams,
+    layer_motion: &mut [crate::motion::MotionParams],
+    ntsc: &mut crate::ntsc::NtscParams,
+    temporal: &mut crate::effects::params::TemporalParams,
+    gesture_canvas: &mut crate::gesture_canvas::GestureCanvasParams,
+    creative_graph: &mut ExportCreativeGraph,
+    layers: &mut [ExportLayer],
+    morph: &mut Option<crate::morph::Morph>,
+) {
+    use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+    let json = raw.to_json();
+    let layer_index = |layers: &[ExportLayer], position: u32| -> Option<usize> {
+        let position = usize::try_from(position).ok()?;
+        layers
+            .iter()
+            .position(|layer| layer.source_index == position)
+    };
+    let apply_effects = |effects: &mut EffectUniforms, param: &str, value: &serde_json::Value| {
+        let mut snapshot = crate::web::state::EffectsSnapshot::from_uniforms(effects);
+        snapshot.apply_param(param, value);
+        snapshot.apply_to_uniforms(effects);
+    };
+    match control {
+        Control::Master { param } => {
+            if let Some(value) = json {
+                apply_effects(master_effects, param, &value);
+            }
+        }
+        Control::MasterTransform { param } => {
+            if let Some(value) = json {
+                crate::App::apply_spatial_transform_edit(master_transform, param, &value);
+            }
+        }
+        Control::LayerParam { layer, param } => {
+            let Some(index) = layer_index(layers, *layer) else {
+                return;
+            };
+            let target = &mut layers[index];
+            match (param.as_str(), raw) {
+                ("opacity", Raw::Continuous(value)) => {
+                    target.opacity = crate::layers::clamp_layer_opacity(*value);
+                }
+                ("speed", Raw::Continuous(value)) => {
+                    target.speed = crate::layers::clamp_layer_speed(*value);
+                }
+                ("fps", Raw::Continuous(value)) => {
+                    if value.is_finite() {
+                        target.fps = crate::layers::clamp_layer_fps(*value);
+                    }
+                }
+                ("blend_mode", Raw::Token(token)) => {
+                    if let Some(mode) = BlendMode::from_key(token) {
+                        target.blend_mode = mode;
+                    }
+                }
+                ("bypass_master_fx", Raw::Toggle(value)) => target.bypass_master_fx = *value,
+                (key, _) if key.starts_with("key_") => {
+                    if let Some(value) = json {
+                        apply_effects(&mut target.effects, key, &value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Control::LayerEffect { layer, param } => {
+            let Some(index) = layer_index(layers, *layer) else {
+                return;
+            };
+            if let Some(value) = json {
+                apply_effects(&mut layers[index].effects, param, &value);
+                layers[index].effects.clear_master_only_effects();
+            }
+        }
+        Control::LayerTransform { layer, param } => {
+            let Some(index) = layer_index(layers, *layer) else {
+                return;
+            };
+            if let Some(value) = json {
+                crate::App::apply_spatial_transform_edit(
+                    &mut layers[index].transform,
+                    param,
+                    &value,
+                );
+            }
+        }
+        Control::LayerVisible { layer } => {
+            if let (Some(index), Raw::Toggle(visible)) = (layer_index(layers, *layer), raw) {
+                layers[index].visible = *visible;
+            }
+        }
+        Control::LayerPattern { layer, param } => {
+            let Some(index) = layer_index(layers, *layer) else {
+                return;
+            };
+            if let Some(value) = json {
+                if let Some(edit) = crate::pattern_synth::PatternSynthEdit::parse(param, &value) {
+                    if let Some(params) = layers[index].pattern.as_mut() {
+                        edit.apply(params);
+                    }
+                }
+            }
+        }
+        Control::Ntsc { param } => {
+            if let Some(value) = json {
+                ntsc.set_param(param, &value);
+            }
+        }
+        Control::Temporal { param } => {
+            if let Some(value) = json {
+                crate::apply_temporal_wire_edit(temporal, param, &value, None);
+            }
+        }
+        Control::MotionMaster { param } => {
+            if let Some(value) = json {
+                let _ = crate::apply_motion_param(master_motion, true, param, &value);
+            }
+        }
+        Control::MotionLayer { layer, param } => {
+            let Some(index) = layer_index(layers, *layer) else {
+                return;
+            };
+            if let Some(value) = json {
+                let _ = crate::apply_motion_param(&mut layer_motion[index], false, param, &value);
+            }
+        }
+        Control::BusCrossfade => {
+            if let Raw::Continuous(value) = raw {
+                creative_graph.composition.set_bus_crossfade(*value);
+            }
+        }
+        Control::BusMix { param } => {
+            if let Some(value) = json {
+                if let Some(edit) = crate::mixing_boundary::BusMixerEdit::parse(param, &value) {
+                    let mut mixer = creative_graph.composition.mixer();
+                    edit.apply(&mut mixer);
+                    creative_graph.composition.set_mixer(mixer);
+                }
+            }
+        }
+        Control::MorphPosition => {
+            if let (Some(morph), Raw::Continuous(value)) = (morph.as_mut(), raw) {
+                morph.set_position(*value);
+            }
+        }
+        Control::GestureCanvas { param } => {
+            if let Raw::Continuous(value) = raw {
+                match param.as_str() {
+                    "radius" => gesture_canvas.radius = *value,
+                    "strength" => gesture_canvas.strength = *value,
+                    "retention" => gesture_canvas.retention = *value,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Admit and build the one gesture canvas an offline job owns.
 ///
 /// The grid is derived from the export output through the same host law the
@@ -5463,7 +5698,7 @@ fn run_export(
     // Resolve saved composition/rack positions once against deterministic
     // export IDs. Missing media still owns its black placeholder ID, so a
     // failed decoder can never retarget a selected-layer image route.
-    let base_creative_graph = resolve_export_creative_graph(patch)?;
+    let mut base_creative_graph = resolve_export_creative_graph(patch)?;
 
     // --- Master effects ---
     let mut master_effects = EffectUniforms {
@@ -5471,10 +5706,10 @@ fn run_export(
         ..Default::default()
     };
     patch.master.apply_to_uniforms(&mut master_effects);
-    let master_transform = patch.master_transform.sanitized();
-    let base_master_motion =
+    let mut master_transform = patch.master_transform.sanitized();
+    let mut base_master_motion =
         resolved_export_motion(patch.master_motion, &base_creative_graph.layer_ids);
-    let base_layer_motion = layers
+    let mut base_layer_motion = layers
         .iter()
         .map(|layer| {
             resolved_export_motion(
@@ -5496,7 +5731,7 @@ fn run_export(
     if let Some(ref ntsc_cfg) = patch.ntsc {
         ntsc_state.params = ntsc_cfg.to_params();
     }
-    let base_ntsc = ntsc_state.params.clone();
+    let mut base_ntsc = ntsc_state.params.clone();
     // Live global and selective workers own independent ntsc-rs state. Keep
     // those processors distinct offline as well, especially when a morph
     // crosses the discrete bypass boundary during one export.
@@ -5558,10 +5793,10 @@ fn run_export(
     } else {
         None
     };
-    let export_morph = patch.morph.clone().map(crate::morph::Morph::from_snapshot);
+    let mut export_morph = patch.morph.clone().map(crate::morph::Morph::from_snapshot);
 
     // --- Temporal effects (feedback/slit-scan), same pass as live ---
-    let base_temporal =
+    let mut base_temporal =
         resolved_export_patch_temporal(patch.temporal.as_ref(), &base_creative_graph.layer_ids);
     let mut temporal_state = crate::renderer::state::TemporalState::default();
     let mut temporal_boundaries = crate::performance::BeatBoundaryTracker::default();
@@ -5590,7 +5825,30 @@ fn run_export(
             "The recorded gesture track has unclosed strokes; export replays it exactly as recorded and never closes them.",
         );
     }
-    let base_gesture_canvas = patch.gesture_canvas.unwrap_or_default().to_params();
+    // --- B9 recorded performance take, replayed by reference tick ---
+    // The checksum is verified before the first frame renders, exactly as the
+    // gesture track's is; export replays the take once, straight through — the
+    // loop flag is live playback transport, not part of the take.
+    let mut performance_replay = match config.performance_take.as_ref() {
+        Some(document) => {
+            let take = document
+                .decode()
+                .map_err(|error| format!("recorded performance take rejected: {error}"))?;
+            if take.truncated() {
+                progress.record_warning(
+                    "The recorded performance take reached its bounded cap; export replays the retained prefix only.",
+                );
+            }
+            if take.incomplete() {
+                progress.record_warning(
+                    "The performance take was captured while recording was still armed; export replays it exactly as recorded.",
+                );
+            }
+            Some((take, crate::performance_track::PerformanceCursor::default()))
+        }
+        None => None,
+    };
+    let mut base_gesture_canvas = patch.gesture_canvas.unwrap_or_default().to_params();
     let gesture_canvas_limits = crate::gesture_canvas::GestureCanvasLimits::device(
         max_dimension,
         raw_device_limits.min_uniform_buffer_offset_alignment,
@@ -5722,6 +5980,35 @@ fn run_export(
     for frame_num in 0..total_frames {
         if progress.cancel.load(Ordering::Acquire) {
             break;
+        }
+
+        // Apply every due B9 take event to the authored bases before this
+        // frame's world is built — the offline mirror of the live
+        // drain-before-render order, addressed by the same rounded rational
+        // tick map every other 30 Hz consumer uses.
+        if let Some((take, cursor)) = performance_replay.as_mut() {
+            let tick = u32::try_from(export_temporal_reference_tick(frame_num, config.fps))
+                .unwrap_or(u32::MAX);
+            let (start, end) = cursor.range_due(take.events(), tick);
+            for event in &take.events()[start..end] {
+                let address = &take.addresses()[usize::from(event.address)];
+                if let Some(raw) = address.law.decode(event.value) {
+                    apply_export_performance_event(
+                        &address.control,
+                        &raw,
+                        &mut master_effects,
+                        &mut master_transform,
+                        &mut base_master_motion,
+                        &mut base_layer_motion,
+                        &mut base_ntsc,
+                        &mut base_temporal,
+                        &mut base_gesture_canvas,
+                        &mut base_creative_graph,
+                        &mut layers,
+                        &mut export_morph,
+                    );
+                }
+            }
         }
 
         // Update time uniform for effects (breathe, grain seed, etc.)
@@ -6914,6 +7201,13 @@ fn run_export(
     if let Some(document) = config.gesture_track.as_ref() {
         if !document.events.is_empty() {
             write_gesture_sidecar_noreplace(&config.output_path, document)?;
+        }
+    }
+    // The replayed performance take publishes on the same law: no take, no
+    // file, so the pre-recorder output pair stays byte-identical.
+    if let Some(document) = config.performance_take.as_ref() {
+        if !document.events.is_empty() {
+            write_performance_sidecar_noreplace(&config.output_path, document)?;
         }
     }
     // A cancellation that wins immediately after atomic sidecar publication
@@ -8462,6 +8756,7 @@ mod tests {
             media_safety_policy: MediaSafetyPolicy::default(),
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track: None,
+            performance_take: None,
         }
     }
 
@@ -17322,6 +17617,7 @@ layers:
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         };
         let output = std::env::temp_dir().join(format!(
             "collideoscope-live-cancel-{}-{}.mp4",
@@ -17346,6 +17642,7 @@ layers:
             media_safety_policy: MediaSafetyPolicy::default(),
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track: None,
+            performance_take: None,
         };
         let mut job = ExportJob::start(patch, config, "videos");
 
@@ -17443,6 +17740,7 @@ mod effects_audit {
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         }
     }
 
@@ -17473,6 +17771,7 @@ mod effects_audit {
             media_safety_policy: MediaSafetyPolicy::default(),
             temporal_event_track: crate::temporal::TemporalEventTrack::default(),
             gesture_track,
+            performance_take: None,
         };
         let output_path = config.output_path.clone();
         let job = ExportJob::start(patch, config, "videos");
@@ -19072,5 +19371,315 @@ mod effects_audit {
         let mut p = base_patch();
         p.layers[0].opacity = 0.3;
         render("opacity", p);
+    }
+
+    // ===== B9 performance recorder =====
+
+    fn render_with_take(
+        label: &str,
+        patch: PatchState,
+        performance_take: Option<crate::performance_track::PerformanceTakeDocument>,
+    ) -> String {
+        let config = ExportConfig {
+            width: 320,
+            height: 180,
+            fps: 24,
+            duration_secs: 1.0,
+            output_path: format!("renders/audit_{label}.mp4"),
+            audio_path: None,
+            audio_path_hint: None,
+            layer_source_hints: Vec::new(),
+            analysis_audio_path_hint: None,
+            ntsc_quality: NtscExportQuality::LiveParity,
+            shutter_samples: ExportShutterSamples::Authored,
+            media_safety_policy: MediaSafetyPolicy::default(),
+            temporal_event_track: crate::temporal::TemporalEventTrack::default(),
+            gesture_track: None,
+            performance_take,
+        };
+        let output_path = config.output_path.clone();
+        let job = ExportJob::start(patch, config, "videos");
+        while !job.is_done() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let err = job.progress.error.lock().unwrap().clone();
+        assert!(err.is_empty(), "{label}: export failed: {err}");
+        output_path
+    }
+
+    fn performance_take_fixture() -> crate::performance_track::PerformanceTakeDocument {
+        use crate::performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceTake,
+            PerformanceTakeDocument, PerformanceValueLaw as Law,
+        };
+        let mut take = PerformanceTake::default();
+        take.record_accepted(
+            0,
+            Control::Master {
+                param: "brightness".to_string(),
+            },
+            Law::Unit {
+                min: -1.0,
+                max: 1.0,
+            },
+            &Raw::Continuous(0.6),
+        )
+        .unwrap();
+        take.record_accepted(
+            6,
+            Control::Master {
+                param: "hue_shift".to_string(),
+            },
+            Law::Unit {
+                min: -180.0,
+                max: 180.0,
+            },
+            &Raw::Continuous(120.0),
+        )
+        .unwrap();
+        take.record_accepted(
+            12,
+            Control::Temporal {
+                param: "feedback".to_string(),
+            },
+            Law::Unit {
+                min: 0.0,
+                max: 0.95,
+            },
+            &Raw::Continuous(0.8),
+        )
+        .unwrap();
+        take.record_accepted(
+            18,
+            Control::LayerEffect {
+                layer: 0,
+                param: "pixelate".to_string(),
+            },
+            Law::Unit {
+                min: 1.0,
+                max: 32.0,
+            },
+            &Raw::Continuous(12.0),
+        )
+        .unwrap();
+        take.finalize(20);
+        PerformanceTakeDocument::capture(&take)
+    }
+
+    /// The performance sidecar publishes on the gesture sidecar's exact
+    /// no-replace law, is cleanup-coupled to the video, and is retired at the
+    /// output claim so a re-export can publish again.
+    #[test]
+    fn the_performance_sidecar_publishes_no_replace_and_retires_at_the_output_claim() {
+        let unique = format!(
+            "cos-performance-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("artifact.mp4");
+        std::fs::write(&output, b"accepted-video").unwrap();
+        let output_string = output.to_string_lossy().into_owned();
+
+        let document = performance_take_fixture();
+        write_performance_sidecar_noreplace(&output_string, &document).unwrap();
+        let sidecar_path = performance_sidecar_path(&output_string);
+        assert_eq!(
+            sidecar_path.file_name().unwrap(),
+            "artifact.mp4.performance.json"
+        );
+        let bytes = std::fs::read(&sidecar_path).unwrap();
+        assert!(bytes.len() <= crate::performance_track::MAX_PERFORMANCE_SERIALIZED_BYTES);
+        let restored =
+            crate::performance_track::PerformanceTakeDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(restored, document);
+        restored.decode().unwrap();
+
+        // No-replace: a second publication refuses rather than overwriting.
+        let second = write_performance_sidecar_noreplace(&output_string, &document).unwrap_err();
+        assert!(second.contains("refusing to overwrite"), "{second}");
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), bytes);
+        // No staging residue survives a refused commit.
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+
+        // Cleanup coupling: the terminal cleanup names the performance
+        // sidecar beside the motion and gesture ones, so a cancelled or
+        // failed render never leaves a take receipt beside a deleted video.
+        let source = include_str!("render_export.rs");
+        let cleanup = source
+            .find("fn remove_started_output(")
+            .expect("terminal cleanup");
+        assert!(
+            source[cleanup..cleanup + 2_500].contains("performance_sidecar_path(path)"),
+            "terminal cleanup must retire the performance sidecar with the video"
+        );
+        remove_partial_path(&sidecar_path, "performance sidecar").unwrap();
+        assert!(!sidecar_path.exists());
+        // Retiring a receipt that was never written is not an error.
+        remove_partial_path(&sidecar_path, "performance sidecar").unwrap();
+
+        // The retirement lives at the output claim, beside the gesture one.
+        let claim = source
+            .split_once(".output_started\n                .store(true, Ordering::Release);")
+            .expect("the encoder supervisor claims the output name")
+            .1;
+        assert!(
+            claim[..800].contains("performance_sidecar_path(&output_path)"),
+            "a re-export must retire its own stale performance receipt at the claim"
+        );
+    }
+
+    /// The offline applier mutates the export bases through the shared
+    /// appliers, and an address the job cannot resolve is a safe no-op.
+    #[test]
+    fn export_replay_applies_take_events_through_the_shared_appliers() {
+        use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+        let mut master_effects = EffectUniforms::default();
+        let mut master_transform = SpatialTransform::default();
+        let mut master_motion = crate::motion::MotionParams::default();
+        let mut layer_motion: Vec<crate::motion::MotionParams> = Vec::new();
+        let mut ntsc = crate::ntsc::NtscParams::default();
+        let mut temporal = crate::effects::params::TemporalParams::default();
+        let mut gesture_canvas = crate::gesture_canvas::GestureCanvasParams::default();
+        let mut graph = resolve_export_creative_graph(&base_patch()).expect("graph");
+        let mut layers: Vec<ExportLayer> = Vec::new();
+        let mut morph: Option<crate::morph::Morph> = None;
+
+        let mut apply = |control: Control, raw: Raw| {
+            apply_export_performance_event(
+                &control,
+                &raw,
+                &mut master_effects,
+                &mut master_transform,
+                &mut master_motion,
+                &mut layer_motion,
+                &mut ntsc,
+                &mut temporal,
+                &mut gesture_canvas,
+                &mut graph,
+                &mut layers,
+                &mut morph,
+            );
+        };
+
+        apply(
+            Control::Master {
+                param: "brightness".to_string(),
+            },
+            Raw::Continuous(0.6),
+        );
+        apply(
+            Control::MasterTransform {
+                param: "position_x".to_string(),
+            },
+            Raw::Continuous(0.25),
+        );
+        apply(
+            Control::Temporal {
+                param: "feedback".to_string(),
+            },
+            Raw::Continuous(0.8),
+        );
+        apply(
+            Control::Ntsc {
+                param: "snow_intensity".to_string(),
+            },
+            Raw::Continuous(0.5),
+        );
+        apply(
+            Control::MotionMaster {
+                param: "shutter_angle".to_string(),
+            },
+            Raw::Continuous(270.0),
+        );
+        apply(Control::BusCrossfade, Raw::Continuous(0.8));
+        apply(
+            Control::BusMix {
+                param: "wipe_pattern".to_string(),
+            },
+            Raw::Token("circle".to_string()),
+        );
+        apply(
+            Control::GestureCanvas {
+                param: "radius".to_string(),
+            },
+            Raw::Continuous(0.9),
+        );
+        // A layer address with no layer at the position, and a morph edit with
+        // no morph state, are safe no-ops rather than panics or retargets.
+        apply(
+            Control::LayerEffect {
+                layer: 5,
+                param: "pixelate".to_string(),
+            },
+            Raw::Continuous(9.0),
+        );
+        apply(Control::MorphPosition, Raw::Continuous(0.5));
+
+        assert!((master_effects.brightness - 0.6).abs() < 1.0e-6);
+        assert!((master_transform.position[0] - 0.25).abs() < 1.0e-6);
+        assert!((temporal.feedback - 0.8).abs() < 1.0e-6);
+        assert!((ntsc.snow_intensity - 0.5).abs() < 1.0e-6);
+        assert!((master_motion.shutter.angle_degrees - 270.0).abs() < 1.0e-6);
+        assert!((graph.composition.bus_crossfade() - 0.8).abs() < 1.0e-6);
+        assert_eq!(
+            graph.composition.mixer().mix.pattern,
+            crate::mixing_boundary::WipePattern::Circle
+        );
+        assert!((gesture_canvas.radius - 0.9).abs() < 1.0e-6);
+    }
+
+    /// B9's labeled export case: a recorded take rides beside the patch and
+    /// replays by reference tick through the shared appliers. The `_untaken`
+    /// twin renders the identical patch with no take and must decode
+    /// differently — the take demonstrably reaches the pixels — and the
+    /// `_repeat` render must decode identically, which is the record/replay
+    /// determinism claim: same take, same patch, same frames.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_performance_recorder_pipeline() {
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let document = performance_take_fixture();
+        let output = render_with_take("performance_recorder", base_patch(), Some(document.clone()));
+        // The job published the take beside the render, byte-verifiable.
+        let sidecar = performance_sidecar_path(&output);
+        let published = crate::performance_track::PerformanceTakeDocument::from_json_bytes(
+            &std::fs::read(&sidecar).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(published, document);
+
+        render_with_take("performance_recorder_untaken", base_patch(), None);
+        assert_ne!(
+            decoded_framemd5("renders/audit_performance_recorder.mp4"),
+            decoded_framemd5("renders/audit_performance_recorder_untaken.mp4"),
+            "a replayed take must change the decoded frames"
+        );
+        assert!(
+            !performance_sidecar_path("renders/audit_performance_recorder_untaken.mp4").exists(),
+            "no take, no sidecar"
+        );
+
+        render_with_take("performance_recorder_repeat", base_patch(), Some(document));
+        assert_eq!(
+            decoded_framemd5("renders/audit_performance_recorder.mp4"),
+            decoded_framemd5("renders/audit_performance_recorder_repeat.mp4"),
+            "the same take against the same patch must replay identically"
+        );
     }
 }

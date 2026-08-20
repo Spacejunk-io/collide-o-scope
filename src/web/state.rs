@@ -1261,6 +1261,12 @@ pub struct AppSnapshot {
     /// otherwise complete snapshot as a disarmed, empty recording.
     #[serde(default)]
     pub gesture: GestureStatusSnapshot,
+    /// B9 performance-recorder truth. Additive: an older panel deserializes
+    /// an otherwise complete snapshot as a disarmed recorder with no take.
+    /// (`performance` is the clip/scene block, so this one carries its full
+    /// name.)
+    #[serde(default)]
+    pub performance_recorder: PerformanceStatusSnapshot,
     /// Program-wide Curved Shutter authoring and read-only execution truth.
     /// Faraday controls remain disabled for this master scope.
     #[serde(default)]
@@ -1360,6 +1366,7 @@ impl Default for AppSnapshot {
             osc_runtime: OscRuntimeSnapshot::default(),
             temporal: TemporalSnapshot::default(),
             gesture: GestureStatusSnapshot::default(),
+            performance_recorder: PerformanceStatusSnapshot::default(),
             master_motion: MotionSnapshot::default(),
             spout: SpoutSnapshot::default(),
             recorder: ProgramRecorderSnapshot::default(),
@@ -2548,6 +2555,42 @@ pub struct GestureStatusSnapshot {
     /// published beside the recording truth rather than inside it.
     #[serde(default)]
     pub canvas: GestureCanvasStatusSnapshot,
+}
+
+/// B9 performance-recorder truth. Additive: an older panel deserializes an
+/// otherwise complete snapshot as a disarmed recorder with no take.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PerformanceStatusSnapshot {
+    /// `off`, `recording`, or `playing`. The two transports are mutually
+    /// exclusive by refusal, so one mode word tells the whole truth.
+    #[serde(default)]
+    pub mode: String,
+    /// Events and distinct control addresses in the loaded take.
+    pub recorded_events: u32,
+    pub recorded_controls: u32,
+    /// Declared take length in 30 Hz reference ticks, stamped at disarm so
+    /// trailing silence stays part of the loop period.
+    pub length_ticks: u32,
+    /// Replay playhead address while playback is armed, zero otherwise.
+    pub playhead_tick: u32,
+    pub loop_playback: bool,
+    /// The take reached its bounded event cap and newer edits stayed
+    /// live-only.
+    pub truncated: bool,
+    /// Recordable-family edits whose param has no declared value law, and
+    /// edits whose value the law could not represent. Separate counters,
+    /// never merged into the recorded count.
+    pub unsupported_edits: u64,
+    pub rejected_edits: u64,
+    /// Canonical checksum of the loaded take, empty while it is empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub checksum: String,
+    /// Named per-address diagnostics for controls the current program could
+    /// not resolve at playback arm — degraded, never retargeted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
 }
 
 /// Authored gesture-canvas controls and the session-local field they drive.
@@ -4528,6 +4571,32 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// Arm or disarm B9 performance recording.
+    ///
+    /// An ordered barrier on the `set_gesture_recording` law: it is never
+    /// coalesced, never latched, and carries the layer-stack revision so an
+    /// arm decision taken against one program can never arrive after a patch
+    /// load has replaced it. Arming starts a fresh take at tick zero.
+    #[serde(rename = "set_performance_recording")]
+    SetPerformanceRecording {
+        enabled: bool,
+        layer_stack_revision: u64,
+    },
+    /// Arm, retune, or disarm B9 performance playback.
+    ///
+    /// The same barrier law as the recording control. Compilation resolves
+    /// every recorded address against the current program exactly once at
+    /// arm; a repeated arm while playing only updates the loop flag.
+    #[serde(rename = "set_performance_playback")]
+    SetPerformancePlayback {
+        enabled: bool,
+        #[serde(default)]
+        loop_playback: bool,
+        layer_stack_revision: u64,
+    },
+    /// Discard the loaded take and stop both performance transports.
+    #[serde(rename = "clear_performance_take")]
+    ClearPerformanceTake,
     /// Set fullscreen audience output explicitly. Current clients use this
     /// idempotent command so a delayed/retried packet cannot invert the
     /// performer's requested state.
@@ -5013,6 +5082,9 @@ impl WebAction {
                 | Self::Pad { .. }
                 | Self::GestureSample { .. }
                 | Self::SetGestureRecording { .. }
+                | Self::SetPerformanceRecording { .. }
+                | Self::SetPerformancePlayback { .. }
+                | Self::ClearPerformanceTake
                 | Self::TriggerCollisionScore
                 | Self::TriggerRefreshGarden
                 | Self::ClearTemporalEventTrack
@@ -5078,6 +5150,9 @@ impl WebAction {
             | Self::SetRefreshGardenMotionRoute { .. }
             | Self::ClearTemporalEventTrack
             | Self::SetGestureRecording { .. }
+            | Self::SetPerformanceRecording { .. }
+            | Self::SetPerformancePlayback { .. }
+            | Self::ClearPerformanceTake
             | Self::SetMotionDonor { .. }
             | Self::SetMotionColliderInput { .. }
             | Self::RequestLayerProxy { .. }
@@ -7451,6 +7526,7 @@ mod protocol_tests {
             "id=\"motion-fields-group\"",
             "id=\"temporal-group\"",
             "id=\"gesture-group\"",
+            "id=\"performance-group\"",
             "id=\"audio-group\"",
         ];
         let mut previous = 0;
@@ -7459,7 +7535,9 @@ mod protocol_tests {
             assert!(position >= previous, "{marker} is out of column order");
             previous = position;
         }
-        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 7);
+        // 7 -> 8 when B9 added the TAKE RECORDER group beside the gesture
+        // field it composes with.
+        assert_eq!(second_column.matches("<div class=\"fx-group\"").count(), 8);
         assert!(!second_column.contains("id=\"mod-group\""));
         assert!(!second_column.contains("id=\"pad-group\""));
         assert!(!second_column.contains("id=\"midi-group\""));
@@ -10806,6 +10884,152 @@ mod protocol_tests {
             assert!(
                 serde_json::from_str::<WebAction>(hostile).is_err(),
                 "accepted an incomplete recording barrier: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn performance_transport_controls_are_uncoalesced_priority_barriers() {
+        // The B9 transports ride the set_gesture_recording law exactly: never
+        // coalesced (an absolute value must not jump an arm/disarm edge),
+        // priority admission, and no manual-history transaction.
+        let record = WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: 9,
+        };
+        let playback = WebAction::SetPerformancePlayback {
+            enabled: true,
+            loop_playback: true,
+            layer_stack_revision: 9,
+        };
+        let clear = WebAction::ClearPerformanceTake;
+        for action in [&record, &playback, &clear] {
+            assert!(action.is_priority());
+            assert!(action.coalesce_key().is_none());
+            assert!(action.is_performance_only_for_history());
+        }
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::json!({
+                "action": "set_performance_recording",
+                "enabled": true,
+                "layer_stack_revision": 9
+            })
+        );
+        let decoded = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_performance_playback","enabled":true,"layer_stack_revision":4}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                decoded,
+                WebAction::SetPerformancePlayback {
+                    enabled: true,
+                    loop_playback: false,
+                    layer_stack_revision: 4,
+                }
+            ),
+            "the loop flag defaults off for an older client"
+        );
+        for hostile in [
+            r#"{"action":"set_performance_recording"}"#,
+            r#"{"action":"set_performance_recording","enabled":true}"#,
+            r#"{"action":"set_performance_playback","loop_playback":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WebAction>(hostile).is_err(),
+                "accepted an incomplete transport barrier: {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_performance_snapshot_is_additive_and_publishes_honest_counters() {
+        // An older snapshot without the block decodes as a disarmed recorder.
+        let legacy = serde_json::to_value(AppSnapshot::default())
+            .map(|mut value| {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("performance_recorder");
+                value
+            })
+            .unwrap();
+        let decoded: AppSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.performance_recorder,
+            PerformanceStatusSnapshot::default()
+        );
+
+        // Empty checksum and degraded lists are omitted from the wire, so an
+        // empty take can never read as a verified one.
+        let idle = serde_json::to_value(PerformanceStatusSnapshot::default()).unwrap();
+        assert!(idle.get("checksum").is_none());
+        assert!(idle.get("degraded").is_none());
+        let busy = serde_json::to_value(PerformanceStatusSnapshot {
+            mode: "playing".to_string(),
+            checksum: "abc".to_string(),
+            degraded: vec!["layer_effect:3:pixelate".to_string()],
+            unsupported_edits: 2,
+            rejected_edits: 1,
+            ..PerformanceStatusSnapshot::default()
+        })
+        .unwrap();
+        assert_eq!(busy["checksum"], "abc");
+        assert_eq!(busy["degraded"][0], "layer_effect:3:pixelate");
+        assert_eq!(busy["unsupported_edits"], 2);
+    }
+
+    #[test]
+    fn the_panel_wires_the_performance_recorder_and_never_latches_its_transports() {
+        let html = include_str!("../../static/index.html");
+        for contract in [
+            "id=\"performance-group\"",
+            "id=\"performance-record-toggle\"",
+            "id=\"performance-play-toggle\"",
+            "id=\"performance-loop-toggle\"",
+            "id=\"performance-clear\"",
+            "id=\"performance-state\"",
+            "id=\"performance-telemetry\"",
+            "id=\"performance-checksum\"",
+            "id=\"performance-degraded\"",
+        ] {
+            assert!(html.contains(contract), "missing recorder HTML: {contract}");
+        }
+        // The fast counters must not sit inside a live announcement region.
+        let telemetry = html
+            .find("id=\"performance-telemetry\"")
+            .expect("performance telemetry element");
+        let telemetry_tag = &html[telemetry..telemetry + html[telemetry..].find('>').unwrap()];
+        assert!(!telemetry_tag.contains("role=\"status\""));
+        assert!(!telemetry_tag.contains("aria-live=\"polite\""));
+
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "syncPerformanceRecorder(msg.performance_recorder)",
+            "action: 'set_performance_recording',",
+            "action: 'set_performance_playback',",
+            "action: 'clear_performance_take'",
+            "loop_playback: performanceLoop,",
+            "'No recorded take'",
+            "recorded edit(s)",
+        ] {
+            assert!(js.contains(contract), "missing recorder JS: {contract}");
+        }
+
+        // No transport may ever be wrapped in a quantized batch.
+        let start = js.find("const QUANTIZABLE_ACTIONS").expect("allowlist");
+        let tail = &js[start..];
+        let end = tail.find("]);").expect("allowlist end") + 3;
+        let allowlist = &tail[..end];
+        for forbidden in [
+            "set_performance_recording",
+            "set_performance_playback",
+            "clear_performance_take",
+        ] {
+            assert!(
+                !allowlist.contains(forbidden),
+                "{forbidden} must never be latchable"
             );
         }
     }

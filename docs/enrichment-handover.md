@@ -29,7 +29,8 @@ second full-frame history ring.
 | B16 — program re-entry | **Complete** | `docs/evidence/b16-program-reentry-note.md`; CLAUDE.md "B16 program re-entry" |
 | B5 — codec mosh | **Complete** | `docs/evidence/b5-codec-mosh-note.md`; CLAUDE.md "B5 codec mosh" |
 | B7 — generator sources | **Complete** | `docs/evidence/b7-generator-sources-note.md`; CLAUDE.md "B7 generator sources" |
-| B9, B10, B11, B6, B15 | Open | — |
+| B9 — the performance recorder | **Complete** | `docs/evidence/b9-performance-recorder-note.md`; CLAUDE.md "The B9 performance recorder" |
+| B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -37,15 +38,16 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-**Wave 2 is complete** (B1, B4, B8, B16, B5, B7). Wave 3 opens with **B9,
-the performance recorder** — the gesture-track contract as template
-(`gesture.rs`: reference ticks, Q16 quantization, domain-separated SHA-256,
-bounded serde, truncation honesty) recording `(tick, param_address, value)`
-events at the coalesced drain, replayed by dispatching real actions through
-`handle_web_action_inner_with_feedback` with an automation origin (the
-transform-gizmo delegation law), values only in v1, stale addresses
-degrading per-address with named diagnostics. Fetch the plan document
-before starting it.
+**Wave 3 continues with B10, modulation source expansion** — pure `ModSource`
+extension through the one matrix law: envelopes (trigger vocabulary
+`Pad | AudioOnset | SceneCut | Beat`, stated retrigger law), deterministic
+chaos/drift/spike generators (seeded, frame-indexed offline — replay identity
+is ours to claim), four macros, and the video-reactive sources
+(`video_motion` from the Motion lattice armed on demand;
+`video_brightness`/`video_cut` via one 16×16 reduction + readback at ~10 Hz
+inside the existing ≤3 in-flight budget). State explicitly which sources are
+live-only zeros offline versus derivable frame-indexed, and test the parity.
+Fetch the plan document before starting it.
 
 ## The working method every tranche follows
 

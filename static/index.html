@@ -1340,6 +1340,30 @@
             </div>
           </div>
 
+          <div class="fx-group" id="performance-group">
+            <div class="fx-group-header">
+              <span class="chevron">&#x25BC;</span>
+              <span class="group-label">TAKE RECORDER</span>
+            </div>
+            <div class="fx-group-body">
+              <div class="performance-recorder" role="region" aria-label="Performance take recorder">
+                <div class="temporal-command-row">
+                  <button type="button" id="performance-record-toggle" aria-pressed="false">Arm recording</button>
+                  <button type="button" id="performance-play-toggle" aria-pressed="false">Play take</button>
+                </div>
+                <div class="temporal-command-row">
+                  <button type="button" id="performance-loop-toggle" aria-pressed="false">Loop</button>
+                  <button type="button" id="performance-clear">Clear take</button>
+                </div>
+                <div class="audio-status" id="performance-state" role="status" aria-live="polite">Recorder off</div>
+                <div class="audio-status performance-telemetry" id="performance-telemetry" aria-live="off">0 recorded edit(s) · 0 control(s) · 0 tick(s)</div>
+                <div class="audio-status" id="performance-checksum" aria-live="off">No recorded take</div>
+                <div class="audio-status" id="performance-degraded" aria-live="off"></div>
+                <div class="audio-status">A take records accepted value edits only. Safety controls, topology, and routes never enter it; replay moves the controls against whatever footage is loaded.</div>
+              </div>
+            </div>
+          </div>
+
           <div class="fx-group" id="audio-group">
             <div class="fx-group-header">
               <span class="chevron">&#x25BC;</span>

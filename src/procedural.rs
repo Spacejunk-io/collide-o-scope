@@ -4022,6 +4022,7 @@ mod tests {
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         }
     }
 
