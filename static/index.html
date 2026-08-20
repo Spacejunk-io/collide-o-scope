@@ -1948,6 +1948,9 @@
     </main>
   </div>
 
+  <!-- The help table is generated from src/control_help.rs and must load
+       before app.js, which indexes it for search and tooltips. -->
+  <script src="help.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
