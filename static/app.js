@@ -2514,11 +2514,20 @@ function syncTemporal(t) {
     sync_latched: syncLatch.latched,
   };
   // The latch's honest state: the switch says what was asked for, this says
-  // whether the program is actually still carrying accumulated shear.
+  // whether the program is actually still carrying accumulated shear. The
+  // fact is carried by the text as well as the colour, so it does not depend
+  // on colour perception to be readable.
   const syncStatus = document.getElementById('sync-latch-status');
   if (syncStatus) {
-    syncStatus.classList.toggle('sync-damaged', t.sync_damaged === true);
-    syncStatus.dataset.damaged = t.sync_damaged === true ? 'true' : 'false';
+    if (!syncStatus.dataset.baseText) {
+      syncStatus.dataset.baseText = syncStatus.textContent;
+    }
+    const damaged = t.sync_damaged === true;
+    syncStatus.classList.toggle('sync-damaged', damaged);
+    syncStatus.dataset.damaged = damaged ? 'true' : 'false';
+    syncStatus.textContent = damaged
+      ? 'DAMAGE HELD — the program is still carrying accumulated shear. Release the latch to unwind it.'
+      : syncStatus.dataset.baseText;
   }
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;

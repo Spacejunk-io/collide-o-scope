@@ -7126,6 +7126,65 @@ mod protocol_tests {
         }
     }
 
+    /// The B14 latch publishes `sync_damaged` as renderer truth, and the
+    /// panel must actually surface it. A fact wired to the DOM and then left
+    /// invisible is the same as not publishing it, so this pins the styling
+    /// rule *and* the text swap — the state must be readable without relying
+    /// on colour perception.
+    #[test]
+    fn the_sync_latch_damage_state_is_visible_and_not_colour_only() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+
+        assert!(
+            html.contains("id=\"sync-latch-status\""),
+            "the sync latch needs a status region to report damage into"
+        );
+        assert!(
+            css.contains(".audio-status.sync-damaged"),
+            "the damage class must carry a styling rule, or the published fact is invisible"
+        );
+        // Colour is the secondary cue; the text is the primary one.
+        assert!(
+            js.contains("DAMAGE HELD"),
+            "the damage state must be readable as text, not colour alone"
+        );
+        assert!(
+            js.contains("syncStatus.dataset.baseText"),
+            "the help text must be restored when the damage clears"
+        );
+        for contract in [
+            "sync_amount: syncLatch.amount",
+            "sync_latched: syncLatch.latched",
+            "const syncLatch = t.sync || {}",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing sync latch binding: {contract}"
+            );
+        }
+        for contract in [
+            "data-temporal=\"sync_amount\"",
+            "data-temporal=\"sync_rate\"",
+            "data-temporal=\"sync_spread\"",
+            "data-temporal=\"sync_bias\"",
+            "data-temporal=\"sync_latched\"",
+        ] {
+            assert!(
+                html.contains(contract),
+                "missing sync latch row: {contract}"
+            );
+        }
+        // The switch is a checkbox and carries its own accessible label.
+        assert!(
+            html.contains(
+                "aria-label=\"Latch horizontal sync faults instead of letting them heal\""
+            ),
+            "the latch switch needs an accessible label"
+        );
+    }
+
     #[test]
     fn spatial_transform_browser_contract_is_complete_accessible_and_stable_id_based() {
         let html = include_str!("../../static/index.html");
