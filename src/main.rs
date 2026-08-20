@@ -4385,6 +4385,13 @@ struct App {
     /// every frame and hashing the take at display rate would add no truth.
     performance_checksum: String,
     performance_status: String,
+    /// B10 video content-analysis host state: the shared CPU law fed by the
+    /// renderer's reduction readbacks, its 10 Hz cadence accumulator, and
+    /// whether the analysis was armed last frame (for the one-shot disarm
+    /// reset).
+    video_analysis_state: modulation::VideoAnalysisState,
+    video_analysis_accumulator: f64,
+    video_analysis_primed: bool,
     /// Routes a completed authored stroke onto exactly one manual-history
     /// entry. Automation-driven origins never reach the store at all.
     gesture_history: history::GestureHistoryRouter,
@@ -4837,6 +4844,9 @@ impl App {
             performance_rejected_edits: 0,
             performance_checksum: String::new(),
             performance_status: String::new(),
+            video_analysis_state: modulation::VideoAnalysisState::default(),
+            video_analysis_accumulator: 0.0,
+            video_analysis_primed: false,
             gesture_history: history::GestureHistoryRouter::default(),
             gesture_history_open: None,
             transform_gizmo_drag: None,
@@ -6679,6 +6689,9 @@ impl App {
         // it, exactly as it does not clear the temporal track.
         self.clear_gesture_recording_state();
         self.clear_performance_recording_state();
+        self.video_analysis_state.reset();
+        self.video_analysis_accumulator = 0.0;
+        self.video_analysis_primed = false;
         self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::PatchGeneration);
         self.temporal_boundaries
             .reanchor(self.mod_matrix.current_beat);
@@ -11159,6 +11172,9 @@ impl App {
                 // Latching a sample or an arm/disarm edge to the next downbeat
                 // would rewrite the recorded stream.
                 | web::state::WebAction::GestureSample { .. }
+                // A B10 bend edge is authored against the frame it was played
+                // in; latching one would move a hand-timed envelope trigger.
+                | web::state::WebAction::BendPad { .. }
                 | web::state::WebAction::SetGestureRecording { .. }
                 // The B9 transports are the same class of barrier: an
                 // arm/disarm edge latched to a downbeat would attach a take
@@ -13391,6 +13407,7 @@ impl App {
                 | WebAction::GyroStream { .. }
                 | WebAction::GyroCalibrate
                 | WebAction::Pad { .. }
+                | WebAction::BendPad { .. }
                 | WebAction::SetPerformanceRecording { .. }
                 | WebAction::SetPerformancePlayback { .. }
                 | WebAction::ClearPerformanceTake
@@ -14131,6 +14148,19 @@ impl App {
                 Param::Paused | Param::ProgramFreeze => Self::normalized_bool(self.master_paused),
                 Param::MediaFreeze => Self::normalized_bool(self.media_frozen),
                 Param::Blackout => Self::normalized_bool(self.blackout),
+                // B10 bend pads answer their held state so a bound
+                // controller's LED can mirror the hold.
+                Param::Bend1
+                | Param::Bend2
+                | Param::Bend3
+                | Param::Bend4
+                | Param::Bend5
+                | Param::Bend6 => Self::normalized_bool(
+                    param
+                        .bend_index()
+                        .map(|index| self.mod_matrix.bend_held[index])
+                        .unwrap_or(false),
+                ),
                 _ => return None,
             }),
             Address::Layer {
@@ -14430,6 +14460,20 @@ impl App {
                         _ => unreachable!(),
                     };
                     self.apply_gesture_control(origin, input);
+                    return Ok(requested);
+                }
+                // B10 bend pads: the gesture-contact law. A bound note or
+                // button drives the momentary engine surface directly, so the
+                // press/release edges never queue behind browser ingress.
+                Param::Bend1
+                | Param::Bend2
+                | Param::Bend3
+                | Param::Bend4
+                | Param::Bend5
+                | Param::Bend6 => {
+                    if let Some(index) = parameter.bend_index() {
+                        self.mod_matrix.set_bend(index, bool_value);
+                    }
                     return Ok(requested);
                 }
                 Param::BusCrossfade => WebAction::SetCompositionBusCrossfade { value: requested },
@@ -17176,6 +17220,56 @@ impl App {
                         _ => {}
                     }
                 }
+            }
+            WebAction::SetEnvelope {
+                index,
+                param,
+                value,
+            } => {
+                if let Some(envelope) = self.mod_matrix.envelopes.get_mut(index) {
+                    match param.as_str() {
+                        "attack" => {
+                            if let Some(n) = value.as_f64() {
+                                envelope.attack = n as f32;
+                            }
+                        }
+                        "decay" => {
+                            if let Some(n) = value.as_f64() {
+                                envelope.decay = n as f32;
+                            }
+                        }
+                        "trigger" => {
+                            if let Some(trigger) = value
+                                .as_str()
+                                .and_then(modulation::EnvelopeTrigger::try_from_str)
+                            {
+                                envelope.trigger = trigger;
+                            }
+                        }
+                        "mode" => {
+                            if let Some(mode) = value
+                                .as_str()
+                                .and_then(modulation::EnvelopeMode::try_from_str)
+                            {
+                                envelope.mode = mode;
+                            }
+                        }
+                        _ => {}
+                    }
+                    envelope.sanitize();
+                }
+            }
+            WebAction::SetMacro { index, value } => {
+                self.mod_matrix.set_macro(index, value);
+            }
+            WebAction::SetModSeed { seed } => {
+                // A new seed is a new deterministic trajectory; restarting the
+                // generators is what makes the reseed itself replayable.
+                self.mod_matrix.generator_seed = seed;
+                self.mod_matrix.reset_performance_sources();
+            }
+            WebAction::BendPad { index, held } => {
+                self.mod_matrix.set_bend(index, held);
             }
             WebAction::AddRouting => {
                 self.mod_matrix.add_routing();
@@ -20546,6 +20640,25 @@ impl ApplicationHandler for App {
             }
         }
 
+        // A B10 bend release is honored even when egui is about to consume
+        // the event: a text field grabbing focus mid-hold must never leave a
+        // pad latched on. Presses stay behind the egui gate, so typing digits
+        // into an editor field plays nothing.
+        if let WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key,
+                    state: winit::event::ElementState::Released,
+                    ..
+                },
+            ..
+        } = &event
+        {
+            if let Some(index) = input::keyboard::map_bend_key(*physical_key) {
+                self.mod_matrix.set_bend(index, false);
+            }
+        }
+
         if let Some(egui_winit) = &mut self.egui_winit {
             let response = egui_winit.on_window_event(self.window.as_ref().unwrap(), &event);
             if response.consumed {
@@ -20575,6 +20688,12 @@ impl ApplicationHandler for App {
                 self.modifiers = mods.state();
             }
 
+            WindowEvent::Focused(false) => {
+                // A window losing focus can swallow key-up events; releasing
+                // every bend pad is what keeps a momentary control momentary.
+                self.mod_matrix.release_all_bends();
+            }
+
             WindowEvent::DroppedFile(path) => {
                 if path.is_dir() {
                     self.set_library_folder(path);
@@ -20599,6 +20718,18 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
+                // B10 bend pads: the digit row is momentary. The press edge
+                // lands here (behind the egui gate); the release edge was
+                // already honored above it. Key repeat re-asserts held, which
+                // is idempotent. Ctrl+digit stays free for future shortcuts.
+                if !self.modifiers.control_key() {
+                    if let Some(index) = input::keyboard::map_bend_key(physical_key) {
+                        if state == winit::event::ElementState::Pressed {
+                            self.mod_matrix.set_bend(index, true);
+                        }
+                        return;
+                    }
+                }
                 // Ctrl+key shortcuts (editor toggle, save, load)
                 if state == winit::event::ElementState::Pressed && self.modifiers.control_key() {
                     match physical_key {
@@ -20819,6 +20950,28 @@ impl ApplicationHandler for App {
                     self.poll_live_capture();
                     self.drain_proxy_worker_events();
                     self.drain_proxy_adoption_events();
+
+                    // B10 video analysis: harvest the oldest completed grid
+                    // and run the shared CPU law on it, publishing into the
+                    // matrix before this frame's modulation sample. While
+                    // disarmed the state resets once, so a later re-arm is an
+                    // honest first frame instead of a giant phantom cut.
+                    if self.mod_matrix.video_analysis_armed() {
+                        let harvested = self
+                            .renderer
+                            .as_mut()
+                            .and_then(Renderer::poll_video_analysis);
+                        if let Some((grid, dt)) = harvested {
+                            let sample = self.video_analysis_state.analyze(&grid, dt);
+                            self.mod_matrix.set_video_analysis(sample);
+                        }
+                    } else if self.video_analysis_primed {
+                        self.video_analysis_state.reset();
+                        self.mod_matrix
+                            .set_video_analysis(modulation::VideoAnalysisSample::default());
+                        self.video_analysis_accumulator = 0.0;
+                    }
+                    self.video_analysis_primed = self.mod_matrix.video_analysis_armed();
 
                     // Process actions from web UI
                     let mut pending_actions: VecDeque<_> = self
@@ -23014,6 +23167,26 @@ impl ApplicationHandler for App {
                         // export has no blackout.
                         if temporal_frame_accepted && !self.blackout {
                             renderer.publish_program_tap();
+                        }
+                        // B10 video analysis shares the seam: the reduction
+                        // observes the exact pre-blackout image the tap
+                        // publishes, armed on demand and cadenced at 10 Hz on
+                        // the reference grid (three ticks). A busy pool keeps
+                        // the accumulator so the next accepted frame retries;
+                        // Pause contributes no delta, so the cadence holds.
+                        if temporal_frame_accepted
+                            && temporal_input.freeze.program_advances()
+                            && self.mod_matrix.video_analysis_armed()
+                        {
+                            self.video_analysis_accumulator += f64::from(program_delta);
+                            let interval =
+                                3.0 / f64::from(crate::effects::params::TEMPORAL_REFERENCE_FPS);
+                            if self.video_analysis_accumulator >= interval
+                                && renderer
+                                    .schedule_video_analysis(self.video_analysis_accumulator as f32)
+                            {
+                                self.video_analysis_accumulator = 0.0;
+                            }
                         }
                         if advanced_audience_rendered {
                             if let Some(executor) = &mut self.composition_gpu {
@@ -32732,6 +32905,75 @@ mod app_state_tests {
         assert_eq!(
             law(Control::BusCrossfade),
             Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+    }
+
+    // ===== B10 mod sources =====
+
+    #[test]
+    fn b10_source_appliers_reach_the_matrix_through_the_ordinary_door() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.handle_web_action(web::state::WebAction::SetEnvelope {
+            index: 2,
+            param: "trigger".to_string(),
+            value: serde_json::json!("bar"),
+        });
+        assert_eq!(
+            app.mod_matrix.envelopes[2].trigger,
+            modulation::EnvelopeTrigger::Beat(4)
+        );
+        app.handle_web_action(web::state::WebAction::SetEnvelope {
+            index: 2,
+            param: "decay".to_string(),
+            value: serde_json::json!(99.0),
+        });
+        assert!(
+            (app.mod_matrix.envelopes[2].decay - 30.0).abs() < 1.0e-6,
+            "the applier sanitizes into the documented range"
+        );
+        app.handle_web_action(web::state::WebAction::SetMacro {
+            index: 1,
+            value: 0.4,
+        });
+        assert!((app.mod_matrix.macros[1] - 0.4).abs() < 1.0e-6);
+        app.handle_web_action(web::state::WebAction::BendPad {
+            index: 4,
+            held: true,
+        });
+        assert!(app.mod_matrix.bend_held[4]);
+        app.handle_web_action(web::state::WebAction::BendPad {
+            index: 4,
+            held: false,
+        });
+        assert!(!app.mod_matrix.bend_held[4]);
+        // A bend edge is never latchable.
+        app.queue_quantized_action(web::state::WebAction::BendPad {
+            index: 1,
+            held: true,
+        });
+        assert!(!app.mod_matrix.bend_held[1]);
+        assert!(app.composition_status.contains("cannot be quantized"));
+    }
+
+    #[test]
+    fn reseeding_the_generators_restarts_a_deterministic_trajectory() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let run = |app: &mut App| -> Vec<f32> {
+            app.handle_web_action(web::state::WebAction::SetModSeed { seed: 12 });
+            (0..120)
+                .map(|_| {
+                    app.mod_matrix.update_at_beat(0.0, 1.0 / 30.0);
+                    app.mod_matrix.source_value(modulation::ModSource::Chaos)
+                })
+                .collect()
+        };
+        let first = run(&mut app);
+        let second = run(&mut app);
+        assert_eq!(
+            first, second,
+            "applying the same seed restarts the same trajectory"
         );
     }
 

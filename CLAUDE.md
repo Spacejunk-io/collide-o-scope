@@ -52,6 +52,7 @@ src/
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
 ├── renderer/stage_map.rs fixed-resource multi-endpoint venue presenter
+├── renderer/video_analysis.rs B10 armed-on-demand 32×18 program-image reduction and bounded readback pool
 ├── renderer/study.rs    fixed-pipeline Study interpreter executor, two textures, no sampler
 ├── video/decoder.rs     synchronous ffmpeg decode core and RGBA row repacking
 ├── video/hw_decode.rs   evaluation-only D3D11VA session and the interop probe seam
@@ -93,6 +94,7 @@ src/
     ├── melting_edge.wgsl  B8 coverage-boundary probe, band drag, self-feeding hold
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
+    ├── video_analysis.wgsl B10 32×18 content-analysis reduction, 16 bilinear taps per cell
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math; the B8 bus mixer
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
     ├── motion_collide.wgsl two-pass Field Collider map and recombination
@@ -589,8 +591,70 @@ spring, slew, and Morph progress rather than advancing transients. Export must
 use this same frame-indexed order and one-sample reuse.
 
 Sources include four clocked LFOs, seven audio characteristics, four MIDI CC
-slots, three gyro axes, and two pad axes. LFOs are bipolar; external sources
-are normalized to 0…1.
+slots, three gyro axes, two pad axes, and the B10 performance sources below.
+LFOs, chaos, and drift are bipolar; every other source is normalized to 0…1.
+
+### B10 performance sources
+
+Pure `ModSource` extension through the one matrix law — no new modulation
+targets, no morph surface, `LAYER_TARGET_SUFFIXES` untouched, and the laws
+derived from BENDR (MIT, © 2026 Steve Blythe) with one house hardening BENDR
+never claimed: **deterministic replay**. Every generator is a pure function
+of accumulated program seconds, the persisted `generator_seed`, and the
+frame inputs, so the same patch replays the same trajectory live and
+offline.
+
+- **Bend pads** `bend1..bend6`: momentary sources on the asymmetric ramp
+  (24/s toward held, 7/s released). Native digit row 1–6 through the
+  dedicated `map_bend_key` mapper (`map_key`'s release-is-inert law is
+  pinned and unmoved; releases are honored even when egui consumes the
+  event, and focus loss releases every pad); panel pads copy the XY pad's
+  pointer-capture/blur/visibility/reconnect machinery; controller profiles
+  bind notes or buttons onto the appended `ControlParameter::Bend1..6`
+  engine surfaces (the GestureContact precedent). Held state never
+  persists; `bend_pad` has no coalesce key, both edges are priority, and it
+  is refused in `Quantized` batches at both gates.
+- **Envelopes** `env1..env4`: linear attack resuming from the current level
+  on retrigger, exponential decay, modes `once | gate | loop`, triggers
+  `bend1..6 | audio_onset | scene_cut | beat | beat2 | bar`. Beat triggers
+  fire on whole-multiple crossings and anchor without firing on first
+  observation. Attack 0.005..10 s, decay 0.02..30 s, neutral non-finite
+  fallbacks.
+- **Macros** `macro1..macro4`: an authored knob that is a source.
+- **Generators**: chaos (hashed hold-interval walk, eased 7/s), drift (the
+  fixed three-sine sum), spike (per-reference-tick firing at 1.6 events/s,
+  hashed amplitude, 9/s decay — tick-addressed and therefore frame-rate
+  invariant). One persisted seed, two hash domains; reseeding restarts the
+  trajectories deterministically.
+- **Video-reactive** `video_motion` / `video_brightness` / `video_cut`:
+  BENDR's content analysis whole — one 32×18 encoded-luma grid; brightness
+  is the mean, cut an onset against `max(0.06, 3.5·EMA)` with `exp(-5t)`
+  release, motion peak-normalized frame difference; the first grid after a
+  gap zeroes motion/cut. Two deliberate deviations from the tranche sketch,
+  both toward BENDR's shipped law: motion is frame difference (not a
+  Motion-lattice readback) and the grid is 32×18 (not 16×16). Armed on
+  demand (`video_analysis_armed`: a consuming route or a scene-cut
+  trigger); live, a lazy `VideoAnalysisGpu` reduces the pre-blackout slot-2
+  image at the program-tap acceptance seam, 10 Hz on the reference grid,
+  through its own two-slot FIFO readback pool (busy pool drops cleanly;
+  ledger: one 2,304-byte target + two 4,608-byte buffers, outside the
+  full-frame texture floor on the pattern-synth precedent; the three
+  full-frame audience readback slots are untouched). Offline, the export
+  loop runs the same CPU law (`reduce_video_analysis_grid`, same UVs, same
+  linear-light filtering) on the frame bytes it already reads for ffmpeg,
+  landing each sample at N-1 — video reactivity is deterministic offline.
+
+Patch closure: `ModConfig.envelopes` / `macros` / `generator_seed`,
+skip-serialized at their defaults so pre-B10 patches keep their bytes and
+canonical hashes; runtime state resets at apply. Wire: `set_envelope` /
+`set_macro` / `set_mod_seed` coalescible and gated by the engine's own
+vocabularies; a new seed restarts the generators. Snapshot: additive
+`envelopes`/`macros`/`bends`/`generator_seed` on `ModSnapshot`. Panel: the
+PERFORM SOURCES group (third-column pin 3 → 4; JS range-template pin
+21 → 24, HTML 198 unmoved). Dice and the generator preserve the sections
+exactly (`GENERATOR_VERSION` stays "12").
+`render_mod_sources_pipeline` is the labeled export case with its
+`_unrouted` difference twin and `_repeat` determinism assertion.
 
 ### Clock and beat latch
 
@@ -3402,6 +3466,25 @@ mislead browser tests.
   with stale-position and absent-morph no-ops.
   `render_performance_recorder_pipeline` is the labeled export case with its
   `_untaken` difference twin and `_repeat` determinism assertion.
+- Mod-source (B10) tests must cover the closed source and trigger
+  vocabularies, every envelope law against its closed form (attack timing,
+  exponential decay, gate hold, loop re-fire, retrigger resuming from the
+  current level, the beat-crossing anchor law), chaos determinism per seed
+  with bounds, spike tick-addressing with frame-rate invariance, the
+  analytic drift sum, bend ramp asymmetry with out-of-range refusal and
+  reset release, macro clamping, the video-analysis law (first-frame
+  honesty, cut onset/decay, no-source decay, hostile input), the reduction
+  reference's flat-field exactness and gradient monotonicity, the
+  arm-on-demand predicate, the ModConfig round trip with skip-at-default
+  omission and hostile sanitize, both gates' vocabularies with the
+  never-latchable bend edge, the panel contracts, `map_bend_key` with
+  `map_key`'s release-is-inert law intact, and reseed determinism through
+  the real action door.
+  `gpu_video_analysis_reduction_matches_the_cpu_reference` carries the
+  physical-GPU claim (the B7 statistical contract: ≥95% of grid bytes
+  within 4 code values, plus the two-slot saturation drop), and
+  `render_mod_sources_pipeline` is the labeled export case with its
+  `_unrouted` difference twin and `_repeat` determinism assertion.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

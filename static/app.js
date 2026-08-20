@@ -232,6 +232,14 @@ function connect() {
         padNeedsReconcile = false;
       }
     }
+    // B10 bend pads: re-assert every held state on reconnect so a release
+    // the server missed can never stay latched, and a hold the server missed
+    // resumes.
+    if (typeof bendHeldLocal !== 'undefined') {
+      for (let i = 0; i < 6; i++) {
+        sendAction({ action: 'bend_pad', index: i, held: bendHeldLocal[i] });
+      }
+    }
     reconcileInterruptedHistoryGestures();
     reconcileGyroStreamConnection();
   };
@@ -5977,7 +5985,150 @@ const MOD_SOURCES = [
   ['gyro_roll', 'Gyro Roll'],
   ['pad_x', 'Pad X'],
   ['pad_y', 'Pad Y'],
+  ['bend1', 'Bend 1'],
+  ['bend2', 'Bend 2'],
+  ['bend3', 'Bend 3'],
+  ['bend4', 'Bend 4'],
+  ['bend5', 'Bend 5'],
+  ['bend6', 'Bend 6'],
+  ['env1', 'Env 1'],
+  ['env2', 'Env 2'],
+  ['env3', 'Env 3'],
+  ['env4', 'Env 4'],
+  ['macro1', 'Macro 1'],
+  ['macro2', 'Macro 2'],
+  ['macro3', 'Macro 3'],
+  ['macro4', 'Macro 4'],
+  ['chaos', 'Chaos'],
+  ['drift', 'Drift'],
+  ['spike', 'Spike'],
+  ['video_motion', 'Vid Motion'],
+  ['video_brightness', 'Vid Bright'],
+  ['video_cut', 'Vid Cut'],
 ];
+
+// B10 perform sources: envelopes, macros, bend pads, and the generator seed.
+const ENVELOPE_TRIGGERS = [
+  ['bend1', 'Bend 1'], ['bend2', 'Bend 2'], ['bend3', 'Bend 3'],
+  ['bend4', 'Bend 4'], ['bend5', 'Bend 5'], ['bend6', 'Bend 6'],
+  ['audio_onset', 'Audio Onset'], ['scene_cut', 'Scene Cut'],
+  ['beat', 'Every Beat'], ['beat2', 'Every 2 Beats'], ['bar', 'Every Bar'],
+];
+const ENVELOPE_MODES = [['once', 'One Shot'], ['gate', 'Gate'], ['loop', 'Loop']];
+
+const envelopeList = document.getElementById('envelope-list');
+if (envelopeList) {
+  for (let i = 0; i < 4; i++) {
+    const row = document.createElement('div');
+    row.className = 'envelope-row';
+    row.dataset.envelope = i;
+    row.innerHTML = `
+      <span class="lfo-name">ENV ${i + 1}</span>
+      <select class="env-trigger" aria-label="Envelope ${i + 1} trigger">${optionsHtml(ENVELOPE_TRIGGERS, 'bend1')}</select>
+      <select class="env-mode" aria-label="Envelope ${i + 1} mode">${optionsHtml(ENVELOPE_MODES, 'once')}</select>
+      <div class="param-row" data-min="0.005" data-max="10" data-step="0.005">
+        <label>Atk</label><input type="range" min="0.005" max="10" step="0.005" value="0.02" aria-label="Envelope ${i + 1} attack seconds"><span class="value">0.02</span>
+      </div>
+      <div class="param-row" data-min="0.02" data-max="30" data-step="0.01">
+        <label>Dec</label><input type="range" min="0.02" max="30" step="0.01" value="0.5" aria-label="Envelope ${i + 1} decay seconds"><span class="value">0.5</span>
+      </div>
+      <div class="lfo-meter"><div class="lfo-meter-fill"></div></div>
+    `;
+    row.querySelector('.env-trigger').addEventListener('change', (e) => {
+      sendAction({ action: 'set_envelope', index: i, param: 'trigger', value: e.target.value });
+    });
+    row.querySelector('.env-mode').addEventListener('change', (e) => {
+      sendAction({ action: 'set_envelope', index: i, param: 'mode', value: e.target.value });
+    });
+    const [attackRow, decayRow] = row.querySelectorAll('.param-row');
+    for (const [paramRow, param] of [[attackRow, 'attack'], [decayRow, 'decay']]) {
+      const slider = paramRow.querySelector('input[type="range"]');
+      slider.addEventListener('input', () => {
+        const value = parseFloat(slider.value);
+        paramRow.querySelector('.value').textContent = value.toFixed(3);
+        sendAction({ action: 'set_envelope', index: i, param, value });
+      });
+    }
+    envelopeList.appendChild(row);
+  }
+}
+
+const macroList = document.getElementById('macro-list');
+if (macroList) {
+  for (let i = 0; i < 4; i++) {
+    const row = document.createElement('div');
+    row.className = 'param-row';
+    row.dataset.macro = i;
+    row.dataset.min = '0';
+    row.dataset.max = '1';
+    row.dataset.step = '0.001';
+    row.innerHTML = `
+      <label>Macro ${i + 1}</label><input type="range" min="0" max="1" step="0.001" value="0" aria-label="Macro ${i + 1}"><span class="value">0.000</span>
+    `;
+    const slider = row.querySelector('input[type="range"]');
+    slider.addEventListener('input', () => {
+      const value = parseFloat(slider.value);
+      row.querySelector('.value').textContent = value.toFixed(3);
+      sendAction({ action: 'set_macro', index: i, value });
+    });
+    macroList.appendChild(row);
+  }
+}
+
+const modSeedInput = document.getElementById('mod-seed');
+if (modSeedInput) {
+  modSeedInput.addEventListener('change', () => {
+    const seed = Number(modSeedInput.value);
+    if (!Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
+      modSeedInput.setCustomValidity('Seed must be a whole number from 0 to 4294967295');
+      modSeedInput.reportValidity();
+      return;
+    }
+    modSeedInput.setCustomValidity('');
+    sendAction({ action: 'set_mod_seed', seed });
+  });
+}
+
+// Bend pads follow the XY pad's press/release machinery literally: pointer
+// capture, forced edge sends, and release on blur/hide/reconnect so a
+// swallowed pointer-up can never latch a pad on.
+const bendHeldLocal = [false, false, false, false, false, false];
+function sendBend(index, held) {
+  bendHeldLocal[index] = held;
+  const pad = document.querySelector(`.bend-pad[data-bend="${index}"]`);
+  if (pad) pad.setAttribute('aria-pressed', held ? 'true' : 'false');
+  sendAction({ action: 'bend_pad', index, held });
+}
+function releaseAllBends() {
+  for (let i = 0; i < 6; i++) {
+    if (bendHeldLocal[i]) sendBend(i, false);
+  }
+}
+for (const pad of document.querySelectorAll('.bend-pad')) {
+  const index = Number(pad.dataset.bend);
+  pad.addEventListener('pointerdown', (e) => {
+    pad.setPointerCapture(e.pointerId);
+    sendBend(index, true);
+    e.preventDefault();
+  });
+  pad.addEventListener('pointerup', () => sendBend(index, false));
+  pad.addEventListener('pointercancel', () => sendBend(index, false));
+  pad.addEventListener('lostpointercapture', () => {
+    if (bendHeldLocal[index]) sendBend(index, false);
+  });
+  // Keyboard accessibility: a keypress is a tap, never a hold.
+  pad.addEventListener('keydown', (e) => {
+    if (e.key === ' ' || e.key === 'Enter') {
+      sendBend(index, true);
+      setTimeout(() => sendBend(index, false), 120);
+      e.preventDefault();
+    }
+  });
+}
+window.addEventListener('blur', releaseAllBends);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) releaseAllBends();
+});
 
 function currentModTargets(selected = '') {
   const groups = [['Master / Program', MASTER_MOD_TARGETS.slice()]];
@@ -6218,7 +6369,7 @@ function syncModulation(m) {
       const fill = row.querySelector('.routing-activity-fill');
       const activityValue = row.querySelector('.routing-activity-value');
       const value = Math.min(1, Math.max(-1, Number(r.value) || 0));
-      const bipolar = /^(lfo\d|gyro_|pad_)/.test(r.source || '');
+      const bipolar = /^(lfo\d|gyro_|pad_|chaos|drift)/.test(r.source || '');
       const meterMin = bipolar ? -1 : 0;
       const bounded = Math.max(meterMin, value);
       const left = bipolar ? (bounded < 0 ? 50 + bounded * 50 : 50) : 0;
@@ -6233,6 +6384,54 @@ function syncModulation(m) {
       activity.setAttribute('aria-valuetext', `${bipolar ? 'bipolar' : 'unipolar'} shaped and slewed value ${bounded.toFixed(2)}`);
       activity.setAttribute('aria-label', `${MOD_SOURCES.find(([source]) => source === r.source)?.[1] || r.source} shaped and slewed modulation value`);
     });
+  }
+
+  // B10 perform sources.
+  syncPerformSources(m);
+}
+
+function syncPerformSources(m) {
+  const envelopes = Array.isArray(m.envelopes) ? m.envelopes : [];
+  document.querySelectorAll('.envelope-row').forEach((row, i) => {
+    const env = envelopes[i];
+    if (!env) return;
+    const trigger = row.querySelector('.env-trigger');
+    const mode = row.querySelector('.env-mode');
+    if (trigger && canSync(trigger)) trigger.value = env.trigger || 'bend1';
+    if (mode && canSync(mode)) mode.value = env.mode || 'once';
+    const [attackRow, decayRow] = row.querySelectorAll('.param-row');
+    for (const [paramRow, value] of [[attackRow, env.attack], [decayRow, env.decay]]) {
+      if (!paramRow || value === undefined) continue;
+      const slider = paramRow.querySelector('input[type="range"]');
+      if (slider && canSync(slider)) {
+        slider.value = value;
+        paramRow.querySelector('.value').textContent = Number(value).toFixed(3);
+      }
+    }
+    const fill = row.querySelector('.lfo-meter-fill');
+    if (fill) fill.style.width = `${(Math.max(0, Math.min(1, env.level || 0)) * 100).toFixed(1)}%`;
+  });
+  const macros = Array.isArray(m.macros) ? m.macros : [];
+  document.querySelectorAll('#macro-list .param-row').forEach((row, i) => {
+    const value = macros[i];
+    if (value === undefined) return;
+    const slider = row.querySelector('input[type="range"]');
+    if (slider && canSync(slider)) {
+      slider.value = value;
+      row.querySelector('.value').textContent = Number(value).toFixed(3);
+    }
+  });
+  const bends = Array.isArray(m.bends) ? m.bends : [];
+  document.querySelectorAll('.bend-pad').forEach((pad) => {
+    const index = Number(pad.dataset.bend);
+    // Never fight the finger that is on it: while this client holds the pad,
+    // its own state is the truth.
+    if (!bendHeldLocal[index]) {
+      pad.setAttribute('aria-pressed', bends[index] ? 'true' : 'false');
+    }
+  });
+  if (modSeedInput && canSync(modSeedInput)) {
+    modSeedInput.value = String(m.generator_seed || 0);
   }
 }
 

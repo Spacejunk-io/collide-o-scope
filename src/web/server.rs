@@ -1509,6 +1509,10 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     // Holding a sample or an arm/disarm edge for the next
                     // downbeat would rewrite the recorded stream.
                     | WebAction::GestureSample { .. }
+                    // A B10 bend edge is authored against the frame it was
+                    // played in; latching one to a downbeat would move an
+                    // envelope trigger the operator timed by hand.
+                    | WebAction::BendPad { .. }
                     | WebAction::SetGestureRecording { .. }
                     // The B9 transports are the same class of barrier: an
                     // arm/disarm edge held for a downbeat would attach a take
@@ -1999,6 +2003,31 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         WebAction::SetLfo { param, value, .. } => {
             valid_identifier(param, 64) && valid_json_value(value)
         }
+        // B10: the envelope vocabulary is closed at the gate exactly as the
+        // engine applier closes it, so the queue never carries a tuple the
+        // engine would only refuse later.
+        WebAction::SetEnvelope {
+            index,
+            param,
+            value,
+        } => {
+            *index < crate::modulation::NUM_ENVELOPES
+                && match param.as_str() {
+                    "attack" | "decay" => value.as_f64().is_some_and(f64::is_finite),
+                    "trigger" => value.as_str().is_some_and(|token| {
+                        crate::modulation::EnvelopeTrigger::try_from_str(token).is_some()
+                    }),
+                    "mode" => value.as_str().is_some_and(|token| {
+                        crate::modulation::EnvelopeMode::try_from_str(token).is_some()
+                    }),
+                    _ => false,
+                }
+        }
+        WebAction::SetMacro { index, value } => {
+            *index < crate::modulation::NUM_MACROS && valid_f32(*value)
+        }
+        WebAction::SetModSeed { .. } => true,
+        WebAction::BendPad { index, .. } => *index < crate::modulation::NUM_BENDS,
         WebAction::SetRouting {
             route_id,
             target_layer_id,
@@ -4970,6 +4999,81 @@ mod tests {
                 inner: Box::new(WebAction::SetGestureRecording {
                     enabled: true,
                     layer_stack_revision: 7,
+                }),
+            },
+            0
+        ));
+    }
+
+    #[test]
+    fn b10_source_edits_are_gated_by_the_engines_own_vocabularies() {
+        assert!(valid_action(
+            &WebAction::SetEnvelope {
+                index: 3,
+                param: "trigger".to_string(),
+                value: serde_json::json!("scene_cut"),
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::SetEnvelope {
+                index: 4,
+                param: "attack".to_string(),
+                value: serde_json::json!(0.1),
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::SetEnvelope {
+                index: 0,
+                param: "trigger".to_string(),
+                value: serde_json::json!("beat3"),
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::SetEnvelope {
+                index: 0,
+                param: "attack".to_string(),
+                value: serde_json::json!(f64::NAN),
+            },
+            0
+        ));
+        assert!(valid_action(
+            &WebAction::SetMacro {
+                index: 0,
+                value: 0.5,
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::SetMacro {
+                index: 4,
+                value: 0.5,
+            },
+            0
+        ));
+        assert!(valid_action(&WebAction::SetModSeed { seed: 77 }, 0));
+        assert!(valid_action(
+            &WebAction::BendPad {
+                index: 5,
+                held: true,
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::BendPad {
+                index: 6,
+                held: true,
+            },
+            0
+        ));
+        // A bend edge is authored against the frame it was played in.
+        assert!(!valid_action(
+            &WebAction::Quantized {
+                inner: Box::new(WebAction::BendPad {
+                    index: 0,
+                    held: true,
                 }),
             },
             0

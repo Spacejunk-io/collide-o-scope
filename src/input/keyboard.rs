@@ -56,6 +56,24 @@ pub fn map_key(key: PhysicalKey, state: ElementState, shift: bool) -> Action {
     }
 }
 
+/// Map a physical key to one of the six B10 bend pads (the digit row 1–6).
+///
+/// A separate mapper rather than an `Action` arm, deliberately: a bend pad is
+/// the tree's one momentary keyboard control, needing both the press and the
+/// release edge, while `map_key`'s release-is-inert law is pinned by its own
+/// tests and stays true for every discrete action.
+pub fn map_bend_key(key: PhysicalKey) -> Option<usize> {
+    match key {
+        PhysicalKey::Code(KeyCode::Digit1) => Some(0),
+        PhysicalKey::Code(KeyCode::Digit2) => Some(1),
+        PhysicalKey::Code(KeyCode::Digit3) => Some(2),
+        PhysicalKey::Code(KeyCode::Digit4) => Some(3),
+        PhysicalKey::Code(KeyCode::Digit5) => Some(4),
+        PhysicalKey::Code(KeyCode::Digit6) => Some(5),
+        _ => None,
+    }
+}
+
 /// Apply an action to effect uniforms. Returns control flags.
 pub fn apply_action(action: Action, uniforms: &mut EffectUniforms) -> ControlFlow {
     match action {
@@ -140,6 +158,33 @@ mod tests {
         assert_eq!(
             apply_action(Action::ToggleMediaFreeze, &mut EffectUniforms::default()),
             ControlFlow::ToggleMediaFreeze
+        );
+    }
+
+    #[test]
+    fn the_digit_row_maps_the_six_bend_pads_and_stays_out_of_map_key() {
+        let digits = [
+            KeyCode::Digit1,
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Digit4,
+            KeyCode::Digit5,
+            KeyCode::Digit6,
+        ];
+        for (index, code) in digits.into_iter().enumerate() {
+            assert_eq!(map_bend_key(PhysicalKey::Code(code)), Some(index));
+            // The discrete mapper stays release-is-inert and never claims a
+            // bend key: the momentary pads own their own mapper.
+            assert_eq!(
+                map_key(PhysicalKey::Code(code), ElementState::Pressed, false),
+                Action::None
+            );
+        }
+        assert_eq!(map_bend_key(PhysicalKey::Code(KeyCode::Digit7)), None);
+        assert_eq!(
+            map_bend_key(PhysicalKey::Code(KeyCode::Digit0)),
+            None,
+            "0 stays the effects reset"
         );
     }
 }

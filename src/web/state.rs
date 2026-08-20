@@ -1991,6 +1991,31 @@ pub struct ModSnapshot {
     /// Engine-owned response, quantize, and spring settings for the XY pad.
     #[serde(default)]
     pub pad_config: PadConfigSnapshot,
+    /// B10 envelope configurations and live levels. Additive: an older panel
+    /// deserializes an otherwise complete snapshot with the block absent.
+    #[serde(default)]
+    pub envelopes: Vec<EnvelopeSnapshot>,
+    /// B10 macro knob values, each 0..1.
+    #[serde(default)]
+    pub macros: Vec<f32>,
+    /// B10 bend pad held states (runtime truth, never persisted).
+    #[serde(default)]
+    pub bends: Vec<bool>,
+    /// B10 deterministic-generator seed.
+    #[serde(default)]
+    pub generator_seed: u32,
+}
+
+/// One B10 envelope's authored configuration plus its live level meter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EnvelopeSnapshot {
+    pub attack: f32,
+    pub decay: f32,
+    pub trigger: String,
+    pub mode: String,
+    /// Live output level 0..1, for the panel meter.
+    #[serde(default)]
+    pub level: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2306,6 +2331,20 @@ impl ModSnapshot {
                 spring_enabled: m.pad_config.spring_enabled,
                 spring_rate: m.pad_config.spring_rate,
             },
+            envelopes: m
+                .envelopes
+                .iter()
+                .map(|envelope| EnvelopeSnapshot {
+                    attack: envelope.attack,
+                    decay: envelope.decay,
+                    trigger: envelope.trigger.as_str().to_string(),
+                    mode: envelope.mode.as_str().to_string(),
+                    level: envelope.level(),
+                })
+                .collect(),
+            macros: m.macros.to_vec(),
+            bends: m.bend_held.to_vec(),
+            generator_seed: m.generator_seed,
         }
     }
 }
@@ -4440,6 +4479,30 @@ pub enum WebAction {
         param: String,
         value: serde_json::Value,
     },
+    /// B10: configure one envelope slot (`attack`/`decay` seconds, `trigger`
+    /// and `mode` as closed tokens). Ordinary coalescible value edit.
+    #[serde(rename = "set_envelope")]
+    SetEnvelope {
+        index: usize,
+        param: String,
+        value: serde_json::Value,
+    },
+    /// B10: set one macro knob (0..1). Ordinary coalescible value edit.
+    #[serde(rename = "set_macro")]
+    SetMacro { index: usize, value: f32 },
+    /// B10: reseed the deterministic chaos/spike generators. Applying a new
+    /// seed restarts their trajectories from zero, deterministically.
+    #[serde(rename = "set_mod_seed")]
+    SetModSeed { seed: u32 },
+    /// B10: one bend pad's press or release edge.
+    ///
+    /// A stream event on the gesture-sample law: it deliberately has no
+    /// coalesce key (a pending press must not be replaced by its release, or
+    /// an envelope trigger would never see the edge), and both edges are
+    /// priority — a dropped release would latch the pad on, and a dropped
+    /// press would fire nothing the operator played.
+    #[serde(rename = "bend_pad")]
+    BendPad { index: usize, held: bool },
     /// Append a new modulation routing (defaults)
     #[serde(rename = "add_routing")]
     AddRouting,
@@ -5025,6 +5088,9 @@ impl WebAction {
             Self::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
             Self::SetBpm { .. } => Some("mod:bpm".into()),
             Self::SetLfo { index, param, .. } => Some(format!("lfo:{index}:{param}")),
+            Self::SetEnvelope { index, param, .. } => Some(format!("env:{index}:{param}")),
+            Self::SetMacro { index, .. } => Some(format!("macro:{index}")),
+            Self::SetModSeed { .. } => Some("mod:seed".into()),
             Self::SetRouting {
                 index,
                 route_id,
@@ -5080,6 +5146,7 @@ impl WebAction {
                 | Self::GyroStream { .. }
                 | Self::GyroCalibrate
                 | Self::Pad { .. }
+                | Self::BendPad { .. }
                 | Self::GestureSample { .. }
                 | Self::SetGestureRecording { .. }
                 | Self::SetPerformanceRecording { .. }
@@ -5198,6 +5265,10 @@ impl WebAction {
                 mode: crate::media_safety::MediaSafetyMode::Safe,
             } => true,
             Self::Pad { active, .. } => !active,
+            // A bend edge pair carries no interpolated middle: a dropped
+            // release latches the pad on, and a dropped press fires nothing
+            // the operator played, so both edges hold an admission reservation.
+            Self::BendPad { .. } => true,
             // A dropped `Begin` orphans every later point of that stroke and a
             // dropped `End` leaves it permanently open, so both edges hold an
             // admission reservation. An intermediate `Move` is ordinary: under
@@ -7543,14 +7614,21 @@ mod protocol_tests {
         assert!(!second_column.contains("id=\"midi-group\""));
 
         let third_column = &html[sources..io];
-        let ordered = ["id=\"mod-group\"", "id=\"pad-group\"", "id=\"midi-group\""];
+        let ordered = [
+            "id=\"mod-group\"",
+            "id=\"pad-group\"",
+            "id=\"perform-group\"",
+            "id=\"midi-group\"",
+        ];
         let mut previous = 0;
         for marker in ordered {
             let position = third_column.find(marker).unwrap();
             assert!(position >= previous, "{marker} is out of column order");
             previous = position;
         }
-        assert_eq!(third_column.matches("<div class=\"fx-group\"").count(), 3);
+        // 3 -> 4 when B10 added the PERFORM SOURCES group (bend pads,
+        // envelopes, macros, generator seed) beside the matrix they feed.
+        assert_eq!(third_column.matches("<div class=\"fx-group\"").count(), 4);
         assert!(!third_column.contains("id=\"audio-group\""));
         assert!(!third_column.contains("id=\"gyro-group\""));
 
@@ -7559,7 +7637,7 @@ mod protocol_tests {
         ));
         assert!(html
             .contains("data-fx-column=\"sources\"><!-- live modulation controls and sources -->"));
-        for group in ["mod", "pad", "midi", "audio"] {
+        for group in ["mod", "pad", "perform", "midi", "audio"] {
             assert_eq!(html.matches(&format!("id=\"{group}-group\"")).count(), 1);
         }
 
@@ -7715,8 +7793,12 @@ mod protocol_tests {
         // B7 added the two generated generator-card templates (one pattern
         // row template, one text row template); their rows render from
         // tables, so only the two literal template tags move the JS count.
+        // B10 added three JS template tags: the envelope row's attack and
+        // decay sliders and the macro row's knob (rendered four times each;
+        // the pin counts literal tags). Its HTML additions are buttons and a
+        // number input, so the HTML count stays.
         assert_eq!(assert_range_tags_are_bounded(html, true), 198);
-        assert_eq!(assert_range_tags_are_bounded(js, false), 21);
+        assert_eq!(assert_range_tags_are_bounded(js, false), 24);
 
         for contract in [
             "function normalizeRangeValue(slider, rawValue)",
@@ -10941,6 +11023,85 @@ mod protocol_tests {
                 "accepted an incomplete transport barrier: {hostile}"
             );
         }
+    }
+
+    #[test]
+    fn b10_source_actions_classify_on_their_own_laws() {
+        // A bend edge is a stream event: never coalesced (a pending press
+        // must not be replaced by its release), both edges priority, and
+        // performance-only for history.
+        let press = WebAction::BendPad {
+            index: 2,
+            held: true,
+        };
+        let release = WebAction::BendPad {
+            index: 2,
+            held: false,
+        };
+        for edge in [&press, &release] {
+            assert!(edge.is_priority());
+            assert!(edge.coalesce_key().is_none());
+            assert!(edge.is_performance_only_for_history());
+        }
+        assert_eq!(
+            serde_json::to_value(&press).unwrap(),
+            serde_json::json!({ "action": "bend_pad", "index": 2, "held": true })
+        );
+
+        // Envelope, macro, and seed edits are ordinary coalescible values.
+        let envelope = WebAction::SetEnvelope {
+            index: 1,
+            param: "attack".to_string(),
+            value: serde_json::json!(0.1),
+        };
+        assert_eq!(envelope.coalesce_key().as_deref(), Some("env:1:attack"));
+        assert!(!envelope.is_performance_only_for_history());
+        let knob = WebAction::SetMacro {
+            index: 3,
+            value: 0.5,
+        };
+        assert_eq!(knob.coalesce_key().as_deref(), Some("macro:3"));
+        let seed = WebAction::SetModSeed { seed: 9 };
+        assert_eq!(seed.coalesce_key().as_deref(), Some("mod:seed"));
+    }
+
+    #[test]
+    fn the_perform_panel_wires_b10_sources_and_never_latches_a_bend() {
+        let html = include_str!("../../static/index.html");
+        for contract in [
+            "id=\"perform-group\"",
+            "id=\"bend-pads\"",
+            "data-bend=\"5\"",
+            "id=\"envelope-list\"",
+            "id=\"macro-list\"",
+            "id=\"mod-seed\"",
+        ] {
+            assert!(html.contains(contract), "missing perform HTML: {contract}");
+        }
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "action: 'set_envelope', index: i, param: 'trigger'",
+            "action: 'set_macro', index: i, value",
+            "action: 'set_mod_seed', seed",
+            "action: 'bend_pad', index, held",
+            "releaseAllBends",
+            "['bend1', 'Bend 1']",
+            "['env1', 'Env 1']",
+            "['macro1', 'Macro 1']",
+            "['chaos', 'Chaos']",
+            "['video_cut', 'Vid Cut']",
+            "chaos|drift",
+        ] {
+            assert!(js.contains(contract), "missing perform JS: {contract}");
+        }
+        let start = js.find("const QUANTIZABLE_ACTIONS").expect("allowlist");
+        let tail = &js[start..];
+        let end = tail.find("]);").expect("allowlist end") + 3;
+        let allowlist = &tail[..end];
+        assert!(
+            !allowlist.contains("bend_pad"),
+            "a bend edge must never be latchable"
+        );
     }
 
     #[test]

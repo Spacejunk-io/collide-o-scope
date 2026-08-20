@@ -30,7 +30,8 @@ second full-frame history ring.
 | B5 — codec mosh | **Complete** | `docs/evidence/b5-codec-mosh-note.md`; CLAUDE.md "B5 codec mosh" |
 | B7 — generator sources | **Complete** | `docs/evidence/b7-generator-sources-note.md`; CLAUDE.md "B7 generator sources" |
 | B9 — the performance recorder | **Complete** | `docs/evidence/b9-performance-recorder-note.md`; CLAUDE.md "The B9 performance recorder" |
-| B10, B11, B6, B15 | Open | — |
+| B10 — modulation source expansion | **Complete** | `docs/evidence/b10-mod-sources-note.md`; CLAUDE.md "B10 performance sources" |
+| B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -38,15 +39,14 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-**Wave 3 continues with B10, modulation source expansion** — pure `ModSource`
-extension through the one matrix law: envelopes (trigger vocabulary
-`Pad | AudioOnset | SceneCut | Beat`, stated retrigger law), deterministic
-chaos/drift/spike generators (seeded, frame-indexed offline — replay identity
-is ours to claim), four macros, and the video-reactive sources
-(`video_motion` from the Motion lattice armed on demand;
-`video_brightness`/`video_cut` via one 16×16 reduction + readback at ~10 Hz
-inside the existing ≤3 in-flight budget). State explicitly which sources are
-live-only zeros offline versus derivable frame-indexed, and test the parity.
+**Wave 3 continues with B11, the monitoring bay** — stage_health's exact
+shape: a sealed preview permit (`native_controls_visible` + surface check,
+sealed in a private submodule per the gizmo precedent), low-res readback
+(≤ 160×90) at 10 Hz only while the panel tab or native pane is visible, zero
+cost otherwise. Three instruments: waveform (luma vs. x with graticule),
+vectorscope (U/V cloud with the six colour-bar targets), and PROBE —
+internal signals rendered to the preview surface only, never audience. The
+web panel gets the same data over the snapshot at the same gated rate.
 Fetch the plan document before starting it.
 
 ## The working method every tranche follows
