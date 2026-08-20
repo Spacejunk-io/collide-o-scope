@@ -355,6 +355,11 @@ enum TapBacking {
     /// retained parity here as well would double-charge the same image against
     /// two independent ledgers.
     GestureCanvas,
+    /// The programme tap. It likewise owns **no** tap surface: the one
+    /// retained copy is charged by the renderer-owned full-frame texture
+    /// floor, and a retained parity here would double-charge the same image
+    /// against two independent ledgers.
+    ProgramTap,
     CurrentPreLocal {
         layer_id: StableLayerId,
     },
@@ -480,6 +485,13 @@ struct PreparedAdvanced {
     /// what `tap_ready` answers with, so an unbound canvas gives its consumer
     /// `donor_valid = false` instead of a confident empty field.
     gesture_canvas_bound: bool,
+    /// The programme-tap identity these bind groups were built against, on
+    /// exactly the canvas law: a changed identity is a rebuild, not a repair.
+    program_tap_identity: (bool, u64),
+    /// Whether a routed programme tap actually reads a published copy, so an
+    /// unbound tap gives its consumer `donor_valid = false` instead of a
+    /// confident empty image.
+    program_tap_bound: bool,
     host: CompositionHost,
     rack: CollisionRackExecutor,
     /// Present only when the plan emits at least one dedicated step. It owns no
@@ -736,6 +748,12 @@ impl GestureCanvasBinding {
     }
 }
 
+/// The programme tap binding shares the canvas binding's exact shape: an
+/// optional view plus a caller-owned monotonic resource epoch. One type serves
+/// both master-scope singletons; the two bind seams are separate functions on
+/// the executor, so a caller cannot hand one singleton to the other's routes.
+pub(crate) type ProgramTapBinding = GestureCanvasBinding;
+
 pub(crate) struct CompositionGpuExecutor {
     dimensions: [u32; 2],
     topology_signature: Option<u64>,
@@ -746,6 +764,9 @@ pub(crate) struct CompositionGpuExecutor {
     /// binding never rebuilds anything on its own, and a stale prepared
     /// identity is what makes the next prepare rebuild rather than reuse.
     gesture_canvas: GestureCanvasBinding,
+    /// The programme tap binding future prepares will use, on exactly the
+    /// canvas law: setting it never rebuilds anything on its own.
+    program_tap: ProgramTapBinding,
 }
 
 impl CompositionGpuExecutor {
@@ -770,6 +791,7 @@ impl CompositionGpuExecutor {
             prepared: None,
             scope_recorder_readback: None,
             gesture_canvas: GestureCanvasBinding::default(),
+            program_tap: ProgramTapBinding::default(),
         })
     }
 
@@ -797,6 +819,24 @@ impl CompositionGpuExecutor {
     )]
     pub(crate) fn gesture_canvas_bound(&self) -> bool {
         self.gesture_canvas.is_bound()
+    }
+
+    /// Publish the programme-tap image a tap route will bind, on exactly the
+    /// canvas seam: deliberately separate from `prepare`, never allocating,
+    /// never rebuilding — the next `prepare` observes the changed identity.
+    pub(crate) fn bind_program_tap(&mut self, binding: ProgramTapBinding) {
+        self.program_tap = binding;
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the physical-GPU payoff fixture asserts the binding it prepared against"
+        )
+    )]
+    pub(crate) fn program_tap_bound(&self) -> bool {
+        self.program_tap.is_bound()
     }
 
     pub fn program_history_initialized(&self) -> bool {
@@ -1098,10 +1138,12 @@ impl CompositionGpuExecutor {
             return false;
         };
         let gesture_identity = self.gesture_canvas.identity();
+        let program_tap_identity = self.program_tap.identity();
         self.prepared.as_ref().is_some_and(|prepared| {
             prepared.topology_signature == plan.topology_signature()
                 && prepared.source_keys.as_ref() == source_keys
                 && prepared.gesture_canvas_identity == gesture_identity
+                && prepared.program_tap_identity == program_tap_identity
         })
     }
 
@@ -1173,14 +1215,17 @@ impl CompositionGpuExecutor {
             .into_boxed_slice();
         let signature = plan.topology_signature();
         let gesture_identity = self.gesture_canvas.identity();
+        let program_tap_identity = self.program_tap.identity();
         if self.prepared.as_ref().is_some_and(|prepared| {
             prepared.topology_signature == signature
                 && prepared.source_keys == source_keys
                 // A rebuilt gesture canvas produces a new presented view while
                 // the topology and every source key stay identical, so the
                 // canvas identity has to be part of the reuse test or the tap
-                // bind groups would keep a destroyed surface's view.
+                // bind groups would keep a destroyed surface's view. The
+                // programme tap obeys the identical law.
                 && prepared.gesture_canvas_identity == gesture_identity
+                && prepared.program_tap_identity == program_tap_identity
         }) {
             self.topology_signature = Some(signature);
             return Ok(CompositionPreparedKind::Advanced {
@@ -1196,6 +1241,7 @@ impl CompositionGpuExecutor {
             sources,
             source_keys,
             &self.gesture_canvas,
+            &self.program_tap,
         )?;
         self.prepared = Some(prepared);
         self.topology_signature = Some(signature);
@@ -1362,6 +1408,10 @@ impl PreparedAdvanced {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two singleton bindings are independent inputs, not a bundle"
+    )]
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -1370,6 +1420,7 @@ impl PreparedAdvanced {
         sources: &[CompositionSourceDescriptor<'_>],
         source_keys: Box<[(StableLayerId, [u32; 2], u64)]>,
         gesture_canvas: &GestureCanvasBinding,
+        program_tap: &ProgramTapBinding,
     ) -> Result<Self, CompositionGpuError> {
         let (
             effect_slot_count,
@@ -1591,6 +1642,7 @@ impl PreparedAdvanced {
                             &prelocal_surfaces,
                             rack_zero.view,
                             gesture_canvas.view.as_ref(),
+                            program_tap.view.as_ref(),
                             &taps[tap_index],
                             read_index,
                         );
@@ -1624,6 +1676,7 @@ impl PreparedAdvanced {
                 &taps,
                 &prelocal_surfaces,
                 gesture_canvas.view.as_ref(),
+                program_tap.view.as_ref(),
             )?;
             let symmetry_slot_count = symmetry_field_step_count(plan);
             let symmetry = if symmetry_slot_count == 0 {
@@ -1647,6 +1700,7 @@ impl PreparedAdvanced {
                     &prelocal_surfaces,
                     rack_zero.view,
                     gesture_canvas.view.as_ref(),
+                    program_tap.view.as_ref(),
                     [ping.view, pong.view],
                 )?,
                 None => Vec::new(),
@@ -1709,6 +1763,7 @@ impl PreparedAdvanced {
                                         &prelocal_surfaces,
                                         rack_zero.view,
                                         gesture_canvas.view.as_ref(),
+                                        program_tap.view.as_ref(),
                                         &taps[tap_index],
                                         0,
                                     )
@@ -1762,6 +1817,7 @@ impl PreparedAdvanced {
                     TapBacking::Transparent
                     | TapBacking::ProgramHistory
                     | TapBacking::GestureCanvas
+                    | TapBacking::ProgramTap
                     | TapBacking::CurrentPreLocal { .. } => {}
                 }
             }
@@ -1784,6 +1840,8 @@ impl PreparedAdvanced {
                 source_keys,
                 gesture_canvas_identity: gesture_canvas.identity(),
                 gesture_canvas_bound: gesture_canvas.is_bound(),
+                program_tap_identity: program_tap.identity(),
+                program_tap_bound: program_tap.is_bound(),
                 host,
                 rack,
                 symmetry,
@@ -2274,6 +2332,9 @@ impl PreparedAdvanced {
             // the same binding `prepared_tap_view` reads, recorded at prepare
             // time, so readiness and the bound view cannot disagree.
             TapBacking::GestureCanvas => self.gesture_canvas_bound,
+            // The identical law for the programme tap: ready exactly when the
+            // host published a committed copy, recorded at prepare time.
+            TapBacking::ProgramTap => self.program_tap_bound,
             TapBacking::CurrentPreLocal { .. } | TapBacking::Current(_) => true,
             TapBacking::Previous { initialized, .. } => initialized,
         }
@@ -3346,6 +3407,13 @@ fn prepare_tap_surfaces(
                 // planner records no previous-frame dependency for it either,
                 // so the declared and actual ledgers agree at zero.
                 TapBacking::GestureCanvas
+            } else if matches!(planned.resolved, PlannedImageSource::ProgramTap) {
+                // Deliberately ahead of the previous-frame branch for the same
+                // reason as the canvas: the tap is a frame-committed singleton
+                // with one image — it *is* the N-1 image — so a route at N-1
+                // timing must not allocate a parity pair, and the planner
+                // records no previous-frame dependency for it either.
+                TapBacking::ProgramTap
             } else if planned.origin.timing() == EdgeTiming::PreviousFrame {
                 TapBacking::Previous {
                     surfaces: std::array::from_fn(|_| {
@@ -3419,6 +3487,7 @@ fn validate_actual_surface_ledger(
             TapBacking::Transparent
             | TapBacking::ProgramHistory
             | TapBacking::GestureCanvas
+            | TapBacking::ProgramTap
             | TapBacking::CurrentPreLocal { .. } => 0,
         })
         .sum();
@@ -3442,6 +3511,7 @@ fn prepared_tap_view<'a>(
     prelocal_surfaces: &'a BTreeMap<StableLayerId, RetainedSurface>,
     zero: &'a wgpu::TextureView,
     gesture_canvas: Option<&'a wgpu::TextureView>,
+    program_tap: Option<&'a wgpu::TextureView>,
     tap: &'a PreparedTap,
     read_index: usize,
 ) -> &'a wgpu::TextureView {
@@ -3458,6 +3528,11 @@ fn prepared_tap_view<'a>(
         // node also sees `donor_valid = false` instead of a confident empty
         // field. Both sites read the one binding, so they cannot disagree.
         TapBacking::GestureCanvas => gesture_canvas.unwrap_or(zero),
+        // The published programme copy when the host published one, and the
+        // rack-owned zero texture when it did not — the identical law: an
+        // unbound tap is inert rather than wrong, `tap_ready` reports the same
+        // fact, and both sites read the one binding so they cannot disagree.
+        TapBacking::ProgramTap => program_tap.unwrap_or(zero),
         TapBacking::CurrentPreLocal { layer_id } => prelocal_surfaces
             .get(layer_id)
             .map_or(zero, |surface| &surface.view),
@@ -3479,9 +3554,11 @@ fn tap_boundary_scope(tap: &PlannedImageTap) -> Option<VisualScopeId> {
         }
         | PlannedImageSource::AllBelow(_)
         | PlannedImageSource::ProgramHistory
-        // The gesture canvas is etched outside the composition graph, so it
-        // names no producing scope and takes part in no scope ordering.
+        // The gesture canvas is etched outside the composition graph, and the
+        // programme tap is published outside it, so neither names a producing
+        // scope and neither takes part in any scope ordering.
         | PlannedImageSource::GestureCanvas
+        | PlannedImageSource::ProgramTap
         | PlannedImageSource::Transparent => None,
     }
 }
@@ -3506,6 +3583,7 @@ fn stage_tap_from_texture(
         TapBacking::Transparent
         | TapBacking::ProgramHistory
         | TapBacking::GestureCanvas
+        | TapBacking::ProgramTap
         | TapBacking::CurrentPreLocal { .. } => {}
     }
 }
@@ -3883,6 +3961,7 @@ fn prepare_symmetry_fields(
     prelocal_surfaces: &BTreeMap<StableLayerId, RetainedSurface>,
     zero: &wgpu::TextureView,
     gesture_canvas: Option<&wgpu::TextureView>,
+    program_tap: Option<&wgpu::TextureView>,
     carriers: [&wgpu::TextureView; 2],
 ) -> Result<Vec<PreparedSymmetryField>, CompositionGpuError> {
     let mut prepared = Vec::new();
@@ -3931,6 +4010,7 @@ fn prepare_symmetry_fields(
                             prelocal_surfaces,
                             zero,
                             gesture_canvas,
+                            program_tap,
                             &taps[*tap_index],
                             read_index,
                         )),
@@ -4033,6 +4113,10 @@ fn tap_index_for_consumer(
         .position(|tap| tap.consumer == consumer)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two singleton donor views are independent inputs, not a bundle"
+)]
 fn prepare_rack_segments(
     device: &wgpu::Device,
     plan: &AdvancedCompositionPlan,
@@ -4041,6 +4125,7 @@ fn prepare_rack_segments(
     taps: &[PreparedTap],
     prelocal_surfaces: &BTreeMap<StableLayerId, RetainedSurface>,
     gesture_canvas: Option<&wgpu::TextureView>,
+    program_tap: Option<&wgpu::TextureView>,
 ) -> Result<Vec<PreparedRackSegment>, CompositionGpuError> {
     let zero = rack
         .surface(1)
@@ -4105,6 +4190,7 @@ fn prepare_rack_segments(
                                 prelocal_surfaces,
                                 zero.view,
                                 gesture_canvas,
+                                program_tap,
                                 &taps[*tap_index],
                                 read_index,
                             )),
@@ -4194,9 +4280,11 @@ fn tap_scope_producer(tap: &PreparedTap) -> Option<VisualScopeId> {
         }
         | PlannedImageSource::AllBelow(_)
         | PlannedImageSource::ProgramHistory
-        // The gesture canvas is etched outside the composition graph, so it
-        // names no producing scope and takes part in no scope ordering.
+        // The gesture canvas is etched outside the composition graph, and the
+        // programme tap is published outside it, so neither names a producing
+        // scope and neither takes part in any scope ordering.
         | PlannedImageSource::GestureCanvas
+        | PlannedImageSource::ProgramTap
         | PlannedImageSource::Transparent => None,
     }
 }
@@ -5242,6 +5330,91 @@ mod tests {
         assert!(validate_actual_surface_ledger(&plan, true, &taps, 0).is_err());
     }
 
+    /// A programme-tap route is charged exactly once — by the renderer-owned
+    /// full-frame texture floor — and must never also claim a retained tap
+    /// surface here. Same fail-closed reconcile as the canvas fixture above.
+    #[test]
+    fn a_program_tap_charges_no_retained_surface_on_either_side_of_the_ledger() {
+        let base = evaluated_base(&[2, 1], [64, 48]);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(1),
+                    bus: BusAssignment::Program,
+                },
+                RuntimeRootItem::Layer {
+                    layer_id: stable_layer(2),
+                    bus: BusAssignment::Program,
+                },
+            ],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let tap_displace = |timing| {
+            RuntimeVisualNodeKind::Displace(crate::visual_rack::RuntimeDisplaceParams {
+                tap: ResolvedImageTap {
+                    source: crate::visual_rack::ResolvedImageSource::ProgramTap,
+                    timing,
+                },
+                amount_x: 0.5,
+                amount_y: -0.25,
+                boundary: crate::visual_rack::DisplaceBoundary::Wrap,
+            })
+        };
+        let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        master.push(tap_displace(EdgeTiming::CurrentFrame)).unwrap();
+        let mut layer_rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        // Both timings, because an N-1 route is where a parity pair would
+        // otherwise be allocated behind the ledger's back — and the tap *is*
+        // the N-1 image, so nothing may stage for it.
+        layer_rack
+            .push(tap_displace(EdgeTiming::PreviousFrame))
+            .unwrap();
+        let racks = vec![
+            (stable_layer(2), layer_rack),
+            (
+                stable_layer(1),
+                RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer),
+            ),
+        ];
+        let plan = EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_program_tap(true),
+        )
+        .unwrap();
+        let EvaluatedCompositionPlan::Advanced(plan) = plan else {
+            panic!("a tap-routed Displace is an advanced composition");
+        };
+        assert_eq!(plan.image_taps().len(), 2);
+        assert!(plan.image_taps().iter().all(|tap| tap.resolved
+            == crate::evaluated_frame::evaluated_composition::PlannedImageSource::ProgramTap));
+
+        // The backings the executor would build for these taps, by the same law
+        // `prepare_tap_surfaces` applies — and none of them owns a surface.
+        let taps: Vec<_> = plan
+            .image_taps()
+            .iter()
+            .cloned()
+            .map(|planned| PreparedTap {
+                planned,
+                backing: TapBacking::ProgramTap,
+            })
+            .collect();
+        validate_actual_surface_ledger(&plan, false, &taps, 0)
+            .expect("a programme-tap route charges zero retained surfaces on both sides");
+
+        // The validator really is live: one extra actual surface fails closed.
+        assert!(validate_actual_surface_ledger(&plan, false, &taps, 1).is_err());
+        assert!(validate_actual_surface_ledger(&plan, true, &taps, 0).is_err());
+    }
+
     /// One layer carrying one Displace node whose donor is the etched gesture
     /// canvas. This is the shape the payoff fixture renders three ways.
     fn gesture_donor_plan(dimensions: [u32; 2], amount: f32) -> EvaluatedCompositionPlan {
@@ -5551,6 +5724,164 @@ mod tests {
         assert!(
             differing(&reused_etched, &reused_empty) > 0,
             "a rebuilt canvas left a stale presented view bound to an unchanged topology"
+        );
+    }
+
+    /// One layer carrying one Displace node whose donor is the programme tap.
+    /// This is the shape the B16 payoff fixture renders three ways.
+    fn program_tap_donor_plan(dimensions: [u32; 2], amount: f32) -> EvaluatedCompositionPlan {
+        let base = evaluated_base(&[1], dimensions);
+        let composition = RuntimeComposition::try_from_parts(
+            Vec::new(),
+            vec![RuntimeRootItem::Layer {
+                layer_id: stable_layer(1),
+                bus: BusAssignment::Program,
+            }],
+            None,
+            0.5,
+        )
+        .unwrap();
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut layer_rack = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Layer);
+        layer_rack
+            .push(RuntimeVisualNodeKind::Displace(
+                crate::visual_rack::RuntimeDisplaceParams {
+                    tap: ResolvedImageTap {
+                        source: crate::visual_rack::ResolvedImageSource::ProgramTap,
+                        timing: EdgeTiming::CurrentFrame,
+                    },
+                    amount_x: amount,
+                    amount_y: amount,
+                    boundary: crate::visual_rack::DisplaceBoundary::Hold,
+                },
+            ))
+            .unwrap();
+        let racks = vec![(stable_layer(1), layer_rack)];
+        EvaluatedCompositionPlan::evaluate(
+            &base,
+            crate::evaluated_frame::evaluated_composition::CompositionPlanInput::new(
+                &composition,
+                &master,
+                &racks,
+            )
+            .with_program_tap(true),
+        )
+        .unwrap()
+    }
+
+    /// The B16 payoff in executor terms. A routed programme tap is rendered
+    /// three ways over a real carrier, and each claim is a leg of the tranche:
+    ///
+    /// (a) an unbound tap and a bound-but-never-published (all-zero) tap are
+    ///     byte identical — live's pre-first-commit diagnostic transparency
+    ///     and export's zero-initialized job-lifetime surface are the same
+    ///     pixels, by arithmetic (the frozen donor decode yields exactly zero
+    ///     for a fully transparent donor);
+    /// (b) a published programme copy reaches the pixels through the routed
+    ///     donor — the re-entry loop's read half demonstrably works;
+    /// (c) rebinding a different tap under a new epoch on an unchanged
+    ///     topology re-prepares rather than keeping the stale view — the
+    ///     renderer-rebuild law the binding identity exists for.
+    ///
+    /// The N-1 publication half (the copy at the acceptance decision, the
+    /// blackout hold, and the byte-identical offline ordering) is pinned by
+    /// the source-order tests in `main.rs`/`render_export.rs` and rendered
+    /// end to end by `render_program_reentry_pipeline`.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn gpu_a_program_tap_donor_feeds_the_previous_frame_back_through_a_routed_displace() {
+        let gpu = GpuHarness::new();
+        let dimensions = [48_u32, 32];
+        let source = gpu.patterned_source(dimensions, "Program tap payoff carrier");
+        let sources = [CompositionSourceDescriptor::new(
+            stable_layer(1),
+            &source.view,
+            dimensions,
+        )];
+        let plan = program_tap_donor_plan(dimensions, 0.4);
+        let render = |binding: ProgramTapBinding| {
+            let mut executor =
+                CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+            let bound = binding.is_bound();
+            executor.bind_program_tap(binding);
+            assert_eq!(executor.program_tap_bound(), bound);
+            executor
+                .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+                .unwrap();
+            gpu.render(&mut executor, &plan, 1.0 / 30.0, true)
+        };
+
+        let unbound = render(ProgramTapBinding::default());
+
+        // A tap surface nothing ever published: wgpu's guaranteed zero
+        // initialization is the exact state export's job-lifetime surface has
+        // at frame zero.
+        let never_published = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Program tap payoff never-published tap"),
+            size: wgpu::Extent3d {
+                width: dimensions[0],
+                height: dimensions[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let zeroed = render(ProgramTapBinding::bound(
+            never_published.create_view(&wgpu::TextureViewDescriptor::default()),
+            1,
+        ));
+
+        // (a) Unpublished and unbound are the same program, in pixels.
+        assert_eq!(
+            zeroed, unbound,
+            "a never-published programme tap changed the rendered image"
+        );
+
+        // (b) A published programme copy reaches the image. The donor here is
+        // an opaque non-neutral image in the tap's exact slot format, standing
+        // for the previous accepted frame's audience copy.
+        let previous = gpu.patterned_source(dimensions, "Program tap payoff previous frame");
+        let fed = render(ProgramTapBinding::bound(previous.view.clone(), 2));
+        let differing = |left: &[[f32; 4]], right: &[[f32; 4]]| {
+            left.iter()
+                .zip(right)
+                .filter(|(a, b)| {
+                    a.iter()
+                        .zip(b.iter())
+                        .any(|(left, right)| (left - right).abs() > 1.0e-3)
+                })
+                .count()
+        };
+        assert!(
+            differing(&fed, &unbound) > 0,
+            "the published programme copy displaced nothing; the tap never reached the node"
+        );
+
+        // (c) One executor, one topology, two different taps. Without the tap
+        // identity in the reuse test this second prepare would keep the
+        // never-published surface's view and the image would not move at all.
+        let mut reused = CompositionGpuExecutor::new(&gpu.device, &gpu.queue, dimensions).unwrap();
+        reused.bind_program_tap(ProgramTapBinding::bound(
+            never_published.create_view(&wgpu::TextureViewDescriptor::default()),
+            1,
+        ));
+        reused
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let reused_zeroed = gpu.render(&mut reused, &plan, 1.0 / 30.0, true);
+        assert_eq!(reused_zeroed, zeroed);
+        reused.bind_program_tap(ProgramTapBinding::bound(previous.view.clone(), 2));
+        reused
+            .prepare(&gpu.device, &gpu.queue, &plan, &sources)
+            .unwrap();
+        let reused_fed = gpu.render(&mut reused, &plan, 1.0 / 30.0, true);
+        assert!(
+            differing(&reused_fed, &reused_zeroed) > 0,
+            "a rebuilt renderer left a stale programme-tap view bound to an unchanged topology"
         );
     }
 

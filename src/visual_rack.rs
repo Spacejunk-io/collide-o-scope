@@ -241,6 +241,18 @@ pub enum SavedImageSource {
     /// and when no canvas is admitted it resolves to a transparent field with
     /// a named diagnostic rather than degrading into some other producer.
     GestureCanvas,
+    /// The finished programme, one frame old: the pre-blackout opaque
+    /// audience image published at the frame-acceptance decision.
+    ///
+    /// Like the gesture canvas, the tap is a master-scope singleton with **no
+    /// saved position to preserve** — the programme is not a layer, a group,
+    /// or a composite prefix, so a route to it survives every reorder,
+    /// deletion, and insertion unchanged. It is N-1 by construction (the copy
+    /// is published only after acceptance is known), so no same-frame cycle
+    /// is expressible, and before the first committed frame it resolves to a
+    /// transparent field with a named diagnostic rather than degrading into
+    /// some other producer.
+    ProgramTap,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +283,9 @@ pub enum ResolvedImageSource {
     /// The etched gesture field. A master-scope singleton with no saved
     /// position: see `SavedImageSource::GestureCanvas`.
     GestureCanvas,
+    /// The finished programme at N-1. A master-scope singleton with no saved
+    /// position: see `SavedImageSource::ProgramTap`.
+    ProgramTap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,9 +332,10 @@ impl SavedImageTap {
                 ResolvedImageSource::MissingGroupOutput(group_id)
             }
             SavedImageSource::CleanProgram => ResolvedImageSource::CleanProgram,
-            // The singleton has no position and no identity to look up, so the
-            // route survives verbatim in both directions.
+            // The singletons have no position and no identity to look up, so
+            // the routes survive verbatim in both directions.
             SavedImageSource::GestureCanvas => ResolvedImageSource::GestureCanvas,
+            SavedImageSource::ProgramTap => ResolvedImageSource::ProgramTap,
         };
         ResolvedImageTap {
             source,
@@ -383,6 +399,7 @@ impl ResolvedImageTap {
             }
             ResolvedImageSource::CleanProgram => SavedImageSource::CleanProgram,
             ResolvedImageSource::GestureCanvas => SavedImageSource::GestureCanvas,
+            ResolvedImageSource::ProgramTap => SavedImageSource::ProgramTap,
         };
         SavedImageTap {
             source,
@@ -6553,6 +6570,87 @@ extra: 1"
         let mut untouched = matte;
         untouched.mark_group_output_missing(GroupId::new(21).unwrap());
         assert_eq!(untouched.tap.source, SavedImageSource::GestureCanvas);
+    }
+
+    #[test]
+    fn the_program_tap_route_is_a_positionless_singleton_in_the_closed_vocabulary() {
+        // Serde tag is the ordinary snake_case member of the closed vocabulary,
+        // and it carries no payload because there is no identity to carry.
+        let saved = SavedImageTap {
+            source: SavedImageSource::ProgramTap,
+            timing: EdgeTiming::CurrentFrame,
+        };
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(json.contains("\"source\":\"program_tap\""), "{json}");
+        assert_eq!(
+            serde_json::from_str::<SavedImageTap>(&json).unwrap(),
+            saved,
+            "the saved route round-trips exactly"
+        );
+        // The vocabulary stays closed: a near-miss tag is rejected rather than
+        // defaulted into some other producer.
+        assert!(serde_json::from_str::<SavedImageSource>(r#"{"source":"program_out"}"#).is_err());
+        assert_eq!(
+            serde_json::from_str::<SavedImageSource>(r#"{"source":"program_tap"}"#).unwrap(),
+            SavedImageSource::ProgramTap
+        );
+
+        // Both directions are a fixed point: nothing is looked up, so nothing
+        // can be lost. `to_runtime` is handed resolvers that would answer for
+        // *any* layer or group, and the route still refuses to become one.
+        let runtime = saved.to_runtime(|_| Some(live_id(99)), |_| true);
+        assert_eq!(runtime.source, ResolvedImageSource::ProgramTap);
+        assert_eq!(runtime.timing, EdgeTiming::CurrentFrame);
+        assert_eq!(runtime.to_saved(|_| Some(saved_position(3))), saved);
+
+        // No saved position and no group identity — deliberately, not by
+        // omission. The programme is a master-scope singleton.
+        assert_eq!(saved.selected_layer_position(), None);
+        assert_eq!(saved.referenced_group(), None);
+        assert_eq!(runtime.referenced_group(), None);
+
+        // Topology edits never touch it: there is no position to invalidate.
+        let mut invalidated = runtime;
+        invalidated.mark_layer_missing(live_id(99));
+        invalidated.mark_group_missing(GroupId::new(21).unwrap());
+        assert_eq!(invalidated, runtime);
+
+        // A rack-level route survives resolution and capture unchanged, and it
+        // is reported by neither positional accessor.
+        let mut rack = VisualRack::empty();
+        rack.push(VisualNodeKind::Displace(DisplaceParams {
+            tap: saved,
+            amount_x: 0.5,
+            ..DisplaceParams::default()
+        }))
+        .unwrap();
+        assert!(rack.selected_layer_positions().next().is_none());
+        assert!(rack.referenced_group_ids().next().is_none());
+        let resolved = rack.resolve_routes(|_| Some(live_id(99)), |_| true);
+        let RuntimeVisualNodeKind::Displace(params) = resolved.iter().next().unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!(params.tap.source, ResolvedImageSource::ProgramTap);
+        let recaptured = resolved.capture_routes(|_| None).unwrap();
+        let VisualNodeKind::Displace(params) = recaptured.iter().next().unwrap().kind else {
+            panic!("displace node")
+        };
+        assert_eq!(
+            params.tap.source,
+            SavedImageSource::ProgramTap,
+            "a positionless route cannot decay into a missing donor"
+        );
+
+        // The same route is authorable through an image matte.
+        let matte = ImageMatte {
+            tap: saved,
+            ..ImageMatte::default()
+        };
+        assert_eq!(matte.sanitized().tap.source, SavedImageSource::ProgramTap);
+        assert_eq!(matte.selected_layer_position(), None);
+        let mut untouched = matte;
+        untouched.mark_group_output_missing(GroupId::new(21).unwrap());
+        assert_eq!(untouched.tap.source, SavedImageSource::ProgramTap);
     }
 
     #[test]

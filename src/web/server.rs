@@ -1036,7 +1036,10 @@ fn valid_creative_route(route: &CreativeImageTapSnapshot) -> bool {
         // dropped at ingress, so the value belongs here as well as in the panel.
         CreativeImageSourceSnapshot::OneBelow
         | CreativeImageSourceSnapshot::AllBelow
-        | CreativeImageSourceSnapshot::GestureCanvas => true,
+        | CreativeImageSourceSnapshot::GestureCanvas
+        // The programme tap is the same singleton shape and is N-1 by
+        // construction, so both timings are authorable here too.
+        | CreativeImageSourceSnapshot::ProgramTap => true,
         CreativeImageSourceSnapshot::CleanProgram => {
             route.timing == crate::visual_rack::EdgeTiming::PreviousFrame
         }
@@ -3734,6 +3737,78 @@ mod tests {
         assert!(js.contains("['gesture_canvas', 'Gesture canvas (etched field)']"));
         assert!(js.contains("case 'gesture_canvas': return 'gesture_canvas';"));
         assert!(js.contains("input = { source: 'gesture_canvas' };"));
+    }
+
+    #[test]
+    fn the_program_tap_route_is_accepted_at_ingress_at_both_timings() {
+        for timing in [
+            crate::visual_rack::EdgeTiming::CurrentFrame,
+            crate::visual_rack::EdgeTiming::PreviousFrame,
+        ] {
+            let route = CreativeImageTapSnapshot {
+                input: CreativeImageSourceSnapshot::ProgramTap,
+                timing,
+            };
+            assert!(
+                valid_creative_route(&route),
+                "the tap is a positionless singleton and is authorable at {timing:?}"
+            );
+            assert!(valid_action(
+                &WebAction::SetVisualNodeRoute {
+                    scope: CreativeScopeSnapshot::Group {
+                        group_id: "9".into(),
+                    },
+                    node_id: "3".into(),
+                    route: route.clone(),
+                    channel: "alpha".into(),
+                    invert: false,
+                    composition_revision: 7,
+                },
+                0
+            ));
+            assert!(valid_action(
+                &WebAction::SetCompositionGroupMatteRoute {
+                    group_id: "9".into(),
+                    route: Some(route.clone()),
+                    channel: "luma".into(),
+                    invert: false,
+                    composition_revision: 7,
+                },
+                0
+            ));
+
+            // It resolves without an ID, a saved position, or a group lookup,
+            // and the resolvers below would happily answer for anything.
+            let resolved = route
+                .to_runtime(|_| crate::performance::SavedLayerPosition::new(4), |_| true)
+                .expect("the singleton resolves to itself");
+            assert_eq!(
+                resolved.source,
+                crate::visual_rack::ResolvedImageSource::ProgramTap
+            );
+            assert_eq!(resolved.timing, timing);
+            assert_eq!(CreativeImageTapSnapshot::from_runtime(resolved), route);
+        }
+
+        // The wire vocabulary stays closed: a near-miss token is refused rather
+        // than defaulted onto another producer.
+        assert!(
+            serde_json::from_str::<CreativeImageSourceSnapshot>(r#"{"source":"program_out"}"#)
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_str::<CreativeImageSourceSnapshot>(r#"{"source":"program_tap"}"#)
+                .unwrap(),
+            CreativeImageSourceSnapshot::ProgramTap
+        );
+
+        // Both panel route editors offer the token and map it back to the same
+        // wire value; a vocabulary present on only one side is the exact defect
+        // this test exists to catch.
+        let js = include_str!("../../static/app.js");
+        assert!(js.contains("['program_tap', 'Program re-entry (N\u{2212}1 audience)']"));
+        assert!(js.contains("case 'program_tap': return 'program_tap';"));
+        assert!(js.contains("input = { source: 'program_tap' };"));
     }
 
     #[test]

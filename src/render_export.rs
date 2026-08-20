@@ -1880,6 +1880,9 @@ fn residual_sidecar_route(
         // S3b's etched canvas is a positionless master-scope singleton, so it
         // resolves with no saved position, stable id, group, or layer stage.
         ResolvedImageSource::GestureCanvas => record.source = "gesture_canvas",
+        // B16's programme tap is the same positionless master-scope
+        // singleton shape.
+        ResolvedImageSource::ProgramTap => record.source = "program_tap",
     }
     record
 }
@@ -2056,6 +2059,9 @@ fn symmetry_sidecar_image_route(
         // resolves with no saved position, stable id, group, or layer stage —
         // exactly as `residual_sidecar_route` records it.
         ResolvedImageSource::GestureCanvas => record.source = "gesture_canvas",
+        // B16's programme tap is the same positionless master-scope
+        // singleton shape.
+        ResolvedImageSource::ProgramTap => record.source = "program_tap",
     }
     record
 }
@@ -4298,6 +4304,12 @@ fn plan_export_composition_inner(
             // therefore always sees an admitted canvas, which is what keeps a
             // routed donor planning identically live and offline.
             .with_gesture_canvas(true)
+            // The offline tap surface exists for the whole job and frame
+            // zero reads its defined-transparent contents, so admission is
+            // unconditional — the same shape as the canvas above. Live
+            // admission flips true at the first accepted frame, after which
+            // both sides plan a routed tap identically.
+            .with_program_tap(true)
             .with_studies(&graph.studies);
     input.resource_limits = resource_limits;
     if let (Some(motion), Some((master, layers))) = (motion, planned_motion.as_ref()) {
@@ -4833,6 +4845,25 @@ fn run_export(
     let composite_views: [wgpu::TextureView; 3] = std::array::from_fn(|i| {
         composite_textures[i].create_view(&wgpu::TextureViewDescriptor::default())
     });
+    // The B16 programme re-entry tap: one retained copy of final slot 2,
+    // published at the acceptance decision exactly as live publishes it. wgpu
+    // zero initialization keeps frame zero's routed taps defined transparent,
+    // pixel-identical to live's pre-first-commit diagnostic resolution.
+    let program_tap_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Export program re-entry tap"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let program_tap_view = program_tap_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let (opaque_output_pipeline, opaque_output_bind_group_layout) =
         crate::renderer::state::build_opaque_output_pipeline(&device);
     let opaque_output_bind_group = crate::renderer::state::build_opaque_output_bind_group(
@@ -5966,6 +5997,14 @@ fn run_export(
                     },
                     None => crate::renderer::composition::GestureCanvasBinding::default(),
                 });
+                // The programme tap binds the job-lifetime export surface
+                // under a constant epoch: the texture never rebuilds inside
+                // one job, so the tap bind groups are built against it
+                // exactly once.
+                executor.bind_program_tap(crate::renderer::composition::ProgramTapBinding::bound(
+                    program_tap_view.clone(),
+                    1,
+                ));
                 match executor.prepare(&device, &queue, &evaluated_composition, &source_descriptors)
                 {
                     Ok(CompositionPreparedKind::Advanced { .. }) => {}
@@ -6365,6 +6404,39 @@ fn run_export(
             }
         }
         gesture_canvas.commit_staged();
+        // The programme tap shares the same acceptance seam: slot 2 still
+        // holds this frame's opaque audience image — offline global NTSC is
+        // applied to the CPU pixels after readback and never lands in slot 2,
+        // exactly as live's asynchronous replacement lands only after live's
+        // copy — so the copy published here is byte for byte the live
+        // ordering. There is no blackout branch offline, because export has
+        // no blackout; live's gate is therefore never taken here rather than
+        // differently taken.
+        {
+            let mut tap_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Export program tap publish"),
+            });
+            tap_encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &composite_textures[2],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &program_tap_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(std::iter::once(tap_encoder.finish()));
+        }
         if advanced_history_staged {
             if let Some(executor) = composition_gpu.as_mut() {
                 executor.commit_frame_history();
@@ -11931,6 +12003,56 @@ layers:
         assert!(
             source[..publish].contains("temporal_state.commit_staged();"),
             "publication belongs after the frame reached ffmpeg, not before it"
+        );
+    }
+
+    /// B16's offline ordering, pinned exactly as the canvas's is: the
+    /// job-lifetime tap surface is built before the loop, bound before
+    /// prepare, and published only at the acceptance decision — after the
+    /// frame reached ffmpeg — byte for byte the live ordering with the
+    /// blackout branch simply never taken (export has no blackout).
+    #[test]
+    fn the_offline_job_publishes_the_program_tap_at_the_acceptance_decision() {
+        let source = include_str!("render_export.rs");
+
+        let build = source
+            .find("let program_tap_texture = device.create_texture(")
+            .expect("the offline tap surface is built before the render loop");
+        assert!(
+            source[build..build + 900].contains("wgpu::TextureUsages::TEXTURE_BINDING"),
+            "the tap is a routable sampled surface, unlike the held-audience copy"
+        );
+
+        let bind = source
+            .find("executor.bind_program_tap(")
+            .expect("the offline executor binds the job-lifetime tap");
+        let prepare = source[bind..]
+            .find("executor.prepare(&device, &queue, &evaluated_composition")
+            .expect("the offline executor prepares after binding");
+        assert!(
+            prepare > 0,
+            "the tap must be bound before prepare builds the tap bind groups"
+        );
+
+        let publish = source
+            .find("label: Some(\"Export program tap publish\"),")
+            .expect("the offline job publishes the tap copy");
+        assert!(
+            source[..publish].contains("temporal_state.commit_staged();"),
+            "publication belongs after the frame reached ffmpeg, not before it"
+        );
+        // The copy reads final slot 2, and offline global NTSC never lands in
+        // slot 2, so the published image is the same pre-NTSC, pre-blackout
+        // opaque audience image live publishes.
+        assert!(
+            source[publish..publish + 700].contains("texture: &composite_textures[2],"),
+            "the offline tap copy must read final audience slot 2"
+        );
+        // Admission is unconditional offline: the surface exists for the whole
+        // job and frame zero reads its defined-transparent contents.
+        assert!(
+            source.contains(".with_program_tap(true)"),
+            "the offline planner admits the job-lifetime tap unconditionally"
         );
     }
 
@@ -17989,6 +18111,61 @@ mod effects_audit {
             decoded_framemd5("renders/audit_display_physics.mp4"),
             decoded_framemd5("renders/audit_display_physics_repeat.mp4"),
             "the display stage must replay deterministically"
+        );
+    }
+
+    /// B16's labeled export case: the finished programme routed back into the
+    /// rig as an ordinary Displace donor — every frame warped by the previous
+    /// frame's pre-blackout opaque audience image, through the real export
+    /// path, the same acceptance-decision copy live performs, no export-only
+    /// tap. The `_untapped` twin carries the identical node at its exact
+    /// bypass (zero gains), so both renders are the same Advanced plan family
+    /// and must decode differently — the re-entry loop demonstrably reaches
+    /// the pixels. The `_repeat` render must decode identically, proving the
+    /// whole two-frame feedback chain (decode → composite → opaque resolve →
+    /// tap publish → next frame's donor) deterministic frame-indexed offline.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_program_reentry_pipeline() {
+        use crate::visual_rack::{
+            DisplaceBoundary, DisplaceParams, EdgeTiming, LegacyRackScope, SavedImageSource,
+            SavedImageTap, VisualNodeKind, VisualRack,
+        };
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_tap = |amount: f32| {
+            let mut patch = base_patch();
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            rack.push(VisualNodeKind::Displace(DisplaceParams {
+                tap: SavedImageTap {
+                    source: SavedImageSource::ProgramTap,
+                    timing: EdgeTiming::CurrentFrame,
+                },
+                amount_x: amount,
+                amount_y: amount,
+                boundary: DisplaceBoundary::Mirror,
+            }))
+            .unwrap();
+            patch.layers[0].rack = Some(rack);
+            patch
+        };
+        render("program_reentry", with_tap(0.4));
+        render("program_reentry_untapped", with_tap(0.0));
+        assert_ne!(
+            decoded_framemd5("renders/audit_program_reentry.mp4"),
+            decoded_framemd5("renders/audit_program_reentry_untapped.mp4"),
+            "a routed programme tap must change the decoded frames"
+        );
+        render("program_reentry_repeat", with_tap(0.4));
+        assert_eq!(
+            decoded_framemd5("renders/audit_program_reentry.mp4"),
+            decoded_framemd5("renders/audit_program_reentry_repeat.mp4"),
+            "the re-entry loop must replay deterministically"
         );
     }
 

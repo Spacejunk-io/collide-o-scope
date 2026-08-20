@@ -1120,6 +1120,83 @@ every path; `render_bus_mixing_boundary_pipeline` and
 `render_melting_edge_and_key_dressing_pipeline` are the labeled export
 cases.
 
+### B16 program re-entry
+
+The missing producer was the programme itself. `SavedImageSource::ProgramTap`
+(serde tag `program_tap`, plan hash code 8, append-only) joins the closed
+image-route vocabulary exactly as `GestureCanvas` did: a master-scope
+singleton with no scope, no ID, and no saved position, selectable by any
+existing image tap — Displace donor, matte, group matte — with no new node
+kind, no new wire action, and no new modulation address. The law is derived
+from BENDR (MIT, © 2026 Steve Blythe): any channel may source the finished
+programme, and whatever it reads is one frame old, which is what makes the
+loop stable rather than an infinite regress.
+
+**What the tap holds.** One retained full-frame `Rgba8UnormSrgb` copy of the
+**pre-blackout opaque audience image**: final composite slot 2 after the
+opaque resolve — so it includes display physics, the melting edge, temporal,
+and synchronous selective VHS — before the blackout clear and before the
+asynchronous global-VHS replacement, which lands in slot 2 only after the
+copy on both paths, so live and export publish the same image by
+construction. The copy is published in its own encoder at the
+**frame-acceptance decision** (after the frame encoder is submitted and
+committed, the only point at which acceptance is known — the gesture-donor /
+ProgramHistory N-1 law), so a routed tap reads the finished programme as of
+the previous accepted frame and no same-frame cycle is expressible. Both
+timings read the same committed copy: the tap *is* the N-1 image and has no
+parity pair, so an N-1 route to it stages nothing.
+
+**The blackout decision, made explicitly.** Blackout suspends publication
+instead of clearing: `publish_program_tap` is gated on
+`temporal_frame_accepted && !blackout`, so the tap **holds** the last
+pre-blackout accepted image while the emergency cut is engaged — program
+memory on the temporal-ring/melt precedent, not an audience wake like B4's
+phosphor. No frame rendered under the cut can enter a re-entry loop, a
+release resumes the loop from the picture the cut interrupted, and blackout
+stays absolute because the tap re-enters only through the composite, which
+the downstream clear blacks on every cut frame. Export has no blackout, so
+the gate's branch is never taken offline rather than differently taken.
+
+**Availability.** Before the first committed frame — process start, and
+again after a patch load (`invalidate_program_tap` beside the renderer's
+PatchGeneration reset, because a new program must not composite its first
+frame through the previous program's image) — a routed tap plans
+`Transparent` with the named `ProgramTapUnavailable` diagnostic and never
+rebinds to another producer. Live admission is `renderer.program_tap_valid()`
+consulted at every in-loop plan construction; export admits unconditionally
+(`with_program_tap(true)`, the offline-canvas precedent) because its
+job-lifetime surface reads defined transparent at frame zero — pixel
+identical to the diagnostic path, proven by arithmetic in the GPU fixture. A
+rebuilt renderer is a new tap texture: the executor's `ProgramTapBinding`
+(the canvas binding's exact shape) carries a host epoch, so prepared tap
+bind groups rebuild instead of keeping a destroyed surface's view. Apply
+Look, broad revert, and source cuts deliberately do not invalidate — the
+program is continuous and the tap stays honest N-1.
+
+**Ledger.** One persistent full-frame surface, charged by raising the
+renderer-owned full-frame texture floor from 29 to 30 (`state.rs`, exact
+byte literals re-pinned); zero passes beyond the one `copy_texture_to_texture`
+per accepted frame; zero retained tap surfaces on either side of the
+composition ledger (`TapBacking::ProgramTap` counts zero and
+`validate_actual_surface_ledger` reconciles it, exactly as the canvas);
+zero new wire actions, zero snapshot cost beyond the route token, zero
+modulation addresses. The copy is unconditional on accepted non-blackout
+frames — content must not depend on whether anything currently routes it.
+
+**Closure.** Patch: routes ride the ordinary `SavedImageTap` serde, so the
+walker claims no edge for them dormant or woken; no new patch section
+exists. Wire: the token rides every existing route action through
+`CreativeImageSourceSnapshot::ProgramTap` at both timings. Morph, Dice,
+generator, Look, preset: route equality covers the new variant with no new
+arm anywhere. Panel: the fixed `program_tap` option beside `one_below` /
+`all_below` / `clean_program` / `gesture_canvas` (no new sliders — the
+range pins do not move). Export consumes the same plan and publishes at the
+same acceptance seam; the `.motion.json` sidecar records the route as
+`program_tap`. `render_program_reentry_pipeline` is the labeled export case
+(the `_untapped` twin holds the identical node at exact bypass inside the
+same Advanced plan family and must decode differently; `_repeat` must decode
+identically, proving the whole two-frame feedback chain deterministic).
+
 ## Effects and compositing
 
 - One combined uniform-driven effect shader avoids pipeline switches.
@@ -2965,6 +3042,31 @@ mislead browser tests.
   `render_bus_mixing_boundary_pipeline` and
   `render_melting_edge_and_key_dressing_pipeline` are the labeled export
   cases, each with a difference twin and a `_repeat` determinism assertion.
+- Program re-entry tests must cover the closed vocabulary (serde tag
+  `program_tap` with a near-miss rejected, plan hash code 8 append-only, the
+  fixed-point saved/runtime round trip with no positional accessor and no
+  tombstone), the planner law (a routed tap at both timings claims no
+  dependency, no ordering edge, no staging, and no ledger surface, with the
+  bare topological order unchanged and both scopes' resource numbers
+  identical; unavailable resolves `Transparent` with the named
+  `ProgramTapUnavailable` diagnostic and never rebinds), the fail-closed
+  ledger reconcile at zero with one-over refusal, the saved-graph walker
+  claiming no edge dormant or woken through a YAML round trip, ingress
+  acceptance at both timings with the panel strings asserted in `app.js`,
+  the live source-order law (bind before prepare; publish only after
+  `commit_temporal_frame` under the `temporal_frame_accepted &&
+  !self.blackout` gate; the blackout clear downstream of the copy; all three
+  in-loop plan constructions consulting `program_tap_valid`; the
+  patch-generation barrier invalidating the tap), the offline source-order
+  mirror (job-lifetime surface, bind before prepare, publish after the
+  ffmpeg write, the copy reading slot 2, unconditional admission), and the
+  renderer texture floor at exactly 30 with its re-pinned byte literals.
+  `gpu_a_program_tap_donor_feeds_the_previous_frame_back_through_a_routed_displace`
+  carries the physical-GPU claim (never-published equals unbound by
+  arithmetic, a published copy demonstrably reaches the pixels, rebinding
+  under a new epoch re-prepares), and `render_program_reentry_pipeline` is
+  the labeled export case with its `_untapped` difference twin inside the
+  same Advanced plan family and its `_repeat` determinism assertion.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

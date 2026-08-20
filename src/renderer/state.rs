@@ -92,11 +92,11 @@ impl LiveFrameResources {
 pub const HISTORY_LEN: u32 = TEMPORAL_HISTORY_LEN;
 
 /// Full-frame RGBA textures owned unconditionally by a live renderer: the
-/// history ring, one feedback texture, three composite targets, and one held
-/// audience frame. This is an exact payload floor, not a VRAM estimate: driver
-/// padding, surfaces, buffers, and media/layer textures are intentionally not
-/// included.
-const RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES: u64 = HISTORY_LEN as u64 + 5;
+/// history ring, one feedback texture, three composite targets, one held
+/// audience frame, and the programme re-entry tap. This is an exact payload
+/// floor, not a VRAM estimate: driver padding, surfaces, buffers, and
+/// media/layer textures are intentionally not included.
+const RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES: u64 = HISTORY_LEN as u64 + 6;
 
 fn renderer_owned_full_frame_texture_floor_bytes(width: u32, height: u32) -> Option<u64> {
     u64::from(width)
@@ -265,14 +265,14 @@ mod temporal_state_tests {
 
     #[test]
     fn renderer_owned_full_frame_texture_floor_is_exact_and_checked() {
-        assert_eq!(RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES, 29);
+        assert_eq!(RENDERER_OWNED_FULL_FRAME_RGBA_TEXTURES, 30);
         assert_eq!(
             renderer_owned_full_frame_texture_floor_bytes(1280, 720),
-            Some(106_905_600)
+            Some(110_592_000)
         );
         assert_eq!(
             renderer_owned_full_frame_texture_floor_bytes(3840, 2160),
-            Some(962_150_400)
+            Some(995_328_000)
         );
         assert_eq!(
             renderer_owned_full_frame_texture_floor_bytes(u32::MAX, u32::MAX),
@@ -2925,6 +2925,19 @@ pub struct Renderer {
     // to/from final audience slot 2.
     held_audience_texture: wgpu::Texture,
 
+    // The B16 programme re-entry tap: one retained copy of the pre-blackout
+    // opaque audience image (slot 2 after the opaque resolve, before the
+    // blackout clear and before asynchronous global VHS replacement),
+    // published only at the frame-acceptance decision. Unlike the held
+    // audience snapshot it IS sampled — any image tap can route it — so it
+    // carries TEXTURE_BINDING and its own view. `program_tap_valid` is the
+    // admission fact the planner consumes: false until the first accepted
+    // frame publishes, false again after an explicit invalidation (patch
+    // load), and false in every freshly built renderer by construction.
+    program_tap_texture: wgpu::Texture,
+    program_tap_view: wgpu::TextureView,
+    program_tap_valid: bool,
+
     // Raw (non-sRGB-decoding) view of slot 2 for egui-wgpu, whose shader
     // performs the gamma-to-linear conversion itself.
     pub output_view: wgpu::TextureView,
@@ -3272,6 +3285,26 @@ impl Renderer {
             usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        // wgpu guarantees zero initialization, so before the first publish the
+        // tap reads defined transparent black rather than uninitialized data —
+        // though the planner keeps unpublished routes on the named diagnostic
+        // path and nothing binds it until `program_tap_valid` is true.
+        let program_tap_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Program re-entry tap"),
+            size: wgpu::Extent3d {
+                width: output_width,
+                height: output_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: COMPOSITE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let program_tap_view =
+            program_tap_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (opaque_output_pipeline, opaque_output_bind_group_layout) =
             build_opaque_output_pipeline(&device);
         let opaque_output_bind_group = build_opaque_output_bind_group(
@@ -3331,6 +3364,9 @@ impl Renderer {
             composite_textures,
             composite_views,
             held_audience_texture,
+            program_tap_texture,
+            program_tap_view,
+            program_tap_valid: false,
             output_view,
             output_width,
             output_height,
@@ -3641,6 +3677,65 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Publish the programme re-entry tap: one copy of the exact pre-blackout
+    /// opaque audience image out of final slot 2, in its own encoder because
+    /// acceptance is only known after the frame encoder has been submitted —
+    /// the same N-1 law the gesture-canvas donor and ProgramHistory obey. The
+    /// caller invokes this only on an accepted frame with blackout disengaged:
+    /// under blackout the tap deliberately *holds* the last pre-blackout
+    /// image (program memory, the temporal-ring/melt precedent), so no frame
+    /// rendered under the emergency cut ever enters a re-entry loop and a
+    /// release resumes from the picture the cut interrupted.
+    pub fn publish_program_tap(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Program Tap Publish"),
+            });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.program_tap_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.output_width,
+                height: self.output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.program_tap_valid = true;
+    }
+
+    /// Whether the tap holds a committed frame. This is the planner's
+    /// admission fact: before the first publish (and after an invalidation) a
+    /// routed tap resolves transparent with a named diagnostic.
+    pub fn program_tap_valid(&self) -> bool {
+        self.program_tap_valid
+    }
+
+    /// The routable tap image, available exactly while it is valid — the
+    /// `GestureCanvasResources::presented_view` availability seam.
+    pub fn program_tap_view(&self) -> Option<&wgpu::TextureView> {
+        self.program_tap_valid.then_some(&self.program_tap_view)
+    }
+
+    /// Drop the tap's validity without touching its bytes. A new program
+    /// (patch apply) must not composite its first frame through the previous
+    /// program's image; the surface itself is re-published before any route
+    /// can bind it again.
+    pub fn invalidate_program_tap(&mut self) {
+        self.program_tap_valid = false;
     }
 
     /// Blackout: clear the final composite to black. Everything downstream
