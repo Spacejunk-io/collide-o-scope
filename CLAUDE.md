@@ -24,6 +24,8 @@ The `ffmpeg-next = "8"` crate must match the installed FFmpeg major.
 ```text
 src/
 ├── main.rs              winit loop, app transactions, history, capture, web/native actions
+├── pattern_synth.rs     B7 pattern-synth source law: authored params, closed vocabularies, CPU reference, wire-edit table
+├── text_page.rs         B7 text-page source law: authored page, bundled two-face raster, wire-edit table
 ├── composition.rs       stable-ID groups, buses, mattes, and authored composition topology
 ├── evaluated_composition.rs unified LegacyExact/Advanced planner and resource admission
 ├── visual_rack.rs       ordered scope racks, typed nodes, taps, validation, persistence
@@ -44,6 +46,7 @@ src/
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
 ├── renderer/display_physics.rs single-seam slot-0 display stage, lazy field/phosphor surfaces
 ├── renderer/melting_edge.rs B8 slot-0 master melt over the program's own coverage, lazy history
+├── renderer/pattern_synth.rs lazy per-layer pattern pass executor shared by live and export
 ├── renderer/scan_processor.rs dedicated instanced-ribbon executor and shared accumulator
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
@@ -85,6 +88,7 @@ src/
     ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
     ├── study_interpreter.wgsl fixed Study interpreter over a bounded instruction buffer
     ├── display_physics.wgsl field domain, N-1 phosphor store, beam/mask display pass
+    ├── pattern_synth.wgsl B7 pattern source: shape/oscillator/wavefolder/comparator/colouriser, no texture
     ├── melting_edge.wgsl  B8 coverage-boundary probe, band drag, self-feeding hold
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
@@ -1300,6 +1304,90 @@ temporal-adjacent state; the generator mutates the eight values in fresh
 field-isolated domains (`mutate_codec_mosh`, `GENERATOR_VERSION` is now
 "12"). `render_codec_mosh_pipeline` is the labeled export case with its
 `_clean` difference and `_repeat` per-host determinism assertions.
+
+### B7 generator sources
+
+The first sources with **perfect offline reconstruction**: no file identity,
+no content reference, no black placeholder — the patch carries everything.
+Two new `LayerSource` arms on the `spout://` sentinel stability rules
+(`synth://pattern`, `text://page`, fixed singletons: the kind is the
+identity, everything else is values). Laws derived from BENDR (MIT, © 2026
+Steve Blythe); `src/pattern_synth.rs` and `src/text_page.rs` are the
+independent CPU references in the `gesture.rs` tradition.
+
+**Pattern synth.** One GPU pass per frame (`pattern_synth.wgsl` — no
+texture, no sampler, one 128-byte compile-time-asserted uniform) computes a
+fixed 1920×1080 page: framing (centre/zoom/rotate/skew/domain-warp) → shape
+(closed vocabulary, codes 0–11: Scan, Radial, Spiral, Plasma, Lissajous,
+Rings, Starburst, Grid, Tunnel, Cells, Interference, Polygon) → oscillator
+(codes 0–5: Sine, Triangle, Saw, Square, Pulse, S&H) → cross-modulation →
+wavefolder → comparator → colouriser (codes 0–4: Mono, RgbPhase, HsvSweep,
+Duotone, Bands; the default is BENDR's own Scan/Sine/RgbPhase). The whole
+path is stateless — a pure function of the 22 authored values and frame-plan
+time (`t = time × rate`, BENDR's GPU-synth law; SPD is inert exactly as on a
+still) — so Pause holds the picture and export replays it structurally. The
+page is fixed-size deliberately: an output-sized page would make an export
+at another resolution a different picture. The computed colour is
+display-domain; the shader decodes it through the exact piecewise sRGB
+transfer so the stored bytes are the picture. The pass encodes into the
+frame encoder immediately after its creation — before Advanced prepare and
+LegacyExact rendering — on both live and export, from the plan's modulated
+copies (`EvaluatedLayer.pattern`, resolved by `modulate_layer_pattern` from
+the same frame-local offsets accumulator every per-layer consumer reads), so
+live/export parity is structural. The executor
+(`renderer/pattern_synth.rs`) is lazy: a session with no pattern layer
+charges nothing. The layer texture takes the ordinary still-image
+media-safety plan (Safe-sized, zero Expert bytes) plus `RENDER_ATTACHMENT`;
+the renderer-owned full-frame texture floor (30) is untouched.
+
+**Text page.** A static typeset page rastered on the CPU (1920×1080 opaque
+RGBA) from its own authored state: body (≤ 4,096 bytes, truncated on a char
+boundary), one of **two bundled licensed faces** (Hack MIT / Ubuntu-Light
+UFL via `epaint_default_fonts` — already in the dependency tree, zero new
+embedded bytes, so the same page rasters byte-identically on every host),
+size/track/x/y/rotate/repeat/outline, ink/bg colours, and the shape fan
+(closed vocabulary codes 0–9) with BENDR's `1 − f·0.55` taper. Re-rastered
+**only on authored change** — between edits it costs what a still costs, and
+the upload rides the still-image publish law verbatim (pending frame →
+ready-frame pump → checked upload, restore-on-failure). The deliberate
+deviation: BENDR's clocked terms (scroll, spin, pulse) are absent — the
+page's law is re-render-on-change, and movement is authored downstream
+through the spatial transform, effects, and Motion. Outline is a bounded
+morphological band (radius ≤ 10 px); rotation is a per-row rotate-blit
+about each row's own anchor.
+
+**Closure.** Patch: `LayerConfig.pattern` / `.text_page`, skip-serialized at
+`None` (pre-B7 bytes and canonical hashes keep); hostile scalars sanitize to
+neutral; unknown tokens/fields are rejections. Resolution:
+`resolve_visual_source` short-circuits both sentinels before any filesystem
+work, like Spout; patch apply and export reconstruction build the layer from
+the config alone. Wire: `add_pattern_layer` / `add_text_layer` (topology,
+immediate) and the coalescible `set_layer_pattern` / `set_layer_text`, both
+validated at the gate and applied by the engine through the **single shared
+parse tables** (`PatternSynthEdit::parse` / `TextPageEdit::parse`, the B8
+`BusMixerEdit` law). Modulation: 22 `pattern_*` layer suffixes at compiled
+indices 94–115 (`LAYER_TARGET_SUFFIXES` is 116); the three vocabularies and
+every text-page field have no address — modulating a page would force a
+re-raster per frame, which the still-cost law forbids. Morph: pattern values
+blend only when both slots captured a pattern source at that position (two
+kinds are two pieces, not two ends of a blend), hue on its shortest wrapped
+unit arc, discrete laws at the midpoint, kind-gated application, ownership
+released on manual edit; the text page is deliberately outside Morph (a body
+is content identity, not performance state). Look: pattern values transfer
+kind-gated (the matte match-then-move precedent); the text page does not.
+Dice and the generator preserve generator source state exactly (the
+source-identity law) — **no `GENERATOR_VERSION` bump**; generated manifests
+record `kind: pattern_synth|text_page`, `offline_policy: reconstructed`,
+verified with no bytes, never tripping `--allow-black-sources`. Prepared
+sources: staging a sentinel into a clip slot is a typed refusal. Snapshot:
+additive `pattern` / `text_page` layer blocks; `offline_export_policy` is
+empty for generators. Panel: generated card sections (range pins:
+`index.html` stays 198, `app.js` template tags 19 → 21). Export provenance:
+`ExportMotionSourceKind` values `pattern_synth` / `text_page` — additive
+values in an existing sidecar field, no schema bump (stays 6).
+`render_pattern_synth_pipeline` and `render_text_page_pipeline` are the
+labeled export cases; each patch's only layer is a generator, which is the
+self-containment proof.
 
 ## Effects and compositing
 
@@ -3276,6 +3364,35 @@ mislead browser tests.
   (resolved reaches the audience image; an unresolved digest is
   byte-identical to no node; warm frames allocate nothing), and
   `render_study_field_pipeline` is the labeled export case.
+- Generator-source tests split along the GPU boundary. Hosted: the pattern
+  transcription fixtures (oscillator waveforms including the S&H cell law,
+  radial symmetry without cross-mod, Scan separability, the hard comparator
+  on constructed pre-comparator signals, wavefolder range and reach,
+  colouriser laws, centre invariance under zoom/rotate, hostile neutral
+  sanitize, the frozen shape/wave/colour code tables, the 128-byte uniform
+  assertion with hostile-time neutralization); the text raster fixtures
+  (opaque page, byte-identical re-raster, glyphs landing at the anchor, the
+  two faces differing, shape-fan fill/stroke laws with rings always
+  stroked, repeat and outline reach, body-cap truncation on a character
+  boundary, frozen code tables); the patch round trip with absent-section
+  byte identity, neutral hostile sanitize, and unknown-token/field
+  rejection; the wire accept/reject battery through the shared parse
+  tables plus the `add_pattern_layer`/`add_text_layer` spellings; the
+  modulation battery (all 22 ranges, discrete refusals, suffix indices
+  pinned at 94..=115 with the table at 116, offsets landing in the frame
+  copy and clamping, dormant identity); and the Morph battery (blend,
+  wrapped hue crossing the unit seam, midpoint recall of all three
+  vocabularies, exact endpoints, the both-slots gate and appended-layer
+  editability). Opt-in:
+  `gpu_pattern_synth_matches_the_cpu_reference_for_every_shape` (all 12
+  shapes x 5 colourisers on a 144-point grid, >=95% of channel samples
+  within four sRGB code values — statistical because BENDR's screen hash
+  amplifies single ulps at isolated pixels — opaque pages, deterministic
+  double render) carries the physical-GPU claim, and
+  `render_pattern_synth_pipeline` / `render_text_page_pipeline` are the
+  labeled export cases: each patch's only layer is a generator, so the
+  render succeeding with no file anywhere is the self-containment proof,
+  with difference twins and `_repeat` determinism assertions.
 - Spatial tests must cover the exact inactive identity, Transparent exposure,
   explicit Clamp, 4:3 Fit/Fill/Native landmarks, source-space anchor behavior,
   aspect-correct rotation/skew, crop/hostile inputs, every edge/sampling mode,

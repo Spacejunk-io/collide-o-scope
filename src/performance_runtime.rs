@@ -643,6 +643,17 @@ impl SystemSourcePreparer {
                 let persisted_reference = file.identity.map(|identity| identity.source_reference());
                 self.prepare_file(&file.path, persisted_reference, start_position, is_current)
             }
+            // A generator source is authored on its layer, not loaded from
+            // the library: a typed refusal, never a positional fallback.
+            ResolvedVisualSource::PatternSynth | ResolvedVisualSource::TextPage => {
+                Err(SourcePrepareError::Failed(
+                    PreparationFailureKind::SourceOpen,
+                    format!(
+                        "generator source '{filename}' is authored on its layer and cannot be \
+                         staged into a clip slot"
+                    ),
+                ))
+            }
         }
     }
 

@@ -28,7 +28,8 @@ second full-frame history ring.
 | B8 — the mixing boundary | **Complete** | `docs/evidence/b8-mixing-boundary-note.md`; CLAUDE.md "B8 the mixing boundary" |
 | B16 — program re-entry | **Complete** | `docs/evidence/b16-program-reentry-note.md`; CLAUDE.md "B16 program re-entry" |
 | B5 — codec mosh | **Complete** | `docs/evidence/b5-codec-mosh-note.md`; CLAUDE.md "B5 codec mosh" |
-| B7, B9, B10, B11, B6, B15 | Open | — |
+| B7 — generator sources | **Complete** | `docs/evidence/b7-generator-sources-note.md`; CLAUDE.md "B7 generator sources" |
+| B9, B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -36,15 +37,15 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-Wave 2 closes with **B7, generator sources** — two new `LayerSource` arms
-(`synth://` and `text://` sentinels on the `spout://` stability rules): a
-Pattern synth rendered as one GPU pass per frame clocked by frame-plan time
-(shape → oscillator → cross-modulation → wavefolder → comparator →
-colouriser, every continuous control a modulation destination), and a
-TextPage rastered on CPU into a bounded RGBA upload re-rendered only on
-authored change. Both serialize wholly in `LayerConfig` — the first sources
-with perfect offline reconstruction. Fetch the plan document before
-starting it.
+**Wave 2 is complete** (B1, B4, B8, B16, B5, B7). Wave 3 opens with **B9,
+the performance recorder** — the gesture-track contract as template
+(`gesture.rs`: reference ticks, Q16 quantization, domain-separated SHA-256,
+bounded serde, truncation honesty) recording `(tick, param_address, value)`
+events at the coalesced drain, replayed by dispatching real actions through
+`handle_web_action_inner_with_feedback` with an automation origin (the
+transform-gizmo delegation law), values only in v1, stale addresses
+degrading per-address with named diagnostics. Fetch the plan document
+before starting it.
 
 ## The working method every tranche follows
 

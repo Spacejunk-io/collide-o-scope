@@ -1781,6 +1781,25 @@ pub fn target_range(target: &str) -> Option<(f32, f32)> {
         "flatten_levels" | "bitcrush_levels" => Some((2.0, 16.0)),
         "colourpass_hue" | "edge_hue" | "emboss_angle" | "halftone_angle" => Some((-180.0, 180.0)),
         "multi_grid_x" | "multi_grid_y" => Some((1.0, 8.0)),
+        // B7 pattern synth. The three discrete vocabularies (shape, wave,
+        // colour mode) have no modulatable address.
+        "pattern_freq_x"
+        | "pattern_freq_y"
+        | "pattern_cross_mod"
+        | "pattern_wavefold"
+        | "pattern_pulse_width"
+        | "pattern_comparator"
+        | "pattern_comp_threshold"
+        | "pattern_comp_soft"
+        | "pattern_warp"
+        | "pattern_hue"
+        | "pattern_saturation" => Some((0.0, 1.0)),
+        "pattern_phase" | "pattern_rate" | "pattern_zoom" | "pattern_rotate" | "pattern_skew"
+        | "pattern_center_x" | "pattern_center_y" => Some((-1.0, 1.0)),
+        "pattern_symmetry" => Some((1.0, 16.0)),
+        "pattern_hue_spread" => Some((0.0, 2.0)),
+        "pattern_brightness" => Some((0.0, 1.5)),
+        "pattern_color_bands" => Some((2.0, 16.0)),
         _ => None,
     }
 }
@@ -1902,6 +1921,20 @@ impl ModulationFrame {
             fps,
             &self.offsets,
         )
+    }
+
+    /// Resolve one pattern layer's authored values plus this frame's
+    /// offsets from the same frame-local routing accumulator every other
+    /// per-layer consumer reads. Non-pattern layers never call this: the
+    /// base is absent, so a route to a `pattern_*` address stays dormant.
+    pub(crate) fn modulate_layer_pattern(
+        &self,
+        index: usize,
+        base: &crate::pattern_synth::PatternSynthParams,
+    ) -> crate::pattern_synth::PatternSynthParams {
+        apply_pattern_synth_offsets(base, |suffix, min, max| {
+            self.offsets.layer_value(index, suffix) * (max - min) * 0.5
+        })
     }
 
     /// Resolve one layer's Motion values from the same frame-local routing
@@ -3297,6 +3330,31 @@ const LAYER_TARGET_SUFFIXES: &[&str] = &[
     // B8 key dressing, appended so every compiled suffix index is stable.
     "key_border",
     "key_shadow",
+    // B7 pattern synth (94..=115), appended so every compiled suffix index
+    // is stable. These are dormant on non-pattern layers: the base is
+    // absent, so the offset applies to nothing and costs nothing.
+    "pattern_freq_x",
+    "pattern_freq_y",
+    "pattern_phase",
+    "pattern_rate",
+    "pattern_cross_mod",
+    "pattern_wavefold",
+    "pattern_pulse_width",
+    "pattern_comparator",
+    "pattern_comp_threshold",
+    "pattern_comp_soft",
+    "pattern_symmetry",
+    "pattern_zoom",
+    "pattern_rotate",
+    "pattern_skew",
+    "pattern_center_x",
+    "pattern_center_y",
+    "pattern_warp",
+    "pattern_hue",
+    "pattern_hue_spread",
+    "pattern_saturation",
+    "pattern_brightness",
+    "pattern_color_bands",
 ];
 
 impl RoutingOffsets {
@@ -3451,8 +3509,64 @@ fn layer_suffix_index(suffix: &str) -> Option<usize> {
         "multi_grid_y" => 91,
         "key_border" => 92,
         "key_shadow" => 93,
+        "pattern_freq_x" => 94,
+        "pattern_freq_y" => 95,
+        "pattern_phase" => 96,
+        "pattern_rate" => 97,
+        "pattern_cross_mod" => 98,
+        "pattern_wavefold" => 99,
+        "pattern_pulse_width" => 100,
+        "pattern_comparator" => 101,
+        "pattern_comp_threshold" => 102,
+        "pattern_comp_soft" => 103,
+        "pattern_symmetry" => 104,
+        "pattern_zoom" => 105,
+        "pattern_rotate" => 106,
+        "pattern_skew" => 107,
+        "pattern_center_x" => 108,
+        "pattern_center_y" => 109,
+        "pattern_warp" => 110,
+        "pattern_hue" => 111,
+        "pattern_hue_spread" => 112,
+        "pattern_saturation" => 113,
+        "pattern_brightness" => 114,
+        "pattern_color_bands" => 115,
         _ => return None,
     })
+}
+
+/// Apply the twenty-two continuous pattern-synth destinations to a copy of
+/// an authored base. The three discrete vocabularies have no address and
+/// pass through untouched; the sanitize pass afterwards is the same neutral
+/// non-finite law every consumer of these values applies.
+fn apply_pattern_synth_offsets(
+    base: &crate::pattern_synth::PatternSynthParams,
+    mut offset: impl FnMut(&'static str, f32, f32) -> f32,
+) -> crate::pattern_synth::PatternSynthParams {
+    let mut p = *base;
+    p.freq_x += offset("pattern_freq_x", 0.0, 1.0);
+    p.freq_y += offset("pattern_freq_y", 0.0, 1.0);
+    p.phase += offset("pattern_phase", -1.0, 1.0);
+    p.rate += offset("pattern_rate", -1.0, 1.0);
+    p.cross_mod += offset("pattern_cross_mod", 0.0, 1.0);
+    p.wavefold += offset("pattern_wavefold", 0.0, 1.0);
+    p.pulse_width += offset("pattern_pulse_width", 0.0, 1.0);
+    p.comparator += offset("pattern_comparator", 0.0, 1.0);
+    p.comp_threshold += offset("pattern_comp_threshold", 0.0, 1.0);
+    p.comp_soft += offset("pattern_comp_soft", 0.0, 1.0);
+    p.symmetry += offset("pattern_symmetry", 1.0, 16.0);
+    p.zoom += offset("pattern_zoom", -1.0, 1.0);
+    p.rotate += offset("pattern_rotate", -1.0, 1.0);
+    p.skew += offset("pattern_skew", -1.0, 1.0);
+    p.center_x += offset("pattern_center_x", -1.0, 1.0);
+    p.center_y += offset("pattern_center_y", -1.0, 1.0);
+    p.warp += offset("pattern_warp", 0.0, 1.0);
+    p.hue += offset("pattern_hue", 0.0, 1.0);
+    p.hue_spread += offset("pattern_hue_spread", 0.0, 2.0);
+    p.saturation += offset("pattern_saturation", 0.0, 1.0);
+    p.brightness += offset("pattern_brightness", 0.0, 1.5);
+    p.color_bands += offset("pattern_color_bands", 2.0, 16.0);
+    p.sanitized()
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -6170,6 +6284,81 @@ mod tests {
 
         // An inert matrix leaves the sanitized base exactly where it was.
         let inert = ModMatrix::new().frame(0).modulate_gesture_canvas(&base);
+        assert_eq!(inert, base.sanitized());
+    }
+
+    #[test]
+    fn pattern_synth_layer_targets_are_bounded_and_discrete_laws_are_refused() {
+        // All twenty-two continuous addresses answer their declared ranges.
+        for (target, range) in [
+            ("layer1_pattern_freq_x", (0.0, 1.0)),
+            ("layer1_pattern_freq_y", (0.0, 1.0)),
+            ("layer1_pattern_phase", (-1.0, 1.0)),
+            ("layer1_pattern_rate", (-1.0, 1.0)),
+            ("layer1_pattern_cross_mod", (0.0, 1.0)),
+            ("layer1_pattern_wavefold", (0.0, 1.0)),
+            ("layer1_pattern_pulse_width", (0.0, 1.0)),
+            ("layer1_pattern_comparator", (0.0, 1.0)),
+            ("layer1_pattern_comp_threshold", (0.0, 1.0)),
+            ("layer1_pattern_comp_soft", (0.0, 1.0)),
+            ("layer1_pattern_symmetry", (1.0, 16.0)),
+            ("layer1_pattern_zoom", (-1.0, 1.0)),
+            ("layer1_pattern_rotate", (-1.0, 1.0)),
+            ("layer1_pattern_skew", (-1.0, 1.0)),
+            ("layer1_pattern_center_x", (-1.0, 1.0)),
+            ("layer1_pattern_center_y", (-1.0, 1.0)),
+            ("layer1_pattern_warp", (0.0, 1.0)),
+            ("layer1_pattern_hue", (0.0, 1.0)),
+            ("layer1_pattern_hue_spread", (0.0, 2.0)),
+            ("layer1_pattern_saturation", (0.0, 1.0)),
+            ("layer1_pattern_brightness", (0.0, 1.5)),
+            ("layer1_pattern_color_bands", (2.0, 16.0)),
+        ] {
+            assert_eq!(target_range(target), Some(range), "{target}");
+        }
+        // The three discrete vocabularies have no modulatable address.
+        for refused in [
+            "layer1_pattern_shape",
+            "layer1_pattern_wave",
+            "layer1_pattern_color_mode",
+        ] {
+            assert_eq!(target_range(refused), None, "{refused}");
+        }
+        // Appended suffix indices are stable: 94..=115, key dressing intact.
+        assert_eq!(layer_suffix_index("key_shadow"), Some(93));
+        assert_eq!(layer_suffix_index("pattern_freq_x"), Some(94));
+        assert_eq!(layer_suffix_index("pattern_color_bands"), Some(115));
+        assert_eq!(LAYER_TARGET_SUFFIXES.len(), 116);
+        assert_eq!(LAYER_TARGET_SUFFIXES[94], "pattern_freq_x");
+        assert_eq!(LAYER_TARGET_SUFFIXES[115], "pattern_color_bands");
+
+        // An applied offset lands in the frame copy; the authored base is
+        // immutable and the discrete laws never move.
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = vec![
+            Routing::new(ModSource::Midi(0), "layer1_pattern_wavefold", 1.0),
+            Routing::new(ModSource::Midi(0), "layer1_pattern_hue_spread", 1.0),
+        ];
+        matrix.update_at_beat(0.0, 0.0);
+        let frame = matrix.frame(1);
+        let base = crate::pattern_synth::PatternSynthParams::default();
+        let modulated = frame.modulate_layer_pattern(0, &base);
+        assert!((modulated.wavefold - 0.5).abs() < 1e-6);
+        assert!((modulated.hue_spread - 2.0).abs() < 1e-6);
+        assert_eq!(modulated.shape, base.shape);
+        assert_eq!(modulated.wave, base.wave);
+        assert_eq!(modulated.color_mode, base.color_mode);
+        assert_eq!(
+            base,
+            crate::pattern_synth::PatternSynthParams::default(),
+            "modulation must contribute to a copy and never rewrite the base"
+        );
+        // Saturated offsets clamp into the declared ranges.
+        assert!((0.0..=1.0).contains(&modulated.wavefold));
+        assert!((0.0..=2.0).contains(&modulated.hue_spread));
+        // A dormant frame is the sanitized identity.
+        let inert = ModMatrix::new().frame(1).modulate_layer_pattern(0, &base);
         assert_eq!(inert, base.sanitized());
     }
 }

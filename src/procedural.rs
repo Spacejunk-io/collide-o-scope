@@ -2699,6 +2699,30 @@ pub fn preflight_sources(
                 offline_policy: Some("deterministic_black".into()),
                 verified: true,
             }),
+            // B7 generators are the first sources with perfect offline
+            // reconstruction: the whole identity is the layer's own config,
+            // so they are verified with no bytes and no black policy, and
+            // they never trip the --allow-black-sources gate.
+            Ok(ResolvedVisualSource::PatternSynth) => sources.push(ManifestSource {
+                role: "layer".into(),
+                layer_index: Some(index),
+                logical_name: crate::layers::PATTERN_SOURCE_PATH.to_string(),
+                kind: "pattern_synth".into(),
+                byte_len: None,
+                sha256: None,
+                offline_policy: Some("reconstructed".into()),
+                verified: true,
+            }),
+            Ok(ResolvedVisualSource::TextPage) => sources.push(ManifestSource {
+                role: "layer".into(),
+                layer_index: Some(index),
+                logical_name: crate::layers::TEXT_PAGE_SOURCE_PATH.to_string(),
+                kind: "text_page".into(),
+                byte_len: None,
+                sha256: None,
+                offline_policy: Some("reconstructed".into()),
+                verified: true,
+            }),
             Ok(ResolvedVisualSource::File(resolved)) => {
                 let logical_name = logical_filename(&layer.filename);
                 let identity = fingerprints
@@ -2858,6 +2882,16 @@ fn apply_inventory_references(patch: &mut PatchState, inventory: &SourceInventor
                     })
                     .map(|identity| identity.source_reference())
                     .unwrap_or_default();
+            }
+            // B7 generators keep their sentinels: the identity is the
+            // layer's own config, which the piece carries verbatim.
+            "pattern_synth" => {
+                layer.filename = "Pattern Synth".to_string();
+                layer.source_path = crate::layers::PATTERN_SOURCE_PATH.to_string();
+            }
+            "text_page" => {
+                layer.filename = "Text Page".to_string();
+                layer.source_path = crate::layers::TEXT_PAGE_SOURCE_PATH.to_string();
             }
             _ => layer.source_path.clear(),
         }
@@ -3972,6 +4006,8 @@ mod tests {
                 clip_slots,
                 active_clip_slot: Some(crate::performance::ClipSlotId::LEGACY),
                 matte: crate::image_routing::LayerMatteConfig::default(),
+                pattern: None,
+                text_page: None,
             }],
             master_rack: None,
             composition: None,

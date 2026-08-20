@@ -1816,6 +1816,30 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && valid_identifier(param, 64)
                 && valid_json_value(value)
         }
+        WebAction::AddPatternLayer | WebAction::AddTextLayer => true,
+        // The single shared parse tables answer both this gate and the
+        // engine applier, so the accepted and applied vocabularies are
+        // structurally one — the B8 BusMixerEdit law.
+        WebAction::SetLayerPattern {
+            layer_id,
+            param,
+            value,
+            ..
+        } => {
+            valid_optional_layer_id(layer_id)
+                && valid_identifier(param, 64)
+                && crate::pattern_synth::PatternSynthEdit::parse(param, value).is_some()
+        }
+        WebAction::SetLayerText {
+            layer_id,
+            param,
+            value,
+            ..
+        } => {
+            valid_optional_layer_id(layer_id)
+                && param.len() <= 64
+                && crate::text_page::TextPageEdit::parse(param, value).is_some()
+        }
         WebAction::SetLayerTransform {
             layer_id,
             param,
@@ -5002,5 +5026,90 @@ mod tests {
         )
         .unwrap();
         assert!(valid_action(&decoded, 0));
+    }
+    #[test]
+    fn generator_wire_actions_validate_through_the_shared_parse_tables() {
+        // Topology adds are plain immediate actions.
+        assert!(valid_action(&WebAction::AddPatternLayer, 0));
+        assert!(valid_action(&WebAction::AddTextLayer, 0));
+
+        let pattern = |param: &str, value: serde_json::Value| WebAction::SetLayerPattern {
+            index: 0,
+            layer_id: Some("7".into()),
+            param: param.into(),
+            value,
+        };
+        // Continuous values inside range, closed tokens, and both accepted.
+        for (param, value) in [
+            ("freq_x", serde_json::json!(0.5)),
+            ("rate", serde_json::json!(-0.5)),
+            ("symmetry", serde_json::json!(8.0)),
+            ("hue_spread", serde_json::json!(1.5)),
+            ("shape", serde_json::json!("tunnel")),
+            ("wave", serde_json::json!("sample_hold")),
+            ("color_mode", serde_json::json!("duotone")),
+        ] {
+            assert!(valid_action(&pattern(param, value.clone()), 0), "{param}");
+        }
+        // Out-of-range, non-finite, unknown tokens, and unknown params are
+        // rejections at the gate, exactly what the applier refuses.
+        for (param, value) in [
+            ("freq_x", serde_json::json!(2.0)),
+            ("rate", serde_json::json!(f64::NAN)),
+            ("shape", serde_json::json!("hypercube")),
+            ("wave", serde_json::json!(3)),
+            ("voltage", serde_json::json!(0.5)),
+        ] {
+            assert!(!valid_action(&pattern(param, value.clone()), 0), "{param}");
+        }
+
+        let text = |param: &str, value: serde_json::Value| WebAction::SetLayerText {
+            index: 0,
+            layer_id: Some("7".into()),
+            param: param.into(),
+            value,
+        };
+        for (param, value) in [
+            (
+                "body",
+                serde_json::json!(
+                    "HELLO
+WORLD"
+                ),
+            ),
+            ("font", serde_json::json!("sans")),
+            ("shape", serde_json::json!("starburst")),
+            ("repeat", serde_json::json!(3)),
+            ("shape_count", serde_json::json!(12)),
+            ("size", serde_json::json!(0.3)),
+            ("rot_degrees", serde_json::json!(-90.0)),
+            ("ink_r", serde_json::json!(0.5)),
+        ] {
+            assert!(valid_action(&text(param, value.clone()), 0), "{param}");
+        }
+        for (param, value) in [
+            ("body", serde_json::json!("x".repeat(5000))),
+            ("font", serde_json::json!("papyrus")),
+            ("repeat", serde_json::json!(0)),
+            ("shape_count", serde_json::json!(99)),
+            ("size", serde_json::json!(5.0)),
+            ("scroll_x", serde_json::json!(0.5)),
+        ] {
+            assert!(!valid_action(&text(param, value.clone()), 0), "{param}");
+        }
+
+        // The wire spellings are the documented ones.
+        let decoded = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_layer_pattern","index":0,"layer_id":"3","param":"wavefold","value":0.5}"#,
+        )
+        .unwrap();
+        assert!(valid_action(&decoded, 0));
+        let decoded = serde_json::from_str::<WebAction>(
+            r#"{"action":"set_layer_text","index":0,"param":"body","value":"PAGE"}"#,
+        )
+        .unwrap();
+        assert!(valid_action(&decoded, 0));
+        assert!(serde_json::from_str::<WebAction>(r#"{"action":"add_pattern_layer"}"#).is_ok());
+        assert!(serde_json::from_str::<WebAction>(r#"{"action":"add_text_layer"}"#).is_ok());
     }
 }
