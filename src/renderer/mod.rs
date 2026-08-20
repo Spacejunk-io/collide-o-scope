@@ -2,6 +2,7 @@ pub(crate) mod blend;
 pub(crate) mod composition;
 pub(crate) mod composition_host;
 pub(crate) mod compositor;
+pub(crate) mod corruption;
 pub(crate) mod display_physics;
 pub(crate) mod gesture_canvas;
 pub(crate) mod melting_edge;

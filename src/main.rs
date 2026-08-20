@@ -9,12 +9,14 @@
 #![allow(clippy::map_or_identity)]
 
 mod audio;
+mod block_dct;
 mod codec_mosh;
 mod composition;
 mod controller_profile;
 mod display_physics;
 mod effects;
 mod evaluated_frame;
+mod filter_avalanche;
 mod gesture;
 mod gesture_canvas;
 mod history;
@@ -36,6 +38,7 @@ mod pattern_synth;
 mod performance;
 mod performance_runtime;
 mod performance_track;
+mod pixel_sort;
 mod precision;
 mod preset;
 mod procedural;
@@ -2324,6 +2327,11 @@ fn default_runtime_node_kind(key: &str) -> Option<visual_rack::RuntimeVisualNode
         // exact bypass until amount, collapse, oscillator, S-curve, skew,
         // tilt, or a reversal wakes it.
         "scan_processor" => Kind::ScanProcessor(scan_processor::ScanProcessorParams::default()),
+        // B6: each corruption node inserts at amount zero — an exact bypass
+        // that encodes no dedicated pass until the operator authors it.
+        "block_dct" => Kind::BlockDct(block_dct::BlockDctParams::default()),
+        "pixel_sort" => Kind::PixelSort(pixel_sort::PixelSortParams::default()),
+        "avalanche" => Kind::Avalanche(filter_avalanche::AvalancheParams::default()),
         // Host-boundary marker nodes are never browser-created.
         "legacy_canonical" | "legacy_temporal" => return None,
         _ => return None,
@@ -2598,6 +2606,25 @@ fn set_runtime_node_param(
                 "scan_mono" => params.mono = finite_json_f32(value)?,
                 "scan_hue" => params.hue = finite_json_f32(value)?,
                 _ => return Err(format!("unsupported scan processor parameter {param}")),
+            },
+            Kind::BlockDct(params) => match param {
+                "dct_amount" => params.amount = finite_json_f32(value)?,
+                "dct_quantize" => params.quantize = finite_json_f32(value)?,
+                "dct_hf_penalty" => params.hf_penalty = finite_json_f32(value)?,
+                "dct_chroma_crush" => params.chroma_crush = finite_json_f32(value)?,
+                "dct_block" => params.block = finite_json_f32(value)?,
+                _ => return Err(format!("unsupported block dct parameter {param}")),
+            },
+            Kind::PixelSort(params) => match param {
+                "sort_amount" => params.amount = finite_json_f32(value)?,
+                "sort_threshold" => params.threshold = finite_json_f32(value)?,
+                _ => return Err(format!("unsupported pixel sort parameter {param}")),
+            },
+            Kind::Avalanche(params) => match param {
+                "avalanche_amount" => params.amount = finite_json_f32(value)?,
+                "avalanche_run" => params.run = finite_json_f32(value)?,
+                "avalanche_axis" => params.axis = json_enum(value)?,
+                _ => return Err(format!("unsupported avalanche parameter {param}")),
             },
         },
     }

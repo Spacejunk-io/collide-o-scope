@@ -1552,6 +1552,26 @@ fn apply_stable_node_offset(
             "scan_hue" => Some(&mut value.hue),
             _ => None,
         },
+        RuntimeVisualNodeKind::BlockDct(value) => match descriptor.key {
+            "dct_amount" => Some(&mut value.amount),
+            "dct_quantize" => Some(&mut value.quantize),
+            "dct_hf_penalty" => Some(&mut value.hf_penalty),
+            "dct_chroma_crush" => Some(&mut value.chroma_crush),
+            "dct_block" => Some(&mut value.block),
+            _ => None,
+        },
+        RuntimeVisualNodeKind::PixelSort(value) => match descriptor.key {
+            "sort_amount" => Some(&mut value.amount),
+            "sort_threshold" => Some(&mut value.threshold),
+            _ => None,
+        },
+        // The avalanche axis is a discrete law with no modulatable address;
+        // only the two continuous values have slots.
+        RuntimeVisualNodeKind::Avalanche(value) => match descriptor.key {
+            "avalanche_amount" => Some(&mut value.amount),
+            "avalanche_run" => Some(&mut value.run),
+            _ => None,
+        },
     };
     if let Some(slot) = slot {
         if matches!(

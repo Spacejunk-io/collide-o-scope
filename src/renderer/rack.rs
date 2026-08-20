@@ -435,6 +435,18 @@ fn compile_pass(node: RuntimeVisualNode) -> Result<RackPassDescriptor, RackCompi
                 tag: node.kind.tag(),
             });
         }
+        // The B6 corruption trio is dedicated (multi-pass float
+        // intermediates, an over-rack-budget tap count, and a retained
+        // per-node history respectively), so like the three kinds above,
+        // reaching any of these arms is a planner error, reported by name.
+        RuntimeVisualNodeKind::BlockDct(_)
+        | RuntimeVisualNodeKind::PixelSort(_)
+        | RuntimeVisualNodeKind::Avalanche(_) => {
+            return Err(RackCompileError::DedicatedPassNode {
+                node_id: node.stable_id,
+                tag: node.kind.tag(),
+            });
+        }
     };
     Ok(RackPassDescriptor {
         node_id: node.stable_id,

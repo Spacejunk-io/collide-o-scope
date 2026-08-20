@@ -32,7 +32,8 @@ second full-frame history ring.
 | B9 — the performance recorder | **Complete** | `docs/evidence/b9-performance-recorder-note.md`; CLAUDE.md "The B9 performance recorder" |
 | B10 — modulation source expansion | **Complete** | `docs/evidence/b10-mod-sources-note.md`; CLAUDE.md "B10 performance sources" |
 | B11 — the monitoring bay | **Complete** | `docs/evidence/b11-monitoring-bay-note.md`; CLAUDE.md "The B11 monitoring bay" |
-| B6, B15 | Open | — |
+| B6 — the corruption trio | **Complete** | `docs/evidence/b6-corruption-trio-note.md`; CLAUDE.md "The B6 corruption trio" |
+| B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -40,14 +41,14 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-**Wave 3 continues with B6, the block-domain corruption trio** — three
-Recipe-A rack nodes: block DCT (real separable 8-point DCT + inverse, two
-passes one per axis, quantizer with HF penalty, chroma quantized harder),
-pixel sort (threshold-gated bright-run stretch, ≤ 64 taps charged
-honestly), and avalanche (PNG-style row-filter corruption propagating one
-row-band per frame through the node's own previous output — one retained
-surface, charged). Next rack kind codes start at 15. Fetch the plan
-document before starting it.
+**Wave 3 continues with B14's remainder, `sync_latched`** — a bounded
+per-line offset table on the tape/NTSC-adjacent shear model that latches
+(every shear stays where it happened; releasing unwinds the accumulated
+displacement at once). "Bounded state may latch but never grow": latching
+is a state flag, not an accumulating buffer. Blackout and Program Freeze
+stay senior. Small; then **B15, panel ergonomics and the snapshot bank**,
+closes the plan. Next rack kind code is 18. Fetch the plan document before
+starting either.
 
 ## The working method every tranche follows
 
