@@ -2414,6 +2414,7 @@ function syncTemporal(t) {
   const display = t.display || {};
   const masterMelt = t.melt || {};
   const mosh = t.mosh || {};
+  const syncLatch = t.sync || {};
   const values = {
     feedback: t.feedback,
     fb_zoom: t.fb_zoom,
@@ -2506,7 +2507,19 @@ function syncTemporal(t) {
     mosh_bitrate_starve: mosh.bitrate_starve,
     mosh_resync: mosh.resync,
     mosh_recycle: mosh.recycle,
+    sync_amount: syncLatch.amount,
+    sync_rate: syncLatch.rate,
+    sync_spread: syncLatch.spread,
+    sync_bias: syncLatch.bias,
+    sync_latched: syncLatch.latched,
   };
+  // The latch's honest state: the switch says what was asked for, this says
+  // whether the program is actually still carrying accumulated shear.
+  const syncStatus = document.getElementById('sync-latch-status');
+  if (syncStatus) {
+    syncStatus.classList.toggle('sync-damaged', t.sync_damaged === true);
+    syncStatus.dataset.damaged = t.sync_damaged === true ? 'true' : 'false';
+  }
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;
     const row = document.querySelector(`.param-row[data-temporal="${param}"]`);

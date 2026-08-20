@@ -1309,6 +1309,27 @@
                     <div class="audio-status">A real encoder and decoder wired back to back with the bitstream broken between them: keys removed, deltas held, dropped, and re-injected out of order. The picture lands a frame or two behind, which is the price of a real codec.</div>
                   </div>
                 </details>
+                <details class="temporal-study">
+                  <summary>SYNC LATCH</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="sync_amount" data-min="0" data-max="1" data-step="0.01">
+                      <label>Shear</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row" data-temporal="sync_rate" data-min="0" data-max="1" data-step="0.01">
+                      <label>Slip Rate</label><input type="range"><span class="value">0.35</span>
+                    </div>
+                    <div class="param-row" data-temporal="sync_spread" data-min="0" data-max="1" data-step="0.01">
+                      <label>Band Height</label><input type="range"><span class="value">0.25</span>
+                    </div>
+                    <div class="param-row" data-temporal="sync_bias" data-min="-1" data-max="1" data-step="0.01">
+                      <label>Drift Bias</label><input type="range"><span class="value">0</span>
+                    </div>
+                    <div class="param-row toggle-row" data-temporal="sync_latched">
+                      <label>Sync Latched</label><label class="toggle"><input type="checkbox" aria-label="Latch horizontal sync faults instead of letting them heal"><span class="toggle-slider"></span></label>
+                    </div>
+                    <div class="audio-status" id="sync-latch-status">Horizontal sync faults that heal with their own tick — until you latch them, after which every shear stays where it happened and accumulates. Releasing the latch unwinds the whole accumulation at once.</div>
+                  </div>
+                </details>
               </div>
             </div>
           </div>

@@ -68,6 +68,7 @@ mod study_eval;
     )
 )]
 mod symmetry;
+mod sync_latch;
 mod temporal;
 mod text_page;
 mod transform_gizmo;
@@ -1766,6 +1767,32 @@ pub(crate) fn apply_temporal_wire_edit(
         "mosh_recycle" => {
             if let Some(flag) = value.as_bool() {
                 p.mosh.recycle = flag;
+            }
+        }
+        // The B14 sync latch's four continuous values plus the switch.
+        "sync_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.sync.amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "sync_rate" => {
+            if let Some(n) = value.as_f64() {
+                p.sync.rate = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "sync_spread" => {
+            if let Some(n) = value.as_f64() {
+                p.sync.spread = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "sync_bias" => {
+            if let Some(n) = value.as_f64() {
+                p.sync.bias = (n as f32).clamp(-1.0, 1.0);
+            }
+        }
+        "sync_latched" => {
+            if let Some(flag) = value.as_bool() {
+                p.sync.latched = flag;
             }
         }
         "disp_il_mode" => {
@@ -10297,6 +10324,15 @@ impl App {
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
             "mosh_recycle" => value.is_boolean(),
+            // The B14 sync latch's wire vocabulary, mirroring the server-side
+            // gate exactly.
+            "sync_amount" | "sync_rate" | "sync_spread" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            "sync_bias" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-1.0..=1.0).contains(&number)),
+            "sync_latched" => value.is_boolean(),
             "slitscan" | "slit_axis" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
@@ -10565,9 +10601,8 @@ impl App {
                         .to_vec(),
                 ),
                 "fb_reflect_x" | "fb_reflect_y" | "fb_servo" | "fb_servo_defeated"
-                | "disp_il_order" | "mosh_recycle" | "slit_interp" | "score_enabled" => {
-                    Some(Law::Toggle)
-                }
+                | "disp_il_order" | "mosh_recycle" | "slit_interp" | "score_enabled"
+                | "sync_latched" => Some(Law::Toggle),
                 "key_mode" => Some(Law::Stepped { min: 0, max: 4 }),
                 "key_history" => Some(Law::Stepped { min: 1, max: 23 }),
                 "loom_folds" => Some(Law::Stepped { min: 1, max: 16 }),
@@ -10600,7 +10635,11 @@ impl App {
                 other if other.starts_with("disp_") => {
                     unit_target(&format!("display_{}", &other["disp_".len()..]))
                 }
-                other if other.starts_with("melt_") || other.starts_with("mosh_") => {
+                other
+                    if other.starts_with("melt_")
+                        || other.starts_with("mosh_")
+                        || other.starts_with("sync_") =>
+                {
                     unit_target(other)
                 }
                 _ => None,
@@ -19575,6 +19614,12 @@ impl App {
             })
             .unwrap_or_else(|| temporal::TemporalState::default().metrics());
         let mut temporal_snapshot = TemporalSnapshot::from_params(&self.temporal_params);
+        // The B14 latch's honest state: whether the program is still carrying
+        // accumulated shear, which the authored switch alone cannot tell you.
+        temporal_snapshot.sync_damaged = self
+            .renderer
+            .as_ref()
+            .is_some_and(renderer::Renderer::sync_latch_damaged);
         temporal_snapshot.telemetry = TemporalTelemetrySnapshot {
             history_valid: temporal_metrics.history_valid,
             history_capacity: temporal_metrics.history_capacity,
@@ -22433,6 +22478,10 @@ impl ApplicationHandler for App {
 
                     let mod_ntsc = evaluated_frame.ntsc().clone();
                     let mod_temporal = *evaluated_frame.temporal();
+                    // The B14 sync latch draws its faults on the master
+                    // random seed, taken from the same immutable frame sample
+                    // every other consumer reads.
+                    let mod_sync_seed = evaluated_frame.master_pass().effects.random_seed;
                     let temporal_input = temporal::TemporalFrameInput::new(
                         program_delta,
                         temporal_freeze_state(gates.program_running, self.media_frozen),
@@ -22974,6 +23023,12 @@ impl ApplicationHandler for App {
                                         &mod_temporal.melt,
                                         temporal_input.program_advancing_delta(),
                                     );
+                                    renderer.render_sync_latch(
+                                        &mut encoder,
+                                        &mod_temporal.sync,
+                                        mod_sync_seed,
+                                        temporal_input.program_advancing_delta(),
+                                    );
                                     renderer.render_display_physics(
                                         &mut encoder,
                                         &mod_temporal.display,
@@ -23037,6 +23092,12 @@ impl ApplicationHandler for App {
                                             renderer.render_melting_edge(
                                                 &mut encoder,
                                                 &mod_temporal.melt,
+                                                temporal_input.program_advancing_delta(),
+                                            );
+                                            renderer.render_sync_latch(
+                                                &mut encoder,
+                                                &mod_temporal.sync,
+                                                mod_sync_seed,
                                                 temporal_input.program_advancing_delta(),
                                             );
                                             renderer.render_display_physics(
@@ -23201,6 +23262,12 @@ impl ApplicationHandler for App {
                                             renderer.render_melting_edge(
                                                 &mut encoder,
                                                 &mod_temporal.melt,
+                                                selective_temporal_input.program_advancing_delta(),
+                                            );
+                                            renderer.render_sync_latch(
+                                                &mut encoder,
+                                                &mod_temporal.sync,
+                                                mod_sync_seed,
                                                 selective_temporal_input.program_advancing_delta(),
                                             );
                                             renderer.render_display_physics(
@@ -33137,6 +33204,20 @@ mod app_state_tests {
             Some(Law::Stepped { min: 1, max: 23 })
         );
         assert_eq!(law(temporal("mosh_recycle")), Some(Law::Toggle));
+        // B14: the switch is a toggle and the four controls ride the
+        // sync_* modulation ranges.
+        assert_eq!(law(temporal("sync_latched")), Some(Law::Toggle));
+        assert_eq!(
+            law(temporal("sync_amount")),
+            Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+        assert_eq!(
+            law(temporal("sync_bias")),
+            Some(Law::Unit {
+                min: -1.0,
+                max: 1.0
+            })
+        );
         assert_eq!(law(temporal("atlas_seed")), None);
         let Some(Law::Discrete { vocab }) = law(temporal("slit_map")) else {
             panic!("slit_map is a closed vocabulary");

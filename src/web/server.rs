@@ -1194,6 +1194,10 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         | "mosh_bitrate_starve"
         | "mosh_resync" => number_in(value, 0.0, 1.0),
         "mosh_recycle" => value.is_boolean(),
+        // The B14 sync latch's four continuous wire params plus the switch.
+        "sync_amount" | "sync_rate" | "sync_spread" => number_in(value, 0.0, 1.0),
+        "sync_bias" => number_in(value, -1.0, 1.0),
+        "sync_latched" => value.is_boolean(),
         "slitscan" | "slit_axis" => number_in(value, 0.0, 1.0),
         "slit_angle" | "loom_angle" => number_in(value, -180.0, 180.0),
         "slit_map" => matches!(
@@ -4145,6 +4149,13 @@ mod tests {
             ("mosh_resync", serde_json::json!(0.3)),
             ("mosh_recycle", serde_json::json!(true)),
             ("mosh_recycle", serde_json::json!(false)),
+            ("sync_amount", serde_json::json!(1.0)),
+            ("sync_rate", serde_json::json!(0.0)),
+            ("sync_spread", serde_json::json!(0.5)),
+            ("sync_bias", serde_json::json!(-1.0)),
+            ("sync_bias", serde_json::json!(1.0)),
+            ("sync_latched", serde_json::json!(true)),
+            ("sync_latched", serde_json::json!(false)),
         ] {
             let action = WebAction::SetTemporal {
                 param: param.into(),
@@ -4180,6 +4191,11 @@ mod tests {
             ("mosh_amount", serde_json::json!(1.001)),
             ("mosh_key_removal", serde_json::json!(-0.1)),
             ("mosh_recycle", serde_json::json!(1)),
+            ("sync_amount", serde_json::json!(1.001)),
+            ("sync_rate", serde_json::json!(-0.1)),
+            ("sync_bias", serde_json::json!(-1.001)),
+            ("sync_latched", serde_json::json!(1)),
+            ("sync_offsets", serde_json::json!(0.5)),
             ("unknown_original", serde_json::json!(0.5)),
         ] {
             let action = WebAction::SetTemporal {

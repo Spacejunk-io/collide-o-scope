@@ -715,10 +715,25 @@ pub struct TemporalConfig {
     /// scalars sanitize on load and unknown fields are rejected.
     #[serde(default, skip_serializing_if = "mosh_config_is_default")]
     pub mosh: crate::codec_mosh::CodecMoshParams,
+    /// Additive B14 sync latch. Skipped at the exact-off default so earlier
+    /// patches keep their bytes and canonical hashes; hostile scalars
+    /// sanitize on load and unknown fields are rejected.
+    ///
+    /// The switch and its four controls persist; the accumulated per-line
+    /// table deliberately does **not**. That table is runtime state like a
+    /// temporal ring — it regrows deterministically from the seed and the
+    /// clock — so a patch never carries a frame's worth of shear history and
+    /// a reload starts the program undamaged.
+    #[serde(default, skip_serializing_if = "sync_config_is_default")]
+    pub sync: crate::sync_latch::SyncLatchParams,
 }
 
 fn display_config_is_default(value: &crate::display_physics::DisplayPhysicsParams) -> bool {
     *value == crate::display_physics::DisplayPhysicsParams::default()
+}
+
+fn sync_config_is_default(value: &crate::sync_latch::SyncLatchParams) -> bool {
+    value.is_exact_off()
 }
 
 fn melt_config_is_default(value: &crate::mixing_boundary::MeltParams) -> bool {
@@ -1598,6 +1613,7 @@ impl TemporalConfig {
             display: p.display.sanitized(),
             melt: p.melt.sanitized(),
             mosh: p.mosh.sanitized(),
+            sync: p.sync.sanitized(),
         }
     }
 
@@ -1657,6 +1673,7 @@ impl TemporalConfig {
             display: self.display.sanitized(),
             melt: self.melt.sanitized(),
             mosh: self.mosh.sanitized(),
+            sync: self.sync.sanitized(),
         }
     }
 }
@@ -7889,6 +7906,59 @@ scenes:
         assert!(
             serde_yaml::from_str::<TemporalConfig>("display:\n  model: plasma\n").is_err(),
             "an unknown display model token is a deserialization rejection"
+        );
+    }
+
+    #[test]
+    fn sync_latch_round_trips_and_an_absent_section_is_the_prior_path() {
+        use crate::sync_latch::SyncLatchParams;
+
+        // A default temporal block serializes without the sync section, so
+        // every pre-B14 patch keeps its bytes and canonical hashes.
+        let default_yaml = serde_yaml::to_string(&TemporalConfig::default()).unwrap();
+        assert!(!default_yaml.contains("sync"));
+        let absent: TemporalConfig = serde_yaml::from_str("feedback: 0.2\n").unwrap();
+        assert_eq!(absent.sync, SyncLatchParams::default());
+        assert!(!absent.to_params().sync.is_active());
+        assert!(!absent.to_params().sync.latched);
+
+        // A non-default block round trips whole, including the switch.
+        let params = TemporalParams {
+            sync: SyncLatchParams {
+                amount: 0.8,
+                rate: 0.6,
+                spread: 0.4,
+                bias: -0.7,
+                latched: true,
+            },
+            ..TemporalParams::default()
+        };
+        let config = TemporalConfig::from_params(&params);
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("sync:"));
+        assert!(yaml.contains("latched: true"));
+        let restored: TemporalConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.sync, config.sync);
+        assert_eq!(restored.to_params().sync, params.sync.sanitized());
+
+        // The accumulated per-line table is runtime state and is deliberately
+        // absent from the patch: only the switch and its four controls
+        // persist, and the table regrows from the seed and the clock.
+        assert!(
+            !yaml.contains("offsets") && !yaml.contains("table"),
+            "the accumulated shear table must never enter a patch"
+        );
+
+        // Hostile scalars sanitize to the neutral default rather than a
+        // clamped extreme, and unknown fields are rejected.
+        let hostile: TemporalConfig =
+            serde_yaml::from_str("sync:\n  amount: .nan\n  rate: 99.0\n").unwrap();
+        let runtime = hostile.to_params();
+        assert_eq!(runtime.sync.amount, 0.0);
+        assert_eq!(runtime.sync.rate, 1.0);
+        assert!(
+            serde_yaml::from_str::<TemporalConfig>("sync:\n  offsets: [1.0]\n").is_err(),
+            "an unknown sync field is a deserialization rejection"
         );
     }
 

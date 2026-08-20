@@ -64,6 +64,12 @@ pub struct TemporalParams {
     /// absent from every temporal activity/shader-selection predicate,
     /// because the stage owns no shader at all.
     pub mosh: crate::codec_mosh::CodecMoshParams,
+    /// B14 sync latch: the tape/NTSC horizontal shear on the same slot-0
+    /// seam, between the melting edge and the display stage. Exact-off by
+    /// default; like `display`, `melt`, and `mosh` it is deliberately
+    /// absent from every temporal activity/shader-selection predicate,
+    /// because the stage owns its own pass and its own shader.
+    pub sync: crate::sync_latch::SyncLatchParams,
     /// B3 feedback rig. Identity by default, which is the exact prior
     /// feedback path: the shader takes the historical expression untouched.
     pub rig: FeedbackRigParams,
@@ -279,6 +285,7 @@ impl Default for TemporalParams {
             display: crate::display_physics::DisplayPhysicsParams::default(),
             melt: crate::mixing_boundary::MeltParams::default(),
             mosh: crate::codec_mosh::CodecMoshParams::default(),
+            sync: crate::sync_latch::SyncLatchParams::default(),
             rig: FeedbackRigParams::default(),
         }
     }
@@ -346,6 +353,9 @@ impl TemporalParams {
             // The melting edge likewise owns its own pass; its store clock
             // applies the reference-tick law in the stage itself.
             melt: self.melt.sanitized(),
+            // The sync latch likewise owns its own pass; its fault clock
+            // applies the reference-tick law in the stage itself.
+            sync: self.sync.sanitized(),
             // The mosh is a CPU stage with its own reference-frame fault
             // clock; its authored values pass through sanitized only.
             mosh: self.mosh.sanitized(),

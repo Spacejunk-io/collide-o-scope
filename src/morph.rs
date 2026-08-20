@@ -785,6 +785,12 @@ pub struct MorphTemporalSnapshot {
     /// discrete recycle law recalls an endpoint at the midpoint.
     #[serde(default)]
     pub mosh: crate::codec_mosh::CodecMoshParams,
+    /// B14 sync latch, captured whole: the params struct is its own
+    /// sanitizing serde block. The four continuous controls blend; the
+    /// discrete latch switch recalls an endpoint at the midpoint, exactly as
+    /// `servo_defeated` does.
+    #[serde(default)]
+    pub sync: crate::sync_latch::SyncLatchParams,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -813,6 +819,7 @@ impl MorphTemporalSnapshot {
             display: value.display,
             melt: value.melt,
             mosh: value.mosh,
+            sync: value.sync,
         }
         .sanitized()
     }
@@ -836,6 +843,7 @@ impl MorphTemporalSnapshot {
             display: self.display.sanitized(),
             melt: self.melt.sanitized(),
             mosh: self.mosh.sanitized(),
+            sync: self.sync.sanitized(),
         }
     }
 
@@ -858,6 +866,7 @@ impl MorphTemporalSnapshot {
             display: clean.display,
             melt: clean.melt,
             mosh: clean.mosh,
+            sync: clean.sync,
             rig: clean.rig.to_params(),
         }
     }
@@ -887,9 +896,32 @@ impl MorphTemporalSnapshot {
             display: interpolate_display_physics(a.display, b.display, weights, choose_b),
             melt: interpolate_master_melt(a.melt, b.melt, weights),
             mosh: interpolate_codec_mosh(a.mosh, b.mosh, weights, choose_b),
+            sync: interpolate_sync_latch(a.sync, b.sync, weights, choose_b),
         }
         .sanitized()
     }
+}
+
+/// B14 sync-latch morphing: the four continuous controls blend, and the
+/// latch switch recalls an endpoint at the midpoint. A morph position can
+/// therefore cross into (or out of) a latched program, but it can never
+/// synthesize a third switch state neither slot captured.
+fn interpolate_sync_latch(
+    a: crate::sync_latch::SyncLatchParams,
+    b: crate::sync_latch::SyncLatchParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> crate::sync_latch::SyncLatchParams {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    crate::sync_latch::SyncLatchParams {
+        amount: blend_finite(a.amount, b.amount, weights),
+        rate: blend_finite(a.rate, b.rate, weights),
+        spread: blend_finite(a.spread, b.spread, weights),
+        bias: blend_finite(a.bias, b.bias, weights),
+        latched: if choose_b { b.latched } else { a.latched },
+    }
+    .sanitized()
 }
 
 /// B5 codec-mosh morphing: the eight continuous controls blend, and the
@@ -4838,6 +4870,51 @@ mod tests {
         assert_eq!(
             MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).display,
             b.display.sanitized()
+        );
+    }
+
+    #[test]
+    fn sync_latch_morphs_values_continuously_and_recalls_the_switch() {
+        use crate::sync_latch::SyncLatchParams;
+        let a = MorphTemporalSnapshot {
+            sync: SyncLatchParams {
+                amount: 0.2,
+                rate: 0.4,
+                spread: 0.2,
+                bias: -0.4,
+                latched: false,
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+        let b = MorphTemporalSnapshot {
+            sync: SyncLatchParams {
+                amount: 0.8,
+                rate: 0.8,
+                spread: 0.6,
+                bias: 0.4,
+                latched: true,
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+
+        let quarter = MorphTemporalSnapshot::interpolate(&a, &b, [0.75, 0.25], false);
+        assert!((quarter.sync.amount - 0.35).abs() < 1.0e-6);
+        assert!((quarter.sync.rate - 0.5).abs() < 1.0e-6);
+        assert!((quarter.sync.spread - 0.3).abs() < 1.0e-6);
+        assert!((quarter.sync.bias - -0.2).abs() < 1.0e-6);
+        // The switch recalls an endpoint, never a blend: a failure switch is
+        // thrown, and no morph position may invent a half-latched program.
+        assert!(!quarter.sync.latched);
+        let past = MorphTemporalSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
+        assert!(past.sync.latched);
+        // Endpoints recall the authored blocks exactly.
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [1.0, 0.0], false).sync,
+            a.sync.sanitized()
+        );
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).sync,
+            b.sync.sanitized()
         );
     }
 
