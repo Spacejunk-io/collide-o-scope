@@ -58,6 +58,12 @@ pub struct TemporalParams {
     /// every temporal activity/shader-selection predicate, because the
     /// stage owns its own pass and its own shader.
     pub melt: crate::mixing_boundary::MeltParams,
+    /// B5 codec mosh: the real encode→break→decode round trip over the
+    /// finished audience image, a CPU stage downstream of every GPU pass.
+    /// Exact bypass by default; like `display` and `melt` it is deliberately
+    /// absent from every temporal activity/shader-selection predicate,
+    /// because the stage owns no shader at all.
+    pub mosh: crate::codec_mosh::CodecMoshParams,
     /// B3 feedback rig. Identity by default, which is the exact prior
     /// feedback path: the shader takes the historical expression untouched.
     pub rig: FeedbackRigParams,
@@ -272,6 +278,7 @@ impl Default for TemporalParams {
             originals: TemporalOriginalsParams::default(),
             display: crate::display_physics::DisplayPhysicsParams::default(),
             melt: crate::mixing_boundary::MeltParams::default(),
+            mosh: crate::codec_mosh::CodecMoshParams::default(),
             rig: FeedbackRigParams::default(),
         }
     }
@@ -339,6 +346,9 @@ impl TemporalParams {
             // The melting edge likewise owns its own pass; its store clock
             // applies the reference-tick law in the stage itself.
             melt: self.melt.sanitized(),
+            // The mosh is a CPU stage with its own reference-frame fault
+            // clock; its authored values pass through sanitized only.
+            mosh: self.mosh.sanitized(),
             rig: self.rig.for_frame_scale(frame_scale),
         }
     }

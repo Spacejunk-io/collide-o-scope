@@ -1197,6 +1197,110 @@ same acceptance seam; the `.motion.json` sidecar records the route as
 same Advanced plan family and must decode differently; `_repeat` must decode
 identically, proving the whole two-frame feedback chain deterministic).
 
+### B5 codec mosh
+
+Nothing here is a shader imitating a codec: `src/codec_mosh.rs` wires a real
+mpeg4 encoder and decoder back to back in-process (`ffmpeg-next` library,
+never the CLI) and breaks the bitstream between them, so the artefacts are
+the decoder's own. The laws are derived from BENDR (MIT, © 2026 Steve
+Blythe), whose codec stage settles every control's semantics; the one
+deliberate deviation is that BENDR's `Math.random()` fault clock becomes the
+shared deterministic avalanche hash (domain "CMSH", independent lanes per
+decision) keyed by the master `random_seed`, the stage's 30 Hz reference
+ordinal, and the packet index — because our export contract demands a
+replayable fault stream and BENDR disables its stage offline outright.
+
+**Authored state.** `CodecMoshParams` on `TemporalParams.mosh` (the B3-rig
+closure pattern): eight continuous controls — `amount` (dry/wet in the
+stored sRGB bytes, BENDR's own framebuffer blend), `key_removal`
+(per-key-chunk dice, deliberately NOT scaled by `rate`; the first key after
+any reset always passes because the decoder needs one whole picture to
+damage, and a forced resync key still faces the dice, so `key_removal = 1`
+never recovers), `hold` (1–6 extra re-applications of the same delta under
+fresh monotonic timestamps), `drop` (starve the decoder; a dropped chunk
+skips its own hold/shuffle dice but still enters the ring), `shuffle`
+(re-inject a ring chunk at least six chunks stale), `rate` (the event-rate
+multiplier for hold/drop/shuffle only), `bitrate_starve`
+(`4 Mbps × 0.02^q`, ±25% reconfigure hysteresis, every reconfigure forces a
+full re-acquire), `resync` (period `max(2, round((1−r)·300)+2)` encoder-fed
+frames; zero never recovers) — plus one discrete law, `recycle` (CLEAN
+feeds the encoder the clean image; RECYCLED feeds the stage's own previous
+blended output, so every pass builds on the last one's wreckage). The wake
+law is `amount` alone at BENDR's own 0.003 deadband, and it is a **true
+bypass**: no encoder alive, no readback armed, byte-identical prior path —
+never "run the codec and hope it is identity", because the round trip is
+lossy even at zero fault pressure.
+
+**The engine.** Encode at BENDR's resolution cap (≤ 640 wide, aspect
+preserved, even, ≥ 64 — "the artefact is the codec, not the detail"),
+`threads = 1` set before open (the per-host determinism lever), GOP at the
+mpeg4 encoder's own 600 ceiling with keyframes forced explicitly per frame
+(a volunteered key is just another key chunk facing the removal dice), no
+B-frames, decoder opened with `OUTPUT_CORRUPT`/`SHOW_ALL` so concealed
+pictures are handed over rather than hidden. Every receive loop carries a
+finite budget; the decoder-resurrection policy is transcribed (a fault
+rebuilds the decoder and forces a bootstrap key — the picture snaps back
+and starts falling apart again; more than six cycles gives the stage up
+with a named error; a thirty-good-frame streak forgives to one). The chunk
+ring holds ≤ 90 delta chunks AND ≤ 8 MiB, FIFO eviction on either bound;
+shuffle fires only past ten entries and never picks the newest six. The
+last decoded picture is held across starvation, so a dropped chunk smears
+rather than flashing dry.
+
+**Live seat.** The global-VHS worker shape verbatim: one `MoshWorker`
+(sync_channel(1) both ways, one in flight, drop-new-while-busy counted as
+healthy `skipped`, terminal on failure with the error named in the additive
+`AppSnapshot::codec_mosh` block), lazily constructed on the first armed
+frame. An armed mosh extends `raw_audience_readback_required` on **every**
+path — slot 2 already holds the selective recomposite, and bypass is a VHS
+bypass, not a general one, so the mosh treats the finished programme
+uniformly like the display stage does. `MoshFrameMetadata` (sampled params,
+reference ordinal, seed) travels with the pixels on the readback tag, the
+NTSC metadata law. On the global-VHS path the metadata carries the sampled
+NTSC params and the worker runs the VHS kernel first **in the same hop** —
+one admission, one frame of latency, the exact offline order, and the NTSC
+worker is deliberately unfed while the mosh is armed. Results are validated
+by generation AND by the stage still being armed; the newest moshed frame
+is retained and re-written into slot 2 each frame (`write_composite`),
+downstream of the VHS replacement and upstream of blackout, which stays the
+absolute final audience operation. The B16 programme tap keeps copying slot
+2 before every asynchronous replacement, so a routed tap reads the pre-mosh
+image — the same law it already had for VHS. Pause holds the fault stream
+still (the ordinal rides the program clock); the documented cost of the
+stage is one to two frames of audience latency and the occasional
+deliberate re-acquisition.
+
+**Export honesty.** Offline runs the identical engine synchronously per
+frame, after global NTSC (codec-after-analog; selective frames arrive
+already VHS-treated, so the mosh applies uniformly), with the ordinal from
+the same paused-aware reference frame the NTSC phase uses. The engine opens
+lazily on the first active frame (modulation can wake a dormant stage
+mid-job) and a missing mpeg4 pair or a given-up decoder is an actionable
+export error, never a silent bypass. **Repeatability is claimed per host**
+(two renders, equal decoded framemd5 — the `_repeat` assertion);
+cross-machine bit-identity is explicitly not claimed, and the `.motion.json`
+sidecar — schema bumped 5 → **6**, its first bump since the Field Collider —
+records the additive `codec_mosh` section (authored recipe, encode
+dimensions, `mpeg4/avcodec-<version>` encoder identity) only when an
+accepted frame actually ran the round trip. The mutated bitstream bytes
+never enter the sidecar.
+
+**Closure.** Patch: `TemporalConfig.mosh`, skip-serialized at the
+exact-bypass default so pre-B5 patches keep their bytes and canonical
+hashes; hostile scalars sanitize to neutral and unknown fields are
+rejected. Wire: nine `mosh_*` params on the ordinary coalescible
+`set_temporal` (both validators plus the applier; `mosh_recycle` boolean).
+Snapshot: an additive `mosh` block on the temporal snapshot plus the
+`codec_mosh` diagnostics block. Panel: a CODEC MOSH group in the temporal
+section (8 sliders — the static range count is 198 — and one toggle).
+Modulation: eight `mosh_*` continuous master addresses (`morph` stays
+last); the recycle law has none. Morph: continuous values blend; recycle
+recalls an endpoint at the midpoint. Live Dice continues not to touch
+temporal-adjacent state; the generator mutates the eight values in fresh
+field-isolated domains (`mutate_codec_mosh`, `GENERATOR_VERSION` is now
+"12"). `render_codec_mosh_pipeline` is the labeled export case with its
+`_clean` difference and `_repeat` per-host determinism assertions.
+
 ## Effects and compositing
 
 - One combined uniform-driven effect shader avoids pipeline switches.
@@ -3067,6 +3171,32 @@ mislead browser tests.
   under a new epoch re-prepares), and `render_program_reentry_pipeline` is
   the labeled export case with its `_untapped` difference twin inside the
   same Advanced plan family and its `_repeat` determinism assertion.
+- Codec-mosh tests split along the codec boundary. Hosted (no codec
+  touched): hostile neutral sanitize, the amount-alone wake law at the
+  0.003 deadband, the transcribed bitrate map with its ±25% hysteresis, the
+  resync period table with zero-never-recovers, the encode-dimension law,
+  per-lane deterministic fault dice, the key bootstrap always passing with
+  later keys facing the dice (and forced resync keys too), delta decisions
+  honoring the probability gates with drop's early return and `rate`
+  exempting key removal, the chunk ring bounded in entries AND bytes with
+  FIFO eviction and the newest-six shield, the worker's
+  one-in-flight/drop-new/slot-release-on-error ladder (tolerant of a host
+  without the codec pair), the patch round trip with skip-at-default
+  omission and unknown-field rejection, the Morph blend with midpoint
+  recall of the recycle law, the eight modulation addresses with the
+  recycle law refused and the offset landing in the frame copy only, the
+  nine-param wire vocabulary in both validators, generator mutation in
+  fresh domains preserving the recycle law, the extended
+  `raw_audience_readback_required` law (armed mosh requires the readback on
+  every path, never through a hold or blackout), and the sidecar schema-6
+  pins with the section absent from a moshless job. Opt-in (`--ignored`,
+  the host FFmpeg's mpeg4 pair required):
+  `mosh_round_trip_is_deterministic_per_host_and_reaches_the_pixels` (two
+  runs byte-identical, the mosh reaches the pixels, amount zero is a
+  no-touch bypass even on a warm engine), and `render_codec_mosh_pipeline`
+  is the labeled export case with its `_clean` difference, `_repeat`
+  per-host determinism, and sidecar encoder-identity assertions.
+  Cross-machine bit-identity is deliberately not asserted anywhere.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

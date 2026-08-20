@@ -1557,6 +1557,10 @@ struct ReadbackSlot {
     /// Parameters and deterministic phase sampled with this raw frame.
     /// `None` is used when the readback exists only for Spout output.
     ntsc_metadata: Option<NtscFrameMetadata>,
+    /// B5 codec-mosh parameters and fault-clock inputs sampled with this raw
+    /// frame — the same law as `ntsc_metadata`: a delayed map is processed
+    /// with the values sampled at its own readback, never a newer frame's.
+    mosh_metadata: Option<crate::codec_mosh::MoshFrameMetadata>,
     /// Selective audience sample copied only after that exact sample's
     /// Temporal and opaque passes were encoded. `None` is the legacy/global
     /// readback path.
@@ -1576,6 +1580,7 @@ pub struct ReadbackFrame {
     pub pixels: Vec<u8>,
     pub epoch: u64,
     pub ntsc_metadata: Option<NtscFrameMetadata>,
+    pub mosh_metadata: Option<crate::codec_mosh::MoshFrameMetadata>,
     pub selective_sample: Option<SelectiveNtscGeneration>,
     pub held_audience: bool,
 }
@@ -5991,8 +5996,9 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
         ntsc_metadata: Option<NtscFrameMetadata>,
+        mosh_metadata: Option<crate::codec_mosh::MoshFrameMetadata>,
     ) -> Result<Option<usize>, String> {
-        self.begin_readback_tagged(encoder, epoch, ntsc_metadata, None, false)
+        self.begin_readback_tagged(encoder, epoch, ntsc_metadata, mosh_metadata, None, false)
     }
 
     /// Encode a readback of one exact selectively processed audience sample.
@@ -6004,7 +6010,14 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         sample: SelectiveNtscGeneration,
     ) -> Result<Option<usize>, String> {
-        self.begin_readback_tagged(encoder, sample.visual_epoch, None, Some(sample), false)
+        self.begin_readback_tagged(
+            encoder,
+            sample.visual_epoch,
+            None,
+            None,
+            Some(sample),
+            false,
+        )
     }
 
     /// Read back the already materialized audience image retained by Pause.
@@ -6015,7 +6028,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
     ) -> Result<Option<usize>, String> {
-        self.begin_readback_tagged(encoder, epoch, None, None, true)
+        self.begin_readback_tagged(encoder, epoch, None, None, None, true)
     }
 
     fn begin_readback_tagged(
@@ -6023,6 +6036,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         epoch: u64,
         ntsc_metadata: Option<NtscFrameMetadata>,
+        mosh_metadata: Option<crate::codec_mosh::MoshFrameMetadata>,
         selective_sample: Option<SelectiveNtscGeneration>,
         held_audience: bool,
     ) -> Result<Option<usize>, String> {
@@ -6069,6 +6083,7 @@ impl Renderer {
                     sequence: 0,
                     epoch,
                     ntsc_metadata: None,
+                    mosh_metadata: None,
                     selective_sample: None,
                     held_audience: false,
                 });
@@ -6082,6 +6097,7 @@ impl Renderer {
         self.readback_slots[idx].sequence = sequence;
         self.readback_slots[idx].epoch = epoch;
         self.readback_slots[idx].ntsc_metadata = ntsc_metadata;
+        self.readback_slots[idx].mosh_metadata = mosh_metadata;
         self.readback_slots[idx].selective_sample = selective_sample;
         self.readback_slots[idx].held_audience = held_audience;
         let slot = &self.readback_slots[idx];
@@ -6193,6 +6209,7 @@ impl Renderer {
                         pixels,
                         epoch: slot.epoch,
                         ntsc_metadata: slot.ntsc_metadata.take(),
+                        mosh_metadata: slot.mosh_metadata.take(),
                         selective_sample: slot.selective_sample.take(),
                         held_audience: std::mem::take(&mut slot.held_audience),
                     });
@@ -6202,6 +6219,7 @@ impl Renderer {
                     // frame (or than one already returned on an earlier poll).
                     slot.buffer.unmap();
                     slot.ntsc_metadata = None;
+                    slot.mosh_metadata = None;
                     slot.selective_sample = None;
                     held_audience_not_harvested |= std::mem::take(&mut slot.held_audience);
                     slot.status.store(SLOT_IDLE, Ordering::Release);
@@ -6209,6 +6227,7 @@ impl Renderer {
                 SLOT_MAP_FAILED => {
                     // Device hiccup (e.g. surface loss); recycle the slot.
                     slot.ntsc_metadata = None;
+                    slot.mosh_metadata = None;
                     slot.selective_sample = None;
                     held_audience_not_harvested |= std::mem::take(&mut slot.held_audience);
                     slot.status.store(SLOT_IDLE, Ordering::Release);

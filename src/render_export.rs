@@ -97,7 +97,18 @@ const MAX_EXPORT_WARNING_CHARS: usize = 1_024;
 /// only. Derived vectors, the transient mapped pair, gate parities, and raw
 /// codec records are deliberately never recorded, and neither is any host path
 /// or filesystem metadata.
-const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 5;
+///
+/// Bumped from 5 when the sidecar began recording the B5 codec mosh. Every
+/// schema-5 key keeps its name and meaning; schema 6 is purely additive and
+/// adds one section, following the same precedent:
+///
+/// - `codec_mosh`: the authored recipe (the eight continuous controls and
+///   the discrete recycle law), the encode dimensions, and the encoder's
+///   identity (`mpeg4/avcodec-<version>`). Present only when at least one
+///   accepted frame ran the round trip. The encoder identity is the honesty
+///   record: per-host repeatability is claimed, cross-machine bit-identity
+///   is not. The mutated bitstream bytes are deliberately never recorded.
+const EXPORT_MOTION_SIDECAR_SCHEMA_VERSION: u16 = 6;
 const MAX_EXPORT_MOTION_SIDECAR_SOURCES: usize = 256;
 const MAX_EXPORT_MOTION_SIDECAR_SCOPES: usize = 256;
 const MAX_EXPORT_MOTION_DISTINCT_STATES: usize = 512;
@@ -571,8 +582,30 @@ struct ExportMotionSidecar {
     symmetry_fields_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     field_collider: Option<FieldColliderSidecar>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codec_mosh: Option<CodecMoshSidecar>,
     last_accepted_frame: Option<MotionSidecarLastFrame>,
     warnings: Vec<String>,
+}
+
+/// B5 codec-mosh export provenance: the authored recipe and the encoder's
+/// identity. Recorded once per job, only after an accepted frame actually
+/// ran the round trip; the bitstream itself never enters the sidecar.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CodecMoshSidecar {
+    /// `mpeg4/avcodec-<linked version>` — the per-host repeatability record.
+    encoder: String,
+    encode_width: u32,
+    encode_height: u32,
+    amount: f32,
+    key_removal: f32,
+    hold: f32,
+    drop: f32,
+    shuffle: f32,
+    rate: f32,
+    bitrate_starve: f32,
+    resync: f32,
+    recycle: bool,
 }
 
 struct ExportMotionSidecarAccumulator {
@@ -588,6 +621,7 @@ struct ExportMotionSidecarAccumulator {
     symmetry_fields: Vec<SymmetrySidecarNode>,
     symmetry_fields_truncated: bool,
     field_collider: Option<FieldColliderSidecar>,
+    codec_mosh: Option<CodecMoshSidecar>,
     last: Option<MotionSidecarLastFrame>,
 }
 
@@ -2293,6 +2327,7 @@ impl ExportMotionSidecarAccumulator {
             symmetry_fields_truncated,
             // Recorded only after an accepted frame, never at construction.
             field_collider: None,
+            codec_mosh: None,
             last: None,
         }
     }
@@ -2357,6 +2392,7 @@ impl ExportMotionSidecarAccumulator {
             symmetry_fields: self.symmetry_fields,
             symmetry_fields_truncated: self.symmetry_fields_truncated,
             field_collider: self.field_collider,
+            codec_mosh: self.codec_mosh,
             last_accepted_frame: self.last,
             warnings: warnings
                 .into_iter()
@@ -5254,6 +5290,14 @@ fn run_export(
     // crosses the discrete bypass boundary during one export.
     let mut selective_ntsc_state = NtscState::new();
 
+    // --- B5 codec mosh (synchronous round trip, one kernel, this owner) ---
+    // The engine opens lazily on the first active frame, because modulation
+    // or a morph can wake a dormant authored stage mid-job. `threads = 1`
+    // makes two renders on this host byte-identical; a missing mpeg4 pair is
+    // an actionable export error, never a silent bypass.
+    let mut mosh_engine: Option<crate::codec_mosh::MoshEngine> = None;
+    let mut mosh_used = false;
+
     // --- Modulation matrix (deterministic: beat derived from frame index) ---
     // Imported audio is sampled from frame-indexed program time. Live capture,
     // MIDI, and other hardware sources read 0 offline; LFO motion renders
@@ -6352,6 +6396,43 @@ fn run_export(
             );
         }
 
+        // B5: the codec round trip, synchronously per frame, after VHS —
+        // codec-after-analog, the exact live ordering (the live worker runs
+        // the VHS kernel and the round trip in one hop, and selective frames
+        // arrive here already VHS-treated, so the mosh applies uniformly on
+        // every path). The fault clock rides the same paused-aware reference
+        // frame the NTSC phase uses, so Pause holds the fault stream still.
+        if mod_temporal.mosh.is_active() {
+            let mosh_result = (|| -> Result<(), String> {
+                if mosh_engine.is_none() {
+                    mosh_engine = Some(crate::codec_mosh::MoshEngine::open(w, h)?);
+                }
+                let engine = mosh_engine.as_mut().expect("mosh engine opened above");
+                let ordinal =
+                    export_ntsc_reference_frame(frame_num, config.fps, patch.master_paused) as u64;
+                engine.apply(
+                    &mut pixels,
+                    w,
+                    h,
+                    mod_temporal.mosh,
+                    ordinal,
+                    master_effects.random_seed,
+                )
+            })();
+            if let Err(error) = mosh_result {
+                temporal_state.discard_staged();
+                gesture_canvas.discard_staged();
+                if advanced_history_staged {
+                    if let Some(executor) = composition_gpu.as_mut() {
+                        executor.discard_frame_history();
+                    }
+                }
+                write_error = Some(format!("codec mosh failed: {error}"));
+                break;
+            }
+            mosh_used = true;
+        }
+
         // Write to ffmpeg
         if let Err(error) = ffmpeg_stdin.write_all(&pixels) {
             temporal_state.discard_staged();
@@ -6554,6 +6635,31 @@ fn run_export(
     }
 
     check_cancelled(progress)?;
+    // Recorded once per job, only when an accepted frame actually ran the
+    // round trip: the authored recipe plus the encoder's identity — the
+    // per-host repeatability record.
+    if mosh_used {
+        let recipe = patch
+            .temporal
+            .as_ref()
+            .map(|temporal| temporal.mosh.sanitized())
+            .unwrap_or_default();
+        let (encode_width, encode_height) = crate::codec_mosh::mosh_dimensions(w, h);
+        motion_sidecar.codec_mosh = Some(CodecMoshSidecar {
+            encoder: crate::codec_mosh::mosh_encoder_identity(),
+            encode_width,
+            encode_height,
+            amount: recipe.amount,
+            key_removal: recipe.key_removal,
+            hold: recipe.hold,
+            drop: recipe.drop,
+            shuffle: recipe.shuffle,
+            rate: recipe.rate,
+            bitrate_starve: recipe.bitrate_starve,
+            resync: recipe.resync,
+            recycle: recipe.recycle,
+        });
+    }
     let sidecar = motion_sidecar.finish(progress.warnings());
     write_motion_sidecar_atomic(&config.output_path, &sidecar)?;
     // A job that replayed a recording publishes it beside the render. An
@@ -9309,8 +9415,9 @@ layers:
         )
         .finish(Vec::new());
 
-        assert_eq!(sidecar.schema_version, 5);
+        assert_eq!(sidecar.schema_version, 6);
         assert!(sidecar.field_collider.is_none());
+        assert!(sidecar.codec_mosh.is_none());
         assert!(!sidecar.authored_residual_nodes_truncated);
         assert_eq!(sidecar.authored_residual_nodes.len(), 1);
         let record = &sidecar.authored_residual_nodes[0];
@@ -10872,6 +10979,7 @@ layers:
             symmetry_fields: Vec::new(),
             symmetry_fields_truncated: false,
             field_collider: None,
+            codec_mosh: None,
             last: None,
         };
         let scope = ExportMotionScopeMetadata {
@@ -10968,10 +11076,12 @@ layers:
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         // Schema 4 appended the per-slot Symmetry Field route section and the
         // Residual Counterpoint section; schema 5 appended the Field Collider
-        // section. Every earlier key below is re-asserted unchanged, and an
-        // exact-M4 job omits the collider section entirely.
-        assert_eq!(json["schema_version"], 5);
+        // section; schema 6 appended the codec-mosh section. Every earlier
+        // key below is re-asserted unchanged, and a job that never ran the
+        // collider or the mosh omits both sections entirely.
+        assert_eq!(json["schema_version"], 6);
         assert!(json.get("field_collider").is_none());
+        assert!(json.get("codec_mosh").is_none());
         assert!(json["symmetry_fields"].as_array().unwrap().is_empty());
         assert_eq!(json["symmetry_fields_truncated"], false);
         assert_eq!(json["cross_gpu_pixel_identity_guaranteed"], false);
@@ -12203,8 +12313,9 @@ layers:
             .0;
         assert_eq!(
             decision.matches("gesture_canvas.discard_staged();").count(),
-            3,
-            "every temporal discard site must discard the gesture canvas too"
+            4,
+            "every temporal discard site must discard the gesture canvas too \
+             (readback, B5 codec-mosh failure, ffmpeg write, GPU-error drain)"
         );
         assert!(
             !decision.contains("Instant::now()"),
@@ -18112,6 +18223,80 @@ mod effects_audit {
             decoded_framemd5("renders/audit_display_physics_repeat.mp4"),
             "the display stage must replay deterministically"
         );
+    }
+
+    /// B5's labeled export case: a real mpeg4 encode→break→decode round trip
+    /// over the finished programme, through the real export path — the same
+    /// engine the live worker owns, synchronously per frame, no export-only
+    /// mosh. The `_clean` twin carries the stage at its exact-bypass default
+    /// (amount zero: no encoder alive, no pixels touched) and must decode
+    /// differently; the `_repeat` render must decode identically, proving
+    /// the fault clock and the codec pair deterministic per host with
+    /// `threads = 1`. Cross-machine bit-identity is deliberately not
+    /// claimed — the sidecar records the encoder identity instead.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_codec_mosh_pipeline() {
+        use crate::codec_mosh::CodecMoshParams;
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_mosh = |mosh: CodecMoshParams| {
+            let mut patch = base_patch();
+            patch.temporal = Some(crate::patch::TemporalConfig {
+                mosh,
+                ..crate::patch::TemporalConfig::default()
+            });
+            patch
+        };
+        let authored = CodecMoshParams {
+            amount: 0.9,
+            key_removal: 0.95,
+            hold: 0.6,
+            drop: 0.15,
+            shuffle: 0.4,
+            rate: 1.0,
+            bitrate_starve: 0.6,
+            resync: 0.2,
+            recycle: false,
+        };
+        render("codec_mosh", with_mosh(authored));
+        render("codec_mosh_clean", with_mosh(CodecMoshParams::default()));
+        assert_ne!(
+            decoded_framemd5("renders/audit_codec_mosh.mp4"),
+            decoded_framemd5("renders/audit_codec_mosh_clean.mp4"),
+            "an authored mosh must change the decoded frames"
+        );
+        render("codec_mosh_repeat", with_mosh(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_codec_mosh.mp4"),
+            decoded_framemd5("renders/audit_codec_mosh_repeat.mp4"),
+            "the round trip must replay deterministically on one host"
+        );
+
+        // The sidecar records the recipe and the encoder identity — the
+        // per-host honesty record — only for the moshed render.
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read("renders/audit_codec_mosh.mp4.motion.json").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sidecar["schema_version"], 6);
+        let mosh = &sidecar["codec_mosh"];
+        assert!(
+            mosh["encoder"]
+                .as_str()
+                .is_some_and(|encoder| encoder.starts_with("mpeg4/avcodec-")),
+            "{mosh}"
+        );
+        let clean: serde_json::Value = serde_json::from_slice(
+            &std::fs::read("renders/audit_codec_mosh_clean.mp4.motion.json").unwrap(),
+        )
+        .unwrap();
+        assert!(clean.get("codec_mosh").is_none());
     }
 
     /// B16's labeled export case: the finished programme routed back into the

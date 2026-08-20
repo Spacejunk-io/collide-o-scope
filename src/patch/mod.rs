@@ -701,6 +701,11 @@ pub struct TemporalConfig {
     /// scalars sanitize on load and unknown fields are rejected.
     #[serde(default, skip_serializing_if = "melt_config_is_default")]
     pub melt: crate::mixing_boundary::MeltParams,
+    /// Additive B5 codec mosh. Skipped at the exact-bypass default so
+    /// earlier patches keep their bytes and canonical hashes; hostile
+    /// scalars sanitize on load and unknown fields are rejected.
+    #[serde(default, skip_serializing_if = "mosh_config_is_default")]
+    pub mosh: crate::codec_mosh::CodecMoshParams,
 }
 
 fn display_config_is_default(value: &crate::display_physics::DisplayPhysicsParams) -> bool {
@@ -709,6 +714,10 @@ fn display_config_is_default(value: &crate::display_physics::DisplayPhysicsParam
 
 fn melt_config_is_default(value: &crate::mixing_boundary::MeltParams) -> bool {
     *value == crate::mixing_boundary::MeltParams::default()
+}
+
+fn mosh_config_is_default(value: &crate::codec_mosh::CodecMoshParams) -> bool {
+    *value == crate::codec_mosh::CodecMoshParams::default()
 }
 
 /// Stable serialized vocabulary for the B12 time-displace map.
@@ -1579,6 +1588,7 @@ impl TemporalConfig {
             rig: TemporalRigConfig::from_params(p.rig),
             display: p.display.sanitized(),
             melt: p.melt.sanitized(),
+            mosh: p.mosh.sanitized(),
         }
     }
 
@@ -1637,6 +1647,7 @@ impl TemporalConfig {
             rig: self.rig.to_params(),
             display: self.display.sanitized(),
             melt: self.melt.sanitized(),
+            mosh: self.mosh.sanitized(),
         }
     }
 }
@@ -7303,6 +7314,55 @@ scenes:
         assert!(
             serde_yaml::from_str::<TemporalConfig>("display:\n  model: plasma\n").is_err(),
             "an unknown display model token is a deserialization rejection"
+        );
+    }
+
+    #[test]
+    fn codec_mosh_round_trips_and_an_absent_section_is_the_prior_path() {
+        use crate::codec_mosh::CodecMoshParams;
+
+        // A default temporal block serializes without the mosh section, so
+        // every pre-B5 patch keeps its bytes and canonical hashes.
+        let default_yaml = serde_yaml::to_string(&TemporalConfig::default()).unwrap();
+        assert!(!default_yaml.contains("mosh"));
+        let absent: TemporalConfig = serde_yaml::from_str("feedback: 0.2\n").unwrap();
+        assert_eq!(absent.mosh, CodecMoshParams::default());
+        assert!(!absent.to_params().mosh.is_active());
+
+        // A non-default block round trips whole, including the discrete
+        // recycle law.
+        let params = TemporalParams {
+            mosh: CodecMoshParams {
+                amount: 0.85,
+                key_removal: 1.0,
+                hold: 0.5,
+                drop: 0.2,
+                shuffle: 0.3,
+                rate: 0.7,
+                bitrate_starve: 0.6,
+                resync: 0.25,
+                recycle: true,
+            },
+            ..TemporalParams::default()
+        };
+        let config = TemporalConfig::from_params(&params);
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("mosh:"));
+        assert!(yaml.contains("recycle: true"));
+        let restored: TemporalConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.mosh, config.mosh);
+        assert_eq!(restored.to_params().mosh, params.mosh.sanitized());
+
+        // Hostile scalars sanitize to the neutral default rather than a
+        // clamped extreme, and unknown fields are rejected.
+        let hostile: TemporalConfig =
+            serde_yaml::from_str("mosh:\n  amount: .nan\n  key_removal: 99.0\n").unwrap();
+        let runtime = hostile.to_params();
+        assert_eq!(runtime.mosh.amount, 0.0);
+        assert_eq!(runtime.mosh.key_removal, 1.0);
+        assert!(
+            serde_yaml::from_str::<TemporalConfig>("mosh:\n  codec: vp8\n").is_err(),
+            "an unknown mosh field is a deserialization rejection"
         );
     }
 
