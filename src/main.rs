@@ -1,4 +1,12 @@
-#![allow(deprecated)] // egui 0.34 deprecation warnings for panel API renames
+#![allow(deprecated)]
+// egui 0.34 deprecation warnings for panel API renames
+// Rust 1.98.0 (CI installs stable fresh) introduced these two style lints,
+// which fire on ~50 established pixel-processing, readback, and planner
+// sites. Migrating them is behavior-neutral but churns frozen, receipt-pinned
+// code for no pixel or safety gain, so the migration is deferred to its own
+// deliberate change rather than riding an unrelated tranche.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+#![allow(clippy::map_or_identity)]
 
 mod audio;
 mod codec_mosh;
