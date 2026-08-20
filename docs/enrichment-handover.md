@@ -24,7 +24,7 @@ second full-frame history ring.
 | B13 — the small-effects tranche | **Complete** | `docs/evidence/b13-small-effects-note.md`; CLAUDE.md "B13 small effects" |
 | B1 — the Scan Processor | **Complete** | `docs/evidence/b1-scan-processor-note.md`; CLAUDE.md "The B1 Scan Processor" |
 | B4 — display physics | **Complete** | `docs/evidence/b4-display-physics-note.md`; CLAUDE.md "B4 display physics" |
-| B14 — failure switches | **Partially landed early** | `servo_defeated` shipped inside B3; the remaining piece is `sync_latched` on the tape/NTSC-adjacent shear model |
+| B14 — failure switches | **Complete** | `servo_defeated` shipped inside B3; `sync_latched` in `docs/evidence/b14-sync-latched-note.md`; CLAUDE.md "B14 the sync latch" |
 | B8 — the mixing boundary | **Complete** | `docs/evidence/b8-mixing-boundary-note.md`; CLAUDE.md "B8 the mixing boundary" |
 | B16 — program re-entry | **Complete** | `docs/evidence/b16-program-reentry-note.md`; CLAUDE.md "B16 program re-entry" |
 | B5 — codec mosh | **Complete** | `docs/evidence/b5-codec-mosh-note.md`; CLAUDE.md "B5 codec mosh" |
@@ -33,7 +33,7 @@ second full-frame history ring.
 | B10 — modulation source expansion | **Complete** | `docs/evidence/b10-mod-sources-note.md`; CLAUDE.md "B10 performance sources" |
 | B11 — the monitoring bay | **Complete** | `docs/evidence/b11-monitoring-bay-note.md`; CLAUDE.md "The B11 monitoring bay" |
 | B6 — the corruption trio | **Complete** | `docs/evidence/b6-corruption-trio-note.md`; CLAUDE.md "The B6 corruption trio" |
-| B15 | Open | — |
+| B15 — ergonomics + snapshot bank | Open — **the closing tranche** | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -41,14 +41,18 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-**Wave 3 continues with B14's remainder, `sync_latched`** — a bounded
-per-line offset table on the tape/NTSC-adjacent shear model that latches
-(every shear stays where it happened; releasing unwinds the accumulated
-displacement at once). "Bounded state may latch but never grow": latching
-is a state flag, not an accumulating buffer. Blackout and Program Freeze
-stay senior. Small; then **B15, panel ergonomics and the snapshot bank**,
-closes the plan. Next rack kind code is 18. Fetch the plan document before
-starting either.
+**B15, panel ergonomics and the snapshot bank — the last tranche in the
+plan.** Four independent pieces: `/` search plus MOVING and CHANGED filters
+(entirely client-side over existing snapshot data, zero new wire actions);
+per-control help text embedded with the panel assets and surfaced as native
+tooltips; a snapshot bank of eight whole-rig slots with a glide time, where
+recall loads a slot into the existing Morph A/B and glides — reusing that
+ownership and materialization law wholesale rather than minting a second one,
+as a revision-carrying barrier like Morph capture; and Dice keep-masks
+(`keep_source | keep_modulation | keep_output_chain`) that select which of the
+already domain-separated streams run, each defaulting to current behaviour so
+an unflagged action is byte-identical. Next rack kind code is 18. Fetch the
+plan document before starting.
 
 ## The working method every tranche follows
 

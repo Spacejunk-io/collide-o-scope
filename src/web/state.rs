@@ -2425,6 +2425,16 @@ pub struct TemporalSnapshot {
     /// serde block; absent means exact bypass.
     #[serde(default)]
     pub mosh: crate::codec_mosh::CodecMoshParams,
+    /// Additive B14 sync latch. The params struct is its own sanitizing serde
+    /// block; absent means exact-off.
+    #[serde(default)]
+    pub sync: crate::sync_latch::SyncLatchParams,
+    /// Read-only renderer truth: whether the sync latch is currently holding
+    /// accumulated shear. The authored switch says what the operator asked
+    /// for; this says whether the program is actually still broken, which is
+    /// the fact a failure switch exists to make visible.
+    #[serde(default)]
+    pub sync_damaged: bool,
     /// Read-only renderer truth. Main fills this DTO when the active executor
     /// exposes metrics; older/exact paths safely report the zero placeholder.
     #[serde(default)]
@@ -2751,6 +2761,8 @@ impl Default for TemporalSnapshot {
             display: crate::display_physics::DisplayPhysicsParams::default(),
             melt: crate::mixing_boundary::MeltParams::default(),
             mosh: crate::codec_mosh::CodecMoshParams::default(),
+            sync: crate::sync_latch::SyncLatchParams::default(),
+            sync_damaged: false,
             telemetry: TemporalTelemetrySnapshot::default(),
         }
     }
@@ -2947,6 +2959,9 @@ impl TemporalSnapshot {
             display: p.display.sanitized(),
             melt: p.melt.sanitized(),
             mosh: p.mosh.sanitized(),
+            sync: p.sync.sanitized(),
+            // Renderer truth, filled by main beside the temporal telemetry.
+            sync_damaged: false,
             originals: TemporalOriginalsSnapshot {
                 loom: TemporalLoomSnapshot {
                     amount: p.originals.loom.amount,
@@ -7887,7 +7902,11 @@ mod protocol_tests {
         // decay sliders and the macro row's knob (rendered four times each;
         // the pin counts literal tags). Its HTML additions are buttons and a
         // number input, so the HTML count stays.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 198);
+        // B14 added the four sync-latch sliders (shear, slip rate, band
+        // height, drift bias) to the temporal section; the latch switch
+        // itself is a checkbox, so only these four move the HTML count. The
+        // JS count is untouched — the group is static markup.
+        assert_eq!(assert_range_tags_are_bounded(html, true), 202);
         assert_eq!(assert_range_tags_are_bounded(js, false), 24);
 
         for contract in [

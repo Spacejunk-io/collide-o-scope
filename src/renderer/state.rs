@@ -2994,6 +2994,7 @@ pub struct Renderer {
     /// The B8 melting-edge stage on the same seam, immediately upstream of
     /// the display stage. Its history surface is lazy too.
     melting_edge: crate::renderer::melting_edge::MeltingEdgeGpu,
+    sync_latch: crate::renderer::sync_latch::SyncLatchGpu,
 
     // Instance + adapter kept for creating additional surfaces (output
     // window). Capabilities must be queried against the SAME adapter the
@@ -3251,6 +3252,14 @@ impl Renderer {
             COMPOSITE_FORMAT,
             [output_width, output_height],
         );
+        // The B14 sync latch rides the same seam between the melting edge and
+        // the display stage. It owns no texture at all — its whole state is a
+        // bounded per-line table and one uniform buffer.
+        let sync_latch = crate::renderer::sync_latch::SyncLatchGpu::new(
+            &device,
+            COMPOSITE_FORMAT,
+            [output_width, output_height],
+        );
 
         // --- Three composite textures ---
         let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -3405,6 +3414,7 @@ impl Renderer {
             temporal_state: TemporalState::default(),
             display_physics,
             melting_edge,
+            sync_latch,
             instance,
             adapter,
             output: None,
@@ -3643,6 +3653,10 @@ impl Renderer {
 
     pub(crate) fn reset_visual_generation_for(&mut self, cause: TemporalResetCause) {
         self.temporal_state.reset_for(cause);
+        // The B14 latched shear table is program memory: it clears on the
+        // causes that begin a new program and deliberately survives a source
+        // cut, a seek, and blackout.
+        self.sync_latch.reset_for(cause);
         self.last_harvested_readback_sequence = self
             .last_harvested_readback_sequence
             .max(self.next_readback_sequence.saturating_sub(1));
@@ -4145,6 +4159,38 @@ impl Renderer {
             melt,
             delta_seconds,
         )
+    }
+
+    /// The B14 sync latch — the tape/NTSC horizontal shear — on the same
+    /// slot-0 seam, between the melting edge and the display stage: a sync
+    /// fault happens in the signal, and the screen model downstream then
+    /// shows it. A frame whose bounded per-line table displaces nothing
+    /// encodes no pass at all, so slot 0 reaches the display stage byte for
+    /// byte. `delta_seconds` is the program-advancing delta, so Pause holds
+    /// the fault stream still.
+    pub(crate) fn render_sync_latch(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        sync: &crate::sync_latch::SyncLatchParams,
+        seed: u32,
+        delta_seconds: f32,
+    ) -> bool {
+        self.sync_latch.encode(
+            &self.device,
+            &self.queue,
+            encoder,
+            &self.composite_textures,
+            &self.composite_views,
+            sync,
+            seed,
+            delta_seconds,
+        )
+    }
+
+    /// Whether the sync latch currently holds accumulated displacement, for
+    /// the operator-facing snapshot.
+    pub fn sync_latch_damaged(&self) -> bool {
+        self.sync_latch.has_damage()
     }
 
     /// Resolve the straight-alpha engine image into one opaque audience image.

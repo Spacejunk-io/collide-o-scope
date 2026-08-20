@@ -4345,6 +4345,45 @@ mod tests {
     }
 
     #[test]
+    fn the_generator_preserves_the_sync_latch_exactly() {
+        use crate::sync_latch::SyncLatchParams;
+        // B14 adds no generator-mutated value: the whole block, switch and
+        // controls alike, is preserved verbatim. The four calls below are the
+        // entire temporal mutation the generation walk performs, so running
+        // them and finding `sync` untouched is the preservation proof.
+        let authored = crate::patch::TemporalConfig {
+            sync: SyncLatchParams {
+                amount: 0.6,
+                rate: 0.4,
+                spread: 0.8,
+                bias: -0.3,
+                latched: true,
+            },
+            ..crate::patch::TemporalConfig::default()
+        };
+        let mut mutated = authored.clone();
+        mutate_temporal_rig(&authored.rig, &mut mutated.rig, 2.0, 77, 3);
+        mutate_display_physics(&authored.display, &mut mutated.display, 2.0, 77, 3);
+        mutate_master_melt(&authored.melt, &mut mutated.melt, 2.0, 77, 3);
+        mutate_codec_mosh(&authored.mosh, &mut mutated.mosh, 2.0, 77, 3);
+        assert_eq!(
+            mutated.sync, authored.sync,
+            "the generator must preserve the sync latch exactly"
+        );
+
+        // And no mutator for it exists at all, so a later edit cannot quietly
+        // start moving it without also moving GENERATOR_VERSION.
+        // The needle is built at runtime: a literal would match this very
+        // assertion and the audit would report itself.
+        let needle = format!("mutate_{}", "sync_latch");
+        let source = include_str!("procedural.rs");
+        assert!(
+            !source.contains(&needle),
+            "B14 declares no generator mutation; adding one needs a version bump"
+        );
+    }
+
+    #[test]
     fn codec_mosh_generation_is_deterministic_bounded_and_preserves_the_recycle_law() {
         use crate::codec_mosh::CodecMoshParams;
         let authored = CodecMoshParams {

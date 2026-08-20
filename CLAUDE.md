@@ -42,6 +42,7 @@ src/
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
 ├── display_physics.rs   B4 display-physics law: fields, phosphor, display model CPU reference
 ├── mixing_boundary.rs   B8 mixing-boundary law: wipes, blend meet, dirty mixer, melt CPU reference
+├── sync_latch.rs        B14 sync-latch law: deterministic shear draws, the bounded per-line table
 ├── block_dct.rs         B6 Block DCT law: DCT-II CPU reference, quantiser, chroma crush
 ├── filter_avalanche.rs  B6 Filter Avalanche law: predictors, deterministic lanes, cascade reference
 ├── pixel_sort.rs        B6 Pixel Sort law: bounded bright-run search CPU reference
@@ -50,6 +51,7 @@ src/
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
 ├── renderer/display_physics.rs single-seam slot-0 display stage, lazy field/phosphor surfaces
 ├── renderer/melting_edge.rs B8 slot-0 master melt over the program's own coverage, lazy history
+├── renderer/sync_latch.rs B14 slot-0 shear stage, no texture: one bounded table and one uniform
 ├── renderer/monitor_bay.rs B11 armed-on-demand 128×72 probe reduction and bounded readback pool
 ├── renderer/pattern_synth.rs lazy per-layer pattern pass executor shared by live and export
 ├── renderer/corruption.rs B6 corruption-trio executor: four pipelines, shared DCT intermediates
@@ -98,6 +100,7 @@ src/
     ├── display_physics.wgsl field domain, N-1 phosphor store, beam/mask display pass
     ├── pattern_synth.wgsl B7 pattern source: shape/oscillator/wavefolder/comparator/colouriser, no texture
     ├── melting_edge.wgsl  B8 coverage-boundary probe, band drag, self-feeding hold
+    ├── sync_latch.wgsl    B14 per-line horizontal shear with the tape wrap, table-driven
     ├── monitor_bay.wgsl   B11 128×72 monitor reduction, 16 bilinear taps per cell
     ├── corruption.wgsl    B6 trio: DCT coefficient/reconstruction stages, pixel sort, avalanche
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
@@ -2083,6 +2086,107 @@ that a disabled collider is byte-identical to exact M4 — plus
 26.7.1). Cross-platform portability rests on hosted three-platform CI, not on
 that adapter.
 
+### B14 the sync latch
+
+"A model that always recovers is a model that cannot actually break."
+`servo_defeated` landed inside B3; `sync_latched` is B14's other half and
+closes it. The seat is the tape/NTSC-adjacent horizontal shear: each
+reference tick some bands of scanlines lose sync and slip sideways.
+Unlatched a slip lives exactly as long as its own tick and the picture heals
+— the B8 knock's law, bit-clean between firings. **Latched, every slip is
+written into a bounded per-line offset table and stays there, accumulating,
+until the switch is released and the whole displacement unwinds in one
+step.** `src/sync_latch.rs` is the independent CPU reference in the
+`gesture.rs` tradition and `sync_latch.wgsl` consumes the table it produces.
+
+**Bounded state may latch but never grow.** The table is the entire latched
+state: one `f32` per output line, capped at `SYNC_LATCH_MAX_LINES` (2,160)
+and `SYNC_LATCH_MAX_OFFSET` (0.25 output UV) per line — 8,640 bytes at the
+absolute cap. The stage owns **no texture at all**, allocates no surface, and
+appears in no ledger; its only GPU resource is one 8,656-byte uniform (a
+16-byte header plus the capped table, compile-time asserted). Accumulation is
+bounded three ways, each with its own fixture: per slip
+(`SYNC_LATCH_SLIP_UV`, 0.02 UV at full amount), per line (clamped on every
+fold), and per frame (`SYNC_LATCH_MAX_TICK_BURST` = 24, the
+`history_ticks_for_delta` burst clamp, so a long stall cannot bill the table
+for every skipped tick at once).
+
+**The seat** is a Recipe-B stage on the shared slot-0 seam, between the B8
+melting edge and the B4 display stage — `temporal → melt → sync latch →
+display → opaque resolve`. That order is the law: a sync fault happens in the
+signal, and the screen model downstream then shows it. Live LegacyExact, live
+Advanced, the selective-VHS path, and export all converge on this adjacency,
+so one implementation and one shader serve all four (three live call sites,
+two offline). The three existing shear producers were surveyed and rejected
+as seats: the B8 knock is bus-scope and absent from LegacyExact, the ntsc-rs
+worker is third-party CPU work with no latch vocabulary, and Shift is a
+layer/master effect rather than tape-adjacent. The stage therefore takes the
+B8 dirt law as its *model*, not its code.
+
+**Laws.** Every draw is the Shift band/epoch/seed law on the shared integer
+avalanche (`mixing_boundary::lane_unit`) in the fresh `LANE_SYNC_FIRE` /
+`LANE_SYNC_SLIP` domains ("SYN" 1 and 2), keyed by the master `random_seed`,
+the stage's own 30 Hz ordinal, and the band index — no sequential RNG state,
+so a tick recomputes alone. `band_height(spread)` spans 1 line to 64, and
+every line in a band carries the identical offset, which is what makes a tear
+a tear rather than static. `band_fires` draws against `rate * 0.5`. `bias`
+folds the symmetric draw toward one side while keeping its magnitude, so at
+±1 accumulation is monotonic to the cap. A sheared line **wraps**: `fract`
+puts the coordinate back inside the frame and the sampler repeats on U, so
+the bilinear tap straddling the seam filters across it rather than clamping.
+The wake law is `amount > ε ∧ rate > ε` — neither control alone wakes the
+stage, and the switch deliberately does not appear in it, because latching an
+inert stage accumulates nothing. Beyond that the executor **skips encoding
+entirely whenever every offset is zero**, so the exact prior path never
+resamples at all. Release is expressed as "unlatched implies an empty table"
+rather than as a falling-edge handler, so the two cannot drift apart. Pulling
+`amount` to zero while latched stops new damage and holds what is already
+done: the switch is what repairs.
+
+**The table is program memory.** Blackout does **not** clear it — the
+temporal-ring and bus-melt precedent, deliberately not B4's phosphor, which
+models the screen itself. The audience goes dark; the program keeps its
+damage, and a release resumes from the picture the cut interrupted.
+`reset_for` clears on exactly the causes that begin a new program
+(`PatchGeneration`, `ApplyLook`, `BroadRevert`, `Resize`, `ManualClear`) and
+holds through `SourceCut`, `Seek`, and `BlackoutTransition`; one hook,
+`Renderer::reset_visual_generation_for`, already carries all three required
+causes. **The table is deliberately absent from patches**: the switch and its
+four controls persist, while the accumulation is runtime state like a
+temporal ring, regrowing deterministically from the seed and the clock — so
+pre-B14 bytes and canonical hashes keep and live and offline agree from any
+common start. Program Freeze needs no special handling: the stage is fed
+`program_advancing_delta()` like its two neighbours, so Pause holds the fault
+clock still, and blackout stays the absolute final audience operation.
+
+**Closure.** Patch: `TemporalConfig.sync`, skip-serialized at the exact-off
+default; hostile scalars sanitize to neutral and unknown fields are rejected.
+Wire: five `sync_*` params on the ordinary coalescible `set_temporal` in both
+validators plus the shared `apply_temporal_wire_edit`. Snapshot: an additive
+`sync` block plus the read-only `sync_damaged` fact — the authored switch
+says what was asked for, that says whether the program is *actually* still
+broken, which is the fact a failure switch exists to make visible. Panel: a
+SYNC LATCH group in the temporal section (four sliders — the static range
+count is **202** — plus the switch; the `app.js` template pin stays 24).
+Modulation: four continuous master addresses (`sync_amount`, `sync_rate`,
+`sync_spread`, `sync_bias`) inserted before `morph`, which stays last; the
+switch is a discrete law with no address, because a failure switch is thrown,
+never swept. Morph blends the four values and recalls the switch at the
+midpoint. Dice and the generator preserve the whole block exactly
+(`GENERATOR_VERSION` stays "12"). The sidecar schema stays 6, the renderer
+texture floor stays 30, and `temporal.wgsl`'s pinned SHA is untouched — the
+stage owns its own shader. `render_sync_latch_pipeline` is the labeled export
+case: its `_healed` twin carries the identical four controls with the switch
+off, so both renders draw the identical fault stream and differ only in
+whether the faults heal.
+
+**Two named boundaries.** The switch has no native surface, matching every
+other temporal discrete law (`fb_servo_defeated`, `mosh_recycle`,
+`disp_model`): the native patch editor captures temporal state rather than
+editing it, and giving temporal discrete laws a native surface is a separate
+change across roughly forty controls. And `active` is a WGSL reserved
+keyword, so the uniform's arming lane is named `armed` on both sides.
+
 ### B2 procedural motion fields
 
 `MotionFieldSource` gained one arm: `Procedural(ProceduralFieldKind)`, a
@@ -3545,6 +3649,31 @@ mislead browser tests.
   comb, closed-form decay, blackout clearing the wake), and
   `render_display_physics_pipeline` is the labeled export case with its
   `_flat` difference and `_repeat` determinism assertions.
+- Sync-latch tests must cover the exact-off default and the wake law
+  (neither control alone wakes the stage, and the switch alone never wakes an
+  inert one), hostile neutral sanitize with out-of-range clamping, the band
+  height span with a band's lines carrying one identical offset, the firing
+  law at zero and full rate, bias forcing the slip sign while keeping its
+  magnitude, every slip inside the declared bound, unlatched slips healing
+  with their own tick, a frame inside a tick holding the shear still,
+  **latching accumulating monotonically and stopping at the cap**, **release
+  unwinding the whole table in one step** with damage surviving a magnitude
+  pulled to zero, the 24-tick burst clamp, determinism per seed and
+  distinctness across seeds, the line cap and hard clear, the wrap law
+  keeping every sample inside the frame, the frozen 16/8,656-byte uniform
+  sizes, distinct hash lanes, the patch round trip with the accumulated table
+  proven absent from the YAML, the Morph blend with midpoint recall of the
+  switch, the four modulation addresses with the switch refused, generator
+  preservation with no mutator in the source, both wire validators, and the
+  B9 value-law oracle. The two `renderer::sync_latch::tests::gpu_sync_latch_`
+  fixtures carry the physical-GPU claim — each line sheared to where the CPU
+  reference says (compared against a model reproducing the filtering
+  sampler's wrapped bilinear tap), the authored default encoding no pass at
+  all, and reset clearing only the causes that begin a new program while a
+  source cut, a seek, and a blackout transition all keep the damage.
+  `render_sync_latch_pipeline` is the labeled export case with its `_healed`
+  difference twin, its `_off` dormant twin, and its `_repeat` determinism
+  assertion.
 - Mixing-boundary tests must cover the 25 append-only blend codes with rows
   0..=14 of the frozen vector tables byte-identical and the code-byte law
   for the bitwise pair, the closed wipe/back-colour vocabularies, the

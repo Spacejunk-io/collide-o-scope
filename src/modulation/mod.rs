@@ -202,6 +202,13 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("mosh_rate", 0.0, 1.0),
     ("mosh_bitrate_starve", 0.0, 1.0),
     ("mosh_resync", 0.0, 1.0),
+    // B14 sync latch: the four continuous controls. The latch switch itself
+    // is a discrete law and deliberately has no address — a failure switch is
+    // thrown, never swept.
+    ("sync_amount", 0.0, 1.0),
+    ("sync_rate", 0.0, 1.0),
+    ("sync_spread", 0.0, 1.0),
+    ("sync_bias", -1.0, 1.0),
     // Program-wide spatial controls. Continuous geometry is modulatable;
     // discrete fit/edge/sampling choices remain explicitly authored.
     ("position_x", POSITION_MIN, POSITION_MAX),
@@ -4656,6 +4663,10 @@ fn apply_offset(
         "mosh_rate" => &mut tp.mosh.rate,
         "mosh_bitrate_starve" => &mut tp.mosh.bitrate_starve,
         "mosh_resync" => &mut tp.mosh.resync,
+        "sync_amount" => &mut tp.sync.amount,
+        "sync_rate" => &mut tp.sync.rate,
+        "sync_spread" => &mut tp.sync.spread,
+        "sync_bias" => &mut tp.sync.bias,
         _ => return,
     };
     *slot = (*slot + offset).clamp(min, max);
@@ -5673,6 +5684,39 @@ mod tests {
         for discrete in ["display_il_mode", "display_il_order", "display_model"] {
             assert_eq!(target_range(discrete), None, "{discrete}");
         }
+    }
+
+    #[test]
+    fn sync_latch_modulation_is_bounded_and_the_switch_has_no_address() {
+        for target in ["sync_amount", "sync_rate", "sync_spread"] {
+            assert_eq!(target_range(target), Some((0.0, 1.0)), "{target}");
+        }
+        assert_eq!(target_range("sync_bias"), Some((-1.0, 1.0)));
+
+        // The switch is a discrete law with no modulatable address — a
+        // failure switch is thrown, never swept — and `morph` stays the final
+        // master target.
+        assert_eq!(target_range("sync_latched"), None);
+        assert_eq!(TARGETS.last().map(|(name, _, _)| *name), Some("morph"));
+
+        // An applied offset lands in the frame's temporal copy, never the
+        // authored base.
+        let mut matrix = ModMatrix::new();
+        matrix.midi[0] = 1.0;
+        matrix.routings = vec![Routing::new(ModSource::Midi(0), "sync_amount", 1.0)];
+        matrix.update_at_beat(0.0, 0.0);
+        let frame = matrix.frame(0);
+        let base = crate::effects::params::TemporalParams::default();
+        let (_fx, _spatial, _np, tp) = frame.modulate(
+            &crate::effects::EffectUniforms::default(),
+            &crate::spatial::SpatialTransform::default(),
+            &crate::ntsc::NtscParams::default(),
+            &base,
+        );
+        approx(tp.sync.amount, 0.5);
+        assert_eq!(base.sync.amount, 0.0, "the authored base is immutable");
+        // The switch never moves under modulation.
+        assert!(!tp.sync.latched);
     }
 
     #[test]

@@ -5354,6 +5354,14 @@ fn run_export(
         wgpu::TextureFormat::Rgba8UnormSrgb,
         [w, h],
     );
+    // The B14 sync latch rides the same seam between the melting edge and
+    // the display stage. It owns no texture: a bounded per-line table and one
+    // uniform buffer are its entire state.
+    let mut sync_latch_gpu = crate::renderer::sync_latch::SyncLatchGpu::new(
+        &device,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        [w, h],
+    );
 
     // Temporal history is the largest mandatory output-sized allocation. It
     // belongs to the setup scope above even when a saved patch currently has
@@ -6419,6 +6427,10 @@ fn run_export(
         debug_assert_eq!(evaluated_frame.context().output_size, [w, h]);
         let mod_ntsc = evaluated_frame.ntsc().clone();
         let mod_temporal = *evaluated_frame.temporal();
+        // The B14 sync latch draws its faults on the master random seed,
+        // taken from the same immutable frame sample every other consumer
+        // reads, so live and offline draw the identical fault stream.
+        let mod_sync_seed = evaluated_frame.master_pass().effects.random_seed;
         let (mut motion_field_products, motion_field_diagnostics) = match &evaluated_composition {
             EvaluatedCompositionPlan::Advanced(plan) => {
                 export_codec_motion_fields(plan, &frame_creative_graph, &layers)
@@ -6663,6 +6675,16 @@ fn run_export(
                     &mod_temporal.melt,
                     temporal_input.program_advancing_delta(),
                 );
+                sync_latch_gpu.encode(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    &composite_textures,
+                    &composite_views,
+                    &mod_temporal.sync,
+                    mod_sync_seed,
+                    temporal_input.program_advancing_delta(),
+                );
                 display_physics_gpu.encode(
                     &device,
                     &queue,
@@ -6870,6 +6892,16 @@ fn run_export(
                     &composite_views,
                     wgpu::TextureFormat::Rgba8UnormSrgb,
                     &mod_temporal.melt,
+                    temporal_input.program_advancing_delta(),
+                );
+                sync_latch_gpu.encode(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    &composite_textures,
+                    &composite_views,
+                    &mod_temporal.sync,
+                    mod_sync_seed,
                     temporal_input.program_advancing_delta(),
                 );
                 display_physics_gpu.encode(
@@ -18955,6 +18987,72 @@ mod effects_audit {
             decoded_framemd5("renders/audit_display_physics.mp4"),
             decoded_framemd5("renders/audit_display_physics_repeat.mp4"),
             "the display stage must replay deterministically"
+        );
+    }
+
+    /// B14's labeled export case: the tape/NTSC horizontal shear latched, so
+    /// every slip stays where it happened and accumulates into the bounded
+    /// per-line table, through the real export path — the same stage and the
+    /// same shader the three live seams encode, no export-only shear. The
+    /// `_healed` twin carries the identical four controls with the switch
+    /// **off**, so both renders draw the identical fault stream from the
+    /// identical hash lanes and differ only in whether the faults heal: the
+    /// decoded frames must differ, which is the whole tranche's claim made
+    /// visible. The `_repeat` render must decode identically, proving that a
+    /// table which is deliberately absent from the patch still regrows
+    /// deterministically from the seed and the frame-indexed clock.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_sync_latch_pipeline() {
+        use crate::sync_latch::SyncLatchParams;
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_sync = |sync: SyncLatchParams| {
+            let mut patch = base_patch();
+            patch.temporal = Some(crate::patch::TemporalConfig {
+                sync,
+                ..crate::patch::TemporalConfig::default()
+            });
+            patch
+        };
+        let authored = SyncLatchParams {
+            amount: 0.9,
+            rate: 0.8,
+            spread: 0.2,
+            bias: 0.6,
+            latched: true,
+        };
+        render("sync_latch", with_sync(authored));
+        render(
+            "sync_latch_healed",
+            with_sync(SyncLatchParams {
+                latched: false,
+                ..authored
+            }),
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_sync_latch.mp4"),
+            decoded_framemd5("renders/audit_sync_latch_healed.mp4"),
+            "latching must change the decoded frames — a fault that heals and              a fault that stays are different programs"
+        );
+        render("sync_latch_repeat", with_sync(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_sync_latch.mp4"),
+            decoded_framemd5("renders/audit_sync_latch_repeat.mp4"),
+            "the latched table must regrow deterministically offline"
+        );
+
+        // The exact-off default is the prior path: no shear, no pass encoded.
+        render("sync_latch_off", with_sync(SyncLatchParams::default()));
+        assert_ne!(
+            decoded_framemd5("renders/audit_sync_latch.mp4"),
+            decoded_framemd5("renders/audit_sync_latch_off.mp4"),
+            "an authored shear must differ from the dormant default"
         );
     }
 
