@@ -3,6 +3,7 @@
 mod audio;
 mod composition;
 mod controller_profile;
+mod display_physics;
 mod effects;
 mod evaluated_frame;
 mod gesture;
@@ -9259,6 +9260,34 @@ impl App {
             "fb_reflect_x" | "fb_reflect_y" | "fb_servo" | "fb_servo_defeated" => {
                 value.is_boolean()
             }
+            // The B4 display stage's twenty wire params, mirroring the
+            // server-side vocabulary exactly.
+            "disp_il_amount" | "disp_il_twitter" | "disp_il_judder" | "disp_phos_r"
+            | "disp_phos_g" | "disp_phos_b" | "disp_scanlines" | "disp_beam_shape"
+            | "disp_mask_strength" | "disp_mask_dark" | "disp_bloom" | "disp_bloom_radius"
+            | "disp_halation" | "disp_defocus" | "disp_sag" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
+            "disp_phosphor" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=0.95).contains(&number)),
+            "disp_beam_width" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.1..=3.0).contains(&number)),
+            "disp_il_mode" => matches!(value.as_str(), Some("weave" | "bob" | "blend")),
+            "disp_model" => matches!(
+                value.as_str(),
+                Some(
+                    "flat"
+                        | "aperture_grille"
+                        | "slot_mask"
+                        | "shadow_mask"
+                        | "lcd_stripe"
+                        | "mono"
+                        | "green_screen"
+                )
+            ),
+            "disp_il_order" => value.is_boolean(),
             "slitscan" | "slit_axis" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
@@ -15923,6 +15952,116 @@ impl App {
                             p.rig.servo_defeated = flag;
                         }
                     }
+                    "disp_il_amount" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.il_amount = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_il_mode" => {
+                        p.display.il_mode = match value.as_str() {
+                            Some("bob") => display_physics::InterlaceMode::Bob,
+                            Some("blend") => display_physics::InterlaceMode::Blend,
+                            _ => display_physics::InterlaceMode::Weave,
+                        };
+                    }
+                    "disp_il_order" => {
+                        if let Some(flag) = value.as_bool() {
+                            p.display.il_order = flag;
+                        }
+                    }
+                    "disp_il_twitter" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.il_twitter = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_il_judder" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.il_judder = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_phosphor" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.phosphor = (n as f32).clamp(0.0, 0.95);
+                        }
+                    }
+                    "disp_phos_r" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.phos_r = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_phos_g" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.phos_g = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_phos_b" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.phos_b = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_model" => {
+                        p.display.model = match value.as_str() {
+                            Some("aperture_grille") => {
+                                display_physics::DisplayModel::ApertureGrille
+                            }
+                            Some("slot_mask") => display_physics::DisplayModel::SlotMask,
+                            Some("shadow_mask") => display_physics::DisplayModel::ShadowMask,
+                            Some("lcd_stripe") => display_physics::DisplayModel::LcdStripe,
+                            Some("mono") => display_physics::DisplayModel::Mono,
+                            Some("green_screen") => display_physics::DisplayModel::GreenScreen,
+                            _ => display_physics::DisplayModel::Flat,
+                        };
+                    }
+                    "disp_scanlines" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.scanlines = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_beam_width" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.beam_width = (n as f32).clamp(0.1, 3.0);
+                        }
+                    }
+                    "disp_beam_shape" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.beam_shape = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_mask_strength" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.mask_strength = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_mask_dark" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.mask_dark = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_bloom" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.bloom = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_bloom_radius" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.bloom_radius = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_halation" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.halation = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_defocus" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.defocus = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "disp_sag" => {
+                        if let Some(n) = value.as_f64() {
+                            p.display.sag = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
                     "slitscan" => {
                         if let Some(n) = value.as_f64() {
                             p.slitscan = (n as f32).clamp(0.0, 1.0);
@@ -20830,8 +20969,15 @@ impl ApplicationHandler for App {
                                 if advanced_encoded {
                                     // Advanced already authored every ordered host
                                     // boundary, including LegacyTemporal, into
-                                    // compat slot0. The established opaque resolve
-                                    // remains the sole audience handoff.
+                                    // compat slot0. The B4 display stage rides the
+                                    // shared slot-0 seam, then the established
+                                    // opaque resolve remains the sole audience
+                                    // handoff.
+                                    renderer.render_display_physics(
+                                        &mut encoder,
+                                        &mod_temporal.display,
+                                        temporal_input.program_advancing_delta(),
+                                    );
                                     renderer.render_opaque_output(&mut encoder);
                                     advanced_audience_rendered = true;
                                     temporal_frame_accepted = true;
@@ -20887,6 +21033,11 @@ impl ApplicationHandler for App {
                                                 temporal_input,
                                             );
                                             temporal_frame_accepted = true;
+                                            renderer.render_display_physics(
+                                                &mut encoder,
+                                                &mod_temporal.display,
+                                                temporal_input.program_advancing_delta(),
+                                            );
                                             renderer.render_opaque_output(&mut encoder);
                                         }
                                         Err(error) => {
@@ -21027,18 +21178,25 @@ impl ApplicationHandler for App {
                                             log::error!("Rejected selective NTSC result: {error}");
                                             self.selective_ntsc_runtime_error = error;
                                         } else {
-                                            renderer.render_temporal_frame(
-                                                &mut encoder,
-                                                &mod_temporal,
+                                            let selective_temporal_input =
                                                 temporal::TemporalFrameInput::new(
                                                     self.selective_temporal_debt,
                                                     temporal_input.freeze,
                                                     temporal_input.blackout,
                                                     temporal_input.events,
                                                 )
-                                                .with_audio_energy(temporal_input.audio_energy),
+                                                .with_audio_energy(temporal_input.audio_energy);
+                                            renderer.render_temporal_frame(
+                                                &mut encoder,
+                                                &mod_temporal,
+                                                selective_temporal_input,
                                             );
                                             temporal_frame_accepted = true;
+                                            renderer.render_display_physics(
+                                                &mut encoder,
+                                                &mod_temporal.display,
+                                                selective_temporal_input.program_advancing_delta(),
+                                            );
                                             renderer.render_opaque_output(&mut encoder);
                                             self.selective_temporal_debt = 0.0;
                                             self.selective_transition_holding = false;

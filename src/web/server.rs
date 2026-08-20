@@ -1150,6 +1150,28 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
             Some("transparent" | "mirror" | "wrap" | "hold")
         ),
         "fb_reflect_x" | "fb_reflect_y" | "fb_servo" | "fb_servo_defeated" => value.is_boolean(),
+        // The B4 display stage's twenty wire params. Seventeen continuous,
+        // three discrete closed vocabularies.
+        "disp_il_amount" | "disp_il_twitter" | "disp_il_judder" | "disp_phos_r" | "disp_phos_g"
+        | "disp_phos_b" | "disp_scanlines" | "disp_beam_shape" | "disp_mask_strength"
+        | "disp_mask_dark" | "disp_bloom" | "disp_bloom_radius" | "disp_halation"
+        | "disp_defocus" | "disp_sag" => number_in(value, 0.0, 1.0),
+        "disp_phosphor" => number_in(value, 0.0, 0.95),
+        "disp_beam_width" => number_in(value, 0.1, 3.0),
+        "disp_il_mode" => matches!(value.as_str(), Some("weave" | "bob" | "blend")),
+        "disp_model" => matches!(
+            value.as_str(),
+            Some(
+                "flat"
+                    | "aperture_grille"
+                    | "slot_mask"
+                    | "shadow_mask"
+                    | "lcd_stripe"
+                    | "mono"
+                    | "green_screen"
+            )
+        ),
+        "disp_il_order" => value.is_boolean(),
         "slitscan" | "slit_axis" => number_in(value, 0.0, 1.0),
         "slit_angle" | "loom_angle" => number_in(value, -180.0, 180.0),
         "slit_map" => matches!(

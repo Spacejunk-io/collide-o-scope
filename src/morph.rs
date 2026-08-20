@@ -751,6 +751,11 @@ pub struct MorphTemporalSnapshot {
     pub originals: TemporalOriginalsConfig,
     /// B3 feedback rig, captured as its serializable config block.
     pub rig: TemporalRigConfig,
+    /// B4 display physics, captured whole: the params struct is its own
+    /// sanitizing serde block. Continuous values blend; the interlace mode,
+    /// the order fault, and the display model recall an endpoint at the
+    /// midpoint.
+    pub display: crate::display_physics::DisplayPhysicsParams,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -776,6 +781,7 @@ impl MorphTemporalSnapshot {
             key_history: value.key_history,
             originals: TemporalOriginalsConfig::from_params(value.originals),
             rig: TemporalRigConfig::from_params(value.rig),
+            display: value.display,
         }
         .sanitized()
     }
@@ -796,6 +802,7 @@ impl MorphTemporalSnapshot {
             key_history: finite_clamp(self.key_history, 1.0, 1.0, 23.0).round(),
             originals: self.originals.sanitized(),
             rig: self.rig.sanitized(),
+            display: self.display.sanitized(),
         }
     }
 
@@ -815,6 +822,7 @@ impl MorphTemporalSnapshot {
             key_softness: clean.key_softness,
             key_history: clean.key_history,
             originals: clean.originals.to_params(),
+            display: clean.display,
             rig: clean.rig.to_params(),
         }
     }
@@ -841,8 +849,44 @@ impl MorphTemporalSnapshot {
             key_history: blend_finite(a.key_history, b.key_history, weights),
             originals: interpolate_temporal_originals(a.originals, b.originals, weights, choose_b),
             rig: interpolate_temporal_rig(a.rig, b.rig, weights, choose_b),
+            display: interpolate_display_physics(a.display, b.display, weights, choose_b),
         }
         .sanitized()
+    }
+}
+
+/// B4 display morphing: the seventeen continuous controls blend, and the
+/// three discrete laws — the interlace mode, the field-order fault, and the
+/// display model — recall an endpoint at the midpoint.
+fn interpolate_display_physics(
+    a: crate::display_physics::DisplayPhysicsParams,
+    b: crate::display_physics::DisplayPhysicsParams,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> crate::display_physics::DisplayPhysicsParams {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    crate::display_physics::DisplayPhysicsParams {
+        il_amount: blend_finite(a.il_amount, b.il_amount, weights),
+        il_mode: pick(a.il_mode, b.il_mode, choose_b),
+        il_order: pick(a.il_order, b.il_order, choose_b),
+        il_twitter: blend_finite(a.il_twitter, b.il_twitter, weights),
+        il_judder: blend_finite(a.il_judder, b.il_judder, weights),
+        phosphor: blend_finite(a.phosphor, b.phosphor, weights),
+        phos_r: blend_finite(a.phos_r, b.phos_r, weights),
+        phos_g: blend_finite(a.phos_g, b.phos_g, weights),
+        phos_b: blend_finite(a.phos_b, b.phos_b, weights),
+        model: pick(a.model, b.model, choose_b),
+        scanlines: blend_finite(a.scanlines, b.scanlines, weights),
+        beam_width: blend_finite(a.beam_width, b.beam_width, weights),
+        beam_shape: blend_finite(a.beam_shape, b.beam_shape, weights),
+        mask_strength: blend_finite(a.mask_strength, b.mask_strength, weights),
+        mask_dark: blend_finite(a.mask_dark, b.mask_dark, weights),
+        bloom: blend_finite(a.bloom, b.bloom, weights),
+        bloom_radius: blend_finite(a.bloom_radius, b.bloom_radius, weights),
+        halation: blend_finite(a.halation, b.halation, weights),
+        defocus: blend_finite(a.defocus, b.defocus, weights),
+        sag: blend_finite(a.sag, b.sag, weights),
     }
 }
 
@@ -4427,6 +4471,57 @@ mod tests {
         assert_eq!(
             MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).rig,
             b.rig.sanitized()
+        );
+    }
+
+    #[test]
+    fn display_physics_morphs_values_continuously_and_recalls_discrete_laws() {
+        use crate::display_physics::{DisplayModel, DisplayPhysicsParams, InterlaceMode};
+        let a = MorphTemporalSnapshot {
+            display: DisplayPhysicsParams {
+                il_amount: 0.2,
+                phosphor: 0.2,
+                scanlines: 0.4,
+                il_mode: InterlaceMode::Weave,
+                il_order: false,
+                model: DisplayModel::Flat,
+                ..DisplayPhysicsParams::default()
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+        let b = MorphTemporalSnapshot {
+            display: DisplayPhysicsParams {
+                il_amount: 0.8,
+                phosphor: 0.6,
+                scanlines: 0.8,
+                il_mode: InterlaceMode::Bob,
+                il_order: true,
+                model: DisplayModel::Mono,
+                ..DisplayPhysicsParams::default()
+            },
+            ..MorphTemporalSnapshot::default()
+        };
+
+        let quarter = MorphTemporalSnapshot::interpolate(&a, &b, [0.75, 0.25], false);
+        assert!((quarter.display.il_amount - 0.35).abs() < 1.0e-6);
+        assert!((quarter.display.phosphor - 0.3).abs() < 1.0e-6);
+        assert!((quarter.display.scanlines - 0.5).abs() < 1.0e-6);
+        // Discrete laws recall an endpoint at the midpoint, never a blend.
+        assert_eq!(quarter.display.il_mode, InterlaceMode::Weave);
+        assert!(!quarter.display.il_order);
+        assert_eq!(quarter.display.model, DisplayModel::Flat);
+        let past = MorphTemporalSnapshot::interpolate(&a, &b, [0.25, 0.75], true);
+        assert_eq!(past.display.il_mode, InterlaceMode::Bob);
+        assert!(past.display.il_order);
+        assert_eq!(past.display.model, DisplayModel::Mono);
+        // Endpoints recall the authored blocks exactly.
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [1.0, 0.0], false).display,
+            a.display.sanitized()
+        );
+        assert_eq!(
+            MorphTemporalSnapshot::interpolate(&a, &b, [0.0, 1.0], true).display,
+            b.display.sanitized()
         );
     }
 

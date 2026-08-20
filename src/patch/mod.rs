@@ -692,6 +692,15 @@ pub struct TemporalConfig {
     /// their bytes and canonical hashes.
     #[serde(default, skip_serializing_if = "TemporalRigConfig::is_default")]
     pub rig: TemporalRigConfig,
+    /// Additive B4 display physics. Skipped at the exact-off default so
+    /// earlier patches keep their bytes and canonical hashes; hostile
+    /// scalars sanitize on load and unknown fields are rejected.
+    #[serde(default, skip_serializing_if = "display_config_is_default")]
+    pub display: crate::display_physics::DisplayPhysicsParams,
+}
+
+fn display_config_is_default(value: &crate::display_physics::DisplayPhysicsParams) -> bool {
+    *value == crate::display_physics::DisplayPhysicsParams::default()
 }
 
 /// Stable serialized vocabulary for the B12 time-displace map.
@@ -1560,6 +1569,7 @@ impl TemporalConfig {
             key_history: p.key_history,
             originals: (!originals.is_default()).then_some(originals),
             rig: TemporalRigConfig::from_params(p.rig),
+            display: p.display.sanitized(),
         }
     }
 
@@ -1616,6 +1626,7 @@ impl TemporalConfig {
             key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
             originals: self.originals.unwrap_or_default().to_params(),
             rig: self.rig.to_params(),
+            display: self.display.sanitized(),
         }
     }
 }
@@ -7194,6 +7205,63 @@ scenes:
         assert_eq!(runtime.rig.drive, 1.0);
         assert_eq!(runtime.rig.saturation, 2.0);
         assert!(serde_yaml::from_str::<TemporalConfig>("rig:\n  seed: 4\n").is_err());
+    }
+
+    #[test]
+    fn display_physics_round_trips_and_an_absent_section_is_the_prior_path() {
+        use crate::display_physics::{DisplayModel, DisplayPhysicsParams, InterlaceMode};
+
+        // A default temporal block serializes without the display section,
+        // so every pre-B4 patch keeps its bytes and canonical hashes.
+        let default_yaml = serde_yaml::to_string(&TemporalConfig::default()).unwrap();
+        assert!(!default_yaml.contains("display"));
+        let absent: TemporalConfig = serde_yaml::from_str("feedback: 0.2\n").unwrap();
+        assert_eq!(absent.display, DisplayPhysicsParams::default());
+        assert!(!absent.to_params().display.stage_active());
+
+        // A non-default block round trips whole, including all three closed
+        // vocabularies.
+        let params = TemporalParams {
+            display: DisplayPhysicsParams {
+                il_amount: 0.7,
+                il_mode: InterlaceMode::Bob,
+                il_order: true,
+                il_judder: 0.4,
+                phosphor: 0.8,
+                phos_b: 0.5,
+                model: DisplayModel::SlotMask,
+                scanlines: 0.6,
+                mask_strength: 0.3,
+                bloom: 0.2,
+                sag: 0.1,
+                ..DisplayPhysicsParams::default()
+            },
+            ..TemporalParams::default()
+        };
+        let config = TemporalConfig::from_params(&params);
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(yaml.contains("display:"));
+        assert!(yaml.contains("il_mode: bob"));
+        assert!(yaml.contains("model: slot_mask"));
+        let restored: TemporalConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.display, config.display);
+        assert_eq!(restored.to_params().display, params.display.sanitized());
+
+        // Hostile scalars sanitize to the neutral default rather than a
+        // clamped extreme, and unknown fields are rejected.
+        let hostile: TemporalConfig =
+            serde_yaml::from_str("display:\n  phosphor: .nan\n  beam_width: 99.0\n").unwrap();
+        let runtime = hostile.to_params();
+        assert_eq!(runtime.display.phosphor, 0.0);
+        assert_eq!(runtime.display.beam_width, 3.0);
+        assert!(
+            serde_yaml::from_str::<TemporalConfig>("display:\n  curvature: 1.0\n").is_err(),
+            "an unknown display field is a deserialization rejection"
+        );
+        assert!(
+            serde_yaml::from_str::<TemporalConfig>("display:\n  model: plasma\n").is_err(),
+            "an unknown display model token is a deserialization rejection"
+        );
     }
 
     #[test]

@@ -37,9 +37,11 @@ src/
 ├── temporal.rs          Loom/Atlas/Garden/Score state, feedback rig, events, resets, commit/discard
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
+├── display_physics.rs   B4 display-physics law: fields, phosphor, display model CPU reference
 ├── scan_processor.rs    B1 Scan Processor law: authored params, beam CPU reference, vertex budget
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
+├── renderer/display_physics.rs single-seam slot-0 display stage, lazy field/phosphor surfaces
 ├── renderer/scan_processor.rs dedicated instanced-ribbon executor and shared accumulator
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
@@ -80,6 +82,7 @@ src/
     ├── effects.wgsl     LegacyExact and Advanced layer/master effects
     ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
     ├── study_interpreter.wgsl fixed Study interpreter over a bounded instruction buffer
+    ├── display_physics.wgsl field domain, N-1 phosphor store, beam/mask display pass
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── composition_host.wgsl straight storage; premultiplied A/B/group math
@@ -895,6 +898,89 @@ pre-B13 golden) and the generator mutates them in a fresh per-scope domain —
 `GENERATOR_VERSION` is now "9" — with layer optics never mutated. Export
 rides the same shader; `render_small_effects_pipeline` is the labeled export
 case with its `_plain` difference and `_repeat` determinism assertions.
+
+### B4 display physics
+
+Everything the program renders is *watched through something*.
+`DisplayPhysicsParams` (`src/display_physics.rs`, the independent CPU
+reference in the `gesture.rs` tradition) rides `TemporalParams.display` and
+drives one new master stage on the **slot-0 seam between the temporal pass
+and the opaque resolve** — the one adjacency live LegacyExact, live
+Advanced, the selective-VHS path, and export all share, so a single
+implementation (`renderer/display_physics.rs` + `display_physics.wgsl`)
+serves all four; this is the `encode_opaque_output` single-seam precedent,
+deliberately not the dual-implementation temporal one. The laws are derived
+from BENDR (MIT, © 2026 Steve Blythe), rewritten in linear light with
+Rec.709 luma. Three sub-blocks, each defaulting to exact-off; a dormant
+stage encodes nothing, touches no surface, and slot 0 reaches the resolve
+untouched.
+
+- **Fields** (`il_amount` wakes it; mode `Weave | Bob | Blend`, the
+  `il_order` dominance fault, twitter, 3:2 judder as dressing): real
+  interlace against one retained previous-field surface in the slot format
+  (RGBA8, one texture copy per reference tick). Field parity and the 3:2
+  film clock (`film_frame = ticks*4/5`, two of five held) advance on the
+  stage's own 30 Hz reference accumulator — the exact
+  `history_ticks_for_delta` law, owned by the stage because the Exact
+  temporal state does not advance on Advanced frames. Weave interleaves,
+  Bob fills from the current image's neighbours, Blend ghosts; twitter
+  flips high vertical detail per field.
+- **Phosphor** (`phosphor` wakes it; `phos_r/g/b` default 0.86/1.0/0.66 —
+  the P22 signature: green outlasts red outlasts blue): one accumulator in
+  the established feedback shape as an `Rgba16Float` ping/pong parity pair
+  (charged honestly at 16 B/px total; explicitly **not** a second history
+  ring). The store law is `max(current, trail * k)` over the pre-field
+  signal, with `k = clamp(phos_rgb * phosphor, 0, 0.995)` exponentiated by
+  the frame's fractional reference ticks (the multiplicative rate law), and
+  the display reads the **N-1** trail — decay lives in the store, exactly
+  BENDR's accumulator.
+- **Display model** (`model != Flat`, `bloom`, `defocus`, or `sag` wakes
+  it): the closed vocabulary `Flat | ApertureGrille | SlotMask |
+  ShadowMask | LcdStripe | Mono | GreenScreen` (codes 0–6, append-only),
+  Lottes-style beam-profile scanlines that widen with brightness, the mask
+  families at framebuffer coordinates, the fixed 12-tap gather ring for
+  defocus/bloom with halation's faceplate tint, and HV sag measured at the
+  picture centre. Scanlines/beam/mask act only under a non-Flat model
+  (BENDR's own gate); perspective-free dressing wakes nothing alone.
+
+**Laws.** Frame-local evaluated state like a spatial transform — never
+topology. An **active** stage flattens coverage (a screen has no
+transparency): it observes covered light and outputs alpha one, so the
+downstream opaque resolve becomes the identity on it and the flatten still
+happens exactly once. Pause holds (the stage is clocked by the
+program-advancing delta only). **Blackout clears the phosphor accumulator
+and the held field** inside `clear_composite` — a blacked-out audience must
+not retain a glowing wake. Disarming the whole stage invalidates both
+memories, so a re-arm never resurrects a stale trail. Surfaces are lazy
+(BENDR's own rule: the persistence pair only exists once phosphor is turned
+up): a default session charges nothing, the first armed frame allocates
+once, and a warmed armed frame allocates nothing. The frozen `temporal.wgsl`
+SHA and both temporal uniform goldens are untouched: the stage owns its own
+shader, its own 128-byte uniform (compile-time asserted), and its own three
+pipelines (field, model, store), all sampler-free `textureLoad` with one
+explicit-load covered bilinear for the sag-warped read.
+
+**Ledger.** Field pass ≤ 5 loads/px (armed only); display pass ≤ 15/px
+(1 base bilinear + 1 trail + 12-tap ring when armed + sag centre); store
+pass 2/px (armed only); ≤ 2 sampled textures per pass, 0 samplers; retained
+bytes when armed: 4 B/px field + 16 B/px phosphor pair; 0 when never armed.
+
+**Closure.** Patch: `TemporalConfig.display`, skip-serialized at the
+exact-off default so pre-B4 patches keep their bytes and canonical hashes;
+hostile scalars sanitize to neutral and unknown fields are rejected. Wire:
+twenty `disp_*` params on the ordinary coalescible `set_temporal` (both
+validators plus the applier; `disp_il_mode`/`disp_model` as closed tokens,
+`disp_il_order` boolean). Snapshot: an additive `display` block on the
+temporal snapshot. Panel: a DISPLAY PHYSICS group in the temporal section
+(17 sliders — the static range count is 165 — two selects, one toggle).
+Modulation: seventeen `display_*` continuous master addresses (the three
+discrete laws have none; `morph` stays last). Morph: continuous values
+blend; mode, order, and model recall an endpoint at the midpoint. Live Dice
+continues not to touch temporal-adjacent state; the generator mutates the
+seventeen values in fresh field-isolated domains (`mutate_display_physics`,
+`GENERATOR_VERSION` is now "10"). Export rides the same encode on the same
+seam with frame-index-derived dt; `render_display_physics_pipeline` is the
+labeled export case.
 
 ## Effects and compositing
 
@@ -2699,6 +2785,25 @@ mislead browser tests.
   default is byte-identical to no node, warm frames allocate nothing —
   and `render_scan_processor_pipeline` is the labeled export case with its
   `_bypass` difference and `_repeat` determinism assertions.
+- Display-physics tests must cover the exact-off wake law per sub-block
+  (dressing controls wake nothing alone), hostile neutral sanitize, the
+  per-tick field parity with the order fault, the 3:2 film clock, the
+  weave/bob/blend laws with amount-zero passthrough, twitter's per-field
+  sign, the phosphor max law against closed-form trails with the P22
+  ordering and the fractional-tick rate law, the mask families, the
+  Lottes beam profile, sag/bloom/halation extraction, the mono/green
+  tints, the 128-byte uniform assertion, the patch round trip with
+  skip-at-default omission and unknown-token rejection, the Morph blend
+  with midpoint recall of the three discrete laws, the seventeen
+  modulation addresses with the discrete laws refused, the twenty-param
+  wire vocabulary in both validators, and generator mutation in fresh
+  domains preserving discrete laws. The frozen `temporal.wgsl` SHA and
+  temporal goldens must not move — the stage owns its own shader.
+  `gpu_display_physics_follows_the_cpu_laws_and_blackout_clears_the_wake`
+  carries the physical-GPU claim (dormant delegation, the real two-moment
+  comb, closed-form decay, blackout clearing the wake), and
+  `render_display_physics_pipeline` is the labeled export case with its
+  `_flat` difference and `_repeat` determinism assertions.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

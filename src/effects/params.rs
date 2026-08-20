@@ -46,6 +46,12 @@ pub struct TemporalParams {
     /// Inert/zero by default. T0 freezes the authoring contract while the
     /// legacy 64-byte GPU path remains the only materialized implementation.
     pub originals: TemporalOriginalsParams,
+    /// B4 display physics: the field domain, phosphor persistence, and the
+    /// display model, seated after the temporal pass and before the opaque
+    /// resolve. Exact-off by default; deliberately absent from every
+    /// temporal activity/shader-selection predicate, because the stage owns
+    /// its own pass and its own shader.
+    pub display: crate::display_physics::DisplayPhysicsParams,
     /// B3 feedback rig. Identity by default, which is the exact prior
     /// feedback path: the shader takes the historical expression untouched.
     pub rig: FeedbackRigParams,
@@ -258,6 +264,7 @@ impl Default for TemporalParams {
             key_softness: 0.03,
             key_history: 1.0,
             originals: TemporalOriginalsParams::default(),
+            display: crate::display_physics::DisplayPhysicsParams::default(),
             rig: FeedbackRigParams::default(),
         }
     }
@@ -318,6 +325,10 @@ impl TemporalParams {
             key_softness: finite_or(self.key_softness, 0.03).clamp(0.0, 0.5),
             key_history: finite_or(self.key_history, 1.0).round().clamp(1.0, 23.0),
             originals: self.originals.sanitized(),
+            // The display stage owns its own pass and applies its own rate
+            // law there (fractional-tick decay in the store); its authored
+            // values pass through this per-frame conversion sanitized only.
+            display: self.display.sanitized(),
             rig: self.rig.for_frame_scale(frame_scale),
         }
     }
