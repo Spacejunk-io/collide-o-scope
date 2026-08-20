@@ -689,6 +689,24 @@ fn creative_node_params(kind: crate::visual_rack::RuntimeVisualNodeKind) -> serd
             "scan_exact_bypass": value.is_exact_bypass(),
             "scan_vertex_count": value.vertex_count(),
         }),
+        RuntimeVisualNodeKind::BlockDct(value) => serde_json::json!({
+            "dct_amount": value.amount,
+            "dct_quantize": value.quantize,
+            "dct_hf_penalty": value.hf_penalty,
+            "dct_chroma_crush": value.chroma_crush,
+            "dct_block": value.block,
+            // Derived, read-only: the mapped block edge in texels.
+            "dct_block_edge": value.block_edge(),
+        }),
+        RuntimeVisualNodeKind::PixelSort(value) => serde_json::json!({
+            "sort_amount": value.amount,
+            "sort_threshold": value.threshold,
+        }),
+        RuntimeVisualNodeKind::Avalanche(value) => serde_json::json!({
+            "avalanche_amount": value.amount,
+            "avalanche_run": value.run,
+            "avalanche_axis": value.axis,
+        }),
     }
 }
 

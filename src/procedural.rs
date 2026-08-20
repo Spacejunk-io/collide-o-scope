@@ -2098,6 +2098,81 @@ fn mutate_saved_rack_values(
                 value.hue =
                     mutate_linear(anchor.hue, value.hue, 0.0, 1.0, temperature * 0.2, &mut rng);
             }
+            // B6: the corruption trio's continuous values mutate
+            // anchor-relatively in each node's own domain; the avalanche's
+            // predictor axis is a discrete law generation preserves exactly.
+            (VisualNodeKind::BlockDct(anchor), VisualNodeKind::BlockDct(value)) => {
+                value.amount = mutate_linear(
+                    anchor.amount,
+                    value.amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.quantize = mutate_linear(
+                    anchor.quantize,
+                    value.quantize,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.hf_penalty = mutate_linear(
+                    anchor.hf_penalty,
+                    value.hf_penalty,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.chroma_crush = mutate_linear(
+                    anchor.chroma_crush,
+                    value.chroma_crush,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.block = mutate_linear(
+                    anchor.block,
+                    value.block,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+            }
+            (VisualNodeKind::PixelSort(anchor), VisualNodeKind::PixelSort(value)) => {
+                value.amount = mutate_linear(
+                    anchor.amount,
+                    value.amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.threshold = mutate_linear(
+                    anchor.threshold,
+                    value.threshold,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+            }
+            (VisualNodeKind::Avalanche(anchor), VisualNodeKind::Avalanche(value)) => {
+                value.amount = mutate_linear(
+                    anchor.amount,
+                    value.amount,
+                    0.0,
+                    1.0,
+                    temperature * 0.2,
+                    &mut rng,
+                );
+                value.run =
+                    mutate_linear(anchor.run, value.run, 0.0, 1.0, temperature * 0.2, &mut rng);
+            }
             // A generated patch never changes rack topology. Be defensive if
             // a future schema-normalization step supplies unlike kinds.
             _ => {}

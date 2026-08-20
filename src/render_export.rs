@@ -18769,6 +18769,138 @@ mod effects_audit {
         );
     }
 
+    /// B6's first labeled export case: a real separable block DCT with a
+    /// coarse quantiser renders through the real export path — the same
+    /// four-pass `corruption.wgsl` pipeline live uses, no export-only path.
+    /// The `_clean` twin at the exact-bypass default must decode
+    /// differently; the `_repeat` render must decode identically.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_block_dct_pipeline() {
+        use crate::block_dct::BlockDctParams;
+        use crate::visual_rack::{LegacyRackScope, VisualNodeKind, VisualRack};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_dct = |params: BlockDctParams| {
+            let mut patch = base_patch();
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            rack.push(VisualNodeKind::BlockDct(params)).unwrap();
+            patch.layers[0].rack = Some(rack);
+            patch
+        };
+        let authored = BlockDctParams {
+            amount: 1.0,
+            quantize: 0.6,
+            hf_penalty: 0.7,
+            chroma_crush: 0.8,
+            block: 0.35,
+        };
+        render("block_dct", with_dct(authored));
+        render("block_dct_clean", with_dct(BlockDctParams::default()));
+        assert_ne!(
+            decoded_framemd5("renders/audit_block_dct.mp4"),
+            decoded_framemd5("renders/audit_block_dct_clean.mp4"),
+            "an authored quantised transform must change the decoded frames"
+        );
+        render("block_dct_repeat", with_dct(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_block_dct.mp4"),
+            decoded_framemd5("renders/audit_block_dct_repeat.mp4"),
+            "the transform must replay deterministically"
+        );
+    }
+
+    /// B6's second labeled export case: the bounded bright-run stretch.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_pixel_sort_pipeline() {
+        use crate::pixel_sort::PixelSortParams;
+        use crate::visual_rack::{LegacyRackScope, VisualNodeKind, VisualRack};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_sort = |params: PixelSortParams| {
+            let mut patch = base_patch();
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            rack.push(VisualNodeKind::PixelSort(params)).unwrap();
+            patch.layers[0].rack = Some(rack);
+            patch
+        };
+        let authored = PixelSortParams {
+            amount: 1.0,
+            threshold: 0.3,
+        };
+        render("pixel_sort", with_sort(authored));
+        render("pixel_sort_clean", with_sort(PixelSortParams::default()));
+        assert_ne!(
+            decoded_framemd5("renders/audit_pixel_sort.mp4"),
+            decoded_framemd5("renders/audit_pixel_sort_clean.mp4"),
+            "authored streaks must change the decoded frames"
+        );
+        render("pixel_sort_repeat", with_sort(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_pixel_sort.mp4"),
+            decoded_framemd5("renders/audit_pixel_sort_repeat.mp4"),
+            "the streaks must replay deterministically"
+        );
+    }
+
+    /// B6's third labeled export case: the reconstruction-filter avalanche
+    /// with its retained previous-output cascade. The determinism claim
+    /// covers the whole chain — the deterministic lane epochs on frame-plan
+    /// time, the node-id-seeded hash lanes, and the tick-clocked history —
+    /// because a repeat render must reproduce every inherited error exactly.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_filter_avalanche_pipeline() {
+        use crate::filter_avalanche::{AvalancheAxis, AvalancheParams};
+        use crate::visual_rack::{LegacyRackScope, VisualNodeKind, VisualRack};
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_avalanche = |params: AvalancheParams| {
+            let mut patch = base_patch();
+            let mut rack = VisualRack::synthetic_legacy(LegacyRackScope::Layer);
+            rack.push(VisualNodeKind::Avalanche(params)).unwrap();
+            patch.layers[0].rack = Some(rack);
+            patch
+        };
+        let authored = AvalancheParams {
+            amount: 0.9,
+            run: 0.7,
+            axis: AvalancheAxis::Up,
+        };
+        render("filter_avalanche", with_avalanche(authored));
+        render(
+            "filter_avalanche_clean",
+            with_avalanche(AvalancheParams::default()),
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_filter_avalanche.mp4"),
+            decoded_framemd5("renders/audit_filter_avalanche_clean.mp4"),
+            "authored corruption must change the decoded frames"
+        );
+        render("filter_avalanche_repeat", with_avalanche(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_filter_avalanche.mp4"),
+            decoded_framemd5("renders/audit_filter_avalanche_repeat.mp4"),
+            "the cascade must replay deterministically"
+        );
+    }
+
     /// B4's labeled export case: a display stage authoring real fields (Bob
     /// with 3:2 judder), phosphor persistence, and an aperture-grille model
     /// with scanlines, bloom, and sag renders through the real export path —

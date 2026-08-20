@@ -1694,6 +1694,9 @@ fn saved_node_image_taps_mut(
         | VisualNodeKind::Grain(_)
         | VisualNodeKind::Study(_)
         | VisualNodeKind::ScanProcessor(_)
+        | VisualNodeKind::BlockDct(_)
+        | VisualNodeKind::PixelSort(_)
+        | VisualNodeKind::Avalanche(_)
         | VisualNodeKind::Mask(MaskParams::Rectangle(_) | MaskParams::Ellipse(_)) => [None, None],
     }
 }
@@ -1721,6 +1724,9 @@ fn saved_node_motion_donors_mut(
         | VisualNodeKind::Residual(_)
         | VisualNodeKind::Study(_)
         | VisualNodeKind::ScanProcessor(_)
+        | VisualNodeKind::BlockDct(_)
+        | VisualNodeKind::PixelSort(_)
+        | VisualNodeKind::Avalanche(_)
         | VisualNodeKind::Displace(_) => [None, None],
     }
 }
@@ -3100,6 +3106,31 @@ fn interpolate_node_kind(
         (VisualNodeKind::ScanProcessor(a), VisualNodeKind::ScanProcessor(b)) => {
             VisualNodeKind::ScanProcessor(interpolate_scan_processor(a, b, weights, choose_b))
         }
+        // The B6 corruption trio owns no routes, so any same-kind pair
+        // interpolates: continuous values blend and the avalanche's
+        // predictor axis recalls an endpoint at the midpoint.
+        (VisualNodeKind::BlockDct(a), VisualNodeKind::BlockDct(b)) => {
+            VisualNodeKind::BlockDct(crate::block_dct::BlockDctParams {
+                amount: blend_finite(a.amount, b.amount, weights),
+                quantize: blend_finite(a.quantize, b.quantize, weights),
+                hf_penalty: blend_finite(a.hf_penalty, b.hf_penalty, weights),
+                chroma_crush: blend_finite(a.chroma_crush, b.chroma_crush, weights),
+                block: blend_finite(a.block, b.block, weights),
+            })
+        }
+        (VisualNodeKind::PixelSort(a), VisualNodeKind::PixelSort(b)) => {
+            VisualNodeKind::PixelSort(crate::pixel_sort::PixelSortParams {
+                amount: blend_finite(a.amount, b.amount, weights),
+                threshold: blend_finite(a.threshold, b.threshold, weights),
+            })
+        }
+        (VisualNodeKind::Avalanche(a), VisualNodeKind::Avalanche(b)) => {
+            VisualNodeKind::Avalanche(crate::filter_avalanche::AvalancheParams {
+                amount: blend_finite(a.amount, b.amount, weights),
+                run: blend_finite(a.run, b.run, weights),
+                axis: pick(a.axis, b.axis, choose_b),
+            })
+        }
         _ => return None,
     })
 }
@@ -3596,6 +3627,20 @@ fn apply_saved_node_kind_values(sampled: VisualNodeKind, live: &mut VisualNodeKi
             *live = value;
             true
         }
+        // The corruption trio is route-free too: the whole params bundle
+        // transfers, the avalanche axis included, exactly like Cellular.
+        (VisualNodeKind::BlockDct(value), VisualNodeKind::BlockDct(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::PixelSort(value), VisualNodeKind::PixelSort(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Avalanche(value), VisualNodeKind::Avalanche(live)) => {
+            *live = value;
+            true
+        }
         _ => false,
     }
 }
@@ -3886,6 +3931,20 @@ fn apply_saved_node_kind_values_to_runtime(
             *live = value;
             true
         }
+        // The corruption trio is route-free: the whole params bundle
+        // transfers.
+        (VisualNodeKind::BlockDct(value), RuntimeVisualNodeKind::BlockDct(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::PixelSort(value), RuntimeVisualNodeKind::PixelSort(live)) => {
+            *live = value;
+            true
+        }
+        (VisualNodeKind::Avalanche(value), RuntimeVisualNodeKind::Avalanche(live)) => {
+            *live = value;
+            true
+        }
         _ => false,
     }
 }
@@ -4040,6 +4099,20 @@ fn apply_runtime_node_kind_values(
             RuntimeVisualNodeKind::ScanProcessor(value),
             RuntimeVisualNodeKind::ScanProcessor(live),
         ) => {
+            *live = value;
+            true
+        }
+        // The corruption trio is route-free: the whole params bundle
+        // transfers.
+        (RuntimeVisualNodeKind::BlockDct(value), RuntimeVisualNodeKind::BlockDct(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::PixelSort(value), RuntimeVisualNodeKind::PixelSort(live)) => {
+            *live = value;
+            true
+        }
+        (RuntimeVisualNodeKind::Avalanche(value), RuntimeVisualNodeKind::Avalanche(live)) => {
             *live = value;
             true
         }

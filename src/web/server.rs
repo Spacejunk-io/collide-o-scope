@@ -998,6 +998,9 @@ fn valid_node_param_value(kind: &str, param: &str, value: &serde_json::Value) ->
                 Some("four" | "eight" | "sixteen" | "thirty_two" | "sixty_four")
             ),
             "quantization" => matches!(value.as_str(), Some("off" | "coarse" | "medium" | "fine")),
+            // The B6 Filter Avalanche's predictor law: closed and
+            // append-only, snake_case tokens exactly as the enum serializes.
+            "avalanche_axis" => matches!(value.as_str(), Some("sub" | "up" | "average")),
             _ => false,
         },
         // Routes are stable authored topology and are never edited through the

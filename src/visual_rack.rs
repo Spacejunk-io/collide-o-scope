@@ -14,8 +14,11 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::block_dct::BlockDctParams;
+use crate::filter_avalanche::AvalancheParams;
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::performance::SavedLayerPosition;
+use crate::pixel_sort::PixelSortParams;
 use crate::scan_processor::ScanProcessorParams;
 use crate::spatial::SpatialTransform;
 use crate::symmetry::{RuntimeSymmetryParams, SymmetryParams};
@@ -53,6 +56,16 @@ pub const MAX_SAMPLED_TEXTURES_PER_PASS: u32 = 3;
 /// [`MAX_SAMPLED_TEXTURES_PER_PASS`]; raising either one never raises the
 /// other, and the fixed Collision Rack layout stays capped at three.
 pub const MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS: u32 = 8;
+/// A dedicated creative pass also owns its own per-pixel lookup ceiling,
+/// separate from the frozen 32-lookup ordinary-rack budget for the same
+/// reason the texture ceilings are separate: a dedicated pass never shares a
+/// pass with rack nodes, so a shared pass-chain cap is a category mismatch.
+/// The value is exactly the widest dedicated pass in the tree — the B6
+/// Filter Avalanche's dry carrier plus 32 gradient taps at two history loads
+/// each — so a wider future kind is a deliberate, reviewed raise rather than
+/// silent headroom. Dedicated lookups still sum into the frame-level
+/// ceilings, which stay honest.
+pub const MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS: u32 = 65;
 pub const MAX_CREATIVE_GPU_BYTES: u64 = 512 * 1024 * 1024;
 /// Rack ping/pong, A lane, B lane, Program lane, and one shared group-local
 /// scratch surface. Image taps/history are charged in addition to this base.
@@ -1680,6 +1693,19 @@ pub enum VisualNodeKind {
     /// transient — so it cannot ride the rack's fixed fullscreen layout at
     /// all.
     ScanProcessor(ScanProcessorParams),
+    /// B6 Block DCT, dedicated because its separable transform is four
+    /// full-frame passes through two float coefficient intermediates — a
+    /// pipeline the ordinary rack's single fullscreen pass cannot express.
+    BlockDct(BlockDctParams),
+    /// B6 Pixel Sort, dedicated because its faithful 32-tap run search
+    /// exceeds the frozen 32-logical-lookup rack budget on its own; the
+    /// dedicated pass charges the taps honestly instead of coarsening the
+    /// transcribed law.
+    PixelSort(PixelSortParams),
+    /// B6 Filter Avalanche, dedicated because the cascade reads the node's
+    /// own previous output — a retained per-node history the ordinary rack
+    /// has no vocabulary for at all.
+    Avalanche(AvalancheParams),
 }
 
 impl VisualNodeKind {
@@ -1699,6 +1725,9 @@ impl VisualNodeKind {
             Self::Residual(_) => NodeKindTag::Residual,
             Self::Study(_) => NodeKindTag::Study,
             Self::ScanProcessor(_) => NodeKindTag::ScanProcessor,
+            Self::BlockDct(_) => NodeKindTag::BlockDct,
+            Self::PixelSort(_) => NodeKindTag::PixelSort,
+            Self::Avalanche(_) => NodeKindTag::Avalanche,
         }
     }
 
@@ -1715,6 +1744,9 @@ impl VisualNodeKind {
             Self::Symmetry(value) => Self::Symmetry(value.sanitized()),
             Self::Residual(value) => Self::Residual(value.sanitized()),
             Self::ScanProcessor(value) => Self::ScanProcessor(value.sanitized()),
+            Self::BlockDct(value) => Self::BlockDct(value.sanitized()),
+            Self::PixelSort(value) => Self::PixelSort(value.sanitized()),
+            Self::Avalanche(value) => Self::Avalanche(value.sanitized()),
             marker => marker,
         }
     }
@@ -1811,6 +1843,9 @@ pub enum NodeKindTag {
     Residual,
     Study,
     ScanProcessor,
+    BlockDct,
+    PixelSort,
+    Avalanche,
 }
 
 impl NodeKindTag {
@@ -1833,6 +1868,9 @@ impl NodeKindTag {
             Self::Symmetry => 12,
             Self::Study => 13,
             Self::ScanProcessor => 14,
+            Self::BlockDct => 15,
+            Self::PixelSort => 16,
+            Self::Avalanche => 17,
         }
     }
 
@@ -1849,7 +1887,17 @@ impl NodeKindTag {
             // dedicated for a stronger reason still: it is instanced ribbon
             // geometry accumulating additively into its own transient, not a
             // fullscreen triangle at all.
-            Self::Symmetry | Self::Study | Self::ScanProcessor => true,
+            // The B6 corruption trio is dedicated for three different
+            // reasons: BlockDct is four full-frame passes through float
+            // intermediates; PixelSort's faithful 32-tap run search exceeds
+            // the frozen rack lookup budget alone; Avalanche reads its own
+            // retained previous output.
+            Self::Symmetry
+            | Self::Study
+            | Self::ScanProcessor
+            | Self::BlockDct
+            | Self::PixelSort
+            | Self::Avalanche => true,
             Self::LegacyCanonical
             | Self::LegacyTemporal
             | Self::Transform
@@ -1898,7 +1946,7 @@ pub struct NodeKindDescriptor {
     pub budget: NodeResourceBudget,
 }
 
-pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 14] = [
+pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 17] = [
     NodeKindDescriptor {
         tag: NodeKindTag::LegacyCanonical,
         key: "legacy_canonical",
@@ -2153,6 +2201,66 @@ pub const NODE_KIND_DESCRIPTORS: [NodeKindDescriptor; 14] = [
             // The scan reads only its carrier: no image taps, no donors, no
             // routes — the whole tombstone/route surface is structurally
             // absent.
+            cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::BlockDct,
+        key: "block_dct",
+        title: "Block DCT",
+        budget: NodeResourceBudget {
+            // Separable: coefficient and reconstruction passes per axis,
+            // four full-frame passes through the node's two float
+            // intermediates (charged byte-exactly in the dedicated
+            // `CorruptionResourcePlan`, not here — the reduced fields count
+            // only sub-full-frame grids).
+            full_frame_passes: 4,
+            // The widest pass walks one 16-texel block line (one load per
+            // tap) plus the dry carrier in the final reconstruction.
+            logical_texture_lookups_per_pixel: 17,
+            // Sampler-free: every lookup is one explicit textureLoad in the
+            // encoded domain.
+            texture_samples_per_pixel: 17,
+            // Carrier plus one coefficient intermediate per pass.
+            sampled_textures_in_pass: 2,
+            cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::PixelSort,
+        key: "pixel_sort",
+        title: "Pixel Sort",
+        budget: NodeResourceBudget {
+            full_frame_passes: 1,
+            // The dry carrier, the bounded 32-tap run search, and the one
+            // run-end fetch — the whole reason this kind is dedicated: the
+            // honest charge exceeds the frozen 32-lookup rack budget alone.
+            logical_texture_lookups_per_pixel: 34,
+            // Sampler-free explicit loads.
+            texture_samples_per_pixel: 34,
+            sampled_textures_in_pass: 1,
+            cross_input_taps: 0,
+            reduced_resolution_passes: 0,
+            reduced_resolution_surfaces: 0,
+        },
+    },
+    NodeKindDescriptor {
+        tag: NodeKindTag::Avalanche,
+        key: "avalanche",
+        title: "Filter Avalanche",
+        budget: NodeResourceBudget {
+            full_frame_passes: 1,
+            // The dry carrier plus at most 32 gradient taps at two history
+            // loads each. The retained previous-output surface is charged
+            // byte-exactly in the dedicated `CorruptionResourcePlan`.
+            logical_texture_lookups_per_pixel: 65,
+            texture_samples_per_pixel: 65,
+            // Carrier plus the node's own retained history.
+            sampled_textures_in_pass: 2,
             cross_input_taps: 0,
             reduced_resolution_passes: 0,
             reduced_resolution_surfaces: 0,
@@ -2801,6 +2909,30 @@ pub const NODE_PARAM_DESCRIPTORS: &[NodeParamDescriptor] = &[
     float_param!(ScanProcessor, "scan_lissajous", 0.0, 1.0, 0.0),
     float_param!(ScanProcessor, "scan_mono", 0.0, 1.0, 0.0),
     float_param!(ScanProcessor, "scan_hue", 0.0, 1.0, 0.0),
+    // B6 Block DCT: five continuous controls, BENDR's own surface. Keys are
+    // `dct_`-prefixed because bare names cross-resolve between kinds under
+    // `same_wire_parameter`.
+    float_param!(BlockDct, "dct_amount", 0.0, 1.0, 0.0),
+    float_param!(BlockDct, "dct_quantize", 0.0, 1.0, 0.25),
+    float_param!(BlockDct, "dct_hf_penalty", 0.0, 1.0, 0.5),
+    float_param!(BlockDct, "dct_chroma_crush", 0.0, 1.0, 0.4),
+    float_param!(BlockDct, "dct_block", 0.0, 1.0, 0.35),
+    // B6 Pixel Sort: two continuous controls.
+    float_param!(PixelSort, "sort_amount", 0.0, 1.0, 0.0),
+    float_param!(PixelSort, "sort_threshold", 0.0, 1.0, 0.45),
+    // B6 Filter Avalanche: two continuous controls plus the predictor, a
+    // closed discrete law with no modulatable address.
+    float_param!(Avalanche, "avalanche_amount", 0.0, 1.0, 0.0),
+    float_param!(Avalanche, "avalanche_run", 0.0, 1.0, 0.4),
+    NodeParamDescriptor {
+        kind: NodeKindTag::Avalanche,
+        key: "avalanche_axis",
+        value_type: NodeParamType::Enum,
+        range: None,
+        default: None,
+        dice_eligible: false,
+        modulatable: false,
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2935,6 +3067,14 @@ pub struct RackResourceBudget {
     /// Simultaneous bindings of the widest *dedicated* pass, charged against
     /// [`MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS`].
     pub max_sampled_textures_in_dedicated_pass: u32,
+    /// Per-pixel lookups of ordinary (segmented) nodes only — the value the
+    /// frozen per-rack ceiling governs. The unqualified totals above keep
+    /// including dedicated kinds so frame-level accounting stays honest.
+    pub ordinary_logical_texture_lookups_per_pixel: u32,
+    pub ordinary_texture_samples_per_pixel: u32,
+    /// Per-pixel lookups of the widest single dedicated pass, charged
+    /// against [`MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS`].
+    pub max_logical_lookups_in_dedicated_pass: u32,
     pub cross_input_taps: u32,
     /// Summed reduced-grid passes. These are additional to
     /// `full_frame_passes`; a node that declares one of each encodes both.
@@ -3220,6 +3360,20 @@ impl VisualRack {
                 .texture_samples_per_pixel
                 .checked_add(u32::from(budget.texture_samples_per_pixel))
                 .ok_or(RackError::ResourceOverflow)?;
+            if node.kind.tag().occupies_dedicated_pass() {
+                result.max_logical_lookups_in_dedicated_pass = result
+                    .max_logical_lookups_in_dedicated_pass
+                    .max(u32::from(budget.logical_texture_lookups_per_pixel));
+            } else {
+                result.ordinary_logical_texture_lookups_per_pixel = result
+                    .ordinary_logical_texture_lookups_per_pixel
+                    .checked_add(u32::from(budget.logical_texture_lookups_per_pixel))
+                    .ok_or(RackError::ResourceOverflow)?;
+                result.ordinary_texture_samples_per_pixel = result
+                    .ordinary_texture_samples_per_pixel
+                    .checked_add(u32::from(budget.texture_samples_per_pixel))
+                    .ok_or(RackError::ResourceOverflow)?;
+            }
             charge_sampled_textures(
                 &mut result,
                 node.kind.tag(),
@@ -3238,16 +3392,28 @@ impl VisualRack {
                 .checked_add(u32::from(budget.reduced_resolution_surfaces))
                 .ok_or(RackError::ResourceOverflow)?;
         }
-        if result.logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK {
+        // The frozen per-rack ceilings govern the ordinary pass chain only;
+        // dedicated passes are checked against their own per-pass ceiling
+        // below, and both still sum into the frame-level totals.
+        if result.ordinary_logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK
+        {
             return Err(RackError::RackLogicalLookupBudget {
-                lookups: result.logical_texture_lookups_per_pixel,
+                lookups: result.ordinary_logical_texture_lookups_per_pixel,
                 limit: MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK,
             });
         }
-        if result.texture_samples_per_pixel > MAX_TEXTURE_SAMPLES_PER_RACK {
+        if result.ordinary_texture_samples_per_pixel > MAX_TEXTURE_SAMPLES_PER_RACK {
             return Err(RackError::RackSampleBudget {
-                samples: result.texture_samples_per_pixel,
+                samples: result.ordinary_texture_samples_per_pixel,
                 limit: MAX_TEXTURE_SAMPLES_PER_RACK,
+            });
+        }
+        if result.max_logical_lookups_in_dedicated_pass
+            > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS
+        {
+            return Err(RackError::RackLogicalLookupBudget {
+                lookups: result.max_logical_lookups_in_dedicated_pass,
+                limit: MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS,
             });
         }
         if result.max_sampled_textures_in_pass > MAX_SAMPLED_TEXTURES_PER_PASS {
@@ -3843,6 +4009,9 @@ pub enum RuntimeVisualNodeKind {
     Residual(RuntimeResidualParams),
     Study(StudyRackParams),
     ScanProcessor(ScanProcessorParams),
+    BlockDct(BlockDctParams),
+    PixelSort(PixelSortParams),
+    Avalanche(AvalancheParams),
 }
 
 impl RuntimeVisualNodeKind {
@@ -3862,6 +4031,9 @@ impl RuntimeVisualNodeKind {
             Self::Residual(_) => NodeKindTag::Residual,
             Self::Study(_) => NodeKindTag::Study,
             Self::ScanProcessor(_) => NodeKindTag::ScanProcessor,
+            Self::BlockDct(_) => NodeKindTag::BlockDct,
+            Self::PixelSort(_) => NodeKindTag::PixelSort,
+            Self::Avalanche(_) => NodeKindTag::Avalanche,
         }
     }
 
@@ -3899,6 +4071,12 @@ impl RuntimeVisualNodeKind {
             // The Scan Processor owns no routes either: it reads only its
             // carrier.
             VisualNodeKind::ScanProcessor(value) => Self::ScanProcessor(value.sanitized()),
+            // The corruption trio owns no routes: BlockDct and PixelSort
+            // read only their carrier, and Avalanche's history is its own
+            // previous output, never another producer's image.
+            VisualNodeKind::BlockDct(value) => Self::BlockDct(value.sanitized()),
+            VisualNodeKind::PixelSort(value) => Self::PixelSort(value.sanitized()),
+            VisualNodeKind::Avalanche(value) => Self::Avalanche(value.sanitized()),
         }
     }
 
@@ -3927,6 +4105,9 @@ impl RuntimeVisualNodeKind {
             }
             Self::Study(value) => VisualNodeKind::Study(value.sanitized()),
             Self::ScanProcessor(value) => VisualNodeKind::ScanProcessor(value.sanitized()),
+            Self::BlockDct(value) => VisualNodeKind::BlockDct(value.sanitized()),
+            Self::PixelSort(value) => VisualNodeKind::PixelSort(value.sanitized()),
+            Self::Avalanche(value) => VisualNodeKind::Avalanche(value.sanitized()),
         }
     }
 
@@ -3943,6 +4124,9 @@ impl RuntimeVisualNodeKind {
             Self::Symmetry(value) => Self::Symmetry(value.sanitized()),
             Self::Residual(value) => Self::Residual(value.sanitized()),
             Self::ScanProcessor(value) => Self::ScanProcessor(value.sanitized()),
+            Self::BlockDct(value) => Self::BlockDct(value.sanitized()),
+            Self::PixelSort(value) => Self::PixelSort(value.sanitized()),
+            Self::Avalanche(value) => Self::Avalanche(value.sanitized()),
             marker => marker,
         }
     }
@@ -4362,6 +4546,20 @@ impl RuntimeVisualRack {
                 .texture_samples_per_pixel
                 .checked_add(u32::from(budget.texture_samples_per_pixel))
                 .ok_or(RackError::ResourceOverflow)?;
+            if node.kind.tag().occupies_dedicated_pass() {
+                result.max_logical_lookups_in_dedicated_pass = result
+                    .max_logical_lookups_in_dedicated_pass
+                    .max(u32::from(budget.logical_texture_lookups_per_pixel));
+            } else {
+                result.ordinary_logical_texture_lookups_per_pixel = result
+                    .ordinary_logical_texture_lookups_per_pixel
+                    .checked_add(u32::from(budget.logical_texture_lookups_per_pixel))
+                    .ok_or(RackError::ResourceOverflow)?;
+                result.ordinary_texture_samples_per_pixel = result
+                    .ordinary_texture_samples_per_pixel
+                    .checked_add(u32::from(budget.texture_samples_per_pixel))
+                    .ok_or(RackError::ResourceOverflow)?;
+            }
             charge_sampled_textures(
                 &mut result,
                 node.kind.tag(),
@@ -4380,17 +4578,30 @@ impl RuntimeVisualRack {
                 .checked_add(u32::from(budget.reduced_resolution_surfaces))
                 .ok_or(RackError::ResourceOverflow)?;
         }
-        if result.logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK {
+        // The frozen per-rack ceilings govern the ordinary pass chain only;
+        // dedicated passes are checked against their own per-pass ceiling
+        // below, and both still sum into the frame-level totals.
+        if result.ordinary_logical_texture_lookups_per_pixel > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK
+        {
             return Err(RackError::RackLogicalLookupBudget {
-                lookups: result.logical_texture_lookups_per_pixel,
+                lookups: result.ordinary_logical_texture_lookups_per_pixel,
                 limit: MAX_LOGICAL_TEXTURE_LOOKUPS_PER_RACK,
             }
             .into());
         }
-        if result.texture_samples_per_pixel > MAX_TEXTURE_SAMPLES_PER_RACK {
+        if result.ordinary_texture_samples_per_pixel > MAX_TEXTURE_SAMPLES_PER_RACK {
             return Err(RackError::RackSampleBudget {
-                samples: result.texture_samples_per_pixel,
+                samples: result.ordinary_texture_samples_per_pixel,
                 limit: MAX_TEXTURE_SAMPLES_PER_RACK,
+            }
+            .into());
+        }
+        if result.max_logical_lookups_in_dedicated_pass
+            > MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS
+        {
+            return Err(RackError::RackLogicalLookupBudget {
+                lookups: result.max_logical_lookups_in_dedicated_pass,
+                limit: MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS,
             }
             .into());
         }
@@ -5392,10 +5603,11 @@ extra: 1"
         assert_eq!(tags.len(), NODE_KIND_DESCRIPTORS.len());
         assert_eq!(keys.len(), NODE_KIND_DESCRIPTORS.len());
         // Ten historical kinds through Displace (code 10), plus Residual
-        // Counterpoint (11), the Symmetry Field (12), the Study (13), and the
-        // Scan Processor (14). Kind codes are append-only, so this count only
-        // ever grows.
-        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 14);
+        // Counterpoint (11), the Symmetry Field (12), the Study (13), the
+        // Scan Processor (14), and the B6 corruption trio — Block DCT (15),
+        // Pixel Sort (16), Filter Avalanche (17). Kind codes are
+        // append-only, so this count only ever grows.
+        assert_eq!(NODE_KIND_DESCRIPTORS.len(), 17);
         for descriptor in NODE_KIND_DESCRIPTORS {
             assert!(descriptor.budget.full_frame_passes > 0);
             assert!(descriptor.budget.logical_texture_lookups_per_pixel > 0);
@@ -6747,6 +6959,9 @@ extra: 1"
             (NodeKindTag::Symmetry, 12),
             (NodeKindTag::Study, 13),
             (NodeKindTag::ScanProcessor, 14),
+            (NodeKindTag::BlockDct, 15),
+            (NodeKindTag::PixelSort, 16),
+            (NodeKindTag::Avalanche, 17),
         ] {
             assert_eq!(tag.signature_code(), code);
         }
@@ -6761,9 +6976,11 @@ extra: 1"
             "Symmetry Field"
         );
 
-        // Three kinds are lifted into dedicated passes: the Symmetry Field's
-        // eight-texture fold, the Study interpreter's history-array pass, and
-        // the Scan Processor's instanced ribbon geometry.
+        // Six kinds are lifted into dedicated passes: the Symmetry Field's
+        // eight-texture fold, the Study interpreter's history-array pass,
+        // the Scan Processor's instanced ribbon geometry, and the B6
+        // corruption trio (a four-pass float-intermediate pipeline, an
+        // over-rack-budget tap count, and a retained per-node history).
         let dedicated: Vec<_> = NODE_KIND_DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.tag.occupies_dedicated_pass())
@@ -6774,7 +6991,10 @@ extra: 1"
             vec![
                 NodeKindTag::Symmetry,
                 NodeKindTag::Study,
-                NodeKindTag::ScanProcessor
+                NodeKindTag::ScanProcessor,
+                NodeKindTag::BlockDct,
+                NodeKindTag::PixelSort,
+                NodeKindTag::Avalanche
             ]
         );
 
@@ -6786,6 +7006,95 @@ extra: 1"
             VisualRack::synthetic_legacy(LegacyRackScope::Master).topology_signature(),
             LEGACY_MASTER_RACK_SIGNATURE
         );
+    }
+
+    /// The corruption trio's declared surface: nine continuous modulatable
+    /// Dice-eligible floats across the three kinds plus the avalanche's
+    /// discrete predictor, every key prefixed so no bare name can
+    /// cross-resolve, and the tagged serde closed under unknown-field and
+    /// unknown-token rejection with hostile scalars sanitizing to neutral.
+    #[test]
+    fn corruption_trio_exposes_its_surface_and_serde_is_closed() {
+        for (tag, key, title, expected_rows) in [
+            (NodeKindTag::BlockDct, "block_dct", "Block DCT", 5usize),
+            (NodeKindTag::PixelSort, "pixel_sort", "Pixel Sort", 2),
+            (NodeKindTag::Avalanche, "avalanche", "Filter Avalanche", 3),
+        ] {
+            assert_eq!(node_kind_descriptor(tag).key, key);
+            assert_eq!(node_kind_descriptor(tag).title, title);
+            let rows: Vec<_> = NODE_PARAM_DESCRIPTORS
+                .iter()
+                .filter(|descriptor| descriptor.kind == tag)
+                .collect();
+            assert_eq!(rows.len(), expected_rows, "{key} row count");
+            for row in &rows {
+                assert_eq!(
+                    row.modulatable,
+                    row.value_type == NodeParamType::Float,
+                    "{} continuous exactly when Float",
+                    row.key
+                );
+                assert_eq!(row.modulatable, row.dice_eligible, "{}", row.key);
+            }
+        }
+        let axis = NODE_PARAM_DESCRIPTORS
+            .iter()
+            .find(|descriptor| descriptor.key == "avalanche_axis")
+            .expect("the predictor row exists");
+        assert_eq!(axis.value_type, NodeParamType::Enum);
+        assert!(!axis.modulatable && !axis.dice_eligible);
+
+        // Serde: the tagged kinds round-trip, unknown fields and tokens are
+        // rejections, and hostile scalars sanitize to neutral through the
+        // node constructor.
+        let dct: VisualNodeKind = serde_json::from_value(serde_json::json!({
+            "kind": "block_dct",
+            "params": { "amount": 0.5, "quantize": 0.9 }
+        }))
+        .unwrap();
+        assert!(matches!(
+            dct,
+            VisualNodeKind::BlockDct(params) if params.amount == 0.5 && params.quantize == 0.9
+        ));
+        assert!(serde_json::from_value::<VisualNodeKind>(serde_json::json!({
+            "kind": "block_dct",
+            "params": { "amount": 0.5, "surprise": 1.0 }
+        }))
+        .is_err());
+        let avalanche: VisualNodeKind = serde_json::from_value(serde_json::json!({
+            "kind": "avalanche",
+            "params": { "amount": 0.5, "axis": "average" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            avalanche,
+            VisualNodeKind::Avalanche(params)
+                if params.axis == crate::filter_avalanche::AvalancheAxis::Average
+        ));
+        assert!(serde_json::from_value::<VisualNodeKind>(serde_json::json!({
+            "kind": "avalanche",
+            "params": { "axis": "paeth" }
+        }))
+        .is_err());
+        // A string where a number belongs is a rejection; the sanitize law
+        // is proven on the params below.
+        assert!(serde_json::from_value::<VisualNodeKind>(serde_json::json!({
+            "kind": "pixel_sort",
+            "params": { "amount": "NaN" }
+        }))
+        .is_err());
+        let node = VisualNode::authored(
+            NodeId::new(9).unwrap(),
+            VisualNodeKind::PixelSort(crate::pixel_sort::PixelSortParams {
+                amount: f32::NAN,
+                threshold: 7.0,
+            }),
+        );
+        let VisualNodeKind::PixelSort(clean) = node.kind else {
+            panic!("kind preserved");
+        };
+        assert_eq!(clean.amount, 0.0, "hostile NaN sanitizes to neutral");
+        assert_eq!(clean.threshold, 1.0, "finite out-of-range clamps");
     }
 
     /// The Scan Processor's declared surface: fifteen continuous modulatable

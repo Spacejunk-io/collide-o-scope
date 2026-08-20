@@ -42,6 +42,9 @@ src/
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
 ├── display_physics.rs   B4 display-physics law: fields, phosphor, display model CPU reference
 ├── mixing_boundary.rs   B8 mixing-boundary law: wipes, blend meet, dirty mixer, melt CPU reference
+├── block_dct.rs         B6 Block DCT law: DCT-II CPU reference, quantiser, chroma crush
+├── filter_avalanche.rs  B6 Filter Avalanche law: predictors, deterministic lanes, cascade reference
+├── pixel_sort.rs        B6 Pixel Sort law: bounded bright-run search CPU reference
 ├── scan_processor.rs    B1 Scan Processor law: authored params, beam CPU reference, vertex budget
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
@@ -49,6 +52,7 @@ src/
 ├── renderer/melting_edge.rs B8 slot-0 master melt over the program's own coverage, lazy history
 ├── renderer/monitor_bay.rs B11 armed-on-demand 128×72 probe reduction and bounded readback pool
 ├── renderer/pattern_synth.rs lazy per-layer pattern pass executor shared by live and export
+├── renderer/corruption.rs B6 corruption-trio executor: four pipelines, shared DCT intermediates
 ├── renderer/scan_processor.rs dedicated instanced-ribbon executor and shared accumulator
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
@@ -95,6 +99,7 @@ src/
     ├── pattern_synth.wgsl B7 pattern source: shape/oscillator/wavefolder/comparator/colouriser, no texture
     ├── melting_edge.wgsl  B8 coverage-boundary probe, band drag, self-feeding hold
     ├── monitor_bay.wgsl   B11 128×72 monitor reduction, 16 bilinear taps per cell
+    ├── corruption.wgsl    B6 trio: DCT coefficient/reconstruction stages, pixel sort, avalanche
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
     ├── video_analysis.wgsl B10 32×18 content-analysis reduction, 16 bilinear taps per cell
@@ -2458,6 +2463,91 @@ frame-plan context only — Pause holds the detuned oscillator still and
 export replays it structurally; `render_scan_processor_pipeline` is the
 labeled export case.
 
+### The B6 corruption trio
+
+Three block-domain corruption mechanisms as three Collision Rack node kinds
+— **Block DCT** (append-only kind code 15), **Pixel Sort** (16), **Filter
+Avalanche** (17) — lifted into one dedicated executor
+(`renderer/corruption.rs`, `corruption.wgsl` composed with the canonical
+`blend.wgsl`; four pipelines, one 80-byte compile-time-asserted
+dynamic-offset uniform record, sampler-free, two bound textures per pass).
+The laws are derived from BENDR (MIT, © 2026 Steve Blythe) and transcribed
+from its shipped chain, then hardened; every law runs in the **encoded sRGB
+domain on straight-alpha values** (the B8 code-byte / B5 real-codec
+precedent — storage artefacts are quantised where they are stored).
+`src/block_dct.rs`, `src/pixel_sort.rs`, and `src/filter_avalanche.rs` are
+the independent CPU references in the `gesture.rs` tradition.
+
+**Why dedicated, three different reasons.** The DCT is four full-frame
+passes through two shared float coefficient intermediates (BENDR's fused
+O(N²) fragment reassociated into O(N) coefficient/reconstruction stages per
+axis — the same sums, proven against the transcription); the sort's
+faithful 32-tap run search is 34 honest lookups per pixel, more than the
+frozen 32-lookup ordinary-rack budget admits for a whole rack; the
+avalanche reads its own previous output, a retained per-node history the
+ordinary rack cannot express. This forced a principled ledger split:
+dedicated passes' per-pixel terms leave the frozen per-rack ceilings (which
+keep their exact meaning for the ordinary pass chain) and are governed by
+`MAX_LOGICAL_TEXTURE_LOOKUPS_PER_DEDICATED_PASS` (= 65, exactly the widest
+pass in the tree — the avalanche's carrier plus 32 gradient taps at two
+loads each — so a wider future kind is a deliberate raise, never silent
+headroom), while still summing into the frame-level ceilings. The lift is
+kind-only (the Scan shape): a default node still owns its step and uniform
+slots, and `is_active` gates every encode.
+
+**The laws.** Block DCT (`dct_amount/quantize/hf_penalty/chroma_crush/
+block`, all five continuous and modulatable; block edge 4–16 via
+`floor(4 + block·12)`): DCT-II with orthonormal scaling both directions,
+quantiser step `(0.004 + q·0.5)·(1 + u·tilt·2)` rounded to nearest, chroma
+crushed in the coefficient domain against Rec.601 luma before the round;
+alpha rides untransformed; wake is amount alone (the 0.004 step floor means
+quantise-zero is never claimed as identity). Pixel Sort
+(`sort_amount/threshold`): a pixel above the encoded-luma threshold
+searches upward through ≤32 taps stepping two rows for its run's end and
+takes the end colour mixed by amount; taps clamp, never wrap. Filter
+Avalanche (`avalanche_amount/run` continuous, `avalanche_axis ∈
+sub|up|average` codes 0–2 discrete with no modulatable address): per-lane
+gate at `amount·0.5`, bounded gradient sum (`span = 2 + run·40`, ≤32 taps,
+out-of-frame taps masked but non-terminating), per-lane epoch-invariant DC
+seed, `fract` wrap. Two hardenings BENDR never claimed: the lane epoch is
+`floor(frame-plan seconds × 3)` through the shared integer-avalanche hash
+keyed by the node's **stable authored id** (persisted topology — never a
+process-lifetime layer id), so Pause holds the fault stream and export
+replays it; and the accumulation reads the node's own previous output —
+one retained working-format surface per node on the bus-melt transaction
+(lazy before the warm-allocation snapshot, invalidated never freed on
+disarm, staged/committed with the frame history, blackout-immune program
+memory), advanced at most once per 30 Hz reference tick so live and export
+cascade at the same speed. A cold history reads the carrier, which is
+exactly BENDR's shipped single-frame law. `MAX_AVALANCHE_NODES` is 4
+(8 B/px each), a typed `AvalancheHistoryBudget` refusal at five.
+
+**Ledger** (per step, re-derived from emitted steps as
+`CorruptionResourcePlan`): DCT 4 passes / 17 lookups per widest pass / 2
+textures / two shared full-frame `Rgba16Float` intermediates charged once
+per frame at 16 B/px (sequential reuse, the Scan-accumulator law); sort 1
+pass / 34 lookups / 2 textures; avalanche 1 pass / 65 lookups / 2 textures
+/ one 8 B/px retained history per node; 80 uniform bytes per pass; zero
+samplers, zero image taps, zero new wire actions.
+
+**Closure.** Patch: ordinary tagged node serde (`kind: block_dct |
+pixel_sort | avalanche`), absent from pre-B6 patches so old bytes and
+canonical hashes keep; unknown fields/tokens rejected; hostile scalars
+neutral. Wire: values on the ordinary coalescible `set_visual_node_param`
+with prefixed keys (`dct_*`, `sort_*`, `avalanche_*` — bare names
+cross-resolve under `same_wire_parameter`); `avalanche_axis` on the server
+gate's closed enum allowlist; no routes, so no topology action. Modulation:
+the nine continuous values only. Morph: any same-kind pair interpolates
+(route-free); the axis recalls an endpoint at the midpoint. Look/preset:
+whole-bundle value transfer in all three appliers. Dice and the generator
+mutate the nine values in per-node stable domains, never the axis; no
+`GENERATOR_VERSION` bump (new kind arms, the B1/B7 precedent). Panel:
+generated node cards (the pinned range counts do not move). Export rides
+the same plan and shader; `render_block_dct_pipeline`,
+`render_pixel_sort_pipeline`, and `render_filter_avalanche_pipeline` are
+the labeled export cases, each with a `_clean` exact-bypass difference twin
+and a `_repeat` determinism assertion.
+
 ## The B9 performance recorder
 
 It records gestures rather than pixels: while recording is armed, every
@@ -3569,6 +3659,29 @@ mislead browser tests.
   within 4 code values, plus the two-slot saturation drop), and
   `render_mod_sources_pipeline` is the labeled export case with its
   `_unrouted` difference twin and `_repeat` determinism assertion.
+- Corruption-trio (B6) tests must cover the append-only kind codes 15/16/17
+  with the six-kind dedicated list, the per-kind param surface (modulatable
+  ⇔ Float ⇔ Dice-eligible; the avalanche axis refused everywhere), the
+  tagged-serde round trips with unknown-field/token rejection and neutral
+  hostile sanitize, the DCT's forward∘inverse identity with the quantiser
+  disengaged plus the floored/tilted/monotonic step law, the
+  coefficient-domain chroma crush with grey invariance, flat-block DC
+  stability and coarse-quantiser ringing, the BENDR block-edge map, the
+  sort's identity/inheritance/64-row-reach/edge-clamp laws, the avalanche's
+  frozen axis codes, span and `floor(t·3)` epoch laws, deterministic
+  per-key gates with the honest amount/2 firing fraction, flat-history
+  DC-only movement, warm-versus-cold history discrimination, the kind-only
+  planner lift with per-node steps at authored positions and inactive
+  bypassed steps, the re-derived combined ledger (shared DCT transient
+  charged once; per-node avalanche histories; the honest 17+34+65 tap sum),
+  and the four-admitted/five-refused avalanche cap.
+  `gpu_corruption_trio_matches_the_cpu_references` carries the physical-GPU
+  claim (all three laws under the B7 statistical contract; the avalanche
+  proven cold and warm with the history binding demonstrably
+  participating), and `render_block_dct_pipeline`,
+  `render_pixel_sort_pipeline`, and `render_filter_avalanche_pipeline` are
+  the labeled export cases with `_clean` difference twins and `_repeat`
+  determinism assertions.
 - Monitoring-bay (B11) tests must cover the Rec.601/vectorscope projection
   fixtures with the six targets derived from the projection (complementary
   bars mirrored through the centre), the flat-grey field reducing to one

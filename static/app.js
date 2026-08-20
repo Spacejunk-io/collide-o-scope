@@ -523,6 +523,9 @@ const CREATIVE_NODE_INFO = Object.freeze({
   residual: { label: 'Residual' },
   study: { label: 'Study' },
   scan_processor: { label: 'Scan Processor' },
+  block_dct: { label: 'Block DCT' },
+  pixel_sort: { label: 'Pixel Sort' },
+  avalanche: { label: 'Filter Avalanche' },
 });
 
 const enumDef = (key, label, options) => ({ key, label, type: 'enum', options });
@@ -674,6 +677,22 @@ const CREATIVE_NODE_PARAMS = Object.freeze({
     floatDef('scan_lissajous', 'Lissajous', 0, 1, 0.001),
     floatDef('scan_mono', 'Mono', 0, 1, 0.001),
     floatDef('scan_hue', 'Colourise', 0, 1, 0.001),
+  ],
+  block_dct: [
+    floatDef('dct_amount', 'Amount', 0, 1, 0.001),
+    floatDef('dct_quantize', 'Quantiser', 0, 1, 0.001),
+    floatDef('dct_hf_penalty', 'HF penalty', 0, 1, 0.001),
+    floatDef('dct_chroma_crush', 'Chroma crush', 0, 1, 0.001),
+    floatDef('dct_block', 'Block size', 0, 1, 0.001),
+  ],
+  pixel_sort: [
+    floatDef('sort_amount', 'Amount', 0, 1, 0.001),
+    floatDef('sort_threshold', 'Threshold', 0, 1, 0.001),
+  ],
+  avalanche: [
+    floatDef('avalanche_amount', 'Amount', 0, 1, 0.001),
+    floatDef('avalanche_run', 'Run', 0, 1, 0.001),
+    enumDef('avalanche_axis', 'Axis', [['sub', 'Sub (row)'], ['up', 'Up (column)'], ['average', 'Average (diagonal)']]),
   ],
 });
 

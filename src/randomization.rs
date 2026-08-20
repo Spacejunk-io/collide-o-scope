@@ -1731,6 +1731,29 @@ pub(crate) fn mutate_runtime_rack_values(
                 value.mono = mutate_linear(0.0, value.mono, 0.0, 1.0, amount * 0.2, &mut rng);
                 value.hue = mutate_linear(0.0, value.hue, 0.0, 1.0, amount * 0.2, &mut rng);
             }
+            RuntimeVisualNodeKind::BlockDct(value) => {
+                // B6: five continuous controls, own stable domain — appending
+                // this arm cannot perturb any previously authored node's
+                // stream.
+                value.amount = mutate_linear(0.0, value.amount, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.quantize =
+                    mutate_linear(0.25, value.quantize, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.hf_penalty =
+                    mutate_linear(0.5, value.hf_penalty, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.chroma_crush =
+                    mutate_linear(0.4, value.chroma_crush, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.block = mutate_linear(0.35, value.block, 0.0, 1.0, amount * 0.2, &mut rng);
+            }
+            RuntimeVisualNodeKind::PixelSort(value) => {
+                value.amount = mutate_linear(0.0, value.amount, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.threshold =
+                    mutate_linear(0.45, value.threshold, 0.0, 1.0, amount * 0.2, &mut rng);
+            }
+            RuntimeVisualNodeKind::Avalanche(value) => {
+                // The predictor axis is a discrete law Dice never touches.
+                value.amount = mutate_linear(0.0, value.amount, 0.0, 1.0, amount * 0.2, &mut rng);
+                value.run = mutate_linear(0.4, value.run, 0.0, 1.0, amount * 0.2, &mut rng);
+            }
         }
     }
 }

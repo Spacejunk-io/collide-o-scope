@@ -11,9 +11,10 @@ use std::fmt;
 use crate::composition::{BusAssignment, RuntimeRootItem};
 use crate::evaluated_frame::evaluated_composition::{
     AdvancedCompositionPlan, AdvancedNtscPath, CompositePrefix, EvaluatedCompositionPlan,
-    EvaluatedRefreshGardenSignalPlan, EvaluatedScanProcessorPlan, EvaluatedScopeExecution,
-    EvaluatedScopeStep, EvaluatedStudyPlan, EvaluatedSymmetryFieldPlan, ImageTapConsumer,
-    LegacyCanonicalApplication, MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
+    EvaluatedCorruptionKind, EvaluatedCorruptionPlan, EvaluatedRefreshGardenSignalPlan,
+    EvaluatedScanProcessorPlan, EvaluatedScopeExecution, EvaluatedScopeStep, EvaluatedStudyPlan,
+    EvaluatedSymmetryFieldPlan, ImageTapConsumer, LegacyCanonicalApplication,
+    MotionFieldAttachment, PlannedImageSource, PlannedImageTap,
 };
 use crate::image_routing::{LayerImageStage, StableLayerId};
 use crate::layers::BlendMode;
@@ -25,6 +26,9 @@ use crate::renderer::composition_host::{
     HostRoutedGardenInput, HostSurface, HostTemporalInput, HostTextureInputs, HostUniformSlot,
 };
 use crate::renderer::compositor::{MatteChannelCode, MatteCompositeUniforms, ResolvedMatteParams};
+use crate::renderer::corruption::{
+    CorruptionGpuExecutor, CorruptionGpuUniforms, CorruptionPassPipeline,
+};
 use crate::renderer::motion::{
     MotionFieldReadParity, MotionFrameInput, MotionGpuError, MotionGpuFieldSource,
     MotionGpuFieldSpec, MotionGpuResources, MotionGpuScopeSpec, MotionRuntimeDiagnostic,
@@ -455,6 +459,35 @@ struct PreparedScanProcessorField {
     resolve_bind_group: wgpu::BindGroup,
 }
 
+/// The lazily allocated retained history of one Filter Avalanche node: the
+/// node's own previous output, program memory on the melt-history precedent.
+struct AvalancheHistory {
+    surface: RetainedSurface,
+    /// (Ping carrier, history) — the warm read pair.
+    bind_group: wgpu::BindGroup,
+}
+
+/// One prepared dedicated B6 corruption step. The pass groups are
+/// topology-fixed at prepare; only the avalanche's history pair arrives
+/// lazily, on its first armed frame, and is counted when it does.
+struct PreparedCorruptionField {
+    scope: VisualScopeId,
+    node_id: NodeId,
+    /// First arena slot; a Block DCT step owns four consecutive slots.
+    uniform_base_slot: u32,
+    /// DCT: [(Ping,Ping), (auxA,Ping), (auxB,Ping), (auxA,Ping)];
+    /// Sort: one (Ping,Ping); Avalanche: the cold fallback (Ping,Ping),
+    /// which degrades exactly to BENDR's shipped single-frame law.
+    pass_groups: Vec<wgpu::BindGroup>,
+    history: Option<AvalancheHistory>,
+    /// Published only by the frame-history transaction, so a discarded
+    /// frame leaves no stale validity and no double-advanced store clock.
+    history_valid: bool,
+    history_staged: bool,
+    last_store_tick: u64,
+    staged_store_tick: u64,
+}
+
 struct PreparedSymmetryField {
     scope: VisualScopeId,
     node_id: NodeId,
@@ -502,6 +535,8 @@ struct PreparedAdvanced {
     study_fields: Vec<PreparedStudyField>,
     scan: Option<ScanProcessorGpuExecutor>,
     scan_fields: Vec<PreparedScanProcessorField>,
+    corruption: Option<CorruptionGpuExecutor>,
+    corruption_fields: Vec<PreparedCorruptionField>,
     motion: Option<MotionGpuResources>,
     taps: Box<[PreparedTap]>,
     /// Current-frame PreLocal donors are independently materialized and
@@ -1737,6 +1772,20 @@ impl PreparedAdvanced {
                 Some(executor) => prepare_scan_processor_fields(device, plan, executor, ping.view),
                 None => Vec::new(),
             };
+            let (corruption_slot_count, corruption_has_dct) = corruption_field_totals(plan);
+            let corruption = (corruption_slot_count > 0).then(|| {
+                CorruptionGpuExecutor::new(
+                    device,
+                    crate::renderer::composition_host::HOST_WORKING_FORMAT,
+                    corruption_slot_count as u32,
+                    dimensions,
+                    corruption_has_dct,
+                )
+            });
+            let corruption_fields = match &corruption {
+                Some(executor) => prepare_corruption_fields(device, plan, executor, ping.view),
+                None => Vec::new(),
+            };
             let retained_scope_sources = retained_scope_sources(plan, &taps);
             let (root_schedule, member_schedules) =
                 build_block_schedules(plan, &retained_scope_sources)?;
@@ -1850,6 +1899,8 @@ impl PreparedAdvanced {
                 study_fields,
                 scan,
                 scan_fields,
+                corruption,
+                corruption_fields,
                 motion,
                 taps: taps.into_boxed_slice(),
                 prelocal_surfaces,
@@ -1950,6 +2001,46 @@ impl PreparedAdvanced {
         }
         if !bus_melt_armed {
             self.bus_melt_valid = false;
+        }
+        // B6 avalanche histories: the same lazy law per node — the first
+        // armed frame allocates once (before the warm-allocation snapshot),
+        // a warmed armed frame allocates nothing, and disarming invalidates
+        // the trail without freeing the surface. Blackout never clears them:
+        // the cascade is program memory on the melt precedent.
+        let mut armed_avalanche: Vec<(VisualScopeId, NodeId)> = Vec::new();
+        for_each_corruption_step(plan, |scope, field| {
+            if matches!(field.kind, EvaluatedCorruptionKind::Avalanche(_)) && field.is_active() {
+                armed_avalanche.push((scope, field.node_id));
+            }
+        });
+        for field in &mut self.corruption_fields {
+            let armed = armed_avalanche
+                .iter()
+                .any(|(scope, node)| *scope == field.scope && *node == field.node_id);
+            if armed && field.history.is_none() {
+                if let Some(executor) = &self.corruption {
+                    let surface = create_retained_surface(
+                        &self.device,
+                        self.host.dimensions(),
+                        "Advanced composition avalanche history",
+                    );
+                    let bind_group = executor.create_bind_group(
+                        &self.device,
+                        self.host.surface(HostSurface::Ping).view,
+                        &surface.view,
+                    );
+                    self.retained_textures += 1;
+                    self.retained_views += 1;
+                    self.executor_bindings += 1;
+                    field.history = Some(AvalancheHistory {
+                        surface,
+                        bind_group,
+                    });
+                }
+            }
+            if !armed {
+                field.history_valid = false;
+            }
         }
         let allocations_before = self.allocation_snapshot();
         self.write_uniforms(queue, plan)?;
@@ -2187,6 +2278,13 @@ impl PreparedAdvanced {
             self.bus_melt_valid = true;
             self.bus_melt_staged = false;
         }
+        for field in &mut self.corruption_fields {
+            field.last_store_tick = field.staged_store_tick;
+            if field.history_staged {
+                field.history_valid = true;
+                field.history_staged = false;
+            }
+        }
         self.history_staged = false;
     }
 
@@ -2202,6 +2300,10 @@ impl PreparedAdvanced {
         }
         self.bus_melt_staged = false;
         self.bus_melt_staged_debt = self.bus_melt_tick_debt;
+        for field in &mut self.corruption_fields {
+            field.history_staged = false;
+            field.staged_store_tick = field.last_store_tick;
+        }
         self.history_staged = false;
     }
 
@@ -2310,6 +2412,7 @@ impl PreparedAdvanced {
                 | EvaluatedScopeStep::SymmetryField { .. }
                 | EvaluatedScopeStep::StudyField { .. }
                 | EvaluatedScopeStep::ScanProcessorField { .. }
+                | EvaluatedScopeStep::CorruptionField { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => continue,
             };
             self.host
@@ -2622,6 +2725,9 @@ impl PreparedAdvanced {
                 EvaluatedScopeStep::ScanProcessorField { plan: field } => {
                     self.execute_scan_processor_field(queue, encoder, plan, scope, field)?;
                 }
+                EvaluatedScopeStep::CorruptionField { plan: field } => {
+                    self.execute_corruption_field(queue, encoder, plan, scope, field)?;
+                }
                 EvaluatedScopeStep::LegacyTemporal { .. }
                 | EvaluatedScopeStep::GroupMatte { .. } => {
                     return Err(CompositionGpuError::InvalidSchedule(format!(
@@ -2865,6 +2971,148 @@ impl PreparedAdvanced {
         Ok(())
     }
 
+    /// Encode one dedicated B6 corruption step: the Block DCT's four-pass
+    /// separable pipeline through the shared intermediates, the Pixel Sort
+    /// pass, or the Filter Avalanche pass over its retained history. Same
+    /// step contract as every dedicated pass: read Ping, land in Ping.
+    fn execute_corruption_field(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        plan: &AdvancedCompositionPlan,
+        scope: VisualScopeId,
+        field: &EvaluatedCorruptionPlan,
+    ) -> Result<(), CompositionGpuError> {
+        if CorruptionGpuExecutor::is_inert(field) {
+            return Ok(());
+        }
+        let index = self
+            .corruption_fields
+            .iter()
+            .position(|prepared| prepared.scope == scope && prepared.node_id == field.node_id)
+            .ok_or_else(|| {
+                CompositionGpuError::InvalidSchedule(format!(
+                    "corruption node {} in {scope:?} was not prepared",
+                    field.node_id.get()
+                ))
+            })?;
+        let executor = self.corruption.as_ref().ok_or_else(|| {
+            CompositionGpuError::InvalidSchedule(
+                "a corruption step was planned without its dedicated executor".into(),
+            )
+        })?;
+        // The only time input is the shared frame-plan seconds, so Pause
+        // holds the avalanche's fault stream and export replays it
+        // structurally. The deterministic seed is the node's stable authored
+        // id — persisted topology, identical live and offline, unlike a
+        // process-lifetime layer id.
+        let time = plan.base().context().time_seconds;
+        let epoch = crate::filter_avalanche::avalanche_epoch(time);
+        let seed = field.node_id.get() as u32;
+        let prepared = &self.corruption_fields[index];
+        let history_ready = prepared.history_valid && prepared.history.is_some();
+        let uniforms = CorruptionGpuUniforms::for_plan(
+            field,
+            self.host.dimensions(),
+            seed,
+            epoch,
+            history_ready,
+        );
+        let base = prepared.uniform_base_slot;
+        for (offset, record) in uniforms.iter().enumerate() {
+            executor.write_pass(queue, base + offset as u32, record);
+        }
+        let pong = self.host.surface(HostSurface::Pong).view;
+        match field.kind {
+            EvaluatedCorruptionKind::BlockDct(_) => {
+                let aux = executor.aux_views().ok_or_else(|| {
+                    CompositionGpuError::InvalidSchedule(
+                        "a Block DCT step was planned without its intermediates".into(),
+                    )
+                })?;
+                executor.encode_pass(
+                    encoder,
+                    CorruptionPassPipeline::DctStage,
+                    &prepared.pass_groups[0],
+                    aux[0],
+                    base,
+                );
+                executor.encode_pass(
+                    encoder,
+                    CorruptionPassPipeline::DctStage,
+                    &prepared.pass_groups[1],
+                    aux[1],
+                    base + 1,
+                );
+                executor.encode_pass(
+                    encoder,
+                    CorruptionPassPipeline::DctStage,
+                    &prepared.pass_groups[2],
+                    aux[0],
+                    base + 2,
+                );
+                executor.encode_pass(
+                    encoder,
+                    CorruptionPassPipeline::DctFinal,
+                    &prepared.pass_groups[3],
+                    pong,
+                    base + 3,
+                );
+            }
+            EvaluatedCorruptionKind::PixelSort(_) => {
+                executor.encode_pass(
+                    encoder,
+                    CorruptionPassPipeline::PixelSort,
+                    &prepared.pass_groups[0],
+                    pong,
+                    base,
+                );
+            }
+            EvaluatedCorruptionKind::Avalanche(_) => {
+                // A valid committed history binds; anything else takes the
+                // cold fallback (the carrier as its own history), which is
+                // exactly BENDR's shipped single-frame law.
+                let group = match (&prepared.history, history_ready) {
+                    (Some(history), true) => &history.bind_group,
+                    _ => &prepared.pass_groups[0],
+                };
+                executor.encode_pass(
+                    encoder,
+                    CorruptionPassPipeline::Avalanche,
+                    group,
+                    pong,
+                    base,
+                );
+            }
+        }
+        copy_texture(
+            encoder,
+            self.host.surface(HostSurface::Pong).texture,
+            self.host.surface(HostSurface::Ping).texture,
+            self.host.dimensions(),
+        );
+        // The avalanche's history store: the node's own output (now in
+        // Ping), advanced at most once per 30 Hz reference tick on the
+        // frame-plan clock (the melt rate law: live and export cascade at
+        // the same speed), staged here and published only by the
+        // frame-history transaction. The first armed frame always stores so
+        // validity can begin.
+        if matches!(field.kind, EvaluatedCorruptionKind::Avalanche(_)) {
+            let store_tick = (f64::from(time.max(0.0)) * 30.0).floor() as u64;
+            let ping = self.host.surface(HostSurface::Ping).texture;
+            let dimensions = self.host.dimensions();
+            let prepared = &mut self.corruption_fields[index];
+            if let Some(history) = &prepared.history {
+                if store_tick != prepared.last_store_tick || !prepared.history_valid {
+                    copy_texture(encoder, ping, &history.surface.texture, dimensions);
+                    prepared.history_staged = true;
+                    prepared.staged_store_tick = store_tick;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn execute_rack_segment(
         &mut self,
         queue: &wgpu::Queue,
@@ -3038,6 +3286,9 @@ impl PreparedAdvanced {
                     }
                     EvaluatedScopeStep::ScanProcessorField { plan: field } => {
                         self.execute_scan_processor_field(queue, encoder, plan, scope, field)?;
+                    }
+                    EvaluatedScopeStep::CorruptionField { plan: field } => {
+                        self.execute_corruption_field(queue, encoder, plan, scope, field)?;
                     }
                     EvaluatedScopeStep::GroupMatte { .. } => {
                         self.execute_group_matte(encoder, plan, group_id)?;
@@ -3335,6 +3586,15 @@ impl PreparedAdvanced {
                 }
                 EvaluatedScopeStep::ScanProcessorField { plan: field } => {
                     self.execute_scan_processor_field(
+                        queue,
+                        encoder,
+                        plan,
+                        VisualScopeId::Master,
+                        field,
+                    )?;
+                }
+                EvaluatedScopeStep::CorruptionField { plan: field } => {
+                    self.execute_corruption_field(
                         queue,
                         encoder,
                         plan,
@@ -3923,6 +4183,84 @@ fn prepare_scan_processor_fields(
         visit(VisualScopeId::Group(group.id), &group.execution);
     }
     visit(VisualScopeId::Master, &plan.master().execution);
+    prepared
+}
+
+/// Walk every planned corruption step in the deterministic
+/// layers-then-groups-then-master step order.
+fn for_each_corruption_step(
+    plan: &AdvancedCompositionPlan,
+    mut visit: impl FnMut(VisualScopeId, &EvaluatedCorruptionPlan),
+) {
+    let mut walk = |scope: VisualScopeId, execution: &EvaluatedScopeExecution| {
+        for step in execution.steps() {
+            if let EvaluatedScopeStep::CorruptionField { plan: field } = step {
+                visit(scope, field);
+            }
+        }
+    };
+    for layer in plan.layers() {
+        walk(VisualScopeId::Layer(layer.stable_id), &layer.execution);
+    }
+    for group in plan.groups() {
+        walk(VisualScopeId::Group(group.id), &group.execution);
+    }
+    walk(VisualScopeId::Master, &plan.master().execution);
+}
+
+/// Total uniform-slot count (a Block DCT step owns four) and whether any
+/// DCT step exists, so the shared intermediates allocate only when needed.
+fn corruption_field_totals(plan: &AdvancedCompositionPlan) -> (usize, bool) {
+    let mut slots = 0usize;
+    let mut has_dct = false;
+    for_each_corruption_step(plan, |_, field| {
+        slots += field.kind.pass_count() as usize;
+        has_dct |= matches!(field.kind, EvaluatedCorruptionKind::BlockDct(_));
+    });
+    (slots, has_dct)
+}
+
+/// Assign every planned corruption step its arena slots in deterministic
+/// step order and build its topology-fixed pass groups. Inert steps still
+/// own their slots so numbering never depends on frame-local values.
+fn prepare_corruption_fields(
+    device: &wgpu::Device,
+    plan: &AdvancedCompositionPlan,
+    executor: &CorruptionGpuExecutor,
+    carrier: &wgpu::TextureView,
+) -> Vec<PreparedCorruptionField> {
+    let mut prepared = Vec::new();
+    let mut next_slot = 0u32;
+    for_each_corruption_step(plan, |scope, field| {
+        let pass_groups = match field.kind {
+            EvaluatedCorruptionKind::BlockDct(_) => {
+                let aux = executor
+                    .aux_views()
+                    .expect("a plan with a DCT step allocates the intermediates");
+                vec![
+                    executor.create_bind_group(device, carrier, carrier),
+                    executor.create_bind_group(device, aux[0], carrier),
+                    executor.create_bind_group(device, aux[1], carrier),
+                    executor.create_bind_group(device, aux[0], carrier),
+                ]
+            }
+            EvaluatedCorruptionKind::PixelSort(_) | EvaluatedCorruptionKind::Avalanche(_) => {
+                vec![executor.create_bind_group(device, carrier, carrier)]
+            }
+        };
+        prepared.push(PreparedCorruptionField {
+            scope,
+            node_id: field.node_id,
+            uniform_base_slot: next_slot,
+            pass_groups,
+            history: None,
+            history_valid: false,
+            history_staged: false,
+            last_store_tick: 0,
+            staged_store_tick: 0,
+        });
+        next_slot += field.kind.pass_count();
+    });
     prepared
 }
 

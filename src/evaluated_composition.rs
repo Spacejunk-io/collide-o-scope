@@ -346,6 +346,14 @@ pub enum EvaluatedScopeStep {
     /// transient, not a fullscreen triangle, so no ordinary segment could
     /// ever encode it.
     ScanProcessorField { plan: EvaluatedScanProcessorPlan },
+    /// One dedicated B6 corruption pass (Block DCT, Pixel Sort, or Filter
+    /// Avalanche), at its exact authored rack position. The trio is lifted
+    /// for three different reasons — a four-pass float-intermediate
+    /// pipeline, a tap count over the frozen ordinary-rack lookup budget,
+    /// and a retained per-node history respectively — and shares one
+    /// evaluated payload because the executor is one machine with three
+    /// laws.
+    CorruptionField { plan: EvaluatedCorruptionPlan },
     /// Stateful master-only boundary in its exact authored position.
     LegacyTemporal { params: TemporalParams },
     /// Group matte is post-transform/rack and pre-opacity/admission.
@@ -372,6 +380,7 @@ impl EvaluatedScopeStep {
             Self::SymmetryField { .. } => Some(NodeKindTag::Symmetry),
             Self::StudyField { .. } => Some(NodeKindTag::Study),
             Self::ScanProcessorField { .. } => Some(NodeKindTag::ScanProcessor),
+            Self::CorruptionField { plan } => Some(plan.kind.tag()),
             Self::MaterializeSpatial { .. }
             | Self::CollisionRack { .. }
             | Self::GroupMatte { .. } => None,
@@ -1061,6 +1070,125 @@ fn scan_processor_resource_plan(
 /// size assertion in `scan_processor.rs`.
 const SCAN_PROCESSOR_UNIFORM_BYTES: u32 = 128;
 
+/// The B6 corruption trio's authored payload, one arm per kind.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EvaluatedCorruptionKind {
+    BlockDct(crate::block_dct::BlockDctParams),
+    PixelSort(crate::pixel_sort::PixelSortParams),
+    Avalanche(crate::filter_avalanche::AvalancheParams),
+}
+
+impl EvaluatedCorruptionKind {
+    pub const fn tag(&self) -> NodeKindTag {
+        match self {
+            Self::BlockDct(_) => NodeKindTag::BlockDct,
+            Self::PixelSort(_) => NodeKindTag::PixelSort,
+            Self::Avalanche(_) => NodeKindTag::Avalanche,
+        }
+    }
+
+    pub fn is_exact_bypass(&self) -> bool {
+        match self {
+            Self::BlockDct(params) => params.is_exact_bypass(),
+            Self::PixelSort(params) => params.is_exact_bypass(),
+            Self::Avalanche(params) => params.is_exact_bypass(),
+        }
+    }
+
+    /// Encoded passes for one active step of this kind: the Block DCT's
+    /// separable pipeline is four, the other two are one each.
+    pub const fn pass_count(&self) -> u32 {
+        match self {
+            Self::BlockDct(_) => 4,
+            Self::PixelSort(_) | Self::Avalanche(_) => 1,
+        }
+    }
+}
+
+/// The evaluated payload of one dedicated corruption pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvaluatedCorruptionPlan {
+    pub node_id: NodeId,
+    pub enabled: bool,
+    pub wet: f32,
+    pub blend: NodeBlend,
+    pub kind: EvaluatedCorruptionKind,
+    pub resources: CorruptionResourcePlan,
+}
+
+impl EvaluatedCorruptionPlan {
+    /// The whole wake law in one place: the executor encodes nothing, and
+    /// the avalanche history neither allocates nor advances, while this is
+    /// false.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.wet > 0.0 && !self.kind.is_exact_bypass()
+    }
+}
+
+/// At most this many Filter Avalanche nodes per composition: each owns one
+/// retained full-frame history surface, so the count is a byte bound, not a
+/// topology opinion. The over-budget Residual-grid law: typed refusal, never
+/// a silent clamp.
+pub const MAX_AVALANCHE_NODES: usize = 4;
+
+/// The dedicated corruption ledger, re-derived from the emitted step (the
+/// Study/Scan asymmetry: the segmenter and the ledger cannot disagree about
+/// what a frame encodes). The Block DCT's two shared full-frame
+/// `Rgba16Float` intermediates and the avalanche's retained history are
+/// charged byte-exactly here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CorruptionResourcePlan {
+    pub full_frame_passes: u32,
+    pub logical_texture_lookups_per_pixel: u32,
+    pub texture_operations_per_pixel: u32,
+    pub max_sampled_textures_in_pass: u32,
+    pub uniform_bytes: u32,
+    /// The Block DCT's coefficient intermediates: two shared full-frame
+    /// `Rgba16Float` surfaces (16 bytes per output pixel total), charged
+    /// once while any DCT step exists — every DCT pass in the frame reuses
+    /// them sequentially, the Scan accumulator law.
+    pub dct_transient_bytes: u64,
+    /// One retained working-format history per authored avalanche node
+    /// (8 bytes per output pixel each), program memory on the melt-history
+    /// precedent.
+    pub avalanche_retained_bytes: u64,
+}
+
+/// One pass's dynamic-offset uniform record, restated from the compile-time
+/// size assertion in `renderer/corruption.rs`.
+const CORRUPTION_UNIFORM_BYTES: u32 = 80;
+
+/// The ledger for one emitted corruption step.
+fn corruption_resource_plan(
+    kind: &EvaluatedCorruptionKind,
+    output: [u32; 2],
+) -> Result<CorruptionResourcePlan, CompositionPlanError> {
+    let descriptor = crate::visual_rack::node_kind_descriptor(kind.tag()).budget;
+    let overflow = || CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow);
+    let pixels = u64::from(output[0])
+        .checked_mul(u64::from(output[1]))
+        .ok_or_else(overflow)?;
+    let dct_transient_bytes = match kind {
+        EvaluatedCorruptionKind::BlockDct(_) => pixels.checked_mul(16).ok_or_else(overflow)?,
+        _ => 0,
+    };
+    let avalanche_retained_bytes = match kind {
+        EvaluatedCorruptionKind::Avalanche(_) => pixels.checked_mul(8).ok_or_else(overflow)?,
+        _ => 0,
+    };
+    Ok(CorruptionResourcePlan {
+        full_frame_passes: kind.pass_count(),
+        logical_texture_lookups_per_pixel: u32::from(descriptor.logical_texture_lookups_per_pixel),
+        texture_operations_per_pixel: u32::from(descriptor.texture_samples_per_pixel),
+        max_sampled_textures_in_pass: u32::from(descriptor.sampled_textures_in_pass),
+        uniform_bytes: CORRUPTION_UNIFORM_BYTES
+            .checked_mul(kind.pass_count())
+            .ok_or_else(overflow)?,
+        dct_transient_bytes,
+        avalanche_retained_bytes,
+    })
+}
+
 /// Count the dedicated Scan Processor steps the segmenter actually emitted,
 /// and sum their authored vertex requests.
 fn count_scan_processor_steps(
@@ -1098,6 +1226,68 @@ fn validate_scan_processor_textures(
     limits: CreativeResourceLimits,
 ) -> Result<(), CompositionPlanError> {
     validate_dedicated_sampled_textures(scan_processor.max_sampled_textures_in_pass, limits)
+}
+
+/// Aggregate the ledgers of every emitted B6 corruption step. The Block
+/// DCT's shared intermediates are charged once while any DCT step exists
+/// (sequential reuse, the Scan-accumulator law); avalanche histories are
+/// per-node and sum.
+fn count_corruption_steps(
+    layers: &[EvaluatedLayerScopePlan],
+    groups: &[EvaluatedGroupScopePlan],
+    master: &EvaluatedMasterScopePlan,
+) -> Result<CorruptionResourcePlan, CompositionPlanError> {
+    let overflow = || CompositionPlanError::Resource(ResourcePreflightError::ArithmeticOverflow);
+    let mut total = CorruptionResourcePlan::default();
+    let mut tally = |execution: &EvaluatedScopeExecution| -> Result<(), CompositionPlanError> {
+        for step in execution.steps() {
+            let EvaluatedScopeStep::CorruptionField { plan } = step else {
+                continue;
+            };
+            let step_plan = plan.resources;
+            total.full_frame_passes = total
+                .full_frame_passes
+                .checked_add(step_plan.full_frame_passes)
+                .ok_or_else(overflow)?;
+            total.logical_texture_lookups_per_pixel = total
+                .logical_texture_lookups_per_pixel
+                .checked_add(step_plan.logical_texture_lookups_per_pixel)
+                .ok_or_else(overflow)?;
+            total.texture_operations_per_pixel = total
+                .texture_operations_per_pixel
+                .checked_add(step_plan.texture_operations_per_pixel)
+                .ok_or_else(overflow)?;
+            total.max_sampled_textures_in_pass = total
+                .max_sampled_textures_in_pass
+                .max(step_plan.max_sampled_textures_in_pass);
+            total.uniform_bytes = total
+                .uniform_bytes
+                .checked_add(step_plan.uniform_bytes)
+                .ok_or_else(overflow)?;
+            total.dct_transient_bytes =
+                total.dct_transient_bytes.max(step_plan.dct_transient_bytes);
+            total.avalanche_retained_bytes = total
+                .avalanche_retained_bytes
+                .checked_add(step_plan.avalanche_retained_bytes)
+                .ok_or_else(overflow)?;
+        }
+        Ok(())
+    };
+    for layer in layers {
+        tally(&layer.execution)?;
+    }
+    for group in groups {
+        tally(&group.execution)?;
+    }
+    tally(&master.execution)?;
+    Ok(total)
+}
+
+fn validate_corruption_textures(
+    corruption: CorruptionResourcePlan,
+    limits: CreativeResourceLimits,
+) -> Result<(), CompositionPlanError> {
+    validate_dedicated_sampled_textures(corruption.max_sampled_textures_in_pass, limits)
 }
 
 /// Plan-visible Study identity: every emitted step's node, digest, and
@@ -1450,6 +1640,7 @@ pub struct AdvancedCompositionPlan {
         )
     )]
     scan_processor_resources: ScanProcessorResourcePlan,
+    corruption_resources: CorruptionResourcePlan,
     topology_signature: u64,
 }
 
@@ -1593,6 +1784,19 @@ impl AdvancedCompositionPlan {
     )]
     pub const fn scan_processor_resources(&self) -> ScanProcessorResourcePlan {
         self.scan_processor_resources
+    }
+
+    /// The combined ledger of every dedicated B6 corruption pass this frame
+    /// encodes. Default when the frame encodes none.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the dedicated corruption ledger is consumed by the prepared executor and tests"
+        )
+    )]
+    pub const fn corruption_resources(&self) -> CorruptionResourcePlan {
+        self.corruption_resources
     }
 
     pub const fn topology_signature(&self) -> u64 {
@@ -1792,6 +1996,13 @@ pub enum CompositionPlanError {
         vertices: u32,
         limit: u32,
     },
+    /// More Filter Avalanche nodes than the retained-history byte bound
+    /// admits. Counted kind-only across the whole authored graph, because
+    /// each authored node may lazily arm its surface.
+    AvalancheHistoryBudget {
+        nodes: usize,
+        limit: usize,
+    },
     UnknownLayerRack(StableLayerId),
     DuplicateLayerMotion(StableLayerId),
     MissingLayerMotion(StableLayerId),
@@ -1891,6 +2102,12 @@ impl fmt::Display for CompositionPlanError {
                     formatter,
                     "scan processor node {} requests {vertices} ribbon vertices; the vertex budget is {limit}",
                     node.get()
+                )
+            }
+            Self::AvalancheHistoryBudget { nodes, limit } => {
+                write!(
+                    formatter,
+                    "the graph authors {nodes} filter-avalanche nodes; each owns a retained full-frame history and at most {limit} are admitted"
                 )
             }
             Self::MissingLayerRack(id) => {
@@ -2586,6 +2803,8 @@ impl<'a> Planner<'a> {
         let scan_processor_resources =
             scan_processor_resource_plan(scan_passes, scan_vertices, output)?;
         validate_scan_processor_textures(scan_processor_resources, self.input.resource_limits)?;
+        let corruption_resources = count_corruption_steps(&layer_plans, &group_plans, &master)?;
+        validate_corruption_textures(corruption_resources, self.input.resource_limits)?;
         let (resources, residual_resources) = resource_preflight(
             output,
             self.input,
@@ -2636,6 +2855,7 @@ impl<'a> Planner<'a> {
                 symmetry_field_resources,
                 study_field_resources,
                 scan_processor_resources,
+                corruption_resources,
                 topology_signature,
             },
         )))
@@ -3409,6 +3629,40 @@ fn flush_segment(
                     blend: node.blend,
                     params,
                     resources: scan_processor_resource_plan(1, vertices, output)?,
+                },
+            });
+            continue;
+        }
+        if let Some(kind) = match node.kind {
+            RuntimeVisualNodeKind::BlockDct(params) => {
+                Some(EvaluatedCorruptionKind::BlockDct(params.sanitized()))
+            }
+            RuntimeVisualNodeKind::PixelSort(params) => {
+                Some(EvaluatedCorruptionKind::PixelSort(params.sanitized()))
+            }
+            RuntimeVisualNodeKind::Avalanche(params) => {
+                Some(EvaluatedCorruptionKind::Avalanche(params.sanitized()))
+            }
+            _ => None,
+        } {
+            // The same dedicated lift, same kind-only reasoning: a corruption
+            // node owns its step whether or not its amount currently wakes
+            // it, so slot numbering never depends on frame-local values.
+            compile_segment_nodes(
+                std::mem::take(&mut ordinary),
+                steps,
+                segment_index,
+                scope,
+                output,
+            )?;
+            steps.push(EvaluatedScopeStep::CorruptionField {
+                plan: EvaluatedCorruptionPlan {
+                    node_id: node.stable_id,
+                    enabled: node.enabled,
+                    wet: node.wet,
+                    blend: node.blend,
+                    kind,
+                    resources: corruption_resource_plan(&kind, output)?,
                 },
             });
             continue;
@@ -4348,6 +4602,20 @@ fn resource_preflight(
         ResidualResourceLimits::from(input.resource_limits),
     )
     .map_err(CompositionPlanError::Residual)?;
+    // B6: each authored Filter Avalanche node owns one retained full-frame
+    // history, so the count is a byte bound. Kind-only, like the dedicated
+    // lift itself: a disabled node still owns its step and may arm later.
+    let avalanche_nodes = racks
+        .iter()
+        .flat_map(|rack| rack.iter())
+        .filter(|node| matches!(node.kind, VisualNodeKind::Avalanche(_)))
+        .count();
+    if avalanche_nodes > MAX_AVALANCHE_NODES {
+        return Err(CompositionPlanError::AvalancheHistoryBudget {
+            nodes: avalanche_nodes,
+            limit: MAX_AVALANCHE_NODES,
+        });
+    }
     let garden_budget = refresh_garden_resource_plan(refresh_garden_signal);
     if let Some(motion) = motion.advanced() {
         let combined_bytes = creative
@@ -8679,6 +8947,143 @@ mod tests {
             &heavy_library,
         )
         .expect("seven history loads plus the carrier fill the budget exactly");
+    }
+
+    /// The B6 corruption lift follows the Scan shape: flush before, one
+    /// kind-only dedicated step per node at its authored position,
+    /// segmentation resuming behind it, with the combined ledger re-derived
+    /// from the emitted steps — the DCT's shared intermediates charged once,
+    /// avalanche histories per node — and the four-node avalanche cap a
+    /// typed refusal at five.
+    #[test]
+    fn corruption_nodes_lift_into_dedicated_steps_and_the_avalanche_cap_refuses() {
+        use crate::block_dct::BlockDctParams;
+        use crate::filter_avalanche::AvalancheParams;
+        use crate::pixel_sort::PixelSortParams;
+
+        let base_input = base(&[1, 2], &[]);
+        let composition = legacy_composition(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let mut racks = legacy_racks(&[1, 2]);
+        let dct_node = racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::BlockDct(BlockDctParams {
+                amount: 0.8,
+                ..BlockDctParams::default()
+            }))
+            .unwrap();
+        racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::DigitalColor(
+                DigitalColorParams::default(),
+            ))
+            .unwrap();
+        let sort_node = racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::PixelSort(PixelSortParams {
+                amount: 0.5,
+                ..PixelSortParams::default()
+            }))
+            .unwrap();
+        let avalanche_node = racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::Avalanche(AvalancheParams {
+                amount: 0.6,
+                ..AvalancheParams::default()
+            }))
+            .unwrap();
+
+        let compiled =
+            advanced(plan_at_device_floor(&base_input, &composition, &master, &racks).unwrap());
+        let steps = layer_plan(&compiled, 2).execution.steps();
+        // Legacy prefix, then: DCT step, rack segment (DigitalColor), sort
+        // step, avalanche step — each dedicated node owns its position.
+        let EvaluatedScopeStep::CorruptionField { plan: dct } = &steps[2] else {
+            panic!("a Block DCT must own a dedicated step, got {:?}", steps[2]);
+        };
+        assert_eq!(dct.node_id, dct_node);
+        assert!(matches!(
+            dct.kind,
+            EvaluatedCorruptionKind::BlockDct(params) if params.amount == 0.8
+        ));
+        assert!(dct.is_active());
+        assert_eq!(steps[2].node_kind_tag(), Some(NodeKindTag::BlockDct));
+        assert!(matches!(
+            steps[3],
+            EvaluatedScopeStep::CollisionRack {
+                segment_index: 0,
+                ..
+            }
+        ));
+        let EvaluatedScopeStep::CorruptionField { plan: sort } = &steps[4] else {
+            panic!("a Pixel Sort must own a dedicated step");
+        };
+        assert_eq!(sort.node_id, sort_node);
+        assert_eq!(steps[4].node_kind_tag(), Some(NodeKindTag::PixelSort));
+        let EvaluatedScopeStep::CorruptionField { plan: avalanche } = &steps[5] else {
+            panic!("a Filter Avalanche must own a dedicated step");
+        };
+        assert_eq!(avalanche.node_id, avalanche_node);
+        assert_eq!(steps[5].node_kind_tag(), Some(NodeKindTag::Avalanche));
+
+        // The combined ledger, re-derived from the emitted steps at the
+        // 64x64 test output: 4 + 1 + 1 passes, 80-byte records per pass,
+        // the DCT's two Rgba16Float intermediates (16 B/px, charged once),
+        // and one avalanche history (8 B/px).
+        let resources = compiled.corruption_resources();
+        assert_eq!(resources.full_frame_passes, 6);
+        assert_eq!(resources.uniform_bytes, 80 * 6);
+        assert_eq!(resources.max_sampled_textures_in_pass, 2);
+        assert_eq!(resources.dct_transient_bytes, 64 * 64 * 16);
+        assert_eq!(resources.avalanche_retained_bytes, 64 * 64 * 8);
+        assert_eq!(
+            resources.logical_texture_lookups_per_pixel,
+            17 + 34 + 65,
+            "the honest per-kind tap counts sum"
+        );
+
+        // A default (exact-bypass) node still owns its step — kind-only
+        // segmentation — but is inactive.
+        let mut bypass_racks = legacy_racks(&[1, 2]);
+        bypass_racks[1]
+            .1
+            .push(RuntimeVisualNodeKind::PixelSort(PixelSortParams::default()))
+            .unwrap();
+        let bypass = advanced(
+            plan_at_device_floor(&base_input, &composition, &master, &bypass_racks).unwrap(),
+        );
+        let bypass_steps = layer_plan(&bypass, 2).execution.steps();
+        let EvaluatedScopeStep::CorruptionField { plan: inert } = &bypass_steps[2] else {
+            panic!("a bypassed corruption node still owns its dedicated step");
+        };
+        assert!(!inert.is_active());
+        assert_eq!(bypass.corruption_resources().dct_transient_bytes, 0);
+
+        // Five authored avalanche nodes are a typed refusal; four are
+        // admitted (kind-only: even disabled nodes own retained bytes).
+        let mut capped = legacy_racks(&[1, 2]);
+        for _ in 0..4 {
+            capped[1]
+                .1
+                .push(RuntimeVisualNodeKind::Avalanche(AvalancheParams::default()))
+                .unwrap();
+        }
+        assert!(plan_at_device_floor(&base_input, &composition, &master, &capped).is_ok());
+        let mut refused = legacy_racks(&[1, 2]);
+        for _ in 0..4 {
+            refused[1]
+                .1
+                .push(RuntimeVisualNodeKind::Avalanche(AvalancheParams::default()))
+                .unwrap();
+        }
+        refused[0]
+            .1
+            .push(RuntimeVisualNodeKind::Avalanche(AvalancheParams::default()))
+            .unwrap();
+        assert!(matches!(
+            plan_at_device_floor(&base_input, &composition, &master, &refused),
+            Err(CompositionPlanError::AvalancheHistoryBudget { nodes: 5, limit: 4 })
+        ));
     }
 
     /// The Scan Processor lift follows the Study shape exactly: flush before,
