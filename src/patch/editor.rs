@@ -120,6 +120,10 @@ fn param_row(
 ) -> Option<String> {
     let mut new_value: Option<String> = None;
     let meta = param_meta(key);
+    // B15: the same sentences the browser panel shows, from the same table.
+    // The native editor and the panel cannot describe a control differently
+    // because there is only one description.
+    let help = crate::control_help::help_for_any(key);
 
     // Fixed pill width for consistent alignment
     const PILL_WIDTH: f32 = 72.0;
@@ -134,21 +138,27 @@ fn param_row(
                 egui::vec2(key_width, ui.spacing().interact_size.y),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.label(
+                    let label = ui.label(
                         egui::RichText::new(&key_text)
                             .monospace()
                             .size(13.0)
                             .color(KEY_COLOR),
                     );
+                    if let Some(help) = help {
+                        label.on_hover_text(help);
+                    }
                 },
             );
         } else {
-            ui.label(
+            let label = ui.label(
                 egui::RichText::new(&key_text)
                     .monospace()
                     .size(13.0)
                     .color(KEY_COLOR),
             );
+            if let Some(help) = help {
+                label.on_hover_text(help);
+            }
         }
 
         let is_active = editor.active_field.as_deref() == Some(key);

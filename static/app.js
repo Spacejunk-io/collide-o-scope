@@ -300,6 +300,7 @@ function connect() {
         syncPatchSave(msg.patch_save_status || '');
         syncPatchLoad(msg.patch_load_status || '');
         syncModulation(msg.modulation);
+        syncControlFilters(msg.modulation);
         syncAudio(msg.audio);
         syncMidi(msg.midi);
         syncControllerRuntime(msg.controller_runtime);
@@ -1792,6 +1793,96 @@ function rangesWithin(root) {
   return ranges;
 }
 
+// Master and layer effect defaults. Hoisted to module scope so the
+// double-click reset and the B15 CHANGED filter read one table rather
+// than two copies that could disagree about what 'default' means.
+const MASTER_PARAM_DEFAULTS = Object.freeze({
+      pixelate: 1, rgb_split: 0, hue_shift: 0, saturation: 0,
+      downsample: 1,
+      shift_amount: 0, shift_block_size: 8, shift_density: 0.5, shift_speed: 3,
+      brightness: 0, contrast: 0, posterize: 0, grain_intensity: 0,
+      grain_size: 1, vignette: 0, color_drift: 0, breathe_scale: 0,
+      breathe_rotation: 0, breathe_position: 0,
+      cellular_amount: 0, cellular_scale: 10, cellular_warp: 0.35,
+      cellular_speed: 0.25, cellular_gap_amount: 0,
+      cellular_gap_threshold: 0.65, cellular_gap_softness: 0.08,
+      key_color_r: 0, key_color_g: 1, key_color_b: 0,
+      key_threshold: 0.5, key_softness: 0.1, key_tolerance: 0.15,
+      contour: 0, contour_bands: 10, contour_width: 1.2, contour_hue: 0,
+      contour_fill: 0.25, flatten: 0, flatten_levels: 5, contour_dither: 0,
+      solarize: 0, negative: 0, colourpass: 0, colourpass_hue: 0,
+      colourpass_width: 0.25, edge_amount: 0, edge_hue: 0, emboss: 0,
+      emboss_angle: 45, halftone: 0, halftone_pitch: 0.4, halftone_angle: 0,
+      moire: 0, moire_freq: 0.4, row_smear: 0, bitcrush: 0,
+      bitcrush_levels: 2, bitcrush_dither: 1, multi_grid_x: 1, multi_grid_y: 1,
+      barrel: 0, chroma_aberration: 0, anamorphic_streak: 0,
+    });
+
+// VHS block defaults, shared by the reset path and the CHANGED filter.
+const NTSC_PARAM_DEFAULTS = Object.freeze({
+      head_switching_height: 8, tracking_noise_height: 24,
+      edge_wave_speed: 0.5,
+    });
+
+// Temporal defaults, shared by the reset path and the CHANGED filter.
+// Any control whose default is not its slider minimum must appear here;
+// `every_temporal_default_agrees_between_the_markup_and_the_reset_table`
+// checks that against the value spans in index.html.
+const TEMPORAL_PARAM_DEFAULTS = Object.freeze({
+      fb_zoom: 1,
+      fb_saturation: 1,
+      fb_gain_r: 1,
+      fb_gain_g: 1,
+      fb_gain_b: 1,
+      fb_drive: 1,
+      fb_pivot: 0.5,
+      key_threshold: 0.1,
+      key_softness: 0.03,
+      key_history: 1,
+      loom_depth: 1,
+      loom_scale: 1,
+      loom_folds: 1,
+      atlas_territories: 8,
+      garden_threshold: 0.1,
+      garden_softness: 0.03,
+      garden_decay: 1,
+      score_state_count: 4,
+      disp_il_twitter: 0.4,
+      disp_phos_r: 0.86,
+      disp_phos_g: 1,
+      disp_phos_b: 0.66,
+      disp_beam_width: 1,
+      disp_beam_shape: 0.5,
+      disp_mask_dark: 0.5,
+      disp_bloom_radius: 0.4,
+      melt_width: 0.3,
+      melt_hold: 0.6,
+      melt_swirl: 0,
+      melt_chroma: 0.5,
+      melt_creep: 0.35,
+      mosh_key_removal: 0.95,
+      mosh_hold: 0.25,
+      mosh_rate: 0.5,
+      mosh_bitrate_starve: 0.35,
+      sync_rate: 0.35,
+      sync_spread: 0.25,
+      // Every bipolar control below defaults to zero while its slider minimum
+      // is negative. An unlisted key falls back to that minimum, so omitting
+      // any of these makes a double-click "reset" author a hard negative
+      // extreme instead of the neutral value.
+      fb_rotate: 0,
+      fb_offset_x: 0,
+      fb_offset_y: 0,
+      fb_hue_rotate: 0,
+      slit_angle: 0,
+      loom_phase: 0,
+      loom_angle: 0,
+      // Explicitly zero: the fallback for an unlisted key is the slider's
+      // minimum, and this control's minimum is -1, so omitting it would make
+      // a double-click reset author full negative bias.
+      sync_bias: 0,
+    });
+
 function bindRangeEditors(root = document) {
   rangesWithin(root).forEach(bindRangeEditor);
 }
@@ -2144,27 +2235,7 @@ document.querySelectorAll('.param-row[data-param]').forEach((row) => {
       valueEl.textContent = formatValue(v, min, max, step);
       sendAction({ action: 'set_param', param, value: v });
     });
-    const defaults = {
-      pixelate: 1, rgb_split: 0, hue_shift: 0, saturation: 0,
-      downsample: 1,
-      shift_amount: 0, shift_block_size: 8, shift_density: 0.5, shift_speed: 3,
-      brightness: 0, contrast: 0, posterize: 0, grain_intensity: 0,
-      grain_size: 1, vignette: 0, color_drift: 0, breathe_scale: 0,
-      breathe_rotation: 0, breathe_position: 0,
-      cellular_amount: 0, cellular_scale: 10, cellular_warp: 0.35,
-      cellular_speed: 0.25, cellular_gap_amount: 0,
-      cellular_gap_threshold: 0.65, cellular_gap_softness: 0.08,
-      key_color_r: 0, key_color_g: 1, key_color_b: 0,
-      key_threshold: 0.5, key_softness: 0.1, key_tolerance: 0.15,
-      contour: 0, contour_bands: 10, contour_width: 1.2, contour_hue: 0,
-      contour_fill: 0.25, flatten: 0, flatten_levels: 5, contour_dither: 0,
-      solarize: 0, negative: 0, colourpass: 0, colourpass_hue: 0,
-      colourpass_width: 0.25, edge_amount: 0, edge_hue: 0, emboss: 0,
-      emboss_angle: 45, halftone: 0, halftone_pitch: 0.4, halftone_angle: 0,
-      moire: 0, moire_freq: 0.4, row_smear: 0, bitcrush: 0,
-      bitcrush_levels: 2, bitcrush_dither: 1, multi_grid_x: 1, multi_grid_y: 1,
-      barrel: 0, chroma_aberration: 0, anamorphic_streak: 0,
-    };
+    const defaults = MASTER_PARAM_DEFAULTS;
     resetRangeOnDoubleActivation(slider, defaults[param] ?? min);
   }
 
@@ -2205,10 +2276,7 @@ document.querySelectorAll('.param-row[data-ntsc]').forEach((row) => {
       valueEl.textContent = formatValue(v, min, max, step);
       sendAction({ action: 'set_ntsc_param', param, value: v });
     });
-    const defaults = {
-      head_switching_height: 8, tracking_noise_height: 24,
-      edge_wave_speed: 0.5,
-    };
+    const defaults = NTSC_PARAM_DEFAULTS;
     resetRangeOnDoubleActivation(slider, defaults[param] ?? 0);
   }
 
@@ -2243,60 +2311,7 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
     slider.min = min;
     slider.max = max;
     slider.step = step;
-    const defaults = {
-      fb_zoom: 1,
-      fb_saturation: 1,
-      fb_gain_r: 1,
-      fb_gain_g: 1,
-      fb_gain_b: 1,
-      fb_drive: 1,
-      fb_pivot: 0.5,
-      key_threshold: 0.1,
-      key_softness: 0.03,
-      key_history: 1,
-      loom_depth: 1,
-      loom_scale: 1,
-      loom_folds: 1,
-      atlas_territories: 8,
-      garden_threshold: 0.1,
-      garden_softness: 0.03,
-      garden_decay: 1,
-      score_state_count: 4,
-      disp_il_twitter: 0.4,
-      disp_phos_r: 0.86,
-      disp_phos_g: 1,
-      disp_phos_b: 0.66,
-      disp_beam_width: 1,
-      disp_beam_shape: 0.5,
-      disp_mask_dark: 0.5,
-      disp_bloom_radius: 0.4,
-      melt_width: 0.3,
-      melt_hold: 0.6,
-      melt_swirl: 0,
-      melt_chroma: 0.5,
-      melt_creep: 0.35,
-      mosh_key_removal: 0.95,
-      mosh_hold: 0.25,
-      mosh_rate: 0.5,
-      mosh_bitrate_starve: 0.35,
-      sync_rate: 0.35,
-      sync_spread: 0.25,
-      // Every bipolar control below defaults to zero while its slider minimum
-      // is negative. An unlisted key falls back to that minimum, so omitting
-      // any of these makes a double-click "reset" author a hard negative
-      // extreme instead of the neutral value.
-      fb_rotate: 0,
-      fb_offset_x: 0,
-      fb_offset_y: 0,
-      fb_hue_rotate: 0,
-      slit_angle: 0,
-      loom_phase: 0,
-      loom_angle: 0,
-      // Explicitly zero: the fallback for an unlisted key is the slider's
-      // minimum, and this control's minimum is -1, so omitting it would make
-      // a double-click reset author full negative bias.
-      sync_bias: 0,
-    };
+    const defaults = TEMPORAL_PARAM_DEFAULTS;
     slider.value = defaults[param] ?? min;
 
     slider.addEventListener('input', () => {
@@ -7882,3 +7897,221 @@ const rangeEditorObserver = new MutationObserver((records) => {
   }
 });
 rangeEditorObserver.observe(document.body, { childList: true, subtree: true });
+
+// ===== B15: control search, filters, and help ============================
+// Entirely client-side over data the panel already holds: no new wire action,
+// no engine round trip, nothing asked of the render thread. A filtered-out
+// control is *hidden*, never disabled — clearing the query restores every row
+// exactly as it was, and a hidden control that a route drives keeps being
+// driven.
+//
+// Cost discipline: the index walks the DOM only when the filter criteria
+// change, or on a snapshot while a filter is actually engaged. With no filter
+// active the 30 Hz state packet does no extra work at all.
+
+const CONTROL_SEARCH = { query: '', moving: false, changed: false };
+
+// The panel's row families, paired with the help table's scope keys.
+const CONTROL_SCOPE_ATTRS = [
+  ['param', 'master'],
+  ['temporal', 'temporal'],
+  ['ntsc', 'ntsc'],
+];
+
+const CONTROL_DEFAULT_TABLES = {
+  master: () => MASTER_PARAM_DEFAULTS,
+  temporal: () => TEMPORAL_PARAM_DEFAULTS,
+  ntsc: () => NTSC_PARAM_DEFAULTS,
+};
+
+let controlRouteTargets = [];
+
+function controlHelpFor(scope, param) {
+  const table = (window.CONTROL_HELP || {})[scope];
+  return (table && table[param]) || '';
+}
+
+// The engine's modulation target naming, transcribed as three rules rather
+// than a two-hundred-entry table. A target these rules cannot map simply
+// lights nothing — they never light the wrong row, because every rule is an
+// exact string equality.
+function routeDrivesControl(target, scope, param) {
+  if (target === param) return true;
+  if (scope !== 'temporal') return false;
+  if (target === `temporal_${param}`) return true;
+  return param.startsWith('disp_') && target === `display_${param.slice(5)}`;
+}
+
+function controlRowIsChanged(entry) {
+  const table = CONTROL_DEFAULT_TABLES[entry.scope]?.() || {};
+  const slider = entry.row.querySelector('input[type="range"]');
+  if (slider) {
+    const min = Number(entry.row.dataset.min ?? slider.min ?? 0);
+    const fallback = Number(table[entry.param] ?? min);
+    return Math.abs(Number(slider.value) - fallback) > 1e-6;
+  }
+  const checkbox = entry.row.querySelector('input[type="checkbox"]');
+  if (checkbox) return checkbox.checked !== Boolean(table[entry.param] ?? false);
+  const select = entry.row.querySelector('select');
+  if (select) {
+    const authored = select.querySelector('option[selected]');
+    return authored ? select.value !== authored.value : false;
+  }
+  const number = entry.row.querySelector('input[type="number"]');
+  if (number && table[entry.param] !== undefined) {
+    return Math.abs(Number(number.value) - Number(table[entry.param])) > 1e-6;
+  }
+  return false;
+}
+
+function buildControlIndex() {
+  const rows = [];
+  document.querySelectorAll('#master-fx .param-row').forEach((row) => {
+    let scope = null;
+    let param = null;
+    for (const [attr, name] of CONTROL_SCOPE_ATTRS) {
+      if (row.dataset[attr]) {
+        scope = name;
+        param = row.dataset[attr];
+        break;
+      }
+    }
+    if (!scope) return;
+    const group = row.closest('.fx-group');
+    const section = row.closest('details.temporal-study');
+    const groupLabel =
+      group?.querySelector('.group-label')?.textContent
+      || group?.querySelector('summary')?.textContent
+      || '';
+    const sectionLabel = section?.querySelector('summary')?.textContent || '';
+    const label = row.querySelector('label')?.textContent || '';
+    const help = controlHelpFor(scope, param);
+    // The help sentence rides the row as a native tooltip. It costs no layout
+    // and screen readers announce it, which an inline expander would not do
+    // for a control the operator is already focused on.
+    if (help && row.title !== help) row.title = help;
+    rows.push({
+      row,
+      group,
+      scope,
+      param,
+      haystack: `${label} ${groupLabel} ${sectionLabel} ${param} ${help}`.toLowerCase(),
+    });
+  });
+  return rows;
+}
+
+function controlFilterEngaged() {
+  return (
+    CONTROL_SEARCH.query.trim() !== ''
+    || CONTROL_SEARCH.moving
+    || CONTROL_SEARCH.changed
+  );
+}
+
+function applyControlFilter() {
+  const countEl = document.getElementById('control-search-count');
+  const engaged = controlFilterEngaged();
+  const index = buildControlIndex();
+  const groups = new Set();
+
+  if (!engaged) {
+    for (const entry of index) {
+      entry.row.classList.remove('control-hidden');
+      if (entry.group) groups.add(entry.group);
+    }
+    for (const group of groups) group.classList.remove('control-hidden');
+    if (countEl && countEl.textContent !== '') countEl.textContent = '';
+    return;
+  }
+
+  const query = CONTROL_SEARCH.query.trim().toLowerCase();
+  let shown = 0;
+  for (const entry of index) {
+    let visible = true;
+    if (query && !entry.haystack.includes(query)) visible = false;
+    if (visible && CONTROL_SEARCH.moving) {
+      visible = controlRouteTargets.some((target) =>
+        routeDrivesControl(target, entry.scope, entry.param));
+    }
+    if (visible && CONTROL_SEARCH.changed) visible = controlRowIsChanged(entry);
+    entry.row.classList.toggle('control-hidden', !visible);
+    if (visible) shown += 1;
+    if (entry.group) groups.add(entry.group);
+  }
+  // A group with nothing left is hidden too, so the column does not become a
+  // list of empty headings.
+  for (const group of groups) {
+    group.classList.toggle('control-hidden', !group.querySelector('.param-row:not(.control-hidden)'));
+  }
+  const text = `${shown}`;
+  if (countEl && countEl.textContent !== text) countEl.textContent = text;
+}
+
+// Refresh the compiled route list from the snapshot the panel already
+// receives. MOVING is derived from this and nothing else.
+function syncControlFilters(modulation) {
+  const routings = (modulation && modulation.routings) || [];
+  const targets = routings
+    .map((routing) => routing && routing.target)
+    .filter((target) => typeof target === 'string');
+  const changed =
+    targets.length !== controlRouteTargets.length
+    || targets.some((target, i) => target !== controlRouteTargets[i]);
+  if (changed) controlRouteTargets = targets;
+  // Values move constantly, so CHANGED has to re-evaluate on every packet —
+  // but only while it is actually engaged.
+  if (CONTROL_SEARCH.changed || (changed && CONTROL_SEARCH.moving)) applyControlFilter();
+}
+
+(function bindControlSearch() {
+  const input = document.getElementById('control-search');
+  const moving = document.getElementById('filter-moving');
+  const changed = document.getElementById('filter-changed');
+  if (!input) return;
+
+  input.addEventListener('input', () => {
+    CONTROL_SEARCH.query = input.value;
+    applyControlFilter();
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      // Escape clears the query rather than bubbling: while a search is open
+      // that is what the key plainly means here.
+      event.stopPropagation();
+      if (input.value !== '') {
+        input.value = '';
+        CONTROL_SEARCH.query = '';
+        applyControlFilter();
+      } else {
+        input.blur();
+      }
+    }
+  });
+
+  const toggle = (button, key) => {
+    button?.addEventListener('click', () => {
+      CONTROL_SEARCH[key] = !CONTROL_SEARCH[key];
+      button.setAttribute('aria-pressed', CONTROL_SEARCH[key] ? 'true' : 'false');
+      applyControlFilter();
+    });
+  };
+  toggle(moving, 'moving');
+  toggle(changed, 'changed');
+
+  // `/` focuses the search, unless the operator is already typing somewhere.
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey) return;
+    const active = document.activeElement;
+    const typing =
+      active
+      && (active.tagName === 'INPUT'
+        || active.tagName === 'TEXTAREA'
+        || active.tagName === 'SELECT'
+        || active.isContentEditable);
+    if (typing) return;
+    event.preventDefault();
+    input.focus();
+    input.select();
+  });
+})();
