@@ -33,7 +33,7 @@ second full-frame history ring.
 | B10 — modulation source expansion | **Complete** | `docs/evidence/b10-mod-sources-note.md`; CLAUDE.md "B10 performance sources" |
 | B11 — the monitoring bay | **Complete** | `docs/evidence/b11-monitoring-bay-note.md`; CLAUDE.md "The B11 monitoring bay" |
 | B6 — the corruption trio | **Complete** | `docs/evidence/b6-corruption-trio-note.md`; CLAUDE.md "The B6 corruption trio" |
-| B15 — ergonomics + snapshot bank | Open — **the closing tranche** | — |
+| B15 — ergonomics + snapshot bank | **Half landed** | search, filters, and per-control help in `docs/evidence/b15-panel-ergonomics-note.md`; the snapshot bank and Dice keep-masks remain |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in

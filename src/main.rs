@@ -12,6 +12,7 @@ mod audio;
 mod block_dct;
 mod codec_mosh;
 mod composition;
+mod control_help;
 mod controller_profile;
 mod display_physics;
 mod effects;

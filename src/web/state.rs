@@ -7152,23 +7152,35 @@ mod protocol_tests {
     }
 
     #[test]
-    fn every_temporal_default_agrees_between_the_markup_and_the_reset_table() {
+    fn every_panel_default_agrees_between_the_markup_and_the_reset_table() {
         let html = include_str!("../../static/index.html");
         let js = include_str!("../../static/app.js");
 
-        // The reset table the temporal binder uses.
-        let table = js
-            .split("const defaults = {")
-            .find(|chunk| chunk.contains("fb_zoom: 1,"))
-            .and_then(|chunk| chunk.split("};").next())
-            .expect("the temporal defaults table must exist");
-        let listed = |param: &str| -> Option<f64> {
-            table.lines().find_map(|line| {
-                let line = line.trim();
-                let rest = line.strip_prefix(param)?.strip_prefix(':')?;
-                rest.trim().trim_end_matches(',').parse::<f64>().ok()
-            })
+        let table_for = |name: &str| -> &str {
+            js.split(&format!("const {name} = Object.freeze({{"))
+                .nth(1)
+                .and_then(|chunk| chunk.split("});").next())
+                .unwrap_or_else(|| panic!("the {name} table must exist"))
         };
+        // The tables pack several entries per line and carry comments, so parse
+        // comma-separated pairs rather than lines. The `:` guard stops a short
+        // key matching the prefix of a longer one.
+        let listed_in = |table: &str, param: &str| -> Option<f64> {
+            table
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .flat_map(|line| line.split(','))
+                .find_map(|chunk| {
+                    let rest = chunk.trim().strip_prefix(param)?.strip_prefix(':')?;
+                    rest.trim().parse::<f64>().ok()
+                })
+        };
+
+        let families = [
+            ("data-param", "MASTER_PARAM_DEFAULTS"),
+            ("data-temporal", "TEMPORAL_PARAM_DEFAULTS"),
+            ("data-ntsc", "NTSC_PARAM_DEFAULTS"),
+        ];
 
         let mut compared = 0usize;
         let mut disagreements: Vec<String> = Vec::new();
@@ -7177,7 +7189,14 @@ mod protocol_tests {
                 Some(end) => &row[..end],
                 None => continue,
             };
-            let Some(param) = attribute(row, "data-temporal") else {
+            let Some((attr, table_name)) = families
+                .iter()
+                .find(|(attr, _)| attribute(row, attr).is_some())
+            else {
+                continue;
+            };
+            let table = table_for(table_name);
+            let Some(param) = attribute(row, attr) else {
                 continue;
             };
             // Only range rows have a reset fallback at all.
@@ -7201,23 +7220,115 @@ mod protocol_tests {
                 continue;
             };
 
-            let effective = listed(&param).unwrap_or(min);
+            let effective = listed_in(table, &param).unwrap_or(min);
             if (effective - shown).abs() >= 1.0e-6 {
                 disagreements.push(format!(
-                    "{param}: panel shows {shown}, reset would send {effective} (min {min})"
+                    "{attr} {param}: panel shows {shown}, reset would send {effective} (min {min})"
                 ));
             }
             compared += 1;
         }
         assert!(
-            compared > 40,
-            "only {compared} temporal rows were compared; the parser stopped matching the markup"
+            compared > 100,
+            "only {compared} rows were compared; the parser stopped matching the markup"
         );
         assert!(
             disagreements.is_empty(),
-            "these temporal controls reset to the wrong value; add them to \
-             the defaults table:\n  {}",
+            "these controls reset to the wrong value; add them to their \
+             defaults table:\n  {}",
             disagreements.join("\n  ")
+        );
+    }
+
+    /// B15's search and filters are a *view* over data the panel already
+    /// holds. The load-bearing claim is that they cost the engine nothing:
+    /// no wire action, no round trip, and no work at all on a state packet
+    /// while no filter is engaged.
+    #[test]
+    fn control_search_is_client_side_accessible_and_sends_nothing() {
+        let html = include_str!("../../static/index.html");
+        let js = include_str!("../../static/app.js");
+        let css = include_str!("../../static/style.css");
+
+        for contract in [
+            "id=\"control-search\"",
+            "id=\"filter-moving\"",
+            "id=\"filter-changed\"",
+            "id=\"control-search-count\"",
+            "role=\"search\"",
+            "aria-pressed=\"false\"",
+            "aria-label=\"Search master controls by name, section, or help text\"",
+        ] {
+            assert!(
+                html.contains(contract),
+                "missing search contract: {contract}"
+            );
+        }
+        assert!(
+            css.contains(".control-hidden"),
+            "the filter needs a hiding rule"
+        );
+        assert!(
+            css.contains(".control-filter[aria-pressed=\"true\"]"),
+            "an engaged filter must look engaged"
+        );
+
+        // The whole feature lives in one block, and that block must never
+        // dispatch. If search ever needs the engine, this test is the place
+        // that decision gets made deliberately.
+        let block = js
+            .split("// ===== B15: control search, filters, and help")
+            .nth(1)
+            .expect("the search engine block must exist");
+        assert!(
+            !block.contains("sendAction("),
+            "control search must not dispatch a wire action"
+        );
+        assert!(
+            !block.contains("ws.send"),
+            "control search must not touch the socket"
+        );
+
+        // The three transcribed target rules, and nothing more: an unmappable
+        // target must light nothing rather than light the wrong row.
+        assert!(block.contains("if (target === param) return true;"));
+        assert!(block.contains("target === `temporal_${param}`"));
+        assert!(block.contains("`display_${param.slice(5)}`"));
+
+        // Idle cost: a state packet does nothing unless a filter is engaged.
+        assert!(
+            block.contains("if (CONTROL_SEARCH.changed || (changed && CONTROL_SEARCH.moving)) applyControlFilter();"),
+            "an idle filter must not walk the DOM on every 30 Hz packet"
+        );
+        // Hidden, never disabled.
+        assert!(block.contains("classList.toggle('control-hidden'"));
+        // The slash shortcut yields to any field the operator is typing in.
+        assert!(block.contains("if (event.key !== '/'"));
+        assert!(block.contains("active.isContentEditable"));
+
+        // Help reaches the rows as native tooltips, from the generated table.
+        assert!(block.contains("window.CONTROL_HELP"));
+        assert!(block.contains("row.title = help"));
+
+        // The filter is wired to the packet the panel already receives.
+        assert!(
+            js.contains("syncControlFilters(msg.modulation);"),
+            "MOVING is derived from the compiled route table in the snapshot"
+        );
+    }
+
+    /// The generated help asset must actually be reachable, or the panel's
+    /// tooltips and its search corpus are both empty.
+    #[test]
+    fn the_generated_help_asset_is_served() {
+        let files = include_str!("static_files.rs");
+        assert!(
+            files.contains("\"help.js\" =>"),
+            "help.js must be served alongside the other panel assets"
+        );
+        assert!(
+            files.contains("crate::control_help::panel_javascript"),
+            "the served help must be generated from the Rust table, never a second copy"
         );
     }
 

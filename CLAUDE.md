@@ -43,6 +43,7 @@ src/
 ├── display_physics.rs   B4 display-physics law: fields, phosphor, display model CPU reference
 ├── mixing_boundary.rs   B8 mixing-boundary law: wipes, blend meet, dirty mixer, melt CPU reference
 ├── sync_latch.rs        B14 sync-latch law: deterministic shear draws, the bounded per-line table
+├── control_help.rs      B15 per-control help: the one table the panel and the native editor share
 ├── block_dct.rs         B6 Block DCT law: DCT-II CPU reference, quantiser, chroma crush
 ├── filter_avalanche.rs  B6 Filter Avalanche law: predictors, deterministic lanes, cascade reference
 ├── pixel_sort.rs        B6 Pixel Sort law: bounded bright-run search CPU reference
@@ -2086,6 +2087,61 @@ that a disabled collider is byte-identical to exact M4 — plus
 26.7.1). Cross-platform portability rests on hosted three-platform CI, not on
 that adapter.
 
+### B15 panel ergonomics
+
+More parameters than BENDR's 404 and, until now, no way to find one. The
+first half of the closing tranche is a way to find a control and a sentence
+explaining what it does.
+
+**One help table, two consumers.** `src/control_help.rs` holds 187 entries
+covering every `data-param`, `data-temporal`, and `data-ntsc` row the panel
+shows, keyed by the wire parameter name. The browser's copy is *generated*
+from it by `panel_javascript` and served as `help.js`; the native patch
+editor hovers the same entries through `help_for_any`. Two hand-kept copies
+would drift the first time a law changed, so there is exactly one — the
+shared-parse-table law applied to prose. Coverage is proven against the
+shipped markup: `every_panel_control_row_has_help_and_no_entry_is_an_orphan`
+fails both for a visible control with no sentence and for an entry describing
+a control that no longer exists, and the generated asset escapes `<`, `>`,
+and `&` so no entry can close the script tag.
+
+**Search and filters are a view, not a feature of the engine.** `/` focuses a
+search over control name, section, and help text; MOVING narrows to controls
+a route currently drives; CHANGED narrows to controls away from their
+default. There is **no new wire action, no round trip, and nothing asked of
+the render thread** — the contract test asserts the whole block contains
+neither `sendAction(` nor `ws.send`. A filtered-out control is hidden, never
+disabled: a route driving a hidden control keeps driving it. The index walks
+the DOM only when the filter criteria change, or on a snapshot while a filter
+is engaged, so an idle panel does no extra work on the 30 Hz packet.
+
+**Matching is split in two.** Identity text (label, section, parameter name)
+takes a plain substring, so `phos` finds Persistence Red; help prose takes a
+**word-start** match, because a substring over sentences is noise — `gain`
+otherwise matches *against*. MOVING transcribes the engine's target naming as
+three exact-equality rules (`target == param`, `temporal_` + param,
+`display_` + the `disp_` tail) rather than a two-hundred-entry map, so a
+target the rules cannot place lights nothing rather than the wrong row.
+CHANGED reads the same hoisted default tables the double-click reset uses, and
+where the panel genuinely does not know a default it reports *not changed*
+rather than guessing.
+
+**The reset-default law.** The binder resolves a reset as
+`defaults[param] ?? min`, which is correct where a default *is* the minimum
+and silently wrong for every bipolar control. Ten were shipping that way —
+`loom_phase` reset to −1000 — and are now listed explicitly.
+`every_panel_default_agrees_between_the_markup_and_the_reset_table` closes the
+class: the panel states each default twice (the value span the operator sees,
+and the reset table a double-click sends), and the test compares them for
+every range row in all three families. **Any new control whose default is not
+its slider minimum must appear in its family's table**, or that test fails.
+
+Pins do not move: `index.html` stays **202** (the search input is
+`type="search"`), `app.js` template tags stay **24**, `GENERATOR_VERSION`
+stays "12", the sidecar schema stays 6, and the renderer texture floor stays
+30. The tranche adds no pass, no uniform, and no shader, so no exactness
+re-measurement applies.
+
 ### B14 the sync latch
 
 "A model that always recovers is a model that cannot actually break."
@@ -3649,6 +3705,25 @@ mislead browser tests.
   comb, closed-form decay, blackout clearing the wake), and
   `render_display_physics_pipeline` is the labeled export case with its
   `_flat` difference and `_repeat` determinism assertions.
+- Panel-ergonomics tests must cover the help table (entry uniqueness within a
+  scope, a prose floor that rejects a label masquerading as help, lookup by
+  scope and by bare name with cross-scope resolution refused, the generated
+  table's shape and its escaping of `<`/`>`/`&` and control characters,
+  coverage against every `data-param`/`data-temporal`/`data-ntsc` row in the
+  shipped markup with orphan entries rejected, and `help.js` loading before
+  `app.js`), the search contract (the block containing neither `sendAction(`
+  nor `ws.send`, the three transcribed MOVING rules, the idle-cost line that
+  keeps a state packet free while no filter is engaged, hidden-never-disabled,
+  the slash shortcut yielding to any field being typed in, and the tooltip
+  source), the generated asset actually being served from the Rust table, and
+  `every_panel_default_agrees_between_the_markup_and_the_reset_table` across
+  master, temporal, and NTSC — which is the guard that keeps a new bipolar
+  control from shipping a reset to its own minimum. The JavaScript itself has
+  no runner in this tree, so its behaviour is proven by driving the live panel
+  (tooltips present at load, identity-substring versus help-word-start
+  matching, a no-match query emptying every group, CHANGED empty on a pristine
+  program, and MOVING resolving all six rules while refusing both unmappable
+  cases).
 - Sync-latch tests must cover the exact-off default and the wake law
   (neither control alone wakes the stage, and the switch alone never wakes an
   inert one), hostile neutral sanitize with out-of-range clamping, the band

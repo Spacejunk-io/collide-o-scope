@@ -330,6 +330,17 @@
           <span class="ws-dot" id="ws-status" title="connecting..."></span>
         </div>
         <h3 class="panel-title">Master Effects</h3>
+        <div class="control-search" role="search">
+          <input type="search" id="control-search" class="control-search-input"
+                 placeholder="Search controls" autocomplete="off" spellcheck="false"
+                 aria-label="Search master controls by name, section, or help text"
+                 aria-describedby="control-search-count">
+          <button type="button" class="control-filter" id="filter-moving" aria-pressed="false"
+                  title="Show only controls a modulation route currently drives">MOVING</button>
+          <button type="button" class="control-filter" id="filter-changed" aria-pressed="false"
+                  title="Show only controls sitting away from their default">CHANGED</button>
+          <span class="control-search-count" id="control-search-count" role="status"></span>
+        </div>
         <div class="fx-scroll" id="master-fx">
           <div class="fx-columns">
           <div class="fx-col" data-fx-column="video"><!-- video effects -->
@@ -1948,6 +1959,9 @@
     </main>
   </div>
 
+  <!-- The help table is generated from src/control_help.rs and must load
+       before app.js, which indexes it for search and tooltips. -->
+  <script src="help.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -2524,3 +2524,67 @@ select:focus-visible,
   }
   .library-item { min-height: 88px; }
 }
+
+/* B15 control search and filters. Entirely client-side over data the panel
+   already holds, so this is presentation only: no control it hides is
+   disabled, and clearing the query restores every row untouched. */
+.control-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px 4px 6px;
+  flex-wrap: wrap;
+}
+
+.control-search-input {
+  flex: 1 1 120px;
+  min-width: 96px;
+  background: var(--bg-input, #1a1a22);
+  border: 1px solid var(--border, #2a2a35);
+  border-radius: 3px;
+  color: var(--text, #d8d8dc);
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
+.control-search-input:focus {
+  outline: none;
+  border-color: #5a8fe6;
+}
+
+.control-filter {
+  background: transparent;
+  border: 1px solid var(--border, #2a2a35);
+  border-radius: 3px;
+  color: var(--text-dim, #6a6a78);
+  cursor: pointer;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  padding: 3px 6px;
+}
+
+.control-filter:hover { color: var(--text, #d8d8dc); }
+
+.control-filter[aria-pressed="true"] {
+  border-color: #5a8fe6;
+  color: #7aa8f0;
+}
+
+.control-search-count {
+  color: var(--text-dim, #6a6a78);
+  font-size: 9px;
+  min-width: 34px;
+  text-align: right;
+}
+
+/* A row or group the current filter excludes. Hidden rather than dimmed:
+   the point of the filter is to make the remaining set scannable. */
+.control-hidden { display: none !important; }
+
+/* The help sentence, revealed under a row on demand. */
+.control-help {
+  color: var(--text-dim, #6a6a78);
+  font-size: 10px;
+  line-height: 1.35;
+  padding: 2px 0 4px 0;
+}
