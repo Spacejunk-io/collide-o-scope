@@ -1510,6 +1510,12 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                     // downbeat would rewrite the recorded stream.
                     | WebAction::GestureSample { .. }
                     | WebAction::SetGestureRecording { .. }
+                    // The B9 transports are the same class of barrier: an
+                    // arm/disarm edge held for a downbeat would attach a take
+                    // decision to the wrong stretch of program time.
+                    | WebAction::SetPerformanceRecording { .. }
+                    | WebAction::SetPerformancePlayback { .. }
+                    | WebAction::ClearPerformanceTake
                     | WebAction::SetMotionDonor { .. }
                     | WebAction::SetMotionColliderInput { .. }
                     | WebAction::ClearMotionMemory
@@ -2053,6 +2059,16 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             layer_stack_revision,
             ..
         } => *layer_stack_revision != 0,
+        // The B9 transports carry the same ingress revision protection.
+        WebAction::SetPerformanceRecording {
+            layer_stack_revision,
+            ..
+        }
+        | WebAction::SetPerformancePlayback {
+            layer_stack_revision,
+            ..
+        } => *layer_stack_revision != 0,
+        WebAction::ClearPerformanceTake => true,
         WebAction::SetGestureCanvas { param, value } => {
             valid_identifier(param, 64) && valid_gesture_canvas_edit(param, value)
         }
@@ -4958,6 +4974,64 @@ mod tests {
             },
             0
         ));
+    }
+
+    #[test]
+    fn performance_transports_are_revision_guarded_and_never_latchable() {
+        // The B9 transports carry the gesture barrier's exact ingress law: a
+        // zero revision is never a live program, and a latched arm/disarm
+        // edge would attach a take decision to the wrong stretch of program
+        // time.
+        assert!(valid_action(
+            &WebAction::SetPerformanceRecording {
+                enabled: true,
+                layer_stack_revision: 7,
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::SetPerformanceRecording {
+                enabled: true,
+                layer_stack_revision: 0,
+            },
+            0
+        ));
+        assert!(valid_action(
+            &WebAction::SetPerformancePlayback {
+                enabled: true,
+                loop_playback: true,
+                layer_stack_revision: 7,
+            },
+            0
+        ));
+        assert!(!valid_action(
+            &WebAction::SetPerformancePlayback {
+                enabled: true,
+                loop_playback: true,
+                layer_stack_revision: 0,
+            },
+            0
+        ));
+        assert!(valid_action(&WebAction::ClearPerformanceTake, 0));
+        for inner in [
+            WebAction::SetPerformanceRecording {
+                enabled: true,
+                layer_stack_revision: 7,
+            },
+            WebAction::SetPerformancePlayback {
+                enabled: true,
+                loop_playback: false,
+                layer_stack_revision: 7,
+            },
+            WebAction::ClearPerformanceTake,
+        ] {
+            assert!(!valid_action(
+                &WebAction::Quantized {
+                    inner: Box::new(inner),
+                },
+                0
+            ));
+        }
     }
 
     /// The authored canvas vocabulary is closed, finite-bounded, and contains

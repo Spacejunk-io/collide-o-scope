@@ -295,6 +295,7 @@ function connect() {
         syncOscRuntime(msg.osc_runtime);
         syncTemporal(msg.temporal);
         syncGesture(msg.gesture);
+        syncPerformanceRecorder(msg.performance_recorder);
         syncMasterMotion(msg.master_motion);
         syncSpout(msg.spout);
         syncRemote(msg.remote_url);
@@ -2616,6 +2617,109 @@ function syncGesture(gesture) {
     checksumEl.textContent = g.checksum
       ? `Recorded track ${String(g.checksum).slice(0, 16)}… · replayable`
       : 'No recorded track';
+  }
+}
+
+// --- B9 performance recorder ------------------------------------------
+// Both transports are ordered barriers carrying the layer-stack revision;
+// the loop flag rides the playback arm so a repeated arm only retunes it.
+let performanceMode = 'off';
+let performanceLoop = false;
+
+document.getElementById('performance-record-toggle')?.addEventListener('click', () => {
+  sendAction({
+    action: 'set_performance_recording',
+    enabled: performanceMode !== 'recording',
+    layer_stack_revision: layerStackRevision,
+  });
+});
+
+document.getElementById('performance-play-toggle')?.addEventListener('click', () => {
+  sendAction({
+    action: 'set_performance_playback',
+    enabled: performanceMode !== 'playing',
+    loop_playback: performanceLoop,
+    layer_stack_revision: layerStackRevision,
+  });
+});
+
+document.getElementById('performance-loop-toggle')?.addEventListener('click', () => {
+  performanceLoop = !performanceLoop;
+  const loopEl = document.getElementById('performance-loop-toggle');
+  if (loopEl) loopEl.setAttribute('aria-pressed', performanceLoop ? 'true' : 'false');
+  if (performanceMode === 'playing') {
+    sendAction({
+      action: 'set_performance_playback',
+      enabled: true,
+      loop_playback: performanceLoop,
+      layer_stack_revision: layerStackRevision,
+    });
+  }
+});
+
+document.getElementById('performance-clear')?.addEventListener('click', () => {
+  sendAction({ action: 'clear_performance_take' });
+});
+
+function syncPerformanceRecorder(recorder) {
+  const p = recorder || {};
+  performanceMode = String(p.mode || 'off');
+  if (performanceMode === 'playing') performanceLoop = Boolean(p.loop_playback);
+
+  const record = document.getElementById('performance-record-toggle');
+  if (record) {
+    const recording = performanceMode === 'recording';
+    record.textContent = recording ? 'Disarm recording' : 'Arm recording';
+    record.setAttribute('aria-pressed', recording ? 'true' : 'false');
+  }
+  const play = document.getElementById('performance-play-toggle');
+  if (play) {
+    const playing = performanceMode === 'playing';
+    play.textContent = playing ? 'Stop playback' : 'Play take';
+    play.setAttribute('aria-pressed', playing ? 'true' : 'false');
+  }
+  const loop = document.getElementById('performance-loop-toggle');
+  if (loop) loop.setAttribute('aria-pressed', performanceLoop ? 'true' : 'false');
+
+  const stateEl = document.getElementById('performance-state');
+  if (stateEl) {
+    const mode =
+      performanceMode === 'recording'
+        ? 'Recording take'
+        : performanceMode === 'playing'
+          ? `Playing take · tick ${Number(p.playhead_tick) || 0}`
+          : 'Recorder off';
+    const status = p.status ? ` · ${p.status}` : '';
+    stateEl.textContent = `${mode}${status}`;
+  }
+
+  const telemetryEl = document.getElementById('performance-telemetry');
+  if (telemetryEl) {
+    const events = Number(p.recorded_events) || 0;
+    const controls = Number(p.recorded_controls) || 0;
+    const ticks = Number(p.length_ticks) || 0;
+    const truncated = p.truncated ? ' (capped)' : '';
+    const skipped = Number(p.unsupported_edits) || 0;
+    const rejected = Number(p.rejected_edits) || 0;
+    const counted =
+      skipped || rejected ? ` · ${skipped + rejected} edit(s) skipped as unrecordable` : '';
+    telemetryEl.textContent =
+      `${events} recorded edit(s)${truncated} · ${controls} control(s) · ${ticks} tick(s)${counted}`;
+  }
+
+  const checksumEl = document.getElementById('performance-checksum');
+  if (checksumEl) {
+    checksumEl.textContent = p.checksum
+      ? `Take ${String(p.checksum).slice(0, 16)}… · replayable`
+      : 'No recorded take';
+  }
+
+  const degradedEl = document.getElementById('performance-degraded');
+  if (degradedEl) {
+    const degraded = Array.isArray(p.degraded) ? p.degraded : [];
+    degradedEl.textContent = degraded.length
+      ? `Degraded control(s): ${degraded.join(', ')}`
+      : '';
   }
 }
 

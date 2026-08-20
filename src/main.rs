@@ -1,4 +1,12 @@
-#![allow(deprecated)] // egui 0.34 deprecation warnings for panel API renames
+#![allow(deprecated)]
+// egui 0.34 deprecation warnings for panel API renames
+// Rust 1.98.0 (CI installs stable fresh) introduced these two style lints,
+// which fire on ~50 established pixel-processing, readback, and planner
+// sites. Migrating them is behavior-neutral but churns frozen, receipt-pinned
+// code for no pixel or safety gain, so the migration is deferred to its own
+// deliberate change rather than riding an unrelated tranche.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+#![allow(clippy::map_or_identity)]
 
 mod audio;
 mod codec_mosh;
@@ -26,6 +34,7 @@ mod patch;
 mod pattern_synth;
 mod performance;
 mod performance_runtime;
+mod performance_track;
 mod precision;
 mod preset;
 mod procedural;
@@ -282,6 +291,121 @@ enum WebActionBatchDisposition {
     /// authored values or topology. Layer and group creative edits remain
     /// independent and retain their ordering.
     MasterVisualReset,
+}
+
+/// The raw value carrier one recordable action holds, before the address law
+/// quantizes it. JSON-valued actions are interpreted under the address's
+/// declared law, so one carrier serves every family.
+#[derive(Debug, Clone)]
+enum PerformanceActionValue {
+    Json(serde_json::Value),
+    Float(f32),
+    Bool(bool),
+}
+
+impl PerformanceActionValue {
+    /// Interpret the carrier under the address's declared law. `None` is a
+    /// counted refusal, never a guessed neutral.
+    fn raw_under(
+        &self,
+        law: &performance_track::PerformanceValueLaw,
+    ) -> Option<performance_track::PerformanceRawValue> {
+        use performance_track::{PerformanceRawValue as Raw, PerformanceValueLaw as Law};
+        match (law, self) {
+            (Law::Unit { .. }, Self::Json(value)) => {
+                value.as_f64().map(|number| Raw::Continuous(number as f32))
+            }
+            (Law::Unit { .. }, Self::Float(value)) => Some(Raw::Continuous(*value)),
+            (Law::Toggle, Self::Json(value)) => value.as_bool().map(Raw::Toggle),
+            (Law::Toggle, Self::Bool(value)) => Some(Raw::Toggle(*value)),
+            (Law::Discrete { .. }, Self::Json(value)) => {
+                value.as_str().map(|token| Raw::Token(token.to_string()))
+            }
+            (Law::Stepped { .. }, Self::Json(value)) => value.as_i64().map(Raw::Integer),
+            _ => None,
+        }
+    }
+}
+
+/// One recordable edit staged at the dispatch seam, waiting for the
+/// frame-acceptance gate to stamp its tick and commit it.
+#[derive(Debug, Clone)]
+struct PendingPerformanceEdit {
+    control: performance_track::PerformanceControl,
+    law: performance_track::PerformanceValueLaw,
+    raw: performance_track::PerformanceRawValue,
+}
+
+/// One compiled replay entry: either a ready-to-dispatch action, or a named
+/// degradation for an address the current program cannot resolve. Degraded
+/// events are held as no-ops rather than retargeted — the stale-ID law.
+#[derive(Debug, Clone)]
+enum CompiledPerformanceEvent {
+    Dispatch(web::state::WebAction),
+    Degraded,
+}
+
+/// The live replay session. Everything is captured at arm — the take, the
+/// compiled dispatch table, and the per-address diagnostics — so a topology
+/// change mid-playback degrades through the engine's own stable-ID refusals
+/// instead of re-resolving against whatever now occupies a position.
+#[derive(Debug, Clone)]
+struct PerformancePlayback {
+    take: performance_track::PerformanceTake,
+    compiled: Vec<CompiledPerformanceEvent>,
+    cursor: performance_track::PerformanceCursor,
+    clock: performance_track::PerformanceClock,
+    loop_playback: bool,
+    /// Named per-address diagnostics resolved at arm, bounded and deduplicated.
+    degraded: Vec<String>,
+}
+
+/// Commit one accepted, program-advancing frame's staged performance edits
+/// and advance both B9 clocks. A free function over disjoint `App` fields
+/// because its call site holds a live renderer borrow; runs only inside the
+/// same acceptance gate the temporal and gesture recorders share, so a
+/// rejected or frozen frame neither consumes a tick nor records an edit.
+#[allow(clippy::too_many_arguments)]
+fn commit_performance_frame_fields(
+    recording: bool,
+    take: &mut performance_track::PerformanceTake,
+    clock: &mut performance_track::PerformanceClock,
+    pending: &mut Vec<PendingPerformanceEdit>,
+    playback: &mut Option<PerformancePlayback>,
+    checksum: &mut String,
+    status: &mut String,
+    rejected_edits: &mut u64,
+    program_delta: f32,
+) {
+    if recording {
+        let tick = clock.reference_tick_u32();
+        let mut take_changed = false;
+        for edit in pending.drain(..) {
+            match take.record_accepted(tick, edit.control, edit.law, &edit.raw) {
+                Ok(true) => take_changed = true,
+                Ok(false) => {
+                    take_changed = true;
+                    *status = format!(
+                        "Take reached its {}-event cap; newer edits remain live-only",
+                        performance_track::MAX_PERFORMANCE_EVENTS
+                    );
+                }
+                Err(error) => {
+                    *rejected_edits = rejected_edits.saturating_add(1);
+                    log::warn!("Performance edit refused: {error}");
+                }
+            }
+        }
+        if take_changed {
+            *checksum = take.checksum_hex();
+        }
+        clock.advance_accepted(program_delta);
+    } else {
+        pending.clear();
+    }
+    if let Some(playback) = playback.as_mut() {
+        playback.clock.advance_accepted(program_delta);
+    }
 }
 
 enum StagedPatchAudio {
@@ -1405,6 +1529,540 @@ fn bounded_motion_value(
         Err(format!(
             "motion parameter {param} must be between {minimum} and {maximum}"
         ))
+    }
+}
+
+/// The one temporal wire applier: the exact `set_temporal` match body,
+/// moved whole out of the action arm so the live handler and the B9
+/// export replay mutate a `TemporalParams` through identical code. The
+/// only App-context input is the pre-resolved Collision Score loop
+/// driver, which names a live layer and therefore stays at the live arm;
+/// offline replay never records that param, so it passes `None`.
+pub(crate) fn apply_temporal_wire_edit(
+    p: &mut effects::params::TemporalParams,
+    param: &str,
+    value: &serde_json::Value,
+    score_loop_driver: Option<temporal::CollisionScoreLoopDriver>,
+) {
+    match param {
+        "feedback" => {
+            if let Some(n) = value.as_f64() {
+                p.feedback = (n as f32).clamp(0.0, 0.95);
+            }
+        }
+        "fb_zoom" => {
+            if let Some(n) = value.as_f64() {
+                p.fb_zoom = (n as f32).clamp(0.9, 1.1);
+            }
+        }
+        "fb_rotate" => {
+            if let Some(n) = value.as_f64() {
+                p.fb_rotate = (n as f32).clamp(-5.0, 5.0);
+            }
+        }
+        "fb_offset_x" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.offset_x = (n as f32).clamp(-0.5, 0.5);
+            }
+        }
+        "fb_offset_y" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.offset_y = (n as f32).clamp(-0.5, 0.5);
+            }
+        }
+        "fb_reflect_x" => {
+            if let Some(flag) = value.as_bool() {
+                p.rig.reflect_x = flag;
+            }
+        }
+        "fb_reflect_y" => {
+            if let Some(flag) = value.as_bool() {
+                p.rig.reflect_y = flag;
+            }
+        }
+        "fb_hue_rotate" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.hue_rotate = (n as f32).clamp(-180.0, 180.0);
+            }
+        }
+        "fb_saturation" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.saturation = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "fb_gain_r" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.gain_r = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "fb_gain_g" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.gain_g = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "fb_gain_b" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.gain_b = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "fb_chroma_displace" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.chroma_displace = (n as f32).clamp(0.0, 0.05);
+            }
+        }
+        "fb_blur" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.blur = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "fb_sharpen" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.sharpen = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "fb_shape" => {
+            p.rig.shape = match value.as_str() {
+                Some("soft") => effects::params::FeedbackShape::Soft,
+                Some("wrap") => effects::params::FeedbackShape::Wrap,
+                Some("fold") => effects::params::FeedbackShape::Fold,
+                _ => effects::params::FeedbackShape::Clamp,
+            };
+        }
+        "fb_drive" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.drive = (n as f32).clamp(0.25, 4.0);
+            }
+        }
+        "fb_pivot" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.pivot = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "fb_threshold" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.threshold = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "fb_noise" => {
+            if let Some(n) = value.as_f64() {
+                p.rig.noise = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "fb_edge" => {
+            p.rig.edge = match value.as_str() {
+                Some("mirror") => motion::MotionBoundaryMode::Mirror,
+                Some("wrap") => motion::MotionBoundaryMode::Wrap,
+                Some("hold") => motion::MotionBoundaryMode::Hold,
+                _ => motion::MotionBoundaryMode::Transparent,
+            };
+        }
+        "fb_servo" => {
+            if let Some(flag) = value.as_bool() {
+                p.rig.servo = flag;
+            }
+        }
+        "fb_servo_defeated" => {
+            if let Some(flag) = value.as_bool() {
+                p.rig.servo_defeated = flag;
+            }
+        }
+        "disp_il_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.display.il_amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        // The B8 master melting edge's six continuous values.
+        "melt_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.melt.melt = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "melt_width" => {
+            if let Some(n) = value.as_f64() {
+                p.melt.width = (n as f32).clamp(0.0, 2.0);
+            }
+        }
+        "melt_hold" => {
+            if let Some(n) = value.as_f64() {
+                p.melt.hold = (n as f32).clamp(0.0, 1.5);
+            }
+        }
+        "melt_swirl" => {
+            if let Some(n) = value.as_f64() {
+                p.melt.swirl = (n as f32).clamp(-1.0, 1.0);
+            }
+        }
+        "melt_chroma" => {
+            if let Some(n) = value.as_f64() {
+                p.melt.chroma = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "melt_creep" => {
+            if let Some(n) = value.as_f64() {
+                p.melt.creep = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        // The B5 codec mosh's eight continuous values plus the
+        // discrete recycle law.
+        "mosh_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_key_removal" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.key_removal = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_hold" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.hold = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_drop" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.drop = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_shuffle" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.shuffle = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_rate" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.rate = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_bitrate_starve" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.bitrate_starve = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_resync" => {
+            if let Some(n) = value.as_f64() {
+                p.mosh.resync = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "mosh_recycle" => {
+            if let Some(flag) = value.as_bool() {
+                p.mosh.recycle = flag;
+            }
+        }
+        "disp_il_mode" => {
+            p.display.il_mode = match value.as_str() {
+                Some("bob") => display_physics::InterlaceMode::Bob,
+                Some("blend") => display_physics::InterlaceMode::Blend,
+                _ => display_physics::InterlaceMode::Weave,
+            };
+        }
+        "disp_il_order" => {
+            if let Some(flag) = value.as_bool() {
+                p.display.il_order = flag;
+            }
+        }
+        "disp_il_twitter" => {
+            if let Some(n) = value.as_f64() {
+                p.display.il_twitter = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_il_judder" => {
+            if let Some(n) = value.as_f64() {
+                p.display.il_judder = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_phosphor" => {
+            if let Some(n) = value.as_f64() {
+                p.display.phosphor = (n as f32).clamp(0.0, 0.95);
+            }
+        }
+        "disp_phos_r" => {
+            if let Some(n) = value.as_f64() {
+                p.display.phos_r = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_phos_g" => {
+            if let Some(n) = value.as_f64() {
+                p.display.phos_g = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_phos_b" => {
+            if let Some(n) = value.as_f64() {
+                p.display.phos_b = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_model" => {
+            p.display.model = match value.as_str() {
+                Some("aperture_grille") => display_physics::DisplayModel::ApertureGrille,
+                Some("slot_mask") => display_physics::DisplayModel::SlotMask,
+                Some("shadow_mask") => display_physics::DisplayModel::ShadowMask,
+                Some("lcd_stripe") => display_physics::DisplayModel::LcdStripe,
+                Some("mono") => display_physics::DisplayModel::Mono,
+                Some("green_screen") => display_physics::DisplayModel::GreenScreen,
+                _ => display_physics::DisplayModel::Flat,
+            };
+        }
+        "disp_scanlines" => {
+            if let Some(n) = value.as_f64() {
+                p.display.scanlines = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_beam_width" => {
+            if let Some(n) = value.as_f64() {
+                p.display.beam_width = (n as f32).clamp(0.1, 3.0);
+            }
+        }
+        "disp_beam_shape" => {
+            if let Some(n) = value.as_f64() {
+                p.display.beam_shape = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_mask_strength" => {
+            if let Some(n) = value.as_f64() {
+                p.display.mask_strength = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_mask_dark" => {
+            if let Some(n) = value.as_f64() {
+                p.display.mask_dark = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_bloom" => {
+            if let Some(n) = value.as_f64() {
+                p.display.bloom = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_bloom_radius" => {
+            if let Some(n) = value.as_f64() {
+                p.display.bloom_radius = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_halation" => {
+            if let Some(n) = value.as_f64() {
+                p.display.halation = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_defocus" => {
+            if let Some(n) = value.as_f64() {
+                p.display.defocus = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "disp_sag" => {
+            if let Some(n) = value.as_f64() {
+                p.display.sag = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "slitscan" => {
+            if let Some(n) = value.as_f64() {
+                p.slitscan = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "slit_axis" => {
+            if let Some(n) = value.as_f64() {
+                p.slit_axis = (n as f32).clamp(0.0, 1.0);
+                p.slit_angle = p.slit_axis * 90.0;
+            }
+        }
+        "slit_angle" => {
+            if let Some(n) = value.as_f64() {
+                let angle = n as f32;
+                if angle.is_finite() {
+                    p.slit_angle = angle.clamp(-180.0, 180.0);
+                }
+            }
+        }
+        "slit_map" => {
+            p.slit_map = match value.as_str() {
+                Some("brightness") => temporal::TimeDisplaceMap::Brightness,
+                Some("radial") => temporal::TimeDisplaceMap::Radial,
+                Some("tbc_ramp") => temporal::TimeDisplaceMap::TbcRamp,
+                Some("sweep") => temporal::TimeDisplaceMap::Sweep,
+                Some("ramp") => temporal::TimeDisplaceMap::Ramp,
+                _ => p.slit_map,
+            };
+        }
+        "slit_interp" => {
+            if let Some(flag) = value.as_bool() {
+                p.slit_interp = flag;
+            }
+        }
+        "key_mode" => {
+            if let Some(n) = value.as_u64() {
+                p.key_mode = n.min(4) as f32;
+            }
+        }
+        "key_threshold" => {
+            if let Some(n) = value.as_f64() {
+                p.key_threshold = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "key_softness" => {
+            if let Some(n) = value.as_f64() {
+                p.key_softness = (n as f32).clamp(0.0, 0.5);
+            }
+        }
+        "key_history" => {
+            if let Some(n) = value.as_u64() {
+                p.key_history = n.clamp(1, 23) as f32;
+            }
+        }
+        "loom_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.loom.amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "loom_topology" => {
+            p.originals.loom.topology = match value.as_str() {
+                Some("linear") => temporal::TemporalTopology::Linear,
+                Some("radial") => temporal::TemporalTopology::Radial,
+                Some("spiral") => temporal::TemporalTopology::Spiral,
+                Some("contour") => temporal::TemporalTopology::Contour,
+                Some("folded") => temporal::TemporalTopology::Folded,
+                Some("kaleidoscopic") => temporal::TemporalTopology::Kaleidoscopic,
+                _ => p.originals.loom.topology,
+            };
+        }
+        "loom_interpolation" => {
+            p.originals.loom.interpolation = match value.as_str() {
+                Some("floor") => temporal::TemporalInterpolation::Floor,
+                Some("linear") => temporal::TemporalInterpolation::Linear,
+                _ => p.originals.loom.interpolation,
+            };
+        }
+        "loom_depth" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.loom.depth = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "loom_phase" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.loom.phase = (n as f32).clamp(-1_000.0, 1_000.0);
+            }
+        }
+        "loom_scale" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.loom.scale = (n as f32).clamp(0.01, 100.0);
+            }
+        }
+        "loom_angle" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.loom.angle = (n as f32).clamp(-180.0, 180.0);
+            }
+        }
+        "loom_folds" => {
+            if let Some(n) = value.as_u64() {
+                p.originals.loom.folds = n.clamp(1, 16) as u8;
+            }
+        }
+        "loom_quantization" => {
+            if let Some(n) = value.as_u64() {
+                p.originals.loom.quantization = n.min(24) as u8;
+            }
+        }
+        "atlas_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.atlas.amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "atlas_seed" => {
+            if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                p.originals.atlas.seed = n;
+            }
+        }
+        "atlas_territories" => {
+            if let Some(n) = value.as_u64() {
+                p.originals.atlas.territories = n.clamp(1, 64) as u8;
+            }
+        }
+        "atlas_collision" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.atlas.collision = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "garden_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.garden.amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "garden_gate" => {
+            p.originals.garden.gate = match value.as_str() {
+                Some("temporal_delta") => temporal::RefreshGardenGate::TemporalDelta,
+                Some("luma") => temporal::RefreshGardenGate::Luma,
+                Some("chroma") => temporal::RefreshGardenGate::Chroma,
+                Some("cellular_ridge") => temporal::RefreshGardenGate::CellularRidge,
+                Some("audio_energy") => temporal::RefreshGardenGate::AudioEnergy,
+                Some("audio_onset") => temporal::RefreshGardenGate::AudioOnset,
+                Some("matte") => temporal::RefreshGardenGate::Matte,
+                Some("motion") => temporal::RefreshGardenGate::Motion,
+                _ => p.originals.garden.gate,
+            };
+        }
+        "garden_threshold" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.garden.threshold = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "garden_softness" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.garden.softness = (n as f32).clamp(0.0, 0.5);
+            }
+        }
+        "garden_decay" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.garden.decay = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "garden_max_hold_ticks" => {
+            if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                p.originals.garden.max_hold_ticks = n;
+            }
+        }
+        "score_enabled" => {
+            if let Some(enabled) = value.as_bool() {
+                p.originals.score.enabled = enabled;
+            }
+        }
+        "score_seed" => {
+            if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                p.originals.score.seed = n;
+            }
+        }
+        "score_state_count" => {
+            if let Some(n) = value.as_u64() {
+                p.originals.score.state_count = n.clamp(2, 16) as u8;
+            }
+        }
+        "score_trigger" => {
+            p.originals.score.trigger = match value.as_str() {
+                Some("boundary") => temporal::CollisionScoreTrigger::Boundary,
+                Some("downbeat") => temporal::CollisionScoreTrigger::Downbeat,
+                Some("audio_onset") => temporal::CollisionScoreTrigger::AudioOnset,
+                Some("manual") => temporal::CollisionScoreTrigger::Manual,
+                _ => p.originals.score.trigger,
+            };
+        }
+        "score_loop_driver" => {
+            if let Some(driver) = score_loop_driver {
+                p.originals.score.loop_driver = driver;
+            }
+        }
+        "reset_loop_boundary" | "reset_downbeat" => {
+            let mode = match value.as_str() {
+                Some("none") => Some(temporal::TemporalEventResetMode::None),
+                Some("score") => Some(temporal::TemporalEventResetMode::Score),
+                Some("memory") => Some(temporal::TemporalEventResetMode::Memory),
+                Some("all") => Some(temporal::TemporalEventResetMode::All),
+                _ => None,
+            };
+            if let Some(mode) = mode {
+                if param == "reset_loop_boundary" {
+                    p.originals.reset.loop_boundary = mode;
+                } else {
+                    p.originals.reset.downbeat = mode;
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3698,6 +4356,35 @@ struct App {
     /// would hash the track at display rate for no new truth.
     gesture_checksum: String,
     gesture_status: String,
+    /// True while B9 performance recording is armed. Arming clears the prior
+    /// take and restarts the take clock at tick zero; the patch is the take's
+    /// opening state, so no synthetic keyframe exists.
+    performance_recording: bool,
+    /// The take being written (or the last finished take, disarmed).
+    performance_take: performance_track::PerformanceTake,
+    /// The take's own accepted-frame reference clock. It advances only while
+    /// recording is armed, on the same acceptance gate as the gesture clock.
+    performance_clock: performance_track::PerformanceClock,
+    /// Recordable edits staged at the dispatch seam this frame, committed only
+    /// at the frame-acceptance gate — the gesture two-phase law, so a rejected
+    /// or frozen frame neither consumes a tick nor records an edit.
+    pending_performance_edits: Vec<PendingPerformanceEdit>,
+    /// The replay session while playback is armed.
+    performance_playback: Option<PerformancePlayback>,
+    /// Guard: the record tap must never observe the replayer's own
+    /// dispatches, or an armed recorder would copy the playing take into
+    /// itself.
+    performance_replay_dispatching: bool,
+    /// Saturating honesty counters: edits whose param has no declared value
+    /// law, and edits whose value the law could not represent. Published
+    /// beside — never merged into — the recorded count.
+    performance_unsupported_edits: u64,
+    performance_rejected_edits: u64,
+    /// Canonical checksum of the loaded take, recomputed only when the take
+    /// actually changes — the gesture-checksum law: the snapshot broadcasts
+    /// every frame and hashing the take at display rate would add no truth.
+    performance_checksum: String,
+    performance_status: String,
     /// Routes a completed authored stroke onto exactly one manual-history
     /// entry. Automation-driven origins never reach the store at all.
     gesture_history: history::GestureHistoryRouter,
@@ -4140,6 +4827,16 @@ impl App {
             gesture_live_only_events: 0,
             gesture_checksum: String::new(),
             gesture_status: String::new(),
+            performance_recording: false,
+            performance_take: performance_track::PerformanceTake::default(),
+            performance_clock: performance_track::PerformanceClock::default(),
+            pending_performance_edits: Vec::new(),
+            performance_playback: None,
+            performance_replay_dispatching: false,
+            performance_unsupported_edits: 0,
+            performance_rejected_edits: 0,
+            performance_checksum: String::new(),
+            performance_status: String::new(),
             gesture_history: history::GestureHistoryRouter::default(),
             gesture_history_open: None,
             transform_gizmo_drag: None,
@@ -5981,6 +6678,7 @@ impl App {
         // program that was replaced. A source cut deliberately does not clear
         // it, exactly as it does not clear the temporal track.
         self.clear_gesture_recording_state();
+        self.clear_performance_recording_state();
         self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::PatchGeneration);
         self.temporal_boundaries
             .reanchor(self.mod_matrix.current_beat);
@@ -6046,6 +6744,16 @@ impl App {
         // written out and silently changing every canonical patch hash.
         let canvas = patch::GestureCanvasConfig::from_params(self.gesture_canvas.params());
         captured.gesture_canvas = (!canvas.is_default()).then_some(canvas);
+        // The B9 take rides the same carried-whole law. A capture while
+        // recording is still armed marks the take explicitly incomplete —
+        // inside the hashed flags — rather than presenting it as finished.
+        captured.performance_take = (!self.performance_take.is_empty()).then(|| {
+            let mut take = self.performance_take.clone();
+            if self.performance_recording {
+                take.mark_incomplete(self.performance_clock.reference_tick_u32());
+            }
+            performance_track::PerformanceTakeDocument::capture(&take)
+        });
         // Carry exactly the Study documents the captured racks reference —
         // whole, deduplicated, in digest order — so the patch is
         // self-contained. A referenced digest the library no longer holds is
@@ -7473,6 +8181,7 @@ impl App {
         // Strictly after the barrier that cleared the retired program's
         // recorder, so a restored track cannot be wiped by its own load.
         self.restore_gesture_track_from_patch(&patch);
+        self.restore_performance_take_from_patch(&patch);
         // Validated above, so these inserts cannot fail except idempotently;
         // referenced digests now resolve on the next frame's plan.
         for document in &patch.studies {
@@ -7700,6 +8409,7 @@ impl App {
         // program that was replaced. A source cut deliberately does not clear
         // it, exactly as it does not clear the temporal track.
         self.clear_gesture_recording_state();
+        self.clear_performance_recording_state();
         self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::ApplyLook);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.reset_visual_generation_for(temporal::TemporalResetCause::ApplyLook);
@@ -9599,6 +10309,456 @@ impl App {
         value.as_str().and_then(layers::BlendMode::from_key)
     }
 
+    /// B9 value-law oracle: the declared lattice each recordable control's
+    /// events are quantized against.
+    ///
+    /// Continuous ranges are consulted from `modulation::target_range` — the
+    /// control's declared modulation range, exactly as the enrichment charter
+    /// words it — through the same wire-name→target-name mappings the panel
+    /// already implies; integer and token laws mirror the engine's own
+    /// validator/applier clamps, and every discrete vocabulary is built from
+    /// the owning enum's `ALL` table so a widened vocabulary widens the law
+    /// without a second hand-list. `None` means the param is deliberately not
+    /// recordable: seeds and algorithm identities, route-adjacent choices
+    /// (`score_loop_driver`, motion sources/qualities/carriers), and the
+    /// imperative reset tokens. The recorder skips and counts those instead of
+    /// guessing.
+    fn performance_value_law_for(
+        control: &performance_track::PerformanceControl,
+    ) -> Option<performance_track::PerformanceValueLaw> {
+        use performance_track::{PerformanceControl as Control, PerformanceValueLaw as Law};
+        let unit_target = |name: &str| -> Option<Law> {
+            modulation::target_range(name).map(|(min, max)| Law::Unit { min, max })
+        };
+        let effect_law = |param: &str, layer_scope: bool| -> Option<Law> {
+            match param {
+                "invert" | "color_grain" => Some(Law::Toggle),
+                "key_mode" => Some(Law::Stepped { min: 0, max: 4 }),
+                "negative_mode" => Some(Law::Stepped { min: 0, max: 2 }),
+                "key_border_color" => Some(Law::Stepped { min: 0, max: 7 }),
+                "grain_algo" => Some(Law::Stepped { min: 0, max: 3 }),
+                // A seed is authored identity, not a performance value.
+                "random_seed" => None,
+                _ if layer_scope && Self::master_only_effect_param(param) => None,
+                _ if layer_scope => unit_target(&format!("layer1_{param}")),
+                _ => unit_target(param),
+            }
+        };
+        let transform_law = |param: &str| -> Option<Law> {
+            match param {
+                "fit" => Some(Law::Discrete {
+                    vocab: ["stretch", "fit", "fill", "native"]
+                        .map(String::from)
+                        .to_vec(),
+                }),
+                "edge" => Some(Law::Discrete {
+                    vocab: ["transparent", "clamp", "repeat", "mirror"]
+                        .map(String::from)
+                        .to_vec(),
+                }),
+                "sampling" => Some(Law::Discrete {
+                    vocab: ["linear", "nearest"].map(String::from).to_vec(),
+                }),
+                _ => unit_target(param),
+            }
+        };
+        let discrete = |vocab: Vec<String>| Some(Law::Discrete { vocab });
+        match control {
+            Control::Master { param } => effect_law(param, false),
+            Control::LayerEffect { param, .. } => effect_law(param, true),
+            Control::MasterTransform { param } | Control::LayerTransform { param, .. } => {
+                transform_law(param)
+            }
+            Control::LayerParam { param, .. } => match param.as_str() {
+                "opacity" => unit_target("layer1_opacity"),
+                "speed" => unit_target("layer1_speed"),
+                "fps" => unit_target("layer1_fps"),
+                "blend_mode" => discrete(
+                    layers::BlendMode::ALL
+                        .iter()
+                        .map(|mode| mode.key().to_string())
+                        .collect(),
+                ),
+                "bypass_master_fx" => Some(Law::Toggle),
+                "key_mode" => Some(Law::Stepped { min: 0, max: 4 }),
+                "key_border_color" => Some(Law::Stepped { min: 0, max: 7 }),
+                "key_threshold" | "key_color_r" | "key_color_g" | "key_color_b"
+                | "key_tolerance" | "key_border" | "key_shadow" => {
+                    Some(Law::Unit { min: 0.0, max: 1.0 })
+                }
+                "key_softness" => Some(Law::Unit { min: 0.0, max: 0.5 }),
+                _ => None,
+            },
+            Control::LayerVisible { .. } => Some(Law::Toggle),
+            Control::LayerPattern { param, .. } => match param.as_str() {
+                "shape" => discrete(
+                    pattern_synth::PatternShape::ALL
+                        .iter()
+                        .map(|shape| shape.key().to_string())
+                        .collect(),
+                ),
+                "wave" => discrete(
+                    pattern_synth::PatternWave::ALL
+                        .iter()
+                        .map(|wave| wave.key().to_string())
+                        .collect(),
+                ),
+                "color_mode" => discrete(
+                    pattern_synth::PatternColorMode::ALL
+                        .iter()
+                        .map(|mode| mode.key().to_string())
+                        .collect(),
+                ),
+                _ => unit_target(&format!("layer1_pattern_{param}")),
+            },
+            Control::Ntsc { param } => match param.as_str() {
+                "enabled"
+                | "edge_wave_enabled"
+                | "head_switching_enabled"
+                | "tracking_noise_enabled" => Some(Law::Toggle),
+                "tape_speed" => Some(Law::Stepped { min: 0, max: 2 }),
+                "head_switching_height" => Some(Law::Stepped { min: 0, max: 24 }),
+                "tracking_noise_height" => Some(Law::Stepped { min: 0, max: 120 }),
+                "snow_intensity" => unit_target("ntsc_snow"),
+                "tracking_noise_snow" => unit_target("ntsc_tracking_snow"),
+                "edge_wave_intensity" => unit_target("ntsc_edge_wave"),
+                "edge_wave_speed" => unit_target("ntsc_edge_wave_speed"),
+                "head_switching_shift" => unit_target("ntsc_head_shift"),
+                "tracking_noise_wave" => unit_target("ntsc_tracking_wave"),
+                "chroma_loss" => unit_target("ntsc_chroma_loss"),
+                "composite_noise_intensity" => unit_target("ntsc_composite_noise"),
+                "luma_noise_intensity" => unit_target("ntsc_luma_noise"),
+                "chroma_noise_intensity" => unit_target("ntsc_chroma_noise"),
+                "luma_smear" => unit_target("ntsc_luma_smear"),
+                "composite_sharpening" => unit_target("ntsc_sharpening"),
+                _ => None,
+            },
+            Control::Temporal { param } => match param.as_str() {
+                "fb_shape" => {
+                    discrete(["clamp", "soft", "wrap", "fold"].map(String::from).to_vec())
+                }
+                "fb_edge" => discrete(
+                    ["transparent", "mirror", "wrap", "hold"]
+                        .map(String::from)
+                        .to_vec(),
+                ),
+                "disp_il_mode" => discrete(["weave", "bob", "blend"].map(String::from).to_vec()),
+                "disp_model" => discrete(
+                    [
+                        "flat",
+                        "aperture_grille",
+                        "slot_mask",
+                        "shadow_mask",
+                        "lcd_stripe",
+                        "mono",
+                        "green_screen",
+                    ]
+                    .map(String::from)
+                    .to_vec(),
+                ),
+                "slit_map" => discrete(
+                    ["ramp", "brightness", "radial", "tbc_ramp", "sweep"]
+                        .map(String::from)
+                        .to_vec(),
+                ),
+                "loom_topology" => discrete(
+                    [
+                        "linear",
+                        "radial",
+                        "spiral",
+                        "contour",
+                        "folded",
+                        "kaleidoscopic",
+                    ]
+                    .map(String::from)
+                    .to_vec(),
+                ),
+                "loom_interpolation" => discrete(["floor", "linear"].map(String::from).to_vec()),
+                "garden_gate" => discrete(
+                    [
+                        "temporal_delta",
+                        "luma",
+                        "chroma",
+                        "cellular_ridge",
+                        "audio_energy",
+                        "audio_onset",
+                        "matte",
+                        "motion",
+                    ]
+                    .map(String::from)
+                    .to_vec(),
+                ),
+                "score_trigger" => discrete(
+                    ["boundary", "downbeat", "audio_onset", "manual"]
+                        .map(String::from)
+                        .to_vec(),
+                ),
+                "fb_reflect_x" | "fb_reflect_y" | "fb_servo" | "fb_servo_defeated"
+                | "disp_il_order" | "mosh_recycle" | "slit_interp" | "score_enabled" => {
+                    Some(Law::Toggle)
+                }
+                "key_mode" => Some(Law::Stepped { min: 0, max: 4 }),
+                "key_history" => Some(Law::Stepped { min: 1, max: 23 }),
+                "loom_folds" => Some(Law::Stepped { min: 1, max: 16 }),
+                "loom_quantization" => Some(Law::Stepped { min: 0, max: 24 }),
+                "atlas_territories" => Some(Law::Stepped { min: 1, max: 64 }),
+                "score_state_count" => Some(Law::Stepped { min: 2, max: 16 }),
+                // Seeds and hold budgets are authored identity; the loop
+                // driver names a live layer; the reset tokens are imperative
+                // commands, not values.
+                "atlas_seed"
+                | "score_seed"
+                | "garden_max_hold_ticks"
+                | "score_loop_driver"
+                | "reset_loop_boundary"
+                | "reset_downbeat" => None,
+                "slit_axis" => Some(Law::Unit { min: 0.0, max: 1.0 }),
+                "feedback" => unit_target("temporal_feedback"),
+                "slitscan" => unit_target("temporal_slitscan"),
+                "slit_angle" => unit_target("temporal_slit_angle"),
+                "key_threshold" => unit_target("temporal_key_threshold"),
+                "key_softness" => unit_target("temporal_key_softness"),
+                other
+                    if other.starts_with("fb_")
+                        || other.starts_with("loom_")
+                        || other.starts_with("atlas_")
+                        || other.starts_with("garden_") =>
+                {
+                    unit_target(&format!("temporal_{other}"))
+                }
+                other if other.starts_with("disp_") => {
+                    unit_target(&format!("display_{}", &other["disp_".len()..]))
+                }
+                other if other.starts_with("melt_") || other.starts_with("mosh_") => {
+                    unit_target(other)
+                }
+                _ => None,
+            },
+            Control::MotionMaster { param } | Control::MotionLayer { param, .. } => {
+                let layer_only = matches!(control, Control::MotionLayer { .. });
+                match param.as_str() {
+                    "field_scale" => unit_target("motion_field_scale"),
+                    "field_rate" => unit_target("motion_field_rate"),
+                    "stretch" => unit_target("motion_stretch"),
+                    "edge_repel" => unit_target("motion_edge_repel"),
+                    "vector_trash" => unit_target("motion_vector_trash"),
+                    "trash_block_size" => unit_target("motion_trash_block_size"),
+                    "shutter_angle" => unit_target("motion_shutter_angle"),
+                    "shutter_phase" => unit_target("motion_shutter_phase"),
+                    "shutter_curvature" => unit_target("motion_shutter_curvature"),
+                    "shutter_chromatic_lag" => unit_target("motion_shutter_chromatic_lag"),
+                    "transplant_amount"
+                    | "confidence_threshold"
+                    | "refresh"
+                    | "decay"
+                    | "occlusion"
+                        if layer_only =>
+                    {
+                        Some(Law::Unit { min: 0.0, max: 1.0 })
+                    }
+                    "confidence_softness" if layer_only => Some(Law::Unit { min: 0.0, max: 0.5 }),
+                    // Sources, qualities, carriers, and the collider's laws
+                    // rewrite what the Motion block observes; they are
+                    // authored topology, not performance values.
+                    _ => None,
+                }
+            }
+            Control::BusCrossfade => Some(Law::Unit { min: 0.0, max: 1.0 }),
+            Control::BusMix { param } => match param.as_str() {
+                "wipe_pattern" => discrete(
+                    mixing_boundary::WipePattern::ALL
+                        .iter()
+                        .map(|pattern| pattern.key().to_string())
+                        .collect(),
+                ),
+                "wipe_border_color" => discrete(
+                    mixing_boundary::BackColor::ALL
+                        .iter()
+                        .map(|color| color.key().to_string())
+                        .collect(),
+                ),
+                "blend" => discrete(
+                    layers::BlendMode::ALL
+                        .iter()
+                        .filter(|blend| **blend != layers::BlendMode::AlphaCut)
+                        .map(|blend| blend.key().to_string())
+                        .collect(),
+                ),
+                "wipe_invert" => Some(Law::Toggle),
+                "wipe_rep" => Some(Law::Stepped { min: 1, max: 4 }),
+                "wipe_soft" | "wipe_detail" | "wipe_border" | "dirt" | "dirt_rate"
+                | "dirt_drop" | "dirt_cut" | "dirt_knock" | "dirt_noise" | "melt_chroma"
+                | "melt_creep" => Some(Law::Unit { min: 0.0, max: 1.0 }),
+                "wipe_x" | "wipe_y" | "melt_swirl" => Some(Law::Unit {
+                    min: -1.0,
+                    max: 1.0,
+                }),
+                "melt" | "melt_width" => Some(Law::Unit { min: 0.0, max: 2.0 }),
+                "melt_hold" => Some(Law::Unit { min: 0.0, max: 1.5 }),
+                _ => None,
+            },
+            Control::MorphPosition => Some(Law::Unit { min: 0.0, max: 1.0 }),
+            Control::GestureCanvas { param } => match param.as_str() {
+                "radius" => unit_target("gesture_radius"),
+                "strength" => unit_target("gesture_strength"),
+                "retention" => unit_target("gesture_retention"),
+                _ => None,
+            },
+        }
+    }
+
+    /// The record tap's view of one dispatched action: the portable control
+    /// identity plus the raw value carrier, or `None` for every action outside
+    /// the closed recordable vocabulary. Layer identity is resolved to the
+    /// layer's *current stack position* — the patch-persistent identity — at
+    /// the moment the edit executes, exactly as a morph slot captures it.
+    fn performance_record_view(
+        &self,
+        action: &web::state::WebAction,
+    ) -> Option<(
+        performance_track::PerformanceControl,
+        PerformanceActionValue,
+    )> {
+        use performance_track::PerformanceControl as Control;
+        use web::state::{MotionScopeSnapshot, WebAction};
+        let layer_position = |index: usize, layer_id: &Option<String>| -> Option<u32> {
+            self.resolve_layer_index(index, layer_id)
+                .and_then(|index| u32::try_from(index).ok())
+        };
+        Some(match action {
+            WebAction::SetParam { param, value } => (
+                Control::Master {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetMasterTransform { param, value } => (
+                Control::MasterTransform {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetLayerParam {
+                index,
+                layer_id,
+                param,
+                value,
+            } => (
+                Control::LayerParam {
+                    layer: layer_position(*index, layer_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetLayerEffect {
+                index,
+                layer_id,
+                param,
+                value,
+            } => (
+                Control::LayerEffect {
+                    layer: layer_position(*index, layer_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetLayerTransform {
+                index,
+                layer_id,
+                param,
+                value,
+            } => (
+                Control::LayerTransform {
+                    layer: layer_position(*index, layer_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetLayerVisibility {
+                index,
+                layer_id,
+                visible,
+            } => (
+                Control::LayerVisible {
+                    layer: layer_position(*index, layer_id)?,
+                },
+                PerformanceActionValue::Bool(*visible),
+            ),
+            WebAction::SetLayerPattern {
+                index,
+                layer_id,
+                param,
+                value,
+            } => (
+                Control::LayerPattern {
+                    layer: layer_position(*index, layer_id)?,
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetNtscParam { param, value } => (
+                Control::Ntsc {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetTemporal { param, value } => (
+                Control::Temporal {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetMotion {
+                scope,
+                param,
+                value,
+            } => match scope {
+                MotionScopeSnapshot::Master => (
+                    Control::MotionMaster {
+                        param: param.clone(),
+                    },
+                    PerformanceActionValue::Json(value.clone()),
+                ),
+                MotionScopeSnapshot::Layer { layer_id } => {
+                    let stable = parse_nonzero_decimal(layer_id)
+                        .and_then(image_routing::StableLayerId::new)?;
+                    let position = self
+                        .layers
+                        .iter()
+                        .position(|layer| layer.stable_layer_id() == stable)
+                        .and_then(|index| u32::try_from(index).ok())?;
+                    (
+                        Control::MotionLayer {
+                            layer: position,
+                            param: param.clone(),
+                        },
+                        PerformanceActionValue::Json(value.clone()),
+                    )
+                }
+            },
+            WebAction::SetCompositionBusCrossfade { value } => {
+                (Control::BusCrossfade, PerformanceActionValue::Float(*value))
+            }
+            WebAction::SetCompositionBusMixParam { param, value } => (
+                Control::BusMix {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            WebAction::SetMorph { value } => (
+                Control::MorphPosition,
+                PerformanceActionValue::Float(*value),
+            ),
+            WebAction::SetGestureCanvas { param, value } => (
+                Control::GestureCanvas {
+                    param: param.clone(),
+                },
+                PerformanceActionValue::Json(value.clone()),
+            ),
+            _ => return None,
+        })
+    }
+
     fn layer_param_morph_control(
         param: &str,
         value: &serde_json::Value,
@@ -9930,6 +11090,7 @@ impl App {
         // program that was replaced. A source cut deliberately does not clear
         // it, exactly as it does not clear the temporal track.
         self.clear_gesture_recording_state();
+        self.clear_performance_recording_state();
         self.reset_gesture_canvas_for(gesture_canvas::GestureCanvasResetCause::BroadRevert);
         // A broad revert starts a new visual generation. If a blackout is
         // already requested, consider its audience edge consumed so the next
@@ -9999,6 +11160,12 @@ impl App {
                 // would rewrite the recorded stream.
                 | web::state::WebAction::GestureSample { .. }
                 | web::state::WebAction::SetGestureRecording { .. }
+                // The B9 transports are the same class of barrier: an
+                // arm/disarm edge latched to a downbeat would attach a take
+                // decision to the wrong stretch of program time.
+                | web::state::WebAction::SetPerformanceRecording { .. }
+                | web::state::WebAction::SetPerformancePlayback { .. }
+                | web::state::WebAction::ClearPerformanceTake
         ) {
             self.composition_status =
                 "Ordered memory/event and donor actions cannot be quantized".to_string();
@@ -12224,6 +13391,9 @@ impl App {
                 | WebAction::GyroStream { .. }
                 | WebAction::GyroCalibrate
                 | WebAction::Pad { .. }
+                | WebAction::SetPerformanceRecording { .. }
+                | WebAction::SetPerformancePlayback { .. }
+                | WebAction::ClearPerformanceTake
                 | WebAction::TriggerCollisionScore
                 | WebAction::TriggerRefreshGarden
                 | WebAction::ClearTemporalEventTrack
@@ -14390,6 +15560,397 @@ impl App {
         }
     }
 
+    /// The B9 record tap. Called at the one dispatch seam every final
+    /// application funnels through, while recording is armed and the dispatch
+    /// is not the replayer's own. A dropped batch remainder never dispatches,
+    /// so it never records; an action outside the recordable vocabulary is
+    /// silently not a take event; a recordable param with no declared law, or
+    /// a value its law cannot represent, is skipped and counted rather than
+    /// guessed.
+    fn stage_performance_edit(&mut self, action: &web::state::WebAction) {
+        let Some((control, carrier)) = self.performance_record_view(action) else {
+            return;
+        };
+        let Some(law) = Self::performance_value_law_for(&control) else {
+            self.performance_unsupported_edits =
+                self.performance_unsupported_edits.saturating_add(1);
+            return;
+        };
+        let Some(raw) = carrier.raw_under(&law) else {
+            self.performance_rejected_edits = self.performance_rejected_edits.saturating_add(1);
+            return;
+        };
+        // Bounded per frame by the drain queue's own ceiling; anything past it
+        // is counted, never silently lost.
+        if self.pending_performance_edits.len() >= web::state::MAX_PENDING_ACTIONS {
+            self.performance_rejected_edits = self.performance_rejected_edits.saturating_add(1);
+            return;
+        }
+        self.pending_performance_edits
+            .push(PendingPerformanceEdit { control, law, raw });
+    }
+
+    /// Arm or disarm performance recording. Arming starts a fresh take at
+    /// tick zero (the BENDR law: a new recording replaces the old take);
+    /// disarming stamps the declared length so trailing silence is part of
+    /// the loop period. Recording and playback are mutually exclusive by
+    /// refusal, never by silently stopping the other.
+    fn set_performance_recording(&mut self, enabled: bool) {
+        if self.performance_recording == enabled {
+            return;
+        }
+        if enabled {
+            if self.performance_playback.is_some() {
+                self.performance_status =
+                    "Recording refused: performance playback is armed".to_string();
+                return;
+            }
+            self.performance_take.clear();
+            self.performance_clock.reset();
+            self.pending_performance_edits.clear();
+            self.performance_unsupported_edits = 0;
+            self.performance_rejected_edits = 0;
+            self.performance_recording = true;
+            self.performance_status =
+                "Recording performance: every accepted value edit is being written down"
+                    .to_string();
+        } else {
+            self.performance_recording = false;
+            self.pending_performance_edits.clear();
+            let tick = self.performance_clock.reference_tick_u32();
+            self.performance_take.finalize(tick);
+            self.refresh_performance_checksum();
+            self.performance_status = if self.performance_take.is_empty() {
+                "Recording disarmed: no take".to_string()
+            } else {
+                format!(
+                    "Take: {} events across {} controls over {} ticks",
+                    self.performance_take.events().len(),
+                    self.performance_take.addresses().len(),
+                    self.performance_take.length_ticks()
+                )
+            };
+        }
+    }
+
+    /// Arm, retune, or disarm performance playback. Compilation resolves every
+    /// address against the current program exactly once, at arm; an address
+    /// the program cannot answer degrades to a named no-op rather than
+    /// retargeting (the stale-ID law). While already armed, a repeated arm
+    /// only updates the loop flag.
+    fn set_performance_playback(&mut self, enabled: bool, loop_playback: bool) {
+        if !enabled {
+            if self.performance_playback.take().is_some() {
+                self.performance_status = "Performance playback disarmed".to_string();
+            }
+            return;
+        }
+        if let Some(playback) = self.performance_playback.as_mut() {
+            playback.loop_playback = loop_playback;
+            return;
+        }
+        if self.performance_recording {
+            self.performance_status =
+                "Playback refused: performance recording is armed".to_string();
+            return;
+        }
+        if self.performance_take.is_empty() {
+            self.performance_status = "Playback refused: no take is loaded".to_string();
+            return;
+        }
+        let take = self.performance_take.clone();
+        let (compiled, degraded) = self.compile_performance_playback(&take);
+        let degraded_count = degraded.len();
+        self.performance_playback = Some(PerformancePlayback {
+            take,
+            compiled,
+            cursor: performance_track::PerformanceCursor::default(),
+            clock: performance_track::PerformanceClock::default(),
+            loop_playback,
+            degraded,
+        });
+        self.performance_status = if degraded_count == 0 {
+            "Replaying take".to_string()
+        } else {
+            format!("Replaying take; {degraded_count} control(s) degraded")
+        };
+    }
+
+    /// Discard the loaded take and stop both transports.
+    fn clear_performance_take(&mut self) {
+        self.performance_recording = false;
+        self.performance_playback = None;
+        self.pending_performance_edits.clear();
+        self.performance_take.clear();
+        self.performance_clock.reset();
+        self.performance_unsupported_edits = 0;
+        self.performance_rejected_edits = 0;
+        self.performance_checksum.clear();
+        self.performance_status = "Take cleared".to_string();
+    }
+
+    /// Recompute the cached take digest. Empty takes publish no checksum: an
+    /// offered digest of nothing would imply there was something to verify.
+    fn refresh_performance_checksum(&mut self) {
+        self.performance_checksum = if self.performance_take.is_empty() {
+            String::new()
+        } else {
+            self.performance_take.checksum_hex()
+        };
+    }
+
+    /// Compile a take's events into dispatchable actions against the current
+    /// program. Layer positions bind to the live layer occupying that stack
+    /// position now; the bound stable ID then tracks its layer through
+    /// reorders for the whole session, and a vanished ID is the engine's own
+    /// safe no-op. A position past the stack degrades by name here.
+    fn compile_performance_playback(
+        &self,
+        take: &performance_track::PerformanceTake,
+    ) -> (Vec<CompiledPerformanceEvent>, Vec<String>) {
+        use performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+        use web::state::{MotionScopeSnapshot, WebAction};
+        let mut degraded: Vec<String> = Vec::new();
+        let mut note_degraded = |control: &Control| {
+            let name = control.describe();
+            if !degraded.contains(&name) && degraded.len() < 64 {
+                degraded.push(name);
+            }
+        };
+        let json_value = |raw: &Raw| -> Option<serde_json::Value> { raw.to_json() };
+        let layer_identity = |position: u32| -> Option<(usize, String)> {
+            let index = usize::try_from(position).ok()?;
+            self.layers
+                .get(index)
+                .map(|layer| (index, layer.layer_id().to_string()))
+        };
+        let compiled = take
+            .events()
+            .iter()
+            .map(|event| {
+                let address = &take.addresses()[usize::from(event.address)];
+                let Some(raw) = address.law.decode(event.value) else {
+                    // Unreachable past document validation; hold it as a
+                    // degraded entry rather than trusting it anyway.
+                    note_degraded(&address.control);
+                    return CompiledPerformanceEvent::Degraded;
+                };
+                let value = json_value(&raw);
+                let action = match (&address.control, raw) {
+                    (Control::Master { param }, _) => value.map(|value| WebAction::SetParam {
+                        param: param.clone(),
+                        value,
+                    }),
+                    (Control::MasterTransform { param }, _) => {
+                        value.map(|value| WebAction::SetMasterTransform {
+                            param: param.clone(),
+                            value,
+                        })
+                    }
+                    (Control::LayerParam { layer, param }, _) => layer_identity(*layer)
+                        .zip(value)
+                        .map(|((index, id), value)| WebAction::SetLayerParam {
+                            index,
+                            layer_id: Some(id),
+                            param: param.clone(),
+                            value,
+                        }),
+                    (Control::LayerEffect { layer, param }, _) => layer_identity(*layer)
+                        .zip(value)
+                        .map(|((index, id), value)| WebAction::SetLayerEffect {
+                            index,
+                            layer_id: Some(id),
+                            param: param.clone(),
+                            value,
+                        }),
+                    (Control::LayerTransform { layer, param }, _) => layer_identity(*layer)
+                        .zip(value)
+                        .map(|((index, id), value)| WebAction::SetLayerTransform {
+                            index,
+                            layer_id: Some(id),
+                            param: param.clone(),
+                            value,
+                        }),
+                    (Control::LayerVisible { layer }, Raw::Toggle(visible)) => {
+                        layer_identity(*layer).map(|(index, id)| WebAction::SetLayerVisibility {
+                            index,
+                            layer_id: Some(id),
+                            visible,
+                        })
+                    }
+                    (Control::LayerPattern { layer, param }, _) => layer_identity(*layer)
+                        .zip(value)
+                        .map(|((index, id), value)| WebAction::SetLayerPattern {
+                            index,
+                            layer_id: Some(id),
+                            param: param.clone(),
+                            value,
+                        }),
+                    (Control::Ntsc { param }, _) => value.map(|value| WebAction::SetNtscParam {
+                        param: param.clone(),
+                        value,
+                    }),
+                    (Control::Temporal { param }, _) => value.map(|value| WebAction::SetTemporal {
+                        param: param.clone(),
+                        value,
+                    }),
+                    (Control::MotionMaster { param }, _) => {
+                        value.map(|value| WebAction::SetMotion {
+                            scope: MotionScopeSnapshot::Master,
+                            param: param.clone(),
+                            value,
+                        })
+                    }
+                    (Control::MotionLayer { layer, param }, _) => layer_identity(*layer)
+                        .zip(value)
+                        .map(|((_, id), value)| WebAction::SetMotion {
+                            scope: MotionScopeSnapshot::Layer { layer_id: id },
+                            param: param.clone(),
+                            value,
+                        }),
+                    (Control::BusCrossfade, Raw::Continuous(value)) => {
+                        Some(WebAction::SetCompositionBusCrossfade { value })
+                    }
+                    (Control::BusMix { param }, _) => {
+                        value.map(|value| WebAction::SetCompositionBusMixParam {
+                            param: param.clone(),
+                            value,
+                        })
+                    }
+                    (Control::MorphPosition, Raw::Continuous(value)) => {
+                        Some(WebAction::SetMorph { value })
+                    }
+                    (Control::GestureCanvas { param }, _) => {
+                        value.map(|value| WebAction::SetGestureCanvas {
+                            param: param.clone(),
+                            value,
+                        })
+                    }
+                    _ => None,
+                };
+                match action {
+                    Some(action) => CompiledPerformanceEvent::Dispatch(action),
+                    None => {
+                        note_degraded(&address.control);
+                        CompiledPerformanceEvent::Degraded
+                    }
+                }
+            })
+            .collect();
+        (compiled, degraded)
+    }
+
+    /// Dispatch every due replay event for the frame the program is about to
+    /// render. The playhead tick is the address this frame will occupy if
+    /// accepted — the same stamp-now/advance-at-acceptance law recording uses
+    /// — and dispatch goes through `handle_web_action_inner_with_feedback`,
+    /// the transform-gizmo delegation seam, so Morph ownership transfer and
+    /// every engine refusal apply exactly as they would to a hand-made edit,
+    /// while manual history records nothing.
+    fn advance_performance_playback(&mut self) {
+        let Some(mut playback) = self.performance_playback.take() else {
+            return;
+        };
+        let tick = playback.clock.reference_tick_u32();
+        let (start, end) = playback.cursor.range_due(playback.take.events(), tick);
+        if start != end {
+            self.performance_replay_dispatching = true;
+            for entry in &playback.compiled[start..end] {
+                if let CompiledPerformanceEvent::Dispatch(action) = entry {
+                    self.handle_web_action_inner_with_feedback(action.clone());
+                }
+            }
+            self.performance_replay_dispatching = false;
+        }
+        let finished = playback.cursor.finished(playback.take.events())
+            && tick >= playback.take.length_ticks();
+        if finished {
+            if playback.loop_playback {
+                playback.cursor.reset();
+                playback.clock.reset();
+                self.performance_playback = Some(playback);
+            } else {
+                self.performance_status = "Playback finished".to_string();
+            }
+        } else {
+            self.performance_playback = Some(playback);
+        }
+    }
+
+    /// Clear every performance-recorder surface. Called by the same
+    /// authored-generation barriers that clear the gesture recording state;
+    /// source cuts deliberately do not reach this, mirroring the gesture
+    /// asymmetry.
+    fn clear_performance_recording_state(&mut self) {
+        self.performance_recording = false;
+        self.performance_playback = None;
+        self.pending_performance_edits.clear();
+        self.performance_take.clear();
+        self.performance_clock.reset();
+        self.performance_unsupported_edits = 0;
+        self.performance_rejected_edits = 0;
+        self.performance_checksum.clear();
+        self.performance_status.clear();
+    }
+
+    /// Restore a patch-carried take: disarmed, validated by the document's
+    /// single acceptance path, replacing whatever take the session held.
+    fn restore_performance_take_from_patch(&mut self, patch: &patch::PatchState) {
+        let Some(document) = patch.performance_take.as_ref() else {
+            return;
+        };
+        match document.decode() {
+            Ok(take) => {
+                let events = take.events().len();
+                let controls = take.addresses().len();
+                self.performance_take = take;
+                self.refresh_performance_checksum();
+                self.performance_status =
+                    format!("Restored take: {events} events across {controls} controls");
+            }
+            Err(error) => {
+                // `PatchState` validation already refused hostile documents;
+                // this arm is defense in depth for a Rust-assembled patch.
+                self.performance_status = format!("Recorded take rejected: {error}");
+                log::warn!("{}", self.performance_status);
+            }
+        }
+    }
+
+    /// Publish performance-recorder truth.
+    fn performance_status_snapshot(&self) -> web::state::PerformanceStatusSnapshot {
+        let (playhead_tick, loop_playback, degraded) = match self.performance_playback.as_ref() {
+            Some(playback) => (
+                playback.clock.reference_tick_u32(),
+                playback.loop_playback,
+                playback.degraded.clone(),
+            ),
+            None => (0, false, Vec::new()),
+        };
+        web::state::PerformanceStatusSnapshot {
+            mode: if self.performance_recording {
+                "recording".to_string()
+            } else if self.performance_playback.is_some() {
+                "playing".to_string()
+            } else {
+                "off".to_string()
+            },
+            recorded_events: u32::try_from(self.performance_take.events().len())
+                .unwrap_or(u32::MAX),
+            recorded_controls: u32::try_from(self.performance_take.addresses().len())
+                .unwrap_or(u32::MAX),
+            length_ticks: self.performance_take.length_ticks(),
+            playhead_tick,
+            loop_playback,
+            truncated: self.performance_take.truncated(),
+            unsupported_edits: self.performance_unsupported_edits,
+            rejected_edits: self.performance_rejected_edits,
+            checksum: self.performance_checksum.clone(),
+            degraded,
+            status: self.performance_status.clone(),
+        }
+    }
+
     /// Device facts a gesture canvas is admitted under. Without a renderer the
     /// host uses the frozen edge and the ordinary 256-byte uniform alignment,
     /// which is the same conservative shape `MediaSafetyPolicy` uses before an
@@ -14768,6 +16329,13 @@ impl App {
         &mut self,
         action: web::state::WebAction,
     ) -> WebActionBatchDisposition {
+        // The B9 record tap sits on this seam because every final application
+        // funnels through it — the drained browser batch, the downbeat
+        // release, native RECOVERY, and the transform gizmo — while the
+        // replayer's own dispatches are excluded by the guard flag.
+        if self.performance_recording && !self.performance_replay_dispatching {
+            self.stage_performance_edit(&action);
+        }
         let address = self.feedback_address_for_web_action(&action);
         let disposition = self.handle_web_action_inner(action);
         if let Some(address) = address {
@@ -15870,6 +17438,38 @@ impl App {
                     self.gesture_status = error;
                 }
             }
+            WebAction::SetPerformanceRecording {
+                enabled,
+                layer_stack_revision,
+            } => {
+                if layer_stack_revision == self.layer_stack_revision {
+                    self.set_performance_recording(enabled);
+                } else {
+                    self.performance_status = format!(
+                        "Performance recording control rejected: stale stack revision {layer_stack_revision}; current is {}",
+                        self.layer_stack_revision
+                    );
+                    log::warn!("{}", self.performance_status);
+                }
+            }
+            WebAction::SetPerformancePlayback {
+                enabled,
+                loop_playback,
+                layer_stack_revision,
+            } => {
+                if layer_stack_revision == self.layer_stack_revision {
+                    self.set_performance_playback(enabled, loop_playback);
+                } else {
+                    self.performance_status = format!(
+                        "Performance playback control rejected: stale stack revision {layer_stack_revision}; current is {}",
+                        self.layer_stack_revision
+                    );
+                    log::warn!("{}", self.performance_status);
+                }
+            }
+            WebAction::ClearPerformanceTake => {
+                self.clear_performance_take();
+            }
             WebAction::SetPadConfig { axis, param, value } => match param.as_str() {
                 "spring_enabled" => {
                     if let Some(enabled) = value.as_bool() {
@@ -16078,529 +17678,12 @@ impl App {
                 } else {
                     None
                 };
-                let p = &mut self.temporal_params;
-                match param.as_str() {
-                    "feedback" => {
-                        if let Some(n) = value.as_f64() {
-                            p.feedback = (n as f32).clamp(0.0, 0.95);
-                        }
-                    }
-                    "fb_zoom" => {
-                        if let Some(n) = value.as_f64() {
-                            p.fb_zoom = (n as f32).clamp(0.9, 1.1);
-                        }
-                    }
-                    "fb_rotate" => {
-                        if let Some(n) = value.as_f64() {
-                            p.fb_rotate = (n as f32).clamp(-5.0, 5.0);
-                        }
-                    }
-                    "fb_offset_x" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.offset_x = (n as f32).clamp(-0.5, 0.5);
-                        }
-                    }
-                    "fb_offset_y" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.offset_y = (n as f32).clamp(-0.5, 0.5);
-                        }
-                    }
-                    "fb_reflect_x" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.rig.reflect_x = flag;
-                        }
-                    }
-                    "fb_reflect_y" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.rig.reflect_y = flag;
-                        }
-                    }
-                    "fb_hue_rotate" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.hue_rotate = (n as f32).clamp(-180.0, 180.0);
-                        }
-                    }
-                    "fb_saturation" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.saturation = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "fb_gain_r" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.gain_r = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "fb_gain_g" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.gain_g = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "fb_gain_b" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.gain_b = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "fb_chroma_displace" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.chroma_displace = (n as f32).clamp(0.0, 0.05);
-                        }
-                    }
-                    "fb_blur" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.blur = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "fb_sharpen" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.sharpen = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "fb_shape" => {
-                        p.rig.shape = match value.as_str() {
-                            Some("soft") => effects::params::FeedbackShape::Soft,
-                            Some("wrap") => effects::params::FeedbackShape::Wrap,
-                            Some("fold") => effects::params::FeedbackShape::Fold,
-                            _ => effects::params::FeedbackShape::Clamp,
-                        };
-                    }
-                    "fb_drive" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.drive = (n as f32).clamp(0.25, 4.0);
-                        }
-                    }
-                    "fb_pivot" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.pivot = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "fb_threshold" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.threshold = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "fb_noise" => {
-                        if let Some(n) = value.as_f64() {
-                            p.rig.noise = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "fb_edge" => {
-                        p.rig.edge = match value.as_str() {
-                            Some("mirror") => motion::MotionBoundaryMode::Mirror,
-                            Some("wrap") => motion::MotionBoundaryMode::Wrap,
-                            Some("hold") => motion::MotionBoundaryMode::Hold,
-                            _ => motion::MotionBoundaryMode::Transparent,
-                        };
-                    }
-                    "fb_servo" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.rig.servo = flag;
-                        }
-                    }
-                    "fb_servo_defeated" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.rig.servo_defeated = flag;
-                        }
-                    }
-                    "disp_il_amount" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.il_amount = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    // The B8 master melting edge's six continuous values.
-                    "melt_amount" => {
-                        if let Some(n) = value.as_f64() {
-                            p.melt.melt = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "melt_width" => {
-                        if let Some(n) = value.as_f64() {
-                            p.melt.width = (n as f32).clamp(0.0, 2.0);
-                        }
-                    }
-                    "melt_hold" => {
-                        if let Some(n) = value.as_f64() {
-                            p.melt.hold = (n as f32).clamp(0.0, 1.5);
-                        }
-                    }
-                    "melt_swirl" => {
-                        if let Some(n) = value.as_f64() {
-                            p.melt.swirl = (n as f32).clamp(-1.0, 1.0);
-                        }
-                    }
-                    "melt_chroma" => {
-                        if let Some(n) = value.as_f64() {
-                            p.melt.chroma = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "melt_creep" => {
-                        if let Some(n) = value.as_f64() {
-                            p.melt.creep = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    // The B5 codec mosh's eight continuous values plus the
-                    // discrete recycle law.
-                    "mosh_amount" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.amount = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_key_removal" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.key_removal = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_hold" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.hold = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_drop" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.drop = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_shuffle" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.shuffle = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_rate" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.rate = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_bitrate_starve" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.bitrate_starve = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_resync" => {
-                        if let Some(n) = value.as_f64() {
-                            p.mosh.resync = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "mosh_recycle" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.mosh.recycle = flag;
-                        }
-                    }
-                    "disp_il_mode" => {
-                        p.display.il_mode = match value.as_str() {
-                            Some("bob") => display_physics::InterlaceMode::Bob,
-                            Some("blend") => display_physics::InterlaceMode::Blend,
-                            _ => display_physics::InterlaceMode::Weave,
-                        };
-                    }
-                    "disp_il_order" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.display.il_order = flag;
-                        }
-                    }
-                    "disp_il_twitter" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.il_twitter = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_il_judder" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.il_judder = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_phosphor" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.phosphor = (n as f32).clamp(0.0, 0.95);
-                        }
-                    }
-                    "disp_phos_r" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.phos_r = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_phos_g" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.phos_g = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_phos_b" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.phos_b = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_model" => {
-                        p.display.model = match value.as_str() {
-                            Some("aperture_grille") => {
-                                display_physics::DisplayModel::ApertureGrille
-                            }
-                            Some("slot_mask") => display_physics::DisplayModel::SlotMask,
-                            Some("shadow_mask") => display_physics::DisplayModel::ShadowMask,
-                            Some("lcd_stripe") => display_physics::DisplayModel::LcdStripe,
-                            Some("mono") => display_physics::DisplayModel::Mono,
-                            Some("green_screen") => display_physics::DisplayModel::GreenScreen,
-                            _ => display_physics::DisplayModel::Flat,
-                        };
-                    }
-                    "disp_scanlines" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.scanlines = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_beam_width" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.beam_width = (n as f32).clamp(0.1, 3.0);
-                        }
-                    }
-                    "disp_beam_shape" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.beam_shape = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_mask_strength" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.mask_strength = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_mask_dark" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.mask_dark = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_bloom" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.bloom = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_bloom_radius" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.bloom_radius = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_halation" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.halation = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_defocus" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.defocus = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "disp_sag" => {
-                        if let Some(n) = value.as_f64() {
-                            p.display.sag = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "slitscan" => {
-                        if let Some(n) = value.as_f64() {
-                            p.slitscan = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "slit_axis" => {
-                        if let Some(n) = value.as_f64() {
-                            p.slit_axis = (n as f32).clamp(0.0, 1.0);
-                            p.slit_angle = p.slit_axis * 90.0;
-                        }
-                    }
-                    "slit_angle" => {
-                        if let Some(n) = value.as_f64() {
-                            let angle = n as f32;
-                            if angle.is_finite() {
-                                p.slit_angle = angle.clamp(-180.0, 180.0);
-                            }
-                        }
-                    }
-                    "slit_map" => {
-                        p.slit_map = match value.as_str() {
-                            Some("brightness") => temporal::TimeDisplaceMap::Brightness,
-                            Some("radial") => temporal::TimeDisplaceMap::Radial,
-                            Some("tbc_ramp") => temporal::TimeDisplaceMap::TbcRamp,
-                            Some("sweep") => temporal::TimeDisplaceMap::Sweep,
-                            Some("ramp") => temporal::TimeDisplaceMap::Ramp,
-                            _ => p.slit_map,
-                        };
-                    }
-                    "slit_interp" => {
-                        if let Some(flag) = value.as_bool() {
-                            p.slit_interp = flag;
-                        }
-                    }
-                    "key_mode" => {
-                        if let Some(n) = value.as_u64() {
-                            p.key_mode = n.min(4) as f32;
-                        }
-                    }
-                    "key_threshold" => {
-                        if let Some(n) = value.as_f64() {
-                            p.key_threshold = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "key_softness" => {
-                        if let Some(n) = value.as_f64() {
-                            p.key_softness = (n as f32).clamp(0.0, 0.5);
-                        }
-                    }
-                    "key_history" => {
-                        if let Some(n) = value.as_u64() {
-                            p.key_history = n.clamp(1, 23) as f32;
-                        }
-                    }
-                    "loom_amount" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.loom.amount = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "loom_topology" => {
-                        p.originals.loom.topology = match value.as_str() {
-                            Some("linear") => temporal::TemporalTopology::Linear,
-                            Some("radial") => temporal::TemporalTopology::Radial,
-                            Some("spiral") => temporal::TemporalTopology::Spiral,
-                            Some("contour") => temporal::TemporalTopology::Contour,
-                            Some("folded") => temporal::TemporalTopology::Folded,
-                            Some("kaleidoscopic") => temporal::TemporalTopology::Kaleidoscopic,
-                            _ => p.originals.loom.topology,
-                        };
-                    }
-                    "loom_interpolation" => {
-                        p.originals.loom.interpolation = match value.as_str() {
-                            Some("floor") => temporal::TemporalInterpolation::Floor,
-                            Some("linear") => temporal::TemporalInterpolation::Linear,
-                            _ => p.originals.loom.interpolation,
-                        };
-                    }
-                    "loom_depth" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.loom.depth = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "loom_phase" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.loom.phase = (n as f32).clamp(-1_000.0, 1_000.0);
-                        }
-                    }
-                    "loom_scale" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.loom.scale = (n as f32).clamp(0.01, 100.0);
-                        }
-                    }
-                    "loom_angle" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.loom.angle = (n as f32).clamp(-180.0, 180.0);
-                        }
-                    }
-                    "loom_folds" => {
-                        if let Some(n) = value.as_u64() {
-                            p.originals.loom.folds = n.clamp(1, 16) as u8;
-                        }
-                    }
-                    "loom_quantization" => {
-                        if let Some(n) = value.as_u64() {
-                            p.originals.loom.quantization = n.min(24) as u8;
-                        }
-                    }
-                    "atlas_amount" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.atlas.amount = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "atlas_seed" => {
-                        if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
-                            p.originals.atlas.seed = n;
-                        }
-                    }
-                    "atlas_territories" => {
-                        if let Some(n) = value.as_u64() {
-                            p.originals.atlas.territories = n.clamp(1, 64) as u8;
-                        }
-                    }
-                    "atlas_collision" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.atlas.collision = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "garden_amount" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.garden.amount = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "garden_gate" => {
-                        p.originals.garden.gate = match value.as_str() {
-                            Some("temporal_delta") => temporal::RefreshGardenGate::TemporalDelta,
-                            Some("luma") => temporal::RefreshGardenGate::Luma,
-                            Some("chroma") => temporal::RefreshGardenGate::Chroma,
-                            Some("cellular_ridge") => temporal::RefreshGardenGate::CellularRidge,
-                            Some("audio_energy") => temporal::RefreshGardenGate::AudioEnergy,
-                            Some("audio_onset") => temporal::RefreshGardenGate::AudioOnset,
-                            Some("matte") => temporal::RefreshGardenGate::Matte,
-                            Some("motion") => temporal::RefreshGardenGate::Motion,
-                            _ => p.originals.garden.gate,
-                        };
-                    }
-                    "garden_threshold" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.garden.threshold = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "garden_softness" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.garden.softness = (n as f32).clamp(0.0, 0.5);
-                        }
-                    }
-                    "garden_decay" => {
-                        if let Some(n) = value.as_f64() {
-                            p.originals.garden.decay = (n as f32).clamp(0.0, 1.0);
-                        }
-                    }
-                    "garden_max_hold_ticks" => {
-                        if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
-                            p.originals.garden.max_hold_ticks = n;
-                        }
-                    }
-                    "score_enabled" => {
-                        if let Some(enabled) = value.as_bool() {
-                            p.originals.score.enabled = enabled;
-                        }
-                    }
-                    "score_seed" => {
-                        if let Some(n) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
-                            p.originals.score.seed = n;
-                        }
-                    }
-                    "score_state_count" => {
-                        if let Some(n) = value.as_u64() {
-                            p.originals.score.state_count = n.clamp(2, 16) as u8;
-                        }
-                    }
-                    "score_trigger" => {
-                        p.originals.score.trigger = match value.as_str() {
-                            Some("boundary") => temporal::CollisionScoreTrigger::Boundary,
-                            Some("downbeat") => temporal::CollisionScoreTrigger::Downbeat,
-                            Some("audio_onset") => temporal::CollisionScoreTrigger::AudioOnset,
-                            Some("manual") => temporal::CollisionScoreTrigger::Manual,
-                            _ => p.originals.score.trigger,
-                        };
-                    }
-                    "score_loop_driver" => {
-                        if let Some(driver) = score_loop_driver {
-                            p.originals.score.loop_driver = driver;
-                        }
-                    }
-                    "reset_loop_boundary" | "reset_downbeat" => {
-                        let mode = match value.as_str() {
-                            Some("none") => Some(temporal::TemporalEventResetMode::None),
-                            Some("score") => Some(temporal::TemporalEventResetMode::Score),
-                            Some("memory") => Some(temporal::TemporalEventResetMode::Memory),
-                            Some("all") => Some(temporal::TemporalEventResetMode::All),
-                            _ => None,
-                        };
-                        if let Some(mode) = mode {
-                            if param == "reset_loop_boundary" {
-                                p.originals.reset.loop_boundary = mode;
-                            } else {
-                                p.originals.reset.downbeat = mode;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                apply_temporal_wire_edit(
+                    &mut self.temporal_params,
+                    &param,
+                    &value,
+                    score_loop_driver,
+                );
             }
             WebAction::ClearTemporalMemory => {
                 self.clear_temporal_memory();
@@ -16962,12 +18045,12 @@ impl App {
                     match param.as_str() {
                         "opacity" => {
                             if let Some(v) = value.as_f64() {
-                                layer.opacity = (v as f32).clamp(0.0, 1.0);
+                                layer.opacity = layers::clamp_layer_opacity(v as f32);
                             }
                         }
                         "speed" => {
                             if let Some(v) = value.as_f64() {
-                                layer.speed = (v as f32).clamp(0.25, 4.0);
+                                layer.speed = layers::clamp_layer_speed(v as f32);
                                 let active_slot = layer.active_clip_slot;
                                 if let Some(slot) = layer.clip_slots.get_mut(active_slot) {
                                     slot.transport.rate = f64::from(layer.speed);
@@ -16978,7 +18061,7 @@ impl App {
                             if let Some(v) = value.as_f64() {
                                 let fps = v as f32;
                                 if fps.is_finite() {
-                                    layer.fps = fps.clamp(1.0, 240.0);
+                                    layer.fps = layers::clamp_layer_fps(fps);
                                     let active_slot = layer.active_clip_slot;
                                     if let Some(slot) = layer.clip_slots.get_mut(active_slot) {
                                         slot.transport.sample_fps = Some(f64::from(layer.fps));
@@ -17259,6 +18342,20 @@ impl App {
                             let track = self.gesture_event_recorder.track();
                             (!track.events().is_empty())
                                 .then(|| gesture::GestureTrackDocument::capture(track))
+                        },
+                        performance_take: {
+                            // The B9 take rides the same law. A job started
+                            // while recording is still armed replays the take
+                            // as it stands, marked explicitly incomplete.
+                            (!self.performance_take.is_empty()).then(|| {
+                                let mut take = self.performance_take.clone();
+                                if self.performance_recording {
+                                    take.mark_incomplete(
+                                        self.performance_clock.reference_tick_u32(),
+                                    );
+                                }
+                                performance_track::PerformanceTakeDocument::capture(&take)
+                            })
                         },
                     };
                     for layer in self.layers.iter().filter(|layer| !layer.is_file_media()) {
@@ -18547,6 +19644,7 @@ impl App {
             ),
             temporal: temporal_snapshot,
             gesture: self.gesture_status_snapshot(),
+            performance_recorder: self.performance_status_snapshot(),
             spout: {
                 let status = self.spout.status();
                 SpoutSnapshot {
@@ -20165,6 +21263,12 @@ impl ApplicationHandler for App {
                     } else {
                         self.mod_matrix.update(Instant::now());
                         self.release_quantized_actions_on_downbeat();
+                        // B9 replay dispatches after the downbeat release so a
+                        // frame's final authored value ordering is browser →
+                        // native → latch → take, and only while the program
+                        // advances: a take is an automatic clock, and Pause
+                        // freezes automatic clocks.
+                        self.advance_performance_playback();
                     }
                     let modulation_frame = self.mod_matrix.frame(self.layers.len());
 
@@ -21989,6 +23093,21 @@ impl ApplicationHandler for App {
                                     published_gesture_checksum(&self.gesture_event_recorder);
                             }
                             self.pending_gesture_events.clear();
+                            // The B9 performance clocks share the same gate.
+                            // The commit is a free function over disjoint
+                            // fields because the renderer borrow is still
+                            // live here — the gesture-checksum precedent.
+                            commit_performance_frame_fields(
+                                self.performance_recording,
+                                &mut self.performance_take,
+                                &mut self.performance_clock,
+                                &mut self.pending_performance_edits,
+                                &mut self.performance_playback,
+                                &mut self.performance_checksum,
+                                &mut self.performance_status,
+                                &mut self.performance_rejected_edits,
+                                program_delta,
+                            );
                         }
                         if selective_required {
                             renderer.map_selective_ntsc_readback();
@@ -31107,6 +32226,536 @@ mod app_state_tests {
             app.gesture_event_recorder.track(),
             &recorded,
             "no morph position may rewrite a recording"
+        );
+    }
+
+    // ===== B9 performance recorder =====
+
+    fn performance_commit_frame(app: &mut App, delta: f32) {
+        commit_performance_frame_fields(
+            app.performance_recording,
+            &mut app.performance_take,
+            &mut app.performance_clock,
+            &mut app.pending_performance_edits,
+            &mut app.performance_playback,
+            &mut app.performance_checksum,
+            &mut app.performance_status,
+            &mut app.performance_rejected_edits,
+            delta,
+        );
+    }
+
+    fn simple_take() -> performance_track::PerformanceTake {
+        let mut take = performance_track::PerformanceTake::default();
+        take.record_accepted(
+            0,
+            performance_track::PerformanceControl::Master {
+                param: "brightness".to_string(),
+            },
+            performance_track::PerformanceValueLaw::Unit {
+                min: -1.0,
+                max: 1.0,
+            },
+            &performance_track::PerformanceRawValue::Continuous(0.75),
+        )
+        .unwrap();
+        take.finalize(0);
+        take
+    }
+
+    #[test]
+    fn the_record_tap_captures_accepted_edits_and_the_commit_stamps_the_frame_tick() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.handle_web_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(app.performance_recording);
+
+        app.handle_web_action(web::state::WebAction::SetParam {
+            param: "brightness".to_string(),
+            value: serde_json::json!(0.75),
+        });
+        assert_eq!(app.pending_performance_edits.len(), 1);
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        assert_eq!(app.performance_take.events().len(), 1);
+        assert_eq!(app.performance_take.events()[0].tick, 0);
+        assert!(app.pending_performance_edits.is_empty());
+        assert!(!app.performance_checksum.is_empty());
+
+        // The law was consulted from the modulation range table.
+        assert_eq!(
+            app.performance_take.addresses()[0].law,
+            performance_track::PerformanceValueLaw::Unit {
+                min: -1.0,
+                max: 1.0
+            }
+        );
+
+        // The second accepted frame lands on tick 1.
+        app.handle_web_action(web::state::WebAction::SetParam {
+            param: "hue_shift".to_string(),
+            value: serde_json::json!(90.0),
+        });
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        assert_eq!(app.performance_take.events().len(), 2);
+        assert_eq!(app.performance_take.events()[1].tick, 1);
+
+        // Disarm stamps the declared length and finishes the take.
+        app.handle_web_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(!app.performance_recording);
+        assert!(!app.performance_take.incomplete());
+        assert_eq!(app.performance_take.length_ticks(), 2);
+    }
+
+    #[test]
+    fn the_record_tap_skips_unrecordable_actions_and_counts_oracle_gaps() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.handle_web_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+
+        // A safety control is outside the recordable vocabulary entirely:
+        // nothing staged and nothing counted, by law rather than omission.
+        app.handle_web_action(web::state::WebAction::SetBlackout { enabled: true });
+        assert!(app.pending_performance_edits.is_empty());
+        assert_eq!(app.performance_unsupported_edits, 0);
+        app.set_blackout(false);
+
+        // A recordable family whose param has no declared law is counted.
+        app.handle_web_action(web::state::WebAction::SetParam {
+            param: "random_seed".to_string(),
+            value: serde_json::json!(7),
+        });
+        assert!(app.pending_performance_edits.is_empty());
+        assert_eq!(app.performance_unsupported_edits, 1);
+        app.handle_web_action(web::state::WebAction::SetTemporal {
+            param: "score_loop_driver".to_string(),
+            value: serde_json::json!("none"),
+        });
+        assert_eq!(app.performance_unsupported_edits, 2);
+
+        // A layer edit with no live layer at the position resolves to no
+        // control at all rather than guessing an address.
+        assert!(app
+            .performance_record_view(&web::state::WebAction::SetLayerParam {
+                index: 0,
+                layer_id: None,
+                param: "opacity".to_string(),
+                value: serde_json::json!(0.5),
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn performance_transports_are_revision_guarded_and_mutually_exclusive() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.handle_web_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision + 1,
+        });
+        assert!(!app.performance_recording);
+        assert!(app.performance_status.contains("stale"));
+
+        app.performance_take = simple_take();
+        app.handle_web_action(web::state::WebAction::SetPerformancePlayback {
+            enabled: true,
+            loop_playback: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(app.performance_playback.is_some());
+        app.handle_web_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(
+            !app.performance_recording,
+            "recording must refuse while playback is armed"
+        );
+        assert!(app.performance_status.contains("refused"));
+
+        app.handle_web_action(web::state::WebAction::SetPerformancePlayback {
+            enabled: false,
+            loop_playback: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(app.performance_playback.is_none());
+        app.handle_web_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(app.performance_recording);
+        app.handle_web_action(web::state::WebAction::SetPerformancePlayback {
+            enabled: true,
+            loop_playback: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(
+            app.performance_playback.is_none(),
+            "playback must refuse while recording is armed"
+        );
+    }
+
+    #[test]
+    fn a_take_replays_through_the_inner_seam_without_manual_history() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.performance_take = simple_take();
+        app.refresh_performance_checksum();
+        app.master_effects.brightness = 0.0;
+
+        app.handle_web_action(web::state::WebAction::SetPerformancePlayback {
+            enabled: true,
+            loop_playback: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(app.performance_playback.is_some());
+        app.advance_performance_playback();
+
+        // The Q16 lattice reproduces the authored value to lattice precision.
+        assert!(
+            (app.master_effects.brightness - 0.75).abs() < 1.0e-4,
+            "replay must move the control: {}",
+            app.master_effects.brightness
+        );
+        // A finished non-looping take disarms itself.
+        assert!(app.performance_playback.is_none());
+        assert!(
+            app.manual_history.undo_label().is_none(),
+            "a replayed edit must never open an undo entry"
+        );
+        // Replay never records into the loaded take.
+        assert_eq!(app.performance_take.events().len(), 1);
+        assert!(app.pending_performance_edits.is_empty());
+    }
+
+    #[test]
+    fn a_looping_take_restarts_from_tick_zero() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let mut take = simple_take();
+        take.finalize(1);
+        app.performance_take = take;
+        app.handle_web_action(web::state::WebAction::SetPerformancePlayback {
+            enabled: true,
+            loop_playback: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+
+        app.advance_performance_playback();
+        app.master_effects.brightness = 0.0;
+        // Two accepted frames cross the declared length; the loop rewinds and
+        // the tick-zero event applies again.
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        app.advance_performance_playback();
+        performance_commit_frame(&mut app, 1.0 / performance_track::PERFORMANCE_REFERENCE_FPS);
+        app.advance_performance_playback();
+        app.advance_performance_playback();
+        assert!(app.performance_playback.is_some(), "loop keeps playing");
+        assert!(
+            (app.master_effects.brightness - 0.75).abs() < 1.0e-4,
+            "the loop must reapply the take from tick zero: {}",
+            app.master_effects.brightness
+        );
+    }
+
+    #[test]
+    fn stale_layer_addresses_degrade_by_name_and_never_retarget() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        let mut take = performance_track::PerformanceTake::default();
+        take.record_accepted(
+            0,
+            performance_track::PerformanceControl::LayerEffect {
+                layer: 3,
+                param: "pixelate".to_string(),
+            },
+            performance_track::PerformanceValueLaw::Unit {
+                min: 1.0,
+                max: 32.0,
+            },
+            &performance_track::PerformanceRawValue::Continuous(8.0),
+        )
+        .unwrap();
+        take.finalize(0);
+        app.performance_take = take;
+        app.handle_web_action(web::state::WebAction::SetPerformancePlayback {
+            enabled: true,
+            loop_playback: false,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        let playback = app.performance_playback.as_ref().expect("armed");
+        assert_eq!(
+            playback.degraded,
+            vec!["layer_effect:3:pixelate".to_string()]
+        );
+        assert!(matches!(
+            playback.compiled[0],
+            CompiledPerformanceEvent::Degraded
+        ));
+        assert!(
+            app.performance_status.contains("degraded"),
+            "the arm status names the degradation: {}",
+            app.performance_status
+        );
+        let armed_snapshot = app.performance_status_snapshot();
+        assert_eq!(
+            armed_snapshot.degraded,
+            vec!["layer_effect:3:pixelate".to_string()]
+        );
+        // Dispatching the degraded entry is a named no-op, never a retarget.
+        app.advance_performance_playback();
+        assert_eq!(app.performance_status_snapshot().mode, "off");
+    }
+
+    #[test]
+    fn generation_barriers_clear_the_recorder_and_source_cuts_do_not() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.performance_take = simple_take();
+        app.refresh_performance_checksum();
+        app.reset_patch_generation();
+        assert!(app.performance_take.is_empty());
+        assert!(app.performance_checksum.is_empty());
+        assert!(!app.performance_recording);
+
+        // The same asymmetry the gesture recorder holds: the three authored
+        // generation barriers clear the take; a source cut keeps it.
+        let source = include_str!("main.rs");
+        for name in [
+            "fn reset_patch_generation(",
+            "fn invalidate_visual_generation_after_look(",
+            "fn revert_master_visual_state(",
+        ] {
+            let start = source.find(name).unwrap_or_else(|| panic!("{name}"));
+            let body = &source[start..start + 6_000];
+            assert!(
+                body.contains("self.clear_performance_recording_state();"),
+                "{name} must clear the performance recorder"
+            );
+        }
+        let cut = source.find("fn invalidate_source_cut_generation(").unwrap();
+        assert!(
+            !source[cut..cut + 4_000].contains("clear_performance_recording_state"),
+            "a source cut must keep the recorded take"
+        );
+        // The restore runs strictly after the barrier that cleared the
+        // retired program's recorder, beside the gesture restore.
+        let restore = source
+            .find("self.restore_performance_take_from_patch(&patch);")
+            .expect("patch load restores the recorded take");
+        assert!(
+            source[..restore].contains("self.restore_gesture_track_from_patch(&patch);"),
+            "the take restore must sit beside the gesture restore, after the barrier"
+        );
+    }
+
+    #[test]
+    fn a_patch_carries_the_take_whole_and_marks_an_armed_capture_incomplete() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.performance_take = simple_take();
+        app.refresh_performance_checksum();
+
+        let patch = app.try_capture_current_patch().expect("capture");
+        let document = patch.performance_take.as_ref().expect("take is carried");
+        assert!(!document.incomplete);
+        assert_eq!(document.event_count, 1);
+
+        // A capture while recording is still armed marks the flag inside the
+        // hashed stream rather than presenting a finished take.
+        app.performance_recording = true;
+        let armed = app.try_capture_current_patch().expect("capture");
+        assert!(armed.performance_take.as_ref().expect("carried").incomplete);
+        app.performance_recording = false;
+
+        // Restore after the barrier replaces the session take.
+        app.reset_patch_generation();
+        assert!(app.performance_take.is_empty());
+        app.restore_performance_take_from_patch(&patch);
+        assert_eq!(app.performance_take.events().len(), 1);
+        assert!(!app.performance_checksum.is_empty());
+
+        // A patch without the section is exactly the pre-recorder path.
+        let mut legacy = patch.clone();
+        legacy.performance_take = None;
+        let before = app.performance_take.clone();
+        app.restore_performance_take_from_patch(&legacy);
+        assert_eq!(app.performance_take, before);
+    }
+
+    #[test]
+    fn performance_transports_are_never_latchable() {
+        let web_state = WebState::new().expect("test token");
+        let mut app = App::new(None, None, web_state);
+        app.queue_quantized_action(web::state::WebAction::SetPerformanceRecording {
+            enabled: true,
+            layer_stack_revision: app.layer_stack_revision,
+        });
+        assert!(!app.performance_recording);
+        assert!(app.composition_status.contains("cannot be quantized"));
+        assert!(app.quantized_actions.is_empty());
+    }
+
+    #[test]
+    fn the_value_law_oracle_answers_from_the_engines_own_tables() {
+        use performance_track::{PerformanceControl as Control, PerformanceValueLaw as Law};
+        let law = |control: Control| App::performance_value_law_for(&control);
+        let master = |param: &str| Control::Master {
+            param: param.to_string(),
+        };
+        let temporal = |param: &str| Control::Temporal {
+            param: param.to_string(),
+        };
+        assert_eq!(
+            law(master("hue_shift")),
+            Some(Law::Unit {
+                min: -180.0,
+                max: 180.0
+            })
+        );
+        assert_eq!(
+            law(master("barrel")),
+            Some(Law::Unit {
+                min: -1.0,
+                max: 1.0
+            }),
+            "master-only optics are recordable at master scope"
+        );
+        assert_eq!(
+            law(Control::LayerEffect {
+                layer: 0,
+                param: "barrel".to_string()
+            }),
+            None,
+            "master-only optics never record at layer scope"
+        );
+        assert_eq!(law(master("random_seed")), None, "a seed is identity");
+        assert_eq!(
+            law(temporal("feedback")),
+            Some(Law::Unit {
+                min: 0.0,
+                max: 0.95
+            })
+        );
+        assert_eq!(
+            law(temporal("disp_phosphor")),
+            Some(Law::Unit {
+                min: 0.0,
+                max: 0.95
+            }),
+            "disp_* maps onto the display_* modulation range"
+        );
+        assert_eq!(
+            law(temporal("key_history")),
+            Some(Law::Stepped { min: 1, max: 23 })
+        );
+        assert_eq!(law(temporal("mosh_recycle")), Some(Law::Toggle));
+        assert_eq!(law(temporal("atlas_seed")), None);
+        let Some(Law::Discrete { vocab }) = law(temporal("slit_map")) else {
+            panic!("slit_map is a closed vocabulary");
+        };
+        assert_eq!(
+            vocab,
+            vec!["ramp", "brightness", "radial", "tbc_ramp", "sweep"]
+        );
+        let Some(Law::Discrete { vocab }) = law(Control::LayerParam {
+            layer: 0,
+            param: "blend_mode".to_string(),
+        }) else {
+            panic!("blend_mode is a closed vocabulary");
+        };
+        assert_eq!(vocab.len(), 25, "every blend mode from the engine table");
+        let Some(Law::Discrete { vocab }) = law(Control::BusMix {
+            param: "blend".to_string(),
+        }) else {
+            panic!("bus blend is a closed vocabulary");
+        };
+        assert_eq!(
+            vocab.len(),
+            24,
+            "the bus meet excludes alpha_cut exactly as its parse table does"
+        );
+        assert!(!vocab.iter().any(|token| token == "alpha_cut"));
+        assert_eq!(
+            law(Control::MotionMaster {
+                param: "transplant_amount".to_string()
+            }),
+            None,
+            "transplant controls are layer-recipient laws"
+        );
+        assert_eq!(
+            law(Control::MotionLayer {
+                layer: 0,
+                param: "transplant_amount".to_string()
+            }),
+            Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+        assert_eq!(
+            law(Control::MotionMaster {
+                param: "field_source".to_string()
+            }),
+            None,
+            "the field source rewrites what Motion observes; it is topology"
+        );
+        assert_eq!(
+            law(Control::Ntsc {
+                param: "tape_speed".to_string()
+            }),
+            Some(Law::Stepped { min: 0, max: 2 })
+        );
+        assert_eq!(
+            law(Control::GestureCanvas {
+                param: "radius".to_string()
+            }),
+            Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+        assert_eq!(
+            law(Control::LayerPattern {
+                layer: 0,
+                param: "freq_x".to_string()
+            }),
+            Some(Law::Unit { min: 0.0, max: 1.0 }),
+            "pattern scalars answer from the layer suffix table"
+        );
+        assert_eq!(
+            law(Control::MorphPosition),
+            Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+        assert_eq!(
+            law(Control::BusCrossfade),
+            Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+    }
+
+    #[test]
+    fn the_temporal_wire_applier_is_shared_by_live_and_export() {
+        let source = include_str!("main.rs");
+        // Built at runtime so the needle cannot match this test's own source.
+        let definition = format!("fn {}(", "apply_temporal_wire_edit");
+        assert_eq!(
+            source.matches(&definition).count(),
+            1,
+            "exactly one temporal wire applier exists"
+        );
+        let arm = source
+            .find("WebAction::SetTemporal { param, value } => {")
+            .expect("the live arm");
+        assert!(
+            source[arm..arm + 1_500].contains("apply_temporal_wire_edit("),
+            "the live arm must delegate to the shared applier"
+        );
+        let export = include_str!("render_export.rs");
+        assert!(
+            export.contains("crate::apply_temporal_wire_edit("),
+            "export replay must consume the same applier"
         );
     }
 }

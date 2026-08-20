@@ -38,6 +38,22 @@ pub const STILL_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp
 
 static NEXT_LAYER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The one clamp law for the three layer transport scalars, shared by the
+/// live `set_layer_param` applier and the B9 export replay so an offline
+/// take can never land a value the live program would have clamped
+/// differently.
+pub(crate) fn clamp_layer_opacity(value: f32) -> f32 {
+    value.clamp(0.0, 1.0)
+}
+
+pub(crate) fn clamp_layer_speed(value: f32) -> f32 {
+    value.clamp(0.25, 4.0)
+}
+
+pub(crate) fn clamp_layer_fps(value: f32) -> f32 {
+    value.clamp(1.0, 240.0)
+}
+
 const fn default_bypass_master_fx() -> bool {
     false
 }

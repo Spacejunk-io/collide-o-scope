@@ -26,6 +26,7 @@ src/
 ├── main.rs              winit loop, app transactions, history, capture, web/native actions
 ├── pattern_synth.rs     B7 pattern-synth source law: authored params, closed vocabularies, CPU reference, wire-edit table
 ├── text_page.rs         B7 text-page source law: authored page, bundled two-face raster, wire-edit table
+├── performance_track.rs B9 portable take contract: typed control addresses, value laws, checksum, clock
 ├── composition.rs       stable-ID groups, buses, mattes, and authored composition topology
 ├── evaluated_composition.rs unified LegacyExact/Advanced planner and resource admission
 ├── visual_rack.rs       ordered scope racks, typed nodes, taps, validation, persistence
@@ -2390,6 +2391,101 @@ frame-plan context only — Pause holds the detuned oscillator still and
 export replays it structurally; `render_scan_processor_pipeline` is the
 labeled export case.
 
+## The B9 performance recorder
+
+It records gestures rather than pixels: while recording is armed, every
+accepted authored value edit is written down as a `(tick, param_address,
+value)` event on the 30 Hz authoring reference, and a finished take plays
+back in real time — or offline, frame-indexed — against completely different
+footage. The law is derived from BENDR (MIT, © 2026 Steve Blythe); the house
+adaptation records accepted edits at the coalesced drain rather than
+change-sampling a control surface, and **the patch is the opening state**: a
+take is carried whole inside the patch, so no synthetic keyframe exists.
+
+**The portable contract** (`src/performance_track.rs`, the gesture-track
+substrate arm for arm): `PERFORMANCE_REFERENCE_FPS` *is*
+`TEMPORAL_REFERENCE_FPS`; events are quantized codes only (8 bytes: `tick:
+u32le | address:u16le | value:u16le`, cap 16,384, `truncated` honesty);
+SHA-256 over a domain-separated little-endian field stream
+(`collide-o-scope/performance-take/v1\0`) with the `truncated`/`incomplete`
+flags *inside* the digest; bounded serde both ways with a hand-validated flat
+address codec (serde ignores `deny_unknown_fields` on tagged enums, so the
+codec refuses hostile extra fields by hand); the clock derives its tick
+before adding the frame's delta. The address table (cap 256, hashed with the
+events) interns each control once: a closed typed `PerformanceControl`
+(append-only codes 0–14) plus the `PerformanceValueLaw` its value lane rides —
+`Unit {min,max}` (Q16 over the declared range), `Discrete {vocab}` (token
+index), `Toggle`, `Stepped {min,max}` (exact integers, because integer
+appliers reject a non-integer wire number). The law is captured at first
+sight, so a take's lattice can never shift under its own events. Layers are
+addressed by saved stack position — the morph-slot identity — never by
+process-lifetime live IDs.
+
+**The value-law oracle** (`performance_value_law_for`) answers from the
+engine's own tables: `modulation::target_range` for continuous families
+(master by wire name; layer effects and pattern scalars through `layer1_…`
+suffixes; temporal through `fb_*→temporal_fb_*` / `disp_*→display_*` maps),
+the owning enums' `ALL` tables for every discrete vocabulary, and the
+validators' integer clamps for stepped laws. `None` is a counted refusal,
+never a guess: seeds, `score_loop_driver`, motion sources/qualities/carriers,
+and the reset tokens. Safety controls (blackout, freeze, pause), topology,
+and routes are outside the vocabulary by law, not omission.
+
+**Recording.** The tap sits on `handle_web_action_inner_with_feedback` — the
+seam every final application funnels through (browser drain, downbeat
+release, native RECOVERY, transform gizmo) — so a take stores what the
+program actually did: coalesced-away values never dispatch and never record.
+Staged edits commit at the same accepted, program-advancing gate the temporal
+and gesture recorders share (a free function over disjoint fields, because
+the renderer borrow is live there); a rejected or frozen frame neither
+consumes a tick nor records. Arming starts a fresh take at tick zero;
+disarming stamps the declared length; a capture mid-recording carries the
+take marked incomplete inside the hashed flags.
+
+**Replay is delegation, not reimplementation.** Playback compiles the take
+once at arm — each event becomes a real `WebAction`, layer positions bound to
+the live stable IDs occupying them — and dispatches due events per frame
+through the transform-gizmo seam, so Morph ownership transfer, sanitize, and
+every engine refusal apply exactly as to a hand-made edit while manual
+history records nothing. A guard flag hides the replayer's dispatches from
+the record tap. An unresolvable address degrades to a named no-op in the
+snapshot's `degraded` list and is never retargeted. Dispatch runs after the
+downbeat release, only while the program advances — a take is an automatic
+clock and Pause freezes it; the playhead advances at the acceptance gate;
+loop rewinds cursor and clock. Recording and playback are mutually exclusive
+by refusal.
+
+**Closure.** Patch: `performance_take` carried whole beside `gesture_track`,
+skip-serialized when absent, gated by its checksum-verifying deserializer,
+restored strictly after the generation barrier; the three authored barriers
+clear the recorder and a source cut deliberately does not. Wire:
+`set_performance_recording` / `set_performance_playback` (revision-guarded at
+ingress and dispatch) and `clear_performance_take` — uncoalesced priority
+barriers, refused in `Quantized` batches at both gates, excluded from manual
+history. Snapshot: the additive `performance_recorder` block (the
+`performance` name belongs to the clip/scene subsystem). Panel: the TAKE
+RECORDER group beside GESTURE FIELD (second-column group pin 7 → 8; buttons
+only, range pins 198/21 unmoved). A take has no modulation address, no Morph
+slot, and Dice/the generator preserve it exactly (`GENERATOR_VERSION` stays
+"12"). Export verifies the checksum before the first frame, replays due
+events at `export_temporal_reference_tick` into the authored bases through
+the same appliers the live arms use — `EffectsSnapshot`,
+`apply_spatial_transform_edit`, `apply_motion_param`, the extracted
+`apply_temporal_wire_edit` (the `set_temporal` match body moved whole so live
+and export mutate `TemporalParams` through identical code), `BusMixerEdit`,
+`PatternSynthEdit`, the shared layer scalar clamps — replays once straight
+through (loop is live transport), and publishes `<output>.performance.json`
+via the staged no-replace commit, cleanup-coupled and claim-retired like the
+gesture sidecar. The motion sidecar schema stays 6.
+
+**v1 boundaries.** Values only: node/group rack params, text-page values,
+pad/gyro/audio/MIDI/LFO/routing configuration, and morph law/glide/capture
+are not yet recordable — the address vocabulary is append-only, so each can
+join without breaking a stored take. MIDI/OSC direct-control edits bypass the
+wire-action seam and are not recorded. `render_performance_recorder_pipeline`
+is the labeled export case: the `_untaken` twin must decode differently and
+the `_repeat` render identically — the record/replay determinism claim.
+
 ## Gesture-field etching
 
 A gesture is an ordered stream of quantized events addressed on the 30 Hz
@@ -3285,6 +3381,27 @@ mislead browser tests.
   is the labeled export case with its `_clean` difference, `_repeat`
   per-host determinism, and sidecar encoder-identity assertions.
   Cross-machine bit-identity is deliberately not asserted anywhere.
+- Performance-recorder tests must cover the portable contract (the Q16/
+  discrete/toggle/stepped lattices with hostile refusals, first-law interning,
+  the checksum covering the address table with both honesty flags inside the
+  digest, bounded serde both ways including hostile extra fields inside one
+  address, the monotonic cursor, the derive-before-add clock, event-cap
+  truncation, and frame-grouping digest invariance), the value-law oracle
+  answering from the engines' own tables (blend and bus vocabularies from
+  `ALL` with `alpha_cut` excluded, master-only optics refusing layer scope,
+  seeds and the loop driver refused by name), the drain tap's
+  capture/commit/skip-and-count behavior, revision guards with mutual
+  transport exclusion, replay through the inner seam with undo exclusion and
+  loop rewind, per-address degradation by name that never retargets, the
+  generation-barrier/source-cut asymmetry with restore-after-barrier source
+  pins, checksum-gated patch carriage with incomplete-capture marking,
+  never-latchable refusals at the server gate and the engine latch, the
+  shared-applier source audits (one `apply_temporal_wire_edit`, consumed by
+  both the live arm and export replay), the sidecar's no-replace/
+  claim-retirement/cleanup laws, and the offline applier for every family
+  with stale-position and absent-morph no-ops.
+  `render_performance_recorder_pipeline` is the labeled export case with its
+  `_untaken` difference twin and `_repeat` determinism assertion.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

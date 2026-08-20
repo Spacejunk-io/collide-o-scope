@@ -492,6 +492,12 @@ pub struct PatchState {
     /// gate on load; an absent section is exactly the pre-study path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub studies: Vec<crate::study::StudyDocument>,
+    /// B9 recorded performance take, carried whole on the gesture-track law:
+    /// a take is authored topology, never interpolated, and an absent section
+    /// is exactly the pre-recorder path. Its own bounded, checksum-verifying
+    /// deserializer is the single acceptance gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_take: Option<crate::performance_track::PerformanceTakeDocument>,
 }
 
 impl PatchState {
@@ -565,6 +571,8 @@ impl<'de> Deserialize<'de> for PatchState {
             gesture_canvas: Option<GestureCanvasConfig>,
             #[serde(default)]
             studies: Vec<crate::study::StudyDocument>,
+            #[serde(default)]
+            performance_take: Option<crate::performance_track::PerformanceTakeDocument>,
         }
 
         let raw = RawPatchState::deserialize(deserializer)?;
@@ -586,6 +594,7 @@ impl<'de> Deserialize<'de> for PatchState {
             gesture_track: raw.gesture_track,
             gesture_canvas: raw.gesture_canvas.map(GestureCanvasConfig::sanitized),
             studies: raw.studies,
+            performance_take: raw.performance_take,
         };
         patch
             .validate_creative_persistence()
@@ -5580,6 +5589,10 @@ impl PatchState {
                 .validate()
                 .map_err(|error| format!("invalid saved gesture track: {error}"))?;
         }
+        if let Some(take) = &self.performance_take {
+            take.validate()
+                .map_err(|error| format!("invalid saved performance take: {error}"))?;
+        }
         if let Some(rack) = &self.master_rack {
             rack.validate_for_scope(LegacyRackScope::Master)
                 .map_err(|error| format!("invalid saved master rack: {error}"))?;
@@ -5832,6 +5845,7 @@ impl PatchState {
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         }
     }
 
@@ -6749,6 +6763,7 @@ mod tests {
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         };
         let mut master = EffectUniforms {
             brightness: -0.4,
@@ -7065,6 +7080,7 @@ scenes:
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -7157,6 +7173,7 @@ scenes:
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         };
 
         let yaml = serde_yaml::to_string(&patch).unwrap();
@@ -8972,6 +8989,7 @@ routings:
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
+            performance_take: None,
         }
     }
 
@@ -10626,6 +10644,51 @@ routings:
         assert!(yaml.contains("gesture_canvas:"));
         let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(restored.gesture_canvas, moved.gesture_canvas);
+    }
+
+    /// The B9 take section rides the gesture-track law: carried whole, absent
+    /// by default, and gated by its own checksum-verifying deserializer.
+    #[test]
+    fn the_performance_take_section_is_additive_and_checksum_gated() {
+        let patch = minimal_patch(1);
+        assert_eq!(patch.performance_take, None);
+        let yaml = serde_yaml::to_string(&patch).unwrap();
+        assert!(!yaml.contains("performance_take:"));
+
+        let mut take = crate::performance_track::PerformanceTake::default();
+        take.record_accepted(
+            0,
+            crate::performance_track::PerformanceControl::Master {
+                param: "brightness".to_string(),
+            },
+            crate::performance_track::PerformanceValueLaw::Unit {
+                min: -1.0,
+                max: 1.0,
+            },
+            &crate::performance_track::PerformanceRawValue::Continuous(0.5),
+        )
+        .unwrap();
+        take.finalize(4);
+        let mut carried = minimal_patch(1);
+        carried.performance_take = Some(
+            crate::performance_track::PerformanceTakeDocument::capture(&take),
+        );
+        let yaml = serde_yaml::to_string(&carried).unwrap();
+        assert!(yaml.contains("performance_take:"));
+        let restored: PatchState = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.performance_take, carried.performance_take);
+        assert_eq!(
+            restored.performance_take.unwrap().decode().unwrap(),
+            take,
+            "the carried take decodes to the exact recorded stream"
+        );
+
+        // A tampered digest is refused at the patch boundary, never repaired.
+        let tampered = yaml.replace(&take.checksum_hex()[..8], "00000000");
+        assert!(
+            serde_yaml::from_str::<PatchState>(&tampered).is_err(),
+            "a mismatched take digest must reject the patch section"
+        );
     }
 
     /// Hostile canvas values sanitize on load and an unknown key inside the
