@@ -4,6 +4,7 @@ pub(crate) mod composition_host;
 pub(crate) mod compositor;
 pub(crate) mod display_physics;
 pub(crate) mod gesture_canvas;
+pub(crate) mod melting_edge;
 pub(crate) mod motion;
 pub(crate) mod rack;
 pub(crate) mod readback;

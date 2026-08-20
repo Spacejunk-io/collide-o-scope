@@ -2958,6 +2958,9 @@ pub struct Renderer {
     /// slot-0 seam between temporal and the opaque resolve. Its surfaces are
     /// lazy: a default session charges nothing.
     display_physics: crate::renderer::display_physics::DisplayPhysicsGpu,
+    /// The B8 melting-edge stage on the same seam, immediately upstream of
+    /// the display stage. Its history surface is lazy too.
+    melting_edge: crate::renderer::melting_edge::MeltingEdgeGpu,
 
     // Instance + adapter kept for creating additional surfaces (output
     // window). Capabilities must be queried against the SAME adapter the
@@ -3210,6 +3213,11 @@ impl Renderer {
             COMPOSITE_FORMAT,
             [output_width, output_height],
         );
+        let melting_edge = crate::renderer::melting_edge::MeltingEdgeGpu::new(
+            &device,
+            COMPOSITE_FORMAT,
+            [output_width, output_height],
+        );
 
         // --- Three composite textures ---
         let tex_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -3337,6 +3345,7 @@ impl Renderer {
             feedback_texture,
             temporal_state: TemporalState::default(),
             display_physics,
+            melting_edge,
             instance,
             adapter,
             output: None,
@@ -3917,6 +3926,29 @@ impl Renderer {
             &self.composite_textures,
             &self.composite_views,
             display,
+            delta_seconds,
+        )
+    }
+
+    /// The B8 melting-edge stage — the master melt over the program's own
+    /// coverage — on the same slot-0 seam, immediately before the display
+    /// stage. A dormant stage (no authored melt) encodes nothing and slot 0
+    /// reaches the display stage untouched. `delta_seconds` is the
+    /// program-advancing delta, so Pause holds the trail still.
+    pub(crate) fn render_melting_edge(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        melt: &crate::mixing_boundary::MeltParams,
+        delta_seconds: f32,
+    ) -> bool {
+        self.melting_edge.encode(
+            &self.device,
+            &self.queue,
+            encoder,
+            &self.composite_textures,
+            &self.composite_views,
+            COMPOSITE_FORMAT,
+            melt,
             delta_seconds,
         )
     }

@@ -218,6 +218,14 @@ pub struct MorphMasterSnapshot {
     pub bitcrush: f32,
     pub bitcrush_levels: f32,
     pub bitcrush_dither: f32,
+    // B8 key dressing. `key_border_color` is a discrete closed table and
+    // recalls an endpoint at the midpoint.
+    #[serde(default)]
+    pub key_border: f32,
+    #[serde(default)]
+    pub key_border_color: f32,
+    #[serde(default)]
+    pub key_shadow: f32,
     pub multi_grid_x: f32,
     pub multi_grid_y: f32,
     pub barrel: f32,
@@ -295,6 +303,9 @@ impl MorphMasterSnapshot {
             bitcrush: value.bitcrush,
             bitcrush_levels: value.bitcrush_levels,
             bitcrush_dither: value.bitcrush_dither,
+            key_border: value.key_border,
+            key_border_color: value.key_border_color,
+            key_shadow: value.key_shadow,
             multi_grid_x: value.multi_grid_x,
             multi_grid_y: value.multi_grid_y,
             barrel: value.barrel,
@@ -374,6 +385,9 @@ impl MorphMasterSnapshot {
             bitcrush: finite_clamp(self.bitcrush, 0.0, 0.0, 1.0),
             bitcrush_levels: finite_clamp(self.bitcrush_levels, 2.0, 2.0, 16.0),
             bitcrush_dither: finite_clamp(self.bitcrush_dither, 1.0, 0.0, 1.0),
+            key_border: finite_clamp(self.key_border, 0.0, 0.0, 1.0),
+            key_border_color: discrete_f32(self.key_border_color, 0.0, 7.0),
+            key_shadow: finite_clamp(self.key_shadow, 0.0, 0.0, 1.0),
             multi_grid_x: finite_clamp(self.multi_grid_x, 1.0, 1.0, 8.0),
             multi_grid_y: finite_clamp(self.multi_grid_y, 1.0, 1.0, 8.0),
             barrel: finite_clamp(self.barrel, 0.0, -1.0, 1.0),
@@ -447,6 +461,9 @@ impl MorphMasterSnapshot {
         value.bitcrush = clean.bitcrush;
         value.bitcrush_levels = clean.bitcrush_levels;
         value.bitcrush_dither = clean.bitcrush_dither;
+        value.key_border = clean.key_border;
+        value.key_border_color = clean.key_border_color;
+        value.key_shadow = clean.key_shadow;
         value.multi_grid_x = clean.multi_grid_x;
         value.multi_grid_y = clean.multi_grid_y;
         value.barrel = clean.barrel;
@@ -535,6 +552,9 @@ impl MorphMasterSnapshot {
             bitcrush: blend_finite(a.bitcrush, b.bitcrush, weights),
             bitcrush_levels: blend_finite(a.bitcrush_levels, b.bitcrush_levels, weights),
             bitcrush_dither: blend_finite(a.bitcrush_dither, b.bitcrush_dither, weights),
+            key_border: blend_finite(a.key_border, b.key_border, weights),
+            key_border_color: pick_finite(a.key_border_color, b.key_border_color, choose_b),
+            key_shadow: blend_finite(a.key_shadow, b.key_shadow, weights),
             multi_grid_x: blend_finite(a.multi_grid_x, b.multi_grid_x, weights),
             multi_grid_y: blend_finite(a.multi_grid_y, b.multi_grid_y, weights),
             barrel: blend_finite(a.barrel, b.barrel, weights),
@@ -756,6 +776,10 @@ pub struct MorphTemporalSnapshot {
     /// the order fault, and the display model recall an endpoint at the
     /// midpoint.
     pub display: crate::display_physics::DisplayPhysicsParams,
+    /// B8 melting edge, captured whole: the params struct is its own
+    /// sanitizing serde block. All six controls are continuous and blend.
+    #[serde(default)]
+    pub melt: crate::mixing_boundary::MeltParams,
 }
 
 impl Default for MorphTemporalSnapshot {
@@ -782,6 +806,7 @@ impl MorphTemporalSnapshot {
             originals: TemporalOriginalsConfig::from_params(value.originals),
             rig: TemporalRigConfig::from_params(value.rig),
             display: value.display,
+            melt: value.melt,
         }
         .sanitized()
     }
@@ -803,6 +828,7 @@ impl MorphTemporalSnapshot {
             originals: self.originals.sanitized(),
             rig: self.rig.sanitized(),
             display: self.display.sanitized(),
+            melt: self.melt.sanitized(),
         }
     }
 
@@ -823,6 +849,7 @@ impl MorphTemporalSnapshot {
             key_history: clean.key_history,
             originals: clean.originals.to_params(),
             display: clean.display,
+            melt: clean.melt,
             rig: clean.rig.to_params(),
         }
     }
@@ -850,9 +877,29 @@ impl MorphTemporalSnapshot {
             originals: interpolate_temporal_originals(a.originals, b.originals, weights, choose_b),
             rig: interpolate_temporal_rig(a.rig, b.rig, weights, choose_b),
             display: interpolate_display_physics(a.display, b.display, weights, choose_b),
+            melt: interpolate_master_melt(a.melt, b.melt, weights),
         }
         .sanitized()
     }
+}
+
+/// B8 master-melt morphing: all six controls are continuous and blend.
+fn interpolate_master_melt(
+    a: crate::mixing_boundary::MeltParams,
+    b: crate::mixing_boundary::MeltParams,
+    weights: [f32; 2],
+) -> crate::mixing_boundary::MeltParams {
+    let a = a.sanitized();
+    let b = b.sanitized();
+    crate::mixing_boundary::MeltParams {
+        melt: blend_finite(a.melt, b.melt, weights),
+        width: blend_finite(a.width, b.width, weights),
+        hold: blend_finite(a.hold, b.hold, weights),
+        swirl: blend_finite(a.swirl, b.swirl, weights),
+        chroma: blend_finite(a.chroma, b.chroma, weights),
+        creep: blend_finite(a.creep, b.creep, weights),
+    }
+    .sanitized()
 }
 
 /// B4 display morphing: the seventeen continuous controls blend, and the
@@ -1098,6 +1145,16 @@ pub enum MorphLayerBlendMode {
     Dodge,
     Burn,
     AlphaCut,
+    VividLight,
+    PinLight,
+    Divide,
+    WrapAdd,
+    Xor,
+    And,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 impl MorphLayerBlendMode {
@@ -1118,6 +1175,16 @@ impl MorphLayerBlendMode {
             BlendMode::Dodge => Self::Dodge,
             BlendMode::Burn => Self::Burn,
             BlendMode::AlphaCut => Self::AlphaCut,
+            BlendMode::VividLight => Self::VividLight,
+            BlendMode::PinLight => Self::PinLight,
+            BlendMode::Divide => Self::Divide,
+            BlendMode::WrapAdd => Self::WrapAdd,
+            BlendMode::Xor => Self::Xor,
+            BlendMode::And => Self::And,
+            BlendMode::Hue => Self::Hue,
+            BlendMode::Saturation => Self::Saturation,
+            BlendMode::Color => Self::Color,
+            BlendMode::Luminosity => Self::Luminosity,
         }
     }
 
@@ -1138,6 +1205,16 @@ impl MorphLayerBlendMode {
             Self::Dodge => BlendMode::Dodge,
             Self::Burn => BlendMode::Burn,
             Self::AlphaCut => BlendMode::AlphaCut,
+            Self::VividLight => BlendMode::VividLight,
+            Self::PinLight => BlendMode::PinLight,
+            Self::Divide => BlendMode::Divide,
+            Self::WrapAdd => BlendMode::WrapAdd,
+            Self::Xor => BlendMode::Xor,
+            Self::And => BlendMode::And,
+            Self::Hue => BlendMode::Hue,
+            Self::Saturation => BlendMode::Saturation,
+            Self::Color => BlendMode::Color,
+            Self::Luminosity => BlendMode::Luminosity,
         }
     }
 }
@@ -3220,6 +3297,59 @@ fn composition_topology_matches(a: &CompositionTree, b: &CompositionTree) -> boo
         })
 }
 
+/// Blend the B8 bus-mixer bundle: continuous values follow the engaged
+/// blend law, discrete laws (pattern, invert, rep, border colour, blend
+/// mode) recall an endpoint at the midpoint like every closed vocabulary.
+fn interpolate_bus_mixer(
+    a: crate::mixing_boundary::BusMixerState,
+    b: crate::mixing_boundary::BusMixerState,
+    weights: [f32; 2],
+    choose_b: bool,
+) -> crate::mixing_boundary::BusMixerState {
+    use crate::mixing_boundary::{BusMixParams, BusMixerState, DirtParams, MeltParams};
+    fn pick<T>(a: T, b: T, choose_b: bool) -> T {
+        if choose_b {
+            b
+        } else {
+            a
+        }
+    }
+    let value = |a_value: f32, b_value: f32, neutral: f32, min: f32, max: f32| {
+        finite_clamp(blend_finite(a_value, b_value, weights), neutral, min, max)
+    };
+    BusMixerState {
+        mix: BusMixParams {
+            pattern: pick(a.mix.pattern, b.mix.pattern, choose_b),
+            soft: value(a.mix.soft, b.mix.soft, 0.03, 0.0, 1.0),
+            origin_x: value(a.mix.origin_x, b.mix.origin_x, 0.0, -1.0, 1.0),
+            origin_y: value(a.mix.origin_y, b.mix.origin_y, 0.0, -1.0, 1.0),
+            detail: value(a.mix.detail, b.mix.detail, 0.3, 0.0, 1.0),
+            invert: pick(a.mix.invert, b.mix.invert, choose_b),
+            rep: pick(a.mix.rep, b.mix.rep, choose_b),
+            border: value(a.mix.border, b.mix.border, 0.0, 0.0, 1.0),
+            border_color: pick(a.mix.border_color, b.mix.border_color, choose_b),
+            blend: pick(a.mix.blend, b.mix.blend, choose_b),
+        },
+        dirt: DirtParams {
+            dirt: value(a.dirt.dirt, b.dirt.dirt, 0.0, 0.0, 1.0),
+            rate: value(a.dirt.rate, b.dirt.rate, 0.3, 0.0, 1.0),
+            drop: value(a.dirt.drop, b.dirt.drop, 0.5, 0.0, 1.0),
+            cut: value(a.dirt.cut, b.dirt.cut, 0.4, 0.0, 1.0),
+            knock: value(a.dirt.knock, b.dirt.knock, 0.5, 0.0, 1.0),
+            noise: value(a.dirt.noise, b.dirt.noise, 0.35, 0.0, 1.0),
+        },
+        melt: MeltParams {
+            melt: value(a.melt.melt, b.melt.melt, 0.0, 0.0, 2.0),
+            width: value(a.melt.width, b.melt.width, 0.3, 0.0, 2.0),
+            hold: value(a.melt.hold, b.melt.hold, 0.6, 0.0, 1.5),
+            swirl: value(a.melt.swirl, b.melt.swirl, 0.0, -1.0, 1.0),
+            chroma: value(a.melt.chroma, b.melt.chroma, 0.5, 0.0, 1.0),
+            creep: value(a.melt.creep, b.melt.creep, 0.35, 0.0, 1.0),
+        },
+    }
+    .sanitized()
+}
+
 fn interpolate_composition(
     a: &CompositionTree,
     b: &CompositionTree,
@@ -3235,6 +3365,12 @@ fn interpolate_composition(
         0.5,
         0.0,
         1.0,
+    ));
+    sampled.set_mixer(interpolate_bus_mixer(
+        a.mixer(),
+        b.mixer(),
+        weights,
+        choose_b,
     ));
     for group_a in a.groups() {
         let group_b = b.group(group_a.id)?;
@@ -3441,6 +3577,7 @@ pub(crate) fn apply_composition_values(
         return false;
     }
     live.set_bus_crossfade(sampled.bus_crossfade());
+    live.set_mixer(sampled.mixer());
     for sampled_group in sampled.groups() {
         let live_group = live
             .group_mut(sampled_group.id)
@@ -3847,6 +3984,7 @@ fn apply_runtime_composition_values(
         return false;
     }
     live.set_bus_crossfade(sampled.bus_crossfade());
+    live.set_mixer(sampled.mixer());
     for sampled_group in sampled.groups() {
         let live_group = live
             .group_mut(sampled_group.id)

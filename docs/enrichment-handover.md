@@ -25,7 +25,8 @@ second full-frame history ring.
 | B1 — the Scan Processor | **Complete** | `docs/evidence/b1-scan-processor-note.md`; CLAUDE.md "The B1 Scan Processor" |
 | B4 — display physics | **Complete** | `docs/evidence/b4-display-physics-note.md`; CLAUDE.md "B4 display physics" |
 | B14 — failure switches | **Partially landed early** | `servo_defeated` shipped inside B3; the remaining piece is `sync_latched` on the tape/NTSC-adjacent shear model |
-| B8, B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
+| B8 — the mixing boundary | **Complete** | `docs/evidence/b8-mixing-boundary-note.md`; CLAUDE.md "B8 the mixing boundary" |
+| B16, B5, B7, B9, B10, B11, B6, B15 | Open | — |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -33,16 +34,13 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-Wave 2 continues with **B8, the mixing boundary** — the melting edge over
-every coverage matte (evaluate the matte four points out; disagreement is
-the edge, its direction the normal; drag the incoming picture along it and
-dissolve the stage's own previous frame back in, so the smear creeps), the
-dirty-mixer fault stage on buses (event clock, four fault laws, hashed like
-Shift in a fresh RNG domain), and the blend/wipe audit (the classic blend
-family as a closed append-only enum with existing laws keeping their
-indices, plus the wipe-pattern vocabulary and key dressing). Melt at zero
-never allocates — the delegation law. Fetch the plan document before
-starting it.
+Wave 2 continues with **B16, program re-entry** — the `GestureCanvas`
+route recipe verbatim: a `SavedImageSource::ProgramTap` arm (serde tag plus
+the next plan hash code), a master singleton with no scope, no ID, and no
+saved position, N-1 publication at the acceptance decision, and
+`Transparent` with a named diagnostic before the first committed frame.
+Blackout must not leak one stale frame — decide the pre/post blackout copy
+explicitly and test it. Fetch the plan document before starting it.
 
 ## The working method every tranche follows
 

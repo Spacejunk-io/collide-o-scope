@@ -4849,6 +4849,13 @@ fn run_export(
         wgpu::TextureFormat::Rgba8UnormSrgb,
         [w, h],
     );
+    // The B8 melting edge rides the same seam immediately upstream of the
+    // display stage; its history surface is equally lazy.
+    let mut melting_edge_gpu = crate::renderer::melting_edge::MeltingEdgeGpu::new(
+        &device,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        [w, h],
+    );
 
     // Temporal history is the largest mandatory output-sized allocation. It
     // belongs to the setup scope above even when a saved patch currently has
@@ -6024,6 +6031,16 @@ fn run_export(
                 // zero. The B4 display stage rides the shared slot-0 seam,
                 // then reuse the established sole opaque boundary before
                 // readback/NTSC, exactly as the live advanced handoff does.
+                melting_edge_gpu.encode(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    &composite_textures,
+                    &composite_views,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    &mod_temporal.melt,
+                    temporal_input.program_advancing_delta(),
+                );
                 display_physics_gpu.encode(
                     &device,
                     &queue,
@@ -6223,6 +6240,16 @@ fn run_export(
 
                 // The B4 display stage rides the shared slot-0 seam offline,
                 // exactly where live encodes it.
+                melting_edge_gpu.encode(
+                    &device,
+                    &queue,
+                    &mut encoder,
+                    &composite_textures,
+                    &composite_views,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    &mod_temporal.melt,
+                    temporal_input.program_advancing_delta(),
+                );
                 display_physics_gpu.encode(
                     &device,
                     &queue,
@@ -17962,6 +17989,153 @@ mod effects_audit {
             decoded_framemd5("renders/audit_display_physics.mp4"),
             decoded_framemd5("renders/audit_display_physics_repeat.mp4"),
             "the display stage must replay deterministically"
+        );
+    }
+
+    /// B8's bus labeled export case: two layers on the A and B lanes meet
+    /// under an authored wipe, blend family, border rule, dirty-mixer fault
+    /// stage, and bus melt — through the real export path, the same `fs_bus`
+    /// live uses, no export-only mixer. The `_plain` twin carries the same
+    /// A/B topology with the mixer at its exact-legacy default and must
+    /// decode differently; the `_repeat` render must decode identically,
+    /// proving the dirt event clock and the melt store deterministic
+    /// frame-indexed offline.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_bus_mixing_boundary_pipeline() {
+        use crate::composition::{BusAssignment, CompositionTree, RootItem};
+        use crate::mixing_boundary::{
+            BackColor, BusMixParams, BusMixerState, DirtParams, MeltParams, WipePattern,
+        };
+        use crate::performance::SavedLayerPosition;
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_mixer = |mixer: BusMixerState| {
+            let mut patch = base_patch();
+            let mut top = patch.layers[0].clone();
+            top.effects.hue_shift = 140.0;
+            patch.layers.push(top);
+            let tree = CompositionTree::try_from_parts(
+                Vec::new(),
+                vec![
+                    RootItem::Layer {
+                        layer: SavedLayerPosition::new(0).expect("layer 0 exists"),
+                        bus: BusAssignment::A,
+                    },
+                    RootItem::Layer {
+                        layer: SavedLayerPosition::new(1).expect("layer 1 exists"),
+                        bus: BusAssignment::B,
+                    },
+                ],
+                None,
+                0.5,
+            )
+            .expect("A/B composition")
+            .with_mixer(mixer);
+            patch.composition = Some(tree);
+            patch
+        };
+        let authored = BusMixerState {
+            mix: BusMixParams {
+                pattern: WipePattern::Circle,
+                soft: 0.2,
+                border: 0.5,
+                border_color: BackColor::Cyan,
+                blend: crate::layers::BlendMode::PinLight,
+                ..BusMixParams::default()
+            },
+            dirt: DirtParams {
+                dirt: 0.8,
+                rate: 0.6,
+                ..DirtParams::default()
+            },
+            melt: MeltParams {
+                melt: 1.2,
+                hold: 1.2,
+                ..MeltParams::default()
+            },
+        };
+        render("bus_mixing_boundary", with_mixer(authored));
+        render(
+            "bus_mixing_boundary_plain",
+            with_mixer(BusMixerState::default()),
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_bus_mixing_boundary.mp4"),
+            decoded_framemd5("renders/audit_bus_mixing_boundary_plain.mp4"),
+            "an authored bus mixer must change the decoded frames"
+        );
+        render("bus_mixing_boundary_repeat", with_mixer(authored));
+        assert_eq!(
+            decoded_framemd5("renders/audit_bus_mixing_boundary.mp4"),
+            decoded_framemd5("renders/audit_bus_mixing_boundary_repeat.mp4"),
+            "the bus mixer must replay deterministically"
+        );
+    }
+
+    /// B8's master labeled export case: the program's own coverage boundary
+    /// (a master luminance key) melts through the slot-0 melting-edge stage
+    /// while the key signal carries its border and shadow dressing — the
+    /// same seam and shaders live uses, no export-only path. The `_dry`
+    /// twin keeps the key but zeroes the melt and the dressing and must
+    /// decode differently; the `_repeat` render must decode identically,
+    /// proving the stage's reference-tick store deterministic offline.
+    #[test]
+    #[ignore = "requires a GPU, ffmpeg on PATH, and videos/audit.mp4"]
+    fn render_melting_edge_and_key_dressing_pipeline() {
+        use crate::mixing_boundary::MeltParams;
+
+        assert!(
+            std::path::Path::new("videos/audit.mp4").is_file(),
+            "create videos/audit.mp4 first"
+        );
+        std::fs::create_dir_all("renders").ok();
+
+        let with_melt = |melt: MeltParams, border: f32, shadow: f32| {
+            let mut patch = base_patch();
+            patch.master.key_mode = 1;
+            patch.master.key_threshold = 0.45;
+            patch.master.key_softness = 0.05;
+            patch.master.key_border = border;
+            patch.master.key_border_color = 2;
+            patch.master.key_shadow = shadow;
+            patch.temporal = Some(crate::patch::TemporalConfig {
+                melt,
+                ..crate::patch::TemporalConfig::default()
+            });
+            patch
+        };
+        let authored = MeltParams {
+            melt: 1.5,
+            width: 1.0,
+            hold: 1.2,
+            chroma: 0.8,
+            creep: 0.35,
+            ..MeltParams::default()
+        };
+        render("melting_edge_key_dressing", with_melt(authored, 0.8, 0.9));
+        render(
+            "melting_edge_key_dressing_dry",
+            with_melt(MeltParams::default(), 0.0, 0.0),
+        );
+        assert_ne!(
+            decoded_framemd5("renders/audit_melting_edge_key_dressing.mp4"),
+            decoded_framemd5("renders/audit_melting_edge_key_dressing_dry.mp4"),
+            "an authored melt and dressing must change the decoded frames"
+        );
+        render(
+            "melting_edge_key_dressing_repeat",
+            with_melt(authored, 0.8, 0.9),
+        );
+        assert_eq!(
+            decoded_framemd5("renders/audit_melting_edge_key_dressing.mp4"),
+            decoded_framemd5("renders/audit_melting_edge_key_dressing_repeat.mp4"),
+            "the melting edge must replay deterministically"
         );
     }
 

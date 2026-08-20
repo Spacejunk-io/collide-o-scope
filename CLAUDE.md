@@ -38,10 +38,12 @@ src/
 ├── gesture.rs           portable quantized gesture events, checksum, one normalized adapter
 ├── gesture_canvas.rs    bounded vector canvas CPU reference, Push/Curl laws, transactions
 ├── display_physics.rs   B4 display-physics law: fields, phosphor, display model CPU reference
+├── mixing_boundary.rs   B8 mixing-boundary law: wipes, blend meet, dirty mixer, melt CPU reference
 ├── scan_processor.rs    B1 Scan Processor law: authored params, beam CPU reference, vertex budget
 ├── renderer/state.rs    LegacyExact passes, audience history, readbacks, output blits
 ├── renderer/composition.rs shared Advanced GPU executor and transactional histories
 ├── renderer/display_physics.rs single-seam slot-0 display stage, lazy field/phosphor surfaces
+├── renderer/melting_edge.rs B8 slot-0 master melt over the program's own coverage, lazy history
 ├── renderer/scan_processor.rs dedicated instanced-ribbon executor and shared accumulator
 ├── renderer/symmetry_field.rs dedicated eight-texture sampler-free Symmetry pass
 ├── renderer/gesture_canvas.rs ping-pong etch canvas and the presented donor image
@@ -83,9 +85,10 @@ src/
     ├── rack_node.wgsl   Collision Rack nodes and image-tap effects
     ├── study_interpreter.wgsl fixed Study interpreter over a bounded instruction buffer
     ├── display_physics.wgsl field domain, N-1 phosphor store, beam/mask display pass
+    ├── melting_edge.wgsl  B8 coverage-boundary probe, band drag, self-feeding hold
     ├── scan_processor.wgsl instanced ribbon geometry, vertex-stage fetch, additive accumulate + resolve
     ├── symmetry_field.wgsl dedicated eight-texture group fold, no sampler
-    ├── composition_host.wgsl straight storage; premultiplied A/B/group math
+    ├── composition_host.wgsl straight storage; premultiplied A/B/group math; the B8 bus mixer
     ├── motion_*.wgsl    field acquisition, transform shutter, Faraday memory
     ├── motion_collide.wgsl two-pass Field Collider map and recombination
     ├── gesture_etch.wgsl one ordered etch sample per pass plus the donor present
@@ -981,6 +984,141 @@ seventeen values in fresh field-isolated domains (`mutate_display_physics`,
 `GENERATOR_VERSION` is now "10"). Export rides the same encode on the same
 seam with frame-index-derived dt; `render_display_physics_pipeline` is the
 labeled export case.
+
+### B8 the mixing boundary
+
+Four pillars, one law module (`src/mixing_boundary.rs`, the independent CPU
+reference in the `gesture.rs` tradition), all derived from BENDR (MIT,
+© 2026 Steve Blythe) and rewritten for this tree.
+
+**The blend audit.** `BlendMode` is 25 append-only codes: the frozen 0–14
+plus `VividLight` 15, `PinLight` 16, `Divide` 17, `WrapAdd` 18, `Xor` 19,
+`And` 20, `Hue` 21, `Saturation` 22, `Color` 23, `Luminosity` 24, all in the
+one `blend.wgsl` kernel with its CPU twin, serde tokens asserted equal to
+`key()`. The HSV component-swap quartet is non-separable; the bitwise pair
+operates on the **stored sRGB code bytes** (encode → round → bitwise →
+decode) — a truncating linear quantizer flips a bit whenever the CPU and GPU
+transfer decodes disagree by one ulp, so the code-byte law is both the
+robust one and the faithful one (BENDR XORs what the framebuffer holds).
+Existing laws keep their indices, proven by the frozen vector rows 0..=14
+staying byte-identical and the re-pinned FNV signature. Rack `NodeBlend` is
+a separate vocabulary and did not change. Widening the choice set moved
+`GENERATOR_VERSION` to "11" (the selection draw is modulo the count; the
+draw count itself is proven unchanged).
+
+**The bus mixer.** `CompositionTree`/`RuntimeComposition` carry one
+`BusMixerState` bundle (mix, dirt, melt) beside `bus_crossfade` — values,
+never topology; skip-serialized at the exact-legacy default so pre-B8
+patches keep their bytes. The bus pass (`fs_bus`) owns the whole law behind
+textually explicit default branches, so a default bus is byte-identical
+(the M6 receipt's six output SHAs did not move):
+
+- **Wipes**: `WipePattern` codes 0–12 (`Dissolve` is the exact historical
+  constant crossfade; then WipeH/WipeV/Diagonal/Box/Circle/SplitH/SplitV/
+  BlindsV/BlindsH/Clock/DiagBars/Blocks), only Circle aspect-corrected,
+  MULTI tiling (rep 1..=4, origin inside each tile), softness with the
+  fader remap that keeps exact endpoints, invert on the field, a border
+  rule from the closed eight-colour bench table (`BackColor`, codes 0–7),
+  and Blocks hashed on the integer avalanche — never a float hash.
+- **The blend meet**: the `BlendMode` family at the A/B crossfade.
+  `Normal` is the exact legacy premultiplied lerp as an explicit branch; a
+  non-Normal meet blends where both lanes carry coverage, and `AlphaCut`
+  is not authorable at the bus (a crossfade has no destination to cut) —
+  it sanitizes to Normal.
+- **The dirty mixer**: an event clock (`0.5 + rate·15` ticks/s) whose tick
+  index is the only state, and four fault laws — knock (timebase shove,
+  sheared down the frame, wrapped vertical hop, upstream of everything),
+  cut (the crossbar thrown to one input), dropout (line bands through to
+  the other side of the crossbar or to dead grey hash), and noise
+  (band-limited monochrome spray with colour dropping out toward Rec.709
+  luma). Bit-clean between firings; every draw is the Shift
+  band/epoch/seed law via `cellular_avalanche` in a fresh per-lane domain,
+  keyed by the master `random_seed`, clocked by frame-plan time only —
+  Pause holds every fault and export replays them structurally. Faults are
+  coverage-honest (they never mint coverage), which is exactly what keeps
+  an all-Program LegacyExact composition inert under authored dirt without
+  touching the eligibility gate. While dirt is authored, neither lane can
+  be culled on the fader position (`layer_effectively_contributes`).
+- **The bus melt**: the analytic mix matte probed at four points
+  (X aspect-corrected, the normal deliberately not — the shipped
+  anisotropy), band = disagreement × 1.25, swirl rotates the normal by
+  ±90°, creep selects the outgoing side, the incoming lane drags by
+  `en·band·melt·0.055`, and the hold dissolves the stage's own previous
+  output back in under the cap law
+  (`min(0.94 + max(hold−1,0)·0.11, 0.995)`) with the chroma-runs-further
+  second tap mixed through the coherent 601 YIQ round trip (the B3 rig
+  matrices — the law reconstructs RGB, so a mixed-standard inverse would
+  be wrong). A plain dissolve has no boundary, so nothing happens.
+
+**The melt histories.** Both seats keep **one** retained surface each on
+the temporal-feedback single-surface precedent, lazily allocated on the
+first armed frame (`melt > ε ∧ hold > ε`), retained after, invalidated —
+never freed — on disarm, and advanced by `copy_texture` at most once per
+30 Hz reference tick on the stage's own rational accumulator, so live and
+export creep at the same rate and Pause holds the trail still. The bus
+history is working-format (8 B/px), allocated inside the executor before
+the warm-allocation snapshot and staged/committed through the
+frame-history transaction; the master history is slot-format RGBA8
+(4 B/px, the B4 held-field charge). Melt histories are **program memory,
+not display memory**: blackout does not clear them (the temporal-ring
+precedent — the audience goes dark, the program keeps its state), unlike
+B4's phosphor which models the screen itself. Exactly two melt scopes
+exist (the bus meet and the master seam), so the ≤2-armed ledger cap is
+structural.
+
+**The master melting edge** (`renderer/melting_edge.rs`,
+`melting_edge.wgsl`) is a Recipe-B stage on the slot-0 seam immediately
+before the B4 display stage at all three live call sites and both export
+sites. Its matte is the composite's own alpha, so static key alpha,
+cellular gap, and group mattes melt through one mechanism. It reads
+through a filtering sampler (the opaque-resolve precedent at this seam;
+every tap is level-0, so nothing needs implicit derivatives), preserves
+coverage — the trail legitimately carries alpha and the downstream opaque
+resolve still flattens exactly once — and its 48-byte uniform is
+compile-time asserted. Params ride `TemporalParams.melt` (`MeltParams`:
+melt 0..2, width 0..2, hold 0..1.5, swirl −1..1, chroma, creep).
+
+**Key dressing.** `key_border`, `key_border_color` (the closed
+`BackColor` table as an integer, the `grain_algo` precedent), and
+`key_shadow` on both static-key scopes, in the new vec4 #19 of the shared
+effect block (`EffectUniforms` 288 → 304, `EffectPassUniforms` 352 → 368,
+spatial slots at byte 304). The house adaptation: a layer has no composite
+underneath it, so the dressing **joins the key signal** (fill + matte)
+exactly as a broadcast border generator adds fill to a key — border via
+the six-tap asymmetric dilation (four axis + two diagonals, BENDR's own
+kernel, radius `0.002 + border·0.02`, X aspect-corrected) and shadow as
+one offset matte tap darkened to black at `0.8 × amount`. Neighbour mattes
+evaluate the spatially mapped source through the one canonical
+`sample_source` chain — a bounded approximation the dressing's own amounts
+gate, so an undressed key costs nothing and is byte-identical.
+
+**Closure.** Patch: the `mixer` block on the composition tree,
+`TemporalConfig.melt`, and the three `EffectsConfig` dressing fields, all
+skip-serialized at their defaults with neutral hostile sanitize and
+unknown-field rejection; the mixer transfers with the crossfade under the
+same Apply-Look identity gate. Wire: `set_composition_bus_mix
+{ param, value }` — coalescible per param, revision-free, quantizable —
+parsed by the single shared `BusMixerEdit::parse` table both the server
+gate and the applier call, so the accepted and applied vocabularies are
+structurally one; six `melt_*` params on `set_temporal` in both validators
+plus the applier; the dressing rides `set_param` / `set_layer_param`
+beside the existing key vocabulary. Snapshot: additive `mixer`, `melt`,
+and dressing fields. Panel: the BUS MIXER group beside the A/B fader, the
+MELTING EDGE temporal group, and dressing rows in both KEYING surfaces
+(static range pin 190; app.js template pin 19). Morph: continuous values
+blend, discrete laws (pattern, invert, rep, border colours, bus blend)
+recall an endpoint at the midpoint. Modulation: seventeen
+`composition/bus_*` addresses beside `bus_crossfade`, six `melt_*` master
+addresses, `key_border`/`key_shadow` at master and layer suffixes 92/93;
+every discrete law has no address. Dice: the seventeen bus values in a
+fresh domain-separated stream; dressing draws appended to the end of the
+B13 small-fx stream so every earlier draw is byte-stable. The generator
+preserves the bus mixer exactly (the crossfade precedent), mutates the
+master melt in fresh field-isolated domains (`mutate_master_melt`), and
+appends the dressing draws per scope. Export rides the same shaders on
+every path; `render_bus_mixing_boundary_pipeline` and
+`render_melting_edge_and_key_dressing_pipeline` are the labeled export
+cases.
 
 ## Effects and compositing
 
@@ -2804,6 +2942,29 @@ mislead browser tests.
   comb, closed-form decay, blackout clearing the wake), and
   `render_display_physics_pipeline` is the labeled export case with its
   `_flat` difference and `_repeat` determinism assertions.
+- Mixing-boundary tests must cover the 25 append-only blend codes with rows
+  0..=14 of the frozen vector tables byte-identical and the code-byte law
+  for the bitwise pair, the closed wipe/back-colour vocabularies, the
+  analytic wipe landmarks with exact fader endpoints and MULTI tiling, the
+  border band profile with its end gates, hostile neutral sanitize for all
+  three param blocks, the wake laws (dressing controls wake nothing alone;
+  melt-armed needs both melt and hold), the event clock's bit-clean quiet
+  ticks with the analytic envelope and honest dropout probability, per-seed
+  determinism with independent hash lanes, the melt band/normal/swirl/
+  creep/cap laws with the vertical-edge fixture and
+  no-boundary-nothing-happens, the coherent 601 YIQ round trip, the shared
+  `BusMixerEdit` parse/apply table with typed rejections (`alpha_cut`
+  refused at the bus), composition serde with the default tree omitting the
+  mixer block and resolve/capture carrying it, morph blending with midpoint
+  recall of every discrete law, the modulation address tables with discrete
+  refusals at both scopes, and Dice bounds in the fresh domains. The
+  `gpu_all_blend_modes_…` compositor parity fixture,
+  `gpu_melting_edge_drags_the_band_holds_history_and_needs_a_boundary`, and
+  the re-pinned M6 receipt (six output SHAs unmoved across the bus rewrite
+  and the effect-block growth) carry the physical-GPU claim;
+  `render_bus_mixing_boundary_pipeline` and
+  `render_melting_edge_and_key_dressing_pipeline` are the labeled export
+  cases, each with a difference twin and a `_repeat` determinism assertion.
 - Proxy-worker tests split along the CLI boundary. Hosted (all three CI
   platforms, no ffmpeg CLI): the crash test written reproduction-first — a
   staging leftover removed and never published or counted, an unsealed

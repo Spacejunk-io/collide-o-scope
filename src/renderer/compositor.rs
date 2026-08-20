@@ -1156,7 +1156,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a GPU adapter"]
-    fn gpu_all_fifteen_blends_match_linear_cpu_opaque_transparent_and_half_alpha_vectors() {
+    fn gpu_all_blend_modes_match_linear_cpu_opaque_transparent_and_half_alpha_vectors() {
         let (device, queue) = gpu_device();
         let cases = [
             ("opaque", [50, 145, 225, 255], [215, 95, 170, 255], 1.0),

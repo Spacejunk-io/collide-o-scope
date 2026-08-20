@@ -15,6 +15,7 @@ mod layers;
 mod media_safety;
 mod media_source;
 mod midi;
+mod mixing_boundary;
 mod modulation;
 mod morph;
 mod motion;
@@ -4675,6 +4676,7 @@ impl App {
                 | WebAction::SetCompositionGroupMembers { .. }
                 | WebAction::MoveCompositionRootItem { .. }
                 | WebAction::SetCompositionBusCrossfade { .. }
+                | WebAction::SetCompositionBusMixParam { .. }
                 | WebAction::SetCompositionLayerBus { .. }
         ) {
             return false;
@@ -5329,6 +5331,22 @@ impl App {
                         staged,
                         false,
                         "Updated composition bus crossfade".into(),
+                    )?;
+                }
+                WebAction::SetCompositionBusMixParam { param, value } => {
+                    let Some(edit) = crate::mixing_boundary::BusMixerEdit::parse(param, value)
+                    else {
+                        return Err(format!("unknown or invalid bus mixer edit: {param}"));
+                    };
+                    let mut staged = self.staged_creative_graph();
+                    let mut mixer = staged.composition.mixer();
+                    edit.apply(&mut mixer);
+                    staged.composition.set_mixer(mixer);
+                    self.preflight_creative_graph(&staged)?;
+                    self.commit_creative_graph(
+                        staged,
+                        false,
+                        format!("Updated bus mixer {param}"),
                     )?;
                 }
                 WebAction::SetCompositionLayerBus {
@@ -7460,6 +7478,9 @@ impl App {
                     | "key_color_g"
                     | "key_color_b"
                     | "key_tolerance"
+                    | "key_border"
+                    | "key_border_color"
+                    | "key_shadow"
             ) =>
             {
                 Self::layer_action_targets_look(*index, layer_id, &applied.mapped_layer_ids)
@@ -7480,7 +7501,11 @@ impl App {
             WebAction::SetCompositionGroupParam { group_id, .. }
             | WebAction::SetCompositionGroupMatteParam { group_id, .. } => parse_group_id(group_id)
                 .is_some_and(|group_id| applied.applied_group_ids.contains(&group_id)),
-            WebAction::SetCompositionBusCrossfade { .. } => applied.applied_bus_crossfade,
+            // The bus mixer rides the same composition value application the
+            // crossfade does, so a pending mixer edit conflicts exactly when
+            // a pending crossfade edit would.
+            WebAction::SetCompositionBusCrossfade { .. }
+            | WebAction::SetCompositionBusMixParam { .. } => applied.applied_bus_crossfade,
             WebAction::Reroll {
                 scope: web::state::RerollScope::Master | web::state::RerollScope::All,
                 ..
@@ -8693,6 +8718,8 @@ impl App {
             | "key_threshold"
             | "key_softness"
             | "key_tolerance"
+            | "key_border"
+            | "key_shadow"
             | "cellular_amount"
             | "cellular_scale"
             | "cellular_warp"
@@ -8736,6 +8763,7 @@ impl App {
             | "chroma_aberration"
             | "anamorphic_streak" => value.as_f64().is_some_and(f64::is_finite),
             "negative_mode" => value.as_u64().is_some_and(|number| number <= 2),
+            "key_border_color" => value.as_u64().is_some_and(|number| number <= 7),
             _ => false,
         }
     }
@@ -9288,6 +9316,20 @@ impl App {
                 )
             ),
             "disp_il_order" => value.is_boolean(),
+            // The B8 master melting edge's six wire params, mirroring the
+            // server-side vocabulary exactly.
+            "melt_amount" | "melt_width" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=2.0).contains(&number)),
+            "melt_hold" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.5).contains(&number)),
+            "melt_swirl" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (-1.0..=1.0).contains(&number)),
+            "melt_chroma" | "melt_creep" => value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
             "slitscan" | "slit_axis" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
@@ -9387,10 +9429,12 @@ impl App {
             }
             "key_mode" if value.as_u64().is_some() => Some(Control::Effects),
             "key_softness" | "key_color_r" | "key_color_g" | "key_color_b" | "key_tolerance"
+            | "key_border" | "key_shadow"
                 if value.as_f64().is_some_and(f64::is_finite) =>
             {
                 Some(Control::Effects)
             }
+            "key_border_color" if value.as_u64().is_some() => Some(Control::Effects),
             _ => None,
         }
     }
@@ -15249,6 +15293,9 @@ impl App {
                         self.master_effects.key_threshold = defaults.key_threshold;
                         self.master_effects.key_softness = defaults.key_softness;
                         self.master_effects.key_tolerance = defaults.key_tolerance;
+                        self.master_effects.key_border = defaults.key_border;
+                        self.master_effects.key_border_color = defaults.key_border_color;
+                        self.master_effects.key_shadow = defaults.key_shadow;
                     }
                     "motion" => {
                         self.master_effects.breathe_scale = defaults.breathe_scale;
@@ -15955,6 +16002,37 @@ impl App {
                     "disp_il_amount" => {
                         if let Some(n) = value.as_f64() {
                             p.display.il_amount = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    // The B8 master melting edge's six continuous values.
+                    "melt_amount" => {
+                        if let Some(n) = value.as_f64() {
+                            p.melt.melt = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "melt_width" => {
+                        if let Some(n) = value.as_f64() {
+                            p.melt.width = (n as f32).clamp(0.0, 2.0);
+                        }
+                    }
+                    "melt_hold" => {
+                        if let Some(n) = value.as_f64() {
+                            p.melt.hold = (n as f32).clamp(0.0, 1.5);
+                        }
+                    }
+                    "melt_swirl" => {
+                        if let Some(n) = value.as_f64() {
+                            p.melt.swirl = (n as f32).clamp(-1.0, 1.0);
+                        }
+                    }
+                    "melt_chroma" => {
+                        if let Some(n) = value.as_f64() {
+                            p.melt.chroma = (n as f32).clamp(0.0, 1.0);
+                        }
+                    }
+                    "melt_creep" => {
+                        if let Some(n) = value.as_f64() {
+                            p.melt.creep = (n as f32).clamp(0.0, 1.0);
                         }
                     }
                     "disp_il_mode" => {
@@ -16703,6 +16781,22 @@ impl App {
                                 layer.effects.key_tolerance = (v as f32).clamp(0.0, 1.0);
                             }
                         }
+                        // B8 key dressing joins the layer key vocabulary.
+                        "key_border" => {
+                            if let Some(v) = value.as_f64() {
+                                layer.effects.key_border = (v as f32).clamp(0.0, 1.0);
+                            }
+                        }
+                        "key_shadow" => {
+                            if let Some(v) = value.as_f64() {
+                                layer.effects.key_shadow = (v as f32).clamp(0.0, 1.0);
+                            }
+                        }
+                        "key_border_color" => {
+                            if let Some(v) = value.as_u64() {
+                                layer.effects.key_border_color = (v.min(7)) as f32;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -16929,6 +17023,7 @@ impl App {
             | WebAction::SetCompositionGroupMembers { .. }
             | WebAction::MoveCompositionRootItem { .. }
             | WebAction::SetCompositionBusCrossfade { .. }
+            | WebAction::SetCompositionBusMixParam { .. }
             | WebAction::SetCompositionLayerBus { .. } => {
                 unreachable!("creative actions are consumed before legacy dispatch")
             }
@@ -20973,6 +21068,11 @@ impl ApplicationHandler for App {
                                     // shared slot-0 seam, then the established
                                     // opaque resolve remains the sole audience
                                     // handoff.
+                                    renderer.render_melting_edge(
+                                        &mut encoder,
+                                        &mod_temporal.melt,
+                                        temporal_input.program_advancing_delta(),
+                                    );
                                     renderer.render_display_physics(
                                         &mut encoder,
                                         &mod_temporal.display,
@@ -21033,6 +21133,11 @@ impl ApplicationHandler for App {
                                                 temporal_input,
                                             );
                                             temporal_frame_accepted = true;
+                                            renderer.render_melting_edge(
+                                                &mut encoder,
+                                                &mod_temporal.melt,
+                                                temporal_input.program_advancing_delta(),
+                                            );
                                             renderer.render_display_physics(
                                                 &mut encoder,
                                                 &mod_temporal.display,
@@ -21192,6 +21297,11 @@ impl ApplicationHandler for App {
                                                 selective_temporal_input,
                                             );
                                             temporal_frame_accepted = true;
+                                            renderer.render_melting_edge(
+                                                &mut encoder,
+                                                &mod_temporal.melt,
+                                                selective_temporal_input.program_advancing_delta(),
+                                            );
                                             renderer.render_display_physics(
                                                 &mut encoder,
                                                 &mod_temporal.display,
@@ -26511,6 +26621,8 @@ mod app_state_tests {
             "barrel",
             "chroma_aberration",
             "anamorphic_streak",
+            "key_border",
+            "key_shadow",
         ] {
             assert!(
                 App::valid_effect_edit(param, &serde_json::json!(0.5)),
@@ -26534,6 +26646,18 @@ mod app_state_tests {
             assert!(App::master_only_effect_param(optic), "{optic}");
         }
         for shared in ["contour", "halftone", "multi_grid_x", "negative_mode"] {
+            assert!(!App::master_only_effect_param(shared), "{shared}");
+        }
+        // B8 key dressing is a both-scope law with a discrete colour table.
+        assert!(App::valid_effect_edit(
+            "key_border_color",
+            &serde_json::json!(7)
+        ));
+        assert!(!App::valid_effect_edit(
+            "key_border_color",
+            &serde_json::json!(8)
+        ));
+        for shared in ["key_border", "key_shadow", "key_border_color"] {
             assert!(!App::master_only_effect_param(shared), "{shared}");
         }
     }

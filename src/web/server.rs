@@ -1172,6 +1172,11 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
             )
         ),
         "disp_il_order" => value.is_boolean(),
+        // The B8 master melting edge's six wire params, all continuous.
+        "melt_amount" | "melt_width" => number_in(value, 0.0, 2.0),
+        "melt_hold" => number_in(value, 0.0, 1.5),
+        "melt_swirl" => number_in(value, -1.0, 1.0),
+        "melt_chroma" | "melt_creep" => number_in(value, 0.0, 1.0),
         "slitscan" | "slit_axis" => number_in(value, 0.0, 1.0),
         "slit_angle" | "loom_angle" => number_in(value, -180.0, 180.0),
         "slit_map" => matches!(
@@ -1733,6 +1738,9 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         } => valid_root_item(item) && valid_composition_revision(*composition_revision),
         WebAction::SetCompositionBusCrossfade { value } => {
             value.is_finite() && (0.0..=1.0).contains(value)
+        }
+        WebAction::SetCompositionBusMixParam { param, value } => {
+            crate::mixing_boundary::BusMixerEdit::parse(param, value).is_some()
         }
         WebAction::SetCompositionLayerBus {
             layer_id,

@@ -20,7 +20,7 @@ use crate::layers::BlendMode;
 use crate::motion::MotionFieldOrigin;
 use crate::program_recorder::CaptureTarget;
 use crate::renderer::composition_host::{
-    CompositionHost, CompositionHostError, HostCapacities, HostCompositeInputs,
+    BusFrameParams, CompositionHost, CompositionHostError, HostCapacities, HostCompositeInputs,
     HostCompositeUniforms, HostEffectSource, HostFrameTiming, HostMatteInputs,
     HostRoutedGardenInput, HostSurface, HostTemporalInput, HostTextureInputs, HostUniformSlot,
 };
@@ -514,6 +514,21 @@ struct PreparedAdvanced {
     temporal: HostTemporalInput,
     routed_garden: Option<HostRoutedGardenInput>,
     bus_inputs: HostTextureInputs,
+    /// Retained for the bus melt's lazy history allocation: the melt is a
+    /// value, never topology, so its surface cannot be sized at prepare.
+    device: wgpu::Device,
+    /// The bus melt's own previous output — one retained working-format
+    /// surface on the temporal-feedback single-surface precedent, lazily
+    /// allocated on the first armed frame, retained thereafter, and
+    /// invalidated (never freed) on disarm so a re-arm cannot resurrect a
+    /// stale trail.
+    bus_melt: Option<(RetainedSurface, wgpu::BindGroup)>,
+    bus_melt_valid: bool,
+    bus_melt_staged: bool,
+    /// The melt store's own 30 Hz reference accumulator: committed debt plus
+    /// the staged value the frame-history transaction publishes.
+    bus_melt_tick_debt: f32,
+    bus_melt_staged_debt: f32,
     present: HostTextureInputs,
     effect_slots: BTreeMap<(VisualScopeId, usize), HostUniformSlot>,
     exact_layer_slots: BTreeMap<StableLayerId, HostUniformSlot>,
@@ -1796,6 +1811,12 @@ impl PreparedAdvanced {
                 temporal,
                 routed_garden,
                 bus_inputs,
+                device: device.clone(),
+                bus_melt: None,
+                bus_melt_valid: false,
+                bus_melt_staged: false,
+                bus_melt_tick_debt: 0.0,
+                bus_melt_staged_debt: 0.0,
                 present,
                 effect_slots,
                 exact_layer_slots,
@@ -1845,6 +1866,33 @@ impl PreparedAdvanced {
             });
         }
         self.discard_frame_history();
+        // The bus melt's lazy surface: the first armed frame allocates once
+        // (deliberately before the warm-allocation snapshot), a warmed armed
+        // frame allocates nothing, and disarming invalidates the trail
+        // without freeing the surface.
+        let bus_melt_armed = plan.mixer().melt.is_armed();
+        if bus_melt_armed && self.bus_melt.is_none() {
+            let surface = create_retained_surface(
+                &self.device,
+                self.host.dimensions(),
+                "Advanced composition bus melt history",
+            );
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Advanced composition bus melt history group"),
+                layout: self.host.bus_history_layout(),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&surface.view),
+                }],
+            });
+            self.retained_textures += 1;
+            self.retained_views += 1;
+            self.executor_bindings += 1;
+            self.bus_melt = Some((surface, group));
+        }
+        if !bus_melt_armed {
+            self.bus_melt_valid = false;
+        }
         let allocations_before = self.allocation_snapshot();
         self.write_uniforms(queue, plan)?;
         if let (Some(resources), Some(motion_plan)) = (&mut self.motion, plan.motion().advanced()) {
@@ -1948,8 +1996,42 @@ impl PreparedAdvanced {
             encoder,
             &self.bus_inputs,
             self.host.surface(HostSurface::Ping).view,
-            plan.bus_crossfade(),
+            &BusFrameParams {
+                history_valid: self.bus_melt_valid,
+                ..bus_frame_params(plan)
+            },
+            self.bus_melt
+                .as_ref()
+                .filter(|_| bus_melt_armed)
+                .map(|(_, group)| group),
         );
+        // Store the bus output as the melt's N-1 memory — at most one melt
+        // step per frame, advanced on the stage's own 30 Hz reference
+        // accumulator so live and export creep at the same rate and Pause
+        // holds the trail still. Validity publishes only on the
+        // frame-history commit, so a discarded frame leaves no stale bit.
+        self.bus_melt_staged_debt = self.bus_melt_tick_debt;
+        self.bus_melt_staged = false;
+        if bus_melt_armed {
+            let debt = (self.bus_melt_tick_debt
+                + timing.temporal_input().program_advancing_delta()
+                    * crate::effects::params::TEMPORAL_REFERENCE_FPS)
+                .min(2.0);
+            if debt >= 1.0 {
+                if let Some((surface, _)) = &self.bus_melt {
+                    copy_texture(
+                        encoder,
+                        self.host.surface(HostSurface::Ping).texture,
+                        &surface.texture,
+                        self.host.dimensions(),
+                    );
+                    self.bus_melt_staged = true;
+                }
+                self.bus_melt_staged_debt = (debt - 1.0).min(1.0);
+            } else {
+                self.bus_melt_staged_debt = debt;
+            }
+        }
         self.execute_master(queue, encoder, plan, timing)?;
         if let (Some(resources), Some(motion_plan)) = (&self.motion, plan.motion().advanced()) {
             resources.encode_field_scope(encoder, motion_plan, VisualScopeId::Master)?;
@@ -2042,6 +2124,11 @@ impl PreparedAdvanced {
         if let Some(motion) = &mut self.motion {
             motion.commit_frame();
         }
+        self.bus_melt_tick_debt = self.bus_melt_staged_debt;
+        if self.bus_melt_staged {
+            self.bus_melt_valid = true;
+            self.bus_melt_staged = false;
+        }
         self.history_staged = false;
     }
 
@@ -2055,6 +2142,8 @@ impl PreparedAdvanced {
                 *staged = false;
             }
         }
+        self.bus_melt_staged = false;
+        self.bus_melt_staged_debt = self.bus_melt_tick_debt;
         self.history_staged = false;
     }
 
@@ -2291,7 +2380,7 @@ impl PreparedAdvanced {
             CompositePrefix::Root {
                 preceding_root_outputs,
             },
-            plan.bus_crossfade(),
+            bus_frame_params(plan),
         )
     }
 
@@ -2300,19 +2389,27 @@ impl PreparedAdvanced {
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         prefix: CompositePrefix,
-        crossfade: f32,
+        bus_params: BusFrameParams,
     ) -> Result<(), CompositionGpuError> {
         if !self.taps.iter().any(|tap| {
             matches!(tap.planned.resolved, PlannedImageSource::AllBelow(candidate) if candidate == prefix)
         }) {
             return Ok(());
         }
+        // A prefix capture runs the same bus law with the same uniforms so
+        // an "all below" tap sees a consistent partial state; only the melt
+        // hold stays closed, because the history belongs to the main bus
+        // output alone.
         self.host.encode_bus(
             queue,
             encoder,
             &self.bus_inputs,
             self.host.surface(HostSurface::Ping).view,
-            crossfade,
+            &BusFrameParams {
+                history_valid: false,
+                ..bus_params
+            },
+            None,
         );
         let source_surface = match prefix {
             CompositePrefix::Root { .. } => HostSurface::Ping,
@@ -2789,7 +2886,7 @@ impl PreparedAdvanced {
                 preceding_root_outputs,
                 preceding_members: 0,
             },
-            plan.bus_crossfade(),
+            bus_frame_params(plan),
         )?;
 
         let schedule_len = self
@@ -2823,7 +2920,7 @@ impl PreparedAdvanced {
                         preceding_root_outputs,
                         preceding_members: completed_members,
                     },
-                    plan.bus_crossfade(),
+                    bus_frame_params(plan),
                 )?;
             }
         }
@@ -3609,6 +3706,21 @@ fn group_plan(
                 group_id.get()
             ))
         })
+}
+
+/// Everything one bus pass needs from the evaluated frame plan: the plan is
+/// the sole source, so live and export encode identical bus uniforms for
+/// the same frame facts.
+fn bus_frame_params(plan: &AdvancedCompositionPlan) -> BusFrameParams {
+    let context = plan.base().context();
+    BusFrameParams {
+        crossfade: plan.bus_crossfade(),
+        mixer: plan.mixer(),
+        time_seconds: context.time_seconds,
+        random_seed: plan.base().master_pass().effects.random_seed,
+        output_size: context.output_size,
+        history_valid: false,
+    }
 }
 
 const fn bus_surface(bus: BusAssignment) -> HostSurface {

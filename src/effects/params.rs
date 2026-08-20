@@ -52,6 +52,12 @@ pub struct TemporalParams {
     /// temporal activity/shader-selection predicate, because the stage owns
     /// its own pass and its own shader.
     pub display: crate::display_physics::DisplayPhysicsParams,
+    /// B8 melting edge: the master melt over the program's own coverage,
+    /// seated on the same slot-0 seam immediately before the display stage.
+    /// Exact-off by default; like `display` it is deliberately absent from
+    /// every temporal activity/shader-selection predicate, because the
+    /// stage owns its own pass and its own shader.
+    pub melt: crate::mixing_boundary::MeltParams,
     /// B3 feedback rig. Identity by default, which is the exact prior
     /// feedback path: the shader takes the historical expression untouched.
     pub rig: FeedbackRigParams,
@@ -265,6 +271,7 @@ impl Default for TemporalParams {
             key_history: 1.0,
             originals: TemporalOriginalsParams::default(),
             display: crate::display_physics::DisplayPhysicsParams::default(),
+            melt: crate::mixing_boundary::MeltParams::default(),
             rig: FeedbackRigParams::default(),
         }
     }
@@ -329,6 +336,9 @@ impl TemporalParams {
             // law there (fractional-tick decay in the store); its authored
             // values pass through this per-frame conversion sanitized only.
             display: self.display.sanitized(),
+            // The melting edge likewise owns its own pass; its store clock
+            // applies the reference-tick law in the stage itself.
+            melt: self.melt.sanitized(),
             rig: self.rig.for_frame_scale(frame_scale),
         }
     }
@@ -682,6 +692,11 @@ pub struct EffectUniforms {
     pub barrel: f32,            // -1.0..1.0 radial distortion (master only)
     pub chroma_aberration: f32, // 0.0..1.0 radial fringe (master only)
     pub anamorphic_streak: f32, // 0.0..1.0 horizontal flare (master only)
+    // vec4 #19 — B8 key dressing: border and shadow join the key signal
+    pub key_border: f32,         // 0.0 = off, 0.0..1.0 matte-grow outline amount
+    pub key_border_color: f32,   // 0..7 closed back-colour table (permanent codes)
+    pub key_shadow: f32,         // 0.0 = off, 0.0..1.0 offset darkened copy
+    pub key_dress_reserved: f32, // alignment slot, exact zero
 }
 
 impl Default for EffectUniforms {
@@ -756,6 +771,10 @@ impl Default for EffectUniforms {
             barrel: 0.0,
             chroma_aberration: 0.0,
             anamorphic_streak: 0.0,
+            key_border: 0.0,
+            key_border_color: 0.0,
+            key_shadow: 0.0,
+            key_dress_reserved: 0.0,
         }
     }
 }
@@ -820,6 +839,9 @@ impl EffectUniforms {
         self.key_softness = defaults.key_softness;
         self.key_color = defaults.key_color;
         self.key_tolerance = defaults.key_tolerance;
+        self.key_border = defaults.key_border;
+        self.key_border_color = defaults.key_border_color;
+        self.key_shadow = defaults.key_shadow;
         self.cellular_gap_amount = defaults.cellular_gap_amount;
         self.cellular_gap_threshold = defaults.cellular_gap_threshold;
         self.cellular_gap_softness = defaults.cellular_gap_softness;
@@ -831,8 +853,10 @@ mod uniform_tests {
     use super::*;
 
     #[test]
-    fn effect_uniform_layout_is_eighteen_vec4s() {
-        assert_eq!(std::mem::size_of::<EffectUniforms>(), 288);
+    fn effect_uniform_layout_is_nineteen_vec4s() {
+        assert_eq!(std::mem::size_of::<EffectUniforms>(), 304);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, key_border), 288);
+        assert_eq!(std::mem::offset_of!(EffectUniforms, key_shadow), 296);
         assert!(std::mem::size_of::<EffectUniforms>().is_multiple_of(16));
         assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_amount), 96);
         assert_eq!(std::mem::offset_of!(EffectUniforms, cellular_scale), 100);

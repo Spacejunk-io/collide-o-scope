@@ -47,6 +47,16 @@ const LAYER_BLEND_MODES = Object.freeze([
   { key: 'dodge', label: 'Dodge', description: 'Dodge brightens the content below toward the layer color.' },
   { key: 'burn', label: 'Burn', description: 'Burn darkens the content below toward the layer color.' },
   { key: 'alpha_cut', label: 'Alpha Cut', description: 'Alpha Cut erases accumulated content; it is a no-op without content below.' },
+  { key: 'vivid_light', label: 'Vivid Light', description: 'Vivid Light burns below half layer values and dodges above them.' },
+  { key: 'pin_light', label: 'Pin Light', description: 'Pin Light replaces content below only outside the doubled layer bounds.' },
+  { key: 'divide', label: 'Divide', description: 'Divide brightens by dividing the content below by the layer color.' },
+  { key: 'wrap_add', label: 'Wrap Add', description: 'Wrap Add sums with analogue overflow, wrapping past full scale.' },
+  { key: 'xor', label: 'Xor Bits', description: 'Xor Bits combines 8-bit code values with exclusive-or.' },
+  { key: 'and', label: 'And Bits', description: 'And Bits combines 8-bit code values with bitwise and.' },
+  { key: 'hue', label: 'Hue', description: 'Hue takes the layer hue while keeping saturation and value below.' },
+  { key: 'saturation', label: 'Saturation', description: 'Saturation takes the layer saturation while keeping hue and value below.' },
+  { key: 'color', label: 'Color', description: 'Color takes the layer hue and saturation while keeping the value below.' },
+  { key: 'luminosity', label: 'Luminosity', description: 'Luminosity takes the layer value while keeping hue and saturation below.' },
 ]);
 const LAYER_BLEND_ORDER_POLICY = 'Reordering changes the content below; the saved blend choice remains unchanged.';
 
@@ -181,6 +191,7 @@ const QUANTIZABLE_ACTIONS = new Set([
   'set_clip_transport', 'set_clip_cue', 'set_layer_matte_param',
   'set_visual_node_param', 'set_composition_group_param',
   'set_composition_group_matte_param', 'set_composition_bus_crossfade',
+  'set_composition_bus_mix',
   'set_morph', 'morph_capture', 'morph_clear', 'morph_glide',
 ]);
 
@@ -1187,6 +1198,7 @@ function syncCreativeRenderedValues() {
   if (!latestCreative) return;
   if (creativeBusCrossfade && canSync(creativeBusCrossfade)) creativeBusCrossfade.value = latestCreative.bus_crossfade ?? 0.5;
   if (creativeBusCrossfadeValue) creativeBusCrossfadeValue.textContent = Number(latestCreative.bus_crossfade ?? 0.5).toFixed(2);
+  syncBusMixer(latestCreative.mixer);
   const rack = creativeScopeRack();
   for (const node of rack?.nodes || []) {
     const card = creativeRackNodes?.querySelector(`[data-node-id="${node.node_id}"]`);
@@ -1311,6 +1323,66 @@ creativeBusCrossfade?.addEventListener('input', () => {
   creativeBusCrossfadeValue.textContent = value.toFixed(2);
   creativeSend({ action: 'set_composition_bus_crossfade', value }, 'Crossfading A / B…');
 });
+
+// --- B8 bus mixer: wipes, blend meet, dirty mixer, edge melt. Every control
+// sends the coalescible set_composition_bus_mix value action. ---
+const BUS_MIX_SNAPSHOT_PATHS = Object.freeze({
+  wipe_soft: (m) => m.mix?.soft, wipe_x: (m) => m.mix?.origin_x, wipe_y: (m) => m.mix?.origin_y,
+  wipe_detail: (m) => m.mix?.detail, wipe_border: (m) => m.mix?.border,
+  dirt: (m) => m.dirt?.dirt, dirt_rate: (m) => m.dirt?.rate, dirt_drop: (m) => m.dirt?.drop,
+  dirt_cut: (m) => m.dirt?.cut, dirt_knock: (m) => m.dirt?.knock, dirt_noise: (m) => m.dirt?.noise,
+  melt: (m) => m.melt?.melt, melt_width: (m) => m.melt?.width, melt_hold: (m) => m.melt?.hold,
+  melt_swirl: (m) => m.melt?.swirl, melt_chroma: (m) => m.melt?.chroma, melt_creep: (m) => m.melt?.creep,
+});
+const busMixSliders = Array.from(document.querySelectorAll('[data-bus-mix]'));
+const busMixPattern = document.getElementById('bus-mix-wipe-pattern');
+const busMixBlend = document.getElementById('bus-mix-blend');
+const busMixBorderColor = document.getElementById('bus-mix-wipe-border-color');
+const busMixInvert = document.getElementById('bus-mix-wipe-invert');
+const busMixRep = document.getElementById('bus-mix-wipe-rep');
+if (busMixBlend) {
+  busMixBlend.innerHTML = LAYER_BLEND_MODES
+    .filter((mode) => mode.key !== 'alpha_cut')
+    .map((mode) => `<option value="${escapeHtml(mode.key)}">${escapeHtml(mode.label)}</option>`)
+    .join('');
+}
+function busMixSend(param, value) {
+  creativeSend({ action: 'set_composition_bus_mix', param, value }, `Bus mixer ${param}…`);
+}
+function syncBusMixer(mixer) {
+  if (!mixer) return;
+  for (const slider of busMixSliders) {
+    const value = BUS_MIX_SNAPSHOT_PATHS[slider.dataset.busMix]?.(mixer);
+    if (typeof value !== 'number') continue;
+    if (canSync(slider)) slider.value = String(value);
+    const output = slider.parentElement?.querySelector('output');
+    if (output) output.textContent = value.toFixed(2);
+  }
+  if (busMixPattern && canSync(busMixPattern)) busMixPattern.value = mixer.mix?.pattern ?? 'dissolve';
+  if (busMixBlend && canSync(busMixBlend)) busMixBlend.value = mixer.mix?.blend ?? 'normal';
+  if (busMixBorderColor && canSync(busMixBorderColor)) busMixBorderColor.value = mixer.mix?.border_color ?? 'white';
+  if (busMixInvert && canSync(busMixInvert)) busMixInvert.checked = Boolean(mixer.mix?.invert);
+  if (busMixRep && canSync(busMixRep)) busMixRep.value = String(mixer.mix?.rep ?? 1);
+}
+for (const slider of busMixSliders) {
+  const output = slider.parentElement?.querySelector('output');
+  slider.addEventListener('input', () => {
+    const value = Number(slider.value);
+    if (output) output.textContent = value.toFixed(2);
+    busMixSend(slider.dataset.busMix, value);
+  });
+  slider.addEventListener('dblclick', () => {
+    const value = Number(slider.dataset.default ?? 0);
+    slider.value = String(value);
+    if (output) output.textContent = value.toFixed(2);
+    busMixSend(slider.dataset.busMix, value);
+  });
+}
+busMixPattern?.addEventListener('change', () => busMixSend('wipe_pattern', busMixPattern.value));
+busMixBlend?.addEventListener('change', () => busMixSend('blend', busMixBlend.value));
+busMixBorderColor?.addEventListener('change', () => busMixSend('wipe_border_color', busMixBorderColor.value));
+busMixInvert?.addEventListener('change', () => busMixSend('wipe_invert', busMixInvert.checked));
+busMixRep?.addEventListener('change', () => busMixSend('wipe_rep', Number(busMixRep.value)));
 
 creativeGroupCreate?.addEventListener('submit', (event) => {
   event.preventDefault();
@@ -2140,6 +2212,11 @@ document.querySelectorAll('.param-row[data-temporal]').forEach((row) => {
       disp_beam_shape: 0.5,
       disp_mask_dark: 0.5,
       disp_bloom_radius: 0.4,
+      melt_width: 0.3,
+      melt_hold: 0.6,
+      melt_swirl: 0,
+      melt_chroma: 0.5,
+      melt_creep: 0.35,
     };
     slider.value = defaults[param] ?? min;
 
@@ -2273,6 +2350,7 @@ function syncTemporal(t) {
   const reset = originals.reset || {};
   const rig = t.rig || {};
   const display = t.display || {};
+  const masterMelt = t.melt || {};
   const values = {
     feedback: t.feedback,
     fb_zoom: t.fb_zoom,
@@ -2350,6 +2428,12 @@ function syncTemporal(t) {
     disp_halation: display.halation,
     disp_defocus: display.defocus,
     disp_sag: display.sag,
+    melt_amount: masterMelt.melt,
+    melt_width: masterMelt.width,
+    melt_hold: masterMelt.hold,
+    melt_swirl: masterMelt.swirl,
+    melt_chroma: masterMelt.chroma,
+    melt_creep: masterMelt.creep,
   };
   for (const [param, value] of Object.entries(values)) {
     if (value === undefined || value === null) continue;
@@ -4159,6 +4243,24 @@ function createLayerCard(layer, index) {
         <input type="range" min="0" max="1" step="0.01" value="${layer.key_tolerance ?? layer.effects?.key_tolerance ?? 0.15}">
         <span class="value">${Number(layer.key_tolerance ?? layer.effects?.key_tolerance ?? 0.15).toFixed(2)}</span>
       </div>
+      <div class="param-row" data-layer="${index}" data-param="key_border">
+        <label>Border</label>
+        <input type="range" min="0" max="1" step="0.01" value="${layer.effects?.key_border ?? 0}">
+        <span class="value">${Number(layer.effects?.key_border ?? 0).toFixed(2)}</span>
+      </div>
+      <div class="param-row select-row" data-layer="${index}" data-param="key_border_color">
+        <label>Border Col</label>
+        <select aria-label="Layer ${index + 1} key border colour">
+          ${[['0', 'White'], ['1', 'Yellow'], ['2', 'Cyan'], ['3', 'Green'], ['4', 'Magenta'], ['5', 'Red'], ['6', 'Blue'], ['7', 'Black']]
+            .map(([code, label]) => `<option value="${code}" ${Number(layer.effects?.key_border_color ?? 0) === Number(code) ? 'selected' : ''}>${label}</option>`)
+            .join('')}
+        </select>
+      </div>
+      <div class="param-row" data-layer="${index}" data-param="key_shadow">
+        <label>Shadow</label>
+        <input type="range" min="0" max="1" step="0.01" value="${layer.effects?.key_shadow ?? 0}">
+        <span class="value">${Number(layer.effects?.key_shadow ?? 0).toFixed(2)}</span>
+      </div>
       <div class="audio-status">This layer's key reveals layers beneath it. Chroma modes use the RGB target and tolerance.</div>
       <div class="param-row toggle-row layer-master-bypass" title="Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.">
         <label>Bypass Master FX</label>
@@ -4299,7 +4401,7 @@ function createLayerCard(layer, index) {
 
     if (select) {
       select.addEventListener('change', () => {
-        const v = param === 'key_mode' ? parseInt(select.value) : select.value;
+        const v = param === 'key_mode' || param === 'key_border_color' ? parseInt(select.value) : select.value;
         if (param === 'blend_mode') syncLayerBlendDescription(row, v);
         sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param, value: v });
       });
@@ -5500,6 +5602,16 @@ function currentModTargets(selected = '') {
   }
   if (latestCreative) {
     groups[0][1].push(['composition/bus_crossfade', 'Composition · A / B Crossfade']);
+    for (const [suffix, label] of [
+      ['bus_wipe_soft', 'Wipe Softness'], ['bus_wipe_x', 'Wipe Center X'], ['bus_wipe_y', 'Wipe Center Y'],
+      ['bus_wipe_detail', 'Wipe Detail'], ['bus_wipe_border', 'Wipe Border'],
+      ['bus_dirt', 'Dirt'], ['bus_dirt_rate', 'Dirt Rate'], ['bus_dirt_drop', 'Dirt Dropout'],
+      ['bus_dirt_cut', 'Dirt Cut'], ['bus_dirt_knock', 'Dirt Knock'], ['bus_dirt_noise', 'Dirt Noise'],
+      ['bus_melt', 'Edge Melt'], ['bus_melt_width', 'Melt Width'], ['bus_melt_hold', 'Melt Hold'],
+      ['bus_melt_swirl', 'Melt Swirl'], ['bus_melt_chroma', 'Melt Chroma'], ['bus_melt_creep', 'Melt Creep'],
+    ]) {
+      groups[0][1].push([`composition/${suffix}`, `Composition · ${label}`]);
+    }
     const nodeTargets = (scopeKey, scopeLabel, rack) => {
       const values = [];
       for (const node of rack?.nodes || []) {

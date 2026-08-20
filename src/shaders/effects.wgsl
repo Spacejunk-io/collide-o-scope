@@ -83,8 +83,13 @@ struct Uniforms {
     barrel: f32,
     chroma_aberration: f32,
     anamorphic_streak: f32,
+    // B8 key dressing: border and shadow join the key signal.
+    key_border: f32,
+    key_border_color: f32,
+    key_shadow: f32,
+    key_dress_reserved: f32,
     // Canonical authored spatial transform. These four vec4 slots are packed
-    // immediately after the eighteen effect slots by EffectPassUniforms.
+    // immediately after the nineteen effect slots by EffectPassUniforms.
     spatial_inverse_row_0: vec4f,
     spatial_inverse_row_1: vec4f,
     // Crop origin X/Y followed by crop extent X/Y in source UV space.
@@ -880,6 +885,8 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     // blending. Premultiplying here as well would square the soft key mask
     // and produce dark fringes.
     var alpha = color.a;
+    // The dressing reads the centre key mask; 1.0 covers the no-key path.
+    var key_mask = 1.0;
     if uniforms.cellular_gap_amount > 0.0001 && cellular_ridge > 0.0 {
         let threshold = clamp(uniforms.cellular_gap_threshold, 0.0, 1.0);
         let softness = max(clamp(uniforms.cellular_gap_softness, 0.0, 0.5), 0.0001);
@@ -896,6 +903,7 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         if uniforms.key_mode > 1.5 {
             k = 1.0 - k;
         }
+        key_mask = k;
         alpha *= k;
     } else if uniforms.key_mode > 2.5 {
         // Chroma distance ignores luminance, making this a real color key
@@ -914,8 +922,117 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         if uniforms.key_mode > 3.5 {
             outside = 1.0 - outside;
         }
+        key_mask = outside;
         alpha *= outside;
     }
 
+    // --- B8 key dressing: border and shadow join the key signal, so the
+    // composite receives an outlined and shadowed key exactly as a broadcast
+    // border generator adds fill to the key. The dressing observes the key
+    // matte a small distance out; both amounts gate the extra taps, so an
+    // undressed key costs nothing and stays byte-identical.
+    if uniforms.key_mode > 0.5
+        && (uniforms.key_border > 0.0001 || uniforms.key_shadow > 0.0001) {
+        let dress_aspect =
+            max(uniforms.resolution.x, 1.0) / max(uniforms.resolution.y, 1.0);
+        var dress_rgb = vec3f(0.0);
+        var dress_alpha = 0.0;
+        if uniforms.key_shadow > 0.0001 {
+            // A single matte tap offset up-left shows the shape's shadow
+            // down-right of it; the fill is black at 0.8 x amount, BENDR's
+            // maximum darkening.
+            let sh = uniforms.key_shadow * 0.035;
+            let shadow_matte = key_matte_at(sample_uv - vec2f(sh / dress_aspect, sh));
+            let key_shad = clamp(shadow_matte - key_mask, 0.0, 1.0);
+            dress_alpha = key_shad * 0.8 * uniforms.key_shadow;
+        }
+        if uniforms.key_border > 0.0001 {
+            // Six-tap max dilation: the four axis neighbours plus two
+            // diagonals only — the deliberately asymmetric kernel.
+            let border_r = 0.002 + uniforms.key_border * 0.02;
+            let border_rx = vec2f(border_r / dress_aspect, 0.0);
+            let border_ry = vec2f(0.0, border_r);
+            var grown = max(
+                max(
+                    key_matte_at(sample_uv - border_rx),
+                    key_matte_at(sample_uv + border_rx),
+                ),
+                max(
+                    key_matte_at(sample_uv - border_ry),
+                    key_matte_at(sample_uv + border_ry),
+                ),
+            );
+            grown = max(
+                grown,
+                max(
+                    key_matte_at(sample_uv - border_rx - border_ry),
+                    key_matte_at(sample_uv + border_rx + border_ry),
+                ),
+            );
+            let key_edge = clamp(grown - key_mask, 0.0, 1.0);
+            let border_alpha = key_edge * clamp(uniforms.key_border * 3.0, 0.0, 1.0);
+            let fill = key_dress_color(u32(clamp(uniforms.key_border_color, 0.0, 7.0)));
+            // Border over shadow, straight alpha.
+            let over = border_alpha + dress_alpha * (1.0 - border_alpha);
+            if over > 0.0001 {
+                dress_rgb =
+                    (fill * border_alpha + dress_rgb * dress_alpha * (1.0 - border_alpha))
+                    / over;
+            }
+            dress_alpha = over;
+        }
+        // The keyed shape stays on top of its own dressing.
+        let dressed_alpha = alpha + dress_alpha * (1.0 - alpha);
+        if dressed_alpha > 0.0001 {
+            rgb = (rgb * alpha + dress_rgb * dress_alpha * (1.0 - alpha)) / dressed_alpha;
+        }
+        alpha = dressed_alpha;
+    }
+
     return vec4f(rgb, alpha);
+}
+
+// B8 key dressing: the authored key law evaluated at a neighbouring
+// coordinate. Neighbours observe the spatially mapped source through the one
+// canonical sample_source chain rather than re-running the colour pipeline —
+// the bounded approximation the dressing's own amounts gate.
+fn key_matte_at(uv: vec2f) -> f32 {
+    let neighbour = sample_source(uv).rgb;
+    if uniforms.key_mode < 2.5 {
+        let luma = dot(neighbour, vec3f(0.2126, 0.7152, 0.0722));
+        let soft = max(clamp(uniforms.key_softness, 0.0, 0.5), 0.001);
+        var k = smoothstep(uniforms.key_threshold - soft, uniforms.key_threshold + soft, luma);
+        if uniforms.key_mode > 1.5 {
+            k = 1.0 - k;
+        }
+        return k;
+    }
+    let source_chroma = processed_chroma(neighbour);
+    let target_chroma = display_chroma(clamp(uniforms.key_color, vec3f(0.0), vec3f(1.0)));
+    let distance = clamp(
+        length(source_chroma - target_chroma) / MAX_DISPLAY_CHROMA_DISTANCE,
+        0.0,
+        1.0,
+    );
+    let tolerance = clamp(uniforms.key_tolerance, 0.0, 1.0);
+    let soft = max(clamp(uniforms.key_softness, 0.0, 0.5), 0.001);
+    var outside = smoothstep(tolerance - soft, tolerance + soft, distance);
+    if uniforms.key_mode > 3.5 {
+        outside = 1.0 - outside;
+    }
+    return outside;
+}
+
+// The eight back colours a bench mixer offers, in the frozen order.
+fn key_dress_color(code: u32) -> vec3f {
+    switch code {
+        case 0u: { return vec3f(1.0, 1.0, 1.0); }
+        case 1u: { return vec3f(1.0, 1.0, 0.0); }
+        case 2u: { return vec3f(0.0, 1.0, 1.0); }
+        case 3u: { return vec3f(0.0, 1.0, 0.0); }
+        case 4u: { return vec3f(1.0, 0.0, 1.0); }
+        case 5u: { return vec3f(1.0, 0.0, 0.0); }
+        case 6u: { return vec3f(0.0, 0.0, 1.0); }
+        default: { return vec3f(0.0, 0.0, 0.0); }
+    }
 }
