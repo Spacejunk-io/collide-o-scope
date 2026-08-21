@@ -387,7 +387,7 @@ impl SpoutOut {
         let generation = self.next_generation();
         let mut status = lock_unpoison(&self.status);
         *status = SpoutStatus {
-            error: "Spout is Windows-only (use Syphon on macOS)".to_string(),
+            error: "Spout is Windows-only; Syphon output is not implemented on macOS".to_string(),
             generation,
             ..SpoutStatus::default()
         };

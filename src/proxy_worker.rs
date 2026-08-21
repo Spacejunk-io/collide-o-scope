@@ -622,14 +622,15 @@ fn sync_parent_directory(child: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The default host cache root, beside the TLS material:
-/// `%LOCALAPPDATA%\collide-o-scope\proxy-cache`, or `./.proxy-cache` when the
-/// environment variable is absent.
+/// The default host cache root, beside the TLS material, under the shared
+/// per-user state root: `proxy-cache`.
+///
+/// This used to fall back to a relative `./.proxy-cache` whenever
+/// `%LOCALAPPDATA%` was absent, which is every non-Windows host — so a cache
+/// published from one working directory was invisible from another, and the
+/// content-addressed artifacts were silently re-encoded instead of adopted.
 pub fn default_proxy_cache_root() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|base| base.join("collide-o-scope").join("proxy-cache"))
-        .unwrap_or_else(|| PathBuf::from(".proxy-cache"))
+    crate::host_paths::state_root().join("proxy-cache")
 }
 
 /// Probe the source container's bounded metadata and report which stream the
@@ -1071,7 +1072,7 @@ fn run_bounded_proxy_encode(
     cancel: &AtomicBool,
 ) -> Result<(), ProxyWorkerError> {
     let limits = limits.validate()?;
-    let mut child = std::process::Command::new("ffmpeg")
+    let mut child = std::process::Command::new(crate::host_paths::ffmpeg())
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -2221,7 +2222,7 @@ mod tests {
     }
 
     fn generate_test_source(path: &Path, with_audio: bool) {
-        let mut command = std::process::Command::new("ffmpeg");
+        let mut command = std::process::Command::new(crate::host_paths::ffmpeg());
         command.args([
             "-y",
             "-hide_banner",

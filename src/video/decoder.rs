@@ -1881,12 +1881,11 @@ mod tests {
                 format!("create temporary codec-motion fixture directory: {error}")
             })?;
             let video = root.join("moving-box.mp4");
-            let executable = std::env::var_os("FFMPEG_DIR")
-                .map(std::path::PathBuf::from)
-                .map(|directory| directory.join("bin").join("ffmpeg.exe"))
-                .filter(|candidate| candidate.is_file())
-                .unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
-            let output = std::process::Command::new(executable)
+            // The shared resolver already prefers $FFMPEG_DIR/bin, then PATH,
+            // then the usual install prefixes — and unlike the hand-rolled
+            // lookup this replaced, it is not spelled with a `.exe` suffix that
+            // can never match off Windows.
+            let output = std::process::Command::new(crate::host_paths::ffmpeg())
                 .args([
                     "-hide_banner",
                     "-loglevel",
@@ -1941,12 +1940,11 @@ mod tests {
             std::fs::create_dir(&root)
                 .map_err(|error| format!("create temporary long-GOP directory: {error}"))?;
             let video = root.join("long-gop.mp4");
-            let executable = std::env::var_os("FFMPEG_DIR")
-                .map(std::path::PathBuf::from)
-                .map(|directory| directory.join("bin").join("ffmpeg.exe"))
-                .filter(|candidate| candidate.is_file())
-                .unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
-            let output = std::process::Command::new(executable)
+            // The shared resolver already prefers $FFMPEG_DIR/bin, then PATH,
+            // then the usual install prefixes — and unlike the hand-rolled
+            // lookup this replaced, it is not spelled with a `.exe` suffix that
+            // can never match off Windows.
+            let output = std::process::Command::new(crate::host_paths::ffmpeg())
                 .args([
                     "-hide_banner",
                     "-loglevel",

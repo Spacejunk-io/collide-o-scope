@@ -864,7 +864,7 @@ fn spawn_ffmpeg_sink(
         .open(&stderr_path)
         .map_err(|error| format!("reserve recording encoder log: {error}"))?;
     let size = format!("{}x{}", config.dimensions.width, config.dimensions.height);
-    let child = match Command::new("ffmpeg")
+    let child = match Command::new(crate::host_paths::ffmpeg())
         .arg("-nostdin")
         .arg("-hide_banner")
         .arg("-loglevel")

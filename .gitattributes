@@ -9,3 +9,14 @@
 *.yaml text eol=lf
 *.md text eol=lf
 *.json text eol=lf
+
+# License texts are conveyed verbatim; keep them byte-stable on every checkout.
+LICENSE text eol=lf
+LICENSES/** text eol=lf
+third_party/**/LICENSE* text eol=lf
+
+# Shell scripts and macOS property lists must never be checked out CRLF:
+# a CRLF shebang line makes a script unrunnable on macOS and Linux.
+*.sh text eol=lf
+*.plist text eol=lf
+*.py text eol=lf

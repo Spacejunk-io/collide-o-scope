@@ -6,6 +6,7 @@ experiments/*/target
 /*.md
 !/README.md
 !/CLAUDE.md
+!/COPYRIGHT.md
 
 # Local clip library (created on first launch; performance media stays local)
 /videos/

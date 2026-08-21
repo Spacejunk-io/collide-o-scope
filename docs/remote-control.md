@@ -971,8 +971,8 @@ exact show computer and stage hardware.
 
 ## Publication and license boundary
 
-The MIT terms in [../LICENSE](../LICENSE) apply to the fork additions described
-there, not automatically to the original upstream portions. Publication or
-distribution of the combined fork is conditional on the publisher having the
-needed upstream authorization or a later upstream license that permits it.
-This is a project boundary notice, not legal advice.
+This fork is distributed under the GNU General Public License, version 3 or
+later — see [../LICENSE](../LICENSE). Upstream's MIT grant is carried into the
+combined work with its notice retained, and is not revoked by that choice; the
+full boundary record is in [../COPYRIGHT.md](../COPYRIGHT.md). This is a
+project boundary notice, not legal advice.

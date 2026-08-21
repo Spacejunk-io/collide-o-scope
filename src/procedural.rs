@@ -3056,7 +3056,7 @@ pub fn generate_with_inventory(
         .filter_map(|layer| {
             layer
                 .source_path
-                .strip_prefix("spout://")
+                .strip_prefix(crate::layers::SPOUT_SOURCE_PREFIX)
                 .map(ToOwned::to_owned)
         })
         .collect();
@@ -3077,8 +3077,8 @@ pub fn generate_with_inventory(
         .map(|layer| {
             layer
                 .source_path
-                .strip_prefix("spout://")
-                .map(|name| format!("spout://{name}"))
+                .strip_prefix(crate::layers::SPOUT_SOURCE_PREFIX)
+                .map(|name| format!("{}{name}", crate::layers::SPOUT_SOURCE_PREFIX))
                 .unwrap_or_else(|| logical_filename(&layer.filename))
         })
         .collect();

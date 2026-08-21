@@ -141,24 +141,14 @@ pub fn read_controller_profile_import(
     }
 }
 
+/// The per-user state root. The ladder itself lives in [`crate::host_paths`]
+/// so the TLS, proxy-cache, stage, and recovery callers cannot drift apart.
 fn default_state_dir_from(
     local_app_data: Option<&OsStr>,
     xdg_state_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> PathBuf {
-    if let Some(base) = local_app_data {
-        return PathBuf::from(base).join("collide-o-scope");
-    }
-    if let Some(base) = xdg_state_home {
-        return PathBuf::from(base).join("collide-o-scope");
-    }
-    if let Some(base) = home {
-        return PathBuf::from(base)
-            .join(".local")
-            .join("state")
-            .join("collide-o-scope");
-    }
-    PathBuf::from(".collide-o-scope")
+    crate::host_paths::state_root_from(local_app_data, xdg_state_home, home)
 }
 
 pub(crate) fn default_control_state_dir() -> PathBuf {

@@ -209,12 +209,15 @@ fn load_or_create_tls(lan_ip: Option<IpAddr>) -> Result<(Vec<Vec<u8>>, Vec<u8>),
     Ok((vec![cert_der], key_der))
 }
 
-/// Certificate storage: %LOCALAPPDATA%\collide-o-scope\tls (or ./.tls).
+/// Certificate storage, under the shared per-user state root: `tls`.
+///
+/// This used to fall back to a relative `./.tls` whenever `%LOCALAPPDATA%` was
+/// absent, which is every non-Windows host. The certificate then followed the
+/// working directory, so a phone that had accepted it once stopped trusting the
+/// panel as soon as the program was launched from somewhere else — the exact
+/// opposite of the documented "accept once" behaviour.
 fn tls_dir() -> Result<PathBuf, String> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|p| p.join("collide-o-scope").join("tls"))
-        .unwrap_or_else(|| PathBuf::from(".tls"));
+    let base = crate::host_paths::state_root().join("tls");
     std::fs::create_dir_all(&base).map_err(|e| format!("tls dir: {e}"))?;
     Ok(base)
 }
