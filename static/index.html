@@ -811,6 +811,15 @@
                 <input type="number" id="morph-duration" min="0.25" max="64" step="0.25" value="4" aria-label="Morph glide duration in beats">
                 <button id="morph-glide-b" class="morph-btn">Glide B</button>
               </div>
+              <div class="snapshot-bank" id="snapshot-bank" role="group" aria-label="Snapshot bank: eight whole-rig slots">
+                <div class="snapshot-bank-slots" id="snapshot-bank-slots"></div>
+                <div class="param-row" data-bank="glide" data-min="0" data-max="64" data-step="0.25">
+                  <label for="snapshot-bank-glide">Bank glide</label>
+                  <input type="range" id="snapshot-bank-glide" min="0" max="64" step="0.25" value="4" aria-label="Snapshot bank recall glide, in beats">
+                  <span class="value" id="snapshot-bank-glide-value">4</span>
+                </div>
+                <div class="audio-status" id="snapshot-bank-status" role="status" aria-live="polite"></div>
+              </div>
               <div class="audio-status" id="morph-status" role="status" aria-live="polite">capture two states, then crossfade</div>
             </div>
           </div>
@@ -1515,6 +1524,18 @@
               <div class="param-row toggle-row" id="reroll-rack-row">
                 <label for="reroll-rack-controls">Rack values</label>
                 <label class="toggle"><input type="checkbox" id="reroll-rack-controls" aria-label="Include bounded Collision Rack value variation; topology and routes never change"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" id="reroll-keep-source-row">
+                <label for="reroll-keep-source">Keep sources</label>
+                <label class="toggle"><input type="checkbox" id="reroll-keep-source" aria-label="Protect every layer from this throw"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" id="reroll-keep-modulation-row">
+                <label for="reroll-keep-modulation">Keep modulation</label>
+                <label class="toggle"><input type="checkbox" id="reroll-keep-modulation" aria-label="Protect the modulation matrix from this throw"><span class="toggle-slider"></span></label>
+              </div>
+              <div class="param-row toggle-row" id="reroll-keep-output-row">
+                <label for="reroll-keep-output">Keep output chain</label>
+                <label class="toggle"><input type="checkbox" id="reroll-keep-output" aria-label="Protect the master chain from this throw"><span class="toggle-slider"></span></label>
               </div>
               <div class="param-row toggle-row" id="reroll-group-controls-row">
                 <label for="reroll-group-controls">Composition values</label>

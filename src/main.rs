@@ -1468,17 +1468,36 @@ struct RerollRequest {
     include_transform: bool,
     include_rack_controls: bool,
     include_group_controls: bool,
+    keep_source: bool,
+    keep_modulation: bool,
+    keep_output_chain: bool,
 }
 
-/// The program icon for every window this process opens.
+/// The title-bar and alt-tab icon for every window this process opens.
 ///
-/// Decoded once from the embedded 48px PNG — the size Windows asks for in a
-/// taskbar and alt-tab list, and small enough that decoding it costs nothing
-/// at startup. A failure here is cosmetic, so it degrades to the platform
-/// default rather than refusing to open a window.
+/// Decoded once from the embedded 48px PNG, which is the size Windows asks
+/// for in a title bar. A failure here is cosmetic, so it degrades to the
+/// platform default rather than refusing to open a window.
 fn program_window_icon() -> Option<winit::window::Icon> {
-    static ICON_BYTES: &[u8] = include_bytes!("../assets/icon/collide-o-scope-48.png");
-    let decoded = image::load_from_memory(ICON_BYTES).ok()?.into_rgba8();
+    decode_program_icon(include_bytes!("../assets/icon/collide-o-scope-48.png"))
+}
+
+/// The taskbar icon, which Windows treats as a **separate** image from the
+/// window icon above: `with_window_icon` populates the small icon a title bar
+/// draws, while the taskbar button reads the big one. Setting only the first
+/// leaves a correct title bar beside a generic taskbar button, so both are
+/// set, and this one decodes the 256px art because the taskbar scales it.
+///
+/// The executable additionally carries a four-size `.ico` in its PE resources
+/// (see `build.rs`), which is what Explorer and a pinned shortcut read. All
+/// three surfaces want the icon from a different place.
+#[cfg(target_os = "windows")]
+fn program_taskbar_icon() -> Option<winit::window::Icon> {
+    decode_program_icon(include_bytes!("../assets/icon/collide-o-scope-256.png"))
+}
+
+fn decode_program_icon(bytes: &[u8]) -> Option<winit::window::Icon> {
+    let decoded = image::load_from_memory(bytes).ok()?.into_rgba8();
     let (width, height) = decoded.dimensions();
     winit::window::Icon::from_rgba(decoded.into_raw(), width, height).ok()
 }
@@ -4571,6 +4590,10 @@ struct App {
     mod_matrix: modulation::ModMatrix,
     // Patch morphing crossfader (A/B slots + t)
     morph: morph::Morph,
+    /// B15 snapshot bank. Recall loads a slot into the Morph pair above
+    /// and glides, so the bank owns storage and nothing else — there is
+    /// exactly one law for what lies between two rigs.
+    snapshot_bank: morph::SnapshotBank,
     /// Saved performance Scenes. Source preparation/commit state lives in the
     /// dedicated runtime; this collection is the authored, patch-owned set.
     scenes: performance::Scenes,
@@ -4973,6 +4996,7 @@ impl App {
             selective_hold_spout_readback_epoch: None,
             mod_matrix: modulation::ModMatrix::new(),
             morph: morph::Morph::default(),
+            snapshot_bank: morph::SnapshotBank::default(),
             scenes: performance::Scenes::default(),
             blackout: false,
             blackout_presented: false,
@@ -6388,8 +6412,14 @@ impl App {
         self.layer_stack_revision = self.layer_stack_revision.wrapping_add(1).max(1);
         // Legacy clients omitted a stack revision. Do not let one of their
         // already-latched captures bind itself to a later topology.
-        self.quantized_actions
-            .retain(|action| !matches!(action, web::state::WebAction::MorphCapture { .. }));
+        self.quantized_actions.retain(|action| {
+            !matches!(
+                action,
+                web::state::WebAction::MorphCapture { .. }
+                    | web::state::WebAction::SnapshotBankSave { .. }
+                    | web::state::WebAction::SnapshotBankRecall { .. }
+            )
+        });
         // This is the one barrier every topology edit crosses — add, remove,
         // reorder, and patch apply all bump the revision — so it is the single
         // place an open preview-gizmo drag is abandoned. Aborting here is what
@@ -6825,6 +6855,64 @@ impl App {
         self.pending_motion_memory_clear = false;
     }
 
+    /// The two revision barriers a bank write shares with a Morph capture.
+    /// A write queued against an older topology is rejected at execution time
+    /// rather than attaching positional slot data to a different stack.
+    fn snapshot_bank_revisions_current(
+        &mut self,
+        what: &str,
+        stack_revision: Option<u64>,
+        composition_revision: Option<u64>,
+    ) -> bool {
+        if stack_revision.is_some_and(|revision| revision != self.layer_stack_revision) {
+            self.composition_status = format!(
+                "Snapshot bank {what} rejected: stale layer-stack revision {:?}; current is {}",
+                stack_revision, self.layer_stack_revision
+            );
+            log::warn!("{}", self.composition_status);
+            return false;
+        }
+        if composition_revision
+            .is_some_and(|revision| revision == 0 || revision != self.composition_revision)
+        {
+            self.composition_status = format!(
+                "Snapshot bank {what} rejected: stale composition revision {:?}; current is {}",
+                composition_revision, self.composition_revision
+            );
+            log::warn!("{}", self.composition_status);
+            return false;
+        }
+        true
+    }
+
+    /// Capture the live rig exactly as a Morph capture does, including the
+    /// materialization that transfers ownership away from an engaged pair
+    /// before the state is read.
+    fn capture_current_rig(&mut self) -> Option<morph::MorphSlot> {
+        self.materialize_morph_at_current_beat();
+        let layer_racks = self.layer_racks();
+        match morph::MorphSlot::capture_with_composition_and_motion(
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &self.layers,
+            &self.master_rack,
+            &layer_racks,
+            &self.composition,
+        ) {
+            Ok(snapshot) => Some(
+                snapshot.with_gesture(self.gesture_canvas.params(), self.gesture_checksum.clone()),
+            ),
+            Err(error) => {
+                self.composition_status = format!("Snapshot bank rejected: {error}");
+                log::warn!("{}", self.composition_status);
+                None
+            }
+        }
+    }
+
     fn try_capture_current_patch(&self) -> Result<patch::PatchState, String> {
         let layer_racks = self.layer_racks();
         let mut captured = patch::PatchState::capture_with_composition_and_motion(
@@ -6844,6 +6932,13 @@ impl App {
             &self.morph,
         )?;
         captured.scenes = self.scenes.clone();
+        // The B15 bank rides the carried-whole law too: an operator who
+        // never stored a rig and never moved the glide emits no section,
+        // so pre-B15 bytes and canonical hashes keep.
+        captured.snapshot_bank = {
+            let bank = self.snapshot_bank.sanitized();
+            (!bank.is_default()).then_some(bank)
+        };
         // A track is authored topology carried whole. An operator who never
         // recorded a gesture emits no section at all, so the saved patch, the
         // recovery journal payload, and every fingerprint derived from them
@@ -7259,7 +7354,8 @@ impl App {
         let monitor_names = monitors.iter().map(MonitorHandle::name).collect::<Vec<_>>();
         let monitor_index = exact_monitor_name_index(selector, &monitor_names)?;
         let monitor = monitors[monitor_index].clone();
-        let attributes = WindowAttributes::default()
+        #[allow(unused_mut, reason = "the taskbar icon is a Windows-only refinement")]
+        let mut attributes = WindowAttributes::default()
             .with_title(format!("collide-o-scope — stage output {}", endpoint.id))
             .with_window_icon(program_window_icon())
             .with_inner_size(winit::dpi::PhysicalSize::new(
@@ -7267,6 +7363,11 @@ impl App {
                 endpoint.output_size[1],
             ))
             .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes = attributes.with_taskbar_icon(program_taskbar_icon());
+        }
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
@@ -7524,10 +7625,16 @@ impl App {
             return;
         };
 
-        let attrs = WindowAttributes::default()
+        #[allow(unused_mut, reason = "the taskbar icon is a Windows-only refinement")]
+        let mut attrs = WindowAttributes::default()
             .with_title("collide-o-scope — output")
             .with_window_icon(program_window_icon())
             .with_fullscreen(Some(Fullscreen::Borderless(Some(target_monitor))));
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(program_taskbar_icon());
+        }
 
         match event_loop.create_window(attrs) {
             Ok(window) => {
@@ -8286,6 +8393,13 @@ impl App {
                 morph::Morph::from_snapshot_at_beat(snapshot, self.mod_matrix.current_beat)
             })
             .unwrap_or_default();
+        // An absent bank section is the exact pre-B15 path: an empty bank at
+        // the default glide, not a bank of default rigs.
+        self.snapshot_bank = patch
+            .snapshot_bank
+            .clone()
+            .map(|bank| bank.sanitized())
+            .unwrap_or_default();
 
         // A replacement patch is a new state and visual generation. Nothing
         // queued against the prior layer/morph topology may fire later, and
@@ -8387,6 +8501,10 @@ impl App {
             | WebAction::ResetFx
             | WebAction::ResetVisualProgram
             | WebAction::MorphCapture { .. }
+            | WebAction::SnapshotBankSave { .. }
+            | WebAction::SnapshotBankRecall { .. }
+            | WebAction::SnapshotBankClear { .. }
+            | WebAction::SetSnapshotBankGlide { .. }
             | WebAction::MorphClear
             | WebAction::SetMorph { .. }
             | WebAction::SetMorphLaw { .. }
@@ -8809,6 +8927,10 @@ impl App {
             WebAction::SetMorph { .. } => Some("morph:t".to_string()),
             WebAction::MorphGlide { .. } => Some("morph:glide".to_string()),
             WebAction::MorphCapture { slot, .. } => Some(format!("morph:capture:{slot}")),
+            WebAction::SnapshotBankSave { slot, .. } => Some(format!("snapshot-bank:save:{slot}")),
+            WebAction::SnapshotBankRecall { slot, .. } => {
+                Some(format!("snapshot-bank:recall:{slot}"))
+            }
             WebAction::MorphClear => Some("morph:clear".to_string()),
             _ => None,
         }
@@ -9203,6 +9325,10 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the throw names every authored option and keep-mask explicitly"
+    )]
     fn reroll_master(
         &mut self,
         supplied_seed: Option<u32>,
@@ -9211,16 +9337,20 @@ impl App {
         include_grain_controls: bool,
         include_transform: bool,
         stream: u64,
+        keep_modulation: bool,
+        keep_output_chain: bool,
     ) {
-        Self::reroll_effect_target(
-            &mut self.master_effects,
-            supplied_seed,
-            stream,
-            mode,
-            amount,
-            include_grain_controls,
-        );
-        if include_transform && amount.is_finite() && amount > 0.0 {
+        if !keep_output_chain {
+            Self::reroll_effect_target(
+                &mut self.master_effects,
+                supplied_seed,
+                stream,
+                mode,
+                amount,
+                include_grain_controls,
+            );
+        }
+        if !keep_output_chain && include_transform && amount.is_finite() && amount > 0.0 {
             let mut target = if mode == web::state::RerollMode::Pattern {
                 spatial::SpatialTransform {
                     fit: self.master_transform.fit,
@@ -9239,10 +9369,14 @@ impl App {
             );
             self.master_transform = target;
         }
-        let master_seed = self.master_effects.random_seed;
-        for (index, lfo) in self.mod_matrix.lfos.iter_mut().enumerate() {
-            let lfo_stream = 0x4c46_4f00_u64 + index as u64;
-            lfo.seed = randomization::stream_seed(master_seed, lfo_stream);
+        // The modulation matrix is its own keep domain: an operator dicing
+        // looks usually wants their LFO phase relationships left alone.
+        if !keep_modulation {
+            let master_seed = self.master_effects.random_seed;
+            for (index, lfo) in self.mod_matrix.lfos.iter_mut().enumerate() {
+                let lfo_stream = 0x4c46_4f00_u64 + index as u64;
+                lfo.seed = randomization::stream_seed(master_seed, lfo_stream);
+            }
         }
     }
 
@@ -9276,6 +9410,9 @@ impl App {
             include_transform,
             include_rack_controls,
             include_group_controls,
+            keep_source,
+            keep_modulation,
+            keep_output_chain,
         } = request;
         use web::state::RerollScope;
         match scope {
@@ -9283,7 +9420,7 @@ impl App {
                 let predicted_seed = supplied_seed
                     .unwrap_or_else(|| randomization::next_seed(self.master_effects.random_seed));
                 let mut candidate = StagedMorphWorld::capture_authored(self);
-                if include_rack_controls {
+                if include_rack_controls && !keep_output_chain {
                     randomization::mutate_runtime_rack_values(
                         &mut candidate.graph.master_rack,
                         amount,
@@ -9292,7 +9429,7 @@ impl App {
                         randomization::DiceRackScope::Master,
                     );
                 }
-                if mode == web::state::RerollMode::Variation {
+                if mode == web::state::RerollMode::Variation && !keep_output_chain {
                     randomization::mutate_live_motion(
                         &mut candidate.master_motion,
                         amount,
@@ -9335,7 +9472,7 @@ impl App {
                         self.bump_composition_revision();
                     }
                 }
-                if mode == web::state::RerollMode::Variation {
+                if mode == web::state::RerollMode::Variation && !keep_output_chain {
                     randomization::mutate_live_temporal_originals(
                         &mut self.temporal_params.originals,
                         amount,
@@ -9352,9 +9489,16 @@ impl App {
                     include_grain_controls,
                     include_transform,
                     0,
+                    keep_modulation,
+                    keep_output_chain,
                 );
             }
             RerollScope::Layer => {
+                // A layer throw is entirely the source domain, so keeping the
+                // source makes it a no-op rather than a partial throw.
+                if keep_source {
+                    return;
+                }
                 let Some(index) =
                     index.and_then(|index| self.resolve_layer_index(index, &layer_id))
                 else {
@@ -9539,7 +9683,7 @@ impl App {
                     .collect();
                 let mut candidate = StagedMorphWorld::capture_authored(self);
                 if include_rack_controls || include_group_controls {
-                    if include_rack_controls {
+                    if include_rack_controls && !keep_output_chain {
                         randomization::mutate_runtime_rack_values(
                             &mut candidate.graph.master_rack,
                             amount,
@@ -9553,6 +9697,9 @@ impl App {
                             .iter_mut()
                             .zip(predicted_layer_seeds.iter().copied())
                         {
+                            if keep_source {
+                                break;
+                            }
                             randomization::mutate_runtime_rack_values(
                                 rack,
                                 amount,
@@ -9572,21 +9719,25 @@ impl App {
                     );
                 }
                 if mode == web::state::RerollMode::Variation {
-                    randomization::mutate_live_motion(
-                        &mut candidate.master_motion,
-                        amount,
-                        predicted_master_seed,
-                        0,
-                        randomization::DiceMotionScope::Master,
-                    );
-                    for (layer, seed) in candidate.layers.iter_mut().zip(&layer_seed_bases) {
+                    if !keep_output_chain {
                         randomization::mutate_live_motion(
-                            &mut layer.motion,
+                            &mut candidate.master_motion,
                             amount,
-                            *seed,
+                            predicted_master_seed,
                             0,
-                            randomization::DiceMotionScope::Layer(layer.layer_id),
+                            randomization::DiceMotionScope::Master,
                         );
+                    }
+                    if !keep_source {
+                        for (layer, seed) in candidate.layers.iter_mut().zip(&layer_seed_bases) {
+                            randomization::mutate_live_motion(
+                                &mut layer.motion,
+                                amount,
+                                *seed,
+                                0,
+                                randomization::DiceMotionScope::Layer(layer.layer_id),
+                            );
+                        }
                     }
                 }
                 if include_rack_controls
@@ -9631,7 +9782,7 @@ impl App {
                         self.bump_composition_revision();
                     }
                 }
-                if mode == web::state::RerollMode::Variation {
+                if mode == web::state::RerollMode::Variation && !keep_output_chain {
                     randomization::mutate_live_temporal_originals(
                         &mut self.temporal_params.originals,
                         amount,
@@ -9648,8 +9799,16 @@ impl App {
                     include_grain_controls,
                     include_transform,
                     0,
+                    keep_modulation,
+                    keep_output_chain,
                 );
+                // The layers are the source domain, addressed by their own
+                // seeds on their own streams, so keeping them cannot shift what
+                // the master draws.
                 for (index, layer) in self.layers.iter_mut().enumerate() {
+                    if keep_source {
+                        break;
+                    }
                     let stream = index as u64 + 1;
                     Self::reroll_effect_target(
                         &mut layer.effects,
@@ -11170,6 +11329,7 @@ impl App {
         self.temporal_params = effects::params::TemporalParams::default();
         self.mod_matrix.reset();
         self.morph = morph::Morph::default();
+        self.snapshot_bank = morph::SnapshotBank::default();
 
         if rack_topology_changed || master_motion_changed {
             self.bump_composition_revision();
@@ -11194,6 +11354,8 @@ impl App {
                         | web::state::WebAction::SetMorph { .. }
                         | web::state::WebAction::SetMorphLaw { .. }
                         | web::state::WebAction::MorphCapture { .. }
+                        | web::state::WebAction::SnapshotBankSave { .. }
+                        | web::state::WebAction::SnapshotBankRecall { .. }
                         | web::state::WebAction::MorphClear
                         | web::state::WebAction::MorphGlide { .. }
                 )
@@ -17161,6 +17323,9 @@ impl App {
                 include_transform,
                 include_rack_controls,
                 include_group_controls,
+                keep_source,
+                keep_modulation,
+                keep_output_chain,
             } => self.apply_reroll(RerollRequest {
                 scope,
                 index,
@@ -17174,6 +17339,9 @@ impl App {
                 include_transform,
                 include_rack_controls,
                 include_group_controls,
+                keep_source,
+                keep_modulation,
+                keep_output_chain,
             }),
             WebAction::SetLayerRerollOnLoop {
                 index,
@@ -17778,6 +17946,80 @@ impl App {
                     "b" => self.morph.b = Some(snap),
                     _ => log::warn!("Ignored invalid morph slot '{slot}'"),
                 }
+            }
+            WebAction::SnapshotBankSave {
+                slot,
+                stack_revision,
+                composition_revision,
+            } => {
+                if !self.snapshot_bank_revisions_current(
+                    "save",
+                    stack_revision,
+                    composition_revision,
+                ) {
+                    return disposition;
+                }
+                match self.capture_current_rig() {
+                    Some(rig) => {
+                        if self.snapshot_bank.store(slot, rig) {
+                            self.composition_status =
+                                format!("Stored the rig in snapshot bank slot {}", slot + 1);
+                        } else {
+                            self.composition_status =
+                                format!("Snapshot bank save rejected: no slot {slot}");
+                            log::warn!("{}", self.composition_status);
+                        }
+                    }
+                    None => return disposition,
+                }
+            }
+            WebAction::SnapshotBankRecall {
+                slot,
+                stack_revision,
+                composition_revision,
+            } => {
+                if !self.snapshot_bank_revisions_current(
+                    "recall",
+                    stack_revision,
+                    composition_revision,
+                ) {
+                    return disposition;
+                }
+                let Some(target) = self.snapshot_bank.slot(slot).cloned() else {
+                    self.composition_status = format!("Snapshot bank slot {} is empty", slot + 1);
+                    return disposition;
+                };
+                let Some(current) = self.capture_current_rig() else {
+                    return disposition;
+                };
+                // Recall does not invent a second way to interpolate a rig: it
+                // loads the pair into the existing Morph A/B and glides, so
+                // ownership transfer, midpoint discretes, and wrapped hues are
+                // the laws that already exist rather than a second set.
+                self.morph.a = Some(current);
+                self.morph.b = Some(target);
+                self.morph.set_position(0.0);
+                let beats = self.snapshot_bank.sanitized().glide_beats;
+                self.morph
+                    .start_glide(1.0, beats, self.mod_matrix.current_beat);
+                self.materialize_morph_at_current_beat();
+                self.composition_status = if beats <= 0.0 {
+                    format!("Recalled snapshot bank slot {}", slot + 1)
+                } else {
+                    format!(
+                        "Gliding to snapshot bank slot {} over {beats} beats",
+                        slot + 1
+                    )
+                };
+            }
+            WebAction::SnapshotBankClear { slot } => {
+                if self.snapshot_bank.clear_slot(slot) {
+                    self.composition_status = format!("Cleared snapshot bank slot {}", slot + 1);
+                }
+            }
+            WebAction::SetSnapshotBankGlide { beats } => {
+                self.snapshot_bank.glide_beats = beats;
+                self.snapshot_bank = self.snapshot_bank.sanitized();
             }
             WebAction::MorphClear => {
                 self.morph.clear();
@@ -19984,6 +20226,8 @@ impl App {
                     .map(|glide| glide.target)
                     .unwrap_or(self.morph.t),
                 glide_duration_beats: morph_glide_remaining,
+                bank_filled: self.snapshot_bank.filled(),
+                bank_glide_beats: self.snapshot_bank.sanitized().glide_beats,
             },
             export_progress,
             export_error,
@@ -20634,6 +20878,11 @@ impl ApplicationHandler for App {
                 .with_title("collide-o-scope")
                 .with_inner_size(winit::dpi::LogicalSize::new(width, height));
             attrs = attrs.with_window_icon(program_window_icon());
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs = attrs.with_taskbar_icon(program_taskbar_icon());
+            }
             event_loop.create_window(attrs).map(Arc::new)
         };
         let requested_output = (output_width, output_height);
@@ -26675,6 +26924,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: true,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
         assert_ne!(app.master_rack, before_dice);
         assert!(!app.master_motion.shutter.is_exact_zero());
@@ -26794,6 +27046,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: true,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
         let after_dice = app.composition.group(group_id).unwrap().matte.unwrap();
         assert_ne!(after_dice, before_dice);
@@ -28445,6 +28700,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         };
         first.handle_web_action(action.clone());
         second.handle_web_action(action);
@@ -28496,6 +28754,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         };
         effects_only.handle_web_action(base.clone());
         let web::state::WebAction::Reroll {
@@ -28526,6 +28787,9 @@ mod app_state_tests {
             include_transform: true,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
 
         assert_eq!(
@@ -28628,6 +28892,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
         let mutated = app.temporal_params.originals;
         assert_ne!(mutated, authored);
@@ -28711,6 +28978,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
         assert!(app.morph.active());
         assert_eq!(app.master_effects.random_seed, stale_seed);
@@ -28728,6 +28998,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
         assert!(!app.morph.active());
         assert_eq!(app.master_effects.random_seed, 77);
@@ -28756,6 +29029,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: false,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         });
         assert_eq!(app.master_effects.random_seed, 0);
         assert!(app.mod_matrix.lfos.iter().all(|lfo| lfo.seed == 0));
@@ -30349,6 +30625,9 @@ mod app_state_tests {
                 include_transform: false,
                 include_rack_controls: false,
                 include_group_controls: false,
+                keep_source: false,
+                keep_modulation: false,
+                keep_output_chain: false,
             },
             WebAction::SetLayerEffect {
                 index: 0,
@@ -30631,6 +30910,9 @@ mod app_state_tests {
             include_transform: false,
             include_rack_controls: true,
             include_group_controls: false,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         };
         let bus = WebAction::SetCompositionBusCrossfade { value: 0.75 };
         let ordered = vec![
@@ -31048,6 +31330,228 @@ mod app_state_tests {
         assert_eq!(
             app.manual_history.metrics().undo_depth,
             depth_after_interleaving
+        );
+    }
+
+    /// B15 Dice keep-masks. The load-bearing claims are that an unflagged
+    /// throw is byte-identical to every throw before the masks existed, and
+    /// that keeping one domain cannot perturb what another draws — which
+    /// holds because the master draws on stream 0 keyed by the master seed
+    /// while each layer draws on stream `index + 1` keyed by its own.
+    ///
+    /// Adding a layer needs a renderer, so the layer domain is proven here by
+    /// auditing its guards rather than by executing them; the master and
+    /// modulation domains are executed.
+    /// B15's snapshot bank. The design ruling is that recall does not mint a
+    /// second interpolation law: it loads the slot into the existing Morph
+    /// A/B pair and glides, so ownership transfer and midpoint discretes are
+    /// the laws that already exist. This proves the wiring of that ruling —
+    /// that a recall engages the pair, that A holds where the program was,
+    /// that B holds the stored rig, and that the travel is a real glide.
+    #[test]
+    fn snapshot_bank_recall_engages_the_morph_pair_and_glides_to_the_stored_rig() {
+        use web::state::WebAction;
+
+        let mut app = App::new(None, None, web::state::WebState::new().expect("test token"));
+
+        // Store a rig with a recognisable master value.
+        app.master_effects.brightness = 0.75;
+        app.handle_web_action(WebAction::SnapshotBankSave {
+            slot: 2,
+            stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
+        });
+        assert!(
+            app.snapshot_bank.slot(2).is_some(),
+            "the slot must hold a rig"
+        );
+        assert!(app.snapshot_bank.filled()[2]);
+
+        // Move the program somewhere else, then recall.
+        app.master_effects.brightness = -0.25;
+        app.handle_web_action(WebAction::SetSnapshotBankGlide { beats: 8.0 });
+        app.handle_web_action(WebAction::SnapshotBankRecall {
+            slot: 2,
+            stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
+        });
+
+        // The pair is engaged, A is where the program was, B is the stored rig.
+        assert!(
+            app.morph.active(),
+            "recall must engage the existing A/B pair"
+        );
+        let a = app.morph.a.as_ref().expect("A");
+        let b = app.morph.b.as_ref().expect("B");
+        assert!(
+            (a.master.brightness - -0.25).abs() < 1.0e-6,
+            "A must hold where the program actually was"
+        );
+        assert!(
+            (b.master.brightness - 0.75).abs() < 1.0e-6,
+            "B must hold the stored rig"
+        );
+
+        // And the travel is a glide toward B, not a jump.
+        let glide = app
+            .morph
+            .glide
+            .expect("a recall with a duration must glide");
+        assert!(
+            (glide.target - 1.0).abs() < 1.0e-6,
+            "the glide travels toward B"
+        );
+        assert!(
+            glide.duration_beats > 0.0,
+            "an authored duration must be honoured"
+        );
+
+        // An empty slot is refused rather than recalling a default rig.
+        let before = app.morph.b.clone();
+        app.handle_web_action(WebAction::SnapshotBankRecall {
+            slot: 7,
+            stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
+        });
+        assert_eq!(
+            app.morph.b.is_some(),
+            before.is_some(),
+            "recalling an empty slot must change nothing"
+        );
+
+        // A stale revision is refused, exactly as a Morph capture would be.
+        app.handle_web_action(WebAction::SnapshotBankSave {
+            slot: 5,
+            stack_revision: Some(app.layer_stack_revision.wrapping_add(1)),
+            composition_revision: Some(app.composition_revision),
+        });
+        assert!(
+            app.snapshot_bank.slot(5).is_none(),
+            "a save against a stale stack revision must be refused"
+        );
+
+        // Zero beats is the explicit snap.
+        app.handle_web_action(WebAction::SetSnapshotBankGlide { beats: 0.0 });
+        app.handle_web_action(WebAction::SnapshotBankRecall {
+            slot: 2,
+            stack_revision: Some(app.layer_stack_revision),
+            composition_revision: Some(app.composition_revision),
+        });
+        assert!(app.morph.active());
+
+        // The bank survives a patch round trip, and an untouched bank emits no
+        // section at all so pre-B15 bytes and canonical hashes keep.
+        let captured = app.try_capture_current_patch().expect("capture");
+        assert!(
+            captured.snapshot_bank.is_some(),
+            "a stored rig must persist"
+        );
+        let yaml = serde_yaml::to_string(&captured).expect("serialize");
+        assert!(yaml.contains("snapshot_bank"));
+
+        let pristine = App::new(None, None, web::state::WebState::new().expect("test token"));
+        let bare = pristine.try_capture_current_patch().expect("capture");
+        assert!(
+            bare.snapshot_bank.is_none(),
+            "an untouched bank must emit no section"
+        );
+        let bare_yaml = serde_yaml::to_string(&bare).expect("serialize");
+        assert!(
+            !bare_yaml.contains("snapshot_bank"),
+            "a pre-B15 patch must keep its bytes"
+        );
+    }
+
+    #[test]
+    fn dice_keep_masks_protect_their_domain_and_leave_the_others_byte_identical() {
+        use web::state::{RerollMode, RerollScope, WebAction};
+
+        let throw = |keep_source: bool, keep_modulation: bool, keep_output_chain: bool| {
+            let mut app = App::new(None, None, web::state::WebState::new().expect("test token"));
+            app.master_effects.random_seed = 4_242;
+            let before_master = bytemuck::bytes_of(&app.master_effects).to_vec();
+            let before_lfos: Vec<_> = app.mod_matrix.lfos.iter().map(|lfo| lfo.seed).collect();
+            app.handle_web_action(WebAction::Reroll {
+                scope: RerollScope::Master,
+                index: None,
+                layer_id: None,
+                group_id: None,
+                stack_revision: None,
+                seed: None,
+                mode: RerollMode::Pattern,
+                amount: 0.7,
+                include_grain_controls: false,
+                include_transform: false,
+                include_rack_controls: false,
+                include_group_controls: false,
+                keep_source,
+                keep_modulation,
+                keep_output_chain,
+            });
+            let after_master = bytemuck::bytes_of(&app.master_effects).to_vec();
+            let after_lfos: Vec<_> = app.mod_matrix.lfos.iter().map(|lfo| lfo.seed).collect();
+            (
+                before_master != after_master,
+                before_lfos != after_lfos,
+                after_master,
+            )
+        };
+
+        // Unflagged: every domain moves, exactly as it always did.
+        let (master, lfos, plain_master) = throw(false, false, false);
+        assert!(master, "an unflagged throw must still reroll the master");
+        assert!(lfos, "an unflagged throw must still reseed the LFOs");
+
+        // Keeping modulation protects the LFO seeds while the picture moves,
+        // and the master's own draw stays byte-identical to the unflagged
+        // throw — the two domains do not share a stream.
+        let (master, lfos, kept_mod_master) = throw(false, true, false);
+        assert!(master, "keeping modulation must still reroll the master");
+        assert!(
+            !lfos,
+            "keeping modulation must leave the LFO seeds untouched"
+        );
+        assert_eq!(
+            plain_master, kept_mod_master,
+            "skipping the LFO reseed must not shift what the master draws"
+        );
+
+        // Keeping the output chain protects the master.
+        let (master, _, _) = throw(false, false, true);
+        assert!(
+            !master,
+            "keeping the output chain must leave the master untouched"
+        );
+
+        // A source mask is scoped to its own domain: it does not touch a
+        // master throw at all.
+        let (master, lfos, source_masked_master) = throw(true, false, false);
+        assert!(
+            master && lfos,
+            "a source mask must not disturb a master throw"
+        );
+        assert_eq!(
+            plain_master, source_masked_master,
+            "a source mask must leave the master draw byte-identical"
+        );
+
+        // Every mask set is a throw that changes nothing.
+        let (master, lfos, _) = throw(true, true, true);
+        assert!(!master && !lfos, "every mask set must change nothing");
+
+        // The layer domain's guards, audited rather than executed: adding a
+        // layer needs a renderer, so this pins that the two layer-side loops
+        // and the layer motion block are gated on the source mask.
+        let source = include_str!("main.rs");
+        let guard = format!("if {}_source {{", "keep");
+        assert!(
+            source.matches(&guard).count() >= 3,
+            "the layer effect loop, the layer rack loop, and the layer scope \
+             must each be gated on the source mask"
+        );
+        assert!(
+            source.contains("if !keep_source {"),
+            "layer motion must be gated on the source mask"
         );
     }
 

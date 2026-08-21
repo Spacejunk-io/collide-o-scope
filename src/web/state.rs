@@ -3433,6 +3433,14 @@ pub struct MorphSnapshot {
     /// Remaining beat duration at the published authoritative clock.
     #[serde(default)]
     pub glide_duration_beats: f64,
+    /// B15 snapshot bank: which of the eight slots hold a rig, so the panel
+    /// can light its lamps. Additive — an older client sees an empty vector
+    /// and shows no bank at all.
+    #[serde(default)]
+    pub bank_filled: Vec<bool>,
+    /// How long a bank recall takes to travel, in beats.
+    #[serde(default)]
+    pub bank_glide_beats: f64,
 }
 
 /// MIDI input state sent to the browser.
@@ -4499,6 +4507,29 @@ pub enum WebAction {
         /// bus assignment, routes, and root order remain authored topology.
         #[serde(default)]
         include_group_controls: bool,
+        /// B15 keep-masks. Each protects one domain from an otherwise ordinary
+        /// throw, and each defaults to false — the established behaviour — so
+        /// an unflagged action is byte-identical to every Dice before them.
+        ///
+        /// They are safe to compose because every Dice draw already runs in
+        /// its own stable, domain-separated stream: the master uses stream 0
+        /// keyed by the master seed, each layer uses stream `index + 1` keyed
+        /// by that layer's own seed. Skipping a domain therefore cannot shift
+        /// what another domain draws.
+        ///
+        /// Keep the layers exactly as they are.
+        #[serde(default)]
+        keep_source: bool,
+        /// Keep the modulation matrix's diced state (the LFO seeds).
+        #[serde(default)]
+        keep_modulation: bool,
+        /// Keep the master chain: its effects, transform, rack, composition
+        /// values, motion, and temporal originals. Note that the master seed
+        /// is part of that chain, so with this set the program's dice cursor
+        /// does not advance and a throw that keeps everything else is a pure
+        /// function of the current seed.
+        #[serde(default)]
+        keep_output_chain: bool,
     },
     #[serde(rename = "set_layer_reroll_on_loop")]
     SetLayerRerollOnLoop {
@@ -4731,6 +4762,35 @@ pub enum WebAction {
         #[serde(default)]
         composition_revision: Option<u64>,
     },
+    /// B15 snapshot bank: store the current rig in one of eight slots.
+    /// Carries the same two revision barriers a Morph capture does, because it
+    /// captures the same thing and would otherwise attach positional slot data
+    /// to a different stack.
+    #[serde(rename = "snapshot_bank_save")]
+    SnapshotBankSave {
+        slot: usize,
+        #[serde(default)]
+        stack_revision: Option<u64>,
+        #[serde(default)]
+        composition_revision: Option<u64>,
+    },
+    /// B15 snapshot bank: recall a slot by loading it into the Morph A/B pair
+    /// and gliding. Revision-barriered for the same reason as a save — the
+    /// recall captures the current rig into A before it travels.
+    #[serde(rename = "snapshot_bank_recall")]
+    SnapshotBankRecall {
+        slot: usize,
+        #[serde(default)]
+        stack_revision: Option<u64>,
+        #[serde(default)]
+        composition_revision: Option<u64>,
+    },
+    /// B15 snapshot bank: empty one slot.
+    #[serde(rename = "snapshot_bank_clear")]
+    SnapshotBankClear { slot: usize },
+    /// B15 snapshot bank: how long a recall takes to travel, in beats.
+    #[serde(rename = "set_snapshot_bank_glide")]
+    SetSnapshotBankGlide { beats: f64 },
     /// Clear both morph slots (crossfader disengages)
     #[serde(rename = "morph_clear")]
     MorphClear,
@@ -5169,6 +5229,7 @@ impl WebAction {
             Self::SetGyroConfig { axis, param, .. } => Some(format!("gyro:{axis}:{param}")),
             Self::Pad { .. } => Some("pad:position".into()),
             Self::SetPadConfig { axis, param, .. } => Some(format!("pad:{axis}:{param}")),
+            Self::SetSnapshotBankGlide { .. } => Some("snapshot-bank:glide".into()),
             Self::SetMorph { .. } => Some("morph:position".into()),
             Self::SetMorphLaw { .. } => Some("morph:law".into()),
             Self::SetTemporal { param, .. } => Some(format!("temporal:{param}")),
@@ -7276,9 +7337,19 @@ mod protocol_tests {
         // The whole feature lives in one block, and that block must never
         // dispatch. If search ever needs the engine, this test is the place
         // that decision gets made deliberately.
+        // Bound the block at the next section banner: everything after it
+        // belongs to another feature, and the no-dispatch claim is about this
+        // one.
         let block = js
             .split("// ===== B15: control search, filters, and help")
             .nth(1)
+            .and_then(|rest| {
+                rest.split(
+                    "
+// =====",
+                )
+                .next()
+            })
             .expect("the search engine block must exist");
         assert!(
             !block.contains("sendAction("),
@@ -8264,7 +8335,8 @@ mod protocol_tests {
         // height, drift bias) to the temporal section; the latch switch
         // itself is a checkbox, so only these four move the HTML count. The
         // JS count is untouched — the group is static markup.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 202);
+        // B15's snapshot bank added one more: the recall glide.
+        assert_eq!(assert_range_tags_are_bounded(html, true), 203);
         assert_eq!(assert_range_tags_are_bounded(js, false), 24);
 
         for contract in [
@@ -8621,6 +8693,9 @@ mod protocol_tests {
                 include_transform: false,
                 include_rack_controls: false,
                 include_group_controls: false,
+                keep_source: false,
+                keep_modulation: false,
+                keep_output_chain: false,
             } if (*amount - 0.7).abs() < f32::EPSILON
         ));
         assert_eq!(reroll.coalesce_key(), None);
@@ -8639,6 +8714,9 @@ mod protocol_tests {
             include_transform: true,
             include_rack_controls: true,
             include_group_controls: true,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         };
         let encoded = serde_json::to_value(&explicit).unwrap();
         assert_eq!(encoded["action"], "reroll");

@@ -300,6 +300,7 @@ function connect() {
         syncPatchSave(msg.patch_save_status || '');
         syncPatchLoad(msg.patch_load_status || '');
         syncModulation(msg.modulation);
+        syncSnapshotBank(msg.morph);
         syncControlFilters(msg.modulation);
         syncAudio(msg.audio);
         syncMidi(msg.midi);
@@ -3210,6 +3211,9 @@ rerollScope?.addEventListener('change', syncRerollModeControls);
 rerollAmount?.addEventListener('input', () => {
   rerollAmountValue.textContent = Number(rerollAmount.value).toFixed(2);
 });
+const rerollKeepSource = document.getElementById('reroll-keep-source');
+const rerollKeepModulation = document.getElementById('reroll-keep-modulation');
+const rerollKeepOutput = document.getElementById('reroll-keep-output');
 rerollSeed?.addEventListener('input', () => readExactRerollSeed());
 rerollButton?.addEventListener('click', () => {
   const seed = readExactRerollSeed();
@@ -3225,6 +3229,12 @@ rerollButton?.addEventListener('click', () => {
     include_rack_controls: !!rerollRackControls?.checked,
     include_group_controls: scope === 'group' && !!rerollGroupControls?.checked
       || scope === 'all' && !!rerollGroupControls?.checked,
+    // B15 keep-masks. Each protects one domain from an otherwise ordinary
+    // throw; all three default off, so an untouched panel sends exactly what
+    // it always sent.
+    keep_source: !!rerollKeepSource?.checked,
+    keep_modulation: !!rerollKeepModulation?.checked,
+    keep_output_chain: !!rerollKeepOutput?.checked,
   };
   if (seed.value !== null) action.seed = seed.value;
   if (scope === 'all') action.stack_revision = layerStackRevision;
@@ -8183,7 +8193,7 @@ function syncControlFilters(modulation) {
   });
 })();
 
-// ===== B15: descriptive prose folds into a ? beside each section ==========
+// ===== B15: descriptive prose folds into a ? beside each section ===
 // A column of controls should be controls. The static grey notes that explain
 // a section are moved into a `?` affordance in that section's own header, so
 // the explanation is one hover away instead of occupying a paragraph between
@@ -8215,3 +8225,83 @@ function syncControlFilters(modulation) {
     note.remove();
   });
 })();
+// ===== B15 snapshot bank ==================================================
+// Eight whole-rig slots and one glide time. Recall does not invent a second
+// way to interpolate a rig: the engine loads the slot into the existing
+// Morph A/B pair and glides, so ownership transfer, midpoint discretes, and
+// wrapped hues are the laws that already exist. The panel only stores, names,
+// and recalls.
+//
+// A save and a recall both carry the two revision barriers a Morph capture
+// carries, because both capture the live rig and would otherwise attach
+// positional slot data to a stack that has since changed.
+const SNAPSHOT_BANK_SLOTS = 8;
+
+function snapshotBankRevisions() {
+  return {
+    stack_revision: layerStackRevision,
+    composition_revision: compositionRevision,
+  };
+}
+
+(function buildSnapshotBank() {
+  const host = document.getElementById('snapshot-bank-slots');
+  if (!host) return;
+  for (let index = 0; index < SNAPSHOT_BANK_SLOTS; index += 1) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'snapshot-bank-slot';
+    button.dataset.slot = String(index);
+    button.textContent = String(index + 1);
+    button.title =
+      `Slot ${index + 1}. Click to recall (loads the slot into the Morph pair and glides); `
+      + 'shift-click to store the current rig; alt-click to empty it.';
+    button.setAttribute('aria-label', `Snapshot bank slot ${index + 1}`);
+    button.addEventListener('click', (event) => {
+      if (event.altKey) {
+        sendAction({ action: 'snapshot_bank_clear', slot: index });
+        return;
+      }
+      if (event.shiftKey) {
+        sendAction({ action: 'snapshot_bank_save', slot: index, ...snapshotBankRevisions() });
+        return;
+      }
+      sendAction({ action: 'snapshot_bank_recall', slot: index, ...snapshotBankRevisions() });
+    });
+    host.appendChild(button);
+  }
+})();
+
+const snapshotBankGlide = document.getElementById('snapshot-bank-glide');
+snapshotBankGlide?.addEventListener('input', () => {
+  const beats = Math.min(64, Math.max(0, Number(snapshotBankGlide.value) || 0));
+  const readout = document.getElementById('snapshot-bank-glide-value');
+  if (readout) readout.textContent = String(beats);
+  sendAction({ action: 'set_snapshot_bank_glide', beats });
+});
+
+function syncSnapshotBank(morph) {
+  const filled = Array.isArray(morph?.bank_filled) ? morph.bank_filled : [];
+  document.querySelectorAll('.snapshot-bank-slot').forEach((button) => {
+    const index = Number(button.dataset.slot);
+    const isFilled = filled[index] === true;
+    button.classList.toggle('filled', isFilled);
+    // The label carries the state too, so a filled slot is not distinguished
+    // by colour alone.
+    button.textContent = isFilled ? `[${index + 1}]` : String(index + 1);
+  });
+  if (snapshotBankGlide && canSync(snapshotBankGlide)
+      && typeof morph?.bank_glide_beats === 'number') {
+    snapshotBankGlide.value = String(morph.bank_glide_beats);
+    const readout = document.getElementById('snapshot-bank-glide-value');
+    if (readout) readout.textContent = String(morph.bank_glide_beats);
+  }
+  const status = document.getElementById('snapshot-bank-status');
+  if (status) {
+    const count = filled.filter(Boolean).length;
+    const text = count === 0
+      ? 'shift-click a slot to store the whole rig'
+      : `${count} of ${SNAPSHOT_BANK_SLOTS} slots stored`;
+    if (status.textContent !== text) status.textContent = text;
+  }
+}

@@ -471,6 +471,11 @@ pub struct PatchState {
     pub temporal: Option<TemporalConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub morph: Option<crate::morph::MorphStateSnapshot>,
+    /// B15 snapshot bank, carried whole like the gesture track. An untouched
+    /// bank emits no section at all, so every pre-B15 patch keeps its bytes
+    /// and its canonical hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_bank: Option<crate::morph::SnapshotBank>,
     /// Prepared multi-layer recalls. Empty is the exact legacy behavior.
     #[serde(default, skip_serializing_if = "Scenes::is_empty")]
     pub scenes: Scenes,
@@ -564,6 +569,8 @@ impl<'de> Deserialize<'de> for PatchState {
             #[serde(default)]
             morph: Option<crate::morph::MorphStateSnapshot>,
             #[serde(default)]
+            snapshot_bank: Option<crate::morph::SnapshotBank>,
+            #[serde(default)]
             scenes: Scenes,
             #[serde(default)]
             gesture_track: Option<crate::gesture::GestureTrackDocument>,
@@ -590,6 +597,9 @@ impl<'de> Deserialize<'de> for PatchState {
             modulation: raw.modulation,
             temporal: raw.temporal,
             morph: raw.morph,
+            snapshot_bank: raw
+                .snapshot_bank
+                .map(|bank| crate::morph::SnapshotBank::sanitized(&bank)),
             scenes: raw.scenes,
             gesture_track: raw.gesture_track,
             gesture_canvas: raw.gesture_canvas.map(GestureCanvasConfig::sanitized),
@@ -5978,6 +5988,7 @@ impl PatchState {
                 temporal, &layer_ids,
             )),
             morph: Some(morph.snapshot_at_beat(mod_matrix.current_beat)),
+            snapshot_bank: None,
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
@@ -6896,6 +6907,7 @@ mod tests {
             modulation: None,
             temporal: None,
             morph: None,
+            snapshot_bank: None,
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
@@ -7213,6 +7225,7 @@ scenes:
             modulation: None,
             temporal: None,
             morph: None,
+            snapshot_bank: None,
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
@@ -7306,6 +7319,7 @@ scenes:
             modulation: None,
             temporal: None,
             morph: None,
+            snapshot_bank: None,
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,
@@ -9175,6 +9189,7 @@ routings:
             modulation: None,
             temporal: None,
             morph: None,
+            snapshot_bank: None,
             scenes: Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,

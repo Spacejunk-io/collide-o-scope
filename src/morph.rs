@@ -1576,6 +1576,104 @@ fn interpolate_pattern_config(
     .sanitized()
 }
 
+/// How many whole-rig slots the B15 snapshot bank holds. Fixed rather than
+/// dynamic: a bank is a row of buttons an operator learns by position, and a
+/// growable one would make slot 5 mean something different tomorrow.
+pub const SNAPSHOT_BANK_SLOTS: usize = 8;
+
+/// The bank's glide bounds, in beats. Zero is the explicit snap; the upper
+/// bound matches the Morph glide the bank hands its recall to.
+pub const SNAPSHOT_BANK_MAX_GLIDE_BEATS: f64 = 64.0;
+
+/// B15's snapshot bank: eight whole-rig slots and one glide time.
+///
+/// A slot holds exactly what a Morph slot holds, because recall does not
+/// invent a second way to interpolate a rig — it loads the slot into the
+/// existing Morph A/B and glides. Ownership transfer, midpoint discretes,
+/// wrapped hues, and stale-topology purges therefore come free, and there is
+/// only ever one law deciding what "between two rigs" means.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SnapshotBank {
+    /// Exactly [`SNAPSHOT_BANK_SLOTS`] entries after sanitize. `None` is an
+    /// empty slot, which recall refuses rather than treating as a default rig.
+    pub slots: Vec<Option<MorphSlot>>,
+    /// How long a recall takes to travel, in beats.
+    pub glide_beats: f64,
+}
+
+impl Default for SnapshotBank {
+    fn default() -> Self {
+        Self {
+            slots: vec![None; SNAPSHOT_BANK_SLOTS],
+            glide_beats: 4.0,
+        }
+    }
+}
+
+impl SnapshotBank {
+    /// Normalize a bank that arrived from a patch: the slot vector is padded
+    /// or truncated to the fixed width, and the glide is clamped into range
+    /// with a non-finite value taking the neutral default rather than an
+    /// extreme.
+    pub fn sanitized(&self) -> Self {
+        let mut slots = self.slots.clone();
+        slots.resize(SNAPSHOT_BANK_SLOTS, None);
+        let default = Self::default();
+        let glide_beats = if self.glide_beats.is_finite() {
+            self.glide_beats.clamp(0.0, SNAPSHOT_BANK_MAX_GLIDE_BEATS)
+        } else {
+            default.glide_beats
+        };
+        Self { slots, glide_beats }
+    }
+
+    /// Whether any slot holds a rig. An empty bank is skipped in a patch, so
+    /// every pre-B15 patch keeps its bytes and its canonical hash.
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+
+    /// Whether this bank is the exact pre-B15 state: nothing stored, and the
+    /// glide untouched.
+    pub fn is_default(&self) -> bool {
+        let clean = self.sanitized();
+        clean.is_empty() && (clean.glide_beats - Self::default().glide_beats).abs() < f64::EPSILON
+    }
+
+    pub fn slot(&self, index: usize) -> Option<&MorphSlot> {
+        self.slots.get(index).and_then(Option::as_ref)
+    }
+
+    /// Store a rig. Out-of-range indices are refused rather than clamped: a
+    /// bank button that silently wrote to a different slot would be worse than
+    /// one that did nothing.
+    pub fn store(&mut self, index: usize, slot: MorphSlot) -> bool {
+        if index >= SNAPSHOT_BANK_SLOTS {
+            return false;
+        }
+        if self.slots.len() != SNAPSHOT_BANK_SLOTS {
+            self.slots.resize(SNAPSHOT_BANK_SLOTS, None);
+        }
+        self.slots[index] = Some(slot);
+        true
+    }
+
+    /// Empty one slot. Returns whether anything was there.
+    pub fn clear_slot(&mut self, index: usize) -> bool {
+        if index >= SNAPSHOT_BANK_SLOTS || self.slots.len() <= index {
+            return false;
+        }
+        self.slots[index].take().is_some()
+    }
+
+    /// Which slots currently hold a rig, for the panel's lamps.
+    pub fn filled(&self) -> Vec<bool> {
+        let clean = self.sanitized();
+        clean.slots.iter().map(Option::is_some).collect()
+    }
+}
+
 /// One serializable A or B morph slot. This is the neutral persistence type;
 /// it has no dependency on `patch` and no runtime layer handles.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -4367,6 +4465,86 @@ fn pick_finite(a: f32, b: f32, choose_b: bool) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_snapshot_bank_is_fixed_width_bounded_and_empty_by_default() {
+        let bank = SnapshotBank::default();
+        assert_eq!(bank.slots.len(), SNAPSHOT_BANK_SLOTS);
+        assert!(bank.is_empty(), "a fresh bank stores nothing");
+        assert!(bank.is_default(), "a fresh bank is the exact pre-B15 state");
+        assert!(bank.filled().iter().all(|filled| !filled));
+
+        // A patch may arrive with a short, long, or hostile bank.
+        let ragged = SnapshotBank {
+            slots: vec![Some(MorphSlot::default())],
+            glide_beats: f64::NAN,
+        }
+        .sanitized();
+        assert_eq!(ragged.slots.len(), SNAPSHOT_BANK_SLOTS, "short banks pad");
+        assert!(ragged.slot(0).is_some());
+        assert_eq!(
+            ragged.glide_beats,
+            SnapshotBank::default().glide_beats,
+            "a non-finite glide takes the neutral default, not an extreme"
+        );
+
+        let overlong = SnapshotBank {
+            slots: vec![None; SNAPSHOT_BANK_SLOTS + 5],
+            glide_beats: 1_000.0,
+        }
+        .sanitized();
+        assert_eq!(
+            overlong.slots.len(),
+            SNAPSHOT_BANK_SLOTS,
+            "long banks truncate"
+        );
+        assert_eq!(overlong.glide_beats, SNAPSHOT_BANK_MAX_GLIDE_BEATS);
+    }
+
+    #[test]
+    fn a_bank_slot_is_addressed_exactly_and_never_clamped_onto_a_neighbour() {
+        let mut bank = SnapshotBank::default();
+        assert!(bank.store(3, MorphSlot::default()), "slot 3 exists");
+        assert!(bank.slot(3).is_some());
+        assert!(bank.filled()[3]);
+        assert!(!bank.filled()[4], "storing must not smear");
+        assert!(!bank.is_empty());
+        assert!(!bank.is_default());
+
+        // Out of range is refused, not clamped: a bank button that silently
+        // wrote to a different slot would be worse than one that did nothing.
+        assert!(!bank.store(SNAPSHOT_BANK_SLOTS, MorphSlot::default()));
+        assert!(!bank.clear_slot(SNAPSHOT_BANK_SLOTS));
+        assert_eq!(
+            bank.filled().iter().filter(|filled| **filled).count(),
+            1,
+            "a refused write must store nothing at all"
+        );
+
+        assert!(bank.clear_slot(3));
+        assert!(
+            !bank.clear_slot(3),
+            "clearing an empty slot reports nothing"
+        );
+        assert!(bank.is_empty());
+    }
+
+    #[test]
+    fn a_bank_round_trips_through_serde_and_an_absent_section_is_the_prior_path() {
+        let mut bank = SnapshotBank::default();
+        bank.store(0, MorphSlot::default());
+        bank.glide_beats = 2.5;
+        let yaml = serde_yaml::to_string(&bank).unwrap();
+        let restored: SnapshotBank = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored.sanitized(), bank.sanitized());
+
+        // Unknown fields are a rejection rather than a silent default.
+        assert!(
+            serde_yaml::from_str::<SnapshotBank>("slots: []\nglide_beats: 1.0\nextra: 3\n")
+                .is_err(),
+            "an unknown bank field must be refused"
+        );
+    }
+
     use super::*;
 
     fn close(a: f32, b: f32) {
