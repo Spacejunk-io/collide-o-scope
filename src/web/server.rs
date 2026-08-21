@@ -542,6 +542,21 @@ async fn create_unique_upload_temp(
     Err("could not allocate a unique upload temp file".to_string())
 }
 
+/// Whether a completed upload body is short of what the client declared.
+///
+/// A partial body that ends cleanly is otherwise indistinguishable from a
+/// whole one: it is renamed into the library, counted as a clip, and given a
+/// thumbnail attempt, so the operator sees a real-looking entry that no
+/// decoder can open. `Content-Length` is already parsed to enforce the upper
+/// bound, and comparing it against what actually arrived costs nothing.
+///
+/// A client that declares no length gets no verdict here -- there is nothing
+/// to compare against, and refusing every chunked upload would be worse than
+/// the defect.
+fn upload_is_truncated(declared_length: Option<u64>, written: u64) -> bool {
+    declared_length.is_some_and(|declared| written < declared)
+}
+
 /// Streamed clip upload into the library folder. The body is written in
 /// chunks to a temp file (never buffered whole in memory), renamed into
 /// place on success, and the render thread is asked to rescan. Names are
@@ -637,6 +652,20 @@ async fn upload_handler(
         let _ = tokio::fs::remove_file(&temp_path).await;
         let _ = tokio::fs::remove_file(&reservation_path).await;
         return (StatusCode::BAD_REQUEST, "empty upload").into_response();
+    }
+    if upload_is_truncated(declared_length, written) {
+        let declared = declared_length.unwrap_or_default();
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = tokio::fs::remove_file(&reservation_path).await;
+        log::warn!(
+            "Rejected truncated upload {name}: {written} of {declared} declared bytes arrived"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("truncated upload: {written} of {declared} declared bytes arrived"),
+        )
+            .into_response();
     }
     drop(file);
 
@@ -2402,6 +2431,32 @@ mod tests {
     use axum::http::HeaderValue;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+
+    #[test]
+    fn a_short_upload_body_is_refused_rather_than_published_as_a_clip() {
+        // The reproduction: a browser declared a whole file and delivered 170
+        // bytes. The body ended cleanly, so the upload was renamed into the
+        // library, counted as a new clip, and handed to the thumbnail
+        // preflight, which is where it finally failed with "moov atom not
+        // found" -- long after it had become a library entry no decoder could
+        // open.
+        assert!(upload_is_truncated(Some(71_407_803), 170));
+        assert!(upload_is_truncated(Some(2), 1));
+
+        // Exactly what was declared is whole.
+        assert!(!upload_is_truncated(Some(71_407_803), 71_407_803));
+        assert!(!upload_is_truncated(Some(0), 0));
+
+        // More than declared is somebody else's problem: the size ceiling
+        // already refused an over-long body, and calling a longer-than-
+        // declared upload "truncated" would be a lie.
+        assert!(!upload_is_truncated(Some(10), 11));
+
+        // A client that declares nothing gets no verdict. Refusing every
+        // chunked upload would be worse than the defect.
+        assert!(!upload_is_truncated(None, 0));
+        assert!(!upload_is_truncated(None, 170));
+    }
 
     #[tokio::test]
     async fn controller_profile_endpoint_is_bounded_pathless_and_exports_latest_publication() {

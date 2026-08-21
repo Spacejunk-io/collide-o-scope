@@ -243,6 +243,43 @@ fn create_uploaded_uniform<T: bytemuck::Pod>(
 #[cfg(test)]
 mod temporal_state_tests {
     use super::*;
+
+    /// The vendored wgpu-hal patch is the only thing standing between a
+    /// one-second presentation stall and a permanent, unrecoverable device
+    /// loss, and nothing about the build fails loudly if it goes missing: the
+    /// program simply becomes fragile again on exactly the hosts it was added
+    /// for. Pin both halves.
+    #[test]
+    fn the_vendored_wgpu_hal_patch_for_the_acquire_timeout_is_still_wired_and_present() {
+        let manifest = include_str!("../../Cargo.toml");
+        assert!(
+            manifest.contains("[patch.crates-io]"),
+            "the crates-io patch section must exist"
+        );
+        assert!(
+            manifest.contains("wgpu-hal = { path = \"third_party/wgpu-hal-29.0.3\" }"),
+            "wgpu-hal must resolve to the vendored copy, not crates.io"
+        );
+
+        let swapchain =
+            include_str!("../../third_party/wgpu-hal-29.0.3/src/vulkan/swapchain/native.rs");
+        assert_eq!(
+            swapchain
+                .matches("Err(vk::Result::TIMEOUT) => return Err(crate::SurfaceError::Lost)")
+                .count(),
+            1,
+            "the post-acquire fence wait must map VK_TIMEOUT to a recoverable surface loss exactly once (gfx-rs/wgpu#9029)"
+        );
+        assert!(
+            swapchain.contains("LOCAL PATCH (collide-o-scope)"),
+            "the patch must stay labelled so a future vendor refresh cannot drop it silently"
+        );
+        let mapper = include_str!("../../third_party/wgpu-hal-29.0.3/src/vulkan/mod.rs");
+        assert!(
+            mapper.contains("fn map_host_device_oom_and_lost_err"),
+            "the mapper the patch exists because of must still be there"
+        );
+    }
     use crate::effects::params::TEMPORAL_REFERENCE_FPS;
     use crate::temporal::{
         CollisionAtlasParams, RefreshGardenGate, RefreshGardenParams, TemporalFrameEvents,

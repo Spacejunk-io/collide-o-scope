@@ -425,11 +425,14 @@ editor-only transform: S6 proves that closure rather than adding to it.
   group of pictures and still had one. A short looping clip meets that tail
   every few seconds, so without the fallback the layer simply stops — and
   raising target decode FPS reaches it sooner and more often. `Superseded` is
-  deliberately not retried; that work was abandoned on purpose. Decoder
-  threading is deliberately still
-  unset — it is worth roughly 7x, but `codec_has_previous_anchor_motion` reads
-  `has_b_frames` from the opened context, so it needs its own evidence that the
-  anchor law and the decoded bytes do not move.
+  deliberately not retried; that work was abandoned on purpose. **Decoder threading is deliberately not set,
+  and that is a settled decision rather than a deferral.** Measured at roughly
+  7x on a 1080p clip, its entire value was masking the GOP walk; with the
+  forward walk in place a frame costs about 1.1 ms against a 33 ms budget, so
+  threading would now only shorten genuine seeks. Against that,
+  `codec_has_previous_anchor_motion` reads `has_b_frames` from the *opened*
+  context, so turning it on would need its own evidence that neither the anchor
+  law nor the decoded bytes move. Do not add it for speed alone.
 - **The harvest discards on generation, never on the command epoch.** Selections
   are published before harvesting so an old completion cannot cross a
   seek/cue/loop discontinuity into the GPU — and the *source generation* is that
@@ -3358,6 +3361,14 @@ absolute-value edits.
 The bounded/coalescing ingress queue is a load-shedding boundary, not an excuse
 to omit pointer throttling or final pointer-release messages.
 
+A clip upload that ends cleanly but short of its declared `Content-Length` is
+refused and removed instead of renamed into the library. A partial body is
+otherwise indistinguishable from a whole one: it becomes a counted clip with a
+thumbnail attempt, and the failure surfaces much later as a file no decoder can
+open. `Content-Length` is already parsed to enforce the upper bound, so
+`upload_is_truncated` costs nothing; a client that declares no length gets no
+verdict, because refusing every chunked upload would be worse than the defect.
+
 `AppSnapshot::output_error` is the operator-facing failure channel for the
 fullscreen output window. Keep the checkbox synchronized to the renderer's
 actual surface state and show creation/surface errors instead of implying that
@@ -4144,6 +4155,21 @@ a passing claim.
   only inside a `#[cfg(feature = "internal_error_panic")] panic!`. Note also
   that `wgpu::Instance::default()` never calls the env-reading constructor, so
   `WGPU_BACKEND`, `WGPU_VALIDATION`, and `WGPU_DEBUG` are inert in this build.
+  **This is patched locally.** `third_party/wgpu-hal-29.0.3` is a verbatim
+  vendored copy of the crate with one arm added to that fence wait, wired in
+  through `[patch.crates-io]` and pinned by
+  `the_vendored_wgpu_hal_patch_for_the_acquire_timeout_is_still_wired_and_present`.
+  The timeout is reported as `SurfaceError::Lost`, deliberately not
+  `SurfaceError::Timeout`: `vkAcquireNextImageKHR` has already succeeded by that
+  point, so an image is acquired, and returning `Timeout` would abandon it
+  unpresented and exhaust the swapchain after a few occurrences. `Lost` makes
+  the caller recreate the surface, retiring the swapchain and the image with it,
+  which is a path `recreate_main_surface` already implements. wgpu is dual
+  MIT/Apache-2.0 and both license files travel with the vendored copy; this is a
+  third-party vendoring, entirely separate from the fork's own `LICENSE`
+  boundary recorded below. Vendored rather than pointed at a git fork so the
+  build stays offline and `--locked` stays honest. Retire the patch if upstream
+  lands a fix and the dependency moves.
 - Portable wgpu exposes no live/free-VRAM budget. Expert media status reports a
   conservative host plan and capability limits, not detected VRAM headroom.
 - Procedural generation emits patches/manifests/preflight receipts only; MP4
