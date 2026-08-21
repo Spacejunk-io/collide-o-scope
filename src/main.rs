@@ -101,7 +101,11 @@ use visual_rack::{LegacyRackScope, RuntimeVisualRack};
 use web::state::{ControlServerInfo, ControlServerStatus, WebState};
 
 const TARGET_FPS: u64 = 30;
-const FRAME_DURATION: Duration = Duration::from_millis(1000 / TARGET_FPS);
+// Microseconds, not milliseconds: `1000 / 30` truncates to 33 ms, which paces
+// the program at 30.30 fps and — because this same value is the stage-health
+// deadline and the proxy assessment's frame budget — marked very nearly every
+// frame as a missed deadline against a target the loop was actually meeting.
+const FRAME_DURATION: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
 const STILL_CAPTURE_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
 const FALLBACK_OUTPUT_WIDTH: u32 = 1280;
 const FALLBACK_OUTPUT_HEIGHT: u32 = 720;
@@ -1138,9 +1142,20 @@ fn render_output_checked(
 ) -> Result<Option<wgpu::SurfaceTexture>, OutputRenderFailure> {
     let output = renderer.render_output(encoder).map_err(|message| {
         let device_lost = renderer.device_error().is_some();
-        renderer.close_output();
+        // `render_output` checks device health before it checks whether an
+        // output target exists, so with no output open — every single-monitor
+        // session, where Output reuses the main window — this is the first
+        // reader of a loss some other stage caused, and the Output subsystem
+        // encoded nothing at all. Say so rather than naming a path that did
+        // no work, and do not close an output that never failed.
+        let attributed = if device_lost && !renderer.has_output() {
+            format!("{message} (detected at the output stage; no output was open)")
+        } else {
+            renderer.close_output();
+            message
+        };
         OutputRenderFailure {
-            message,
+            message: attributed,
             device_lost,
         }
     })?;
@@ -22201,14 +22216,26 @@ impl ApplicationHandler for App {
                                             "Layer '{}' GPU upload failed: {error}",
                                             layer.filename
                                         );
+                                        let reported = format!("GPU upload failed: {error}");
+                                        layer.set_media_source_error(reported);
                                         layer.restore_ready_media_frame_after_failed_upload(frame);
+                                    } else {
+                                        // A picture arrived, so whatever was
+                                        // wrong no longer is.
+                                        layer.set_media_source_error(String::new());
                                     }
                                 }
                                 Ok(None) => {}
-                                Err(error) => log::error!(
-                                    "Layer '{}' decoder failed: {error}",
-                                    layer.filename
-                                ),
+                                Err(error) => {
+                                    log::error!(
+                                        "Layer '{}' decoder failed: {error}",
+                                        layer.filename
+                                    );
+                                    // Without this the operator sees a frozen
+                                    // picture and nothing else: no status, no
+                                    // panel note, no stage-health line.
+                                    layer.set_media_source_error(format!("decode failed: {error}"));
+                                }
                             }
                         }
                     }

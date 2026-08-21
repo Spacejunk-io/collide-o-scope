@@ -842,20 +842,34 @@ impl ThreadedDecoder {
         consumed_at: Instant,
     ) -> Result<Option<ReadyFrame>, String> {
         let current_generation = self.mailbox.generation();
-        let current_epoch = self.mailbox.epoch();
         let mut state = lock_state(&self.shared);
-        if state.latest.as_ref().is_some_and(|frame| {
-            frame.source_generation != current_generation || frame.command_epoch != current_epoch
-        }) {
+        // Discard on **generation**, not on epoch. The source generation is
+        // the discontinuity token — a seek, cue, or loop changes it — and
+        // dropping a completion that predates one is the whole point of
+        // publishing selections before harvesting. The epoch is a different
+        // thing: it advances on *every* command, so guarding on it here
+        // discards the completion of the immediately preceding request, which
+        // in ordinary playback is every frame the decoder ever finishes. The
+        // render thread issues a request and harvests a few microseconds
+        // later in the same frame body, so the worker essentially never wins
+        // that race; delivery then survives only on the rare rendered frame
+        // that is not sample-due, which is why playback ran at roughly
+        // `(render_fps - sample_fps) / render_fps` of its authored rate and
+        // stopped entirely for a source whose rate equals the render rate.
+        // Taking the previous request's completion is exactly the documented
+        // latest-only mailbox behaviour, one frame of latency and no backlog.
+        if state
+            .latest
+            .as_ref()
+            .is_some_and(|frame| frame.source_generation != current_generation)
+        {
             state.latest = None;
             state.drop_frame();
         }
         if state
             .command_error
             .as_ref()
-            .is_some_and(|(generation, epoch, _)| {
-                *generation != current_generation || *epoch != current_epoch
-            })
+            .is_some_and(|(generation, _, _)| *generation != current_generation)
         {
             state.command_error = None;
         }
@@ -1422,6 +1436,63 @@ mod tests {
         assert_eq!(
             dropped.upload_p95_duration,
             Some(Duration::from_micros(800))
+        );
+    }
+
+    #[test]
+    fn the_previous_requests_completion_is_delivered_rather_than_discarded() {
+        // The render thread publishes a selection and harvests a few
+        // microseconds later in the same frame body, so a worker essentially
+        // never finishes inside that window. What it does finish is the
+        // *previous* request, and that must reach the GPU: guarding the
+        // harvest on the per-command epoch discarded it every single frame and
+        // playback survived only on rendered frames that were not sample-due.
+        let published_at = Instant::now();
+        let mut decoder = synthetic_decoder_at(DecodedFrame::synthetic(1, 0, 0), published_at);
+        decoder.mailbox.select_after(0, 0.5, None).unwrap();
+        let first_epoch = decoder.mailbox.epoch();
+        lock_state(&decoder.shared).publish(
+            DecodedFrame {
+                command_epoch: first_epoch,
+                ..DecodedFrame::synthetic(2, 0, 0)
+            },
+            published_at,
+            Duration::from_micros(400),
+        );
+
+        // The next frame's request lands before the harvest, exactly as the
+        // live loop orders them.
+        decoder.mailbox.select_after(0, 0.6, None).unwrap();
+        assert_ne!(decoder.mailbox.epoch(), first_epoch);
+
+        let harvested = decoder
+            .try_next_ready_frame_result_at(published_at)
+            .unwrap()
+            .expect("the previous request's completion must still be delivered");
+        assert_eq!(harvested.source_generation, 0);
+        assert_eq!(
+            harvested.pts,
+            Some(2),
+            "the newest completion wins the mailbox"
+        );
+    }
+
+    #[test]
+    fn a_completion_from_before_a_discontinuity_is_still_discarded() {
+        // The generation is the discontinuity token, and it must keep its
+        // exact meaning: a seek, cue, or loop retires everything before it.
+        let published_at = Instant::now();
+        let mut decoder = synthetic_decoder_at(DecodedFrame::synthetic(1, 0, 0), published_at);
+        lock_state(&decoder.shared).publish(
+            DecodedFrame::synthetic(2, 0, 0),
+            published_at,
+            Duration::from_micros(400),
+        );
+        decoder.mailbox.select_after(7, 0.6, None).unwrap();
+        assert_eq!(
+            decoder.try_next_ready_frame_result_at(published_at),
+            Ok(None),
+            "a completion from before the discontinuity must never reach the GPU"
         );
     }
 

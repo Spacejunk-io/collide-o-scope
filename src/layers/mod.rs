@@ -1596,6 +1596,19 @@ impl Layer {
         &self.source_error
     }
 
+    /// Record — or clear — the operator-facing reason this layer's source is
+    /// not producing pictures. A decode that keeps failing is otherwise
+    /// invisible on every surface: the layer simply holds its last image, and
+    /// a frozen picture with no explanation is indistinguishable from a paused
+    /// one. `source_error` is already published in the layer snapshot and in
+    /// the stage-health row, so writing it here is what makes the failure
+    /// speak.
+    pub fn set_media_source_error(&mut self, error: String) {
+        if self.source_error != error {
+            self.source_error = error;
+        }
+    }
+
     /// Take at most the newest live frame. The receiver's one-frame slot
     /// discards intermediate images, so a slow render tick never builds lag.
     pub fn try_spout_frame(&self) -> Option<SpoutFrame> {

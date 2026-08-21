@@ -7459,6 +7459,23 @@ mod protocol_tests {
             scenes_at < grid_at,
             "Scenes should sit above the library grid, which is the long scrolling surface"
         );
+        // The Library heading and its + upload control label the grid, so they
+        // belong immediately above it rather than at the top of a column whose
+        // other sections have nothing to do with the library.
+        let title_at = left
+            .find("<h3 class=\"panel-title\">Library")
+            .expect("the library title must exist");
+        let upload_at = left
+            .find("class=\"lib-upload-btn\"")
+            .expect("the library upload control must exist");
+        assert!(
+            scenes_at < title_at && title_at < grid_at,
+            "the Library heading belongs directly above the grid it names"
+        );
+        assert!(
+            title_at < upload_at && upload_at < grid_at,
+            "the + upload control stays inside the Library heading, above the grid"
+        );
 
         // Static prose folds into a ? beside its section; live notes do not.
         assert!(
