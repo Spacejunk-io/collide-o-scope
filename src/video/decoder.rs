@@ -54,6 +54,16 @@ fn enable_export_motion_vectors(context: &mut ffmpeg::codec::context::Context) {
     }
 }
 
+/// Where the live FFmpeg decoder actually sits, as opposed to which picture
+/// was last *selected*. Only a real decode advances it; a seek or a reopen
+/// clears it. A reverse cache hit deliberately leaves it alone, because a
+/// cache hit serves pixels without moving the decoder at all.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StreamPosition {
+    source_seconds: f64,
+    pts: Option<i64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecoderSeekStats {
     pub index_builds: u64,
@@ -106,6 +116,11 @@ pub struct VideoDecoder {
     duration_seconds: f64,
     last_pts: Option<i64>,
     last_source_seconds: f64,
+    /// The live decoder's own position. This is deliberately **not**
+    /// `last_source_seconds`: a reverse cache hit adopts that field from
+    /// cached pixels while the decoder stays exactly where it was, so only a
+    /// decode may write this one.
+    stream_position: Option<StreamPosition>,
     frame_count: u64,
     total_frames: u64,
     /// Number of times EOF was reached and the input was successfully
@@ -306,6 +321,7 @@ impl VideoDecoder {
             duration_seconds,
             last_pts: None,
             last_source_seconds: 0.0,
+            stream_position: None,
             frame_count: 0,
             total_frames,
             loop_generation: 0,
@@ -544,24 +560,73 @@ impl VideoDecoder {
             }
         }
 
-        let keyframe = self.keyframe_index.preceding(target_seconds);
-        self.seek_to_preceding_keyframe(keyframe.pts)
-            .map_err(DecodeWorkError::Failed)?;
-        self.check_work_current(&mut is_current)?;
-        self.frame_count = (keyframe.source_seconds * f64::from(self.fps))
-            .floor()
-            .max(0.0) as u64;
-
         let previous_accepted_identity = previous_accepted_identity
             .filter(|identity| identity.source_generation == source_generation);
+
+        let keyframe = self.keyframe_index.preceding(target_seconds);
+        let mut continue_forward = can_continue_forward(
+            self.stream_position,
+            target_seconds,
+            keyframe.source_seconds,
+            frame_period,
+            previous_accepted_identity,
+        );
+        loop {
+            if !continue_forward {
+                self.seek_to_preceding_keyframe(keyframe.pts)
+                    .map_err(DecodeWorkError::Failed)?;
+                self.check_work_current(&mut is_current)?;
+                self.frame_count = (keyframe.source_seconds * f64::from(self.fps))
+                    .floor()
+                    .max(0.0) as u64;
+            }
+            match self.walk_to_target(
+                target_seconds,
+                source_generation,
+                previous_accepted_identity,
+                compose_skipped_motion,
+                frame_period,
+                &mut is_current,
+            ) {
+                Ok(frame) => return Ok(frame),
+                // A forward walk can end holding nothing where the seek walk
+                // would have re-decoded the group of pictures and therefore
+                // still held a terminal frame — a decoder already sitting on
+                // the last picture decodes straight into EOF. Continuing
+                // forward is an optimization and is never permitted to be
+                // worse than the walk it replaced, so redo it the old way.
+                // `Superseded` is deliberately not retried: that work was
+                // abandoned on purpose.
+                Err(DecodeWorkError::Failed(_)) if continue_forward => {
+                    continue_forward = false;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Decode forward from wherever the decoder currently sits until the
+    /// picture that satisfies the target is reached.
+    fn walk_to_target<F>(
+        &mut self,
+        target_seconds: f64,
+        source_generation: u64,
+        previous_accepted_identity: Option<CodecFrameIdentity>,
+        compose_skipped_motion: bool,
+        frame_period: f64,
+        is_current: &mut F,
+    ) -> Result<DecodedVideoFrame, DecodeWorkError>
+    where
+        F: FnMut() -> bool,
+    {
         let mut motion_sequence = None;
         let mut motion_sequence_rejected = false;
         let mut newest = None;
         let mut reached_eof = false;
         for _ in 0..MAX_SEEK_DECODE_FRAMES {
-            self.check_work_current(&mut is_current)?;
+            self.check_work_current(is_current)?;
             let Some(mut frame) =
-                self.next_frame_without_loop_interruptible(source_generation, &mut is_current)?
+                self.next_frame_without_loop_interruptible(source_generation, is_current)?
             else {
                 reached_eof = true;
                 break;
@@ -681,6 +746,10 @@ impl VideoDecoder {
 
     fn seek_to_preceding_keyframe(&mut self, pts: i64) -> Result<(), String> {
         self.check_cancelled()?;
+        // Repositioning invalidates the live position on every exit path,
+        // including a failed seek: after this call the decoder is somewhere
+        // this type can no longer name until it decodes again.
+        self.stream_position = None;
         // SAFETY: `input_ctx` owns a live AVFormatContext for the complete
         // call, the stream index was obtained from that context, and FFmpeg
         // does not retain any Rust pointer. Restricting max_ts to `pts` plus
@@ -793,6 +862,12 @@ impl VideoDecoder {
             codec_motion,
         };
         self.adopt_selected_metadata(metadata);
+        // A real decode is the only thing that moves the live decoder, so this
+        // is the one place the stream position may advance.
+        self.stream_position = Some(StreamPosition {
+            source_seconds: metadata.source_seconds,
+            pts: metadata.pts,
+        });
         if let Err(error) = self.reverse_cache.insert(&decoded) {
             // Reverse acceleration is optional. A cache allocation failure
             // cannot poison forward playback or source selection.
@@ -900,6 +975,7 @@ impl VideoDecoder {
         self.loop_generation = next_loop_generation(self.loop_generation);
         self.last_pts = None;
         self.last_source_seconds = 0.0;
+        self.stream_position = None;
         self.reset_codec_motion_reference_state();
         self.seek_stats.reopen_calls = self.seek_stats.reopen_calls.saturating_add(1);
 
@@ -992,6 +1068,66 @@ fn exact_adjacent_reference_proof(
         time_base,
     };
     proof.elapsed_seconds().map(|_| proof)
+}
+
+/// Whether the requested picture can be reached by decoding forward from where
+/// the live decoder already is, instead of seeking back to the preceding
+/// keyframe and walking the whole group of pictures again.
+///
+/// Without this, every forward advance — including an ordinary one-frame step —
+/// costs a seek, a flush, and a decode of the entire GOP. The cost is therefore
+/// O(GOP), which for a 240-frame 1080p GOP is over a second of work per
+/// displayed frame and reads to an operator as a frozen picture.
+///
+/// Two conditions make the forward walk return *provably* the same picture the
+/// seek walk would return:
+///
+/// * no keyframe lies between the live position and the target, so a seek would
+///   land at or behind where the decoder already is and the seek walk would
+///   decode through this position anyway; and
+/// * the target is far enough ahead that the picture at the live position fails
+///   the walk's own `reached` test — `source_seconds + frame_period * 0.5 >=
+///   target_seconds`. Every picture at or before the live position then fails
+///   it too, because presentation times increase, so the first picture that
+///   satisfies it is the same one in both walks.
+///
+/// The previously accepted identity is the last picture the *renderer
+/// consumed*, while the position is the last one the *decoder produced*. Those
+/// diverge whenever a decode is superseded, and requiring them to be equal
+/// builds a trap: the first decode of a long group of pictures is slow enough
+/// to be superseded, after which the fast path can never engage again and every
+/// frame seeks forever. So the position is required only to be at or after the
+/// accepted picture, never behind it.
+///
+/// When it is strictly after, the transitions between the two belong to frames
+/// the renderer discarded, and continuing forward does not collect them. That
+/// is safe rather than merely tolerable: `append_codec_motion_after` requires
+/// the first transition it appends to *prove* its past reference is the
+/// accepted identity, so a broken chain is rejected whole and the frame simply
+/// carries no composed sequence. Codec motion can therefore be briefly
+/// unavailable while the pipeline recovers, but it can never be wrong — and
+/// once decodes stop being superseded the two agree again and the sequence is
+/// composed exactly as before.
+fn can_continue_forward(
+    position: Option<StreamPosition>,
+    target_seconds: f64,
+    keyframe_seconds: f64,
+    frame_period: f64,
+    previous_accepted_identity: Option<CodecFrameIdentity>,
+) -> bool {
+    let Some(position) = position else {
+        return false;
+    };
+    if !position.source_seconds.is_finite() || position.source_seconds < keyframe_seconds {
+        return false;
+    }
+    if target_seconds <= position.source_seconds + frame_period * 0.5 {
+        return false;
+    }
+    match previous_accepted_identity {
+        Some(identity) => position.pts.is_some_and(|pts| pts >= identity.pts),
+        None => true,
+    }
 }
 
 fn append_codec_motion_after(
@@ -1235,13 +1371,179 @@ fn reserve_packed_rgba(output_len: usize) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        count_packet_without_frame, enable_export_motion_vectors, next_loop_generation,
-        repack_rgba_plane, require_decoded_frame_before_loop, reserve_packed_rgba,
-        should_interrupt_input, validate_media_dimensions, VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
+        can_continue_forward, count_packet_without_frame, enable_export_motion_vectors,
+        next_loop_generation, repack_rgba_plane, require_decoded_frame_before_loop,
+        reserve_packed_rgba, should_interrupt_input, validate_media_dimensions, StreamPosition,
+        VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
     };
     use crate::video::{CodecFrameIdentity, CodecTimeBase};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    // --- forward-continue law -------------------------------------------
+    //
+    // Every forward advance used to seek back to the preceding keyframe and
+    // re-walk the whole GOP, so a displayed frame cost O(GOP) decodes. These
+    // pin the exact conditions under which the walk may instead continue from
+    // where the live decoder already is.
+
+    const FRAME_PERIOD: f64 = 1.0 / 30.0;
+
+    fn position_at(source_seconds: f64, pts: i64) -> Option<StreamPosition> {
+        Some(StreamPosition {
+            source_seconds,
+            pts: Some(pts),
+        })
+    }
+
+    fn accepted(pts: i64) -> Option<CodecFrameIdentity> {
+        Some(CodecFrameIdentity {
+            source_generation: 1,
+            pts,
+            presentation_ordinal: 7,
+        })
+    }
+
+    #[test]
+    fn an_unknown_stream_position_always_seeks() {
+        assert!(!can_continue_forward(None, 4.0, 0.0, FRAME_PERIOD, None));
+    }
+
+    #[test]
+    fn a_non_finite_stream_position_always_seeks() {
+        for broken in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                !can_continue_forward(position_at(broken, 0), 4.0, 0.0, FRAME_PERIOD, None),
+                "{broken} must not authorize a forward walk"
+            );
+        }
+    }
+
+    #[test]
+    fn a_keyframe_between_the_position_and_the_target_seeks_to_it() {
+        // Position 7.9 s, target 8.5 s, and a keyframe at 8.0 s: seeking lands
+        // closer to the target than continuing would, so the walk must seek.
+        assert!(!can_continue_forward(
+            position_at(7.9, 790),
+            8.5,
+            8.0,
+            FRAME_PERIOD,
+            None
+        ));
+        // The same request with the keyframe behind the position continues.
+        assert!(can_continue_forward(
+            position_at(7.9, 790),
+            8.5,
+            0.0,
+            FRAME_PERIOD,
+            None
+        ));
+    }
+
+    #[test]
+    fn the_refusal_boundary_is_exactly_the_walks_own_reached_test() {
+        // The walk returns the first picture satisfying
+        // `source_seconds + frame_period * 0.5 >= target_seconds`. Continuing
+        // forward is only equivalent while the picture already at the live
+        // position fails that test, so the two boundaries must agree exactly.
+        let position_seconds = 2.0;
+        for step in -4..=4 {
+            let target = position_seconds + f64::from(step) * FRAME_PERIOD * 0.25;
+            let position_would_satisfy_reached = position_seconds + FRAME_PERIOD * 0.5 >= target;
+            let continues = can_continue_forward(
+                position_at(position_seconds, 200),
+                target,
+                0.0,
+                FRAME_PERIOD,
+                None,
+            );
+            assert_eq!(
+                continues, !position_would_satisfy_reached,
+                "target {target} disagrees with the reached test"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backward_request_never_continues_forward() {
+        assert!(!can_continue_forward(
+            position_at(9.0, 900),
+            1.0,
+            0.0,
+            FRAME_PERIOD,
+            None
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_one_frame_advance_continues_instead_of_seeking() {
+        assert!(can_continue_forward(
+            position_at(2.0, 200),
+            2.0 + FRAME_PERIOD,
+            0.0,
+            FRAME_PERIOD,
+            None
+        ));
+    }
+
+    #[test]
+    fn composing_motion_requires_the_position_to_be_at_or_after_the_accepted_picture() {
+        let target = 2.0 + FRAME_PERIOD;
+        // The live decoder sits exactly on the previously accepted picture:
+        // the frames it will now decode are precisely the transitions after
+        // it, which is what the seek walk would have collected.
+        assert!(can_continue_forward(
+            position_at(2.0, 200),
+            target,
+            0.0,
+            FRAME_PERIOD,
+            accepted(200)
+        ));
+        // It sits later than the accepted picture, because a decode was
+        // superseded. Continuing forward is still admitted — requiring
+        // equality here traps the pipeline in a permanent seek-per-frame
+        // state — and the omitted transitions make the composed sequence fail
+        // its own past-reference proof rather than come out wrong.
+        assert!(can_continue_forward(
+            position_at(2.0, 200),
+            target,
+            0.0,
+            FRAME_PERIOD,
+            accepted(140)
+        ));
+        // Behind the accepted picture is refused: that is not a position the
+        // pipeline should ever be in, so it is not one to optimize.
+        assert!(!can_continue_forward(
+            position_at(2.0, 200),
+            target,
+            0.0,
+            FRAME_PERIOD,
+            accepted(260)
+        ));
+        // A position with no PTS cannot be proven to be that picture.
+        assert!(!can_continue_forward(
+            Some(StreamPosition {
+                source_seconds: 2.0,
+                pts: None,
+            }),
+            target,
+            0.0,
+            FRAME_PERIOD,
+            accepted(200)
+        ));
+        // With no accepted identity no sequence is composed, so the condition
+        // is vacuous rather than blocking.
+        assert!(can_continue_forward(
+            Some(StreamPosition {
+                source_seconds: 2.0,
+                pts: None,
+            }),
+            target,
+            0.0,
+            FRAME_PERIOD,
+            None
+        ));
+    }
 
     #[test]
     fn export_motion_vectors_flag_is_enabled_before_decoder_open() {
@@ -1616,6 +1918,159 @@ mod tests {
                 return Err(format!("generate temporary codec-motion fixture: {error}"));
             }
             Ok(Self { root, video })
+        }
+    }
+
+    /// 120 moving frames at 30 fps inside a single group of pictures. A long
+    /// GOP is exactly the shape that makes a seek-per-frame walk expensive.
+    struct TemporaryLongGopFixture {
+        root: std::path::PathBuf,
+        video: std::path::PathBuf,
+    }
+
+    impl TemporaryLongGopFixture {
+        fn create() -> Result<Self, String> {
+            let root = std::env::temp_dir().join(format!(
+                "collideoscope-long-gop-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| error.to_string())?
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root)
+                .map_err(|error| format!("create temporary long-GOP directory: {error}"))?;
+            let video = root.join("long-gop.mp4");
+            let executable = std::env::var_os("FFMPEG_DIR")
+                .map(std::path::PathBuf::from)
+                .map(|directory| directory.join("bin").join("ffmpeg.exe"))
+                .filter(|candidate| candidate.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from("ffmpeg"));
+            let output = std::process::Command::new(executable)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x64:rate=30:duration=4",
+                    "-c:v",
+                    "mpeg4",
+                    "-g",
+                    "120",
+                    "-bf",
+                    "0",
+                    "-q:v",
+                    "2",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-y",
+                ])
+                .arg(&video)
+                .output()
+                .map_err(|error| format!("run temporary long-GOP fixture: {error}"))?;
+            if !output.status.success() {
+                let error = String::from_utf8_lossy(&output.stderr);
+                let _ = std::fs::remove_dir_all(&root);
+                return Err(format!("generate temporary long-GOP fixture: {error}"));
+            }
+            Ok(Self { root, video })
+        }
+    }
+
+    impl Drop for TemporaryLongGopFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an ffmpeg executable; creates only a temporary long-GOP clip"]
+    fn forward_playback_returns_the_seek_walks_pictures_without_re_walking_the_gop() {
+        let fixture = TemporaryLongGopFixture::create().unwrap();
+        let path = fixture.video.to_string_lossy().to_string();
+
+        // One decoder, played forward the way live playback advances it.
+        let mut forward = VideoDecoder::open(&path).unwrap();
+        let mut played = Vec::new();
+        for frame_index in 0..60u32 {
+            let target = f64::from(frame_index) / 30.0;
+            played.push(forward.seek_decode(target).unwrap());
+        }
+
+        // The baseline is the walk this change replaced: a decoder whose
+        // stream position is unknown must seek to the preceding keyframe and
+        // decode the whole group of pictures to reach the same target.
+        for (frame_index, forward_frame) in played.iter().enumerate() {
+            let target = frame_index as f64 / 30.0;
+            let mut seeking = VideoDecoder::open(&path).unwrap();
+            let seek_frame = seeking.seek_decode(target).unwrap();
+            assert_eq!(
+                seek_frame.metadata.pts, forward_frame.metadata.pts,
+                "frame {frame_index} selected a different picture"
+            );
+            assert_eq!(
+                seek_frame.metadata.source_seconds, forward_frame.metadata.source_seconds,
+                "frame {frame_index} reported a different source time"
+            );
+            assert!(
+                seek_frame.rgba == forward_frame.rgba,
+                "frame {frame_index} decoded different pixels than the seek walk"
+            );
+            assert_eq!(
+                seeking.seek_stats().seek_calls,
+                1,
+                "the baseline decoder must actually seek"
+            );
+        }
+
+        // The whole point: 60 forward advances inside one group of pictures
+        // cost one seek, not sixty. Anything above a handful means the fast
+        // path stopped engaging and every displayed frame is re-walking.
+        assert!(
+            forward.seek_stats().seek_calls <= 2,
+            "forward playback seeked {} times across one GOP",
+            forward.seek_stats().seek_calls
+        );
+        assert_eq!(forward.seek_stats().reopen_calls, 0);
+        assert_eq!(forward.seek_stats().scans_from_zero, 0);
+    }
+
+    #[test]
+    #[ignore = "requires an ffmpeg executable; creates only a temporary long-GOP clip"]
+    fn forward_playback_agrees_with_the_seek_walk_all_the_way_through_the_tail() {
+        // Playing to the very end is the case where continuing forward and
+        // seeking genuinely differ: the forward walk can hit EOF having
+        // decoded nothing, while the seek walk re-decodes the whole group of
+        // pictures and therefore always holds a terminal frame.
+        let fixture = TemporaryLongGopFixture::create().unwrap();
+        let path = fixture.video.to_string_lossy().to_string();
+
+        let mut forward = VideoDecoder::open(&path).unwrap();
+        for frame_index in 0..150u32 {
+            let target = f64::from(frame_index) / 30.0;
+            let forward_result = forward.seek_decode(target);
+
+            let mut seeking = VideoDecoder::open(&path).unwrap();
+            let seek_result = seeking.seek_decode(target);
+
+            match (&forward_result, &seek_result) {
+                (Ok(forward_frame), Ok(seek_frame)) => {
+                    assert_eq!(
+                        forward_frame.metadata.pts, seek_frame.metadata.pts,
+                        "frame {frame_index} selected a different picture"
+                    );
+                    assert!(
+                        forward_frame.rgba == seek_frame.rgba,
+                        "frame {frame_index} decoded different pixels"
+                    );
+                }
+                (Err(_), Err(_)) => {}
+                (forward_result, seek_result) => panic!(
+                    "frame {frame_index} at {target}s disagreed: forward={forward_result:?} seek={seek_result:?}"
+                ),
+            }
         }
     }
 

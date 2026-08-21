@@ -386,6 +386,50 @@ editor-only transform: S6 proves that closure rather than adding to it.
   Opening the decoder also publishes a first-frame seed; harvest it before the
   paused-layer early return so a clip opened while paused never displays
   uninitialized texture data. Pause/resume resets transport debt.
+- **Selection continues forward instead of re-walking the GOP.** Live playback
+  selects an absolute source time, and the decoder used to answer every such
+  request — including an ordinary one-frame advance — by seeking to the
+  preceding keyframe, flushing, and decoding the whole group of pictures
+  forward. That cost is O(GOP): a 240-frame 1080p GOP is over a second of
+  decode per displayed frame, which an operator sees as a frozen picture while
+  the render loop still reports its full frame rate. `can_continue_forward` is
+  the law that admits the fast path, and it is written as a pure function so it
+  is testable without a decoder. It requires that the live decoder's position
+  is known, that no keyframe lies between that position and the target (else a
+  seek genuinely lands closer), and that the target is far enough ahead that
+  the picture already at that position fails the walk's own `reached` test —
+  which is what makes the forward walk return provably the same picture the
+  seek walk returns. While a codec-motion sequence is being composed the
+  position must additionally be **at or after** the previously accepted
+  picture. Deliberately not *equal to* it: the accepted identity is the last
+  picture the renderer **consumed** while the position is the last one the
+  decoder **produced**, and those diverge the moment a decode is superseded.
+  Requiring equality builds a trap — the first decode of a long GOP is slow
+  enough to be superseded, after which the fast path never engages again and
+  every frame seeks forever. Measured on a 640x480 clip with a 250-frame GOP:
+  20 forward advances cost 20 seeks and 247 ms under the equality rule, and 1
+  seek and 23 ms under this one. When the position is strictly after the
+  accepted picture the transitions between them belong to frames the renderer
+  discarded; `append_codec_motion_after` requires the first transition it
+  appends to prove its past reference is the accepted identity, so a broken
+  chain is rejected whole. Codec motion is therefore briefly *unavailable*
+  while the pipeline recovers, never wrong, and once decodes stop being
+  superseded the two agree again. `stream_position` is deliberately not
+  `last_source_seconds`: only a real decode may advance it, a seek or reopen
+  clears it, and a reverse cache hit leaves it alone because serving cached
+  pixels does not move the decoder. **Continuing forward is an optimization and
+  is never permitted to be worse than the walk it replaced**: a forward walk
+  that ends in a `Failed` error redoes the request through the seek path once,
+  because a decoder already sitting on the last picture decodes straight into
+  EOF holding no terminal frame, where the seek walk would have re-decoded the
+  group of pictures and still had one. A short looping clip meets that tail
+  every few seconds, so without the fallback the layer simply stops — and
+  raising target decode FPS reaches it sooner and more often. `Superseded` is
+  deliberately not retried; that work was abandoned on purpose. Decoder
+  threading is deliberately still
+  unset — it is worth roughly 7x, but `codec_has_previous_anchor_motion` reads
+  `has_b_frames` from the opened context, so it needs its own evidence that the
+  anchor law and the decoded bytes do not move.
 - Each Spout layer owns a **receiver worker**. It publishes only the newest
   complete RGBA frame; the render thread resizes the layer texture when sender
   dimensions change.
@@ -4062,6 +4106,26 @@ a passing claim.
   offline.
 - Audio exposes 3–8 routable bands; the compact 32-bin spectrum remains
   display-only telemetry.
+- A swapchain acquire that takes longer than one second is reported as a
+  permanent device loss, and it is not our bug. In
+  `wgpu-hal/src/vulkan/swapchain/native.rs` the post-acquire
+  `wait_for_fences(..., timeout_ns)` maps through `map_host_device_oom_and_lost_err`,
+  which has no `VK_TIMEOUT` arm — unlike `vkAcquireNextImageKHR` twelve lines
+  above, which maps it to the recoverable `SurfaceError::Timeout`. A timeout
+  therefore becomes `DeviceError::Unexpected`, whose `Display` is
+  "Unexpected error variant (driver implementation is at fault)", and
+  `Device::handle_hal_error` matches `Unexpected` alongside `Lost` and calls
+  `lose()`. `timeout_ns` is wgpu-core's `FRAME_TIMEOUT_MS = 1000`. That wait
+  exists specifically for Windows hosts whose Vulkan driver presents through a
+  DXGI swapchain — which is every AMD Windows host — so a borderless-fullscreen
+  transition that stalls DWM past a second kills the device. This is
+  gfx-rs/wgpu#9029, open with no PR. Two consequences for diagnosis: the
+  message is *not* evidence of a driver reset (a real TDR writes Event ID 4101
+  to the Windows System log, and its absence is meaningful), and the underlying
+  `VkResult` is unrecoverable from logs because `get_unexpected_err` names it
+  only inside a `#[cfg(feature = "internal_error_panic")] panic!`. Note also
+  that `wgpu::Instance::default()` never calls the env-reading constructor, so
+  `WGPU_BACKEND`, `WGPU_VALIDATION`, and `WGPU_DEBUG` are inert in this build.
 - Portable wgpu exposes no live/free-VRAM budget. Expert media status reports a
   conservative host plan and capability limits, not detected VRAM headroom.
 - Procedural generation emits patches/manifests/preflight receipts only; MP4

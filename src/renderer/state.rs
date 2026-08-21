@@ -2843,6 +2843,10 @@ impl GpuHealth {
     fn record(&self, error: String) {
         if let Ok(mut stored) = self.error.lock() {
             if stored.is_none() {
+                // The latch is first-write-wins and never cleared, so every
+                // later reader prints a string with no provenance. This is the
+                // one moment the failure can be timestamped at all.
+                log::error!("GPU health latched: {error}");
                 *stored = Some(error);
             }
         }
