@@ -22216,14 +22216,26 @@ impl ApplicationHandler for App {
                                             "Layer '{}' GPU upload failed: {error}",
                                             layer.filename
                                         );
+                                        let reported = format!("GPU upload failed: {error}");
+                                        layer.set_media_source_error(reported);
                                         layer.restore_ready_media_frame_after_failed_upload(frame);
+                                    } else {
+                                        // A picture arrived, so whatever was
+                                        // wrong no longer is.
+                                        layer.set_media_source_error(String::new());
                                     }
                                 }
                                 Ok(None) => {}
-                                Err(error) => log::error!(
-                                    "Layer '{}' decoder failed: {error}",
-                                    layer.filename
-                                ),
+                                Err(error) => {
+                                    log::error!(
+                                        "Layer '{}' decoder failed: {error}",
+                                        layer.filename
+                                    );
+                                    // Without this the operator sees a frozen
+                                    // picture and nothing else: no status, no
+                                    // panel note, no stage-health line.
+                                    layer.set_media_source_error(format!("decode failed: {error}"));
+                                }
                             }
                         }
                     }

@@ -430,6 +430,24 @@ editor-only transform: S6 proves that closure rather than adding to it.
   unset — it is worth roughly 7x, but `codec_has_previous_anchor_motion` reads
   `has_b_frames` from the opened context, so it needs its own evidence that the
   anchor law and the decoded bytes do not move.
+- **The harvest discards on generation, never on the command epoch.** Selections
+  are published before harvesting so an old completion cannot cross a
+  seek/cue/loop discontinuity into the GPU — and the *source generation* is that
+  discontinuity token. The epoch is a different thing: it advances on every
+  command, so guarding the harvest on it discarded the completion of the
+  immediately preceding request, which in ordinary playback is every frame the
+  decoder ever finishes. The render thread issues a request and harvests a few
+  microseconds later in the same frame body, so the worker essentially never
+  wins that race; delivery then survived only on a rendered frame that was not
+  sample-due, leaving playback at roughly `(render_fps - sample_fps) /
+  render_fps` of its authored rate — about a fifth for a 24 fps clip, and
+  **nothing at all** for a source whose rate equals the render rate. Taking the
+  previous request's completion is exactly the documented latest-only mailbox
+  behaviour: one frame of latency and no backlog.
+- **A failing decode is written to `source_error`.** It is already published in
+  the layer snapshot and in the stage-health row, so a source that stops
+  producing pictures says why instead of presenting as a frozen image
+  indistinguishable from a paused one. A successful upload clears it.
 - Each Spout layer owns a **receiver worker**. It publishes only the newest
   complete RGBA frame; the render thread resizes the layer texture when sender
   dimensions change.
