@@ -77,13 +77,13 @@ cp "$binary" "$macos_dir/collide-o-scope"
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 printf 'APPL????' >"$app/Contents/PkgInfo"
 
-# Deliberately NOT shipped: CLAUDE.md and every other developer document.
-# CLAUDE.md is contributor instructions, not program data — nothing reads it at
-# build or run time, it is embedded in no binary and hashed into no receipt, and
-# the program is fully functional without it. Copying it here would ship the
-# project's internal working notes to every operator. If a future change needs a
-# document inside the bundle, add that document explicitly; do not sweep in the
-# repository root.
+# Deliberately NOT shipped: developer documentation of any kind. Contributor
+# instructions are not program data — nothing reads them at build or run time,
+# they are embedded in no binary and hashed into no receipt, and the program is
+# fully functional without them. Copying them here would ship the project's
+# internal working notes to every operator. If a future change needs a document
+# inside the bundle, add that document explicitly; do not sweep the repository
+# root.
 
 # ---------------------------------------------------------------------------
 # Icon

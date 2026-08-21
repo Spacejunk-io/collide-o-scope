@@ -138,8 +138,8 @@ files describe that relationship as "derived from" and, in several places,
 light, Rec.709 luma, deterministic replay) rather than copied wholesale, but
 the relationship is close enough that MIT's permission notice is reproduced in
 full at [LICENSES/MIT-BENDR.txt](LICENSES/MIT-BENDR.txt) rather than merely
-named. The per-site attributions in `src/` and `CLAUDE.md` are part of that
-notice and must not be stripped.
+named. The per-site attributions throughout `src/` are part of that notice and
+must not be stripped.
 
 ## Components carried in this repository
 
