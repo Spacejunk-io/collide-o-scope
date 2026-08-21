@@ -5,6 +5,19 @@ video, still-image, and live Spout sources with GPU effects, then lets LFOs, aud
 MIDI, and a phone's touch and tilt modulate the performance from a browser
 control panel.
 
+> **⚠️ Photosensitivity / seizure warning.** This instrument is built to
+> strobe. Feedback loops, sync faults, hard cuts, dirty-mixer knocks,
+> display-model flicker, and rapid full-frame color changes are deliberate
+> core capabilities, and both the live output and rendered videos can contain
+> sustained flashing, strobing, and high-contrast pattern motion. A small
+> percentage of people may experience seizures when exposed to flashing
+> lights or patterns, even with no prior history of epilepsy or seizures. If
+> you or anyone watching experiences dizziness, altered vision, eye or muscle
+> twitching, disorientation, or any involuntary movement, stop immediately
+> and seek medical attention. Operators performing for an audience should
+> announce the presence of strobe-like effects and follow venue and local
+> guidance on photosensitive content.
+
 > This is a fork of [collide-o-scope by Luis Queral](https://github.com/luismqueral/collide-o-scope)
 > ([queral.studio](https://queral.studio)). The original engine, compositing
 > architecture, and effect suite are his work. This fork adds the modulation
@@ -14,13 +27,125 @@ control panel.
 > [COPYRIGHT.md](COPYRIGHT.md) for the precise licensing and attribution
 > boundary.
 
-<img width="1919" height="1040" alt="collide-o-scope" src="https://github.com/user-attachments/assets/3690c19f-8ab4-4a9d-9672-45476da4dede" />
+## Build
+
+### Windows
+
+```powershell
+winget install -e --id Gyan.FFmpeg.Shared --version 8.1.2
+winget install -e --id LLVM.LLVM
+# plus Visual Studio 2022 "Desktop development with C++"
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```
+
+### macOS
+
+Two different FFmpeg pieces are needed, and they are allowed to be different
+versions, because they are used in two different ways:
+
+- **The FFmpeg 8 shared libraries**, linked into the program through
+  `ffmpeg-next`. The major must be 8.
+- **An `ffmpeg` / `ffprobe` command line built with `libx264`**, run as a
+  separate process for thumbnails, proxy encodes, and the final H.264/AAC mux.
+  Any recent major is fine here.
+
+Homebrew no longer packages FFmpeg 8 — `ffmpeg` is 9.x and there is no
+`ffmpeg@8` formula — so the libraries are built from source, exactly as CI
+does:
+
+```sh
+brew install llvm@18 pkg-config make xz
+export LIBCLANG_PATH="$(brew --prefix llvm@18)/lib"
+
+FFMPEG_VERSION=8.1.2
+PREFIX="$HOME/.local/ffmpeg-$FFMPEG_VERSION"
+curl -fL "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" | tar -xJ
+cd "ffmpeg-$FFMPEG_VERSION"
+./configure --prefix="$PREFIX" --disable-autodetect --disable-doc \
+  --disable-programs --disable-static --enable-pic --enable-shared
+make -j"$(sysctl -n hw.logicalcpu)"
+make install
+cd ..
+
+export FFMPEG_DIR="$PREFIX"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+export DYLD_FALLBACK_LIBRARY_PATH="$PREFIX/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+```
+
+Then the command-line tools, which may be Homebrew's current build:
+
+```sh
+brew install ffmpeg   # 9.x is fine: it is run as a separate process
+cargo build
+```
+
+Setting `FFMPEG_DIR` and `PKG_CONFIG_PATH` explicitly stops being optional the
+moment Homebrew's FFmpeg is installed. `ffmpeg-sys-next` probes with no minimum
+version, and its feature table stops at 8.1 — so it will happily build against
+9.x headers while still claiming the 8.1 feature set.
+`DYLD_FALLBACK_LIBRARY_PATH` keeps the running program on the 8.x dylibs for
+the same reason.
+
+If the command-line tools are somewhere the process cannot see, set `COS_FFMPEG`
+and `COS_FFPROBE` to absolute paths. This matters on macOS specifically: an app
+launched from Finder inherits launchd's minimal `PATH`, which contains neither
+`/opt/homebrew/bin` nor `/usr/local/bin`. The program searches those prefixes
+itself before giving up, so launching from a terminal is not required — but an
+explicit override is the reliable answer for an unusual install.
+
+#### Running as an app bundle
+
+macOS denies Local Network and microphone access outright, rather than
+prompting, when the process has no usage-description strings — and a bare
+executable has nowhere to carry them. That silently breaks the browser control
+panel and live audio analysis. Assemble the bundle instead:
+
+```sh
+scripts/bundle-macos.sh          # honours FFMPEG_DIR, vendors the dylibs
+open target/macos/collide-o-scope.app
+```
+
+The bundle is unsigned, so the first launch is quarantined: right-click → Open
+once, or sign it with your own identity. Set `COS_FFMPEG` / `COS_FFPROBE` if the
+command-line tools live somewhere unusual.
+
+Spout input/output is Windows-only, and there is no Syphon backend on macOS —
+see [the platform capability ledger](src/precision.rs). The common APIs report
+an unavailable status instead of pretending to provide either.
+
+### Linux
+
+```sh
+# ffmpeg 8 development libraries (libav*-dev), clang, pkg-config
+cargo build
+```
+
+Where a distribution ships a different FFmpeg major, build 8.1.2 from source as
+above and export `FFMPEG_DIR`, `PKG_CONFIG_PATH`, and `LD_LIBRARY_PATH`.
+
+## Run
+
+```sh
+# Open with a video file (its parent becomes the library)
+cargo run -- path/to/clip.mp4
+
+# Open with a folder
+cargo run -- path/to/clips/
+
+# No arguments: use/create ./videos as the initial library
+cargo run
+```
+
+The control panel opens in the default browser. If automatic opening fails, use
+the current authenticated **Open Panel** link in the native **RECOVERY** strip.
+Use **Choose Library** there to select another folder without restarting; a
+cancelled chooser leaves the current library and program state unchanged.
 
 ## What it does
 
-- Composites a dynamically sized stack of video, PNG/JPEG/BMP/WebP still, or
-  live Spout layers with a curated 15-mode blend set, typed image routing,
-  one-level groups, and A/B buses.
+- Composites a dynamically sized stack of video, PNG/JPEG/BMP/WebP still,
+  live Spout, pattern-synth, or typeset text-page layers with a curated
+  25-mode blend set, typed image routing, one-level groups, and A/B buses.
   The composition contract caps a stack at 256 layers; practical usable depth
   can be lower under source, GPU, output-resolution, motion, and selective-VHS
   resource plans.
@@ -44,7 +169,17 @@ control panel.
 - Adds prepared clip slots, bounded cue/loop transport, and atomic Scenes;
   bounded Collision Racks at master, layer, and group scope; Temporal Topology
   Loom, Collision Atlas, Refresh Garden, and Collision Score; and deterministic
-  motion fields, Faraday Motion Transplant, and Curved Shutter Sculpture.
+  motion fields (codec, lattice, and six procedural kinds), Faraday Motion
+  Transplant, the two-input Field Collider, flow shaping, and Curved Shutter
+  Sculpture.
+- Carries the complete sixteen-instrument enrichment, its laws derived from
+  BENDR (MIT, © 2026 Steve Blythe) and independently rewritten for this tree:
+  a drawn-raster Scan Processor, real-codec datamosh, a temporal feedback rig,
+  display physics, a bus mixer with wipes and a melting edge, a latching sync
+  fault, three block-domain corruption nodes, generator sources reconstructed
+  entirely from the patch, program re-entry, a take recorder, performance
+  modulation sources, and a preview monitoring bay — each summarized below and
+  documented per instrument under `docs/evidence/`.
 - Saves complete YAML performance patches. **Load snapshot** reconstructs the
   saved performance, while **Apply look** transfers its visual treatment onto
   the sources already on stage.
@@ -77,19 +212,23 @@ control panel.
 
 The **Collision Rack + Groups** panel replaces a fixed effect order with a
 small, preflighted graph while preserving the exact historical path for old
-patches. A master, layer, or group rack contains at most eight stable-ID nodes:
-Transform, Digital/Color, Key, Cellular, Shift, Grain, or geometric/image Mask.
-Every node has enable, wet mix, and one of 15 curated blends. Legacy Canonical
-and Legacy Temporal markers retain the established order during migration.
-Unsafe sample counts, image dependencies, current-frame cycles, or GPU resource
-plans are rejected before the live graph changes.
+patches. A master, layer, or group rack contains at most eight stable-ID nodes
+drawn from a closed vocabulary: Transform, Digital/Color, Key, Cellular,
+Shift, Grain, geometric/image Mask, the two-input Displace and Residual
+Counterpoint, the Symmetry Field, the data-only Study interpreter, the
+drawn-raster Scan Processor, and the Block DCT, Pixel Sort, and Filter
+Avalanche corruption trio. Every node has enable, wet mix, and one of the 25
+curated blends. Legacy Canonical and Legacy Temporal markers retain the
+established order during migration. Unsafe sample counts, image dependencies,
+current-frame cycles, or GPU resource plans are rejected before the live
+graph changes.
 
 Entirely new studies and operators are intentionally never half-shipped. The
 named Displace, Residual Counterpoint, Gesture-Field Etching, Symmetry Field,
-Field Collider, native transform gizmo, and evidence-gated scale tranches that
-were once planned here have all landed; the resource ledgers, acceptance
-gates, and measurements that governed each landing are preserved per tranche
-in the evidence notes and receipts under `docs/evidence/`.
+Field Collider, and native transform-gizmo tranches landed under their own
+resource ledgers and acceptance gates, and the sixteen-instrument enrichment
+closed the same way. The measurements that governed each landing are preserved
+per tranche in the evidence notes and receipts under `docs/evidence/`.
 
 The composition root can contain layers and up to 16 one-level groups. Groups
 own contiguous members, opacity, transform, rack, matte, solo/bypass, and a
@@ -161,15 +300,93 @@ reports the admitted donor field and its grid rather than inventing
 recipient-local truth.
 
 Offline export writes `<video>.motion.json` only after the video succeeds. The
-bounded schema-v3 report records source fingerprints when available; the
-requested export shutter policy and literal count; distinct authored and
-effective scope/algorithm/quality/carrier choices; the final planner source,
-the source actually rendered, and whether its field was attached; codec
-transition count and elapsed source time only for an attached proven codec
-field; an exact codec proof/vector digest; planned-but-unattached field truth;
-dynamic-state changes; the last accepted frame; diagnostics; and
-warnings. It explicitly sets cross-GPU pixel identity to false; it is
-provenance, not a promise that different drivers render identical pixels.
+bounded report — schema version 6 at this writing — records source
+fingerprints when available; the requested export shutter policy and literal
+count; distinct authored and effective scope/algorithm/quality/carrier
+choices; the final planner source, the source actually rendered, and whether
+its field was attached; codec transition count and elapsed source time only
+for an attached proven codec field; an exact codec proof/vector digest;
+planned-but-unattached field truth; per-slot Symmetry Field and Field
+Collider route identity, armed or not; the codec-mosh recipe and encoder
+identity when an accepted frame actually ran the round trip; dynamic-state
+changes; the last accepted frame; diagnostics; and warnings. It explicitly
+sets cross-GPU pixel identity to false; it is provenance, not a promise that
+different drivers render identical pixels. A recorded gesture track or
+performance take likewise publishes its own `<output>.gesture.json` /
+`<output>.performance.json` sidecar through the same staged no-replace
+commit.
+
+## The enrichment instruments
+
+Sixteen further instruments landed as one closed sequence. Their laws derive
+from BENDR (MIT, © 2026 Steve Blythe), and every one is an independent
+rewrite in this tree's idiom: deterministic, bounded, patch-persistent, and
+carried identically by live rendering and offline export. Each defaults to an
+exact bypass or exact-off state, so a pre-enrichment patch keeps its bytes,
+its canonical hash, and its pixels.
+
+- **Scan Processor** (rack node) — a Rutt/Etra-style drawn raster: one
+  instanced ribbon per scanline, luminance deflecting the beam, and a
+  beam-energy law that makes line density itself the picture — bright caustic
+  ridges where scanlines bunch, dark gaps where they splay.
+- **Corruption trio** (rack nodes) — Block DCT quantization with chroma
+  crush, a bright-run Pixel Sort, and a self-feeding Filter Avalanche
+  cascade, all operating on the stored sRGB bytes, where real storage
+  artifacts live.
+- **Feedback rig** — per-tick offset, discrete reflections, in-loop color
+  grading, chromatic displacement, a blur/sharpen pair, waveshaping,
+  threshold decay, deterministic loop noise, and a defeatable servo on the
+  temporal feedback loop. Defeated, the loop is allowed to run away and stay
+  there.
+- **Time-displace maps** — slit-scan driven by brightness, radial distance, a
+  TBC-style per-scanline ramp, or a slow travelling sweep, with optional
+  interpolated history sampling.
+- **Display physics** — real interlace fields with a dominance fault and 3:2
+  judder, a P22 phosphor-persistence accumulator, and a closed display-model
+  vocabulary (aperture grille, slot mask, shadow mask, LCD stripe, mono,
+  green-screen) with beam-profile scanlines, bloom, defocus, and sag.
+- **Codec mosh** — a real mpeg4 encoder and decoder wired back to back
+  in-process with the bitstream broken between them, so the artifacts are the
+  decoder's own: key removal, delta hold, starvation, shuffle, bitrate
+  starve, and a recycled mode that re-encodes its own wreckage.
+  Deterministic per host, and replayed structurally offline.
+- **The mixing boundary** — ten appended blend modes completing the 25, a bus
+  mixer with thirteen wipe patterns, a blend meet at the A/B crossfade, a
+  deterministic dirty mixer (knock, cut, dropout, noise), melting-edge decay
+  at bus and master scope, and broadcast-style key border/shadow dressing.
+- **Sync latch** — tape-adjacent horizontal sync slips that heal on their own
+  tick, or, latched, accumulate into a bounded per-line table until the
+  switch is released and the whole displacement unwinds at once.
+- **Generator sources** — a GPU pattern synthesizer (twelve shapes, six
+  oscillators, wavefolder, comparator, five colourisers) and a CPU-typeset
+  text page with two bundled faces. Both are reconstructed offline from the
+  patch alone: no file identity, no placeholder, perfect self-containment.
+- **Program re-entry** — the finished program itself as an image route,
+  honestly one frame old by construction, so any matte, mask, or Displace
+  donor can feed the output back into the composition stably.
+- **Performance modulation sources** — six momentary bend pads, four
+  triggerable envelopes, four macro knobs, seeded chaos/drift/spike
+  generators, and video-reactive motion/brightness/cut analysis of the
+  program's own content, all deterministic in replay.
+- **Take recorder** — records accepted control edits as quantized events on
+  the 30 Hz authoring reference and replays them, live or offline, against
+  completely different footage. Takes travel whole inside patches.
+- **Monitoring bay** — a preview-only waveform and vectorscope over a
+  low-resolution probe of the program, the program tap, or the gesture
+  canvas, beside a live modulation-source strip. It costs nothing while
+  hidden and can never reach an audience surface.
+- **Panel ergonomics** — a one-sentence help entry for every control, shared
+  verbatim between the browser and the native editor; `/` search over names,
+  sections, and help text; MOVING and CHANGED filters; an eight-slot
+  whole-rig snapshot bank recalled as beat glides; and Dice keep-masks.
+- **Procedural motion fields** — six deterministic synthetic field kinds
+  (curl, radial, spiral, contour, chroma, weave) as first-class motion
+  sources, plus flow shaping (stretch, edge repel, vector trash) over any
+  applied field, including the Field Collider's derived one.
+- **Small effects and optics** — contour lines, flatten, solarize, negative,
+  colour pass, edge, emboss, halftone, moiré, row smear, bitcrush, and multi
+  grid at layer and master scope, plus master-only barrel distortion,
+  chromatic aberration, and anamorphic streak.
 
 ## Spatial transforms
 
@@ -202,7 +419,7 @@ transform edit.
 
 Transforms are complete patch and Apply-look state, optional Morph A/B state,
 continuous modulation destinations, and an opt-in part of Bounded-variation
-Dice. Procedural generator v7 mutates continuous spatial values through
+Dice. The procedural generator mutates continuous spatial values through
 independent deterministic streams while preserving the saved discrete fit,
 edge, and sampling choices. The same evaluated state reaches live and offline
 rendering.
@@ -220,6 +437,7 @@ unchanged.
 | Audio | Live input, Windows system-playback loopback, or deterministic looping WAV/MP3/FLAC/Ogg/Opus/M4A/AAC analysis; level; 3–8 configurable bands; onset, brightness, noisiness; and a 32-bin display spectrum |
 | MIDI | Legacy four-CC learn surface plus a separately persisted typed profile: selected input/output, channel filters, note and absolute/relative CC sources, button modes, Start/Continue/Stop/24-PPQN Clock, and bounded feedback |
 | Phone | Calibrated yaw/pitch/roll and a multitouch XY pad |
+| Performance | Six momentary bend pads (digit row 1–6, panel pads, or controller bindings), four triggerable envelopes, four macro knobs, seeded chaos/drift/spike generators, and video-reactive motion/brightness/cut analysis |
 
 Each routing supports signed depth, Linear/Exp/Log/SCurve/Steps response, curve
 amount, and separate attack/release slew. A route meter—centered for bipolar
@@ -238,16 +456,21 @@ the same frame-indexed ordering.
 The matrix exposes every continuous master and NTSC value, Shift amount/block
 size/density/speed, spatial position/scale/anchor/rotation/skew/skew-axis/crop,
 temporal feedback/slit-scan/history-key plus bounded Loom/Atlas/Garden values,
-master/layer Curved Shutter and layer Faraday values, Morph position, and each
-layer's opacity, speed, target FPS, key controls, spatial values, and continuous
+the feedback-rig, display-physics, melting-edge, sync-latch, and codec-mosh
+families, bus-mixer values, the small-effects and master-optics families, key
+border/shadow dressing, gesture-canvas radius/strength/retention, motion
+field scale/rate and flow shaping, pattern-synth layer values, master/layer
+Curved Shutter and layer Faraday values, Morph position, and each layer's
+opacity, speed, target FPS, key controls, spatial values, and continuous
 effects. Stable-ID targets also cover compatible rack-node wet/numeric values,
 group opacity/transform/matte values, and the composition A/B crossfade. This includes RGB
 chroma targets/tolerance, key thresholds and softness, temporal key history,
 and VHS edge-wave speed, tracking wave, composite/chroma noise, luma smear,
 and sharpening. Selector/topology choices—image routes, static/temporal key
 mode, rack order/blend, Temporal topology/gate/Score/reset law, Motion field/
-quality/donor/carrier, and grain algorithm—remain deliberate discrete controls,
-not modulation targets. The legacy patch target `layerN_key` is read as the canonical
+quality/donor/carrier, grain algorithm, and every other closed vocabulary such
+as the display model, negative mode, sync-latch switch, and mosh recycle—
+remain deliberate discrete controls, not modulation targets. The legacy patch target `layerN_key` is read as the canonical
 `layerN_key_threshold`; if both spellings occur, the canonical route wins.
 Every current layer is routable, including stacks beyond the original panel's
 former 16-layer ceiling; the independent limit remains 64 simultaneous routes.
@@ -330,8 +553,12 @@ allows the grain algorithm and color-grain switch to change. **Transform** opts
 bounded position, scale, anchor, rotation, skew/axis, and crop in; **Rack
 values** opts compatible node wet/numeric values in; and **Composition values**
 opts group opacity/transform/matte values (plus A/B crossfade for Everything)
-in. These three are off by default. Pattern-only and automatic per-loop rerolls
-never move those controls. Sources, topology, image routes, node IDs/order/
+in. These three are off by default. Three keep-masks — **Keep source**,
+**Keep modulation**, and **Keep output chain** — exclude whole domains from a
+throw; every draw already runs in its own domain-separated stream, so
+skipping one domain never shifts what another draws, and an unflagged throw
+is byte-identical to every throw before the masks existed. Pattern-only and
+automatic per-loop rerolls never move those controls. Sources, topology, image routes, node IDs/order/
 enabled/blend, group membership/solo/bypass/bus, layer opacity/visibility/blend/key,
 master-FX bypass, transport, modulation routes, VHS, temporal topology/seeds/
 Score/reset/loop-driver law, and Motion algorithm/source/quality/donor/carrier
@@ -392,6 +619,16 @@ effect values are also modulation targets. The **Layer effects** disclosure and
 its nested **CELLULAR** disclosure start closed for each new layer card and
 remember their state by layer identity while that layer remains present. All
 connected panels receive the same engine state.
+
+Every visible control carries a one-sentence help entry, generated from the
+same table the native editor hovers, so the two surfaces cannot drift. `/`
+focuses a search over control names, sections, and help text; **MOVING**
+narrows the view to controls a modulation route is currently driving, and
+**CHANGED** to controls away from their defaults. Filters are a pure view —
+a hidden control keeps its value and its routes, and no filter costs a round
+trip to the engine. An eight-slot snapshot bank saves and recalls whole rigs
+through the same Morph machinery, so a recall is a beat glide rather than a
+second interpolation law.
 
 The Library column makes the source-allocation policy visible. **Safe** is the
 default and preserves the established per-source UHD-area ceiling of 8,294,400
@@ -522,7 +759,11 @@ and completed-frame depths, published/consumed totals, overwrite/drop counts,
 fixed-64 rolling decode/upload/publish-to-consume p95, and successful CPU upload wall timing without
 allocating in the decode hot path; absent decoder telemetry remains absent.
 It has an editor-preview-only permit and cannot enter audience, Spout,
-recording, or export pixels. `StageMap` is a different persisted venue document,
+recording, or export pixels. The preview-only monitoring bay described above
+follows the same permit discipline: it is armed only while the native overlay
+or a watching panel actually shows it, and its instruments are computed on
+the CPU from a bounded low-resolution readback rather than a second render
+path. `StageMap` is a different persisted venue document,
 not part of `PatchState`: up to 16 endpoints and 256 total slices can apply
 source rectangles, four-corner perspective or bounded convex polygon masks,
 edge feather, linear calibration, test cards, and endpoint identification.
@@ -541,8 +782,9 @@ RGBA16Float working surfaces plus 25 Compat8 temporal surfaces: the 24-frame
 clean ring and one recursive-feedback image. Advanced filters and accumulates
 covered color premultiplied at spatial/temporal boundaries, while final
 presentation alone receives deterministic 8×8 ordered dithering; intermediate
-Compat8 history/feedback conversion is not dithered. Full-16 temporal storage is
-only a resource-accounted candidate.
+Compat8 history/feedback conversion is not dithered. Full-16 temporal storage
+remains a candidate: it now has a measurement-only render path behind its own
+opt-in receipt fixture, and the settled Compat8 default has not moved.
 
 The local 192×108 Windows/Vulkan physical-GPU receipt measures production still
 and active-feedback shaders against an independent reference. Advanced improves
@@ -557,24 +799,41 @@ artist-relevant evidence gate without making a blanket subjective claim. A
 local receipt alone does not close the cross-platform boundary: the exact
 published SHA must pass hosted Linux, macOS, and Windows jobs with durable URLs.
 
-Content-addressed proxy keys/plans and bounded playback observations are pure
-assessment today—there is no integrated proxy encoder or cache worker. Study
-schema 1 / ABI 1.0 is a closed, at-most-1-MiB data-only SSA format with fixed
-read-only creative inputs and no native code, shader injection, filesystem,
-network, process, device, or host-mutation authority. It is not a general plugin
-ABI and its data license cannot license the host application.
+The proxy loop is closed for content-referenced video. `Y` — or the layer
+card's **Encode proxy** control — requests a bounded FFV1/Matroska encode into
+a content-addressed cache: the source is re-fingerprinted, the encode runs
+under an absolute deadline and a staging-size cap, and the artifact is
+published atomically behind a SHA-256 seal. Patch load and publication-time
+hot adoption both consult that cache, so a validated artifact backs the
+decoder at the live playhead while the layer keeps its original identity — a
+proxy can never enter a patch, an export, or Dice. A path-based video layer
+first mints a verified content identity through the same bounded fingerprint
+machinery, and that identity enters persistence so the next capture emits a
+content reference. Proxy scale/frame-rate/audio settings are host-session
+state: each tuple keys its own cache entries, and eviction recency survives
+sessions through an advisory record that can order eviction but never bypass
+a seal. Live playback observations still assess every measured video source
+and recommend a proxy from decode, upload, age, drop, and queue pressure.
 
-Live proxy observations assess every measured video source, including ordinary
-paths, and can recommend a proxy from decode, upload, age, drop, and queue
-pressure. Only a content-addressed cache key/preflight requires an
-already-verified retained `cos-sha256://` identity; ordinary paths do not cause
-background or warm-path fingerprinting merely to obtain one.
+Study schema 1 / ABI 1.0 is a closed, at-most-1-MiB data-only SSA format with
+fixed read-only creative inputs and no native code, shader injection,
+filesystem, network, process, device, or host-mutation authority. It is not a
+general plugin ABI and its data license cannot license the host application.
+A Study document reaches the stage through the Study rack node: assigned and
+compiled in one action, content-addressed by digest, carried whole inside the
+patch's own bounded library, and executed by a fixed GPU interpreter under an
+explicit per-pixel load budget.
 
-Hardware decode, zero-copy decode, Syphon, NDI, external capture-input backends, full-16
-history, and bounded mesh warping remain explicitly evidence-gated/deferred;
-no menu, schema, platform assumption, or CI configuration is reported as a
-working backend. See [Precision and scale](docs/precision-and-scale.md) for the
-exact ledger, proxy law, Study validation, and capability evidence table.
+Zero-copy decode, Syphon, NDI, external capture-input backends, and bounded
+mesh warping remain explicitly evidence-gated/deferred; no menu, schema,
+platform assumption, or CI configuration is reported as a working backend.
+Hardware decode has moved one deliberate step: an evaluation-only D3D11VA
+backend now exists in the tree, constructed by an opt-in interop probe alone,
+and it advances the capability to exactly "evaluation required" on Windows —
+live use stays gated on per-adapter export determinism, because the same
+patch exporting differently on different GPUs is never an acceptable trade.
+See [Precision and scale](docs/precision-and-scale.md) for the exact ledger,
+proxy law, Study validation, and capability evidence table.
 
 ## Sources and output
 
@@ -584,6 +843,11 @@ exact ledger, proxy law, Study validation, and capability evidence table.
   refreshes that folder. Neither operation adds a layer automatically. Patches
   retain a stable path and fall back to the active-library filename for older
   patches.
+- **Generator layers:** the panel can add a pattern-synth or text-page layer
+  with no file behind it. Their authored state is the entire source, so a
+  patch that uses them is perfectly self-contained: offline export
+  reconstructs the identical picture from the patch alone, with no content
+  reference and no black placeholder.
 - **Spout input (Windows):** enter an exact sender name and choose **Add
   live**. The receiver is an ordinary composited layer with transport/effect
   controls and a visible connection status. A missing or warming sender stays
@@ -618,6 +882,9 @@ For selective VHS, export uses the same contributing-layer plan, conditional
 master processing, inherited-only VHS, straight-alpha stack composition, and
 post-composite Temporal order as live rendering, but evaluates it synchronously
 for each output frame. The legacy no-bypass and VHS-off paths remain unchanged.
+An armed codec mosh runs the identical real-codec engine synchronously per
+frame, after global NTSC; its repeatability is claimed per host — two renders
+on one machine decode identically — and deliberately never cross-machine.
 
 Expert media mode may admit a larger saved source during offline source
 reconstruction, under the same host-local reservation policy. It does not raise
@@ -706,7 +973,13 @@ include:
   sample-and-hold seeds;
 - routing curves/slew, audio band count/crossovers/ceiling, gyro calibration/configuration, and XY
   configuration/current position;
-- Morph A/B slots, crossfader law/position, and remaining beat glide.
+- Morph A/B slots, crossfader law/position, and remaining beat glide;
+- the enrichment state: feedback rig, time-displace, display physics, melting
+  edge, sync latch, codec mosh, bus mixer, key dressing, small effects and
+  optics, pattern-synth and text-page layer sources, performance-source
+  configuration with its generator seed, the snapshot bank, the Study
+  library, and — carried whole with their checksums — the recorded gesture
+  track and performance take.
 
 `PatchState` is an additive typed YAML document, not the generator manifest.
 Omitted fields keep explicit compatibility defaults and legacy filename/slit
@@ -752,7 +1025,8 @@ target\release\collide-o-scope.exe generate `
   --max-fingerprint-bytes 68719476736
 ```
 
-Generator v7 resolves and SHA-256 fingerprints visual and imported
+The generator — version 12 at this writing, with manifests accepting every
+earlier version string — resolves and SHA-256 fingerprints visual and imported
 analysis-audio files before it commits output. It replaces private local paths
 with `cos-sha256://<digest>/<bytes>` references, so canonical anchor/piece hashes
 and lineage are independent of the host root and change when source bytes do.
@@ -779,120 +1053,6 @@ audio DSP remains research-gated. See
 the mutation design, shared source resolver, reproducibility boundary, and
 remaining research trajectory.
 
-## Build
-
-### Windows
-
-```powershell
-winget install -e --id Gyan.FFmpeg.Shared --version 8.1.2
-winget install -e --id LLVM.LLVM
-# plus Visual Studio 2022 "Desktop development with C++"
-powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
-```
-
-### macOS
-
-Two different FFmpeg pieces are needed, and they are allowed to be different
-versions, because they are used in two different ways:
-
-- **The FFmpeg 8 shared libraries**, linked into the program through
-  `ffmpeg-next`. The major must be 8.
-- **An `ffmpeg` / `ffprobe` command line built with `libx264`**, run as a
-  separate process for thumbnails, proxy encodes, and the final H.264/AAC mux.
-  Any recent major is fine here.
-
-Homebrew no longer packages FFmpeg 8 — `ffmpeg` is 9.x and there is no
-`ffmpeg@8` formula — so the libraries are built from source, exactly as CI
-does:
-
-```sh
-brew install llvm@18 pkg-config make xz
-export LIBCLANG_PATH="$(brew --prefix llvm@18)/lib"
-
-FFMPEG_VERSION=8.1.2
-PREFIX="$HOME/.local/ffmpeg-$FFMPEG_VERSION"
-curl -fL "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" | tar -xJ
-cd "ffmpeg-$FFMPEG_VERSION"
-./configure --prefix="$PREFIX" --disable-autodetect --disable-doc \
-  --disable-programs --disable-static --enable-pic --enable-shared
-make -j"$(sysctl -n hw.logicalcpu)"
-make install
-cd ..
-
-export FFMPEG_DIR="$PREFIX"
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
-export DYLD_FALLBACK_LIBRARY_PATH="$PREFIX/lib:$DYLD_FALLBACK_LIBRARY_PATH"
-```
-
-Then the command-line tools, which may be Homebrew's current build:
-
-```sh
-brew install ffmpeg   # 9.x is fine: it is run as a separate process
-cargo build
-```
-
-Setting `FFMPEG_DIR` and `PKG_CONFIG_PATH` explicitly stops being optional the
-moment Homebrew's FFmpeg is installed. `ffmpeg-sys-next` probes with no minimum
-version, and its feature table stops at 8.1 — so it will happily build against
-9.x headers while still claiming the 8.1 feature set.
-`DYLD_FALLBACK_LIBRARY_PATH` keeps the running program on the 8.x dylibs for
-the same reason.
-
-If the command-line tools are somewhere the process cannot see, set `COS_FFMPEG`
-and `COS_FFPROBE` to absolute paths. This matters on macOS specifically: an app
-launched from Finder inherits launchd's minimal `PATH`, which contains neither
-`/opt/homebrew/bin` nor `/usr/local/bin`. The program searches those prefixes
-itself before giving up, so launching from a terminal is not required — but an
-explicit override is the reliable answer for an unusual install.
-
-### Linux
-
-```sh
-# ffmpeg 8 development libraries (libav*-dev), clang, pkg-config
-cargo build
-```
-
-Where a distribution ships a different FFmpeg major, build 8.1.2 from source as
-above and export `FFMPEG_DIR`, `PKG_CONFIG_PATH`, and `LD_LIBRARY_PATH`.
-
-#### Running as an app bundle
-
-macOS denies Local Network and microphone access outright, rather than
-prompting, when the process has no usage-description strings — and a bare
-executable has nowhere to carry them. That silently breaks the browser control
-panel and live audio analysis. Assemble the bundle instead:
-
-```sh
-scripts/bundle-macos.sh          # honours FFMPEG_DIR, vendors the dylibs
-open target/macos/collide-o-scope.app
-```
-
-The bundle is unsigned, so the first launch is quarantined: right-click → Open
-once, or sign it with your own identity. Set `COS_FFMPEG` / `COS_FFPROBE` if the
-command-line tools live somewhere unusual.
-
-Spout input/output is Windows-only, and there is no Syphon backend on macOS —
-see [the platform capability ledger](src/precision.rs). The common APIs report
-an unavailable status instead of pretending to provide either.
-
-## Run
-
-```sh
-# Open with a video file (its parent becomes the library)
-cargo run -- path/to/clip.mp4
-
-# Open with a folder
-cargo run -- path/to/clips/
-
-# No arguments: use/create ./videos as the initial library
-cargo run
-```
-
-The control panel opens in the default browser. If automatic opening fails, use
-the current authenticated **Open Panel** link in the native **RECOVERY** strip.
-Use **Choose Library** there to select another folder without restarting; a
-cancelled chooser leaves the current library and program state unchanged.
-
 ## Keyboard
 
 | Key | Action |
@@ -902,13 +1062,16 @@ cancelled chooser leaves the current library and program state unchanged.
 | F | Toggle main-window fullscreen |
 | O | Toggle fullscreen output window |
 | B | Blackout/unblackout |
+| Y | Encode a proxy for the selected video layer, minting a verified content identity first when the layer has none |
+| 1–6 | Momentary bend-pad modulation sources (fast ramp while held, slower release) |
 | P / Shift+P | Increase/decrease pixelate |
 | G / Shift+G | Increase/decrease RGB split |
 | 0 | Reset effects |
+| Arrow keys | Nudge the selected scope's transform position; Shift is coarse, Alt is fine |
 | Ctrl+E | Toggle patch parameter editor |
 | Ctrl+S / Ctrl+O / Ctrl+Shift+O | Save / Load snapshot / Apply look |
 | Ctrl+Shift+I / Ctrl+Shift+X | Import / export the portable controller profile JSON |
-| Esc | Quit or close output window as appropriate |
+| Esc | Cancel or undo an open transform-gizmo drag; otherwise quit or close the output window as appropriate |
 
 ## Validation boundary
 
