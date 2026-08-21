@@ -1089,9 +1089,10 @@ This fork is distributed under the **GNU General Public License, version 3 or
 later** (`GPL-3.0-or-later`). The full text is in [LICENSE](LICENSE); the
 attribution and boundary record is in [COPYRIGHT.md](COPYRIGHT.md).
 
-Upstream granted an MIT license on 2026-08-19, and MIT is GPL-compatible, so
-the upstream portions are carried into the combined GPL work with their
-copyright notice retained at
+Upstream granted an MIT license on 2026-08-19 — its coverage of this fork's
+lineage confirmed and approved by Luis Queral on 2026-08-21 — and MIT is
+GPL-compatible, so the upstream portions are carried into the combined GPL
+work with their copyright notice retained at
 [LICENSES/MIT-collide-o-scope-upstream.txt](LICENSES/MIT-collide-o-scope-upstream.txt).
 That grant is not revoked or narrowed by this choice: the upstream repository
 remains available under MIT from upstream. What copyleft adds is that this

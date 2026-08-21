@@ -71,10 +71,13 @@ that carries the grant, in a repository with a single copyright holder. A
 repository-root `LICENSE` at the tip of `main` is normally read as covering the
 project's contents, and on that reading the grant reaches the forked tree.
 
-That reading is sound, but it is an inference rather than a signed statement.
-The cheap and complete cure is a one-line written confirmation from Luis that
-the MIT grant covers the pre-license commits and branches. Obtain it before
-publishing a binary.
+That reading was initially an inference rather than a signed statement, and
+this file therefore required a one-line confirmation from Luis before any
+binary was published. **That confirmation has been received: on 2026-08-21,
+Luis confirmed and approved the MIT grant's coverage of this fork's lineage,
+including the pre-license commits and branches.** The provenance is settled,
+not inferred; the reasoning above is retained as the record of why the
+confirmation was worth obtaining.
 
 ## What the relicense does, and what it does not do
 
