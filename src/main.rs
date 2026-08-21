@@ -1485,15 +1485,20 @@ fn program_window_icon() -> Option<winit::window::Icon> {
 /// The taskbar icon, which Windows treats as a **separate** image from the
 /// window icon above: `with_window_icon` populates the small icon a title bar
 /// draws, while the taskbar button reads the big one. Setting only the first
-/// leaves a correct title bar beside a generic taskbar button, so both are
-/// set, and this one decodes the 256px art because the taskbar scales it.
+/// leaves a correct title bar beside a generic taskbar button, so both are set.
+///
+/// This decodes the 48px art rather than the 256px art on purpose. The big
+/// icon is asked for at the system large-icon metric — 32px at 100% DPI, 48
+/// at 150% — and handing the shell a 256px bitmap for that slot is a known
+/// way to get a blank button instead of a scaled one. 48 covers both common
+/// scales, and it is the same art the title bar already renders correctly.
 ///
 /// The executable additionally carries a four-size `.ico` in its PE resources
 /// (see `build.rs`), which is what Explorer and a pinned shortcut read. All
 /// three surfaces want the icon from a different place.
 #[cfg(target_os = "windows")]
 fn program_taskbar_icon() -> Option<winit::window::Icon> {
-    decode_program_icon(include_bytes!("../assets/icon/collide-o-scope-256.png"))
+    decode_program_icon(include_bytes!("../assets/icon/collide-o-scope-48.png"))
 }
 
 fn decode_program_icon(bytes: &[u8]) -> Option<winit::window::Icon> {
