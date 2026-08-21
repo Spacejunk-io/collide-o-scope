@@ -8,7 +8,7 @@ a substantial-portions relationship, and MIT's permission notice is reproduced
 here for that reason rather than as a courtesy.
 
 PROVENANCE OF THIS FILE: the copyright line below is the one asserted at all
-107 attribution sites in `src/` and throughout `CLAUDE.md` ("BENDR (MIT,
+107 attribution sites throughout `src/` ("BENDR (MIT,
 (c) 2026 Steve Blythe)"). The permission text is the standard MIT text. If you
 hold or can reach BENDR's own LICENSE file, replace this file with that
 verbatim copy and delete this header.

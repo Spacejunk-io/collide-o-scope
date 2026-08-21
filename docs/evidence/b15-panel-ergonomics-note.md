@@ -20,9 +20,10 @@ surfaces, by construction.
 **187 entries**, covering every `data-param`, `data-temporal`, and `data-ntsc`
 row the panel shows. House voice: what the control does, and *why it behaves
 the way it does* — the second half being the part that is hard to recover from
-the code, and therefore the part worth writing down. Where a law is documented
-in CLAUDE.md the text states it exactly; where behaviour is a matter of degree
-it stays general rather than inventing a precision the engine does not promise.
+the code, and therefore the part worth writing down. Where a law is stated
+exactly by the module that owns it, the text states it exactly; where behaviour
+is a matter of degree it stays general rather than inventing a precision the
+engine does not promise.
 
 Coverage is proven against the shipped markup rather than asserted.
 `every_panel_control_row_has_help_and_no_entry_is_an_orphan` fails both when a

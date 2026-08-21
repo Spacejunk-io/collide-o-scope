@@ -2,11 +2,17 @@
 experiments/*/target
 .DS_Store
 
-# Root-level working notes stay local; only the two public guides are tracked.
+# Root-level working notes stay local; only the public guide and the licence
+# boundary record are tracked.
 /*.md
 !/README.md
-!/CLAUDE.md
 !/COPYRIGHT.md
+
+# Contributor documentation is local-only working material: it describes how
+# to build and extend the program rather than being part of it. Nothing reads
+# it at build or run time and it ships in no bundle. CLAUDE.md is already
+# covered by the /*.md rule above; the handover needs its own line.
+/docs/enrichment-handover.md
 
 # Local clip library (created on first launch; performance media stays local)
 /videos/

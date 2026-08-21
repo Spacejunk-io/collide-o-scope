@@ -3516,7 +3516,8 @@ mislead browser tests.
   `the_production_probe_defers_every_capability_with_its_actionable_reason`
   pins the per-platform progression, including hardware decode stopping at
   exactly `EvaluationRequired(InteroperabilityProof)` on Windows.
-- `s2-eight-texture-floor-receipt.json` is a tracked artifact that the probe in
+- `docs/evidence/s2-eight-texture-floor-receipt.json` is a tracked artifact
+  that the probe in
   `tests/eight_texture_floor_probe.rs` regenerates in place. It is tracked
   because `MAX_SAMPLED_TEXTURES_PER_DEDICATED_PASS` and the Symmetry Field's
   single-pass shape cite it by name as their justification; deleting it would
@@ -4349,12 +4350,19 @@ a passing claim.
   `@rpath`, because a Finder launch inherits no `DYLD_*` variable. **The dylib
   relocation is the one step in that script never executed on hardware**; it
   self-checks with `otool -L` and fails loudly, but confirm it on a real Mac
-  before claiming a working bundle. **This file does not ship in the bundle.**
-  `CLAUDE.md` is contributor instructions, not program data: nothing reads it at
-  build or run time, it is embedded in no binary and hashed into no receipt, and
-  the program is fully functional without it. It stays tracked in the repository
-  but is excluded from every packaged artifact, and a future packaging step must
-  name any document it ships explicitly rather than sweeping the repository root.
+  before claiming a working bundle. **No developer document ships in the
+  bundle**, and a future packaging step must name any document it ships
+  explicitly rather than sweeping the repository root.
+- **This file is local-only, and so is `docs/enrichment-handover.md`.** Both are
+  contributor working material rather than program data: nothing reads either at
+  build or run time, neither is embedded in a binary or hashed into a receipt,
+  and the program is fully functional without them. Both are untracked and
+  ignored — `CLAUDE.md` by `.gitignore`'s `/*.md` rule, the handover by its own
+  line — so neither can be committed back by accident. Keep the backups on the
+  Desktop in step with any edit made here, because a fresh clone will not carry
+  these files at all. Do not add either one back to the repository without a
+  deliberate `!` allowlist entry, which is the signal that the decision was
+  reconsidered.
 - **Shell scripts and property lists are pinned to LF in `.gitattributes`.** A
   CRLF shebang makes a script unrunnable on macOS and Linux, and neither
   extension was covered before.

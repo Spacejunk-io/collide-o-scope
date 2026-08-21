@@ -50,7 +50,8 @@ pub const MAX_SAMPLED_TEXTURES_PER_PASS: u32 = 3;
 /// separate ceiling. Eight simultaneously sampled textures in one pass was
 /// proven portable under the production device floor
 /// (`Limits::default()`, `src/renderer/state.rs`) by the S2 probe, whose
-/// receipt `s2-eight-texture-floor-receipt.json` records the enforced-cap
+/// receipt `docs/evidence/s2-eight-texture-floor-receipt.json` records the
+/// enforced-cap
 /// argument: the floor guarantees sixteen, and a seventeen-texture layout was
 /// refused on the same device. This ceiling is independent of
 /// [`MAX_SAMPLED_TEXTURES_PER_PASS`]; raising either one never raises the

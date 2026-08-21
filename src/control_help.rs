@@ -9,8 +9,9 @@
 //!
 //! House voice: what the control does, and why it behaves the way it does.
 //! The second half is the part that is hard to recover from the code, so it
-//! is the part worth writing down. Where a law is documented in CLAUDE.md the
-//! text states it exactly; where behaviour is a matter of degree it stays
+//! is the part worth writing down. Where a law is stated exactly by the module
+//! that owns it, the text states it exactly; where behaviour is a matter of
+//! degree it stays
 //! general rather than inventing a precision the engine does not promise.
 //!
 //! The table is keyed by the **wire parameter name**, which is also the key

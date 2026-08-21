@@ -647,7 +647,7 @@ fn write_receipt(
 
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/s2-eight-texture-floor-receipt.json"
+        "/docs/evidence/s2-eight-texture-floor-receipt.json"
     );
     let mut file = std::fs::File::create(path).expect("receipt file");
     file.write_all(receipt.as_bytes()).expect("receipt write");
