@@ -33,7 +33,7 @@ second full-frame history ring.
 | B10 — modulation source expansion | **Complete** | `docs/evidence/b10-mod-sources-note.md`; CLAUDE.md "B10 performance sources" |
 | B11 — the monitoring bay | **Complete** | `docs/evidence/b11-monitoring-bay-note.md`; CLAUDE.md "The B11 monitoring bay" |
 | B6 — the corruption trio | **Complete** | `docs/evidence/b6-corruption-trio-note.md`; CLAUDE.md "The B6 corruption trio" |
-| B15 — ergonomics + snapshot bank | **Half landed** | search, filters, and per-control help in `docs/evidence/b15-panel-ergonomics-note.md`; the snapshot bank and Dice keep-masks remain |
+| B15 — ergonomics + snapshot bank | **Complete** | `docs/evidence/b15-panel-ergonomics-note.md`; CLAUDE.md "B15 panel ergonomics" |
 
 Each landed tranche documents itself in `CLAUDE.md` (B2 under "B2 procedural
 motion fields" and the Motion sections; B3 under "The B3 feedback rig") and in
@@ -41,18 +41,20 @@ its evidence note. Read those before extending either subsystem.
 
 ## Next up
 
-**B15, panel ergonomics and the snapshot bank — the last tranche in the
-plan.** Four independent pieces: `/` search plus MOVING and CHANGED filters
-(entirely client-side over existing snapshot data, zero new wire actions);
-per-control help text embedded with the panel assets and surfaced as native
-tooltips; a snapshot bank of eight whole-rig slots with a glide time, where
-recall loads a slot into the existing Morph A/B and glides — reusing that
-ownership and materialization law wholesale rather than minting a second one,
-as a revision-carrying barrier like Morph capture; and Dice keep-masks
-(`keep_source | keep_modulation | keep_output_chain`) that select which of the
-already domain-separated streams run, each defaulting to current behaviour so
-an unflagged action is byte-identical. Next rack kind code is 18. Fetch the
-plan document before starting.
+**Nothing. The sixteen-tranche enrichment plan is complete.**
+
+Every tranche B1–B16 has landed with an evidence note in `docs/evidence/` and
+a section in `CLAUDE.md`. What remains is maintenance, and the two things a
+successor most needs are the frozen contracts below and the per-tranche
+sections in `CLAUDE.md` — read the section for any subsystem before extending
+it, because each one records not just what the code does but why the
+alternatives were rejected.
+
+The deferrals recorded in `CLAUDE.md`'s "Known constraints" are deliberately
+**not** tranches and should not be picked up as though they were: hardware
+decode reaching `Available`, adopting the Full16 history candidate, MP4 batch
+rendering from the generator, and the visual-driven audio DSP research gate are
+all operator-decided.
 
 ## The working method every tranche follows
 

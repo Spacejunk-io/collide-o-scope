@@ -4093,6 +4093,7 @@ mod tests {
             modulation: None,
             temporal: None,
             morph: None,
+            snapshot_bank: None,
             scenes: crate::performance::Scenes::default(),
             gesture_track: None,
             gesture_canvas: None,

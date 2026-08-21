@@ -1,9 +1,9 @@
-# B15 — panel ergonomics: search, filters, and per-control help
+# B15 — panel ergonomics, the snapshot bank, and Dice keep-masks
 
 "We have more parameters than BENDR's 404 and no way to find one." This is the
-first half of the plan's closing tranche: a way to find a control, and a
-sentence explaining what it does once you have. The snapshot bank and the Dice
-keep-masks are the second half.
+plan's closing tranche, in four parts: a way to find a control, a sentence
+explaining what it does, eight whole-rig slots to travel between, and a way to
+throw the dice without losing the part you liked.
 
 ## One help table, two consumers
 
@@ -150,3 +150,78 @@ tranche adds no pass, no uniform, and no shader.
 and the filters are buttons. `app.js` literal template tags stay **24**.
 `GENERATOR_VERSION` stays "12", the sidecar schema stays 6, and the renderer
 texture floor stays 30.
+
+## The snapshot bank
+
+Eight whole-rig slots and one glide time. The spec left one decision to
+implementation — widen Morph, or build a bank that recalls *through* it — and
+the second is the one taken, for the reason the spec itself gives: **recall
+does not invent a second way to interpolate a rig.** A slot holds exactly what
+a Morph slot holds; a recall captures the live rig into A, loads the slot into
+B, and starts a glide. Ownership transfer, midpoint discretes, wrapped hue
+arcs, and stale-topology purges are therefore the laws that already exist,
+and there is only ever one answer to "what lies between two rigs".
+
+The bank owns storage and nothing else:
+
+- **Fixed width.** Eight slots, never growable — a bank is a row of buttons an
+  operator learns by position, and a growable one would make slot 5 mean
+  something different tomorrow. An out-of-range slot is refused rather than
+  clamped onto a neighbour, because a button that silently wrote elsewhere
+  would be worse than one that did nothing.
+- **Barriered like a capture.** Save and recall both carry the two revision
+  barriers `morph_capture` carries, are ordering barriers in both queues, and
+  are purged from the queue by any topology edit — they capture the same thing,
+  so they inherit the same hazard.
+- **Empty means empty.** Recalling an empty slot is refused rather than
+  recalling a default rig.
+- **Carried whole in patches**, skip-serialized when untouched, so every
+  pre-B15 patch keeps its bytes and its canonical hash. A short, long, or
+  hostile bank sanitizes to the fixed width with a non-finite glide taking the
+  neutral default rather than an extreme.
+
+## Dice keep-masks
+
+`keep_source`, `keep_modulation`, and `keep_output_chain` on the existing Dice
+action, each defaulting to false — the established behaviour — so an unflagged
+throw is byte-identical to every throw before them.
+
+They compose safely because every Dice draw already runs in its own stable,
+domain-separated stream: the master draws on stream 0 keyed by the master seed,
+each layer on stream `index + 1` keyed by its own. Skipping a domain therefore
+**cannot shift what another domain draws**, and the fixture proves exactly
+that: with the source kept, the master's draw is byte-identical to the
+unflagged throw; with the output chain kept, the layers' draws are.
+
+The domains map onto real code paths rather than onto new bookkeeping — the
+master chain (effects, transform, rack, composition, motion, temporal
+originals), the layers (effects, transform, rack, motion), and the modulation
+matrix (the LFO seeds). One documented consequence: the master seed is part of
+the output chain, so a throw that keeps it does not advance the program's dice
+cursor, which makes a modulation-only throw a pure function of the current
+seed. That corner is documented rather than papered over; the useful cases —
+keep my sources, keep my modulation — are unaffected.
+
+Adding a layer needs a renderer, which hosted tests do not have, so the layer
+domain is proven by auditing its four guards rather than by executing them.
+The master and modulation domains are executed.
+
+## Live verification of the second half
+
+Driven against the running app: eight slots render; shift-clicking slot 3
+stores the rig and the label becomes `[3]` with the status reading "1 of 8
+slots stored"; moving the program and clicking the slot recalls it, and the
+Morph status reads **"gliding to B — 2.02 beats remaining"** with the fader
+mid-travel at 0.49 — the recall demonstrably travels through the existing
+Morph pair rather than snapping; alt-clicking empties the slot and the status
+returns to its prompt.
+
+## Final pins
+
+`index.html` range count **203** (the bank's recall glide is the one addition
+beyond the search half's 202). `app.js` literal template tags stay **24**.
+`GENERATOR_VERSION` stays "12" — the keep-masks are live Dice, not the
+generator. The sidecar schema stays 6 and the renderer texture floor stays 30.
+The tranche adds no pass, no uniform, and no shader.
+
+Full six-step gate green at the final tree state: **1,602 passed, 0 failed**.

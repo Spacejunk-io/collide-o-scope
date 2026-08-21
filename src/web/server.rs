@@ -2121,6 +2121,29 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
                 && stack_revision.is_none_or(|revision| revision != 0)
                 && composition_revision.is_none_or(|revision| revision != 0)
         }
+        // The bank's two write actions carry the same revision barriers a
+        // Morph capture does, and address a fixed eight slots. An out-of-range
+        // slot is refused rather than clamped onto a neighbour.
+        WebAction::SnapshotBankSave {
+            slot,
+            stack_revision,
+            composition_revision,
+        }
+        | WebAction::SnapshotBankRecall {
+            slot,
+            stack_revision,
+            composition_revision,
+        } => {
+            *slot < crate::morph::SNAPSHOT_BANK_SLOTS
+                && stack_revision.is_none_or(|revision| revision != 0)
+                && composition_revision.is_none_or(|revision| revision != 0)
+        }
+        WebAction::SnapshotBankClear { slot } => *slot < crate::morph::SNAPSHOT_BANK_SLOTS,
+        WebAction::SetSnapshotBankGlide { beats } => {
+            beats.is_finite()
+                && *beats >= 0.0
+                && *beats <= crate::morph::SNAPSHOT_BANK_MAX_GLIDE_BEATS
+        }
         WebAction::SetMorphLaw { law } => matches!(law.as_str(), "linear" | "equal_power"),
         WebAction::ResetGroup { group } => valid_identifier(group, 32),
         WebAction::StartProgramRecording { .. }
@@ -3047,6 +3070,9 @@ mod tests {
                 include_transform: false,
                 include_rack_controls: false,
                 include_group_controls: false,
+                keep_source: false,
+                keep_modulation: false,
+                keep_output_chain: false,
             }
         }
 
@@ -3106,6 +3132,9 @@ mod tests {
             include_transform: false,
             include_rack_controls: true,
             include_group_controls: true,
+            keep_source: false,
+            keep_modulation: false,
+            keep_output_chain: false,
         };
         assert!(valid_action(&group, 0));
         for group_id in [None, Some("0"), Some("group-77")] {

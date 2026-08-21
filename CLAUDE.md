@@ -2136,9 +2136,33 @@ and the reset table a double-click sends), and the test compares them for
 every range row in all three families. **Any new control whose default is not
 its slider minimum must appear in its family's table**, or that test fails.
 
-Pins do not move: `index.html` stays **202** (the search input is
-`type="search"`), `app.js` template tags stay **24**, `GENERATOR_VERSION`
-stays "12", the sidecar schema stays 6, and the renderer texture floor stays
+**The snapshot bank** is eight whole-rig slots and one glide time, and its
+design ruling is that **recall does not invent a second way to interpolate a
+rig**: a slot holds exactly what a Morph slot holds, and a recall captures the
+live rig into A, loads the slot into B, and glides. Ownership transfer,
+midpoint discretes, and wrapped hue arcs are therefore the laws that already
+exist. The width is fixed at eight because a bank is a row of buttons learned
+by position; an out-of-range slot is refused rather than clamped onto a
+neighbour, and an empty slot is refused rather than recalled as a default rig.
+Save and recall carry the two revision barriers `morph_capture` carries, are
+ordering barriers in both queues, and are purged by any topology edit. The
+bank is carried whole in patches and skip-serialized when untouched, so
+pre-B15 bytes and canonical hashes keep.
+
+**Dice keep-masks** — `keep_source`, `keep_modulation`, `keep_output_chain` —
+each default to false, so an unflagged throw is byte-identical to every throw
+before them. They compose safely because every Dice draw already runs in its
+own domain-separated stream (the master on stream 0 keyed by the master seed,
+each layer on stream `index + 1` keyed by its own), so skipping a domain
+cannot shift what another draws — which the fixture measures directly. One
+documented consequence: the master seed belongs to the output chain, so a
+throw that keeps it does not advance the dice cursor and a modulation-only
+throw is a pure function of the current seed.
+
+Pins: `index.html` **203** (the search input is `type="search"`; the bank's
+recall glide is the one added range), `app.js` template tags stay **24**,
+`GENERATOR_VERSION` stays "12" — the keep-masks are live Dice, not the
+generator — the sidecar schema stays 6, and the renderer texture floor stays
 30. The tranche adds no pass, no uniform, and no shader, so no exactness
 re-measurement applies.
 
