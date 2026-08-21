@@ -74,6 +74,7 @@ src/
 ├── midi/mod.rs          supervised typed MIDI events, hotplug, clock, feedback
 ├── osc.rs               bounded typed OSC ingress/feedback and LAN-safe configuration
 ├── history.rs           bounded manual gestures and two-phase undo/redo
+├── host_paths.rs        the one state-directory ladder and the one FFmpeg tool resolver
 ├── preset.rs            identity-safe scoped presets and atomic library persistence
 ├── recovery_journal.rs  checksummed append-only PatchState recovery journal
 ├── morph.rs             A/B snapshots, blend laws, beat glides, persistence
@@ -140,14 +141,25 @@ Runtime needs the matching FFmpeg DLL directory on `PATH`.
 
 ### macOS/Linux
 
-```sh
-brew install ffmpeg
-# or install ffmpeg 8 development libraries, clang, and pkg-config
-cargo build
-cargo run -- videos/some-file.mp4
-```
+**`brew install ffmpeg` is wrong and must not be restored.** Homebrew's
+`ffmpeg` is 9.x (aliased `ffmpeg@9`) and its `versioned_formulae` list runs
+`@7, @6, @5, @4, @2.8` — Homebrew skipped 8 entirely. `ffmpeg-sys-next` probes
+with no minimum version and its feature table stops at 8.1, so a 9.x host does
+not fail cleanly: it builds against 9.x headers while claiming the 8.1 feature
+set. Build the libraries from source and pin them explicitly, exactly as CI
+does (`ci.yml`), then export `FFMPEG_DIR`, `PKG_CONFIG_PATH`, and
+`DYLD_FALLBACK_LIBRARY_PATH` (`LD_LIBRARY_PATH` on Linux). The full recipe is
+in `README.md`.
 
-Spout reports unavailable on non-Windows platforms.
+The linked **libraries** must be major 8. The **command-line** `ffmpeg`, run as
+a separate process for thumbnails, proxy encodes, and the H.264/AAC mux, is a
+different question: any recent major works, and it must carry `libx264`. Do not
+collapse the two requirements back into one line.
+
+Spout reports unavailable on non-Windows platforms, and there is no Syphon
+backend: `precision.rs` pins both Syphon capabilities at
+`Deferred(BackendNotIntegrated)` on macOS, and a status string that names
+Syphon as an available alternative is a lie the capability ledger contradicts.
 
 ## One architectural law
 
@@ -3516,9 +3528,16 @@ mislead browser tests.
   honestly reports `unknown` in a tree with no git metadata. The one consequence
   to expect: running that opt-in probe dirties the working tree, so a gate whose
   evidence claims a clean tree must be run before it or the receipt committed
-  after it. The probe commit `5a10b79` is reachable only through
-  `probe/s2-eight-texture-floor`; keep that branch, or the receipt's own
-  provenance and the `renderer/symmetry_field.rs` citation both dangle.
+  after it. The receipt is authoritative about its own
+  provenance, and both commits it names — `claim_first_proven` `4866d34` and
+  `measured_at` `ebbaa3b` — are reachable from the default branch, so the
+  evidence does not depend on any side branch surviving.
+  `renderer/symmetry_field.rs` cites `4866d34` so the source and the receipt
+  agree. (This bullet previously named `5a10b79`, the tip of
+  `probe/s2-eight-texture-floor`, and claimed the branch had to be kept or the
+  provenance would dangle. That was wrong twice over: the receipt never cited
+  that commit, and the branch tip carried only an older receipt format and an
+  older probe file, both superseded in the default.)
 - `cargo test` covers pure protocol, persistence, modulation, morph, temporal,
   transport, audio, Spout lifecycle helpers, and export-argument behavior.
 - `cargo test effects_audit -- --ignored` renders the labeled effect suite
@@ -4302,9 +4321,112 @@ a passing claim.
 - Gizmo hit testing and painting are proven in software. A physical operator
   dragging a handle on a real pointer or tablet is hardware proof and is not
   transferable from those tests.
-- Upstream original code has no blanket MIT grant; `LICENSE` only covers the
-  additions described there. Publication/distribution of the combined fork is
-  conditional on the publisher having authorization for the original portions
-  or a later upstream license that permits it. Record this boundary without
-  presenting project documentation as legal advice, and do not broaden the MIT
-  claim.
+- **Host paths have one ladder and one resolver, both in `host_paths.rs`.**
+  Never write `Command::new("ffmpeg")` or `Command::new("ffprobe")` again: a
+  macOS process launched from Finder inherits launchd's minimal `PATH`, which
+  excludes `/opt/homebrew/bin` and `/usr/local/bin`, so a bare name silently
+  fails every thumbnail, preview, proxy encode, and export mux. Call
+  `host_paths::ffmpeg()` / `ffprobe()`, which honour `COS_FFMPEG` / `COS_FFPROBE`
+  first, then `PATH`, then the usual Homebrew and MacPorts prefixes, and fall
+  back to the bare name so discovery can only improve a host, never regress one.
+  Likewise never read `LOCALAPPDATA` directly for a state directory: call
+  `host_paths::state_root()`. `tls_dir` and `default_proxy_cache_root` used to
+  fall back to `./.tls` and `./.proxy-cache`, so off Windows the panel
+  certificate and the content-addressed proxy cache followed the working
+  directory — a phone that had accepted the certificate stopped trusting it, and
+  a published proxy became invisible. `controller_profile`, `stage_map`, and
+  `recovery_journal` keep their own callers but the ladder itself is shared.
+- **`brew install ffmpeg` must never come back.** It is recorded in the build
+  section above with its reasoning; the short version is that Homebrew has no
+  FFmpeg 8 at all and `ffmpeg-sys-next` does not reject 9.x cleanly.
+- **macOS needs the app bundle, not the bare binary.** `packaging/macos/Info.plist`
+  carries `NSLocalNetworkUsageDescription` and `NSMicrophoneUsageDescription`;
+  without them macOS 15 denies the LAN panel and cpal capture outright instead
+  of prompting, and a bare executable has nowhere to put them.
+  `scripts/bundle-macos.sh` assembles the bundle, generates the `.icns` from the
+  same PNGs the Windows icon uses, and — when `FFMPEG_DIR` is set — vendors the
+  FFmpeg dylibs into `Contents/Frameworks` and rewrites every install name to
+  `@rpath`, because a Finder launch inherits no `DYLD_*` variable. **The dylib
+  relocation is the one step in that script never executed on hardware**; it
+  self-checks with `otool -L` and fails loudly, but confirm it on a real Mac
+  before claiming a working bundle. **This file does not ship in the bundle.**
+  `CLAUDE.md` is contributor instructions, not program data: nothing reads it at
+  build or run time, it is embedded in no binary and hashed into no receipt, and
+  the program is fully functional without it. It stays tracked in the repository
+  but is excluded from every packaged artifact, and a future packaging step must
+  name any document it ships explicitly rather than sweeping the repository root.
+- **Shell scripts and property lists are pinned to LF in `.gitattributes`.** A
+  CRLF shebang makes a script unrunnable on macOS and Linux, and neither
+  extension was covered before.
+- **What macOS CI does and does not prove.** `ci.yml` runs the *full* gate on
+  `macos-15` (Apple Silicon) with FFmpeg 8.1.2 built from source and
+  `--disable-programs`, so there is no `ffmpeg` CLI on the runner — every
+  CLI-dependent fixture is opt-in there, exactly like `effects_audit`. The 132
+  `#[ignore]` GPU fixtures never execute, so a green macOS run proves
+  compilation plus hosted CPU tests and **never a rendered frame**. Every golden,
+  receipt, and labeled export case in this tree was measured on AMD/Vulkan; do
+  not claim cross-platform byte-identity of exports. Live-versus-export parity
+  has no macOS equivalent at all, because those fixtures build an off-main-thread
+  `EventLoop`, which winit forbids on macOS — structurally impossible, not
+  merely untested.
+- **Still unfixed on macOS, and honestly so.** `rfd` modal dialogs run from
+  inside a winit callback on the thread winit forces to be main — a known
+  re-entrancy hazard that cannot be exercised without a Mac. `File::sync_all()`
+  is `F_FULLFSYNC` on Apple targets with no fallback, and nine sites propagate
+  that error while two swallow it; on a library or output folder hosted on
+  SMB/NFS/exFAT the propagating sites fail the write rather than degrading.
+  Changing either is a durability-contract decision, not a portability fix, so
+  neither was touched.
+- The combined fork is **`GPL-3.0-or-later`**. `LICENSE` is the verbatim GNU
+  GPL v3 text (35,149 bytes, SHA-256
+  `3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986`) and must
+  stay byte-identical — `.gitattributes` pins it to LF for that reason.
+  `COPYRIGHT.md` is the boundary record and is whitelisted past `.gitignore`'s
+  `/*.md` rule; check that whitelist still holds before claiming a notice ships.
+  Upstream granted MIT in `a1c6b9d` (2026-08-19); MIT is inbound-compatible with
+  GPLv3, so the upstream portions are carried into the GPL work and their notice
+  is retained verbatim at `LICENSES/MIT-collide-o-scope-upstream.txt`. Retaining
+  it is an MIT condition, not a courtesy. Relicensing does **not** revoke the
+  upstream grant — `luismqueral/collide-o-scope` stays MIT from upstream — and
+  does not retroactively cover copies of this fork already released under MIT
+  (every commit through `aafe671`).
+- **The upstream grant's provenance is an inference, not a signature.** The MIT
+  `LICENSE` landed on upstream `main`; this fork derives from
+  `feat/web-control-panel` (tip `1a4e100`), which carries no `LICENSE` of its
+  own, and this tree was re-rooted at `ffa831d` so no Luis commit is an ancestor
+  of HEAD. The connection is that `feat/web-control-panel` is fully contained in
+  `main` (zero commits ahead) under a single copyright holder. Get a one-line
+  written confirmation from Luis before publishing a binary; do not upgrade the
+  inference to a settled fact in project text.
+- **Do not add a dependency whose license is GPLv3-incompatible** — `GPL-2.0-only`,
+  proprietary, or absent. MIT, BSD, ISC, Apache-2.0, MPL-2.0, and Zlib are fine
+  inbound. Three standing traps in the current 564-package graph: `self_cell` is
+  `Apache-2.0 OR GPL-2.0-only`, a **disjunction** (Apache elected — do not
+  "simplify" it); `winit` and `cpal` are **Apache-2.0 only**, so this work can
+  never be offered under GPLv2 and the compatibility relied on runs one way, to
+  v3 or later; and the native FFmpeg is not a Cargo dependency at all, so a
+  `Cargo.lock` audit cannot see it. The pinned `Gyan.FFmpeg.Shared` 8.1.2 build
+  is `--enable-gpl --enable-version3` (i.e. GPL-3.0-or-later, an exact match) and
+  carries no `--enable-nonfree`; an `--enable-nonfree` build is not
+  redistributable at all, whatever this program's licence says.
+- **The bundled typefaces are not GPL and must never be described as GPL.**
+  `epaint_default_fonts` declares `(MIT OR Apache-2.0) AND OFL-1.1 AND
+  Ubuntu-font-1.0` — a conjunction — and `include_bytes!`-embeds four faces into
+  the executable. They are separately-licensed data carried alongside the code,
+  with their notices at `LICENSES/fonts/`. OFL 1.1 clause 5's only carve-out is
+  for *documents* made with the font, not for binaries embedding it, so the
+  position is the ordinary one rather than a formally settled one; state it that
+  way. `TextPageFont::Sans` is the single reachable site if the strictest
+  reading is ever required.
+- BENDR (MIT, © 2026 Steve Blythe) attribution is a standing requirement, not
+  a stylistic one. The tree's own prose says both "derived from" and
+  "transcribed", so the permission notice — not merely the license name — is
+  carried at `LICENSES/MIT-BENDR.txt`. The per-site attributions are part of
+  that notice. Do not strip them, and keep `COPYRIGHT.md`'s wording agreeing
+  with the source's.
+- **GPLv3 does not reach network use.** The panel binds `0.0.0.0:3030`/`:3031`,
+  and GPLv3 §0 excludes network interaction with no transfer of a copy from
+  "convey", so a modified hosted or venue deployment need not release source.
+  `AGPL-3.0-or-later` closes exactly that and is inbound-compatible with the
+  whole graph. The current choice is deliberate; record it as a choice rather
+  than implying GPLv3 covers the case.

@@ -21,6 +21,7 @@ mod filter_avalanche;
 mod gesture;
 mod gesture_canvas;
 mod history;
+mod host_paths;
 mod image_routing;
 mod input;
 mod layers;
@@ -20538,7 +20539,7 @@ fn inspect_thumbnail_candidate(
             None,
         )
     } else {
-        let mut command = std::process::Command::new("ffprobe");
+        let mut command = std::process::Command::new(crate::host_paths::ffprobe());
         command
             .args([
                 "-v",
@@ -20610,7 +20611,7 @@ fn generate_one_thumbnail(
             return false;
         }
     };
-    let mut command = std::process::Command::new("ffmpeg");
+    let mut command = std::process::Command::new(crate::host_paths::ffmpeg());
     command.arg("-i").arg(&candidate.path).args([
         "-vframes",
         "1",
@@ -20685,7 +20686,7 @@ fn generate_one_preview(
         }
         let seek = duration * index as f64 / NUM_FRAMES as f64;
         let seek_text = format!("{seek:.2}");
-        let mut command = std::process::Command::new("ffmpeg");
+        let mut command = std::process::Command::new(crate::host_paths::ffmpeg());
         command
             .args(["-ss", seek_text.as_str(), "-i"])
             .arg(&candidate.path)

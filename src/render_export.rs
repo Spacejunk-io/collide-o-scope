@@ -18414,7 +18414,7 @@ mod effects_audit {
     /// Decoded-frame digests for one rendered file, via the same ffmpeg CLI
     /// the export path already requires.
     fn decoded_framemd5(path: &str) -> String {
-        let output = std::process::Command::new("ffmpeg")
+        let output = std::process::Command::new(crate::host_paths::ffmpeg())
             .args(["-v", "error", "-i", path, "-f", "framemd5", "-"])
             .output()
             .expect("ffmpeg framemd5");

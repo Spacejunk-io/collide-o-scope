@@ -8,7 +8,8 @@
 //! lifted into its own step by the composition planner.
 //!
 //! Eight sampled textures in one pass is portable under the production device
-//! floor. `s2-eight-texture-floor-receipt.json` (commit `5a10b79`) created its
+//! floor. `s2-eight-texture-floor-receipt.json` (commit `4866d34`, the
+//! receipt's own `claim_first_proven`) created its
 //! probe device with the *exact* production `required_limits`
 //! (`wgpu::Limits::default()`, `renderer/state.rs:2892`), proved an
 //! eight-texture layout is accepted, and proved a seventeen-texture layout is

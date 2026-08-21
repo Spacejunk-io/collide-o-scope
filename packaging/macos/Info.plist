@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>collide-o-scope</string>
+
+	<key>CFBundleDisplayName</key>
+	<string>collide-o-scope</string>
+
+	<key>CFBundleIdentifier</key>
+	<string>io.spacejunk.collide-o-scope</string>
+
+	<key>CFBundleExecutable</key>
+	<string>collide-o-scope</string>
+
+	<key>CFBundleIconFile</key>
+	<string>collide-o-scope</string>
+
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+
+	<!-- wgpu selects Metal on macOS; Retina output must not be upscaled from a
+	     1x backing store. -->
+	<key>NSHighResolutionCapable</key>
+	<true/>
+
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.video</string>
+
+	<!-- TCC usage descriptions. Without these strings the system denies the
+	     capability outright rather than prompting, and a non-bundled binary has
+	     nowhere to put them - which is the whole reason this bundle exists.
+
+	     Local network: the control panel binds 0.0.0.0:3030 and 0.0.0.0:3031 so
+	     a phone or tablet on the same network can drive the instrument, and the
+	     LAN address is discovered by opening a UDP socket outward. macOS 15
+	     gates all of that behind the Local Network permission.
+
+	     Microphone: cpal captures a live input for the audio analysis that
+	     drives the modulation matrix. Denial here is soft by design - the
+	     sources fall to zero and the toggle returns to off - but the operator
+	     should still be asked rather than silently refused. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>collide-o-scope serves its control panel on your local network so you can perform from a phone, tablet, or another computer.</string>
+
+	<key>NSMicrophoneUsageDescription</key>
+	<string>collide-o-scope analyses live audio to drive visual modulation. Nothing is recorded or transmitted.</string>
+</dict>
+</plist>

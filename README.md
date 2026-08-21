@@ -10,8 +10,9 @@ control panel.
 > architecture, and effect suite are his work. This fork adds the modulation
 > matrix, remote control, prepared performance, Collision Rack, temporal and
 > motion studies, professional control/stage tools, Spout I/O, offline export,
-> and Windows support. See [LICENSE](LICENSE) for the precise licensing and
-> attribution boundary.
+> and Windows support. The fork is licensed [GPL-3.0-or-later](LICENSE); see
+> [COPYRIGHT.md](COPYRIGHT.md) for the precise licensing and attribution
+> boundary.
 
 <img width="1919" height="1040" alt="collide-o-scope" src="https://github.com/user-attachments/assets/3690c19f-8ab4-4a9d-9672-45476da4dede" />
 
@@ -789,15 +790,90 @@ winget install -e --id LLVM.LLVM
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 ```
 
-### macOS / Linux
+### macOS
+
+Two different FFmpeg pieces are needed, and they are allowed to be different
+versions, because they are used in two different ways:
+
+- **The FFmpeg 8 shared libraries**, linked into the program through
+  `ffmpeg-next`. The major must be 8.
+- **An `ffmpeg` / `ffprobe` command line built with `libx264`**, run as a
+  separate process for thumbnails, proxy encodes, and the final H.264/AAC mux.
+  Any recent major is fine here.
+
+Homebrew no longer packages FFmpeg 8 — `ffmpeg` is 9.x and there is no
+`ffmpeg@8` formula — so the libraries are built from source, exactly as CI
+does:
 
 ```sh
-brew install ffmpeg   # or apt: libav*-dev clang pkg-config (ffmpeg 8.x)
+brew install llvm@18 pkg-config make xz
+export LIBCLANG_PATH="$(brew --prefix llvm@18)/lib"
+
+FFMPEG_VERSION=8.1.2
+PREFIX="$HOME/.local/ffmpeg-$FFMPEG_VERSION"
+curl -fL "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz" | tar -xJ
+cd "ffmpeg-$FFMPEG_VERSION"
+./configure --prefix="$PREFIX" --disable-autodetect --disable-doc \
+  --disable-programs --disable-static --enable-pic --enable-shared
+make -j"$(sysctl -n hw.logicalcpu)"
+make install
+cd ..
+
+export FFMPEG_DIR="$PREFIX"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+export DYLD_FALLBACK_LIBRARY_PATH="$PREFIX/lib:$DYLD_FALLBACK_LIBRARY_PATH"
+```
+
+Then the command-line tools, which may be Homebrew's current build:
+
+```sh
+brew install ffmpeg   # 9.x is fine: it is run as a separate process
 cargo build
 ```
 
-Spout input/output is Windows-only. The common APIs report an unavailable
-status instead of pretending to provide Spout on other platforms.
+Setting `FFMPEG_DIR` and `PKG_CONFIG_PATH` explicitly stops being optional the
+moment Homebrew's FFmpeg is installed. `ffmpeg-sys-next` probes with no minimum
+version, and its feature table stops at 8.1 — so it will happily build against
+9.x headers while still claiming the 8.1 feature set.
+`DYLD_FALLBACK_LIBRARY_PATH` keeps the running program on the 8.x dylibs for
+the same reason.
+
+If the command-line tools are somewhere the process cannot see, set `COS_FFMPEG`
+and `COS_FFPROBE` to absolute paths. This matters on macOS specifically: an app
+launched from Finder inherits launchd's minimal `PATH`, which contains neither
+`/opt/homebrew/bin` nor `/usr/local/bin`. The program searches those prefixes
+itself before giving up, so launching from a terminal is not required — but an
+explicit override is the reliable answer for an unusual install.
+
+### Linux
+
+```sh
+# ffmpeg 8 development libraries (libav*-dev), clang, pkg-config
+cargo build
+```
+
+Where a distribution ships a different FFmpeg major, build 8.1.2 from source as
+above and export `FFMPEG_DIR`, `PKG_CONFIG_PATH`, and `LD_LIBRARY_PATH`.
+
+#### Running as an app bundle
+
+macOS denies Local Network and microphone access outright, rather than
+prompting, when the process has no usage-description strings — and a bare
+executable has nowhere to carry them. That silently breaks the browser control
+panel and live audio analysis. Assemble the bundle instead:
+
+```sh
+scripts/bundle-macos.sh          # honours FFMPEG_DIR, vendors the dylibs
+open target/macos/collide-o-scope.app
+```
+
+The bundle is unsigned, so the first launch is quarantined: right-click → Open
+once, or sign it with your own identity. Set `COS_FFMPEG` / `COS_FFPROBE` if the
+command-line tools live somewhere unusual.
+
+Spout input/output is Windows-only, and there is no Syphon backend on macOS —
+see [the platform capability ledger](src/precision.rs). The common APIs report
+an unavailable status instead of pretending to provide either.
 
 ## Run
 
@@ -846,11 +922,21 @@ treat a successful build or shader fixture as hardware proof.
 
 ## Publication and license boundary
 
-The MIT grant in [LICENSE](LICENSE) applies only to the modifications and
-additions identified there. The original upstream code did not carry a blanket
-license when this fork was made. Publication or distribution of the combined
-fork is therefore conditional on the publisher having the needed authorization
-for the original portions (or on a later upstream license that permits it).
+This fork is distributed under the **GNU General Public License, version 3 or
+later** (`GPL-3.0-or-later`). The full text is in [LICENSE](LICENSE); the
+attribution and boundary record is in [COPYRIGHT.md](COPYRIGHT.md).
+
+Upstream granted an MIT license on 2026-08-19, and MIT is GPL-compatible, so
+the upstream portions are carried into the combined GPL work with their
+copyright notice retained at
+[LICENSES/MIT-collide-o-scope-upstream.txt](LICENSES/MIT-collide-o-scope-upstream.txt).
+That grant is not revoked or narrowed by this choice: the upstream repository
+remains available under MIT from upstream. What copyleft adds is that this
+fork, and anything derived from it, must keep passing the same freedoms on —
+including corresponding source. Commits up to and including `aafe671` carried
+an MIT grant on this fork's own additions, and copies released under it keep
+those terms.
+
 This project notice records the boundary; it is not legal advice.
 
 ## Credits
@@ -858,4 +944,8 @@ This project notice records the boundary; it is not legal advice.
 - [Luis Queral](https://github.com/luismqueral) — original
   collide-o-scope engine, effects, and vision.
 - [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) — VHS signal simulation.
+- **BENDR** by Steve Blythe (MIT) — the source of the laws the B1–B16
+  enrichment tranches implement. Every one is an independent rewrite in this
+  tree's idiom; the attribution is recorded at each site and in
+  [COPYRIGHT.md](COPYRIGHT.md).
 - Fork development with AI-assisted review and implementation.
