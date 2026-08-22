@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 pub const SENDER_NAME: &str = "collide-o-scope";
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
 
+#[cfg(any(windows, test))]
 pub const SPOUT_1080P_WIDTH: u32 = 1920;
+#[cfg(any(windows, test))]
 pub const SPOUT_1080P_HEIGHT: u32 = 1080;
 
 /// Resolution advertised by the Spout sender.
@@ -51,6 +53,7 @@ impl SpoutResolutionMode {
         }
     }
 
+    #[cfg(any(windows, test))]
     pub const fn output_dimensions(self, native_width: u32, native_height: u32) -> (u32, u32) {
         match self {
             Self::Native => (native_width, native_height),
