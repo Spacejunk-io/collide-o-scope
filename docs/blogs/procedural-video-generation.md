@@ -155,10 +155,15 @@ seed/index/temperature, deterministic title/slug, logical source roles, byte
 lengths and SHA-256 values, identity completeness, and warnings. it never
 records local absolute paths, timestamps, or other private filesystem metadata.
 
-`preflight.json` is a deterministic receipt for the same anchor/piece hashes and
-source inventory. it records the fingerprint/search limits, unique verified
-file count and bytes, status, warnings, and the deliberately narrow claim scope
-`canonical_configuration_and_source_bytes`. `pixel_identity_claimed` is false:
+schema-v2 `preflight.json` is a deterministic receipt for the same anchor/piece
+hashes and source inventory. after round-tripping the final `patch.yaml`, it
+records every current-stack layer's resolved Master and Temporal bypass values,
+including explicit false values. it also records the fingerprint/search limits, unique
+verified file count and bytes, status, warnings, and the deliberately narrow
+claim scope `canonical_configuration_and_source_bytes`. schema-v1 receipts load
+with an empty, unmeasured bypass set. the measurements are authored
+configuration facts, not a claim of runtime topology admission or activation.
+`pixel_identity_claimed` is false:
 the receipt does not capture application/build identity, export settings,
 FFmpeg, GPU/backend behavior, or a rendered-artifact digest.
 

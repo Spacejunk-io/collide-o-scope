@@ -52,10 +52,14 @@ use crate::visual_rack::{
 // "12": B5 adds the eight codec-mosh continuous values in fresh
 // field-isolated domains; every earlier stream is byte-stable, but a
 // generated piece now carries the new values.
-pub const GENERATOR_VERSION: &str = "12";
+// "13": preflight schema 2 records the final emitted patch's resolved
+// per-layer Master and Temporal bypass values after a YAML round trip. The
+// PRNG streams and mutation laws are unchanged; the version names the new
+// inspectable evidence carried beside every generated piece.
+pub const GENERATOR_VERSION: &str = "13";
 pub const MAX_GENERATED_COUNT: usize = 256;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
-pub const PREFLIGHT_SCHEMA_VERSION: u32 = 1;
+pub const PREFLIGHT_SCHEMA_VERSION: u32 = 2;
 pub const CANONICAL_IDENTITY_ALGORITHM: &str = "normalized-patch-json-v1+sha256";
 
 #[derive(Clone, Debug)]
@@ -117,6 +121,17 @@ pub struct PreflightLimits {
     pub max_fingerprint_bytes: u64,
 }
 
+/// Resolved authored bypass values in one final generated layer. Indices are
+/// zero-based and follow UI stack order, matching `ManifestSource::layer_index`.
+/// These are configuration facts, not a claim that a renderer admitted or
+/// activated a particular runtime topology.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LayerBypassMeasurement {
+    pub layer_index: usize,
+    pub bypass_master_fx: bool,
+    pub bypass_temporal_fx: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreflightReceipt {
     pub schema_version: u32,
@@ -130,6 +145,11 @@ pub struct PreflightReceipt {
     pub source_bytes: u64,
     pub limits: PreflightLimits,
     pub sources: Vec<ManifestSource>,
+    /// Schema 1 receipts omit this field and deserialize to an empty,
+    /// explicitly unmeasured set. Schema 2 always serializes one record per
+    /// final current-stack layer, including all-false values.
+    #[serde(default)]
+    pub layer_bypass_states: Vec<LayerBypassMeasurement>,
     pub warnings: Vec<String>,
 }
 
@@ -2423,28 +2443,45 @@ fn mutate_saved_creative_values(
     }
 }
 
-fn validate_generated_patch(patch: &PatchState) -> Result<(), String> {
+fn roundtrip_generated_patch(patch: &PatchState) -> Result<PatchState, String> {
     let yaml = serde_yaml::to_string(patch)
         .map_err(|error| format!("serialize generated creative graph: {error}"))?;
     serde_yaml::from_str::<PatchState>(&yaml)
-        .map(|_| ())
         .map_err(|error| format!("validate generated creative graph: {error}"))
+}
+
+#[cfg(test)]
+fn validate_generated_patch(patch: &PatchState) -> Result<(), String> {
+    roundtrip_generated_patch(patch).map(drop)
+}
+
+fn measure_layer_bypasses(patch: &PatchState) -> Vec<LayerBypassMeasurement> {
+    patch
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(layer_index, layer)| LayerBypassMeasurement {
+            layer_index,
+            bypass_master_fx: layer.bypass_master_fx,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
+        })
+        .collect()
 }
 
 fn retain_valid_creative_edge_values(
     patch: &mut PatchState,
     edge_fallbacks: Vec<CreativeEdgeFallback>,
-) -> Result<(), String> {
-    if validate_generated_patch(patch).is_ok() {
-        return Ok(());
+) -> Result<PatchState, String> {
+    if let Ok(roundtripped) = roundtrip_generated_patch(patch) {
+        return Ok(roundtripped);
     }
     for fallback in edge_fallbacks {
         fallback.restore(patch);
-        if validate_generated_patch(patch).is_ok() {
-            return Ok(());
+        if let Ok(roundtripped) = roundtrip_generated_patch(patch) {
+            return Ok(roundtripped);
         }
     }
-    validate_generated_patch(patch)
+    roundtrip_generated_patch(patch)
 }
 
 fn normalized_anchor(anchor: &PatchState) -> Result<PatchState, String> {
@@ -3456,7 +3493,12 @@ pub fn generate_with_inventory(
             index,
             &mut creative_edge_fallbacks,
         );
-        retain_valid_creative_edge_values(&mut patch, creative_edge_fallbacks)?;
+        // Receipts must describe what the emitted YAML means when the program
+        // reads it, not merely the pre-serialization Rust value. Keep the
+        // final piece, its canonical hash, and its measurements on that one
+        // deserialized truth. The validation round trip is also returned here
+        // so the serial seam runs once, even when a creative fallback lands.
+        patch = retain_valid_creative_edge_values(&mut patch, creative_edge_fallbacks)?;
 
         let title_seed = domain_seed(config.seed, index, 0x5449_544c_4500);
         let title = title_for(&patch, title_seed);
@@ -3504,6 +3546,7 @@ pub fn generate_with_inventory(
             source_bytes,
             limits: inventory.limits.clone(),
             sources: inventory.sources.clone(),
+            layer_bypass_states: measure_layer_bypasses(&patch),
             warnings,
         };
         walk = patch.clone();
@@ -4696,6 +4739,7 @@ mod tests {
         let first = generate(&anchor(), &config).unwrap();
         let second = generate(&anchor(), &config).unwrap();
         assert_eq!(first[0].manifest, second[0].manifest);
+        assert_eq!(first[0].preflight, second[0].preflight);
         assert_eq!(
             serde_yaml::to_string(&first[0].patch).unwrap(),
             serde_yaml::to_string(&second[0].patch).unwrap()
@@ -4713,6 +4757,85 @@ mod tests {
         );
         assert_eq!(first[0].manifest.generator_version, GENERATOR_VERSION);
         assert!(first[0].manifest.title.contains(' '));
+    }
+
+    #[test]
+    fn preflight_v2_measures_resolved_independent_bypasses_from_emitted_yaml() {
+        let anchor: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers:
+  - filename: temporal-only.mp4
+    bypass_master_fx: false
+    bypass_temporal_fx: true
+    effects: {}
+  - filename: master-only.mp4
+    bypass_master_fx: true
+    bypass_temporal_fx: false
+    effects: {}
+  - filename: omitted.mp4
+    effects: {}
+"#,
+        )
+        .unwrap();
+        assert!(!anchor.layers[2].bypass_master_fx);
+        assert!(!anchor.layers[2].bypass_temporal_fx);
+
+        let piece = generate(
+            &anchor,
+            &GenerationConfig {
+                seed: 0x4259_5041_5353,
+                count: 1,
+                temperature: 0.0,
+                allow_black_sources: false,
+            },
+        )
+        .unwrap()
+        .remove(0);
+
+        assert_eq!(piece.manifest.generator_version, "13");
+        assert_eq!(piece.preflight.schema_version, 2);
+        assert_eq!(
+            piece.preflight.layer_bypass_states,
+            [
+                LayerBypassMeasurement {
+                    layer_index: 0,
+                    bypass_master_fx: false,
+                    bypass_temporal_fx: true,
+                },
+                LayerBypassMeasurement {
+                    layer_index: 1,
+                    bypass_master_fx: true,
+                    bypass_temporal_fx: false,
+                },
+                LayerBypassMeasurement {
+                    layer_index: 2,
+                    bypass_master_fx: false,
+                    bypass_temporal_fx: false,
+                },
+            ]
+        );
+
+        let emitted_yaml = serde_yaml::to_string(&piece.patch).unwrap();
+        let emitted: PatchState = serde_yaml::from_str(&emitted_yaml).unwrap();
+        assert_eq!(
+            measure_layer_bypasses(&emitted),
+            piece.preflight.layer_bypass_states,
+            "the receipt must be reconstructed from the exact emitted YAML truth"
+        );
+        let receipt_json = serde_json::to_string(&piece.preflight).unwrap();
+        assert!(receipt_json.contains("\"bypass_temporal_fx\":false"));
+        assert!(receipt_json.contains("\"bypass_temporal_fx\":true"));
+
+        let mut legacy = serde_json::to_value(&piece.preflight).unwrap();
+        legacy["schema_version"] = serde_json::json!(1);
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("layer_bypass_states");
+        let legacy: PreflightReceipt = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.schema_version, 1);
+        assert!(legacy.layer_bypass_states.is_empty());
     }
 
     #[test]
@@ -5361,6 +5484,15 @@ scenes:
                 layer.bypass_temporal_fx,
                 "procedural mutation must preserve independent Temporal bypass authoring"
             );
+            assert_eq!(
+                piece.preflight.layer_bypass_states,
+                [LayerBypassMeasurement {
+                    layer_index: 0,
+                    bypass_master_fx: true,
+                    bypass_temporal_fx: true,
+                }],
+                "every receipt must report the final preserved routing truth"
+            );
             assert!(layer.opacity.is_finite() && (0.0..=1.0).contains(&layer.opacity));
             assert!(layer.speed.is_finite() && (0.25..=4.0).contains(&layer.speed));
             assert!(piece.patch.master.cellular_amount.is_finite());
@@ -5446,6 +5578,15 @@ scenes:
         assert!(created[0].join("patch.yaml").is_file());
         assert!(created[0].join("manifest.json").is_file());
         assert!(created[0].join("preflight.json").is_file());
+        let written_patch: PatchState =
+            serde_yaml::from_slice(&fs::read(created[0].join("patch.yaml")).unwrap()).unwrap();
+        let written_preflight: PreflightReceipt =
+            serde_json::from_slice(&fs::read(created[0].join("preflight.json")).unwrap()).unwrap();
+        assert_eq!(written_preflight.schema_version, PREFLIGHT_SCHEMA_VERSION);
+        assert_eq!(
+            written_preflight.layer_bypass_states,
+            measure_layer_bypasses(&written_patch)
+        );
         assert_eq!(
             fs::read_dir(&created[0])
                 .unwrap()
