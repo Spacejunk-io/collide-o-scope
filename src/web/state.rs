@@ -3776,6 +3776,10 @@ pub struct LayerSnapshot {
     /// program Temporal family dry while its history continues to warm.
     #[serde(default)]
     pub bypass_master_fx: bool,
+    /// Independently authored request to bypass inherited Temporal FX for
+    /// this layer. Missing values from older engines default to inheritance.
+    #[serde(default)]
+    pub bypass_temporal_fx: bool,
     /// Video-only deterministic pattern reroll at each decoded loop boundary.
     #[serde(default)]
     pub reroll_on_loop: bool,
@@ -7082,6 +7086,15 @@ mod protocol_tests {
                 if id == "layer-abc" && param == "bypass_master_fx" && value == serde_json::json!(true))
         );
 
+        let temporal_bypass: WebAction = serde_json::from_str(
+            r#"{"action":"set_layer_param","index":2,"layer_id":"layer-abc","param":"bypass_temporal_fx","value":true}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(temporal_bypass, WebAction::SetLayerParam { index: 2, layer_id: Some(id), param, value }
+                if id == "layer-abc" && param == "bypass_temporal_fx" && value == serde_json::json!(true))
+        );
+
         let reorder: WebAction = serde_json::from_str(
             r#"{"action":"move_layer","from":2,"to":0,"layer_id":"layer-abc","stack_revision":7}"#,
         )
@@ -7921,12 +7934,13 @@ mod protocol_tests {
     }
 
     #[test]
-    fn legacy_layer_snapshot_defaults_master_fx_bypass_to_off() {
+    fn legacy_layer_snapshot_defaults_independent_bypasses_to_off() {
         let current = LayerSnapshot {
             layer_id: "17".into(),
             filename: "plate.png".into(),
             visible: true,
             bypass_master_fx: true,
+            bypass_temporal_fx: true,
             reroll_on_loop: false,
             paused: false,
             opacity: 1.0,
@@ -7962,12 +7976,14 @@ mod protocol_tests {
         assert!(value.get("proxy_backing_prefix").is_none());
         assert!(value.get("proxy_note").is_none());
         value.as_object_mut().unwrap().remove("bypass_master_fx");
+        value.as_object_mut().unwrap().remove("bypass_temporal_fx");
         value.as_object_mut().unwrap().remove("reroll_on_loop");
         value.as_object_mut().unwrap().remove("transform");
         value.as_object_mut().unwrap().remove("motion");
         value.as_object_mut().unwrap().remove("performance");
         let legacy: LayerSnapshot = serde_json::from_value(value).unwrap();
         assert!(!legacy.bypass_master_fx);
+        assert!(!legacy.bypass_temporal_fx);
         assert_eq!(legacy.motion, MotionSnapshot::default());
         assert!(!legacy.reroll_on_loop);
         assert_eq!(legacy.transform, SpatialTransform::default());
@@ -8817,6 +8833,25 @@ mod protocol_tests {
             "Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.",
         ] {
             assert!(js.contains(contract), "missing bypass UI contract: {contract}");
+        }
+    }
+
+    #[test]
+    fn layer_temporal_fx_bypass_ui_is_stable_id_accessible_and_independent() {
+        let js = include_str!("../../static/app.js");
+        for contract in [
+            "<label>Bypass Temporal FX</label>",
+            "aria-label=\"Bypass Temporal FX for layer ${index + 1}\"",
+            "aria-describedby=\"layer-temporal-bypass-help-${index}\"",
+            "param: 'bypass_temporal_fx'",
+            "...currentLayerSelector(card, layer, index)",
+            "bypassTemporalFx.checked = !!layer.bypass_temporal_fx",
+            "Authored independently from Bypass Master FX.",
+        ] {
+            assert!(
+                js.contains(contract),
+                "missing Temporal bypass UI contract: {contract}"
+            );
         }
     }
 

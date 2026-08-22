@@ -167,6 +167,82 @@ fn validate_readback_buffer_size(
     Ok(size)
 }
 
+/// Remove wgpu's per-row copy padding without allowing malformed mapped ranges
+/// to panic the render thread. The dedicated post-mosh lane uses this helper
+/// after its one asynchronous map completes.
+fn unpack_post_mosh_overlay_rows(
+    data: &[u8],
+    row_bytes: usize,
+    padded_row_bytes: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
+    if row_bytes > padded_row_bytes {
+        return None;
+    }
+    let output_len = row_bytes.checked_mul(height)?;
+    let required_len = match height {
+        0 => 0,
+        _ => padded_row_bytes
+            .checked_mul(height.saturating_sub(1))?
+            .checked_add(row_bytes)?,
+    };
+    if data.len() < required_len {
+        return None;
+    }
+
+    let mut pixels = Vec::with_capacity(output_len);
+    for row in 0..height {
+        let start = row.checked_mul(padded_row_bytes)?;
+        pixels.extend_from_slice(&data[start..start + row_bytes]);
+    }
+    Some(pixels)
+}
+
+const fn post_mosh_overlay_readback_busy_status(status: u8) -> bool {
+    status != SLOT_IDLE
+}
+
+/// Lazy full-frame transaction target for rebuilding a CPU Codec-Mosh plate
+/// with the current dry prefix. While armed, CPU audience uploads land here,
+/// leaving accepted slot 2 untouched until the complete overlay is encoded.
+struct TemporalBypassAudienceCandidate {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    opaque_output_bind_group: wgpu::BindGroup,
+    route: TemporalBypassAudienceRouteState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TemporalBypassAudienceRouteState {
+    route_armed: bool,
+    uploaded_base: bool,
+}
+
+impl TemporalBypassAudienceRouteState {
+    fn configure_route(&mut self, armed: bool) {
+        self.route_armed = armed;
+        self.uploaded_base = false;
+    }
+
+    fn note_cpu_upload(&mut self) -> bool {
+        if !self.route_armed {
+            return false;
+        }
+        self.uploaded_base = true;
+        true
+    }
+}
+
+impl TemporalBypassAudienceCandidate {
+    fn configure_route(&mut self, armed: bool) {
+        self.route.configure_route(armed);
+    }
+
+    fn note_cpu_upload(&mut self) -> bool {
+        self.route.note_cpu_upload()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SelectiveNtscAllocationSnapshot {
     pub scratch_bytes: u64,
@@ -364,6 +440,138 @@ mod temporal_state_tests {
         assert!(validate_readback_buffer_size(0, 720, u64::MAX)
             .unwrap_err()
             .contains("cannot be empty"));
+    }
+
+    #[test]
+    fn post_mosh_overlay_readback_unpads_rows_without_crossing_a_map() {
+        let mapped = [
+            1, 2, 3, 4, 90, 91, 92, 93, // row 0 plus padding
+            5, 6, 7, 8, 94, 95, 96, 97, // row 1 plus padding
+        ];
+        assert_eq!(
+            unpack_post_mosh_overlay_rows(&mapped, 4, 8, 2),
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(unpack_post_mosh_overlay_rows(&mapped[..10], 4, 8, 2), None);
+        assert_eq!(unpack_post_mosh_overlay_rows(&mapped, 9, 8, 1), None);
+    }
+
+    #[test]
+    fn post_mosh_overlay_readback_has_one_nonblocking_idle_admission() {
+        assert!(!post_mosh_overlay_readback_busy_status(SLOT_IDLE));
+        for status in [
+            SLOT_MAP_PENDING,
+            SLOT_MAP_REQUESTED,
+            SLOT_MAPPED,
+            SLOT_MAP_FAILED,
+        ] {
+            assert!(post_mosh_overlay_readback_busy_status(status));
+        }
+
+        let tag = PostMoshOverlayReadbackTag {
+            epoch: 41,
+            mosh_generation: 73,
+        };
+        assert_eq!(tag.epoch, 41);
+        assert_eq!(tag.mosh_generation, 73);
+    }
+
+    #[test]
+    fn temporal_bypass_requires_one_authored_top_prefix() {
+        for valid in [
+            vec![],
+            vec![false],
+            vec![true],
+            vec![true, true, false, false],
+            vec![false, false, false],
+        ] {
+            assert!(temporal_bypass_flags_form_top_prefix(valid));
+        }
+        for invalid in [
+            vec![false, true],
+            vec![true, false, true],
+            vec![false, true, true, false],
+        ] {
+            assert!(!temporal_bypass_flags_form_top_prefix(invalid));
+        }
+    }
+
+    #[test]
+    fn post_mosh_candidate_routes_only_an_armed_cpu_upload() {
+        let mut route = TemporalBypassAudienceRouteState::default();
+        assert!(!route.note_cpu_upload());
+        assert!(!route.uploaded_base);
+
+        route.configure_route(true);
+        assert!(route.note_cpu_upload());
+        assert!(route.uploaded_base);
+
+        route.configure_route(false);
+        assert!(!route.route_armed);
+        assert!(!route.uploaded_base);
+        assert!(!route.note_cpu_upload());
+    }
+
+    #[test]
+    fn post_mosh_candidate_resolves_opaque_before_publishing_slot_two() {
+        let source = include_str!("state.rs").replace("\r\n", "\n");
+        let start = source
+            .rfind("pub(crate) fn render_temporal_bypass_overlay_audience(")
+            .expect("post-Mosh dry-overlay entry");
+        let end = source[start..]
+            .find("fn encode_temporal_bypass_overlay_to_base(")
+            .map(|offset| start + offset)
+            .expect("post-Mosh dry-overlay boundary");
+        let body = &source[start..end];
+        let overlay = body
+            .find("self.encode_temporal_bypass_overlay_to_base(")
+            .expect("straight-alpha dry overlay");
+        let opaque = body
+            .find("encode_opaque_output(")
+            .expect("opaque black resolve");
+        let publish = body[opaque..]
+            .find("encoder.copy_texture_to_texture(")
+            .map(|offset| opaque + offset)
+            .expect("transactional slot-2 publication");
+        assert!(overlay < opaque && opaque < publish);
+
+        let publication = &body[publish..];
+        let resolved_scratch = publication
+            .find("texture: &self.composite_textures[0]")
+            .expect("resolved scratch source");
+        let audience = publication
+            .find("texture: &self.composite_textures[2]")
+            .expect("opaque audience destination");
+        assert!(resolved_scratch < audience);
+
+        // Alpha Cut deliberately leaves straight RGB in place while reducing
+        // coverage. The shared audience resolve must therefore multiply that
+        // RGB by coverage and force alpha to one before slot 2 is visible.
+        let opaque_shader = include_str!("../shaders/opaque_output.wgsl");
+        assert!(opaque_shader.contains("straight.rgb * coverage"));
+        assert!(opaque_shader.contains("vec4f(straight.rgb * coverage, 1.0)"));
+    }
+
+    #[test]
+    fn temporal_bypass_preflights_and_withholds_wet_only_program_history() {
+        let source = include_str!("state.rs").replace("\r\n", "\n");
+        let render = source
+            .rfind("pub fn render_evaluated_frame(")
+            .expect("exact renderer entry");
+        let render_body = &source[render
+            ..source[render..]
+                .find("fn render_evaluated_layers_with_conditional_master(")
+                .map(|offset| render + offset)
+                .expect("exact renderer boundary")];
+        let preflight = render_body
+            .find("self.preflight_temporal_bypass_overlay(resources, evaluated)?;")
+            .expect("dry-overlay preflight");
+        let first_render = render_body
+            .find("self.render_evaluated_layers(encoder, resources, evaluated)?;")
+            .expect("first direct render");
+        assert!(preflight < first_render);
+        assert!(render_body.contains("if isolated_temporal_overlay {\n                // Slot 0 contains only the wet partition here."));
+        assert!(render_body.contains("gpu.history_valid = false;"));
     }
 
     fn advance(state: &mut TemporalState, delta_seconds: f32) -> u32 {
@@ -1660,6 +1868,33 @@ pub struct ReadbackPoll {
     pub held_audience_not_harvested: bool,
 }
 
+/// Exact identity of a final audience copy made after a retained CPU Codec
+/// Mosh plate has received the current GPU dry-layer overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostMoshOverlayReadbackTag {
+    epoch: u64,
+    mosh_generation: u64,
+}
+
+/// A completed final-audience copy for Spout. This lane is intentionally
+/// distinct from [`ReadbackFrame`]: its completion can never supersede or
+/// discard the raw wet plate consumed by NTSC or Codec Mosh.
+pub struct PostMoshOverlayReadbackFrame {
+    pub pixels: Vec<u8>,
+    pub epoch: u64,
+    pub mosh_generation: u64,
+}
+
+/// One lazy staging allocation for the cold post-mosh/dry-overlay Spout path.
+/// A busy slot rejects new admission immediately rather than creating a queue.
+struct PostMoshOverlayReadbackSlot {
+    buffer: wgpu::Buffer,
+    status: Arc<AtomicU8>,
+    used_size: u64,
+    padded_row_bytes: u32,
+    tag: Option<PostMoshOverlayReadbackTag>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ArmedLegacyScopeReadback {
     reservation: RecorderReadbackReservation,
@@ -2873,6 +3108,53 @@ where
     indices
 }
 
+/// The bounded isolated route can preserve ordinary source-over ordering only
+/// when every authored dry layer is above every inheriting layer. The detached
+/// planner enforces the same law; retaining it at the renderer boundary keeps
+/// a malformed caller from silently lifting a lower layer to the top.
+pub(crate) fn temporal_bypass_flags_form_top_prefix<I>(flags: I) -> bool
+where
+    I: IntoIterator<Item = bool>,
+{
+    let mut saw_inheriting_layer = false;
+    for bypass_temporal_fx in flags {
+        if bypass_temporal_fx {
+            if saw_inheriting_layer {
+                return false;
+            }
+        } else {
+            saw_inheriting_layer = true;
+        }
+    }
+    true
+}
+
+/// Whether this frame contributes at least one layer through the independent
+/// post-Temporal dry overlay. Invalid opacity is conservative: the evaluated
+/// compositor will sanitize it, so the route must not silently disappear.
+pub(crate) fn temporal_bypass_overlay_active(evaluated: &EvaluatedFramePlan) -> bool {
+    evaluated.layers().iter().any(|layer| {
+        let opacity_contributes = layer.opacity > 0.0 || !layer.opacity.is_finite();
+        layer.visible && layer.bypass_temporal_fx && opacity_contributes
+    })
+}
+
+fn temporal_bypass_wet_layer_contributes(evaluated: &EvaluatedFramePlan) -> bool {
+    evaluated.layers().iter().any(|layer| {
+        let opacity_contributes = layer.opacity > 0.0 || !layer.opacity.is_finite();
+        layer.visible && !layer.bypass_temporal_fx && opacity_contributes
+    })
+}
+
+/// Dry overlay indices in the exact order they must be applied to an existing
+/// wet audience: lowest dry layer first, UI Layer 1 last/on top.
+pub(crate) fn temporal_bypass_overlay_indices(evaluated: &EvaluatedFramePlan) -> Vec<usize> {
+    visible_stack_indices(evaluated.layers().iter().map(|layer| {
+        let opacity_contributes = layer.opacity > 0.0 || !layer.opacity.is_finite();
+        layer.visible && layer.bypass_temporal_fx && opacity_contributes
+    }))
+}
+
 /// Scratch-slot plan for one layer in the conditional path. Local layer FX
 /// always write slot 1. An inherited master writes 1 -> 2 and therefore
 /// composites 0 + 2 -> 1; a bypass composites 0 + 1 -> 2 directly. This is
@@ -3040,6 +3322,13 @@ pub struct Renderer {
     readback_slots: Vec<ReadbackSlot>,
     next_readback_sequence: u64,
     last_harvested_readback_sequence: u64,
+    // Dedicated single-slot final-audience lane for Spout after CPU Mosh and
+    // GPU dry-overlay recomposition. It never participates in raw readback
+    // sequence freshness, so its newer copy cannot discard the wet Mosh plate.
+    post_mosh_overlay_readback: Option<PostMoshOverlayReadbackSlot>,
+    // One lazy full-frame candidate for the isolated dry-overlay + Codec-Mosh
+    // transaction. It is never allocated by an inherited/Master-only frame.
+    temporal_bypass_audience_candidate: RefCell<Option<TemporalBypassAudienceCandidate>>,
     selective_ntsc_gpu: Option<SelectiveNtscGpuState>,
 
     // Recorder/capture readback is a separate fixed two-slot pipeline. It is
@@ -3476,6 +3765,8 @@ impl Renderer {
             readback_slots: Vec::new(),
             next_readback_sequence: 1,
             last_harvested_readback_sequence: 0,
+            post_mosh_overlay_readback: None,
+            temporal_bypass_audience_candidate: RefCell::new(None),
             selective_ntsc_gpu: None,
             program_recorder_readback: RefCell::new(None),
             temporal_pipeline,
@@ -3711,6 +4002,87 @@ impl Renderer {
         configure_surface_checked(&self.device, surface, config, &self.gpu_health)
     }
 
+    fn ensure_temporal_bypass_audience_candidate(&self) -> Result<(), String> {
+        let mut retained = self.temporal_bypass_audience_candidate.borrow_mut();
+        if retained.is_some() {
+            return Ok(());
+        }
+        let opaque_output_layout = self.opaque_output_pipeline.get_bind_group_layout(0);
+        let candidate = create_gpu_resources_checked(
+            &self.device,
+            &format!(
+                "Temporal-bypass post-Mosh audience candidate at {}x{}",
+                self.output_width, self.output_height
+            ),
+            || {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("Temporal Bypass Post-Mosh Audience Candidate"),
+                    size: wgpu::Extent3d {
+                        width: self.output_width,
+                        height: self.output_height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: COMPOSITE_FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let opaque_output_bind_group = build_opaque_output_bind_group(
+                    &self.device,
+                    &opaque_output_layout,
+                    &view,
+                    &self.sampler,
+                );
+                TemporalBypassAudienceCandidate {
+                    texture,
+                    view,
+                    opaque_output_bind_group,
+                    route: TemporalBypassAudienceRouteState::default(),
+                }
+            },
+        )?;
+        self.ensure_device_healthy().map_err(|error| {
+            format!("Temporal-bypass audience candidate allocation failed: {error}")
+        })?;
+        *retained = Some(candidate);
+        Ok(())
+    }
+
+    fn configure_temporal_bypass_audience_candidate(&self, armed: bool) -> Result<(), String> {
+        if armed {
+            self.ensure_temporal_bypass_audience_candidate()?;
+        }
+        if let Some(candidate) = self
+            .temporal_bypass_audience_candidate
+            .borrow_mut()
+            .as_mut()
+        {
+            candidate.configure_route(armed);
+        }
+        Ok(())
+    }
+
+    fn invalidate_legacy_program_history(&self) {
+        if let Ok(mut retained) = self.image_routing_gpu.lock() {
+            if let Some(resources) = retained.as_mut() {
+                resources.history_valid = false;
+            }
+        }
+    }
+
+    fn disarm_temporal_bypass_audience_candidate(&self) {
+        if let Some(candidate) = self
+            .temporal_bypass_audience_candidate
+            .borrow_mut()
+            .as_mut()
+        {
+            candidate.configure_route(false);
+        }
+    }
+
     /// Start a new patch/visual generation without sampling any temporal or
     /// asynchronous readback data produced by the prior generation.
     ///
@@ -3720,10 +4092,29 @@ impl Renderer {
     /// and `poll_readback` will recycle them without returning their pixels.
     pub(crate) fn reset_visual_generation_for(&mut self, cause: TemporalResetCause) {
         self.temporal_state.reset_for(cause);
+        self.melting_edge.invalidate_history();
+        self.display_physics.invalidate_memory();
+        self.invalidate_legacy_program_history();
+        self.disarm_temporal_bypass_audience_candidate();
         // The B14 latched shear table is program memory: it clears on the
         // causes that begin a new program and deliberately survives a source
         // cut, a seek, and blackout.
         self.sync_latch.reset_for(cause);
+        self.invalidate_async_output_generation();
+    }
+
+    /// Reset only memories that may contain pixels crossing the isolated
+    /// Temporal wet/dry partition. Retained textures stay allocated; validity
+    /// gates make their old bytes unreachable on the next frame.
+    pub(crate) fn reset_temporal_bypass_partition(&mut self) {
+        self.temporal_state
+            .reset_for(TemporalResetCause::BypassPartition);
+        self.melting_edge.invalidate_history();
+        self.display_physics.invalidate_memory();
+        self.invalidate_legacy_program_history();
+        self.disarm_temporal_bypass_audience_candidate();
+        self.sync_latch
+            .reset_for(TemporalResetCause::BypassPartition);
         self.invalidate_async_output_generation();
     }
 
@@ -4842,6 +5233,20 @@ impl Renderer {
         Ok(())
     }
 
+    fn legacy_layer_output_capture_armed(&self, stable_id: u64) -> bool {
+        let prepared = self.program_recorder_readback.borrow();
+        prepared.as_ref().is_some_and(|prepared| {
+            matches!(
+                prepared.target,
+                crate::program_recorder::CaptureTarget::Layer(target)
+                    if target.get() == stable_id
+                        && prepared
+                            .armed_scope
+                            .is_some_and(|armed| !armed.captured)
+            )
+        })
+    }
+
     /// Render all plan-selected layers. Final result ends up in
     /// `composite_views[0]`; authored `Layer` state is never consulted.
     fn render_evaluated_layers(
@@ -4854,6 +5259,7 @@ impl Renderer {
         // first layer (index 0, "Layer 1" in UI) ends up on top.
         let visible_layers =
             visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
+        let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
 
         // Visibility is a transport control, not just a compositing hint. If
         // every layer is hidden, clear the prior accumulation instead of
@@ -4876,8 +5282,41 @@ impl Renderer {
             return Ok(());
         }
 
+        // An all-dry stack still needs a defined empty wet input for the one
+        // shared Temporal machine. Dry layer local passes below remain useful
+        // for exact scope capture, but none may enter this accumulation.
+        if isolated_temporal_overlay
+            && !visible_layers
+                .iter()
+                .any(|&index| !evaluated.layers()[index].bypass_temporal_fx)
+        {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Clear Empty Temporal Wet Base"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.composite_views[0],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(transparent_accumulation_clear()),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+
+        let mut wet_stack_index = 0_usize;
         for (i, &layer_index) in visible_layers.iter().enumerate() {
             let layer = &evaluated.layers()[layer_index];
+            let deferred_dry = isolated_temporal_overlay && layer.bypass_temporal_fx;
+            // The dry prefix is normally rendered exactly once at its
+            // post-Temporal seam below. A specifically armed layer recorder
+            // may take the old local boundary here; ordinary frames avoid the
+            // duplicate full-frame shader work.
+            if deferred_dry && !self.legacy_layer_output_capture_armed(layer.source.stable_id) {
+                continue;
+            }
             let pass_uniforms = &evaluated.layer_passes()[layer_index];
             let texture_view = resources.texture_view(layer.source)?;
 
@@ -4940,13 +5379,19 @@ impl Renderer {
             }
             self.capture_legacy_layer_output(encoder, layer.source.stable_id)?;
 
+            if deferred_dry {
+                continue;
+            }
+
             // Step 2: Composite layer onto accumulated result.
             // The bottom layer composites onto a cleared black base with its
             // (modulated) opacity — it was previously copied raw, which
             // silently ignored opacity whenever only one layer was visible.
             // Its blend mode is forced to Normal: screen against black is
             // identity and multiply is a black frame — only surprises.
-            if i == 0 {
+            if (isolated_temporal_overlay && wet_stack_index == 0)
+                || (!isolated_temporal_overlay && i == 0)
+            {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Clear Base"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5048,6 +5493,7 @@ impl Renderer {
                     },
                 );
             }
+            wet_stack_index += 1;
         }
         Ok(())
     }
@@ -5307,6 +5753,50 @@ impl Renderer {
         encode_program_history_copy(encoder, &self.composite_textures[0], gpu);
     }
 
+    /// Validate every fallible fact needed by the deferred dry prefix before
+    /// the caller can encode Temporal or any other retained-memory stage.
+    /// Once this succeeds, both overlay encoders use only already-resolved,
+    /// immutable frame resources and infallible command construction.
+    fn preflight_temporal_bypass_overlay(
+        &self,
+        resources: &LiveFrameResources,
+        evaluated: &EvaluatedFramePlan,
+    ) -> Result<Vec<usize>, String> {
+        if evaluated.context().output_size != [self.output_width, self.output_height] {
+            return Err("temporal bypass overlay dimensions do not match renderer".to_string());
+        }
+        if evaluated.layers().len() != evaluated.layer_passes().len()
+            || evaluated.layers().len() != evaluated.layer_pre_passes().len()
+        {
+            return Err("temporal bypass overlay layer/pass alignment mismatch".to_string());
+        }
+        if !temporal_bypass_flags_form_top_prefix(
+            evaluated
+                .layers()
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx),
+        ) {
+            return Err(
+                "Bypass Temporal FX layers must form one contiguous top prefix".to_string(),
+            );
+        }
+        if evaluated.image_routing().is_active() {
+            return Err(
+                "temporal bypass overlay cannot execute with routed image mattes".to_string(),
+            );
+        }
+
+        let overlay_indices = temporal_bypass_overlay_indices(evaluated);
+        if overlay_indices.is_empty() {
+            return Err("temporal bypass overlay contains no contributing dry layers".to_string());
+        }
+        for &layer_index in &overlay_indices {
+            let layer = &evaluated.layers()[layer_index];
+            resources.texture_view(layer.source)?;
+        }
+        Ok(overlay_indices)
+    }
+
     /// Render the complete direct-effects portion of the program.
     ///
     /// With no visible bypass this calls the two established passes verbatim:
@@ -5336,14 +5826,48 @@ impl Renderer {
         if evaluated.layers().len() != evaluated.layer_pre_passes().len() {
             return Err("evaluated layer/pre-pass alignment mismatch".into());
         }
+        let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
+        let authored_temporal_bypass = evaluated
+            .layers()
+            .iter()
+            .any(|layer| layer.bypass_temporal_fx);
+        if authored_temporal_bypass
+            && !temporal_bypass_flags_form_top_prefix(
+                evaluated
+                    .layers()
+                    .iter()
+                    .map(|layer| layer.bypass_temporal_fx),
+            )
+        {
+            return Err(
+                "Bypass Temporal FX layers must form one contiguous top prefix".to_string(),
+            );
+        }
+        if isolated_temporal_overlay {
+            self.preflight_temporal_bypass_overlay(resources, evaluated)?;
+        }
+        self.configure_temporal_bypass_audience_candidate(
+            isolated_temporal_overlay && evaluated.temporal().mosh.is_active(),
+        )?;
         let path = master_fx_composition_path(
             evaluated
                 .layers()
                 .iter()
+                .filter(|layer| !(isolated_temporal_overlay && layer.bypass_temporal_fx))
                 .map(|layer| (layer.visible, layer.bypass_master_fx, layer.opacity)),
         );
 
         if evaluated.image_routing().is_active() {
+            if evaluated
+                .layers()
+                .iter()
+                .any(|layer| layer.bypass_temporal_fx)
+            {
+                return Err(
+                    "Bypass Temporal FX reached the routed renderer; planner must require LegacyExact"
+                        .to_string(),
+                );
+            }
             if evaluated.image_routing().mattes().len() != evaluated.layers().len() {
                 return Err("evaluated image matte/layer alignment mismatch".into());
             }
@@ -5367,7 +5891,9 @@ impl Renderer {
                 // Keep this sequence exactly equivalent to the pre-bypass
                 // renderer for old patches and all-inherited performances.
                 self.render_evaluated_layers(encoder, resources, evaluated)?;
-                self.render_master_pass(encoder, evaluated.master_pass());
+                if !isolated_temporal_overlay || temporal_bypass_wet_layer_contributes(evaluated) {
+                    self.render_master_pass(encoder, evaluated.master_pass());
+                }
             }
             MasterFxCompositionPath::ConditionalPerLayer => {
                 self.render_evaluated_layers_with_conditional_master(
@@ -5383,7 +5909,14 @@ impl Renderer {
             .lock()
             .map_err(|_| "image-routing GPU resource lock is poisoned".to_string())?;
         if let Some(gpu) = locked.as_mut() {
-            self.encode_program_history(encoder, gpu);
+            if isolated_temporal_overlay {
+                // Slot 0 contains only the wet partition here. Publishing it
+                // as a complete clean ProgramHistory would admit missing dry
+                // pixels when the route is later re-enabled.
+                gpu.history_valid = false;
+            } else {
+                self.encode_program_history(encoder, gpu);
+            }
         }
         Ok(())
     }
@@ -5398,10 +5931,12 @@ impl Renderer {
         // bottom and UI Layer 1 (index 0) is composited last, on top.
         let visible_layers =
             visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
+        let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
 
-        debug_assert!(visible_layers
-            .iter()
-            .any(|&index| evaluated.layers()[index].bypass_master_fx));
+        debug_assert!(visible_layers.iter().any(|&index| {
+            let layer = &evaluated.layers()[index];
+            !layer.bypass_temporal_fx && layer.bypass_master_fx
+        }));
 
         // Every inherited layer reads the local-FX image from slot 1. Reuse
         // one immutable master uniform buffer and bind groups for all of them.
@@ -5438,8 +5973,13 @@ impl Renderer {
             }],
         });
 
+        let mut wet_stack_index = 0_usize;
         for (stack_index, &layer_index) in visible_layers.iter().enumerate() {
             let layer = &evaluated.layers()[layer_index];
+            let deferred_dry = isolated_temporal_overlay && layer.bypass_temporal_fx;
+            if deferred_dry && !self.legacy_layer_output_capture_armed(layer.source.stable_id) {
+                continue;
+            }
             let pass_uniforms = &evaluated.layer_passes()[layer_index];
             let texture_view = resources.texture_view(layer.source)?;
             let fx_buffer = create_uploaded_uniform(
@@ -5498,6 +6038,10 @@ impl Renderer {
             }
             self.capture_legacy_layer_output(encoder, layer.source.stable_id)?;
 
+            if deferred_dry {
+                continue;
+            }
+
             let slots = conditional_layer_slots(layer.bypass_master_fx);
             if let Some(master_output) = slots.master_output {
                 debug_assert_eq!(master_output, 2);
@@ -5522,7 +6066,9 @@ impl Renderer {
                 pass.draw(0..3, 0..1);
             }
 
-            if stack_index == 0 {
+            if (isolated_temporal_overlay && wet_stack_index == 0)
+                || (!isolated_temporal_overlay && stack_index == 0)
+            {
                 encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Conditional Clear Base"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -5620,6 +6166,7 @@ impl Renderer {
                     depth_or_array_layers: 1,
                 },
             );
+            wet_stack_index += 1;
         }
         Ok(())
     }
@@ -5708,6 +6255,327 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Reapply the dry top prefix to the straight-alpha engine image after
+    /// core Temporal, Melt, Sync Latch, and Display Physics but before the
+    /// one opaque audience resolve.
+    pub(crate) fn render_temporal_bypass_overlay_engine(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &LiveFrameResources,
+        evaluated: &EvaluatedFramePlan,
+    ) -> Result<bool, String> {
+        let overlay_indices = self.preflight_temporal_bypass_overlay(resources, evaluated)?;
+        self.encode_temporal_bypass_overlay_to_base(
+            encoder,
+            resources,
+            evaluated,
+            &overlay_indices,
+            &self.composite_textures[0],
+            &self.composite_views[0],
+            2,
+            2,
+            1,
+        );
+        Ok(true)
+    }
+
+    /// Reapply the same dry prefix to an opaque delayed Codec-Mosh plate.
+    /// CPU replacement pixels are diverted into one lazy candidate while this
+    /// route is armed, and slot 2 is published only after the complete prefix
+    /// has been rebuilt. A preflight/allocation failure therefore leaves the
+    /// last accepted audience untouched.
+    pub(crate) fn render_temporal_bypass_overlay_audience(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &LiveFrameResources,
+        evaluated: &EvaluatedFramePlan,
+    ) -> Result<bool, String> {
+        let overlay_indices = self.preflight_temporal_bypass_overlay(resources, evaluated)?;
+        self.ensure_temporal_bypass_audience_candidate()?;
+        let mut retained = self.temporal_bypass_audience_candidate.borrow_mut();
+        let candidate = retained
+            .as_mut()
+            .expect("the Temporal-bypass audience candidate was just prepared");
+
+        if !candidate.route.uploaded_base {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.composite_textures[2],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &candidate.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.output_width,
+                    height: self.output_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        self.encode_temporal_bypass_overlay_to_base(
+            encoder,
+            resources,
+            evaluated,
+            &overlay_indices,
+            &candidate.texture,
+            &candidate.view,
+            0,
+            0,
+            1,
+        );
+        // The composite kernel is straight-alpha, including destination-out
+        // Alpha Cut. Resolve the completed candidate over black before the
+        // transaction publishes it: slot 2 is an opaque audience invariant,
+        // not another engine scratch surface. The resolve writes slot 0 first
+        // so an allocation/preflight failure above leaves accepted slot 2
+        // byte-for-byte untouched.
+        encode_opaque_output(
+            encoder,
+            &self.opaque_output_pipeline,
+            &candidate.opaque_output_bind_group,
+            &self.composite_views[0],
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: self.output_width,
+                height: self.output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        candidate.route.uploaded_base = false;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_temporal_bypass_overlay_to_base(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        resources: &LiveFrameResources,
+        evaluated: &EvaluatedFramePlan,
+        overlay_indices: &[usize],
+        base_texture: &wgpu::Texture,
+        base_view: &wgpu::TextureView,
+        master_output_slot: usize,
+        bypass_output_slot: usize,
+        inherited_output_slot: usize,
+    ) {
+        let master_buffer = create_uploaded_uniform(
+            &self.device,
+            &self.queue,
+            "Temporal Bypass Master FX Uniforms",
+            evaluated.master_pass(),
+        );
+        let master_texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Temporal Bypass Master FX Input"),
+            layout: &self.effects_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.composite_views[1]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                },
+            ],
+        });
+        let master_uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Temporal Bypass Master FX Uniforms BG"),
+            layout: &self.effects_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: master_buffer.as_entire_binding(),
+            }],
+        });
+
+        for &layer_index in overlay_indices {
+            let layer = &evaluated.layers()[layer_index];
+            let texture_view = resources
+                .texture_view(layer.source)
+                .expect("Temporal-bypass sources were resolved by preflight");
+            let layer_buffer = create_uploaded_uniform(
+                &self.device,
+                &self.queue,
+                "Temporal Bypass Layer FX Uniforms",
+                &evaluated.layer_passes()[layer_index],
+            );
+            let layer_texture_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Temporal Bypass Layer FX Input"),
+                layout: &self.effects_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.nearest_sampler),
+                    },
+                ],
+            });
+            let layer_uniform_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Temporal Bypass Layer FX Uniforms BG"),
+                layout: &self.effects_uniform_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: layer_buffer.as_entire_binding(),
+                }],
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Temporal Bypass Layer FX Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[1],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &layer_texture_group, &[]);
+                pass.set_bind_group(1, &layer_uniform_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            let (overlay_slot, output_slot) = if layer.bypass_master_fx {
+                (1, bypass_output_slot)
+            } else {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Temporal Bypass Inherited Master FX Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[master_output_slot],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.effects_pipeline);
+                pass.set_bind_group(0, &master_texture_group, &[]);
+                pass.set_bind_group(1, &master_uniform_group, &[]);
+                pass.draw(0..3, 0..1);
+                (master_output_slot, inherited_output_slot)
+            };
+            debug_assert_ne!(overlay_slot, output_slot);
+
+            let composite_buffer = create_uploaded_uniform(
+                &self.device,
+                &self.queue,
+                "Temporal Bypass Composite Uniforms",
+                &CompositeUniforms {
+                    opacity: layer.opacity,
+                    blend_mode: layer.blend_mode.as_u32(),
+                    _pad: [0.0; 2],
+                },
+            );
+            let composite_texture_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Temporal Bypass Composite Inputs"),
+                    layout: &self.composite_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(base_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.composite_views[overlay_slot],
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+            let composite_uniform_group =
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Temporal Bypass Composite Uniforms BG"),
+                    layout: &self.composite_uniform_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: composite_buffer.as_entire_binding(),
+                    }],
+                });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Temporal Bypass Final Composite Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.composite_views[output_slot],
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.composite_pipeline);
+                pass.set_bind_group(0, &composite_texture_group, &[]);
+                pass.set_bind_group(1, &composite_uniform_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.composite_textures[output_slot],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: base_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.output_width,
+                    height: self.output_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     fn selective_batch_layout(&self, layer_count: usize) -> Result<(u32, u64, u64), String> {
@@ -6205,6 +7073,177 @@ impl Renderer {
         (self.output_width * 4 + 255) & !255
     }
 
+    /// Encode one exact copy of composite slot 2 after a retained CPU Codec
+    /// Mosh plate has received the current GPU dry-layer overlay.
+    ///
+    /// This cold path owns one lazily allocated staging buffer. `Ok(false)` is
+    /// a normal, nonblocking busy result: the caller drops this final Spout
+    /// sample rather than waiting or allocating a backlog. After submitting
+    /// `encoder`, call [`Self::map_post_mosh_overlay_readback`].
+    pub fn begin_post_mosh_overlay_readback(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        epoch: u64,
+        mosh_generation: u64,
+    ) -> Result<bool, String> {
+        if self
+            .post_mosh_overlay_readback
+            .as_ref()
+            .is_some_and(|slot| {
+                post_mosh_overlay_readback_busy_status(slot.status.load(Ordering::Acquire))
+            })
+        {
+            return Ok(false);
+        }
+
+        self.ensure_device_healthy()
+            .map_err(|error| format!("post-mosh overlay readback unavailable: {error}"))?;
+        let padded_row_bytes = self.readback_bytes_per_row();
+        let buffer_size = validate_readback_buffer_size(
+            padded_row_bytes,
+            self.output_height,
+            self.device.limits().max_buffer_size,
+        )?;
+
+        if self.post_mosh_overlay_readback.is_none() {
+            let buffer = create_gpu_resources_checked(
+                &self.device,
+                &format!(
+                    "post-mosh overlay Spout readback buffer ({buffer_size} bytes at {}x{})",
+                    self.output_width, self.output_height
+                ),
+                || {
+                    self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Post-Mosh Overlay Spout Readback"),
+                        size: buffer_size,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    })
+                },
+            )?;
+            self.ensure_device_healthy().map_err(|error| {
+                format!("post-mosh overlay readback buffer allocation failed: {error}")
+            })?;
+            self.post_mosh_overlay_readback = Some(PostMoshOverlayReadbackSlot {
+                buffer,
+                status: Arc::new(AtomicU8::new(SLOT_IDLE)),
+                used_size: buffer_size,
+                padded_row_bytes,
+                tag: None,
+            });
+        }
+
+        let slot = self
+            .post_mosh_overlay_readback
+            .as_mut()
+            .expect("the post-mosh readback slot was just allocated");
+        debug_assert!(!post_mosh_overlay_readback_busy_status(
+            slot.status.load(Ordering::Acquire)
+        ));
+        slot.tag = Some(PostMoshOverlayReadbackTag {
+            epoch,
+            mosh_generation,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.composite_textures[2],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &slot.buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(slot.padded_row_bytes),
+                    rows_per_image: Some(self.output_height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.output_width,
+                height: self.output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        slot.status.store(SLOT_MAP_PENDING, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Request the one-slot final-audience map after the encoder containing
+    /// its texture copy has been submitted. This method never waits.
+    pub fn map_post_mosh_overlay_readback(&self) {
+        if self.ensure_device_healthy().is_err() {
+            return;
+        }
+        let Some(slot) = self.post_mosh_overlay_readback.as_ref() else {
+            return;
+        };
+        if slot.status.load(Ordering::Acquire) != SLOT_MAP_PENDING {
+            return;
+        }
+
+        slot.status.store(SLOT_MAP_REQUESTED, Ordering::Release);
+        let status = slot.status.clone();
+        slot.buffer
+            .slice(0..slot.used_size)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                status.store(
+                    if result.is_ok() {
+                        SLOT_MAPPED
+                    } else {
+                        SLOT_MAP_FAILED
+                    },
+                    Ordering::Release,
+                );
+            });
+    }
+
+    /// Harvest the tagged final post-mosh/dry-overlay audience image without
+    /// blocking. Map failures and malformed mapped ranges recycle the slot and
+    /// return no frame, allowing a later frame to retry.
+    pub fn poll_post_mosh_overlay_readback(&mut self) -> Option<PostMoshOverlayReadbackFrame> {
+        self.post_mosh_overlay_readback.as_ref()?;
+        if self.ensure_device_healthy().is_err() {
+            return None;
+        }
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        if self.gpu_health.error().is_some() {
+            return None;
+        }
+
+        let row_bytes = usize::try_from(u64::from(self.output_width).checked_mul(4)?).ok()?;
+        let height = self.output_height as usize;
+        let slot = self.post_mosh_overlay_readback.as_mut()?;
+        match slot.status.load(Ordering::Acquire) {
+            SLOT_MAPPED => {
+                let data = slot.buffer.slice(0..slot.used_size).get_mapped_range();
+                let pixels = unpack_post_mosh_overlay_rows(
+                    &data,
+                    row_bytes,
+                    slot.padded_row_bytes as usize,
+                    height,
+                );
+                drop(data);
+                slot.buffer.unmap();
+                let tag = slot.tag.take();
+                slot.status.store(SLOT_IDLE, Ordering::Release);
+                pixels
+                    .zip(tag)
+                    .map(|(pixels, tag)| PostMoshOverlayReadbackFrame {
+                        pixels,
+                        epoch: tag.epoch,
+                        mosh_generation: tag.mosh_generation,
+                    })
+            }
+            SLOT_MAP_FAILED => {
+                slot.tag = None;
+                slot.status.store(SLOT_IDLE, Ordering::Release);
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Phase 1 of async readback: encode a copy of the final opaque audience
     /// image in composite_textures[2]
     /// into a free staging buffer. Returns the slot index to pass to
@@ -6465,10 +7504,39 @@ impl Renderer {
     }
 
     /// Write processed opaque RGBA pixels back to the audience image. The
-    /// straight-alpha engine accumulation in slot 0 remains untouched.
+    /// straight-alpha engine accumulation in slot 0 remains untouched. While
+    /// isolated Temporal bypass brackets Codec Mosh, the upload is diverted to
+    /// its prepared candidate so an incomplete dry rebuild cannot replace the
+    /// accepted audience in slot 2.
     pub fn write_composite(&self, pixels: &[u8]) {
         let w = self.output_width;
         let h = self.output_height;
+        let mut retained = self.temporal_bypass_audience_candidate.borrow_mut();
+        if let Some(candidate) = retained.as_mut() {
+            if candidate.note_cpu_upload() {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &candidate.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 4),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                return;
+            }
+        }
+        drop(retained);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.composite_textures[2],

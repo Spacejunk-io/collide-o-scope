@@ -116,6 +116,7 @@ pub struct LayerFrameInput<'a> {
     pub visible: bool,
     pub paused: bool,
     pub bypass_master_fx: bool,
+    pub bypass_temporal_fx: bool,
     /// The B7 pattern synth's authored base, present only on a pattern
     /// layer. The evaluator resolves this frame's modulated copy so live and
     /// export encode identical pattern uniforms from the plan alone.
@@ -142,6 +143,7 @@ pub struct EvaluatedLayer {
     pub visible: bool,
     pub paused: bool,
     pub bypass_master_fx: bool,
+    pub bypass_temporal_fx: bool,
     /// This frame's modulated pattern-synth values (base plus offsets,
     /// sanitized), or `None` for every other source kind. Frame-local
     /// evaluated data, never authored state.
@@ -326,6 +328,7 @@ impl EvaluatedFramePlan {
                 visible: input.visible,
                 paused: input.paused,
                 bypass_master_fx: input.bypass_master_fx,
+                bypass_temporal_fx: input.bypass_temporal_fx,
                 pattern: input
                     .pattern
                     .map(|base| modulation.modulate_layer_pattern(index, base)),
@@ -639,6 +642,7 @@ mod tests {
         visible: bool,
         paused: bool,
         bypass_master_fx: bool,
+        bypass_temporal_fx: bool,
         source: SourceTap,
     }
 
@@ -654,6 +658,7 @@ mod tests {
             visible: base.visible,
             paused: base.paused,
             bypass_master_fx: base.bypass_master_fx,
+            bypass_temporal_fx: base.bypass_temporal_fx,
             pattern: None,
         }
     }
@@ -691,6 +696,7 @@ mod tests {
                 visible: index != 6,
                 paused: index == 7,
                 bypass_master_fx: index % 3 == 0,
+                bypass_temporal_fx: index % 4 == 0,
                 source: SourceTap::new(100 + index as u64, index, 640 + index as u32, 480),
             })
             .collect()
@@ -741,6 +747,9 @@ mod tests {
         assert_eq!(plan.layer_passes().len(), 3);
         assert_eq!(plan.layers()[1].source.stable_id, 101);
         assert_eq!(plan.layers()[1].source.slot, 1);
+        assert!(plan.layers()[0].bypass_master_fx);
+        assert!(plan.layers()[0].bypass_temporal_fx);
+        assert!(!plan.layers()[1].bypass_temporal_fx);
         assert!(plan.layers()[1].speed > layers[1].speed);
         assert!(plan.layers()[1].opacity < layers[1].opacity);
         assert_ne!(
@@ -783,6 +792,7 @@ mod tests {
         layers[0].visible = false;
         layers[0].paused = true;
         layers[0].bypass_master_fx = !layers[0].bypass_master_fx;
+        layers[0].bypass_temporal_fx = !layers[0].bypass_temporal_fx;
         layers[0].source = SourceTap::new(999, 42, 32, 16);
 
         assert_eq!(

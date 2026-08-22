@@ -3295,6 +3295,10 @@ pub struct LayerConfig {
     /// frame. Missing in legacy patches preserves historical inheritance.
     #[serde(default)]
     pub bypass_master_fx: bool,
+    /// Independently skip inherited Temporal processing for this layer.
+    /// Missing in legacy patches preserves historical Temporal inheritance.
+    #[serde(default)]
+    pub bypass_temporal_fx: bool,
     #[serde(default)]
     pub reroll_on_loop: bool,
     #[serde(default)]
@@ -3364,6 +3368,8 @@ impl<'de> Deserialize<'de> for LayerConfig {
             #[serde(default)]
             bypass_master_fx: bool,
             #[serde(default)]
+            bypass_temporal_fx: bool,
+            #[serde(default)]
             reroll_on_loop: bool,
             #[serde(default)]
             effects: EffectsConfig,
@@ -3411,6 +3417,7 @@ impl<'de> Deserialize<'de> for LayerConfig {
             paused: raw.paused,
             visible: raw.visible,
             bypass_master_fx: raw.bypass_master_fx,
+            bypass_temporal_fx: raw.bypass_temporal_fx,
             reroll_on_loop: raw.reroll_on_loop,
             effects: raw.effects,
             transform: raw.transform,
@@ -4686,6 +4693,7 @@ impl LayerConfig {
             paused: layer.paused,
             visible: layer.visible,
             bypass_master_fx: layer.bypass_master_fx,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
             reroll_on_loop: layer.reroll_on_loop,
             effects: EffectsConfig::from_uniforms(&layer.effects),
             transform: layer.transform.sanitized(),
@@ -4774,6 +4782,7 @@ impl LayerConfig {
         layer.paused = self.paused;
         layer.visible = self.visible;
         layer.bypass_master_fx = self.bypass_master_fx;
+        layer.bypass_temporal_fx = self.bypass_temporal_fx;
         layer.reroll_on_loop = self.reroll_on_loop;
         self.effects.apply_to_uniforms(&mut layer.effects);
         // The B13 optics author at master scope only; a hostile or hand-edited
@@ -4798,6 +4807,7 @@ impl LayerConfig {
             &mut layer.blend_mode,
             &mut layer.visible,
             &mut layer.bypass_master_fx,
+            &mut layer.bypass_temporal_fx,
             &mut layer.effects,
             &mut layer.transform,
         );
@@ -4813,12 +4823,17 @@ impl LayerConfig {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the detached look-transfer seam names every independently persisted layer field"
+    )]
     fn apply_look_to_fields(
         &self,
         opacity: &mut f32,
         blend_mode: &mut BlendMode,
         visible: &mut bool,
         bypass_master_fx: &mut bool,
+        bypass_temporal_fx: &mut bool,
         effects: &mut EffectUniforms,
         transform: &mut SpatialTransform,
     ) {
@@ -4826,6 +4841,7 @@ impl LayerConfig {
         *blend_mode = BlendMode::from_key(self.blend_mode.as_str()).unwrap_or(BlendMode::Normal);
         *visible = self.visible;
         *bypass_master_fx = self.bypass_master_fx;
+        *bypass_temporal_fx = self.bypass_temporal_fx;
         self.effects.apply_to_uniforms(effects);
         // Look application targets layer scope here; the B13 optics stay
         // master-only.
@@ -4844,6 +4860,7 @@ impl LayerConfig {
             ("paused", format!("{}", self.paused)),
             ("visible", format!("{}", self.visible)),
             ("bypass_master_fx", format!("{}", self.bypass_master_fx)),
+            ("bypass_temporal_fx", format!("{}", self.bypass_temporal_fx)),
             ("reroll_on_loop", format!("{}", self.reroll_on_loop)),
             ("position_x", format!("{:.4}", self.transform.position[0])),
             ("position_y", format!("{:.4}", self.transform.position[1])),
@@ -4919,6 +4936,12 @@ impl LayerConfig {
             "bypass_master_fx" => {
                 if let Ok(v) = value.parse() {
                     self.bypass_master_fx = v;
+                    return true;
+                }
+            }
+            "bypass_temporal_fx" => {
+                if let Ok(v) = value.parse() {
+                    self.bypass_temporal_fx = v;
                     return true;
                 }
             }
@@ -6758,6 +6781,7 @@ mod tests {
             paused: true,
             visible,
             bypass_master_fx,
+            bypass_temporal_fx: false,
             reroll_on_loop: true,
             effects: EffectsConfig {
                 brightness,
@@ -6795,6 +6819,7 @@ mod tests {
         blend_mode: BlendMode,
         visible: bool,
         bypass_master_fx: bool,
+        bypass_temporal_fx: bool,
         effects: EffectUniforms,
         transform: SpatialTransform,
     }
@@ -6812,6 +6837,7 @@ mod tests {
             blend_mode: BlendMode::Multiply,
             visible: true,
             bypass_master_fx: false,
+            bypass_temporal_fx: false,
             effects: EffectUniforms {
                 brightness: -0.9,
                 random_seed: topology_id as u32 + 1_000,
@@ -6855,6 +6881,7 @@ mod tests {
             let mut opacity = 0.0;
             let mut visible = false;
             let mut bypass_master_fx = true;
+            let mut bypass_temporal_fx = true;
             let mut effects = EffectUniforms::default();
             let mut transform = SpatialTransform::default();
             from_json.apply_look_to_fields(
@@ -6862,6 +6889,7 @@ mod tests {
                 &mut applied,
                 &mut visible,
                 &mut bypass_master_fx,
+                &mut bypass_temporal_fx,
                 &mut effects,
                 &mut transform,
             );
@@ -6877,6 +6905,7 @@ mod tests {
         let mut opacity = 0.0;
         let mut visible = false;
         let mut bypass_master_fx = true;
+        let mut bypass_temporal_fx = true;
         let mut effects = EffectUniforms::default();
         let mut transform = SpatialTransform::default();
         unknown.apply_look_to_fields(
@@ -6884,6 +6913,7 @@ mod tests {
             &mut applied,
             &mut visible,
             &mut bypass_master_fx,
+            &mut bypass_temporal_fx,
             &mut effects,
             &mut transform,
         );
@@ -6896,10 +6926,11 @@ mod tests {
 
     #[test]
     fn look_application_is_visual_only_positional_and_reports_mismatches() {
-        let saved = vec![
+        let mut saved = vec![
             saved_layer("saved-a.mp4", 0.2, "difference", false, true, 0.25, 41),
             saved_layer("saved-b.mp4", 0.7, "screen", true, false, -0.3, 97),
         ];
+        saved[0].bypass_temporal_fx = true;
         let mut live = vec![
             fake_live_layer(11, "live-a.mov", 0.91),
             fake_live_layer(22, "live-b.mov", 0.92),
@@ -6924,6 +6955,7 @@ mod tests {
             live[2].blend_mode,
             live[2].visible,
             live[2].bypass_master_fx,
+            live[2].bypass_temporal_fx,
             live[2].effects.brightness,
             live[2].effects.random_seed,
             live[2].transform,
@@ -6935,6 +6967,7 @@ mod tests {
                 &mut layer.blend_mode,
                 &mut layer.visible,
                 &mut layer.bypass_master_fx,
+                &mut layer.bypass_temporal_fx,
                 &mut layer.effects,
                 &mut layer.transform,
             );
@@ -6953,6 +6986,7 @@ mod tests {
         assert_eq!(live[0].blend_mode, BlendMode::Difference);
         assert!(!live[0].visible);
         assert!(live[0].bypass_master_fx);
+        assert!(live[0].bypass_temporal_fx);
         assert_eq!(live[0].effects.brightness, 0.25);
         assert_eq!(live[0].effects.random_seed, 41);
         assert_eq!(live[0].transform.position, [0.2, 0.25]);
@@ -6960,6 +6994,7 @@ mod tests {
         assert_eq!(live[1].blend_mode, BlendMode::Screen);
         assert!(live[1].visible);
         assert!(!live[1].bypass_master_fx);
+        assert!(!live[1].bypass_temporal_fx);
         assert_eq!(live[1].effects.brightness, -0.3);
         assert_eq!(live[1].effects.random_seed, 97);
         assert_eq!(live[1].transform.position, [0.7, -0.3]);
@@ -6969,6 +7004,7 @@ mod tests {
                 live[2].blend_mode,
                 live[2].visible,
                 live[2].bypass_master_fx,
+                live[2].bypass_temporal_fx,
                 live[2].effects.brightness,
                 live[2].effects.random_seed,
                 live[2].transform,
@@ -7469,6 +7505,7 @@ autopilot:
                 paused: false,
                 visible: true,
                 bypass_master_fx: true,
+                bypass_temporal_fx: true,
                 reroll_on_loop: false,
                 effects: layer_effects,
                 transform: SpatialTransform::default(),
@@ -7509,6 +7546,7 @@ autopilot:
         assert_eq!(parsed.master.downsample, 0.35);
         assert_eq!(parsed.layers[0].effects.downsample, 0.6);
         assert!(parsed.layers[0].bypass_master_fx);
+        assert!(parsed.layers[0].bypass_temporal_fx);
 
         let mut restored = EffectUniforms::default();
         parsed.master.apply_to_uniforms(&mut restored);
@@ -7521,6 +7559,7 @@ autopilot:
         assert_eq!(legacy.master.downsample, 1.0);
         assert_eq!(legacy.layers[0].effects.downsample, 1.0);
         assert!(!legacy.layers[0].bypass_master_fx);
+        assert!(!legacy.layers[0].bypass_temporal_fx);
 
         let mut invalid = EffectsConfig {
             downsample: f32::NAN,
@@ -7544,24 +7583,37 @@ autopilot:
     }
 
     #[test]
-    fn layer_master_fx_bypass_round_trips_and_native_editor_exposes_it() {
+    fn independent_layer_bypasses_round_trip_and_native_editor_exposes_them() {
         let legacy: LayerConfig = serde_yaml::from_str(
             "filename: legacy.mp4\nopacity: 1\nblend_mode: normal\neffects: {}\n",
         )
         .unwrap();
         assert!(!legacy.bypass_master_fx);
+        assert!(!legacy.bypass_temporal_fx);
 
         let mut edited = legacy;
         assert!(edited.set_field("bypass_master_fx", "true"));
+        assert!(edited.set_field("bypass_temporal_fx", "true"));
         assert!(edited.bypass_master_fx);
+        assert!(edited.bypass_temporal_fx);
         assert!(edited
             .top_fields()
             .iter()
             .any(|(key, value)| *key == "bypass_master_fx" && value == "true"));
+        assert!(edited
+            .top_fields()
+            .iter()
+            .any(|(key, value)| *key == "bypass_temporal_fx" && value == "true"));
 
         let yaml = serde_yaml::to_string(&edited).unwrap();
         let restored: LayerConfig = serde_yaml::from_str(&yaml).unwrap();
         assert!(restored.bypass_master_fx);
+        assert!(restored.bypass_temporal_fx);
+
+        let mut independent = restored;
+        assert!(independent.set_field("bypass_master_fx", "false"));
+        assert!(!independent.bypass_master_fx);
+        assert!(independent.bypass_temporal_fx);
     }
 
     #[test]
@@ -8318,6 +8370,7 @@ autopilot:
         let mut blend_mode = BlendMode::Normal;
         let mut visible = true;
         let mut bypass = false;
+        let mut bypass_temporal = false;
         let mut effects = EffectUniforms::default();
         let mut transform = SpatialTransform::default();
         layer_config.apply_look_to_fields(
@@ -8325,6 +8378,7 @@ autopilot:
             &mut blend_mode,
             &mut visible,
             &mut bypass,
+            &mut bypass_temporal,
             &mut effects,
             &mut transform,
         );
@@ -11357,6 +11411,7 @@ lfos:
             paused: false,
             visible: true,
             bypass_master_fx: false,
+            bypass_temporal_fx: false,
             reroll_on_loop: false,
             effects: EffectsConfig::default(),
             transform: SpatialTransform::default(),

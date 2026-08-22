@@ -1404,6 +1404,7 @@ fn selective_ntsc_topology_signature(evaluated: &EvaluatedFramePlan) -> u64 {
         mix(layer.source.stable_id);
         mix(layer.visible as u64);
         mix(layer.bypass_master_fx as u64);
+        mix(layer.bypass_temporal_fx as u64);
         let contributes = layer.opacity.is_finite() && layer.opacity > 0.0;
         mix(contributes as u64);
     }
@@ -2898,6 +2899,30 @@ enum CreativeCommitImpact {
     TopologyOrStack,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MorphPartitionReset {
+    None,
+    BypassPartition,
+    SourceCut,
+}
+
+/// Select exactly one retained-pixel barrier after an accepted outer
+/// transaction materializes Morph. A source cut is the stronger barrier and
+/// therefore owns the Temporal-partition reset instead of stacking a second
+/// reset beside it.
+const fn morph_partition_reset(
+    materialized_partition_changed: bool,
+    source_cut_required: bool,
+) -> MorphPartitionReset {
+    if source_cut_required {
+        MorphPartitionReset::SourceCut
+    } else if materialized_partition_changed {
+        MorphPartitionReset::BypassPartition
+    } else {
+        MorphPartitionReset::None
+    }
+}
+
 const fn creative_commit_impact(
     candidate_changed: bool,
     topology_changed: bool,
@@ -2922,6 +2947,7 @@ struct StagedLayerLook {
     paused: bool,
     visible: bool,
     bypass_master_fx: bool,
+    bypass_temporal_fx: bool,
     effects: effects::EffectUniforms,
     transform: spatial::SpatialTransform,
     matte: image_routing::LayerMatte,
@@ -2955,6 +2981,7 @@ impl StagedLayerLook {
             paused: layer.paused,
             visible: layer.visible,
             bypass_master_fx: layer.bypass_master_fx,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
             effects: layer.effects,
             transform: layer.transform,
             matte: layer.matte,
@@ -2972,6 +2999,7 @@ impl StagedLayerLook {
         layer.paused = self.paused;
         layer.visible = self.visible;
         layer.bypass_master_fx = self.bypass_master_fx;
+        layer.bypass_temporal_fx = self.bypass_temporal_fx;
         layer.effects = self.effects;
         layer.transform = self.transform;
         layer.matte = self.matte;
@@ -5492,12 +5520,12 @@ impl App {
                 self.layers[index].bypass_master_fx = enabled;
                 self.composition_status = if enabled {
                     format!(
-                        "Layer {} bypasses inheritable master FX; while contributing, it links program Temporal dry with warm history",
+                        "Layer {} bypasses inheritable master FX; Bypass Temporal FX remains independent, otherwise this uses the Master-only LinkedDry law while contributing",
                         layer_id.get()
                     )
                 } else {
                     format!(
-                        "Layer {} inherits master FX; linked Temporal bypass now follows the remaining contributing layers",
+                        "Layer {} inherits master FX; Temporal routing follows explicit Bypass Temporal FX or the remaining Master-only LinkedDry contributors",
                         layer_id.get()
                     )
                 };
@@ -5506,6 +5534,90 @@ impl App {
             Err(error) => {
                 self.composition_status = format!(
                     "Bypass Master FX rejected for layer {}: {error}",
+                    layer_id.get()
+                );
+                log::warn!("{}", self.composition_status);
+                false
+            }
+        }
+    }
+
+    fn invalidate_temporal_bypass_partition_generation(&mut self) {
+        self.visual_epoch = self.visual_epoch.wrapping_add(1);
+        self.ntsc_presented = None;
+        self.mosh_presented = None;
+        self.mosh_interval_generation = self.mosh_interval_generation.wrapping_add(1).max(1);
+        self.selective_temporal_debt = 0.0;
+        self.selective_transition_holding = false;
+        self.selective_hold_snapshot_valid = false;
+        self.selective_hold_spout_barrier_epoch = None;
+        self.selective_hold_spout_readback_epoch = None;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.reset_temporal_bypass_partition();
+        }
+        if let Some(executor) = self.composition_gpu.as_mut() {
+            executor.reset_temporal_bypass_partition();
+        }
+    }
+
+    fn finish_accepted_morph_partition_transaction(
+        &mut self,
+        materialized_partition_changed: bool,
+        source_cut_required: bool,
+    ) {
+        match morph_partition_reset(materialized_partition_changed, source_cut_required) {
+            MorphPartitionReset::None => {}
+            MorphPartitionReset::BypassPartition => {
+                self.invalidate_temporal_bypass_partition_generation();
+            }
+            MorphPartitionReset::SourceCut => self.invalidate_source_cut_generation(),
+        }
+    }
+
+    /// Admit the independent Temporal-family bypass only when the detached
+    /// planner can represent it as an exact LegacyExact top overlay. Changing
+    /// membership invalidates every retained wet pixel that may still contain
+    /// the layer, plus delayed CPU output tagged to the previous partition.
+    fn set_layer_temporal_bypass_transactional(&mut self, index: usize, enabled: bool) -> bool {
+        let Some(layer) = self.layers.get(index) else {
+            return false;
+        };
+        if layer.bypass_temporal_fx == enabled {
+            return true;
+        }
+
+        let layer_id = layer.stable_layer_id();
+        let mut layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        layers[index].bypass_temporal_fx = enabled;
+        let staged = self.staged_creative_graph();
+        match self.preflight_creative_graph_with_visuals(
+            &staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &layers,
+        ) {
+            Ok(()) => {
+                self.layers[index].bypass_temporal_fx = enabled;
+                self.invalidate_temporal_bypass_partition_generation();
+                self.composition_status = if enabled {
+                    format!(
+                        "Layer {} bypasses the Temporal family as an exact top overlay; inherited layers remain wet",
+                        layer_id.get()
+                    )
+                } else {
+                    format!(
+                        "Layer {} rejoins the shared Temporal family; wet history was safely rebased",
+                        layer_id.get()
+                    )
+                };
+                true
+            }
+            Err(error) => {
+                self.composition_status = format!(
+                    "Bypass Temporal FX rejected for layer {}: {error}",
                     layer_id.get()
                 );
                 log::warn!("{}", self.composition_status);
@@ -5534,11 +5646,22 @@ impl App {
             && self
                 .morph
                 .controls_layer_field(index, morph::LayerMorphControl::BypassMasterFx);
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
         let rollback =
             morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
-        if morph_owned && !self.release_active_morph_for_manual_edit() {
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return false;
         }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
 
         let accepted = self.set_layer_master_bypass_transactional(index, enabled);
         if !accepted {
@@ -5546,6 +5669,59 @@ impl App {
                 world.install(self);
                 self.morph = morph;
             }
+        } else if materialized_temporal_partition {
+            self.invalidate_temporal_bypass_partition_generation();
+        }
+        accepted
+    }
+
+    /// Keep Morph materialization inside the same admission transaction as the
+    /// Temporal partition, mirroring the Master-bypass rollback law.
+    fn apply_layer_temporal_bypass_action(
+        &mut self,
+        index: usize,
+        layer_id: &Option<String>,
+        value: &serde_json::Value,
+    ) -> bool {
+        let Some(index) = self.resolve_layer_index(index, layer_id) else {
+            return false;
+        };
+        let Some(enabled) = value.as_bool() else {
+            return false;
+        };
+        let morph_owned = self.morph.active()
+            && self
+                .morph
+                .controls_layer_field(index, morph::LayerMorphControl::BypassTemporalFx);
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
+        let rollback =
+            morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
+            return false;
+        }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
+        let setter_changes_partition = self
+            .layers
+            .get(index)
+            .is_some_and(|layer| layer.bypass_temporal_fx != enabled);
+
+        let accepted = self.set_layer_temporal_bypass_transactional(index, enabled);
+        if !accepted {
+            if let Some((world, morph)) = rollback {
+                world.install(self);
+                self.morph = morph;
+            }
+        } else if materialized_temporal_partition && !setter_changes_partition {
+            self.invalidate_temporal_bypass_partition_generation();
         }
         accepted
     }
@@ -5560,11 +5736,22 @@ impl App {
         }
 
         let morph_owned = self.morph.active();
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
         let rollback =
             morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
-        if morph_owned && !self.release_active_morph_for_manual_edit() {
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return false;
         }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
 
         let mut candidate = self.ntsc_params.clone();
         candidate.set_param(param, value);
@@ -5594,6 +5781,89 @@ impl App {
                 world.install(self);
                 self.morph = morph;
             }
+        } else {
+            self.finish_accepted_morph_partition_transaction(
+                materialized_temporal_partition,
+                false,
+            );
+        }
+        accepted
+    }
+
+    fn temporal_edit_requires_partition_preflight(param: &str) -> bool {
+        matches!(param, "garden_amount" | "garden_gate")
+    }
+
+    /// Refresh Garden's matte/motion gates change the composition resources
+    /// observed at the Temporal boundary. When an explicit dry prefix exists,
+    /// stage that edit and the current Morph sample together so neither an
+    /// invalid route nor a rejected materialization can leak into live state.
+    fn apply_temporal_partition_sensitive_action(
+        &mut self,
+        param: &str,
+        value: &serde_json::Value,
+    ) -> bool {
+        if !Self::temporal_edit_requires_partition_preflight(param)
+            || !Self::valid_temporal_edit(param, value)
+        {
+            return false;
+        }
+
+        let morph_owned = self.morph.active();
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
+        let rollback =
+            morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
+            return false;
+        }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
+
+        let mut candidate = self.temporal_params;
+        apply_temporal_wire_edit(&mut candidate, param, value, None);
+        let accepted = if self.layers.iter().any(|layer| layer.bypass_temporal_fx) {
+            let layers = self
+                .layers
+                .iter()
+                .map(StagedLayerLook::capture)
+                .collect::<Vec<_>>();
+            let staged = self.authored_creative_graph();
+            match self.preflight_creative_graph_with_visuals(
+                &staged,
+                &self.master_effects,
+                &self.master_transform,
+                &self.master_motion,
+                &self.ntsc_params,
+                &candidate,
+                &layers,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.composition_status = format!("Refresh Garden edit rejected: {error}");
+                    log::warn!("{}", self.composition_status);
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        if accepted {
+            self.temporal_params = candidate;
+            if materialized_temporal_partition {
+                self.invalidate_temporal_bypass_partition_generation();
+            }
+        } else if let Some((world, morph)) = rollback {
+            world.install(self);
+            self.morph = morph;
         }
         accepted
     }
@@ -5636,7 +5906,42 @@ impl App {
         temporal_params: &effects::params::TemporalParams,
         layers: &[StagedLayerLook],
     ) -> Result<(), String> {
-        let live_ids = self.live_layer_ids();
+        let runtime_layers = self.layers.iter().collect::<Vec<_>>();
+        self.preflight_creative_graph_with_visuals_for_layers(
+            &runtime_layers,
+            &self.mod_matrix,
+            staged,
+            master_effects,
+            master_transform,
+            master_motion,
+            ntsc_params,
+            temporal_params,
+            layers,
+        )
+    }
+
+    /// Plan a wholly detached visual world against an explicitly ordered set
+    /// of runtime source facts. Patch recall and stack reorder cannot borrow
+    /// `self.layers` as their prospective order, but they still need the same
+    /// source dimensions, transport visibility, codec facts, device limits,
+    /// and GPU-plan validation as an ordinary live edit.
+    #[allow(clippy::too_many_arguments)]
+    fn preflight_creative_graph_with_visuals_for_layers(
+        &self,
+        runtime_layers: &[&Layer],
+        mod_matrix: &modulation::ModMatrix,
+        staged: &StagedCreativeGraph,
+        master_effects: &effects::EffectUniforms,
+        master_transform: &spatial::SpatialTransform,
+        master_motion: &motion::MotionParams,
+        ntsc_params: &ntsc::NtscParams,
+        temporal_params: &effects::params::TemporalParams,
+        layers: &[StagedLayerLook],
+    ) -> Result<(), String> {
+        let live_ids = runtime_layers
+            .iter()
+            .map(|layer| layer.stable_layer_id())
+            .collect::<Vec<_>>();
         if layers.len() != live_ids.len()
             || layers
                 .iter()
@@ -5647,6 +5952,9 @@ impl App {
                 "creative visual values do not exactly align with live stable layers".into(),
             );
         }
+        mod_matrix.validate_temporal_bypass_motion_routing(
+            layers.iter().any(|layer| layer.bypass_temporal_fx),
+        )?;
         staged
             .composition
             .validate_for_layers(&live_ids)
@@ -5683,26 +5991,41 @@ impl App {
             &staged.composition,
         )?;
 
+        // A routed Garden gate is topology even while its authored amount is
+        // zero: modulation can raise `temporal_garden_amount` on a later frame
+        // without another authoring transaction. Refuse that dormant invalid
+        // combination now so it can never turn into a planner error/frozen
+        // last-good frame during performance.
+        if layers.iter().any(|layer| layer.bypass_temporal_fx)
+            && matches!(
+                temporal_params.originals.garden.gate,
+                temporal::RefreshGardenGate::Matte | temporal::RefreshGardenGate::Motion
+            )
+        {
+            return Err(
+                "Bypass Temporal FX requires an inline Refresh Garden gate; matte and motion gates are routed even at zero amount"
+                    .into(),
+            );
+        }
+
         let (width, height) = self
             .renderer
             .as_ref()
             .map(|renderer| (renderer.output_width, renderer.output_height))
             .unwrap_or((FALLBACK_OUTPUT_WIDTH, FALLBACK_OUTPUT_HEIGHT));
-        let modulation = self.mod_matrix.frame(self.layers.len());
+        let modulation = mod_matrix.frame(runtime_layers.len());
+        let study_beat = mod_matrix.clock.beat(std::time::Instant::now());
         let base = EvaluatedFramePlan::evaluate(
             &modulation,
-            {
-                let (bands, beat) = self.study_frame_inputs();
-                FramePlanContext::new(width, height, self.program_clock.elapsed.as_secs_f32())
-                    .with_study_inputs(bands, beat)
-            },
+            FramePlanContext::new(width, height, self.program_clock.elapsed.as_secs_f32())
+                .with_study_inputs(mod_matrix.audio.bands, (study_beat.fract().abs()) as f32),
             MasterFrameInput {
                 effects: master_effects,
                 transform: master_transform,
                 ntsc: ntsc_params,
                 temporal: temporal_params,
             },
-            self.layers
+            runtime_layers
                 .iter()
                 .zip(layers)
                 .enumerate()
@@ -5722,12 +6045,12 @@ impl App {
                     visible: layer.visible && runtime.transport_visible(),
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    bypass_temporal_fx: layer.bypass_temporal_fx,
                     pattern: layer.pattern.as_ref(),
                 }),
         );
         let mattes: Vec<_> = layers.iter().map(|layer| layer.matte).collect();
-        let motion_layers = self
-            .layers
+        let motion_layers = runtime_layers
             .iter()
             .zip(layers)
             .map(|(runtime, layer)| {
@@ -5758,7 +6081,8 @@ impl App {
                 .as_ref()
                 .is_some_and(renderer::Renderer::program_tap_valid),
         )
-        .with_studies(&self.study_library);
+        .with_studies(&self.study_library)
+        .with_authored_motion_modulation(mod_matrix.has_authored_motion_routing());
         let motion_limits = self.renderer.as_ref().map_or_else(
             || motion::MotionDeviceLimits::new(u32::MAX, u64::MAX),
             |renderer| {
@@ -5841,8 +6165,8 @@ impl App {
             .map_err(|error| format!("flatten committed composition: {error}"))?;
         let stack_changed = desired != self.live_layer_ids();
         let mut racks = std::collections::BTreeMap::new();
-        for (layer_id, rack) in staged.layer_racks {
-            if racks.insert(layer_id, rack).is_some() {
+        for (layer_id, rack) in &staged.layer_racks {
+            if racks.insert(*layer_id, rack.clone()).is_some() {
                 return Err(format!(
                     "duplicate staged rack for layer {}",
                     layer_id.get()
@@ -5878,8 +6202,67 @@ impl App {
             })
             .transpose()?;
 
-        if !self.release_active_morph_for_manual_edit() {
+        let morph_owned = self.morph.active();
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
+        let rollback =
+            morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
+
+        // The initial edit was planned against the sampled Morph graph, but
+        // release also materializes every visual field. Re-run the combined
+        // planner against that exact world before either graph or matte data
+        // becomes live. Rejection restores the authored world and engaged
+        // Morph without having invalidated retained Temporal pixels.
+        let runtime_layers = desired
+            .iter()
+            .map(|layer_id| {
+                self.layers
+                    .iter()
+                    .find(|layer| layer.stable_layer_id() == *layer_id)
+                    .expect("staged creative commit prevalidated every live layer")
+            })
+            .collect::<Vec<_>>();
+        let mut candidate_layers = runtime_layers
+            .iter()
+            .map(|layer| StagedLayerLook::capture(layer))
+            .collect::<Vec<_>>();
+        if let Some(mattes) = mattes.as_ref() {
+            for layer in &mut candidate_layers {
+                layer.matte = *mattes
+                    .get(&layer.layer_id)
+                    .expect("staged creative commit prevalidated every layer matte");
+            }
+        }
+        if let Err(error) = self.preflight_creative_graph_with_visuals_for_layers(
+            &runtime_layers,
+            &self.mod_matrix,
+            &staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &candidate_layers,
+        ) {
+            if let Some((world, morph)) = rollback {
+                world.install(self);
+                self.morph = morph;
+            }
+            return Err(format!(
+                "post-Morph creative graph preflight failed: {error}"
+            ));
         }
         let graph_changed = self.master_rack != staged.master_rack
             || self.composition != staged.composition
@@ -5899,6 +6282,10 @@ impl App {
         );
         if impact == CreativeCommitImpact::NoChange {
             self.composition_status = status;
+            self.finish_accepted_morph_partition_transaction(
+                materialized_temporal_partition,
+                false,
+            );
             return Ok(());
         }
         if stack_changed {
@@ -5931,9 +6318,10 @@ impl App {
             self.bump_composition_revision();
         }
         self.composition_status = status;
-        if impact == CreativeCommitImpact::TopologyOrStack {
-            self.invalidate_source_cut_generation();
-        }
+        self.finish_accepted_morph_partition_transaction(
+            materialized_temporal_partition,
+            impact == CreativeCommitImpact::TopologyOrStack,
+        );
         Ok(())
     }
 
@@ -6711,7 +7099,7 @@ impl App {
             .morph
             .active()
             .then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
-        if !self.release_active_morph_for_manual_edit() {
+        if !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".into());
         }
         if let Err(error) = validate_bypass(self) {
@@ -7112,7 +7500,7 @@ impl App {
             .ok_or_else(|| format!("layer index {removed_index} is absent"))?;
         let _validated = stage_composition_remove(&self.composition, &old_ids, removed_id)?;
 
-        if !self.release_active_morph_for_manual_edit() {
+        if !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".into());
         }
         let staged_composition = stage_composition_remove(&self.composition, &old_ids, removed_id)
@@ -7165,11 +7553,47 @@ impl App {
         desired_ids.insert(to, moved_id);
         let _validated = stage_composition_reorder(&self.composition, &desired_ids)?;
 
-        if !self.release_active_morph_for_manual_edit() {
+        let rollback = self
+            .morph
+            .active()
+            .then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".into());
         }
         let staged = stage_composition_reorder(&self.composition, &desired_ids)
             .expect("morph materialization cannot change composition topology");
+        let mut order = (0..self.layers.len()).collect::<Vec<_>>();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        let runtime_layers = order
+            .iter()
+            .map(|&index| &self.layers[index])
+            .collect::<Vec<_>>();
+        let candidate_layers = runtime_layers
+            .iter()
+            .map(|layer| StagedLayerLook::capture(layer))
+            .collect::<Vec<_>>();
+        let mut staged_graph = self.authored_creative_graph();
+        staged_graph.composition = staged.clone();
+        if let Err(error) = self.preflight_creative_graph_with_visuals_for_layers(
+            &runtime_layers,
+            &self.mod_matrix,
+            &staged_graph,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &candidate_layers,
+        ) {
+            if let Some((world, morph)) = rollback {
+                world.install(self);
+                self.morph = morph;
+            }
+            return Err(format!(
+                "prospective layer order is not renderable: {error}"
+            ));
+        }
         self.stop_autopilot_for_manual_control("manual layer reorder");
         self.remap_scenes_after_layer_move(from, to);
         let layer = self.layers.remove(from);
@@ -8874,6 +9298,39 @@ impl App {
             &mut staged_mod_matrix,
             &mut staged_temporal,
         )?;
+        if rebuilt.iter().any(|layer| layer.bypass_temporal_fx) {
+            let staged_visuals = rebuilt
+                .iter()
+                .map(StagedLayerLook::capture)
+                .collect::<Vec<_>>();
+            let runtime_layers = rebuilt.iter().collect::<Vec<_>>();
+            let staged_graph = StagedCreativeGraph {
+                master_rack: staged_master_rack.clone(),
+                layer_racks: rebuilt
+                    .iter()
+                    .map(Layer::stable_layer_id)
+                    .zip(staged_layer_racks.iter().cloned())
+                    .collect(),
+                composition: staged_composition.clone(),
+            };
+            let effective_mod_matrix = if replace_modulation {
+                &staged_mod_matrix
+            } else {
+                &self.mod_matrix
+            };
+            self.preflight_creative_graph_with_visuals_for_layers(
+                &runtime_layers,
+                effective_mod_matrix,
+                &staged_graph,
+                &staged_master_effects,
+                &staged_master_transform,
+                &staged_master_motion,
+                &staged_ntsc,
+                &staged_temporal,
+                &staged_visuals,
+            )
+            .map_err(|error| format!("loaded patch Temporal-bypass preflight failed: {error}"))?;
+        }
         let bypass_capabilities = rebuilt
             .iter()
             .map(|layer| (layer.stable_layer_id(), layer.bypass_master_fx))
@@ -9135,6 +9592,7 @@ impl App {
                     | "blend_mode"
                     | "visible"
                     | "bypass_master_fx"
+                    | "bypass_temporal_fx"
                     | "key_mode"
                     | "key_threshold"
                     | "key_softness"
@@ -9284,7 +9742,7 @@ impl App {
         let prior_graph = self.authored_creative_graph();
         let prior_morph = self.morph.clone();
 
-        if !self.release_active_morph_for_manual_edit() {
+        if !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".into());
         }
         let applied_ntsc = patch.ntsc.is_some();
@@ -9781,7 +10239,11 @@ impl App {
 
     /// Commit the exact effective morph world at the current authoritative
     /// beat. This is also the ordering boundary used before slot capture.
-    fn try_materialize_morph_at_current_beat_with_offset(&mut self, morph_offset: f32) -> bool {
+    fn try_materialize_morph_at_current_beat_with_offset_and_partition_reset(
+        &mut self,
+        morph_offset: f32,
+        reset_temporal_partition: bool,
+    ) -> bool {
         if !self.morph.active() {
             return true;
         }
@@ -9823,7 +10285,18 @@ impl App {
                 &candidate.layers,
             ) {
                 Ok(()) => {
+                    let temporal_partition_changed = baseline
+                        .layers
+                        .iter()
+                        .map(|layer| layer.bypass_temporal_fx)
+                        .ne(candidate
+                            .layers
+                            .iter()
+                            .map(|layer| layer.bypass_temporal_fx));
                     candidate.install(self);
+                    if temporal_partition_changed && reset_temporal_partition {
+                        self.invalidate_temporal_bypass_partition_generation();
+                    }
                     if fallback {
                         self.composition_status = format!(
                             "Morph sample {t:.4} was invalid ({}); used captured endpoint {sample_t:.1}",
@@ -9852,6 +10325,13 @@ impl App {
         false
     }
 
+    fn try_materialize_morph_at_current_beat_with_offset(&mut self, morph_offset: f32) -> bool {
+        self.try_materialize_morph_at_current_beat_with_offset_and_partition_reset(
+            morph_offset,
+            true,
+        )
+    }
+
     fn materialize_morph_at_current_beat_with_offset(&mut self, morph_offset: f32) {
         let _ = self.try_materialize_morph_at_current_beat_with_offset(morph_offset);
     }
@@ -9867,11 +10347,26 @@ impl App {
     /// captured slot is deliberately preserved so the performer can continue
     /// authoring its partner.
     fn release_active_morph_for_manual_edit(&mut self) -> bool {
+        self.release_active_morph_for_manual_edit_with_partition_reset(true)
+    }
+
+    /// Some callers wrap Morph release in a larger detached transaction whose
+    /// final commit already owns the one generation reset. Suppressing the
+    /// eager reset here lets a rejected outer transaction restore both the
+    /// authored Morph world and its untouched Temporal history.
+    fn release_active_morph_for_manual_edit_with_partition_reset(
+        &mut self,
+        reset_temporal_partition: bool,
+    ) -> bool {
         if !self.morph.active() {
             return true;
         }
         let morph_offset = self.mod_matrix.frame(0).morph_offset();
-        let materialized = self.try_materialize_morph_at_current_beat_with_offset(morph_offset);
+        let materialized = self
+            .try_materialize_morph_at_current_beat_with_offset_and_partition_reset(
+                morph_offset,
+                reset_temporal_partition,
+            );
         if materialized {
             self.morph.clear();
         }
@@ -10897,8 +11392,41 @@ impl App {
 
         // The preflight above is detached. Only now may an active Morph be
         // materialized/released and the live matte edge become visible.
-        if topology_changed && !self.release_active_morph_for_manual_edit() {
+        let morph_owned = topology_changed && self.morph.active();
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
+        let rollback =
+            morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".into());
+        }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
+
+        if morph_owned {
+            let post_morph_graph = self.authored_creative_graph();
+            let mut post_morph_mattes = self
+                .layers
+                .iter()
+                .map(|layer| layer.matte)
+                .collect::<Vec<_>>();
+            post_morph_mattes[index] = candidate;
+            if let Err(error) =
+                self.preflight_creative_graph_with_mattes(&post_morph_graph, &post_morph_mattes)
+            {
+                if let Some((world, morph)) = rollback {
+                    world.install(self);
+                    self.morph = morph;
+                }
+                return Err(format!("post-Morph matte preflight failed: {error}"));
+            }
         }
         let impact = creative_commit_impact(
             self.layers[index].matte != candidate,
@@ -10907,6 +11435,10 @@ impl App {
         );
         if impact == CreativeCommitImpact::NoChange {
             self.composition_status = status;
+            self.finish_accepted_morph_partition_transaction(
+                materialized_temporal_partition,
+                false,
+            );
             return Ok(());
         }
         self.layers[index].matte = candidate;
@@ -10914,9 +11446,10 @@ impl App {
             self.bump_composition_revision();
         }
         self.composition_status = status;
-        if impact == CreativeCommitImpact::TopologyOrStack {
-            self.invalidate_source_cut_generation();
-        }
+        self.finish_accepted_morph_partition_transaction(
+            materialized_temporal_partition,
+            impact == CreativeCommitImpact::TopologyOrStack,
+        );
         Ok(())
     }
 
@@ -11261,7 +11794,7 @@ impl App {
                         .map(|mode| mode.key().to_string())
                         .collect(),
                 ),
-                "bypass_master_fx" => Some(Law::Toggle),
+                "bypass_master_fx" | "bypass_temporal_fx" => Some(Law::Toggle),
                 "key_mode" => Some(Law::Stepped { min: 0, max: 4 }),
                 "key_border_color" => Some(Law::Stepped { min: 0, max: 7 }),
                 "key_threshold" | "key_color_r" | "key_color_g" | "key_color_b"
@@ -11657,6 +12190,7 @@ impl App {
             "fps" if Self::finite_f32_edit(value) => Some(Control::Fps),
             "blend_mode" if Self::blend_mode_edit(value).is_some() => Some(Control::BlendMode),
             "bypass_master_fx" if value.as_bool().is_some() => Some(Control::BypassMasterFx),
+            "bypass_temporal_fx" if value.as_bool().is_some() => Some(Control::BypassTemporalFx),
             "key_threshold" if value.as_f64().is_some_and(f64::is_finite) => {
                 Some(Control::KeyThreshold)
             }
@@ -14497,10 +15031,25 @@ impl App {
 
         let baseline = StagedMorphWorld::capture_authored(self);
         let prior_morph = self.morph.clone();
-        let result = (|| -> Result<(StagedMorphWorld, MotionEditImpact, String), String> {
-            if !self.release_active_morph_for_manual_edit() {
+        let morph_owned = self.morph.active();
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
+        let result = (|| -> Result<(StagedMorphWorld, MotionEditImpact, String, bool), String> {
+            if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false)
+            {
                 return Err("active Morph sample cannot be materialized safely".into());
             }
+            let materialized_temporal_partition =
+                temporal_partition_before.as_ref().is_some_and(|before| {
+                    before
+                        .iter()
+                        .copied()
+                        .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+                });
             let mut candidate = StagedMorphWorld::capture_authored(self);
             let (impact, status) = match action {
                 WebAction::SetMotion {
@@ -14693,17 +15242,21 @@ impl App {
                 &candidate.temporal_params,
                 &candidate.layers,
             )?;
-            Ok((candidate, impact, status))
+            Ok((candidate, impact, status, materialized_temporal_partition))
         })();
 
         match result {
-            Ok((candidate, impact, status)) => {
+            Ok((candidate, impact, status, materialized_temporal_partition)) => {
                 candidate.install(self);
                 if impact == MotionEditImpact::MemoryTopology {
                     self.clear_motion_memory();
                     self.bump_composition_revision();
                 }
                 self.composition_status = status;
+                self.finish_accepted_morph_partition_transaction(
+                    materialized_temporal_partition,
+                    false,
+                );
             }
             Err(error) => {
                 baseline.install(self);
@@ -15240,9 +15793,21 @@ impl App {
 
         let baseline = StagedMorphWorld::capture_authored(self);
         let prior_morph = self.morph.clone();
-        if !self.release_active_morph_for_manual_edit() {
+        let morph_owned = self.morph.active();
+        let temporal_partition_before = morph_owned.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.bypass_temporal_fx)
+                .collect::<Vec<_>>()
+        });
+        if morph_owned && !self.release_active_morph_for_manual_edit_with_partition_reset(false) {
             return Err("active Morph sample cannot be materialized safely".to_string());
         }
+        let materialized_temporal_partition = temporal_partition_before.is_some_and(|before| {
+            before
+                .into_iter()
+                .ne(self.layers.iter().map(|layer| layer.bypass_temporal_fx))
+        });
         let result = (|| -> Result<(StagedMorphWorld, bool), String> {
             let mut candidate = StagedMorphWorld::capture_authored(self);
             let changed = match (&preset.payload, target) {
@@ -15373,8 +15938,11 @@ impl App {
                 if changed {
                     candidate.install(self);
                     self.bump_composition_revision();
-                    self.invalidate_source_cut_generation();
                 }
+                self.finish_accepted_morph_partition_transaction(
+                    materialized_temporal_partition,
+                    changed,
+                );
                 Ok(())
             }
             Err(error) => {
@@ -17797,10 +18365,33 @@ impl App {
             value,
         } = &action
         {
-            if param == "bypass_master_fx" {
-                let accepted = self.apply_layer_master_bypass_action(*index, layer_id, value);
+            if matches!(param.as_str(), "bypass_master_fx" | "bypass_temporal_fx") {
+                let accepted = if param == "bypass_master_fx" {
+                    self.apply_layer_master_bypass_action(*index, layer_id, value)
+                } else {
+                    self.apply_layer_temporal_bypass_action(*index, layer_id, value)
+                };
                 if accepted && self.performance_recording && !self.performance_replay_dispatching {
                     self.stage_performance_edit(&action);
+                }
+                return WebActionBatchDisposition::Continue;
+            }
+        }
+        if let web::state::WebAction::SetTemporal { param, value } = &action {
+            if Self::temporal_edit_requires_partition_preflight(param) {
+                let address = self.feedback_address_for_web_action(&action);
+                let accepted = self.apply_temporal_partition_sensitive_action(param, value);
+                if accepted && self.performance_recording && !self.performance_replay_dispatching {
+                    self.stage_performance_edit(&action);
+                }
+                if let Some(address) = address {
+                    if let Some(normalized) = self.automation_current_normalized(address) {
+                        self.publish_controller_feedback(
+                            address,
+                            normalized,
+                            controller_profile::AutomationOrigin::HostAutomation,
+                        );
+                    }
                 }
                 return WebActionBatchDisposition::Continue;
             }
@@ -17950,8 +18541,18 @@ impl App {
             value,
         } = &action
         {
-            if param == "bypass_master_fx" {
-                self.apply_layer_master_bypass_action(*index, layer_id, value);
+            if matches!(param.as_str(), "bypass_master_fx" | "bypass_temporal_fx") {
+                if param == "bypass_master_fx" {
+                    self.apply_layer_master_bypass_action(*index, layer_id, value);
+                } else {
+                    self.apply_layer_temporal_bypass_action(*index, layer_id, value);
+                }
+                return WebActionBatchDisposition::Continue;
+            }
+        }
+        if let WebAction::SetTemporal { param, value } = &action {
+            if Self::temporal_edit_requires_partition_preflight(param) {
+                self.apply_temporal_partition_sensitive_action(param, value);
                 return WebActionBatchDisposition::Continue;
             }
         }
@@ -19335,6 +19936,7 @@ impl App {
                 }
             }
             WebAction::SetTemporal { param, value } => {
+                debug_assert!(!Self::temporal_edit_requires_partition_preflight(&param));
                 let score_loop_driver = if param == "score_loop_driver" {
                     value.as_str().and_then(|driver| {
                         if driver == "none" {
@@ -19680,63 +20282,77 @@ impl App {
                             self.layer_stack_revision
                         );
                     }
-                    let routing = &mut self.mod_matrix.routings[index];
-                    match param.as_str() {
-                        "source" => {
-                            if let Some(s) = value.as_str() {
-                                if let Some(source) = modulation::ModSource::try_from_str(s) {
-                                    if routing.source != source {
-                                        routing.source = source;
+                    if param == "target" {
+                        if let Some(target) = resolved_target {
+                            let temporal_bypass_authored =
+                                self.layers.iter().any(|layer| layer.bypass_temporal_fx);
+                            if let Err(error) = self
+                                .mod_matrix
+                                .set_routing_target_with_temporal_bypass_policy(
+                                    index,
+                                    target,
+                                    temporal_bypass_authored,
+                                )
+                            {
+                                self.composition_status =
+                                    format!("Modulation target edit rejected: {error}");
+                                log::warn!("{}", self.composition_status);
+                            }
+                        }
+                    } else {
+                        let routing = &mut self.mod_matrix.routings[index];
+                        match param.as_str() {
+                            "source" => {
+                                if let Some(s) = value.as_str() {
+                                    if let Some(source) = modulation::ModSource::try_from_str(s) {
+                                        if routing.source != source {
+                                            routing.source = source;
+                                            routing.reset_runtime();
+                                        }
+                                    }
+                                }
+                            }
+                            "depth" => {
+                                if let Some(n) = value.as_f64() {
+                                    routing.depth = (n as f32).clamp(-1.0, 1.0);
+                                }
+                            }
+                            "curve" => {
+                                if let Some(s) = value.as_str() {
+                                    let curve = modulation::Curve::from_str(s);
+                                    if routing.curve != curve {
+                                        routing.curve = curve;
                                         routing.reset_runtime();
                                     }
                                 }
                             }
-                        }
-                        "target" => {
-                            if let Some(target) = resolved_target {
-                                routing.set_target(target);
-                            }
-                        }
-                        "depth" => {
-                            if let Some(n) = value.as_f64() {
-                                routing.depth = (n as f32).clamp(-1.0, 1.0);
-                            }
-                        }
-                        "curve" => {
-                            if let Some(s) = value.as_str() {
-                                let curve = modulation::Curve::from_str(s);
-                                if routing.curve != curve {
-                                    routing.curve = curve;
-                                    routing.reset_runtime();
+                            "curve_amount" => {
+                                if let Some(n) = value.as_f64() {
+                                    let amount = (n as f32).clamp(-2.0, 2.0);
+                                    if routing.curve_amount != amount {
+                                        routing.curve_amount = amount;
+                                        routing.reset_runtime();
+                                    }
                                 }
                             }
-                        }
-                        "curve_amount" => {
-                            if let Some(n) = value.as_f64() {
-                                let amount = (n as f32).clamp(-2.0, 2.0);
-                                if routing.curve_amount != amount {
-                                    routing.curve_amount = amount;
-                                    routing.reset_runtime();
+                            "attack" => {
+                                if let Some(n) = value.as_f64() {
+                                    let attack = (n as f32).clamp(0.0, 10.0);
+                                    if routing.attack != attack {
+                                        routing.attack = attack;
+                                    }
                                 }
                             }
-                        }
-                        "attack" => {
-                            if let Some(n) = value.as_f64() {
-                                let attack = (n as f32).clamp(0.0, 10.0);
-                                if routing.attack != attack {
-                                    routing.attack = attack;
+                            "release" => {
+                                if let Some(n) = value.as_f64() {
+                                    let release = (n as f32).clamp(0.0, 10.0);
+                                    if routing.release != release {
+                                        routing.release = release;
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        "release" => {
-                            if let Some(n) = value.as_f64() {
-                                let release = (n as f32).clamp(0.0, 10.0);
-                                if routing.release != release {
-                                    routing.release = release;
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -19747,7 +20363,10 @@ impl App {
                 value,
             } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
-                    debug_assert_ne!(param, "bypass_master_fx");
+                    debug_assert!(!matches!(
+                        param.as_str(),
+                        "bypass_master_fx" | "bypass_temporal_fx"
+                    ));
                     if matches!(param.as_str(), "speed" | "fps") {
                         self.clear_performance_transactions();
                     }
@@ -21142,6 +21761,7 @@ impl App {
                         temporal::TemporalResetCause::Resize => "resize",
                         temporal::TemporalResetCause::BroadRevert => "broad_revert",
                         temporal::TemporalResetCause::ManualClear => "manual_clear",
+                        temporal::TemporalResetCause::BypassPartition => "bypass_partition",
                         temporal::TemporalResetCause::LoopBoundary => "loop_boundary",
                         temporal::TemporalResetCause::Downbeat => "downbeat",
                         temporal::TemporalResetCause::BlackoutTransition => "blackout_transition",
@@ -21253,6 +21873,7 @@ impl App {
                         fps: layer.fps,
                         blend_mode: layer.blend_mode.key().to_string(),
                         bypass_master_fx: layer.bypass_master_fx,
+                        bypass_temporal_fx: layer.bypass_temporal_fx,
                         reroll_on_loop: layer.reroll_on_loop,
                         progress: layer.progress(),
                         key_mode: layer.effects.key_mode as u32,
@@ -23591,6 +24212,7 @@ impl ApplicationHandler for App {
                                 visible: layer.visible && layer.transport_visible(),
                                 paused: layer.paused,
                                 bypass_master_fx: layer.bypass_master_fx,
+                                bypass_temporal_fx: layer.bypass_temporal_fx,
                                 pattern: layer.pattern_params(),
                             }),
                     );
@@ -23639,6 +24261,9 @@ impl ApplicationHandler for App {
                         .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
                         .with_program_tap(renderer.program_tap_valid())
                         .with_studies(&self.study_library)
+                        .with_authored_motion_modulation(
+                            self.mod_matrix.has_authored_motion_routing(),
+                        )
                         .with_motion(
                             evaluated_master_motion,
                             &evaluated_layer_motion,
@@ -23714,6 +24339,9 @@ impl ApplicationHandler for App {
                             .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
                             .with_program_tap(renderer.program_tap_valid())
                             .with_studies(&self.study_library)
+                            .with_authored_motion_modulation(
+                                self.mod_matrix.has_authored_motion_routing(),
+                            )
                             .with_motion(
                                 evaluated_master_motion,
                                 &evaluated_layer_motion,
@@ -23803,6 +24431,9 @@ impl ApplicationHandler for App {
                                 .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
                                 .with_program_tap(renderer.program_tap_valid())
                                 .with_studies(&self.study_library)
+                                .with_authored_motion_modulation(
+                                    self.mod_matrix.has_authored_motion_routing(),
+                                )
                                 .with_motion(
                                     evaluated_master_motion,
                                     &evaluated_layer_motion,
@@ -24032,6 +24663,22 @@ impl ApplicationHandler for App {
                         .map_or(*evaluated_frame.temporal(), |plan| {
                             plan.effective_temporal()
                         });
+                    let temporal_bypass_overlay_active = evaluated_creative.as_ref().is_some_and(
+                        |plan| {
+                            plan.temporal_master_path()
+                                == evaluated_frame::evaluated_composition::TemporalMasterPath::IsolatedDryOverlay
+                        },
+                    );
+                    // Codec Mosh must sample the wet plate before the explicit
+                    // dry overlay. Advance its generation before either copy is
+                    // encoded so every async result names this exact partition.
+                    let mosh_active = mod_temporal.mosh.is_active() && !self.blackout;
+                    update_mosh_interval(
+                        mosh_active,
+                        &mut self.mosh_interval_active,
+                        &mut self.mosh_interval_generation,
+                        &mut self.mosh_presented,
+                    );
                     // The B14 sync latch draws its faults on the master
                     // random seed, taken from the same immutable frame sample
                     // every other consumer reads.
@@ -24166,6 +24813,7 @@ impl ApplicationHandler for App {
                     let mut advanced_encoded = false;
                     let mut advanced_audience_rendered = false;
                     let mut temporal_frame_accepted = false;
+                    let mut temporal_bypass_mosh_readback_to_map = None;
                     let mut scope_readback_to_map: Option<(
                         LiveCaptureFrameIntent,
                         renderer::readback::RecorderReadbackReservation,
@@ -24635,45 +25283,125 @@ impl ApplicationHandler for App {
                                     } else {
                                         None
                                     };
-                                    let legacy_render_result = renderer.render_evaluated_frame(
+                                    let mut legacy_render_result = renderer.render_evaluated_frame(
                                         &mut encoder,
                                         &frame_resources,
                                         &evaluated_frame,
                                     );
-                                    match &legacy_render_result {
-                                        Ok(()) => {
-                                            renderer.render_temporal_frame(
-                                                &mut encoder,
-                                                &mod_temporal,
-                                                temporal_input,
-                                            );
-                                            temporal_frame_accepted = true;
-                                            renderer.render_melting_edge(
-                                                &mut encoder,
-                                                &mod_temporal.melt,
-                                                temporal_input.program_advancing_delta(),
-                                            );
-                                            renderer.render_sync_latch(
-                                                &mut encoder,
-                                                &mod_temporal.sync,
-                                                mod_sync_seed,
-                                                temporal_input.program_advancing_delta(),
-                                            );
-                                            renderer.render_display_physics(
-                                                &mut encoder,
-                                                &mod_temporal.display,
-                                                temporal_input.program_advancing_delta(),
-                                            );
+                                    if legacy_render_result.is_ok() {
+                                        renderer.render_temporal_frame(
+                                            &mut encoder,
+                                            &mod_temporal,
+                                            temporal_input,
+                                        );
+                                        renderer.render_melting_edge(
+                                            &mut encoder,
+                                            &mod_temporal.melt,
+                                            temporal_input.program_advancing_delta(),
+                                        );
+                                        renderer.render_sync_latch(
+                                            &mut encoder,
+                                            &mod_temporal.sync,
+                                            mod_sync_seed,
+                                            temporal_input.program_advancing_delta(),
+                                        );
+                                        renderer.render_display_physics(
+                                            &mut encoder,
+                                            &mod_temporal.display,
+                                            temporal_input.program_advancing_delta(),
+                                        );
+
+                                        let audience_result = if temporal_bypass_overlay_active {
+                                            if mosh_active {
+                                                // Materialize the opaque wet plate first and
+                                                // copy it for Codec Mosh before the dry prefix
+                                                // is restored to the accepted programme.
+                                                renderer.render_opaque_output(&mut encoder);
+                                                let metadata = codec_mosh::MoshFrameMetadata {
+                                                    params: mod_temporal.mosh.sanitized(),
+                                                    ordinal: ntsc::reference_frame_for_time(
+                                                        elapsed_duration.as_secs_f64(),
+                                                    )
+                                                        as u64,
+                                                    seed: self.master_effects.random_seed,
+                                                    generation: self.mosh_interval_generation,
+                                                    ntsc: None,
+                                                };
+                                                match renderer.begin_readback(
+                                                    &mut encoder,
+                                                    self.visual_epoch,
+                                                    None,
+                                                    Some(metadata),
+                                                ) {
+                                                    Ok(slot) => {
+                                                        temporal_bypass_mosh_readback_to_map = slot;
+                                                    }
+                                                    Err(error) => {
+                                                        self.mosh_live_metrics.record_admission(
+                                                            ntsc::NtscSubmitOutcome::Unavailable,
+                                                        );
+                                                        self.output_error = format!(
+                                                            "Temporal-bypass wet Codec Mosh readback unavailable: {error}"
+                                                        );
+                                                        log::error!("{}", self.output_error);
+                                                    }
+                                                }
+                                                renderer
+                                                    .render_temporal_bypass_overlay_audience(
+                                                        &mut encoder,
+                                                        &frame_resources,
+                                                        &evaluated_frame,
+                                                    )
+                                                    .and_then(|rendered| {
+                                                        rendered.then_some(()).ok_or_else(|| {
+                                                            "Temporal bypass overlay was planned but rendered no layers"
+                                                                .to_string()
+                                                        })
+                                                    })
+                                            } else {
+                                                renderer
+                                                    .render_temporal_bypass_overlay_engine(
+                                                        &mut encoder,
+                                                        &frame_resources,
+                                                        &evaluated_frame,
+                                                    )
+                                                    .and_then(|rendered| {
+                                                        rendered.then_some(()).ok_or_else(|| {
+                                                            "Temporal bypass overlay was planned but rendered no layers"
+                                                                .to_string()
+                                                        })
+                                                    })
+                                                    .map(|()| {
+                                                        renderer.render_opaque_output(&mut encoder);
+                                                    })
+                                            }
+                                        } else {
                                             renderer.render_opaque_output(&mut encoder);
+                                            Ok(())
+                                        };
+                                        if let Err(error) = audience_result {
+                                            if temporal_bypass_mosh_readback_to_map.is_some() {
+                                                // The wet copy was already encoded before
+                                                // overlay failure. Map it only to recycle its
+                                                // slot; the new token makes its metadata stale.
+                                                self.mosh_interval_generation = self
+                                                    .mosh_interval_generation
+                                                    .wrapping_add(1)
+                                                    .max(1);
+                                                self.mosh_presented = None;
+                                            }
+                                            legacy_render_result = Err(error);
+                                        } else {
+                                            temporal_frame_accepted = true;
                                         }
-                                        Err(error) => {
-                                            // Slot 2 is the last accepted audience
-                                            // image. A rejected creative plan must
-                                            // neither replace it with black nor
-                                            // consume temporal/reset/Score events.
-                                            log::error!("Live frame plan rejected: {error}");
-                                            self.output_error.clone_from(error);
-                                        }
+                                    }
+                                    if let Err(error) = &legacy_render_result {
+                                        // Slot 2 is the last accepted audience
+                                        // image. A rejected creative plan must
+                                        // neither replace it with black nor
+                                        // consume temporal/reset/Score events.
+                                        log::error!("Live frame plan rejected: {error}");
+                                        self.output_error.clone_from(error);
                                     }
                                     if let Some((intent, reservation)) = legacy_scope_armed {
                                         match renderer
@@ -25011,7 +25739,11 @@ impl ApplicationHandler for App {
                             self.pending_gesture_canvas_events.clear();
                             return;
                         }
-                        renderer.commit_temporal_frame();
+                        if temporal_frame_accepted {
+                            renderer.commit_temporal_frame();
+                        } else {
+                            renderer.discard_temporal_frame();
+                        }
                         // The canvas shares the temporal acceptance decision
                         // exactly. A discarded frame rewinds the field, the
                         // decay clock, and the generation together.
@@ -25217,6 +25949,9 @@ impl ApplicationHandler for App {
                         if selective_required {
                             renderer.map_selective_ntsc_readback();
                         }
+                        if let Some(index) = temporal_bypass_mosh_readback_to_map {
+                            renderer.map_readback(index);
+                        }
                         if let Some(index) = selective_audience_readback {
                             renderer.map_readback(index);
                         }
@@ -25278,21 +26013,28 @@ impl ApplicationHandler for App {
                             );
                         }
                         let spout_active = self.spout_enabled && self.spout.is_running();
-                        // B5: the mosh wake law, sampled from this frame's
-                        // modulated temporal copy. Blackout disables the path
-                        // exactly as it disables NTSC.
-                        let mosh_active = mod_temporal.mosh.is_active() && !self.blackout;
-                        // Codec pixels, readbacks, worker jobs, and retained
-                        // output all belong to one continuous armed interval.
-                        // Linked Temporal dry keeps the visual epoch and warm
-                        // history intact, so advance this narrower token on
-                        // each edge; re-entry accepts only newly sampled work.
-                        update_mosh_interval(
-                            mosh_active,
-                            &mut self.mosh_interval_active,
-                            &mut self.mosh_interval_generation,
-                            &mut self.mosh_presented,
-                        );
+                        // `mosh_active` and its interval token were sampled
+                        // before encoding so an isolated dry prefix can tag a
+                        // wet-only GPU copy without entering the codec.
+                        if let Some(frame) = renderer.poll_post_mosh_overlay_readback() {
+                            if temporal_bypass_overlay_active
+                                && spout_active
+                                && mosh_sample_is_current(
+                                    frame.epoch,
+                                    frame.mosh_generation,
+                                    self.visual_epoch,
+                                    self.mosh_interval_generation,
+                                    mosh_active,
+                                )
+                            {
+                                self.spout.try_submit(
+                                    frame.pixels,
+                                    renderer.output_width,
+                                    renderer.output_height,
+                                    frame.epoch,
+                                );
+                            }
+                        }
                         // Harvest a completed raw readback. The generation tag
                         // rejects both pre-blackout content and delayed blackout
                         // frames that finish after the cut is released.
@@ -25416,7 +26158,7 @@ impl ApplicationHandler for App {
                                         frame.epoch,
                                     );
                                 }
-                            } else if spout_active {
+                            } else if spout_active && !mosh_active {
                                 self.spout.try_submit(
                                     frame.pixels,
                                     renderer.output_width,
@@ -25459,7 +26201,7 @@ impl ApplicationHandler for App {
                                     self.mosh_interval_generation,
                                     mosh_active,
                                 ) {
-                                    if spout_active {
+                                    if spout_active && !temporal_bypass_overlay_active {
                                         self.spout.try_submit(
                                             processed.pixels.clone(),
                                             renderer.output_width,
@@ -25486,7 +26228,8 @@ impl ApplicationHandler for App {
                             ntsc_path,
                             spout_active,
                             mosh_active,
-                        );
+                        ) && !(temporal_bypass_overlay_active
+                            && mosh_active);
                         if need_raw_readback {
                             let mut ntsc_metadata =
                                 (ntsc_path == LiveNtscPath::LegacyGlobal).then(|| {
@@ -25573,7 +26316,10 @@ impl ApplicationHandler for App {
                         // and owns the write while armed: until its first
                         // result lands the audience keeps the clean composite
                         // rather than a frozen VHS-only frame.
-                        if mosh_active {
+                        let mut mosh_replacement_written = false;
+                        if mosh_active
+                            && (!temporal_bypass_overlay_active || temporal_frame_accepted)
+                        {
                             if let Some((epoch, generation, pixels)) = self.mosh_presented.as_ref()
                             {
                                 if mosh_sample_is_current(
@@ -25584,8 +26330,81 @@ impl ApplicationHandler for App {
                                     mosh_active,
                                 ) {
                                     renderer.write_composite(pixels);
+                                    mosh_replacement_written = true;
                                 }
                             }
+                        }
+
+                        let mut temporal_overlay_audience_ready = temporal_frame_accepted;
+                        if temporal_bypass_overlay_active && mosh_active && mosh_replacement_written
+                        {
+                            match renderer.render_temporal_bypass_overlay_audience(
+                                &mut encoder,
+                                &frame_resources,
+                                &evaluated_frame,
+                            ) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    temporal_overlay_audience_ready = false;
+                                    self.output_error =
+                                        "Temporal bypass post-Mosh overlay rendered no layers"
+                                            .to_string();
+                                    log::error!("{}", self.output_error);
+                                }
+                                Err(error) => {
+                                    temporal_overlay_audience_ready = false;
+                                    self.output_error = format!(
+                                        "Temporal bypass post-Mosh overlay failed: {error}"
+                                    );
+                                    log::error!("{}", self.output_error);
+                                }
+                            }
+                        }
+
+                        let post_mosh_overlay_readback = if temporal_bypass_overlay_active
+                            && mosh_active
+                            && spout_active
+                            && temporal_overlay_audience_ready
+                        {
+                            match renderer.begin_post_mosh_overlay_readback(
+                                &mut encoder,
+                                self.visual_epoch,
+                                self.mosh_interval_generation,
+                            ) {
+                                Ok(scheduled) => scheduled,
+                                Err(error) => {
+                                    self.output_error = format!(
+                                        "Temporal-bypass final Spout readback unavailable: {error}"
+                                    );
+                                    log::error!("{}", self.output_error);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if post_mosh_overlay_readback {
+                            renderer.queue.submit(std::iter::once(encoder.finish()));
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
+                            renderer.map_post_mosh_overlay_readback();
+                            if exit_on_renderer_device_loss(
+                                renderer,
+                                &mut self.output_error,
+                                event_loop,
+                            ) {
+                                return;
+                            }
+                            encoder = renderer.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor {
+                                    label: Some("Post-Mosh Temporal Overlay Audience Encoder"),
+                                },
+                            );
                         }
 
                         // Absolute final image operation: the emergency cut wins
@@ -26646,6 +27465,7 @@ mod app_state_tests {
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 pattern: None,
             }],
         );
@@ -26740,7 +27560,7 @@ mod app_state_tests {
         // publish/dispose the held audience snapshot.
         let source = include_str!("main.rs").replace("\r\n", "\n");
         let exact_match = source
-            .find("let legacy_render_result = renderer.render_evaluated_frame(")
+            .find("let mut legacy_render_result = renderer.render_evaluated_frame(")
             .expect("LegacyExact creative acceptance match");
         let exact_tail = &source[exact_match..];
         let rejection = exact_tail
@@ -27505,6 +28325,47 @@ mod app_state_tests {
         assert_eq!(
             creative_commit_impact(true, false, true),
             CreativeCommitImpact::TopologyOrStack
+        );
+    }
+
+    #[test]
+    fn accepted_morph_transactions_choose_exactly_one_retained_pixel_reset() {
+        assert_eq!(
+            morph_partition_reset(false, false),
+            MorphPartitionReset::None
+        );
+        assert_eq!(
+            morph_partition_reset(true, false),
+            MorphPartitionReset::BypassPartition
+        );
+        assert_eq!(
+            morph_partition_reset(false, true),
+            MorphPartitionReset::SourceCut
+        );
+        assert_eq!(
+            morph_partition_reset(true, true),
+            MorphPartitionReset::SourceCut,
+            "the hard SourceCut owns the partition reset instead of doubling it"
+        );
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let initial_epoch = app.visual_epoch;
+        app.finish_accepted_morph_partition_transaction(false, false);
+        assert_eq!(app.visual_epoch, initial_epoch, "no change has no reset");
+
+        app.finish_accepted_morph_partition_transaction(true, false);
+        assert_eq!(
+            app.visual_epoch,
+            initial_epoch.wrapping_add(1),
+            "a materialized partition change resets exactly once"
+        );
+
+        let before_hard_barrier = app.visual_epoch;
+        app.finish_accepted_morph_partition_transaction(true, true);
+        assert_eq!(
+            app.visual_epoch,
+            before_hard_barrier.wrapping_add(1),
+            "SourceCut plus a partition change still resets exactly once"
         );
     }
 
@@ -29799,6 +30660,7 @@ mod app_state_tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: true,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }],
             )
@@ -32145,6 +33007,232 @@ mod app_state_tests {
     }
 
     #[test]
+    fn temporal_bypass_is_an_independent_boolean_layer_control() {
+        use performance_track::{PerformanceControl, PerformanceValueLaw};
+        use web::state::WebAction;
+
+        assert_eq!(
+            App::layer_param_morph_control("bypass_temporal_fx", &serde_json::Value::Bool(true)),
+            Some(morph::LayerMorphControl::BypassTemporalFx)
+        );
+        assert_eq!(
+            App::layer_param_morph_control("bypass_temporal_fx", &serde_json::json!(1)),
+            None,
+            "Temporal bypass accepts only a JSON boolean"
+        );
+        assert_eq!(
+            App::performance_value_law_for(&PerformanceControl::LayerParam {
+                layer: 0,
+                param: "bypass_temporal_fx".to_string(),
+            }),
+            Some(PerformanceValueLaw::Toggle)
+        );
+
+        let action = WebAction::SetLayerParam {
+            index: 0,
+            layer_id: Some("17".to_string()),
+            param: "bypass_temporal_fx".to_string(),
+            value: serde_json::Value::Bool(true),
+        };
+        assert!(App::action_conflicts_with_applied_look(
+            &action,
+            &legacy_look_scope(vec![17], false, false),
+        ));
+        assert!(!App::action_conflicts_with_applied_look(
+            &action,
+            &legacy_look_scope(vec![18], false, false),
+        ));
+    }
+
+    #[test]
+    fn temporal_bypass_sensitive_mutations_use_detached_admission_before_publish() {
+        assert!(App::temporal_edit_requires_partition_preflight(
+            "garden_amount"
+        ));
+        assert!(App::temporal_edit_requires_partition_preflight(
+            "garden_gate"
+        ));
+        assert!(!App::temporal_edit_requires_partition_preflight(
+            "garden_decay"
+        ));
+
+        let source = include_str!("main.rs");
+        let patch_start = source
+            .find("fn apply_loaded_patch_with_history_identity(")
+            .expect("patch transaction");
+        let patch_end = source[patch_start..]
+            .find("fn layer_action_targets_look(")
+            .map(|offset| patch_start + offset)
+            .expect("patch transaction end");
+        let patch_body = &source[patch_start..patch_end];
+        let patch_preflight = patch_body
+            .find("preflight_creative_graph_with_visuals_for_layers(")
+            .expect("detached patch preflight");
+        let patch_publish = patch_body
+            .find("self.master_effects = staged_master_effects;")
+            .expect("patch publish boundary");
+        assert!(patch_preflight < patch_publish);
+
+        let move_start = source
+            .find("fn move_layer_transactional(")
+            .expect("move transaction");
+        let move_end = source[move_start..]
+            .find("fn resolve_layer_index(")
+            .map(|offset| move_start + offset)
+            .expect("move transaction end");
+        let move_body = &source[move_start..move_end];
+        let move_preflight = move_body
+            .find("preflight_creative_graph_with_visuals_for_layers(")
+            .expect("prospective-order preflight");
+        let move_publish = move_body
+            .find("self.layers.remove(from)")
+            .expect("stack mutation boundary");
+        assert!(move_preflight < move_publish);
+        assert!(
+            move_body.contains("release_active_morph_for_manual_edit_with_partition_reset(false)")
+        );
+
+        let feedback_start = source
+            .find("fn handle_web_action_inner_with_feedback(")
+            .expect("feedback dispatcher");
+        let feedback_end = source[feedback_start..]
+            .find("fn handle_web_action(")
+            .map(|offset| feedback_start + offset)
+            .expect("feedback dispatcher end");
+        let feedback_body = &source[feedback_start..feedback_end];
+        assert!(feedback_body.contains("apply_temporal_partition_sensitive_action(param, value)"));
+        assert!(feedback_body.contains("if accepted && self.performance_recording"));
+
+        assert!(source.contains("} else if spout_active && !mosh_active {"));
+    }
+
+    #[test]
+    fn morph_wrapped_transactions_defer_resets_until_acceptance() {
+        fn function_body<'a>(source: &'a str, start: &str, next: &str) -> &'a str {
+            let start = source.find(start).unwrap_or_else(|| panic!("{start}"));
+            let end = source[start..]
+                .find(next)
+                .map(|offset| start + offset)
+                .unwrap_or_else(|| panic!("{next}"));
+            &source[start..end]
+        }
+
+        let source = include_str!("main.rs");
+        let ntsc = function_body(
+            source,
+            "fn apply_ntsc_param_action(",
+            "fn temporal_edit_requires_partition_preflight(",
+        );
+        let creative = function_body(
+            source,
+            "fn commit_creative_graph_with_mattes(",
+            "fn handle_creative_web_action(",
+        );
+        let add = function_body(source, "fn commit_new_bottom_layer(", "fn add_layer(");
+        let remove = function_body(
+            source,
+            "fn remove_layer_transactional(",
+            "fn move_layer_transactional(",
+        );
+        let matte = function_body(
+            source,
+            "fn commit_layer_matte_candidate(",
+            "fn cached_slot_is_prepared(",
+        );
+        let motion = function_body(
+            source,
+            "fn handle_motion_web_action(",
+            "fn history_action_is_performance_only(",
+        );
+        let preset = function_body(source, "fn apply_scoped_preset(", "fn normalized_range(");
+
+        for (name, body) in [
+            ("NTSC", ntsc),
+            ("creative graph", creative),
+            ("layer add", add),
+            ("layer remove", remove),
+            ("layer matte", matte),
+            ("Motion", motion),
+            ("scoped preset", preset),
+        ] {
+            assert!(
+                body.contains("release_active_morph_for_manual_edit_with_partition_reset(false)"),
+                "{name} must suppress the eager partition reset"
+            );
+            assert!(
+                !body.contains("release_active_morph_for_manual_edit()"),
+                "{name} must not leak an eager reset before its transaction accepts"
+            );
+        }
+
+        for (name, body) in [
+            ("NTSC", ntsc),
+            ("creative graph", creative),
+            ("layer matte", matte),
+            ("Motion", motion),
+            ("scoped preset", preset),
+        ] {
+            assert!(
+                body.contains("finish_accepted_morph_partition_transaction("),
+                "{name} must choose its one reset only on an accepted path"
+            );
+        }
+
+        for (name, body, preflight, publish) in [
+            (
+                "creative graph",
+                creative,
+                "preflight_creative_graph_with_visuals_for_layers(",
+                "self.move_layer_storage_without_revision(from, to);",
+            ),
+            (
+                "layer matte",
+                matte,
+                "self.preflight_creative_graph_with_mattes(&post_morph_graph",
+                "self.layers[index].matte = candidate;",
+            ),
+        ] {
+            let release = body
+                .find("release_active_morph_for_manual_edit_with_partition_reset(false)")
+                .expect("Morph release");
+            let post_preflight = body[release..]
+                .find(preflight)
+                .map(|offset| release + offset)
+                .unwrap_or_else(|| panic!("{name} post-Morph preflight"));
+            let rollback = body[post_preflight..]
+                .find("world.install(self);")
+                .map(|offset| post_preflight + offset)
+                .unwrap_or_else(|| panic!("{name} rollback"));
+            let publish = body
+                .find(publish)
+                .unwrap_or_else(|| panic!("{name} publish"));
+            assert!(release < post_preflight && post_preflight < rollback && rollback < publish);
+            assert!(
+                body[post_preflight..].contains("return Err("),
+                "{name} must refuse before publication"
+            );
+        }
+        assert!(
+            creative.contains("let runtime_layers = desired"),
+            "creative root moves must preflight in prospective stable-ID order"
+        );
+
+        for (name, body) in [("layer add", add), ("layer remove", remove)] {
+            assert_eq!(
+                body.matches("self.invalidate_source_cut_generation();")
+                    .count(),
+                1,
+                "{name} accepts with one hard SourceCut"
+            );
+            assert!(
+                !body.contains("finish_accepted_morph_partition_transaction("),
+                "{name}'s SourceCut already owns the partition reset"
+            );
+        }
+        assert!(add.contains("world.install(self);"));
+    }
+
+    #[test]
     fn successful_patch_dispositions_filter_only_the_remaining_conflicting_scope() {
         use web::state::{RerollMode, RerollScope, WebAction};
 
@@ -33525,7 +34613,7 @@ mod app_state_tests {
             .find(".begin_legacy_scope_recorder_readback(intent.tag)")
             .unwrap();
         let exact_render = source
-            .find("let legacy_render_result = renderer.render_evaluated_frame(")
+            .find("let mut legacy_render_result = renderer.render_evaluated_frame(")
             .unwrap();
         let exact_finish = source
             .find(".finish_legacy_scope_recorder_readback(reservation)")
@@ -35043,6 +36131,20 @@ mod app_state_tests {
                 value: serde_json::json!(0.5),
             })
             .is_none());
+
+        // Routing topology is never a performance event. In particular, a
+        // Motion-target candidate refused by the Temporal-bypass policy cannot
+        // be claimed by the take recorder before admission decides it.
+        assert!(app
+            .performance_record_view(&web::state::WebAction::SetRouting {
+                index: 0,
+                route_id: None,
+                target_layer_id: None,
+                layer_stack_revision: None,
+                param: "target".to_string(),
+                value: serde_json::json!("motion_shutter_angle"),
+            })
+            .is_none());
     }
 
     #[test]
@@ -35387,6 +36489,13 @@ mod app_state_tests {
             panic!("blend_mode is a closed vocabulary");
         };
         assert_eq!(vocab.len(), 25, "every blend mode from the engine table");
+        assert_eq!(
+            law(Control::LayerParam {
+                layer: 0,
+                param: "bypass_temporal_fx".to_string(),
+            }),
+            Some(Law::Toggle)
+        );
         let Some(Law::Discrete { vocab }) = law(Control::BusMix {
             param: "blend".to_string(),
         }) else {

@@ -159,6 +159,7 @@ impl SyncLatchGpu {
                 | TemporalResetCause::BroadRevert
                 | TemporalResetCause::Resize
                 | TemporalResetCause::ManualClear
+                | TemporalResetCause::BypassPartition
         );
         if clears {
             self.state.clear();

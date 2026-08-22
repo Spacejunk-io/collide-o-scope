@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::composition::{CompositionTree, RuntimeComposition};
 use crate::effects::EffectUniforms;
 use crate::evaluated_frame::evaluated_composition::{
-    AdvancedNtscPath, CompositionPlanInput, EvaluatedCompositionPlan,
+    AdvancedNtscPath, CompositionPlanInput, EvaluatedCompositionPlan, TemporalMasterPath,
 };
 use crate::evaluated_frame::{
     EvaluatedFramePlan, FramePlanContext, LayerFrameInput, MasterFrameInput, ResolvedImageInput,
@@ -41,8 +41,8 @@ use crate::renderer::compositor::{
     MatteResourceLimits, MatteResourcePlan,
 };
 use crate::renderer::state::{
-    conditional_layer_slots, master_fx_composition_path, visible_stack_indices,
-    MasterFxCompositionPath,
+    conditional_layer_slots, master_fx_composition_path, temporal_bypass_overlay_active,
+    temporal_bypass_overlay_indices, visible_stack_indices, MasterFxCompositionPath,
 };
 use crate::spatial::{EffectPassUniforms, SpatialTransform};
 use crate::transport::{
@@ -1601,6 +1601,147 @@ struct CompositeUniforms {
     _pad: [f32; 2],
 }
 
+/// Export has two exact dry-overlay seams. Without Codec Mosh the authored
+/// prefix can be reapplied on the GPU before the established opaque resolve.
+/// With Codec Mosh, the first resolve/readback must remain wet-only; the dry
+/// prefix is rendered once for the pre-mosh analysis/program tap and again on
+/// top of the returned moshed wet audience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportTemporalBypassMode {
+    Inactive,
+    BeforeOpaque,
+    AroundCodecMosh,
+}
+
+fn export_temporal_bypass_mode(
+    path: TemporalMasterPath,
+    codec_mosh_active: bool,
+) -> ExportTemporalBypassMode {
+    match (path, codec_mosh_active) {
+        (TemporalMasterPath::IsolatedDryOverlay, false) => ExportTemporalBypassMode::BeforeOpaque,
+        (TemporalMasterPath::IsolatedDryOverlay, true) => ExportTemporalBypassMode::AroundCodecMosh,
+        (TemporalMasterPath::Inherited | TemporalMasterPath::LinkedDry, _) => {
+            ExportTemporalBypassMode::Inactive
+        }
+    }
+}
+
+/// Back-to-front indices admitted to the shared wet accumulation. The extra
+/// predicate is dormant unless at least one dry layer contributes, preserving
+/// the established layer list and command order for every old frame.
+fn export_temporal_wet_stack_indices(evaluated: &EvaluatedFramePlan) -> Vec<usize> {
+    let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
+    visible_stack_indices(
+        evaluated.layers().iter().map(|layer| {
+            layer.visible && (!isolated_temporal_overlay || !layer.bypass_temporal_fx)
+        }),
+    )
+}
+
+/// Whether the isolated route has any visible, non-zero wet contribution for
+/// the global Master pass to process. This mirrors live's all-dry fast path and
+/// avoids a full-frame shader pass over a defined transparent base.
+fn export_temporal_wet_layer_contributes(evaluated: &EvaluatedFramePlan) -> bool {
+    evaluated.layers().iter().any(|layer| {
+        let opacity_contributes = layer.opacity > 0.0 || !layer.opacity.is_finite();
+        layer.visible && !layer.bypass_temporal_fx && opacity_contributes
+    })
+}
+
+/// Bottom-to-top dry sources, paired with their immutable evaluated slots.
+/// Keeping this plan CPU-visible lets export validate every deferred texture
+/// before it opens a stateful Temporal transaction.
+fn export_temporal_bypass_overlay_sources(
+    evaluated: &EvaluatedFramePlan,
+) -> Vec<(usize, SourceTap)> {
+    temporal_bypass_overlay_indices(evaluated)
+        .into_iter()
+        .map(|layer_index| (layer_index, evaluated.layers()[layer_index].source))
+        .collect()
+}
+
+/// Legacy ProgramHistory is captured before Temporal. During isolated bypass
+/// that seam contains only the wet partition, so publishing it would expose a
+/// composition that is never visible. Hold the history invalid until the
+/// partition returns to the inherited path.
+fn export_may_publish_legacy_program_history(evaluated: &EvaluatedFramePlan) -> bool {
+    !temporal_bypass_overlay_active(evaluated)
+}
+
+/// Observe the authored dry/wet membership without allocating after the first
+/// frame. A first observation seeds an empty Temporal machine; every later
+/// difference is a hard partition edge, even when Program Freeze supplies a
+/// zero delta for that frame.
+fn observe_export_temporal_bypass_partition(
+    previous: &mut Vec<bool>,
+    initialized: &mut bool,
+    evaluated: &EvaluatedFramePlan,
+) -> bool {
+    let changed = *initialized
+        && (previous.len() != evaluated.layers().len()
+            || previous
+                .iter()
+                .zip(evaluated.layers())
+                .any(|(prior, layer)| *prior != layer.bypass_temporal_fx));
+    previous.clear();
+    previous.extend(
+        evaluated
+            .layers()
+            .iter()
+            .map(|layer| layer.bypass_temporal_fx),
+    );
+    *initialized = true;
+    changed
+}
+
+/// Mirror live's interval-generation law for the synchronous export owner.
+/// Codec/recycle history belongs to one continuously armed interval; a dry
+/// edge and a later re-arm must never resume the old MPEG-4 stream.
+fn update_export_mosh_interval<T>(active: bool, was_active: &mut bool, retained: &mut Option<T>) {
+    if *was_active != active {
+        *was_active = active;
+        *retained = None;
+    } else if !active {
+        *retained = None;
+    }
+}
+
+/// Allocate the one isolated-Mosh programme candidate at the frame preflight
+/// boundary. This is deliberately synchronous and checked: once Temporal,
+/// Melt, Sync, or Display has encoded, no cold full-frame allocation remains.
+fn ensure_export_temporal_bypass_program_candidate(
+    device: &wgpu::Device,
+    retained: &mut Option<wgpu::Texture>,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    if retained.is_some() {
+        return Ok(());
+    }
+    let candidate = scoped_export_gpu_operation(
+        device,
+        format!("export Temporal-bypass programme candidate at {width}x{height}"),
+        || {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Export Temporal Bypass Program Candidate"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        },
+    )?;
+    *retained = Some(candidate);
+    Ok(())
+}
+
 /// Upload one small export uniform without mapping the new buffer.
 ///
 /// `DeviceExt::create_buffer_init` maps at creation and immediately accesses
@@ -1771,6 +1912,7 @@ struct ExportLayer {
     opacity: f32,
     blend_mode: BlendMode,
     bypass_master_fx: bool,
+    bypass_temporal_fx: bool,
     matte: LayerMatte,
     reroll_on_loop: bool,
     consumed_loop_generation: u64,
@@ -2601,6 +2743,7 @@ struct ExportFrameLayerBase {
     visible: bool,
     paused: bool,
     bypass_master_fx: bool,
+    bypass_temporal_fx: bool,
     /// B7 pattern-synth base, present only for a pattern layer. Morph
     /// samples write into it exactly as they write effects, so the shared
     /// evaluator sees the same post-morph base live rendering sees.
@@ -2619,6 +2762,7 @@ impl From<&ExportLayer> for ExportFrameLayerBase {
             visible: layer.visible,
             paused: layer.paused,
             bypass_master_fx: layer.bypass_master_fx,
+            bypass_temporal_fx: layer.bypass_temporal_fx,
             pattern: layer.pattern,
         }
     }
@@ -2986,6 +3130,7 @@ fn black_placeholder_layer(
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
         matte: LayerMatte::default(),
         reroll_on_loop: false,
         consumed_loop_generation: 0,
@@ -3075,6 +3220,7 @@ fn pattern_export_layer(
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
         matte: LayerMatte::default(),
         reroll_on_loop: false,
         consumed_loop_generation: 0,
@@ -3157,6 +3303,7 @@ fn text_page_export_layer(
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
         matte: LayerMatte::default(),
         reroll_on_loop: false,
         consumed_loop_generation: 0,
@@ -3226,6 +3373,7 @@ fn still_export_layer(
         opacity: layer_cfg.opacity,
         blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
         bypass_master_fx: layer_cfg.bypass_master_fx,
+        bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
         matte: LayerMatte::default(),
         reroll_on_loop: false,
         consumed_loop_generation: 0,
@@ -3714,6 +3862,9 @@ fn apply_export_morph_world(
             if let Some(bypass_master_fx) = sampled.bypass_master_fx {
                 world.layer_bases[position].bypass_master_fx = bypass_master_fx;
             }
+            if let Some(bypass_temporal_fx) = sampled.bypass_temporal_fx {
+                world.layer_bases[position].bypass_temporal_fx = bypass_temporal_fx;
+            }
         }
     }
 }
@@ -3794,6 +3945,7 @@ fn evaluate_export_morph_world(
                 visible: base.visible,
                 paused: base.paused,
                 bypass_master_fx: base.bypass_master_fx,
+                bypass_temporal_fx: base.bypass_temporal_fx,
                 pattern: base.pattern.as_ref(),
             }),
     )
@@ -3806,6 +3958,9 @@ struct ExportMotionPlanAdapter<'a> {
     sources: &'a [ExportLayer],
     limits: crate::motion::MotionDeviceLimits,
     modulation: &'a crate::modulation::ModulationFrame,
+    /// Authored route topology, deliberately independent of this frame's
+    /// deterministic source samples.
+    authored_motion_modulation: bool,
     shutter_samples: ExportShutterSamples,
     /// `None` uses decoder-advertised status for the first pure plan. A retry
     /// supplies the exact rasterization/attachment outcome aligned with
@@ -4598,7 +4753,10 @@ fn plan_export_composition_inner(
             // admission flips true at the first accepted frame, after which
             // both sides plan a routed tap identically.
             .with_program_tap(true)
-            .with_studies(&graph.studies);
+            .with_studies(&graph.studies)
+            .with_authored_motion_modulation(
+                motion.is_some_and(|motion| motion.authored_motion_modulation),
+            );
     input.resource_limits = resource_limits;
     if let (Some(motion), Some((master, layers))) = (motion, planned_motion.as_ref()) {
         input = input.with_motion(*master, layers, motion.limits);
@@ -4750,6 +4908,28 @@ fn export_recorded_gesture_track(
         .map_err(|error| format!("recorded gesture track rejected before rendering: {error}"))
 }
 
+/// Whether a validated performance take can ever author the explicit dry
+/// partition during this job. Scan the bounded event/address tables once at
+/// admission; waiting until the event's frame would create a partial export
+/// even though the incompatibility was knowable before FFmpeg started.
+fn performance_take_authors_temporal_bypass(
+    take: &crate::performance_track::PerformanceTake,
+) -> bool {
+    use crate::performance_track::{PerformanceControl as Control, PerformanceRawValue as Raw};
+    take.events().iter().any(|event| {
+        let Some(address) = take.addresses().get(usize::from(event.address)) else {
+            return false;
+        };
+        matches!(
+            (&address.control, address.law.decode(event.value)),
+            (
+                Control::LayerParam { param, .. },
+                Some(Raw::Toggle(true))
+            ) if param == "bypass_temporal_fx"
+        )
+    })
+}
+
 /// Apply one replayed B9 performance event to the export job's authored
 /// bases.
 ///
@@ -4824,6 +5004,9 @@ fn apply_export_performance_event(
                     }
                 }
                 ("bypass_master_fx", Raw::Toggle(value)) => target.bypass_master_fx = *value,
+                ("bypass_temporal_fx", Raw::Toggle(value)) => {
+                    target.bypass_temporal_fx = *value;
+                }
                 (key, _) if key.starts_with("key_") => {
                     if let Some(value) = json {
                         apply_effects(&mut target.effects, key, &value);
@@ -5331,6 +5514,11 @@ fn run_export(
         view_formats: &[],
     });
     let program_tap_view = program_tap_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    // Codec Mosh is a synchronous CPU replacement. When a top prefix bypasses
+    // Temporal, retain the pre-mosh wet+dry programme transactionally until
+    // ffmpeg accepts the corresponding moshed-wet+dry frame. The surface stays
+    // lazy so every pre-bypass export keeps its established allocation set.
+    let mut temporal_bypass_program_candidate: Option<wgpu::Texture> = None;
     let (opaque_output_pipeline, opaque_output_bind_group_layout) =
         crate::renderer::state::build_opaque_output_pipeline(&device);
     let opaque_output_bind_group = crate::renderer::state::build_opaque_output_bind_group(
@@ -5682,6 +5870,7 @@ fn run_export(
             opacity: layer_cfg.opacity,
             blend_mode: configured_blend_mode(&layer_cfg.blend_mode),
             bypass_master_fx: layer_cfg.bypass_master_fx,
+            bypass_temporal_fx: layer_cfg.bypass_temporal_fx,
             matte: LayerMatte::default(),
             reroll_on_loop: layer_cfg.reroll_on_loop,
             transport,
@@ -5751,6 +5940,7 @@ fn run_export(
     // makes two renders on this host byte-identical; a missing mpeg4 pair is
     // an actionable export error, never a silent bypass.
     let mut mosh_engine: Option<crate::codec_mosh::MoshEngine> = None;
+    let mut mosh_interval_active = false;
     let mut mosh_used = false;
 
     // --- Modulation matrix (deterministic: beat derived from frame index) ---
@@ -5766,6 +5956,16 @@ fn run_export(
             &base_creative_graph.composition,
         );
     }
+    let authored_motion_modulation = mod_matrix.has_authored_motion_routing();
+    let patch_or_morph_authors_temporal_bypass =
+        patch.layers.iter().any(|layer| layer.bypass_temporal_fx)
+            || patch.morph.as_ref().is_some_and(|snapshot| {
+                [snapshot.a.as_ref(), snapshot.b.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|slot| slot.layers.iter())
+                    .any(|layer| layer.bypass_temporal_fx == Some(true))
+            });
     let analysis_clip = if mod_matrix.audio_enabled
         && mod_matrix.audio_source_kind == crate::modulation::AUDIO_SOURCE_FILE
     {
@@ -5807,6 +6007,8 @@ fn run_export(
     let mut base_temporal =
         resolved_export_patch_temporal(patch.temporal.as_ref(), &base_creative_graph.layer_ids);
     let mut temporal_state = crate::renderer::state::TemporalState::default();
+    let mut previous_temporal_bypass_partition = Vec::with_capacity(layers.len());
+    let mut temporal_bypass_partition_initialized = false;
     let mut temporal_boundaries = crate::performance::BeatBoundaryTracker::default();
     let mut temporal_audio_onsets = crate::temporal::TemporalAudioOnsetTracker::default();
     let recorded_temporal_track = config.temporal_event_track.clone();
@@ -5863,6 +6065,14 @@ fn run_export(
         }
         None => None,
     };
+    let performance_authors_temporal_bypass = performance_replay
+        .as_ref()
+        .is_some_and(|(take, _)| performance_take_authors_temporal_bypass(take));
+    mod_matrix
+        .validate_temporal_bypass_motion_routing(
+            patch_or_morph_authors_temporal_bypass || performance_authors_temporal_bypass,
+        )
+        .map_err(|error| format!("export Temporal-bypass admission failed: {error}"))?;
     let mut base_gesture_canvas = patch.gesture_canvas.unwrap_or_default().to_params();
     let gesture_canvas_limits = crate::gesture_canvas::GestureCanvasLimits::device(
         max_dimension,
@@ -6107,6 +6317,7 @@ fn run_export(
                         sources: &layers,
                         limits: motion_device_limits,
                         modulation: &modulation_frame,
+                        authored_motion_modulation,
                         shutter_samples: config.shutter_samples,
                         codec_availability: None,
                     },
@@ -6398,6 +6609,7 @@ fn run_export(
                         visible: base.visible,
                         paused: base.paused,
                         bypass_master_fx: base.bypass_master_fx,
+                        bypass_temporal_fx: base.bypass_temporal_fx,
                         pattern: base.pattern.as_ref(),
                     },
                 ),
@@ -6414,6 +6626,7 @@ fn run_export(
                 sources: &layers,
                 limits: motion_device_limits,
                 modulation: &modulation_frame,
+                authored_motion_modulation,
                 shutter_samples: config.shutter_samples,
                 codec_availability: None,
             },
@@ -6459,6 +6672,7 @@ fn run_export(
                     sources: &layers,
                     limits: motion_device_limits,
                     modulation: &modulation_frame,
+                    authored_motion_modulation,
                     shutter_samples: config.shutter_samples,
                     codec_availability: Some(&codec_availability),
                 },
@@ -6484,6 +6698,84 @@ fn run_export(
         // owns the linked Temporal-bypass law. This copy is neutral only for
         // the rendered frame; authored/modulated temporal state stays intact.
         let mod_temporal = evaluated_composition.effective_temporal();
+        let mosh_active = mod_temporal.mosh.is_active();
+        let temporal_bypass_mode =
+            export_temporal_bypass_mode(evaluated_composition.temporal_master_path(), mosh_active);
+        if temporal_bypass_overlay_active(&evaluated_frame)
+            != (temporal_bypass_mode != ExportTemporalBypassMode::Inactive)
+        {
+            write_error =
+                Some("isolated Temporal bypass planner/export classification mismatch".to_string());
+            break;
+        }
+        if temporal_bypass_mode != ExportTemporalBypassMode::Inactive && mod_ntsc.enabled {
+            write_error = Some(
+                "isolated Temporal bypass reached export with VHS enabled; planner must reject this topology"
+                    .to_string(),
+            );
+            break;
+        }
+        if temporal_bypass_mode != ExportTemporalBypassMode::Inactive {
+            match preflight_temporal_bypass_overlay_resources(&layers, &evaluated_frame, w, h) {
+                Ok(resources) if !resources.is_empty() => {}
+                Ok(_) => {
+                    gesture_canvas.discard_staged();
+                    write_error = Some(
+                        "temporal bypass export plan had no contributing dry overlay".to_string(),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    gesture_canvas.discard_staged();
+                    write_error = Some(format!(
+                        "temporal bypass export resource preflight failed: {error}"
+                    ));
+                    break;
+                }
+            }
+        }
+        if temporal_bypass_mode == ExportTemporalBypassMode::AroundCodecMosh {
+            if let Err(error) = ensure_export_temporal_bypass_program_candidate(
+                &device,
+                &mut temporal_bypass_program_candidate,
+                w,
+                h,
+            ) {
+                gesture_canvas.discard_staged();
+                write_error = Some(format!(
+                    "temporal bypass export candidate preflight failed: {error}"
+                ));
+                break;
+            }
+        }
+        update_export_mosh_interval(mosh_active, &mut mosh_interval_active, &mut mosh_engine);
+        if observe_export_temporal_bypass_partition(
+            &mut previous_temporal_bypass_partition,
+            &mut temporal_bypass_partition_initialized,
+            &evaluated_frame,
+        ) {
+            // Membership is part of the Temporal machine's input identity.
+            // Rebase every memory that may still contain pixels from a newly
+            // dry layer. `BypassPartition` is HARD, so this also invalidates a
+            // paused freeze hold and rebuilds it from the new wet stack.
+            temporal_state.reset_for(crate::temporal::TemporalResetCause::BypassPartition);
+            melting_edge_gpu.invalidate_history();
+            display_physics_gpu.invalidate_memory();
+            sync_latch_gpu.reset_for(crate::temporal::TemporalResetCause::BypassPartition);
+            if let Some(resources) = image_routing_gpu.as_mut() {
+                // Legacy ProgramHistory is partitioned composition state too:
+                // neither a prior full stack nor an isolated wet-only stack
+                // may become the N-1 donor after membership changes.
+                resources.history_valid = false;
+            }
+            if let Some(executor) = composition_gpu.as_mut() {
+                executor.reset_temporal_bypass_partition();
+            }
+            // Codec Mosh owns decoded/recycled prior images outside the GPU
+            // Temporal state. Dropping the synchronous engine is its exact
+            // generation cut; it reopens lazily if this frame remains armed.
+            mosh_engine = None;
+        }
         for warning in export_motion_plan_warnings(&evaluated_composition) {
             if emitted_motion_warnings.insert(warning.clone()) {
                 progress.record_warning(warning);
@@ -6916,6 +7208,45 @@ fn run_export(
                     &mod_temporal.display,
                     temporal_input.program_advancing_delta(),
                 );
+                if temporal_bypass_mode == ExportTemporalBypassMode::BeforeOpaque {
+                    let overlay = render_temporal_bypass_overlay_export(
+                        &device,
+                        &queue,
+                        &mut encoder,
+                        &layers,
+                        &evaluated_frame,
+                        &composite_textures,
+                        &composite_views,
+                        &effects_pipeline,
+                        &effects_bind_group_layout,
+                        &effects_uniform_layout,
+                        &composite_pipeline,
+                        &composite_bind_group_layout,
+                        &composite_uniform_layout,
+                        &sampler,
+                        &nearest_sampler,
+                        w,
+                        h,
+                    );
+                    match overlay {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            temporal_state.discard_staged();
+                            gesture_canvas.discard_staged();
+                            write_error = Some(
+                                "temporal bypass export plan had no contributing dry overlay"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            temporal_state.discard_staged();
+                            gesture_canvas.discard_staged();
+                            write_error = Some(format!("temporal bypass export failed: {error}"));
+                            break;
+                        }
+                    }
+                }
                 // Export consumes the same opaque SDR program image as live preview,
                 // projector, Spout, and NTSC. Keep key alpha inside the engine and
                 // flatten it over black exactly once at this boundary.
@@ -6956,6 +7287,102 @@ fn run_export(
                 break;
             }
         };
+        // An isolated dry prefix must be visible to analysis and the N-1
+        // programme tap, but Codec Mosh must receive only the wet audience.
+        // Render the pre-mosh full programme into a transaction candidate now;
+        // it is published only after the final frame reaches ffmpeg.
+        let mut temporal_bypass_analysis_pixels: Option<Vec<u8>> = None;
+        if temporal_bypass_mode == ExportTemporalBypassMode::AroundCodecMosh {
+            let candidate = temporal_bypass_program_candidate
+                .as_ref()
+                .expect("temporal bypass program candidate passed frame preflight");
+            let mut overlay_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Export Pre-Mosh Temporal Bypass Overlay"),
+                });
+            let overlay = render_temporal_bypass_overlay_export(
+                &device,
+                &queue,
+                &mut overlay_encoder,
+                &layers,
+                &evaluated_frame,
+                &composite_textures,
+                &composite_views,
+                &effects_pipeline,
+                &effects_bind_group_layout,
+                &effects_uniform_layout,
+                &composite_pipeline,
+                &composite_bind_group_layout,
+                &composite_uniform_layout,
+                &sampler,
+                &nearest_sampler,
+                w,
+                h,
+            );
+            match overlay {
+                Ok(true) => {}
+                Ok(false) => {
+                    temporal_state.discard_staged();
+                    gesture_canvas.discard_staged();
+                    write_error = Some(
+                        "pre-mosh temporal bypass plan had no contributing dry overlay".to_string(),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    temporal_state.discard_staged();
+                    gesture_canvas.discard_staged();
+                    write_error = Some(format!("pre-mosh temporal bypass export failed: {error}"));
+                    break;
+                }
+            }
+            crate::renderer::state::encode_opaque_output(
+                &mut overlay_encoder,
+                &opaque_output_pipeline,
+                &opaque_output_bind_group,
+                &composite_views[2],
+            );
+            overlay_encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &composite_textures[2],
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: candidate,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(std::iter::once(overlay_encoder.finish()));
+            if mod_matrix.video_analysis_armed() {
+                temporal_bypass_analysis_pixels = match readback_pixels(
+                    &device,
+                    &queue,
+                    candidate,
+                    &staging,
+                    w,
+                    h,
+                    bytes_per_row,
+                    &progress.cancel,
+                ) {
+                    Ok(pixels) => Some(pixels),
+                    Err(error) => {
+                        temporal_state.discard_staged();
+                        gesture_canvas.discard_staged();
+                        write_error = Some(error);
+                        break;
+                    }
+                };
+            }
+        }
         // B10 video analysis, from the exact bytes live reduces: the
         // pre-VHS/pre-mosh program image (the pre-blackout slot-2 seam the
         // live reduction and the program tap both observe). The sample lands
@@ -6967,8 +7394,14 @@ fn run_export(
             video_analysis_accumulator += f64::from(program_dt);
             let interval = 3.0 / f64::from(crate::effects::params::TEMPORAL_REFERENCE_FPS);
             if video_analysis_accumulator >= interval {
-                let grid =
-                    crate::modulation::reduce_video_analysis_grid(&pixels, w as usize, h as usize);
+                let analysis_pixels = temporal_bypass_analysis_pixels
+                    .as_deref()
+                    .unwrap_or(pixels.as_slice());
+                let grid = crate::modulation::reduce_video_analysis_grid(
+                    analysis_pixels,
+                    w as usize,
+                    h as usize,
+                );
                 let sample = video_analysis_state.analyze(&grid, video_analysis_accumulator as f32);
                 mod_matrix.set_video_analysis(sample);
                 video_analysis_accumulator = 0.0;
@@ -7000,7 +7433,7 @@ fn run_export(
         // arrive here already VHS-treated, so the mosh applies uniformly on
         // every path). The fault clock rides the same paused-aware reference
         // frame the NTSC phase uses, so Pause holds the fault stream still.
-        if mod_temporal.mosh.is_active() {
+        if mosh_active {
             let mosh_result = (|| -> Result<(), String> {
                 if mosh_engine.is_none() {
                     mosh_engine = Some(crate::codec_mosh::MoshEngine::open(w, h)?);
@@ -7029,6 +7462,94 @@ fn run_export(
                 break;
             }
             mosh_used = true;
+        }
+
+        if temporal_bypass_mode == ExportTemporalBypassMode::AroundCodecMosh {
+            // `pixels` is the CPU-returned wet audience here. Put it back into
+            // the engine seam, reapply the independently dry prefix, and only
+            // then read the visible frame that ffmpeg receives. Codec Mosh has
+            // therefore affected wet pixels exactly once and dry pixels zero
+            // times, while the final file still contains the complete stack.
+            if let Err(error) = upload_export_texture_checked(
+                &device,
+                &queue,
+                &composite_textures[0],
+                &pixels,
+                w,
+                h,
+                "Export Moshed Temporal Wet Program",
+            ) {
+                temporal_state.discard_staged();
+                gesture_canvas.discard_staged();
+                write_error = Some(error);
+                break;
+            }
+            let mut final_overlay_encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Export Post-Mosh Temporal Bypass Overlay"),
+                });
+            let overlay = render_temporal_bypass_overlay_export(
+                &device,
+                &queue,
+                &mut final_overlay_encoder,
+                &layers,
+                &evaluated_frame,
+                &composite_textures,
+                &composite_views,
+                &effects_pipeline,
+                &effects_bind_group_layout,
+                &effects_uniform_layout,
+                &composite_pipeline,
+                &composite_bind_group_layout,
+                &composite_uniform_layout,
+                &sampler,
+                &nearest_sampler,
+                w,
+                h,
+            );
+            match overlay {
+                Ok(true) => {}
+                Ok(false) => {
+                    temporal_state.discard_staged();
+                    gesture_canvas.discard_staged();
+                    write_error = Some(
+                        "post-mosh temporal bypass plan had no contributing dry overlay"
+                            .to_string(),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    temporal_state.discard_staged();
+                    gesture_canvas.discard_staged();
+                    write_error = Some(format!("post-mosh temporal bypass export failed: {error}"));
+                    break;
+                }
+            }
+            crate::renderer::state::encode_opaque_output(
+                &mut final_overlay_encoder,
+                &opaque_output_pipeline,
+                &opaque_output_bind_group,
+                &composite_views[2],
+            );
+            queue.submit(std::iter::once(final_overlay_encoder.finish()));
+            pixels = match readback_pixels(
+                &device,
+                &queue,
+                &composite_textures[2],
+                &staging,
+                w,
+                h,
+                bytes_per_row,
+                &progress.cancel,
+            ) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    temporal_state.discard_staged();
+                    gesture_canvas.discard_staged();
+                    write_error = Some(error);
+                    break;
+                }
+            };
         }
 
         // Write to ffmpeg
@@ -7083,21 +7604,26 @@ fn run_export(
             }
         }
         gesture_canvas.commit_staged();
-        // The programme tap shares the same acceptance seam: slot 2 still
-        // holds this frame's opaque audience image — offline global NTSC is
-        // applied to the CPU pixels after readback and never lands in slot 2,
-        // exactly as live's asynchronous replacement lands only after live's
-        // copy — so the copy published here is byte for byte the live
-        // ordering. There is no blackout branch offline, because export has
-        // no blackout; live's gate is therefore never taken here rather than
-        // differently taken.
+        // The programme tap shares the same acceptance seam. Ordinarily slot 2
+        // is the pre-VHS/pre-mosh opaque audience image. Isolated Codec Mosh is
+        // the one exception: slot 2 now holds the visible moshed-wet+dry file
+        // frame, so publish the retained pre-mosh wet+dry candidate instead.
+        // Neither source is made visible until ffmpeg has accepted the frame.
         {
+            let program_tap_source =
+                if temporal_bypass_mode == ExportTemporalBypassMode::AroundCodecMosh {
+                    temporal_bypass_program_candidate
+                        .as_ref()
+                        .expect("accepted isolated mosh frame retained its pre-mosh programme")
+                } else {
+                    &composite_textures[2]
+                };
             let mut tap_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Export program tap publish"),
             });
             tap_encoder.copy_texture_to_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &composite_textures[2],
+                    texture: program_tap_source,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -7441,6 +7967,35 @@ fn export_layer_resource(
         ));
     }
     Ok(layer)
+}
+
+/// Resolve the complete dry prefix before Temporal stages any history. A
+/// deferred source mismatch is therefore a frame-preflight error rather than
+/// a late overlay failure after Temporal/Melt/Display have encoded work.
+fn preflight_temporal_bypass_overlay_resources<'a>(
+    layers: &'a [ExportLayer],
+    evaluated: &EvaluatedFramePlan,
+    output_width: u32,
+    output_height: u32,
+) -> Result<Vec<(usize, &'a ExportLayer)>, String> {
+    if evaluated.context().output_size != [output_width, output_height] {
+        return Err("temporal bypass export dimensions do not match target".to_string());
+    }
+    if layers.len() != evaluated.layers().len()
+        || evaluated.layers().len() != evaluated.layer_passes().len()
+    {
+        return Err("temporal bypass export resource/plan alignment mismatch".to_string());
+    }
+    if evaluated.image_routing().is_active() {
+        return Err("temporal bypass export cannot execute with routed image mattes".to_string());
+    }
+
+    export_temporal_bypass_overlay_sources(evaluated)
+        .into_iter()
+        .map(|(layer_index, source)| {
+            export_layer_resource(layers, source).map(|layer| (layer_index, layer))
+        })
+        .collect()
 }
 
 /// Render all planned straight-alpha slices and synchronously collect them in
@@ -8126,7 +8681,13 @@ fn render_layers_and_master_export_routed(
             output_height,
         )?;
         if let Some(resources) = routing.as_mut() {
-            encode_program_history_copy(encoder, &composite_textures[0], resources);
+            if export_may_publish_legacy_program_history(evaluated) {
+                encode_program_history_copy(encoder, &composite_textures[0], resources);
+            } else {
+                // Slot 0 is wet-only until the post-Temporal dry overlay. It
+                // is not a visible programme and must never become N-1 state.
+                resources.history_valid = false;
+            }
         }
         return Ok(());
     }
@@ -8163,7 +8724,13 @@ fn render_layers_and_master_export_routed(
         output_width,
         output_height,
     )?;
-    encode_program_history_copy(encoder, &composite_textures[0], resources);
+    if export_may_publish_legacy_program_history(evaluated) {
+        encode_program_history_copy(encoder, &composite_textures[0], resources);
+    } else {
+        // Planner validation rejects this topology, but keep the adapter
+        // fail-closed if an isolated dry plan ever reaches the routed arm.
+        resources.history_valid = false;
+    }
     Ok(())
 }
 
@@ -8202,12 +8769,14 @@ fn render_layers_and_master_export(
     {
         return Err("evaluated export resource/plan alignment mismatch".into());
     }
-    let path = master_fx_composition_path(
-        evaluated
-            .layers()
-            .iter()
-            .map(|layer| (layer.visible, layer.bypass_master_fx, layer.opacity)),
-    );
+    let isolated_temporal_overlay = temporal_bypass_overlay_active(evaluated);
+    let path = master_fx_composition_path(evaluated.layers().iter().filter_map(|layer| {
+        (!isolated_temporal_overlay || !layer.bypass_temporal_fx).then_some((
+            layer.visible,
+            layer.bypass_master_fx,
+            layer.opacity,
+        ))
+    }));
     match path {
         MasterFxCompositionPath::LegacyPostComposite => {
             render_layers_export(
@@ -8229,21 +8798,23 @@ fn render_layers_and_master_export(
                 output_width,
                 output_height,
             )?;
-            render_master_effects_export(
-                device,
-                queue,
-                encoder,
-                evaluated.master_pass(),
-                composite_textures,
-                composite_views,
-                effects_pipeline,
-                effects_bind_group_layout,
-                effects_uniform_layout,
-                sampler,
-                nearest_sampler,
-                output_width,
-                output_height,
-            );
+            if !isolated_temporal_overlay || export_temporal_wet_layer_contributes(evaluated) {
+                render_master_effects_export(
+                    device,
+                    queue,
+                    encoder,
+                    evaluated.master_pass(),
+                    composite_textures,
+                    composite_views,
+                    effects_pipeline,
+                    effects_bind_group_layout,
+                    effects_uniform_layout,
+                    sampler,
+                    nearest_sampler,
+                    output_width,
+                    output_height,
+                );
+            }
         }
         MasterFxCompositionPath::ConditionalPerLayer => {
             render_layers_with_conditional_master_export(
@@ -8270,6 +8841,160 @@ fn render_layers_and_master_export(
     Ok(())
 }
 
+/// Reapply the exact top-prefix dry stack to the wet programme in slot 0.
+///
+/// The planner admits this only for LegacyExact without routing or VHS. Each
+/// dry layer therefore follows the same bounded three-slot law as live:
+/// source -> local FX -> optional Master FX -> opacity/blend over the current
+/// wet/dry accumulation, in bottom-to-top order. The caller decides whether
+/// slot 0 is the straight-alpha post-Temporal engine image or an uploaded
+/// opaque Codec-Mosh wet replacement.
+#[allow(clippy::too_many_arguments)]
+fn render_temporal_bypass_overlay_export(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    encoder: &mut wgpu::CommandEncoder,
+    layers: &[ExportLayer],
+    evaluated: &EvaluatedFramePlan,
+    composite_textures: &[wgpu::Texture; 3],
+    composite_views: &[wgpu::TextureView; 3],
+    effects_pipeline: &wgpu::RenderPipeline,
+    effects_bind_group_layout: &wgpu::BindGroupLayout,
+    effects_uniform_layout: &wgpu::BindGroupLayout,
+    composite_pipeline: &wgpu::RenderPipeline,
+    composite_bind_group_layout: &wgpu::BindGroupLayout,
+    composite_uniform_layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    nearest_sampler: &wgpu::Sampler,
+    output_width: u32,
+    output_height: u32,
+) -> Result<bool, String> {
+    let overlay_resources = preflight_temporal_bypass_overlay_resources(
+        layers,
+        evaluated,
+        output_width,
+        output_height,
+    )?;
+    if overlay_resources.is_empty() {
+        return Ok(false);
+    }
+
+    for (layer_index, layer) in overlay_resources {
+        let evaluated_layer = &evaluated.layers()[layer_index];
+        encode_export_effect_pass(
+            device,
+            queue,
+            encoder,
+            &layer.texture_view,
+            &composite_views[1],
+            &evaluated.layer_passes()[layer_index],
+            effects_pipeline,
+            effects_bind_group_layout,
+            effects_uniform_layout,
+            sampler,
+            nearest_sampler,
+            "Export Temporal Bypass Layer FX",
+        );
+
+        let overlay_slot = if evaluated_layer.bypass_master_fx {
+            1
+        } else {
+            encode_export_effect_pass(
+                device,
+                queue,
+                encoder,
+                &composite_views[1],
+                &composite_views[2],
+                evaluated.master_pass(),
+                effects_pipeline,
+                effects_bind_group_layout,
+                effects_uniform_layout,
+                sampler,
+                nearest_sampler,
+                "Export Temporal Bypass Inherited Master FX",
+            );
+            2
+        };
+        let output_slot = if overlay_slot == 1 { 2 } else { 1 };
+        let composite_buffer = create_uploaded_uniform(
+            device,
+            queue,
+            "Export Temporal Bypass Composite Uniforms",
+            &CompositeUniforms {
+                opacity: evaluated_layer.opacity,
+                blend_mode: evaluated_layer.blend_mode.as_u32(),
+                _pad: [0.0; 2],
+            },
+        );
+        let composite_texture_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Temporal Bypass Composite Inputs"),
+            layout: composite_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&composite_views[0]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&composite_views[overlay_slot]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        let composite_uniform_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Export Temporal Bypass Composite Uniforms BG"),
+            layout: composite_uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: composite_buffer.as_entire_binding(),
+            }],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Export Temporal Bypass Final Composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &composite_views[output_slot],
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(composite_pipeline);
+            pass.set_bind_group(0, &composite_texture_group, &[]);
+            pass.set_bind_group(1, &composite_uniform_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[output_slot],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &composite_textures[0],
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
+                width: output_width,
+                height: output_height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_layers_with_conditional_master_export(
     device: &wgpu::Device,
@@ -8290,8 +9015,7 @@ fn render_layers_with_conditional_master_export(
     output_width: u32,
     output_height: u32,
 ) -> Result<(), String> {
-    let visible_layers =
-        visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
+    let visible_layers = export_temporal_wet_stack_indices(evaluated);
     debug_assert!(visible_layers
         .iter()
         .any(|&index| evaluated.layers()[index].bypass_master_fx));
@@ -8531,8 +9255,7 @@ fn render_layers_export(
     output_width: u32,
     output_height: u32,
 ) -> Result<(), String> {
-    let visible_layers =
-        visible_stack_indices(evaluated.layers().iter().map(|layer| layer.visible));
+    let visible_layers = export_temporal_wet_stack_indices(evaluated);
 
     if visible_layers.is_empty() {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -8805,6 +9528,223 @@ fn render_master_effects_export(
 mod tests {
     use super::*;
     use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialGpuUniforms};
+
+    #[test]
+    fn temporal_bypass_export_mode_brackets_codec_mosh_only_for_isolated_dry() {
+        assert_eq!(
+            export_temporal_bypass_mode(TemporalMasterPath::IsolatedDryOverlay, false),
+            ExportTemporalBypassMode::BeforeOpaque
+        );
+        assert_eq!(
+            export_temporal_bypass_mode(TemporalMasterPath::IsolatedDryOverlay, true),
+            ExportTemporalBypassMode::AroundCodecMosh
+        );
+        for path in [TemporalMasterPath::Inherited, TemporalMasterPath::LinkedDry] {
+            assert_eq!(
+                export_temporal_bypass_mode(path, false),
+                ExportTemporalBypassMode::Inactive
+            );
+            assert_eq!(
+                export_temporal_bypass_mode(path, true),
+                ExportTemporalBypassMode::Inactive
+            );
+        }
+    }
+
+    #[test]
+    fn export_codec_mosh_interval_never_resumes_a_retired_engine() {
+        let mut was_active = false;
+        let mut retained = Some(1_u8);
+
+        update_export_mosh_interval(false, &mut was_active, &mut retained);
+        assert!(retained.is_none(), "a dry interval retains no codec owner");
+
+        retained = Some(2);
+        update_export_mosh_interval(true, &mut was_active, &mut retained);
+        assert!(retained.is_none(), "the first arm is a fresh generation");
+
+        retained = Some(3);
+        update_export_mosh_interval(true, &mut was_active, &mut retained);
+        assert_eq!(retained, Some(3), "continuous arming keeps codec history");
+
+        update_export_mosh_interval(false, &mut was_active, &mut retained);
+        assert!(retained.is_none(), "the dry edge retires codec history");
+
+        retained = Some(4);
+        update_export_mosh_interval(true, &mut was_active, &mut retained);
+        assert!(
+            retained.is_none(),
+            "re-arming cannot resume a retired stream"
+        );
+    }
+
+    #[test]
+    fn temporal_bypass_program_candidate_is_lazy_and_checked() {
+        let source = include_str!("render_export.rs");
+        let start = source
+            .find("fn ensure_export_temporal_bypass_program_candidate(")
+            .expect("isolated Mosh candidate helper exists");
+        let end = source[start..]
+            .find("/// Upload one small export uniform")
+            .map(|offset| start + offset)
+            .expect("candidate helper has a bounded source section");
+        let helper = &source[start..end];
+
+        assert!(
+            helper.contains("if retained.is_some()"),
+            "the full-frame candidate must remain a one-time cold allocation"
+        );
+        assert!(
+            helper.contains("scoped_export_gpu_operation("),
+            "candidate allocation must synchronously surface validation/OOM errors"
+        );
+    }
+
+    fn temporal_bypass_stack_fixture(bypass: [bool; 3]) -> EvaluatedFramePlan {
+        let effects = EffectUniforms::default();
+        let transform = SpatialTransform::default();
+        let ntsc = crate::ntsc::NtscParams::default();
+        let temporal = crate::effects::params::TemporalParams::default();
+        let modulation = crate::modulation::ModMatrix::new().frame(3);
+        EvaluatedFramePlan::evaluate(
+            &modulation,
+            FramePlanContext::new(64, 36, 0.0),
+            MasterFrameInput {
+                effects: &effects,
+                transform: &transform,
+                ntsc: &ntsc,
+                temporal: &temporal,
+            },
+            bypass
+                .into_iter()
+                .enumerate()
+                .map(|(slot, bypass_temporal_fx)| LayerFrameInput {
+                    source: SourceTap::new((slot + 1) as u64, slot, 64, 36),
+                    effects: &effects,
+                    transform: &transform,
+                    opacity: 1.0,
+                    speed: 1.0,
+                    fps: 30.0,
+                    blend_mode: BlendMode::Normal,
+                    visible: true,
+                    paused: false,
+                    bypass_master_fx: slot == 1,
+                    bypass_temporal_fx,
+                    pattern: None,
+                }),
+        )
+    }
+
+    #[test]
+    fn temporal_bypass_export_partitions_wet_and_dry_in_stack_order() {
+        let inherited = temporal_bypass_stack_fixture([false; 3]);
+        assert_eq!(export_temporal_wet_stack_indices(&inherited), vec![2, 1, 0]);
+        assert!(temporal_bypass_overlay_indices(&inherited).is_empty());
+        assert!(export_may_publish_legacy_program_history(&inherited));
+
+        // UI slots 0 and 1 form the admitted top prefix. Slot 2 remains wet;
+        // the dry overlay is reapplied from its lower member to UI Layer 1.
+        let isolated = temporal_bypass_stack_fixture([true, true, false]);
+        assert_eq!(export_temporal_wet_stack_indices(&isolated), vec![2]);
+        assert!(export_temporal_wet_layer_contributes(&isolated));
+        assert_eq!(temporal_bypass_overlay_indices(&isolated), vec![1, 0]);
+        assert_eq!(
+            export_temporal_bypass_overlay_sources(&isolated)
+                .into_iter()
+                .map(|(layer_index, source)| (layer_index, source.slot, source.stable_id))
+                .collect::<Vec<_>>(),
+            vec![(1, 1, 2), (0, 0, 1)]
+        );
+        assert!(!export_may_publish_legacy_program_history(&isolated));
+
+        let all_dry = temporal_bypass_stack_fixture([true; 3]);
+        assert!(export_temporal_wet_stack_indices(&all_dry).is_empty());
+        assert!(!export_temporal_wet_layer_contributes(&all_dry));
+
+        let mut previous = Vec::new();
+        let mut initialized = false;
+        assert!(!observe_export_temporal_bypass_partition(
+            &mut previous,
+            &mut initialized,
+            &inherited,
+        ));
+        assert!(!observe_export_temporal_bypass_partition(
+            &mut previous,
+            &mut initialized,
+            &inherited,
+        ));
+        assert!(observe_export_temporal_bypass_partition(
+            &mut previous,
+            &mut initialized,
+            &isolated,
+        ));
+        assert!(!observe_export_temporal_bypass_partition(
+            &mut previous,
+            &mut initialized,
+            &isolated,
+        ));
+        assert!(observe_export_temporal_bypass_partition(
+            &mut previous,
+            &mut initialized,
+            &inherited,
+        ));
+    }
+
+    #[test]
+    fn temporal_bypass_export_preflights_before_partition_and_temporal_encoding() {
+        let source = include_str!("render_export.rs");
+        let run_export = &source[source
+            .find("fn run_export(")
+            .expect("offline export entry point exists")..];
+        let preflight = run_export
+            .find("match preflight_temporal_bypass_overlay_resources(")
+            .expect("isolated dry resources are preflighted");
+        let candidate = run_export
+            .find("ensure_export_temporal_bypass_program_candidate(")
+            .expect("isolated Mosh candidate is allocated during preflight");
+        let mosh_interval = run_export
+            .find("update_export_mosh_interval(")
+            .expect("Codec Mosh interval is observed before stateful rendering");
+        let partition = run_export
+            .find("if observe_export_temporal_bypass_partition(")
+            .expect("bypass partition is observed");
+        let temporal_encode = run_export
+            .find("encode_temporal_prepared_frame(")
+            .expect("legacy Temporal is encoded");
+        assert!(
+            preflight < candidate
+                && candidate < mosh_interval
+                && mosh_interval < partition
+                && partition < temporal_encode,
+            "all cold resources and codec edges must precede every stateful partition/Temporal operation"
+        );
+
+        let partition_reset = &run_export[partition..temporal_encode];
+        assert!(
+            partition_reset.contains("resources.history_valid = false;"),
+            "every partition edge must invalidate retained legacy ProgramHistory"
+        );
+    }
+
+    #[test]
+    fn temporal_bypass_all_dry_export_skips_the_empty_global_master_pass() {
+        let source = include_str!("render_export.rs");
+        let start = source
+            .find("fn render_layers_and_master_export(")
+            .expect("offline exact compositor exists");
+        let end = source[start..]
+            .find("fn render_temporal_bypass_overlay_export(")
+            .map(|offset| start + offset)
+            .expect("offline exact compositor has a bounded source section");
+        let compositor = &source[start..end];
+
+        assert!(
+            compositor.contains(
+                "if !isolated_temporal_overlay || export_temporal_wet_layer_contributes(evaluated)"
+            ),
+            "an all-dry isolated stack must preserve its transparent wet base without a global Master pass"
+        );
+    }
 
     fn config(duration_secs: f32) -> ExportConfig {
         ExportConfig {
@@ -9365,6 +10305,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }),
         );
@@ -9539,6 +10480,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }),
         );
@@ -9668,6 +10610,7 @@ layers:
                         visible: true,
                         paused: false,
                         bypass_master_fx: false,
+                        bypass_temporal_fx: false,
                         pattern: None,
                     }),
             );
@@ -9767,6 +10710,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: slot == 0,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }),
         );
@@ -10206,6 +11150,7 @@ layers:
                             visible: true,
                             paused: false,
                             bypass_master_fx: false,
+                            bypass_temporal_fx: false,
                             pattern: None,
                         }),
                 );
@@ -10531,6 +11476,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }),
         )
@@ -11981,6 +12927,7 @@ layers:
                         visible: true,
                         paused: false,
                         bypass_master_fx: false,
+                        bypass_temporal_fx: false,
                         pattern: None,
                     }),
             )
@@ -12138,6 +13085,7 @@ layers:
                         visible: true,
                         paused: false,
                         bypass_master_fx: false,
+                        bypass_temporal_fx: false,
                         pattern: None,
                     }),
             )
@@ -12780,12 +13728,14 @@ layers:
             source[..publish].contains("temporal_state.commit_staged();"),
             "publication belongs after the frame reached ffmpeg, not before it"
         );
-        // The copy reads final slot 2, and offline global NTSC never lands in
-        // slot 2, so the published image is the same pre-NTSC, pre-blackout
-        // opaque audience image live publishes.
+        // The ordinary copy reads final slot 2. Isolated Codec Mosh instead
+        // selects the retained pre-mosh wet+dry candidate, so the tap never
+        // exposes the wet-only codec input or the moshed visible replacement.
         assert!(
-            source[publish..publish + 700].contains("texture: &composite_textures[2],"),
-            "the offline tap copy must read final audience slot 2"
+            source[..publish].contains("let program_tap_source =")
+                && source[..publish].contains("ExportTemporalBypassMode::AroundCodecMosh")
+                && source[publish..publish + 900].contains("texture: program_tap_source,"),
+            "the offline tap copy must select the deliberate pre-mosh programme source"
         );
         // Admission is unconditional offline: the surface exists for the whole
         // job and frame zero reads its defined-transparent contents.
@@ -12940,11 +13890,10 @@ layers:
             .split_once("temporal_state.commit_staged();")
             .expect("the acceptance decision follows staging")
             .0;
-        assert_eq!(
-            decision.matches("gesture_canvas.discard_staged();").count(),
-            4,
-            "every temporal discard site must discard the gesture canvas too \
-             (readback, B5 codec-mosh failure, ffmpeg write, GPU-error drain)"
+        assert!(
+            decision.matches("gesture_canvas.discard_staged();").count() >= 4,
+            "every temporal abort path must retain the established gesture discard coverage \
+             (including readback, codec-mosh, ffmpeg, and GPU-error failure)"
         );
         assert!(
             !decision.contains("Instant::now()"),
@@ -13216,6 +14165,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }],
             );
@@ -13682,6 +14632,7 @@ layers:
                 opacity: base.opacity,
                 blend_mode: base.blend_mode,
                 bypass_master_fx: base.bypass_master_fx,
+                bypass_temporal_fx: base.bypass_temporal_fx,
                 matte: LayerMatte::default(),
                 reroll_on_loop: false,
                 consumed_loop_generation: 0,
@@ -13842,6 +14793,32 @@ layers:
                 self.width,
                 self.height,
             );
+            if temporal_bypass_overlay_active(plan) {
+                let rendered = render_temporal_bypass_overlay_export(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    layers,
+                    plan,
+                    &composite_textures,
+                    &composite_views,
+                    &self.pipeline,
+                    &self.texture_layout,
+                    &self.uniform_layout,
+                    &self.composite_pipeline,
+                    &self.composite_texture_layout,
+                    &self.composite_uniform_layout,
+                    &self.sampler,
+                    &self.nearest_sampler,
+                    self.width,
+                    self.height,
+                )?;
+                if !rendered {
+                    return Err(
+                        "spatial full-stack fixture planned no Temporal bypass overlay".to_string(),
+                    );
+                }
+            }
             crate::renderer::state::encode_opaque_output(
                 &mut encoder,
                 &opaque_pipeline,
@@ -14108,6 +15085,7 @@ layers:
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 pattern: None,
             }],
         );
@@ -15186,6 +16164,7 @@ layers:
             visible: true,
             paused: false,
             bypass_master_fx: false,
+            bypass_temporal_fx: false,
             pattern: None,
         }
     }
@@ -15218,6 +16197,7 @@ layers:
             visible: true,
             paused: false,
             bypass_master_fx: false,
+            bypass_temporal_fx: false,
             pattern: None,
         }
     }
@@ -15357,6 +16337,7 @@ layers:
                     fps: Some(30.0),
                     effects: Some(MorphMasterSnapshot::capture(effects)),
                     transform: Some(transform),
+                    bypass_temporal_fx: Some(opacity >= 0.5),
                     ..LayerMorphSnapshot::default()
                 },
                 LayerMorphSnapshot {
@@ -15366,6 +16347,7 @@ layers:
                     fps: Some(24.0),
                     effects: Some(MorphMasterSnapshot::capture(effects2)),
                     transform: Some(transform2),
+                    bypass_temporal_fx: Some(opacity2 < 0.5),
                     ..LayerMorphSnapshot::default()
                 },
             ],
@@ -15456,6 +16438,7 @@ layers:
         layer.visible = base.visible;
         layer.paused = base.paused;
         layer.bypass_master_fx = base.bypass_master_fx;
+        layer.bypass_temporal_fx = base.bypass_temporal_fx;
 
         // Live materializes Morph into mutable runtime state first, then the
         // immutable evaluator applies the already-sampled modulation frame.
@@ -15491,6 +16474,7 @@ layers:
                 visible: layer.visible,
                 paused: layer.paused,
                 bypass_master_fx: layer.bypass_master_fx,
+                bypass_temporal_fx: layer.bypass_temporal_fx,
                 pattern: None,
             }],
         )
@@ -15553,6 +16537,9 @@ layers:
         if let Some(value) = sampled.bypass_master_fx {
             layer.bypass_master_fx = value;
         }
+        if let Some(value) = sampled.bypass_temporal_fx {
+            layer.bypass_temporal_fx = value;
+        }
 
         EvaluatedFramePlan::evaluate(
             &modulation,
@@ -15574,6 +16561,7 @@ layers:
                 visible: layer.visible,
                 paused: layer.paused,
                 bypass_master_fx: layer.bypass_master_fx,
+                bypass_temporal_fx: layer.bypass_temporal_fx,
                 pattern: None,
             }],
         )
@@ -15590,6 +16578,7 @@ layers:
         layer.visible = base.visible;
         layer.paused = base.paused;
         layer.bypass_master_fx = base.bypass_master_fx;
+        layer.bypass_temporal_fx = base.bypass_temporal_fx;
     }
 
     #[cfg(target_os = "windows")]
@@ -15622,6 +16611,9 @@ layers:
         }
         if let Some(value) = sampled.bypass_master_fx {
             layer.bypass_master_fx = value;
+        }
+        if let Some(value) = sampled.bypass_temporal_fx {
+            layer.bypass_temporal_fx = value;
         }
     }
 
@@ -15700,6 +16692,7 @@ layers:
                     visible: layer.visible,
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    bypass_temporal_fx: layer.bypass_temporal_fx,
                     pattern: None,
                 }),
         );
@@ -15763,6 +16756,7 @@ layers:
                     visible: layer.visible,
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    bypass_temporal_fx: layer.bypass_temporal_fx,
                     pattern: None,
                 }),
         );
@@ -15831,6 +16825,7 @@ layers:
             visible,
             paused: false,
             bypass_master_fx: false,
+            bypass_temporal_fx: false,
             pattern: None,
         }
     }
@@ -15875,6 +16870,7 @@ layers:
                     visible: visible[index],
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }),
         )
@@ -15986,6 +16982,7 @@ layers:
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 pattern: None,
             }],
         );
@@ -16235,6 +17232,11 @@ layers:
                 export.layers()[0].opacity.to_bits(),
                 "opacity diverged at {fps} fps"
             );
+            assert_eq!(
+                live.layers()[0].bypass_temporal_fx,
+                export.layers()[0].bypass_temporal_fx,
+                "Temporal bypass diverged at {fps} fps"
+            );
             assert_ne!(
                 live.layers()[0].transform,
                 parity_layer_base().transform,
@@ -16350,6 +17352,11 @@ layers:
                     export_plan.layers()[index].blend_mode,
                     "layer {index} blend diverged at {fps} fps"
                 );
+                assert_eq!(
+                    live_plan.layers()[index].bypass_temporal_fx,
+                    export_plan.layers()[index].bypass_temporal_fx,
+                    "layer {index} Temporal bypass diverged at {fps} fps"
+                );
             }
             assert_ne!(
                 live_plan.layers()[0].transform,
@@ -16372,6 +17379,7 @@ layers:
             live_layers[0].blend_mode = BlendMode::Multiply;
             live_layers[0].visible = false;
             live_layers[0].bypass_master_fx = true;
+            live_layers[0].bypass_temporal_fx = !live_layers[0].bypass_temporal_fx;
 
             // These are two real consumers: live owns actual `Layer` textures
             // and uses `Renderer::render_evaluated_frame`; export owns detached
@@ -16406,6 +17414,7 @@ layers:
                 layer.blend_mode = BlendMode::Multiply;
                 layer.visible = false;
                 layer.bypass_master_fx = true;
+                layer.bypass_temporal_fx = !layer.bypass_temporal_fx;
             }
             let export_pixels = export_harness
                 .render_export_full_stack(&mut export_layers, &export_plan, 1.0 / fps as f32)
@@ -16493,6 +17502,7 @@ layers:
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }
             })
@@ -16534,6 +17544,7 @@ layers:
                     visible: layer.visible,
                     paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
+                    bypass_temporal_fx: layer.bypass_temporal_fx,
                     pattern: None,
                 }),
         );
@@ -17657,6 +18668,7 @@ layers:
                 opacity: 1.0,
                 blend_mode: "normal".to_string(),
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 reroll_on_loop: false,
                 speed: 1.0,
                 fps: 30.0,
@@ -17793,6 +18805,7 @@ mod effects_audit {
                 opacity: 1.0,
                 blend_mode: "normal".to_string(),
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 reroll_on_loop: false,
                 speed: 1.0,
                 fps: 30.0,
@@ -19747,6 +20760,52 @@ mod effects_audit {
         .unwrap();
         take.finalize(20);
         PerformanceTakeDocument::capture(&take)
+    }
+
+    #[test]
+    fn export_admission_finds_temporal_bypass_authored_only_by_a_later_take_event() {
+        use crate::performance_track::{
+            PerformanceControl as Control, PerformanceRawValue as Raw, PerformanceTake,
+            PerformanceValueLaw as Law,
+        };
+        let mut take = PerformanceTake::default();
+        take.record_accepted(
+            0,
+            Control::LayerParam {
+                layer: 0,
+                param: "bypass_temporal_fx".to_string(),
+            },
+            Law::Toggle,
+            &Raw::Toggle(false),
+        )
+        .unwrap();
+        take.record_accepted(
+            240,
+            Control::LayerParam {
+                layer: 0,
+                param: "bypass_temporal_fx".to_string(),
+            },
+            Law::Toggle,
+            &Raw::Toggle(true),
+        )
+        .unwrap();
+        take.finalize(300);
+
+        assert!(performance_take_authors_temporal_bypass(&take));
+
+        let mut unrelated = PerformanceTake::default();
+        unrelated
+            .record_accepted(
+                240,
+                Control::LayerParam {
+                    layer: 0,
+                    param: "bypass_master_fx".to_string(),
+                },
+                Law::Toggle,
+                &Raw::Toggle(true),
+            )
+            .unwrap();
+        assert!(!performance_take_authors_temporal_bypass(&unrelated));
     }
 
     /// The performance sidecar publishes on the gesture sidecar's exact

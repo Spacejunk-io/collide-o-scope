@@ -2019,6 +2019,26 @@ enum CompiledTarget {
     Invalid,
 }
 
+/// Whether a wire destination addresses the dedicated Master/layer Motion
+/// surface.
+///
+/// This deliberately asks the compiled target registries instead of matching
+/// a second hand-maintained list. A future valid `motion_*` destination is
+/// therefore covered as soon as it enters `TARGETS` or
+/// `LAYER_TARGET_SUFFIXES`, while an arbitrary unknown string with that prefix
+/// remains inert rather than being mistaken for authored topology.
+pub(crate) fn is_motion_modulation_target(target: &str) -> bool {
+    match compile_target(target) {
+        CompiledTarget::Master(index) => TARGETS
+            .get(index)
+            .is_some_and(|(key, _, _)| key.starts_with("motion_")),
+        CompiledTarget::Layer { suffix, .. } => LAYER_TARGET_SUFFIXES
+            .get(suffix)
+            .is_some_and(|key| key.starts_with("motion_")),
+        CompiledTarget::Stable(_) | CompiledTarget::Invalid => false,
+    }
+}
+
 fn master_target_index(target: &str) -> Option<usize> {
     TARGETS.iter().position(|(key, _, _)| *key == target)
 }
@@ -3825,6 +3845,77 @@ impl ModMatrix {
         }
     }
 
+    /// Whether any authored route targets the dedicated Master/layer Motion
+    /// controls, independent of its present source sample, depth, slew state,
+    /// or whether the addressed layer currently exists.
+    ///
+    /// That independence is an admission invariant: a zero-valued LFO or a
+    /// dormant layer route may wake on a later frame without another edit.
+    pub(crate) fn has_authored_motion_routing(&self) -> bool {
+        self.routings
+            .iter()
+            .any(|routing| is_motion_modulation_target(routing.target()))
+    }
+
+    /// Refuse the topology that could wake Advanced Motion after an isolated
+    /// Temporal-bypass frame was already admitted. The caller supplies the
+    /// detached candidate's bypass fact; route *values* are intentionally not
+    /// consulted.
+    pub(crate) fn validate_temporal_bypass_motion_routing(
+        &self,
+        explicit_temporal_bypass_authored: bool,
+    ) -> Result<(), String> {
+        if !explicit_temporal_bypass_authored {
+            return Ok(());
+        }
+        let Some(routing) = self
+            .routings
+            .iter()
+            .find(|routing| is_motion_modulation_target(routing.target()))
+        else {
+            return Ok(());
+        };
+        Err(temporal_bypass_motion_routing_error(routing))
+    }
+
+    /// Transactionally replace one route destination under the same policy
+    /// used by detached live/patch and export admission. A refused candidate
+    /// never resets the accepted route's slew/cache state.
+    pub(crate) fn set_routing_target_with_temporal_bypass_policy(
+        &mut self,
+        index: usize,
+        target: impl Into<String>,
+        explicit_temporal_bypass_authored: bool,
+    ) -> Result<bool, String> {
+        let Some(current) = self.routings.get(index) else {
+            return Ok(false);
+        };
+        let mut candidate = current.clone();
+        let changed = candidate.set_target(target);
+        if !changed {
+            return Ok(false);
+        }
+        if explicit_temporal_bypass_authored {
+            if let Some(routing) = self
+                .routings
+                .iter()
+                .enumerate()
+                .map(|(candidate_index, routing)| {
+                    if candidate_index == index {
+                        &candidate
+                    } else {
+                        routing
+                    }
+                })
+                .find(|routing| is_motion_modulation_target(routing.target()))
+            {
+                return Err(temporal_bypass_motion_routing_error(routing));
+            }
+        }
+        self.routings[index] = candidate;
+        Ok(true)
+    }
+
     /// Accumulate stable rack/group routes into the caller's compact topology
     /// address book. A persisted route whose scope, node, or parameter is
     /// currently missing remains stored in `routings` but contributes zero.
@@ -4039,6 +4130,14 @@ impl ModMatrix {
         self.lfos = std::array::from_fn(|_| Lfo::default());
         self.routings.clear();
     }
+}
+
+fn temporal_bypass_motion_routing_error(routing: &Routing) -> String {
+    format!(
+        "Bypass Temporal FX cannot coexist with authored Motion modulation route {} -> '{}'; retarget/remove the route or disable Temporal bypass (the route remains topology even while its source or depth is zero)",
+        routing.route_id(),
+        routing.target()
+    )
 }
 
 fn parse_layer_target(target: &str) -> Option<(usize, &str)> {
@@ -5002,6 +5101,39 @@ mod tests {
         approx(matrix.routings[1].cached, 0.0);
         matrix.routings[0].reset_runtime();
         approx(matrix.routings[0].cached, 0.0);
+    }
+
+    #[test]
+    fn temporal_bypass_motion_policy_counts_zero_routes_and_refuses_edits_atomically() {
+        assert!(is_motion_modulation_target("motion_shutter_angle"));
+        assert!(is_motion_modulation_target("layer1_motion_refresh"));
+        assert!(!is_motion_modulation_target("motion_not_registered"));
+        assert!(!is_motion_modulation_target("layer1_brightness"));
+
+        let mut zero = ModMatrix::new();
+        zero.routings
+            .push(Routing::new(ModSource::Lfo(0), "motion_shutter_angle", 0.0));
+        assert_eq!(zero.routings[0].cached_value(), 0.0);
+        assert!(zero.has_authored_motion_routing());
+        let error = zero
+            .validate_temporal_bypass_motion_routing(true)
+            .expect_err("a zero source/depth Motion route is still authored topology");
+        assert!(error.contains("source or depth is zero"));
+        zero.validate_temporal_bypass_motion_routing(false)
+            .expect("the route is valid without explicit Temporal bypass");
+
+        let mut live = ModMatrix::new();
+        live.midi[0] = 1.0;
+        live.routings
+            .push(Routing::new(ModSource::Midi(0), "brightness", 1.0));
+        live.update_at_beat(0.0, 0.0);
+        let accepted_cache = live.routings[0].cached_value();
+        let accepted_target = live.routings[0].target().to_owned();
+        assert!(live
+            .set_routing_target_with_temporal_bypass_policy(0, "layer1_motion_refresh", true,)
+            .is_err());
+        assert_eq!(live.routings[0].target(), accepted_target);
+        assert_eq!(live.routings[0].cached_value(), accepted_cache);
     }
 
     #[test]

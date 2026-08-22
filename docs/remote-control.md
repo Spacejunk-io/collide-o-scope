@@ -139,21 +139,41 @@ Media is also released.
   live, so those systems may continue changing the rendered master afterward.
 - **Bypass Master FX** on a layer skips inherited Digital, Analog, Cellular,
   Motion, and VHS processing for that layer. Its own Layer FX, opacity, key,
-  and blend remain active. Temporal is one flattened program-history machine,
-  so a visible, positive-opacity bypass layer links the complete shared
-  Temporal family dry for the whole program: Feedback, Slit-Scan, Temporal
-  Originals, Melt, Sync Latch, Display Physics, and Codec Mosh receive neutral
-  frame parameters. The clean program still warms temporal history, and the
-  authored/modulated controls resume unchanged when no contributing bypass
-  remains. With VHS enabled, direct master effects and VHS run only on
-  inherited layer slices; the engine then recomposites the stack before that
-  linked Temporal boundary. Offline render follows the same law. Hidden or
-  non-positive-opacity layers neither link Temporal dry nor create selective
-  work. Live selective processing has a 320 MiB safety budget and no silent
+  and blend remain active. This switch retains the v1.2 LinkedDry contract: a
+  visible, positive-opacity bypass layer links the complete shared Temporal
+  family dry for the whole program when no explicit **Bypass Temporal FX**
+  route is active. Feedback, Slit-Scan, Temporal Originals, Melt, Sync Latch,
+  Display Physics, and Codec Mosh receive neutral frame parameters. The clean
+  program still warms Temporal history, and the authored/modulated controls
+  resume unchanged when no contributing bypass remains. With VHS enabled,
+  direct master effects and VHS run only on inherited layer slices; the engine
+  then recomposites the stack before that linked Temporal boundary. Offline
+  render follows the same law. Hidden or non-positive-opacity layers neither
+  link Temporal dry nor create selective work. Live selective processing has
+  a 320 MiB safety budget and no silent
   global-VHS fallback: if the current output size and contributing stack exceed
   it, the prior exact audience frame is held and the VHS panel reports how to
   reduce the load. Layer **Reset FX** and master **Revert** preserve this
   non-destructive switch.
+- **Bypass Temporal FX** is the independent, exact Temporal route. It defaults
+  off and is controlled remotely with `set_layer_param` parameter
+  `bypass_temporal_fx`. Every enabled layer must form one contiguous prefix at
+  the top/front of a flat LegacyExact Program stack: Layer 1 is topmost, so
+  Layer 1 alone or Layers 1–N may be dry, with no inheriting gap between them.
+  The lower inherited stack continues through Feedback, Slit-Scan, Temporal
+  Originals, Melt, Sync Latch, Display Physics, and Codec Mosh; afterward the
+  engine recomposites the dry prefix bottom-to-top with each layer's original
+  Layer FX, key, opacity, and blend. Changing prefix membership resets the
+  Temporal-family history before the new partition renders, without changing
+  authored controls. Interleaving, groups, A/B or non-Program buses, active
+  mattes, advanced layer/master racks, advanced Motion, any authored
+  Master/layer Motion modulation route (even at zero source or depth), routed
+  Refresh Garden, and currently VHS are rejected transactionally: the switch and audience
+  remain at their prior accepted state. When admitted, this explicit route
+  takes precedence over Master-only LinkedDry: lower inherited layers remain
+  temporally wet even if a contributing layer also bypasses Master FX, while
+  each switch continues to govern its named boundary. Patches that omit the
+  additive field load `bypass_temporal_fx: false`.
 - A layer's Cellular **Gap Key** controls how completely Voronoi ridges are removed;
   **Gap Threshold** selects which ridge strengths open, and **Gap Softness**
   feathers the edge. Those gaps reveal layers beneath it. The master Cellular
@@ -380,7 +400,8 @@ algorithm and color-grain switch to change.
 
 Dice never changes source identity; rack/group/layer topology; image routes;
 node IDs/order/enabled/blend; group membership/solo/bypass/bus; layer opacity,
-visibility, blend, keying, or Bypass Master FX; transport; modulation routes;
+visibility, blend, keying, Bypass Master FX, or Bypass Temporal FX; transport;
+modulation routes;
 VHS; Temporal topology/seeds/Score/reset/loop-driver law; or Motion algorithm,
 field-source/quality, donor, or carrier law. Because variation edits visual
 bases, a valid variation materializes and clears an engaged A/B Morph before
@@ -695,12 +716,17 @@ offscreen. Test cards, identification, and calibration affect that endpoint
 only, after the completed creative Program, and never alter the artwork saved
 in a patch.
 
-Selective VHS export is synchronous but follows the live layer law: bypassed
-layers retain only their direct effects, inherited layers receive master effects
-and VHS, and the stack is recomposited. If any bypass layer contributes, the
-complete shared Temporal family then runs neutral while accepting the clean
-program into warm history. A selective-processing failure stops the export with
-an error instead of silently applying VHS to a bypassed layer.
+Selective VHS export is synchronous but follows the live **Bypass Master FX**
+law: bypassed layers retain only their direct effects, inherited layers receive
+master effects and VHS, and the stack is recomposited. If any Bypass Master FX
+layer contributes, the complete shared Temporal family then runs neutral while
+accepting the clean program into warm history. A selective-processing failure
+stops the export with an error instead of silently applying VHS to a bypassed
+layer.
+
+An admitted **Bypass Temporal FX** top prefix also follows its live law during
+offline render: the inherited background receives the complete Temporal family,
+including Codec Mosh, before the dry prefix is recomposited in authored order.
 
 **VHS quality** affects both the ordinary global path and those inherited
 selective slices:
@@ -771,7 +797,7 @@ admitted donor field and grid.
 |---|---|---|
 | Sources and Performance Set | Rebuilds saved sources/order, prepared clip slots, slot transport/cues, active slots, and Scenes | Keeps current sources, identities/order/count, prepared slots, transport, and Scenes |
 | Collision Rack/composition | Restores exact rack nodes/IDs/routes, groups/root/membership/buses/A-B, and mattes/image routes | Copies compatible rack/group/matte/A-B values only; preserves topology, IDs, routes, donors, membership, order, solo/bypass, and bus assignment |
-| Master/layer visuals | Restores all saved values, including spatial transforms and Motion | Applies master values and maps saved layer transform, opacity, blend, visibility, Bypass Master FX, direct effects/keying, pattern seed, and Motion values by stack position; preserves Motion donor routes |
+| Master/layer visuals | Restores all saved values, including spatial transforms and Motion | Applies master values and maps saved layer transform, opacity, blend, visibility, Bypass Master FX, Bypass Temporal FX, direct effects/keying, pattern seed, and Motion values by stack position; preserves Motion donor routes |
 | Layer transport | Restores pause plus legacy speed/FPS/loop-reroll and the complete per-slot transport | Preserves all current values |
 | Program transport | Restores Freeze Program and Freeze Media | Preserves both current freeze states |
 | Modulation/input | Restores BPM, LFOs/seeds, routes, and input configuration | Preserves the current matrix and input state |
@@ -796,8 +822,9 @@ Saved state includes stable source identities (legacy paths or retained
 `cos-sha256://` length/digest references); prepared slots, their complete
 transport/cues, and Scenes; Collision Racks, composition/groups/A-B, image
 routes/mattes; master/layer effects, transforms, Temporal Originals, and Motion;
-layer order/visibility/pause/blend/bypass/reroll; both freeze states; modulation
-routes, LFO seeds/input configuration, tempo/Morph, gyro/pad, and audio bands.
+layer order/visibility/pause/blend/Bypass Master FX/Bypass Temporal FX/reroll;
+both freeze states; modulation routes, LFO seeds/input configuration,
+tempo/Morph, gyro/pad, and audio bands.
 MIDI/audio devices are reopened as available rather than serialized as live
 handles.
 
@@ -998,6 +1025,7 @@ proof of any deferred backend.
 | **Library is empty or points at the wrong folder** | Check the active path in RECOVERY, choose the intended folder, and use Rescan. Choosing or rescanning does not add a layer automatically. |
 | **A large source is rejected in Safe or Expert mode** | Safe intentionally stops above UHD area. Expert still enforces DCI-8K area, absolute/device edge, per-buffer, and aggregate host-planning limits; it is not a guarantee of available VRAM. Reduce the source or close other above-Safe sources. |
 | **Selective VHS reports a memory budget error** | The requested output size and number of visible, positive-opacity layers exceed the bounded live working set. Hide unneeded layers, set their opacity to zero, or lower the output resolution. The engine holds the prior exact audience frame and does not violate Bypass Master FX. |
+| **Bypass Temporal FX is rejected** | Put every dry layer in one contiguous prefix beginning at Layer 1/top and use a flat LegacyExact Program stack. Remove groups, A/B or non-Program bus routing, mattes, advanced racks or advanced Motion, authored Master/layer Motion modulation routes (including zero-depth routes), and routed Refresh Garden; disable VHS. The rejected transaction leaves the previous switch state and audience frame intact. |
 | **Audio meters remain zero** | Select/enable a real input, grant OS access, and inspect the panel error. Software-only tests do not prove venue hardware. |
 | **QR contains 127.0.0.1** | No LAN address was found at launch. Connect networking and restart. |
 
