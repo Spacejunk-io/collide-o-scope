@@ -826,6 +826,8 @@ const DICE_TEMPORAL_GARDEN_THRESHOLD: u64 = 0x5433_4741_5244_5448;
 const DICE_TEMPORAL_GARDEN_SOFTNESS: u64 = 0x5433_4741_5244_534f;
 const DICE_TEMPORAL_GARDEN_DECAY: u64 = 0x5433_4741_5244_4443;
 const DICE_TEMPORAL_GARDEN_HOLD: u64 = 0x5433_4741_5244_484f;
+const DICE_TEMPORAL_LONG_EXPOSURE_AMOUNT: u64 = 0x4c45_4449_4345_414d;
+const DICE_TEMPORAL_LONG_EXPOSURE_FRAMES: u64 = 0x4c45_4449_4345_4652;
 
 fn temporal_rng(seed: u32, stream: u64, domain: u64) -> SplitMix64 {
     SplitMix64::new(u64::from(seed) ^ stream.wrapping_mul(0xa076_1d64_78bd_642f) ^ domain)
@@ -994,6 +996,26 @@ pub(crate) fn mutate_live_temporal_originals(
             + f64::from(MEAN_REVERSION) * (value - anchor)
             + f64::from(rng.signed()) * f64::from(amount) * 30.0;
         originals.garden.max_hold_ticks = candidate.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+    }
+    linear!(
+        originals.long_exposure.amount,
+        defaults.long_exposure.amount,
+        0.0,
+        1.0,
+        0.2,
+        DICE_TEMPORAL_LONG_EXPOSURE_AMOUNT
+    );
+    {
+        let mut rng = temporal_rng(seed, stream, DICE_TEMPORAL_LONG_EXPOSURE_FRAMES);
+        originals.long_exposure.shutter_frames = mutate_linear(
+            f32::from(defaults.long_exposure.shutter_frames),
+            f32::from(originals.long_exposure.shutter_frames),
+            2.0,
+            24.0,
+            amount * 3.0,
+            &mut rng,
+        )
+        .round() as u8;
     }
 }
 
@@ -2208,6 +2230,8 @@ mod tests {
         assert!((0.0..=1.0).contains(&left.garden.threshold));
         assert!((0.0..=0.5).contains(&left.garden.softness));
         assert!((0.0..=1.0).contains(&left.garden.decay));
+        assert!((0.0..=1.0).contains(&left.long_exposure.amount));
+        assert!((2..=24).contains(&left.long_exposure.shutter_frames));
 
         assert_eq!(left.loom.topology, authored.loom.topology);
         assert_eq!(left.loom.interpolation, authored.loom.interpolation);

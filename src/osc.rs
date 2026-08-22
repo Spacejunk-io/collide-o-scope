@@ -25,6 +25,7 @@ use crate::controller_profile::{
     PersistedDocumentLoadStatus, RuntimeControlAddress, RuntimeNodeScope,
 };
 use crate::image_routing::StableLayerId;
+use crate::performance::SceneId;
 use crate::visual_rack::{GroupId, NodeId};
 
 pub const OSC_CONFIG_VERSION: u16 = 1;
@@ -233,6 +234,12 @@ pub fn format_control_address(address: RuntimeControlAddress) -> Result<String, 
         RuntimeControlAddress::Transport(parameter) => {
             format!("/collide/v1/transport/{}", parameter.key())
         }
+        RuntimeControlAddress::ScenePrepare { scene_id } => {
+            format!("/collide/v1/scene/{}/prepare", scene_id.get())
+        }
+        RuntimeControlAddress::SceneTrigger { scene_id } => {
+            format!("/collide/v1/scene/{}/trigger", scene_id.get())
+        }
     };
     if path.len() > OSC_MAX_STRING_BYTES {
         Err(OscError::StringBytes(path.len()))
@@ -269,6 +276,16 @@ pub fn parse_control_address(path: &str) -> Result<RuntimeControlAddress, OscErr
         ["", "collide", "v1", "transport", key] => {
             Ok(RuntimeControlAddress::Transport(parameter(Some(key))?))
         }
+        ["", "collide", "v1", "scene", scene, "prepare"] => {
+            Ok(RuntimeControlAddress::ScenePrepare {
+                scene_id: parse_scene_id(scene)?,
+            })
+        }
+        ["", "collide", "v1", "scene", scene, "trigger"] => {
+            Ok(RuntimeControlAddress::SceneTrigger {
+                scene_id: parse_scene_id(scene)?,
+            })
+        }
         ["", "collide", "v1", "node", "master", node, key] => Ok(RuntimeControlAddress::Node {
             scope: RuntimeNodeScope::Master,
             node_id: NodeId::new(parse_u64(node)?).ok_or(OscError::StableId)?,
@@ -303,6 +320,12 @@ fn parse_u64(value: &str) -> Result<u64, OscError> {
     value.parse().map_err(|_| OscError::StableId)
 }
 
+fn parse_scene_id(value: &str) -> Result<SceneId, OscError> {
+    let value = parse_u64(value)?;
+    let value = u16::try_from(value).map_err(|_| OscError::StableId)?;
+    SceneId::new(value).ok_or(OscError::StableId)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OscEvent {
     pub address: RuntimeControlAddress,
@@ -326,7 +349,18 @@ pub fn decode_packet(bytes: &[u8], peer: SocketAddr) -> Result<Vec<OscEvent>, Os
         .into_iter()
         .map(|message| OscEvent {
             address: message.address,
-            value: AutomationValue::Absolute(message.value),
+            // OSC has no held-button decoder. An asserted Scene action is one
+            // message pulse; a false/zero packet is an inert release. MIDI
+            // reaches the same adapter as a true rising-edge Trigger.
+            value: if message.address.is_scene_action() {
+                if message.value >= 0.5 {
+                    AutomationValue::Trigger
+                } else {
+                    AutomationValue::Gate(false)
+                }
+            } else {
+                AutomationValue::Absolute(message.value)
+            },
             origin: AutomationOrigin::Osc(peer),
         })
         .collect())
@@ -957,9 +991,27 @@ fn is_osc_feedback_echo(shared: &OscShared, event: OscEvent) -> bool {
     let AutomationOrigin::Osc(peer) = event.origin else {
         return false;
     };
-    let AutomationValue::Absolute(value) = event.value else {
-        return false;
+    let value = match event.value {
+        AutomationValue::Absolute(value) => value,
+        // Scene packets decode asserted feedback as a pulse and zero as the
+        // inert release half. Compare those typed values to the exact float
+        // put on the wire, or a looped-back ready LED packet can become an
+        // unsolicited Scene launch.
+        AutomationValue::Trigger if event.address.is_scene_action() => 1.0,
+        AutomationValue::Gate(value) if event.address.is_scene_action() => {
+            if value {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        AutomationValue::Delta(_) | AutomationValue::Trigger | AutomationValue::Gate(_) => {
+            return false
+        }
     };
+    if !value.is_finite() {
+        return false;
+    }
     let Ok(mut recent) = shared.recent.try_lock() else {
         return false;
     };
@@ -1048,6 +1100,10 @@ mod tests {
         StableLayerId::new(value).unwrap()
     }
 
+    fn scene(value: u16) -> SceneId {
+        SceneId::new(value).unwrap()
+    }
+
     #[test]
     fn typed_addresses_round_trip_stable_scopes_and_closed_parameters() {
         let addresses = [
@@ -1066,11 +1122,31 @@ mod tests {
                 parameter: ControlParameter::Wet,
             },
             RuntimeControlAddress::Transport(ControlParameter::ProgramFreeze),
+            RuntimeControlAddress::ScenePrepare {
+                scene_id: scene(12),
+            },
+            RuntimeControlAddress::SceneTrigger {
+                scene_id: scene(12),
+            },
         ];
         for address in addresses {
             let encoded = format_control_address(address).unwrap();
             assert_eq!(parse_control_address(&encoded), Ok(address));
         }
+        assert_eq!(
+            format_control_address(RuntimeControlAddress::ScenePrepare {
+                scene_id: scene(12),
+            })
+            .unwrap(),
+            "/collide/v1/scene/12/prepare"
+        );
+        assert_eq!(
+            format_control_address(RuntimeControlAddress::SceneTrigger {
+                scene_id: scene(12),
+            })
+            .unwrap(),
+            "/collide/v1/scene/12/trigger"
+        );
         assert_eq!(
             parse_control_address("/collide/v1/layer/42/../../file"),
             Err(OscError::Address)
@@ -1079,6 +1155,62 @@ mod tests {
             parse_control_address("/collide/v1/master/not_a_parameter"),
             Err(OscError::Parameter)
         );
+        assert_eq!(
+            parse_control_address("/collide/v1/scene/0/trigger"),
+            Err(OscError::StableId)
+        );
+        assert_eq!(
+            parse_control_address("/collide/v1/scene/65536/prepare"),
+            Err(OscError::StableId)
+        );
+        assert_eq!(
+            parse_control_address("/collide/v1/scene/12/fire"),
+            Err(OscError::Address)
+        );
+    }
+
+    #[test]
+    fn scene_action_packets_are_asserted_pulses_with_inert_releases() {
+        let trigger = RuntimeControlAddress::SceneTrigger { scene_id: scene(4) };
+        let asserted = decode_packet(&encode_feedback(trigger, 1.0).unwrap(), peer()).unwrap();
+        assert_eq!(asserted.len(), 1);
+        assert_eq!(asserted[0].address, trigger);
+        assert_eq!(asserted[0].value, AutomationValue::Trigger);
+
+        let released = decode_packet(&encode_feedback(trigger, 0.0).unwrap(), peer()).unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].address, trigger);
+        assert_eq!(released[0].value, AutomationValue::Gate(false));
+    }
+
+    #[test]
+    fn looped_scene_feedback_pulses_and_releases_are_suppressed() {
+        let shared = OscShared::default();
+        let address = RuntimeControlAddress::SceneTrigger { scene_id: scene(4) };
+        {
+            let mut recent = shared.recent.lock().unwrap();
+            recent.push_back(RecentFeedback {
+                peer: peer(),
+                address,
+                value_bits: 1.0_f32.to_bits(),
+                sent_at: Instant::now(),
+            });
+            recent.push_back(RecentFeedback {
+                peer: peer(),
+                address,
+                value_bits: 0.0_f32.to_bits(),
+                sent_at: Instant::now(),
+            });
+        }
+
+        let asserted = decode_packet(&encode_feedback(address, 1.0).unwrap(), peer()).unwrap();
+        let released = decode_packet(&encode_feedback(address, 0.0).unwrap(), peer()).unwrap();
+        assert!(is_osc_feedback_echo(&shared, asserted[0]));
+        assert!(is_osc_feedback_echo(&shared, released[0]));
+
+        let other_peer: SocketAddr = "127.0.0.1:9010".parse().unwrap();
+        let remote = decode_packet(&encode_feedback(address, 1.0).unwrap(), other_peer).unwrap();
+        assert!(!is_osc_feedback_echo(&shared, remote[0]));
     }
 
     #[test]

@@ -8,9 +8,9 @@ pub const TEMPORAL_REFERENCE_FPS: f32 = 30.0;
     reason = "T0 exposes the frozen authoring vocabulary before T1 consumers land"
 )]
 pub use crate::temporal::{
-    CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, RefreshGardenGate,
-    RefreshGardenParams, TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
-    TemporalTopology, TimeDisplaceMap,
+    CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, LongExposureParams,
+    RefreshGardenGate, RefreshGardenParams, TemporalInterpolation, TemporalLoomParams,
+    TemporalOriginalsParams, TemporalTopology, TimeDisplaceMap,
 };
 
 /// Temporal (frame-history) effect parameters: feedback trails and

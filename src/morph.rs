@@ -20,8 +20,8 @@ use crate::motion::MotionParams;
 use crate::ntsc::NtscParams;
 use crate::patch::{
     CollisionAtlasConfig, CollisionScoreLoopDriverConfig, CurvedShutterConfig, FaradayConfig,
-    FieldColliderConfig, FlowShapingConfig, GestureCanvasConfig, MotionConfig, MotionDonorConfig,
-    ProceduralFieldConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
+    FieldColliderConfig, FlowShapingConfig, GestureCanvasConfig, LongExposureConfig, MotionConfig,
+    MotionDonorConfig, ProceduralFieldConfig, RefreshGardenConfig, RefreshGardenMatteRouteConfig,
     RefreshGardenMotionRouteConfig, TemporalLoomConfig, TemporalOriginalsConfig,
     TemporalResetPolicyConfig, TemporalRigConfig, TimeDisplaceMapConfig,
 };
@@ -1087,6 +1087,16 @@ fn interpolate_temporal_originals(
             max_hold_ticks: blend_u32(a.garden.max_hold_ticks, b.garden.max_hold_ticks, weights),
             matte_route: pick(a.garden.matte_route, b.garden.matte_route, choose_b),
             motion_route: pick(a.garden.motion_route, b.garden.motion_route, choose_b),
+        },
+        long_exposure: LongExposureConfig {
+            amount: blend_finite(a.long_exposure.amount, b.long_exposure.amount, weights),
+            shutter_frames: blend_u8(
+                a.long_exposure.shutter_frames,
+                b.long_exposure.shutter_frames,
+                weights,
+                2,
+                24,
+            ),
         },
         // Score configuration is entirely discrete: an A/B move may recall
         // either conductor, but may not synthesize a third sequence.
@@ -6459,6 +6469,13 @@ key_threshold: 0.2
             key_threshold: 0.08,
             key_softness: 0.02,
             key_history: 1.0,
+            originals: crate::temporal::TemporalOriginalsParams {
+                long_exposure: crate::temporal::LongExposureParams {
+                    amount: 0.2,
+                    shutter_frames: 4,
+                },
+                ..Default::default()
+            },
             ..Default::default()
         });
         let temporal_b = MorphTemporalSnapshot::capture(&TemporalParams {
@@ -6466,6 +6483,13 @@ key_threshold: 0.2
             key_threshold: 0.48,
             key_softness: 0.1,
             key_history: 9.0,
+            originals: crate::temporal::TemporalOriginalsParams {
+                long_exposure: crate::temporal::LongExposureParams {
+                    amount: 0.8,
+                    shutter_frames: 20,
+                },
+                ..Default::default()
+            },
             ..Default::default()
         });
         let temporal =
@@ -6474,6 +6498,8 @@ key_threshold: 0.2
         close(temporal.key_threshold, 0.28);
         close(temporal.key_softness, 0.06);
         close(temporal.key_history, 5.0);
+        close(temporal.originals.long_exposure.amount, 0.5);
+        assert_eq!(temporal.originals.long_exposure.shutter_frames, 12);
 
         let legacy_master: MorphMasterSnapshot =
             serde_yaml::from_str("pixelate_size: 2\n").unwrap();
@@ -6486,6 +6512,10 @@ key_threshold: 0.2
         close(legacy_temporal.key_threshold, 0.1);
         close(legacy_temporal.key_softness, 0.03);
         close(legacy_temporal.key_history, 1.0);
+        assert_eq!(
+            legacy_temporal.originals.long_exposure,
+            LongExposureConfig::default()
+        );
     }
 
     #[test]

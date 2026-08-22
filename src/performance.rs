@@ -22,6 +22,12 @@ pub const MAX_CLIP_SLOTS_PER_LAYER: usize = 32;
 pub const MAX_SCENES: usize = 128;
 /// A scene cannot address more layer positions than the engine will plan.
 pub const MAX_SCENE_BINDINGS: usize = 256;
+/// Hard authored/runtime limit for the Scene-only Autopilot sequence.
+pub const MAX_AUTOPILOT_STEPS: usize = 128;
+/// Longest dwell accepted for one Autopilot step.
+pub const MAX_AUTOPILOT_HOLD_BEATS: u16 = 256;
+/// Resolume-style useful default: one bar in the engine's default 4/4 meter.
+pub const DEFAULT_AUTOPILOT_HOLD_BEATS: u16 = 4;
 /// Largest saved zero-based layer position accepted from untrusted input.
 pub const MAX_SAVED_LAYER_POSITION: u32 = 4095;
 
@@ -172,6 +178,58 @@ impl<'de> Deserialize<'de> for SceneId {
     {
         let value = u16::deserialize(deserializer)?;
         Self::new(value).ok_or_else(|| de::Error::custom("scene id must be non-zero"))
+    }
+}
+
+/// Number of accepted media beats for which an Autopilot Scene remains live.
+///
+/// Keeping the bound in the type makes authored, YAML, web, and runtime paths
+/// share the same law. The wire representation remains an ordinary integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AutopilotHoldBeats(u16);
+
+impl AutopilotHoldBeats {
+    pub const DEFAULT: Self = Self(DEFAULT_AUTOPILOT_HOLD_BEATS);
+
+    pub const fn new(value: u16) -> Option<Self> {
+        if value == 0 || value > MAX_AUTOPILOT_HOLD_BEATS {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl Default for AutopilotHoldBeats {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl Serialize for AutopilotHoldBeats {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u16(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AutopilotHoldBeats {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u16::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| {
+            de::Error::custom(format_args!(
+                "Autopilot hold_beats must be in 1..={MAX_AUTOPILOT_HOLD_BEATS}"
+            ))
+        })
     }
 }
 
@@ -717,6 +775,184 @@ impl<'de> Deserialize<'de> for Scenes {
     }
 }
 
+/// End-of-sequence law for the Scene-only beat Autopilot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotRepeat {
+    Once,
+    #[default]
+    Loop,
+}
+
+/// One stable Scene recall and its exact accepted-media-beat dwell.
+/// Duplicate Scene IDs are deliberately legal and retain authored order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutopilotStep {
+    pub scene_id: SceneId,
+    #[serde(default)]
+    pub hold_beats: AutopilotHoldBeats,
+}
+
+/// Bounded authored Autopilot step sequence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutopilotSteps(Vec<AutopilotStep>);
+
+impl AutopilotSteps {
+    pub fn try_from_vec(entries: Vec<AutopilotStep>) -> Result<Self, PerformanceCollectionError> {
+        if entries.len() > MAX_AUTOPILOT_STEPS {
+            return Err(PerformanceCollectionError::TooMany {
+                collection: "Autopilot steps",
+                limit: MAX_AUTOPILOT_STEPS,
+            });
+        }
+        Ok(Self(entries))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &AutopilotStep> {
+        self.0.iter()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&AutopilotStep> {
+        self.0.get(index)
+    }
+}
+
+impl Serialize for AutopilotSteps {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.len()))?;
+        for step in &self.0 {
+            sequence.serialize_element(step)?;
+        }
+        sequence.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for AutopilotSteps {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct AutopilotStepsVisitor;
+
+        impl<'de> Visitor<'de> for AutopilotStepsVisitor {
+            type Value = AutopilotSteps;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "at most {MAX_AUTOPILOT_STEPS} Autopilot steps")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // Never trust an unbounded sequence hint as an allocation
+                // request. The vector cannot grow beyond the authored cap.
+                let mut entries =
+                    Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX_AUTOPILOT_STEPS));
+                while let Some(step) = sequence.next_element::<AutopilotStep>()? {
+                    if entries.len() == MAX_AUTOPILOT_STEPS {
+                        return Err(de::Error::custom(format_args!(
+                            "an Autopilot may contain at most {MAX_AUTOPILOT_STEPS} steps"
+                        )));
+                    }
+                    entries.push(step);
+                }
+                Self::Value::try_from_vec(entries).map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_seq(AutopilotStepsVisitor)
+    }
+}
+
+/// Stable diagnostic for an authored step whose Scene no longer exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutopilotSceneReferenceIssue {
+    pub step_index: usize,
+    pub scene_id: SceneId,
+}
+
+impl fmt::Display for AutopilotSceneReferenceIssue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Autopilot step {} references missing Scene {}",
+            self.step_index + 1,
+            self.scene_id.get()
+        )
+    }
+}
+
+impl std::error::Error for AutopilotSceneReferenceIssue {}
+
+/// Persisted Scene-only beat sequence. An empty value is the additive legacy
+/// default and is omitted from canonical patch serialization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutopilotPlan {
+    #[serde(default)]
+    pub repeat: AutopilotRepeat,
+    #[serde(default)]
+    pub steps: AutopilotSteps,
+}
+
+impl AutopilotPlan {
+    #[allow(
+        dead_code,
+        reason = "retained for typed native editors and pure scheduler fixtures"
+    )]
+    pub fn try_new(
+        repeat: AutopilotRepeat,
+        steps: Vec<AutopilotStep>,
+    ) -> Result<Self, PerformanceCollectionError> {
+        Ok(Self {
+            repeat,
+            steps: AutopilotSteps::try_from_vec(steps)?,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Resolve stable Scene identities against the currently authored set.
+    /// The first broken reference is reported with its authored step index;
+    /// duplicate valid references remain legal.
+    pub fn validate_scenes(&self, scenes: &Scenes) -> Result<(), AutopilotSceneReferenceIssue> {
+        for (step_index, step) in self.steps.iter().enumerate() {
+            if scenes.get(step.scene_id).is_none() {
+                return Err(AutopilotSceneReferenceIssue {
+                    step_index,
+                    scene_id: step.scene_id,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+// The binary currently has no library root. Keeping the pure state machine
+// below this domain module makes it testable now without changing main.rs;
+// live integration can refer to `performance::autopilot` directly.
+#[path = "autopilot.rs"]
+pub mod autopilot;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,6 +1092,71 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn autopilot_plan_is_bounded_defaults_to_a_bar_loop_and_allows_duplicates() {
+        let repeated = AutopilotStep {
+            scene_id: SceneId::new(9).unwrap(),
+            hold_beats: AutopilotHoldBeats::default(),
+        };
+        let plan =
+            AutopilotPlan::try_new(AutopilotRepeat::default(), vec![repeated, repeated]).unwrap();
+        assert_eq!(plan.repeat, AutopilotRepeat::Loop);
+        assert_eq!(plan.steps.get(0).unwrap().hold_beats.get(), 4);
+        assert_eq!(plan.steps.get(1).unwrap().scene_id, repeated.scene_id);
+
+        let yaml = serde_yaml::to_string(&plan).unwrap();
+        let restored: AutopilotPlan = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(restored, plan);
+
+        let too_many = (0..=MAX_AUTOPILOT_STEPS)
+            .map(|index| AutopilotStep {
+                scene_id: SceneId::new(u16::try_from(index + 1).unwrap()).unwrap(),
+                hold_beats: AutopilotHoldBeats::default(),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            AutopilotSteps::try_from_vec(too_many.clone()),
+            Err(PerformanceCollectionError::TooMany {
+                limit: MAX_AUTOPILOT_STEPS,
+                ..
+            })
+        ));
+        let hostile_yaml = serde_yaml::to_string(&too_many).unwrap();
+        assert!(serde_yaml::from_str::<AutopilotSteps>(&hostile_yaml)
+            .unwrap_err()
+            .to_string()
+            .contains("at most 128"));
+    }
+
+    #[test]
+    fn autopilot_holds_and_scene_references_fail_closed_without_pruning_intent() {
+        assert!(serde_yaml::from_str::<AutopilotHoldBeats>("0").is_err());
+        assert!(serde_yaml::from_str::<AutopilotHoldBeats>("257").is_err());
+        assert_eq!(
+            serde_yaml::from_str::<AutopilotHoldBeats>("256")
+                .unwrap()
+                .get(),
+            256
+        );
+
+        let plan: AutopilotPlan = serde_yaml::from_str(
+            "repeat: once\nsteps:\n  - scene_id: 7\n  - scene_id: 99\n    hold_beats: 1\n",
+        )
+        .unwrap();
+        assert_eq!(plan.steps.get(0).unwrap().hold_beats.get(), 4);
+        let scenes = Scenes::try_from_vec(vec![Scene {
+            id: SceneId::new(7).unwrap(),
+            name: String::new(),
+            trigger_mode: TriggerMode::Immediate,
+            bindings: SceneBindings::default(),
+        }])
+        .unwrap();
+        let issue = plan.validate_scenes(&scenes).unwrap_err();
+        assert_eq!(issue.step_index, 1);
+        assert_eq!(issue.scene_id.get(), 99);
+        assert_eq!(plan.len(), 2, "validation never prunes authored steps");
     }
 
     #[test]

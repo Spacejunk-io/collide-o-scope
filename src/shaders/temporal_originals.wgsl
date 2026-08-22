@@ -2,7 +2,7 @@
 //
 // The legacy shader remains in temporal.wgsl and is selected whenever every
 // original is zero. Keep its frozen 64-byte uniform at binding 0; this path
-// adds a separate fixed 128-byte block at binding 1. Collision Atlas is a
+// adds a separate fixed 144-byte block at binding 1. Collision Atlas is a
 // bounded analytical 3x3 Worley search and allocates/samples no extra texture.
 
 struct TemporalUniforms {
@@ -42,6 +42,7 @@ struct TemporalOriginalsUniforms {
     score_runtime: vec4u,  // score seed, state index, ordinal low, ordinal high
     garden_values: vec4f,  // amount, threshold, softness, decay
     garden_modes: vec4u,   // gate, max hold ticks, observation ticks, packed runtime
+    long_exposure_values: vec4f, // amount, shutter frames, reserved, reserved
 };
 
 @group(0) @binding(0) var current_tex: texture_2d<f32>;
@@ -433,6 +434,59 @@ fn woven_history(current: vec4f, uv: vec2f, normalized_age: f32) -> vec4f {
     return mix(lower, upper, fract(depth));
 }
 
+// A bounded box-shutter integral over clean pre-temporal images. The virtual
+// current frame is sample zero; initialized ring ages follow it. Shutters up
+// to eight frames are exact. Longer shutters use eight uniformly stratified
+// samples across the complete interval, preserving trail extent without
+// letting a 24-tap full-resolution loop dominate the frame. Averaging (rather
+// than recursive feedback) gives photographic motion ghosts without runaway
+// gain, and amount zero never enters this loop.
+fn long_exposure_history_load(uv: vec2f, discrete_age: u32) -> vec4f {
+    let dimensions = textureDimensions(history_tex);
+    let max_coords = dimensions - vec2u(1u);
+    let normalized = clamp(uv, vec2f(0.0), vec2f(1.0));
+    let coords = min(vec2u(normalized * vec2f(dimensions)), max_coords);
+    let layer = wrap_layer(u.write_index - f32(discrete_age));
+    // The clean ring matches the output dimensions, so same-pixel shutter
+    // reads need no bilinear footprint. Sampled-texture format conversion
+    // still decodes Compat8 sRGB to linear here; Full16 is already linear.
+    return textureLoad(history_tex, vec2i(coords), layer, 0);
+}
+
+fn long_exposure_legacy(current: vec4f, uv: vec2f) -> vec4f {
+    let amount = clamp(originals.long_exposure_values.x, 0.0, 1.0);
+    if amount <= 0.0 || u.valid_history <= 1.0 {
+        return current;
+    }
+    let requested = u32(clamp(
+        round(originals.long_exposure_values.y),
+        2.0,
+        u.history_len,
+    ));
+    let available = min(requested, u32(u.valid_history));
+    let sample_count = min(available, 8u);
+    let current_alpha = clamp(current.a, 0.0, 1.0);
+    var integrated = vec4f(current.rgb * current_alpha, current_alpha);
+    for (var sample_index = 1u; sample_index < 8u; sample_index = sample_index + 1u) {
+        if sample_index >= sample_count { break; }
+        let age = u32(round(
+            f32(sample_index) * f32(available - 1u) / f32(sample_count - 1u),
+        ));
+        let history = long_exposure_history_load(uv, age);
+        let history_alpha = clamp(history.a, 0.0, 1.0);
+        integrated += vec4f(history.rgb * history_alpha, history_alpha);
+    }
+    let exposure_covered = integrated / f32(sample_count);
+    var exposure = vec4f(0.0);
+    if exposure_covered.a > 0.000001 {
+        exposure = vec4f(
+            exposure_covered.rgb / exposure_covered.a,
+            exposure_covered.a,
+        );
+    }
+    return mix(current, exposure, amount);
+}
+
 fn legacy_originals(uv: vec2f) -> vec4f {
     let current = textureSample(current_tex, samp, uv);
     var color = current;
@@ -477,6 +531,8 @@ fn legacy_originals(uv: vec2f) -> vec4f {
         let woven = woven_history(current, uv, age);
         color = mix(color, woven, originals_amount);
     }
+
+    color = long_exposure_legacy(color, uv);
 
     // One carrier read serves both frozen feedback and Refresh Garden. The
     // legacy feedback transform is also Garden's bounded identity/warp law.
@@ -667,6 +723,30 @@ fn advanced_woven_history(current: vec4f, uv: vec2f, normalized_age: f32) -> vec
     return mix(lower, upper, fract(depth));
 }
 
+fn long_exposure_advanced(current: vec4f, uv: vec2f) -> vec4f {
+    let amount = clamp(originals.long_exposure_values.x, 0.0, 1.0);
+    if amount <= 0.0 || u.valid_history <= 1.0 {
+        return current;
+    }
+    let requested = u32(clamp(
+        round(originals.long_exposure_values.y),
+        2.0,
+        u.history_len,
+    ));
+    let available = min(requested, u32(u.valid_history));
+    let sample_count = min(available, 8u);
+    var integrated = current;
+    for (var sample_index = 1u; sample_index < 8u; sample_index = sample_index + 1u) {
+        if sample_index >= sample_count { break; }
+        let age = u32(round(
+            f32(sample_index) * f32(available - 1u) / f32(sample_count - 1u),
+        ));
+        integrated += premultiply_originals(long_exposure_history_load(uv, age));
+    }
+    let exposure = integrated / f32(sample_count);
+    return mix(current, exposure, amount);
+}
+
 fn advanced_originals(uv: vec2f) -> vec4f {
     let current = premultiply_originals(textureSample(current_tex, samp, uv));
     var color = current;
@@ -704,6 +784,8 @@ fn advanced_originals(uv: vec2f) -> vec4f {
         let woven = advanced_woven_history(current, uv, age);
         color = mix(color, woven, originals_amount);
     }
+
+    color = long_exposure_advanced(color, uv);
 
     var previous = vec4f(0.0);
     var previous_inside = 0.0;

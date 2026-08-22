@@ -10,8 +10,9 @@ use crate::composition::{
 };
 use crate::effects::params::{
     CollisionAtlasParams, CollisionScoreParams, CollisionScoreTrigger, FeedbackRigParams,
-    FeedbackShape, RefreshGardenGate, RefreshGardenParams, TemporalInterpolation,
-    TemporalLoomParams, TemporalOriginalsParams, TemporalParams, TemporalTopology, TimeDisplaceMap,
+    FeedbackShape, LongExposureParams, RefreshGardenGate, RefreshGardenParams,
+    TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams, TemporalParams,
+    TemporalTopology, TimeDisplaceMap,
 };
 use crate::effects::EffectUniforms;
 use crate::image_routing::{
@@ -21,7 +22,7 @@ use crate::layers::{BlendMode, Layer};
 use crate::modulation::{
     Curve, GyroAxisConfig, Lfo, LfoShape, ModMatrix, ModSource, PadAxisConfig, PadConfig,
     ResolvedStableModTarget, Routing, SavedStableModScope, SavedStableModTarget,
-    StableModAddressBook, MAX_ROUTINGS, NUM_LFOS,
+    StableModAddressBook, LEGACY_NUM_LFOS, MAX_ROUTINGS, NUM_LFOS,
 };
 use crate::motion::{
     CurvedShutterParams, CurvedShutterQuality, FaradayParams, FieldColliderMode,
@@ -31,8 +32,8 @@ use crate::motion::{
 };
 use crate::ntsc::NtscParams;
 use crate::performance::{
-    ClipSlotConfig, ClipSlotId, ClipSlots, SavedLayerPosition, SceneReferenceErrorKind,
-    SceneReferenceIssue, Scenes,
+    AutopilotPlan, ClipSlotConfig, ClipSlotId, ClipSlots, SavedLayerPosition,
+    SceneReferenceErrorKind, SceneReferenceIssue, Scenes,
 };
 use crate::spatial::{EdgeMode, FitMode, SamplingMode, SpatialTransform};
 use crate::temporal::{
@@ -479,6 +480,10 @@ pub struct PatchState {
     /// Prepared multi-layer recalls. Empty is the exact legacy behavior.
     #[serde(default, skip_serializing_if = "Scenes::is_empty")]
     pub scenes: Scenes,
+    /// Scene-only beat sequence. Empty is exactly the pre-Autopilot behavior
+    /// and stays absent from canonical legacy patch bytes.
+    #[serde(default, skip_serializing_if = "AutopilotPlan::is_empty")]
+    pub autopilot: AutopilotPlan,
     /// Recorded gesture track. A track is authored topology rather than a
     /// value: it is carried whole, never interpolated, and an absent section is
     /// exactly the pre-gesture path. Its own bounded, checksum-verifying
@@ -573,6 +578,8 @@ impl<'de> Deserialize<'de> for PatchState {
             #[serde(default)]
             scenes: Scenes,
             #[serde(default)]
+            autopilot: AutopilotPlan,
+            #[serde(default)]
             gesture_track: Option<crate::gesture::GestureTrackDocument>,
             #[serde(default)]
             gesture_canvas: Option<GestureCanvasConfig>,
@@ -601,6 +608,7 @@ impl<'de> Deserialize<'de> for PatchState {
                 .snapshot_bank
                 .map(|bank| crate::morph::SnapshotBank::sanitized(&bank)),
             scenes: raw.scenes,
+            autopilot: raw.autopilot,
             gesture_track: raw.gesture_track,
             gesture_canvas: raw.gesture_canvas.map(GestureCanvasConfig::sanitized),
             studies: raw.studies,
@@ -1546,12 +1554,50 @@ impl CollisionScoreConfig {
     }
 }
 
+/// Persisted long-exposure treatment. This block exists only inside the
+/// additive Temporal Originals section, which the enclosing Temporal config
+/// omits completely while every original is neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LongExposureConfig {
+    pub amount: f32,
+    pub shutter_frames: u8,
+}
+
+impl Default for LongExposureConfig {
+    fn default() -> Self {
+        Self::from_params(LongExposureParams::default())
+    }
+}
+
+impl LongExposureConfig {
+    pub fn from_params(value: LongExposureParams) -> Self {
+        Self {
+            amount: value.amount,
+            shutter_frames: value.shutter_frames,
+        }
+    }
+
+    pub fn to_params(self) -> LongExposureParams {
+        LongExposureParams {
+            amount: finite_or(self.amount, 0.0).clamp(0.0, 1.0),
+            shutter_frames: self.shutter_frames.clamp(2, 24),
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TemporalOriginalsConfig {
     pub loom: TemporalLoomConfig,
     pub atlas: CollisionAtlasConfig,
     pub garden: RefreshGardenConfig,
+    #[serde(default, skip_serializing_if = "LongExposureConfig::is_default")]
+    pub long_exposure: LongExposureConfig,
     pub score: CollisionScoreConfig,
     pub reset: TemporalResetPolicyConfig,
 }
@@ -1562,6 +1608,7 @@ impl TemporalOriginalsConfig {
             loom: TemporalLoomConfig::from_params(value.loom),
             atlas: CollisionAtlasConfig::from_params(value.atlas),
             garden: RefreshGardenConfig::from_params(value.garden),
+            long_exposure: LongExposureConfig::from_params(value.long_exposure),
             score: CollisionScoreConfig::from_params(value.score),
             reset: TemporalResetPolicyConfig::from_params(value.reset),
         }
@@ -1572,6 +1619,7 @@ impl TemporalOriginalsConfig {
             loom: self.loom.to_params(),
             atlas: self.atlas.to_params(),
             garden: self.garden.to_params(),
+            long_exposure: self.long_exposure.to_params(),
             score: self.score.to_params(),
             reset: self.reset.to_params(),
         }
@@ -2413,7 +2461,7 @@ impl GestureCanvasConfig {
 pub struct ModConfig {
     #[serde(default = "default_bpm")]
     pub bpm: f32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lfo_configs")]
     pub lfos: Vec<LfoConfig>,
     #[serde(default)]
     pub routings: Vec<RoutingConfig>,
@@ -2577,7 +2625,7 @@ fn default_pad_position() -> Vec<f32> {
     vec![0.5, 0.5]
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct LfoConfig {
     #[serde(default = "default_shape")]
     pub shape: String,
@@ -2587,6 +2635,62 @@ pub struct LfoConfig {
     pub phase: f32,
     #[serde(default)]
     pub seed: u32,
+}
+
+impl Default for LfoConfig {
+    fn default() -> Self {
+        Self {
+            shape: default_shape(),
+            beats: default_beats(),
+            phase: 0.0,
+            seed: 0,
+        }
+    }
+}
+
+impl LfoConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Deserialize the fixed public LFO bank without ever trusting a sequence
+/// length hint as an allocation size. A ninth entry is a closed-vocabulary
+/// error rather than silently materialized and discarded.
+fn deserialize_lfo_configs<'de, D>(deserializer: D) -> Result<Vec<LfoConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LfoConfigsVisitor;
+
+    impl<'de> de::Visitor<'de> for LfoConfigsVisitor {
+        type Value = Vec<LfoConfig>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "at most {NUM_LFOS} LFO configurations")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut lfos = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(NUM_LFOS));
+            while lfos.len() < NUM_LFOS {
+                let Some(lfo) = sequence.next_element::<LfoConfig>()? else {
+                    return Ok(lfos);
+                };
+                lfos.push(lfo);
+            }
+            if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom(format_args!(
+                    "a modulation bank may contain at most {NUM_LFOS} LFO configurations"
+                )));
+            }
+            Ok(lfos)
+        }
+    }
+
+    deserializer.deserialize_seq(LfoConfigsVisitor)
 }
 
 fn default_shape() -> String {
@@ -2689,18 +2793,25 @@ impl Default for PadPatchConfig {
 
 impl ModConfig {
     pub fn from_matrix(m: &ModMatrix) -> Self {
+        let mut lfos: Vec<LfoConfig> = m
+            .lfos
+            .iter()
+            .map(|l| LfoConfig {
+                shape: l.shape.as_str().to_string(),
+                beats: l.beats,
+                phase: l.normalized_phase(),
+                seed: l.seed,
+            })
+            .collect();
+        // Preserve the canonical bytes emitted by the original four-lane
+        // bank. New trailing lanes are written only through the last authored
+        // non-default lane; default LFOs 5–8 remain neutral and absent.
+        while lfos.len() > LEGACY_NUM_LFOS && lfos.last().is_some_and(LfoConfig::is_default) {
+            lfos.pop();
+        }
         Self {
             bpm: m.clock.bpm,
-            lfos: m
-                .lfos
-                .iter()
-                .map(|l| LfoConfig {
-                    shape: l.shape.as_str().to_string(),
-                    beats: l.beats,
-                    phase: l.normalized_phase(),
-                    seed: l.seed,
-                })
-                .collect(),
+            lfos,
             routings: m
                 .routings
                 .iter()
@@ -3179,8 +3290,9 @@ pub struct LayerConfig {
     pub paused: bool,
     #[serde(default = "default_true")]
     pub visible: bool,
-    /// Skip the shared master shader for this layer. Missing in legacy
-    /// patches means the historical behavior: master effects remain active.
+    /// Skip the inheritable master prefix for this layer. A contributing
+    /// bypass also links the shared program Temporal family dry for that
+    /// frame. Missing in legacy patches preserves historical inheritance.
     #[serde(default)]
     pub bypass_master_fx: bool,
     #[serde(default)]
@@ -3336,6 +3448,8 @@ pub enum PatternShapeConfig {
     Interference,
     Polygon,
     Mandelbrot,
+    MemorySplats,
+    GaussianSplats,
 }
 
 impl PatternShapeConfig {
@@ -3355,6 +3469,8 @@ impl PatternShapeConfig {
             Self::Interference => S::Interference,
             Self::Polygon => S::Polygon,
             Self::Mandelbrot => S::Mandelbrot,
+            Self::MemorySplats => S::MemorySplats,
+            Self::GaussianSplats => S::GaussianSplats,
         }
     }
 
@@ -3374,6 +3490,8 @@ impl PatternShapeConfig {
             S::Interference => Self::Interference,
             S::Polygon => Self::Polygon,
             S::Mandelbrot => Self::Mandelbrot,
+            S::MemorySplats => Self::MemorySplats,
+            S::GaussianSplats => Self::GaussianSplats,
         }
     }
 }
@@ -5993,6 +6111,7 @@ impl PatchState {
             morph: Some(morph.snapshot_at_beat(mod_matrix.current_beat)),
             snapshot_bank: None,
             scenes: Scenes::default(),
+            autopilot: AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -6912,6 +7031,7 @@ mod tests {
             morph: None,
             snapshot_bank: None,
             scenes: Scenes::default(),
+            autopilot: AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -7150,6 +7270,57 @@ scenes:
     }
 
     #[test]
+    fn autopilot_patch_section_is_additive_bounded_and_default_omitted() {
+        let legacy = minimal_patch(1);
+        assert!(legacy.autopilot.is_empty());
+        let legacy_yaml = serde_yaml::to_string(&legacy).unwrap();
+        assert!(!legacy_yaml.contains("autopilot:"));
+
+        let absent: PatchState = serde_yaml::from_str(
+            "master: {}\nlayers:\n  - filename: legacy.mov\n    effects: {}\n",
+        )
+        .unwrap();
+        assert!(absent.autopilot.is_empty());
+        assert!(!serde_yaml::to_string(&absent)
+            .unwrap()
+            .contains("autopilot:"));
+
+        let authored: PatchState = serde_yaml::from_str(
+            r#"
+master: {}
+layers: []
+scenes:
+  - { id: 7, name: Verse }
+  - { id: 9, name: Chorus }
+autopilot:
+  repeat: once
+  steps:
+    - { scene_id: 7 }
+    - { scene_id: 9, hold_beats: 16 }
+    - { scene_id: 7, hold_beats: 1 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(authored.autopilot.len(), 3);
+        assert_eq!(authored.autopilot.steps.get(0).unwrap().hold_beats.get(), 4);
+        assert_eq!(
+            authored.autopilot.steps.get(1).unwrap().hold_beats.get(),
+            16
+        );
+        authored
+            .autopilot
+            .validate_scenes(&authored.scenes)
+            .unwrap();
+        let canonical = serde_yaml::to_string(&authored).unwrap();
+        assert!(canonical.contains("autopilot:"));
+        let restored: PatchState = serde_yaml::from_str(&canonical).unwrap();
+        assert_eq!(restored.autopilot, authored.autopilot);
+
+        let hostile = canonical.replace("hold_beats: 16", "hold_beats: 257");
+        assert!(serde_yaml::from_str::<PatchState>(&hostile).is_err());
+    }
+
+    #[test]
     fn hostile_explicit_empty_slot_array_is_rejected() {
         let error = match serde_yaml::from_str::<LayerConfig>(
             "filename: blank.mov\neffects: {}\nclip_slots: []\nactive_clip_slot: 9\n",
@@ -7230,6 +7401,7 @@ scenes:
             morph: None,
             snapshot_bank: None,
             scenes: Scenes::default(),
+            autopilot: AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -7324,6 +7496,7 @@ scenes:
             morph: None,
             snapshot_bank: None,
             scenes: Scenes::default(),
+            autopilot: AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -7551,6 +7724,10 @@ scenes:
         assert_eq!(temporal.key_threshold, 0.1);
         assert_eq!(temporal.key_softness, 0.03);
         assert_eq!(temporal.key_history, 1.0);
+        assert_eq!(
+            temporal.originals.long_exposure,
+            LongExposureParams::default()
+        );
 
         let invalid_temporal: TemporalConfig = serde_yaml::from_str(
             "key_mode: 99\nkey_threshold: .nan\nkey_softness: 8\nkey_history: 99\n",
@@ -7576,6 +7753,8 @@ scenes:
         originals.atlas.seed = 0xdead_beef;
         originals.garden.amount = 0.8;
         originals.garden.gate = RefreshGardenGateConfig::AudioOnset;
+        originals.long_exposure.amount = 0.65;
+        originals.long_exposure.shutter_frames = 20;
         originals.score.enabled = true;
         originals.score.seed = 0x1234_5678;
         originals.score.trigger = CollisionScoreTriggerConfig::Boundary;
@@ -7590,6 +7769,7 @@ scenes:
         };
         let yaml = serde_yaml::to_string(&configured).unwrap();
         assert!(yaml.contains("originals:"));
+        assert!(yaml.contains("long_exposure:"));
         assert!(yaml.contains("kind: selected_layer"));
         assert!(!yaml.contains("layer_id"));
         assert!(!yaml.contains("event_ordinal"));
@@ -7610,6 +7790,8 @@ scenes:
         );
         assert_eq!(params.originals.atlas.seed, 0xdead_beef);
         assert_eq!(params.originals.garden.gate, RefreshGardenGate::AudioOnset);
+        assert_eq!(params.originals.long_exposure.amount, 0.65);
+        assert_eq!(params.originals.long_exposure.shutter_frames, 20);
         assert_eq!(params.originals.score.seed, 0x1234_5678);
         assert_eq!(
             params.originals.score.loop_driver,
@@ -7639,6 +7821,23 @@ scenes:
             restored.originals.unwrap().score.loop_driver,
             CollisionScoreLoopDriverConfig::MissingSelectedLayer { .. }
         ));
+
+        let legacy_originals = TemporalConfig {
+            originals: Some(TemporalOriginalsConfig {
+                loom: TemporalLoomConfig {
+                    amount: 0.5,
+                    ..TemporalLoomConfig::default()
+                },
+                ..TemporalOriginalsConfig::default()
+            }),
+            ..TemporalConfig::default()
+        };
+        let legacy_yaml = serde_yaml::to_string(&legacy_originals).unwrap();
+        assert!(legacy_yaml.contains("loom:"));
+        assert!(
+            !legacy_yaml.contains("long_exposure:"),
+            "neutral additive state must not perturb established patch bytes"
+        );
     }
 
     #[test]
@@ -8991,6 +9190,152 @@ routings:
     }
 
     #[test]
+    fn legacy_four_lfo_banks_keep_their_shape_and_new_lanes_are_neutral() {
+        let legacy: ModConfig = serde_yaml::from_str(
+            r#"
+bpm: 120
+lfos:
+  - { shape: sine, beats: 4.0, phase: 0.125, seed: 0 }
+  - { shape: triangle, beats: 2.0, phase: 0.25, seed: 11 }
+  - { shape: saw, beats: 8.0, phase: 0.5, seed: 22 }
+  - { shape: sample_hold, beats: 1.0, phase: 0.75, seed: 33 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.lfos.len(), LEGACY_NUM_LFOS);
+
+        let expected_legacy = legacy.lfos.clone();
+        let mut restored = ModMatrix::new();
+        legacy.apply_to_matrix(&mut restored);
+        assert_eq!(restored.lfos[0].shape, LfoShape::Sine);
+        assert_eq!(restored.lfos[3].shape, LfoShape::SampleHold);
+        assert_eq!(restored.lfos[3].seed, 33);
+        for lfo in &restored.lfos[LEGACY_NUM_LFOS..] {
+            assert_eq!(lfo.shape, LfoShape::Sine);
+            assert_eq!(lfo.beats, 4.0);
+            assert_eq!(lfo.phase, 0.0);
+            assert_eq!(lfo.seed, 0);
+        }
+        assert!(restored.routings.is_empty());
+
+        let recaptured = ModConfig::from_matrix(&restored);
+        assert_eq!(recaptured.lfos, expected_legacy);
+        assert_eq!(recaptured.lfos.len(), LEGACY_NUM_LFOS);
+        assert_eq!(
+            ModConfig::from_matrix(&ModMatrix::new()).lfos.len(),
+            LEGACY_NUM_LFOS,
+            "an untouched eight-lane engine must retain legacy canonical bytes"
+        );
+    }
+
+    #[test]
+    fn eighth_lfo_configuration_and_route_round_trip_without_renumbering() {
+        let mut matrix = ModMatrix::new();
+        matrix.lfos[7].shape = LfoShape::SampleHold;
+        matrix.lfos[7].beats = 16.0;
+        matrix.lfos[7].set_phase(0.375);
+        matrix.lfos[7].seed = 0x7abc_def0;
+        matrix
+            .routings
+            .push(Routing::new(ModSource::Lfo(7), "brightness", 0.625));
+
+        let captured = ModConfig::from_matrix(&matrix);
+        assert_eq!(captured.lfos.len(), NUM_LFOS);
+        assert_eq!(captured.routings[0].source, "lfo7");
+        let yaml = serde_yaml::to_string(&captured).unwrap();
+        let parsed: ModConfig = serde_yaml::from_str(&yaml).unwrap();
+        let mut restored = ModMatrix::new();
+        parsed.apply_to_matrix(&mut restored);
+
+        assert_eq!(restored.lfos[7].shape, LfoShape::SampleHold);
+        assert_eq!(restored.lfos[7].beats, 16.0);
+        assert_eq!(restored.lfos[7].phase, 0.375);
+        assert_eq!(restored.lfos[7].seed, 0x7abc_def0);
+        assert_eq!(restored.routings.len(), 1);
+        assert_eq!(restored.routings[0].source, ModSource::Lfo(7));
+        assert_eq!(restored.routings[0].target(), "brightness");
+        assert_eq!(restored.routings[0].depth, 0.625);
+    }
+
+    #[test]
+    fn lfo_patch_bank_rejects_a_ninth_entry() {
+        let yaml = format!("lfos:\n{}", "  - {}\n".repeat(NUM_LFOS + 1));
+        let error = serde_yaml::from_str::<ModConfig>(&yaml)
+            .err()
+            .expect("a ninth LFO configuration must be rejected");
+        assert!(error.to_string().contains("at most 8"), "{error}");
+    }
+
+    #[test]
+    fn lfo_patch_bank_caps_a_hostile_size_hint_before_allocation() {
+        use serde::de::{self, DeserializeSeed, IntoDeserializer};
+        use std::cell::Cell;
+
+        struct LfoBomb<'a> {
+            produced: &'a Cell<usize>,
+        }
+
+        impl<'de> de::SeqAccess<'de> for LfoBomb<'_> {
+            type Error = serde_json::Error;
+
+            fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+            where
+                T: DeserializeSeed<'de>,
+            {
+                self.produced.set(self.produced.get() + 1);
+                seed.deserialize(serde_json::json!({}).into_deserializer())
+                    .map(Some)
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(usize::MAX)
+            }
+        }
+
+        struct LfoBombDeserializer<'a> {
+            produced: &'a Cell<usize>,
+        }
+
+        impl<'de> serde::Deserializer<'de> for LfoBombDeserializer<'_> {
+            type Error = serde_json::Error;
+
+            fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+            where
+                V: de::Visitor<'de>,
+            {
+                Err(de::Error::custom("the LFO bomb only offers a sequence"))
+            }
+
+            fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+            where
+                V: de::Visitor<'de>,
+            {
+                visitor.visit_seq(LfoBomb {
+                    produced: self.produced,
+                })
+            }
+
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct tuple tuple_struct
+                map struct enum identifier ignored_any
+            }
+        }
+
+        let produced = Cell::new(0);
+        let error = deserialize_lfo_configs(LfoBombDeserializer {
+            produced: &produced,
+        })
+        .expect_err("an unbounded LFO sequence must be refused");
+        assert!(error.to_string().contains("at most 8"), "{error}");
+        assert_eq!(
+            produced.get(),
+            NUM_LFOS + 1,
+            "the visitor must stop at the first over-cap item"
+        );
+    }
+
+    #[test]
     fn modulation_capture_prefers_retained_content_identity_without_changing_legacy_paths() {
         let mut matrix = ModMatrix::new();
         matrix.audio_clip_path = r"D:\resolved\analysis.wav".to_string();
@@ -9194,6 +9539,7 @@ routings:
             morph: None,
             snapshot_bank: None,
             scenes: Scenes::default(),
+            autopilot: AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -11070,6 +11416,35 @@ routings:
                 .shape,
             crate::pattern_synth::PatternShape::Mandelbrot
         );
+
+        // Memory-like and Gaussian splats extend the same closed, append-only
+        // shape vocabulary without changing any existing pattern field.
+        for (shape, token, runtime) in [
+            (
+                PatternShapeConfig::MemorySplats,
+                "memory_splats",
+                crate::pattern_synth::PatternShape::MemorySplats,
+            ),
+            (
+                PatternShapeConfig::GaussianSplats,
+                "gaussian_splats",
+                crate::pattern_synth::PatternShape::GaussianSplats,
+            ),
+        ] {
+            let splats = PatternSynthConfig {
+                shape,
+                ..PatternSynthConfig::default()
+            };
+            let yaml = serde_yaml::to_string(&splats).unwrap();
+            assert!(yaml.contains(&format!("shape: {token}")));
+            assert_eq!(
+                serde_yaml::from_str::<PatternSynthConfig>(&yaml)
+                    .unwrap()
+                    .to_params()
+                    .shape,
+                runtime
+            );
+        }
 
         // Hostile scalars sanitize to neutral values; unknown tokens and
         // unknown fields are deserialization rejections.

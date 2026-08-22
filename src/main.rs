@@ -557,6 +557,29 @@ struct PerformanceStagingIntent {
     activate: Option<transport::TriggerMode>,
     publish_inactive_metadata: bool,
     deferred_history: Option<DeferredPerformanceHistory>,
+    owner: PerformanceIntentOwner,
+}
+
+/// Everything attached to a prepared request before the runtime assigns its
+/// generation and stable transaction key. Keeping this as one value prevents
+/// preparation call sites from drifting as ownership metadata evolves.
+struct PerformanceSubmissionIntent {
+    descriptors: Vec<PreparedSlotDescriptor>,
+    activate: Option<transport::TriggerMode>,
+    publish_inactive_metadata: bool,
+    deferred_history: Option<DeferredPerformanceHistory>,
+    status: String,
+    owner: PerformanceIntentOwner,
+}
+
+/// Preparation ownership is explicit so an Autopilot reset can cancel only
+/// work from its retired epoch without disturbing a manual preload already
+/// accepted by the operator. GPU-ready cache entries are deliberately neutral:
+/// once prepared, the exact same Scene payload is safe for either owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerformanceIntentOwner {
+    Manual,
+    Autopilot(performance::autopilot::AutopilotTarget),
 }
 
 #[derive(Clone)]
@@ -625,6 +648,14 @@ fn resolve_scene_snapshot_bindings<'a>(
         }
     }
     (layer_ids, issues.join("; "))
+}
+
+/// Controller feedback is asserted only for an inactive GPU-ready Scene.
+/// Once armed for Immediate/Beat/Bar, the payload remains cached until commit
+/// but the ready lamp must fall so hardware reflects pending rather than stale
+/// preparation truth.
+const fn scene_feedback_is_ready(scene_exists: bool, cached: bool, scheduled: bool) -> bool {
+    scene_exists && cached && !scheduled
 }
 
 /// A dedicated swapchain is useful only when it can live on a genuinely
@@ -1537,6 +1568,35 @@ fn raw_audience_readback_required(
             || (path == LiveNtscPath::Disabled && spout_active))
 }
 
+/// Advance the narrower mosh generation on every armed/dry edge and retire the
+/// retained output. Linked Temporal dry deliberately preserves the broader
+/// visual epoch and warm history, so that epoch alone cannot distinguish two
+/// separate codec intervals.
+fn update_mosh_interval<T>(
+    mosh_active: bool,
+    was_active: &mut bool,
+    generation: &mut u64,
+    retained: &mut Option<T>,
+) {
+    if *was_active != mosh_active {
+        *was_active = mosh_active;
+        *generation = generation.wrapping_add(1).max(1);
+        *retained = None;
+    } else if !mosh_active {
+        *retained = None;
+    }
+}
+
+fn mosh_sample_is_current(
+    sample_epoch: u64,
+    sample_generation: u64,
+    current_epoch: u64,
+    current_generation: u64,
+    mosh_active: bool,
+) -> bool {
+    mosh_active && sample_epoch == current_epoch && sample_generation == current_generation
+}
+
 /// Piece-local time advances only while the master transport is playing.
 /// Keeping this independent from wall time makes every time-authored visual
 /// (shader animation, temporal accumulation, NTSC phase, and imported-audio
@@ -2097,6 +2157,16 @@ pub(crate) fn apply_temporal_wire_edit(
         "key_history" => {
             if let Some(n) = value.as_u64() {
                 p.key_history = n.clamp(1, 23) as f32;
+            }
+        }
+        "long_exposure_amount" => {
+            if let Some(n) = value.as_f64() {
+                p.originals.long_exposure.amount = (n as f32).clamp(0.0, 1.0);
+            }
+        }
+        "long_exposure_frames" => {
+            if let Some(n) = value.as_u64() {
+                p.originals.long_exposure.shutter_frames = n.clamp(2, 24) as u8;
             }
         }
         "loom_amount" => {
@@ -4547,7 +4617,12 @@ struct App {
     mosh_worker: Option<codec_mosh::MoshWorker>,
     /// Newest moshed frame retained between CPU completions so the mosh does
     /// not alternate with raw frames.
-    mosh_presented: Option<(u64, Vec<u8>)>,
+    mosh_presented: Option<(u64, u64, Vec<u8>)>,
+    /// Codec work is valid only within one continuous armed interval. This
+    /// narrower generation changes across linked Temporal dry without
+    /// disturbing the program-wide visual epoch or warm Temporal history.
+    mosh_interval_generation: u64,
+    mosh_interval_active: bool,
     /// The mosh path's admission/stale counters, on the NTSC counter law.
     mosh_live_metrics: ntsc::NtscPathMetrics,
     /// Process-lifetime diagnostics stay path-specific because global and
@@ -4586,6 +4661,12 @@ struct App {
     performance_staging: Option<PerformanceStagingIntent>,
     performance_scheduled: Option<ScheduledPerformanceActivation>,
     performance_boundaries: performance::BeatBoundaryTracker,
+    /// Patch-owned authored sequence plus its runtime-only deterministic
+    /// scheduler. Decoder/GPU work remains in the shared Scene transaction
+    /// path above; the scheduler owns only sequence and beat decisions.
+    autopilot_plan: performance::AutopilotPlan,
+    autopilot_scheduler: performance::autopilot::AutopilotScheduler,
+    autopilot_status: String,
     /// Program-clock downbeats use a tracker separate from Scene activation:
     /// Media Freeze stops clip/Scene boundaries but must keep temporal effects
     /// and Collision Score advancing.
@@ -4976,7 +5057,7 @@ impl App {
             ),
         };
         let (mut controller_status, controller_profile_pending_initial_resolution) =
-            match controller_profile.resolve(|_| None) {
+            match controller_profile.resolve_with_scenes(|_| None, |_| false) {
                 Ok(resolved) => match midi.apply_profile(resolved) {
                     Ok(()) => (controller_load_status, false),
                     Err(error) => (
@@ -4988,6 +5069,13 @@ impl App {
                     format!(
                         "{controller_load_status}; waiting for initial saved layer position {}",
                         position.get()
+                    ),
+                    true,
+                ),
+                Err(controller_profile::ControllerProfileError::MissingScene(scene_id)) => (
+                    format!(
+                        "{controller_load_status}; waiting for initial authored Scene {}",
+                        scene_id.get()
                     ),
                     true,
                 ),
@@ -5094,6 +5182,8 @@ impl App {
             ntsc_worker: ntsc::NtscWorker::new(),
             mosh_worker: None,
             mosh_presented: None,
+            mosh_interval_generation: 1,
+            mosh_interval_active: false,
             mosh_live_metrics: ntsc::NtscPathMetrics::default(),
             ntsc_live_metrics: ntsc::LiveNtscMetrics::default(),
             ntsc_presented: None,
@@ -5113,6 +5203,9 @@ impl App {
             performance_staging: None,
             performance_scheduled: None,
             performance_boundaries: performance::BeatBoundaryTracker::default(),
+            autopilot_plan: performance::AutopilotPlan::default(),
+            autopilot_scheduler: performance::autopilot::AutopilotScheduler::default(),
+            autopilot_status: String::new(),
             temporal_boundaries: performance::BeatBoundaryTracker::default(),
             pending_temporal_events: temporal::TemporalFrameEvents::default(),
             temporal_event_recorder: temporal::TemporalEventRecorder::default(),
@@ -5370,9 +5463,10 @@ impl App {
     }
 
     /// Route a layer around the inheritable master prefix only after the exact
-    /// detached frame plan accepts that partition. This prevents a malformed
-    /// master ordering from entering live state and turning the renderer's
-    /// last-good-frame safety hold into what looks like a frozen toggle.
+    /// detached frame plan accepts that partition. A contributing bypass also
+    /// links the shared Temporal family to its neutral warm-history path. This
+    /// prevents malformed master ordering from entering live state and turning
+    /// the renderer's last-good-frame safety hold into a frozen-looking toggle.
     fn set_layer_master_bypass_transactional(&mut self, index: usize, enabled: bool) -> bool {
         let Some(layer) = self.layers.get(index) else {
             return false;
@@ -5396,11 +5490,17 @@ impl App {
         ) {
             Ok(()) => {
                 self.layers[index].bypass_master_fx = enabled;
-                self.composition_status = format!(
-                    "Layer {} {} the inheritable master FX prefix",
-                    layer_id.get(),
-                    if enabled { "bypasses" } else { "inherits" }
-                );
+                self.composition_status = if enabled {
+                    format!(
+                        "Layer {} bypasses inheritable master FX; while contributing, it links program Temporal dry with warm history",
+                        layer_id.get()
+                    )
+                } else {
+                    format!(
+                        "Layer {} inherits master FX; linked Temporal bypass now follows the remaining contributing layers",
+                        layer_id.get()
+                    )
+                };
                 true
             }
             Err(error) => {
@@ -6628,6 +6728,7 @@ impl App {
             insertion_index,
         )
         .expect("morph materialization cannot change composition topology");
+        self.stop_autopilot_for_manual_control("manual layer creation");
         self.layers.push(layer);
         self.composition = staged;
         self.selected_layer = Some(insertion_index);
@@ -7069,6 +7170,7 @@ impl App {
         }
         let staged = stage_composition_reorder(&self.composition, &desired_ids)
             .expect("morph materialization cannot change composition topology");
+        self.stop_autopilot_for_manual_control("manual layer reorder");
         self.remap_scenes_after_layer_move(from, to);
         let layer = self.layers.remove(from);
         self.layers.insert(to, layer);
@@ -7281,6 +7383,7 @@ impl App {
             &self.morph,
         )?;
         captured.scenes = self.scenes.clone();
+        captured.autopilot = self.autopilot_plan.clone();
         // The B15 bank rides the carried-whole law too: an operator who
         // never stored a rig and never moved the glide emits no section,
         // so pre-B15 bytes and canonical hashes keep.
@@ -7507,9 +7610,11 @@ impl App {
         document: controller_profile::ControllerProfileDocument,
         source: &str,
     ) -> Result<(), String> {
-        let prepared = controller_profile::prepare_controller_profile_swap(document, |position| {
-            position.resolve(&self.layers).map(Layer::stable_layer_id)
-        })
+        let prepared = controller_profile::prepare_controller_profile_swap_with_scenes(
+            document,
+            |position| position.resolve(&self.layers).map(Layer::stable_layer_id),
+            |scene_id| self.scenes.get(scene_id).is_some(),
+        )
         .map_err(|error| error.to_string())?;
         let prior_document = self.controller_profile.clone();
         let (document, runtime) = prepared.into_parts();
@@ -7567,7 +7672,13 @@ impl App {
         }
         let resolved_controller = world
             .controller_profile
-            .resolve(|position| position.resolve(&world.stable_layer_ids).copied())
+            .resolve_with_scenes(
+                |position| position.resolve(&world.stable_layer_ids).copied(),
+                // Scene control identities are allowed to remain inert
+                // tombstones in history. Redoing a Scene removal must not
+                // reject or retarget the controller profile.
+                |_| true,
+            )
             .map_err(|error| format!("resolve history controller profile: {error}"))?;
         let prior_stage_map = self.stage_map.clone();
         let prior_presets = self.preset_library.clone();
@@ -8709,7 +8820,13 @@ impl App {
         let rebuilt_ids: Vec<_> = rebuilt.iter().map(Layer::stable_layer_id).collect();
         let staged_controller_rebind = restored_layer_ids.is_none().then(|| {
             self.controller_profile
-                .resolve(|position| position.resolve(&rebuilt_ids).copied())
+                .resolve_with_scenes(
+                    |position| position.resolve(&rebuilt_ids).copied(),
+                    // Patch recall may retire a mapped Scene. Preserve its
+                    // stable address as an inert tombstone while still
+                    // resolving layer positions against the new stack.
+                    |_| true,
+                )
                 .map_err(|error| error.to_string())
         });
         for (config, layer) in patch.layers.iter().zip(rebuilt.iter_mut()) {
@@ -8824,16 +8941,17 @@ impl App {
                 }
                 Err(error) => {
                     // The controller document is venue state, not part of the
-                    // artistic patch transaction. Missing saved positions
-                    // therefore remain safely bound to the retired stable IDs
-                    // and are reported instead of retargeting or rejecting a
-                    // valid piece load.
+                    // artistic patch transaction. Missing saved positions or
+                    // Scene IDs therefore remain safely tombstoned on the
+                    // retired runtime addresses and are reported instead of
+                    // retargeting or rejecting a valid piece load.
                     self.controller_status =
                         format!("Controller profile could not follow loaded patch: {error}");
                 }
             }
         }
         self.scenes = patch.scenes.clone();
+        self.autopilot_plan = patch.autopilot.clone();
         self.performance_patch_dir = Some(patch_dir.to_path_buf());
         self.selected_layer = restored_selected_layer
             .and_then(|selected| {
@@ -8862,6 +8980,14 @@ impl App {
         // no temporal/readback/NTSC pixel from the prior patch may leak into
         // this one.
         self.reset_patch_generation();
+        self.autopilot_status = if self.autopilot_plan.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Loaded {}-step Autopilot plan (stopped)",
+                self.autopilot_plan.len()
+            )
+        };
         // Strictly after the barrier that cleared the retired program's
         // recorder, so a restored track cannot be wiped by its own load.
         self.restore_gesture_track_from_patch(&patch);
@@ -10984,8 +11110,15 @@ impl App {
             ),
             "slit_interp" => value.is_boolean(),
             "key_mode" => value.as_u64().is_some_and(|number| number <= 4),
-            "key_threshold" | "loom_amount" | "loom_depth" | "atlas_amount" | "atlas_collision"
-            | "garden_amount" | "garden_threshold" | "garden_decay" => value
+            "key_threshold"
+            | "loom_amount"
+            | "loom_depth"
+            | "atlas_amount"
+            | "atlas_collision"
+            | "garden_amount"
+            | "garden_threshold"
+            | "garden_decay"
+            | "long_exposure_amount" => value
                 .as_f64()
                 .is_some_and(|number| number.is_finite() && (0.0..=1.0).contains(&number)),
             "key_softness" | "garden_softness" => value
@@ -10994,6 +11127,9 @@ impl App {
             "key_history" => value
                 .as_u64()
                 .is_some_and(|number| (1..=23).contains(&number)),
+            "long_exposure_frames" => value
+                .as_u64()
+                .is_some_and(|number| (2..=24).contains(&number)),
             "loom_topology" => matches!(
                 value.as_str(),
                 Some("linear" | "radial" | "spiral" | "contour" | "folded" | "kaleidoscopic")
@@ -11244,6 +11380,7 @@ impl App {
                 | "sync_latched" => Some(Law::Toggle),
                 "key_mode" => Some(Law::Stepped { min: 0, max: 4 }),
                 "key_history" => Some(Law::Stepped { min: 1, max: 23 }),
+                "long_exposure_frames" => Some(Law::Stepped { min: 2, max: 24 }),
                 "loom_folds" => Some(Law::Stepped { min: 1, max: 16 }),
                 "loom_quantization" => Some(Law::Stepped { min: 0, max: 24 }),
                 "atlas_territories" => Some(Law::Stepped { min: 1, max: 64 }),
@@ -11263,6 +11400,7 @@ impl App {
                 "slit_angle" => unit_target("temporal_slit_angle"),
                 "key_threshold" => unit_target("temporal_key_threshold"),
                 "key_softness" => unit_target("temporal_key_softness"),
+                "long_exposure_amount" => unit_target("temporal_long_exposure_amount"),
                 other
                     if other.starts_with("fb_")
                         || other.starts_with("loom_")
@@ -11921,9 +12059,17 @@ impl App {
                 | web::state::WebAction::SetPerformanceRecording { .. }
                 | web::state::WebAction::SetPerformancePlayback { .. }
                 | web::state::WebAction::ClearPerformanceTake
+                // Autopilot already owns a precise future-beat scheduler.
+                // Nesting it in the generic four-beat latch would give one
+                // command two independent clocks and ambiguous priority.
+                | web::state::WebAction::ReplaceAutopilotPlan { .. }
+                | web::state::WebAction::AutopilotPlay
+                | web::state::WebAction::AutopilotPause
+                | web::state::WebAction::AutopilotReset
         ) {
             self.composition_status =
-                "Ordered memory/event and donor actions cannot be quantized".to_string();
+                "Ordered memory/event, donor, and Autopilot actions cannot be quantized"
+                    .to_string();
             return WebActionBatchDisposition::Continue;
         }
         let Some(key) = Self::quantized_action_key(&action) else {
@@ -12965,6 +13111,7 @@ impl App {
         activate: bool,
         deferred_history: Option<DeferredPerformanceHistory>,
     ) {
+        self.stop_autopilot_for_manual_control("a committed resample");
         let Some(layer_index) = self
             .layers
             .iter()
@@ -13067,6 +13214,13 @@ impl App {
     }
 
     fn clear_performance_transactions(&mut self) {
+        let autopilot_was_armed = !matches!(
+            self.autopilot_scheduler.state(),
+            performance::autopilot::AutopilotState::Stopped
+                | performance::autopilot::AutopilotState::Complete
+                | performance::autopilot::AutopilotState::Faulted
+        );
+        let _ = self.autopilot_scheduler.reset();
         if let Some(runtime) = self.performance_runtime.as_mut() {
             if let Err(error) = runtime.cancel_pending() {
                 log::error!("Could not cancel performance preparation: {error}");
@@ -13078,6 +13232,50 @@ impl App {
         self.performance_scheduled = None;
         self.performance_boundaries
             .reanchor(self.mod_matrix.current_beat);
+        if autopilot_was_armed {
+            self.autopilot_status =
+                "Autopilot stopped by a manual performance/topology change".to_string();
+        }
+    }
+
+    /// Apply an epoch-qualified cancel without touching manual work or the
+    /// neutral GPU-ready Scene cache. The preparation runtime owns one newest
+    /// request, so matching the staged target proves which work is cancelled.
+    fn cancel_autopilot_owned_epoch(&mut self, epoch: u64) {
+        let owns_staging = self.performance_staging.as_ref().is_some_and(|intent| {
+            matches!(
+                intent.owner,
+                PerformanceIntentOwner::Autopilot(target) if target.epoch == epoch
+            )
+        });
+        if !owns_staging {
+            return;
+        }
+        if let Some(runtime) = self.performance_runtime.as_mut() {
+            if let Err(error) = runtime.cancel_pending() {
+                log::error!("Could not cancel Autopilot preparation epoch {epoch}: {error}");
+            }
+            runtime.clear_ready();
+        }
+        self.performance_staging = None;
+    }
+
+    fn stop_autopilot_for_manual_control(&mut self, reason: &str) {
+        if matches!(
+            self.autopilot_scheduler.state(),
+            performance::autopilot::AutopilotState::Stopped
+        ) {
+            return;
+        }
+        let commands = self.autopilot_scheduler.reset();
+        for command in commands {
+            if let performance::autopilot::AutopilotCommand::CancelOwned { epoch } = command {
+                self.cancel_autopilot_owned_epoch(epoch);
+            }
+        }
+        self.performance_boundaries
+            .reanchor(self.mod_matrix.current_beat);
+        self.autopilot_status = format!("Autopilot stopped by {reason}");
     }
 
     fn cached_performance_position(
@@ -13107,10 +13305,13 @@ impl App {
             .performance_scheduled
             .as_ref()
             .map(|scheduled| &scheduled.key);
-        let position = self
-            .performance_gpu_cache
-            .iter()
-            .position(|cached| armed != Some(cached.key()));
+        let autopilot_expected = self
+            .autopilot_scheduler
+            .expected_target()
+            .map(|target| performance_runtime::PreparedTransactionKey::Scene(target.scene_id));
+        let position = self.performance_gpu_cache.iter().position(|cached| {
+            armed != Some(cached.key()) && autopilot_expected.as_ref() != Some(cached.key())
+        });
         position
             .and_then(|position| self.performance_gpu_cache.remove(position))
             .is_some()
@@ -13125,6 +13326,32 @@ impl App {
         deferred_history: Option<DeferredPerformanceHistory>,
         status: String,
     ) {
+        let _ = self.submit_performance_request_owned(
+            request,
+            PerformanceSubmissionIntent {
+                descriptors,
+                activate,
+                publish_inactive_metadata,
+                deferred_history,
+                status,
+                owner: PerformanceIntentOwner::Manual,
+            },
+        );
+    }
+
+    fn submit_performance_request_owned(
+        &mut self,
+        request: performance_runtime::PreparationRequest,
+        intent: PerformanceSubmissionIntent,
+    ) -> Result<(), String> {
+        let PerformanceSubmissionIntent {
+            descriptors,
+            activate,
+            publish_inactive_metadata,
+            deferred_history,
+            status,
+            owner,
+        } = intent;
         let key = request.key.clone();
         let replacement_count = request.replacement_count();
         self.evict_cached_performance_key(&key);
@@ -13144,14 +13371,14 @@ impl App {
                     "Cannot prepare {status}: all {} prepared-source slots are armed",
                     self.performance_budget.max_prepared_sources()
                 );
-                return;
+                return Err(self.source_staging_status.clone());
             }
         }
 
         let Some(runtime) = self.performance_runtime.as_mut() else {
             self.source_staging_status =
                 format!("Cannot prepare {status}: performance staging is unavailable");
-            return;
+            return Err(self.source_staging_status.clone());
         };
         match runtime.submit(request) {
             Ok(generation) => {
@@ -13162,14 +13389,17 @@ impl App {
                     activate,
                     publish_inactive_metadata,
                     deferred_history,
+                    owner,
                 });
                 self.source_staging_status =
                     format!("Preparing {status} (generation {})", generation.get());
+                Ok(())
             }
             Err(error) => {
                 self.performance_staging = None;
                 self.source_staging_status = format!("Preparation rejected for {status}: {error}");
                 log::error!("{}", self.source_staging_status);
+                Err(self.source_staging_status.clone())
             }
         }
     }
@@ -13182,6 +13412,7 @@ impl App {
         activate: bool,
         trigger_mode: transport::TriggerMode,
     ) {
+        self.stop_autopilot_for_manual_control("manual ClipSlot loading");
         let Some(layer_index) = self.resolve_stable_layer_id(layer_id) else {
             self.source_staging_status = format!("Layer {layer_id} is absent");
             return;
@@ -13260,6 +13491,7 @@ impl App {
         cue_id: Option<transport::CueId>,
         trigger_mode: transport::TriggerMode,
     ) {
+        self.stop_autopilot_for_manual_control("manual ClipSlot activation");
         let layer = &self.layers[layer_index];
         let Some(slot) = layer.clip_slots.get(slot_id).cloned() else {
             self.source_staging_status = format!(
@@ -13301,35 +13533,45 @@ impl App {
         scene_id: performance::SceneId,
         activate: Option<transport::TriggerMode>,
     ) {
+        self.stop_autopilot_for_manual_control("manual Scene control");
+        if let Err(error) =
+            self.stage_scene_owned(scene_id, activate, PerformanceIntentOwner::Manual)
+        {
+            self.scene_status = error;
+        }
+    }
+
+    fn stage_scene_owned(
+        &mut self,
+        scene_id: performance::SceneId,
+        activate: Option<transport::TriggerMode>,
+        owner: PerformanceIntentOwner,
+    ) -> Result<(), String> {
         let Some(scene) = self.scenes.get(scene_id).cloned() else {
-            self.scene_status = format!("Scene {} is absent", scene_id.get());
-            return;
+            return Err(format!("Scene {} is absent", scene_id.get()));
         };
         if scene.bindings.is_empty() {
-            self.scene_status = format!(
+            return Err(format!(
                 "Scene {} is invalid: an atomic Scene must bind at least one layer",
                 scene_id.get()
-            );
-            return;
+            ));
         }
         let mut descriptors = Vec::with_capacity(scene.bindings.len());
         for binding in scene.bindings.iter() {
             let Some(layer) = binding.layer_position.resolve(&self.layers) else {
-                self.scene_status = format!(
+                return Err(format!(
                     "Scene {} is invalid: layer position {} is absent",
                     scene_id.get(),
                     binding.layer_position.get()
-                );
-                return;
+                ));
             };
             let Some(slot) = layer.clip_slots.get(binding.slot_id).cloned() else {
-                self.scene_status = format!(
+                return Err(format!(
                     "Scene {} is invalid: slot {} is absent from layer {}",
                     scene_id.get(),
                     binding.slot_id.get(),
                     layer.layer_id()
-                );
-                return;
+                ));
             };
             descriptors.push(PreparedSlotDescriptor {
                 layer_id: layer.stable_layer_id(),
@@ -13344,20 +13586,52 @@ impl App {
             |_layer_id, slot| Ok(Self::resolved_prepared_source(slot, context.clone())),
         ) {
             Ok(request) => {
-                self.submit_performance_request(
+                self.submit_performance_request_owned(
                     request,
-                    descriptors,
-                    activate,
-                    false,
-                    None,
-                    format!("Scene {}", scene_id.get()),
-                );
+                    PerformanceSubmissionIntent {
+                        descriptors,
+                        activate,
+                        publish_inactive_metadata: false,
+                        deferred_history: None,
+                        status: format!("Scene {}", scene_id.get()),
+                        owner,
+                    },
+                )?;
                 self.scene_status = format!("Preparing Scene {}", scene_id.get());
+                Ok(())
             }
-            Err(error) => {
-                self.scene_status = format!("Cannot prepare Scene {}: {error}", scene_id.get());
-            }
+            Err(error) => Err(format!("Cannot prepare Scene {}: {error}", scene_id.get())),
         }
+    }
+
+    fn stage_autopilot_target(
+        &mut self,
+        target: performance::autopilot::AutopilotTarget,
+    ) -> Result<(), String> {
+        let key = performance_runtime::PreparedTransactionKey::Scene(target.scene_id);
+        if self.cached_performance_position(&key).is_some()
+            || self.performance_staging.as_ref().is_some_and(|intent| {
+                intent.key == key && intent.owner == PerformanceIntentOwner::Autopilot(target)
+            })
+        {
+            self.autopilot_status = format!(
+                "Autopilot step {} Scene {} is prepared",
+                target.step_index + 1,
+                target.scene_id.get()
+            );
+            return Ok(());
+        }
+        self.stage_scene_owned(
+            target.scene_id,
+            None,
+            PerformanceIntentOwner::Autopilot(target),
+        )?;
+        self.autopilot_status = format!(
+            "Autopilot preparing step {} Scene {}",
+            target.step_index + 1,
+            target.scene_id.get()
+        );
+        Ok(())
     }
 
     fn cached_direct_slot_matches(
@@ -13385,6 +13659,7 @@ impl App {
         key: performance_runtime::PreparedTransactionKey,
         trigger_mode: transport::TriggerMode,
     ) -> bool {
+        self.stop_autopilot_for_manual_control("manual prepared-source activation");
         let Some(position) = self.cached_performance_position(&key) else {
             return false;
         };
@@ -13539,12 +13814,261 @@ impl App {
         }
     }
 
+    fn validate_autopilot_scene_content(
+        &self,
+        plan: &performance::AutopilotPlan,
+    ) -> Result<(), (performance::SceneId, String)> {
+        for step in plan.steps.iter() {
+            let Some(scene) = self.scenes.get(step.scene_id) else {
+                return Err((
+                    step.scene_id,
+                    format!("Autopilot references missing Scene {}", step.scene_id.get()),
+                ));
+            };
+            if scene.bindings.is_empty() {
+                return Err((
+                    scene.id,
+                    format!(
+                        "Autopilot Scene {} is invalid: an atomic Scene must bind at least one layer",
+                        scene.id.get()
+                    ),
+                ));
+            }
+            if scene.bindings.len() > self.performance_budget.max_prepared_sources() {
+                return Err((
+                    scene.id,
+                    format!(
+                        "Autopilot Scene {} needs {} prepared sources, above the host limit {}",
+                        scene.id.get(),
+                        scene.bindings.len(),
+                        self.performance_budget.max_prepared_sources()
+                    ),
+                ));
+            }
+            let (_, issues) = resolve_scene_snapshot_bindings(scene, |saved_position| {
+                saved_position
+                    .resolve(&self.layers)
+                    .map(|layer| (layer.layer_id(), &layer.clip_slots))
+            });
+            if !issues.is_empty() {
+                return Err((
+                    scene.id,
+                    format!("Autopilot Scene {} is invalid: {issues}", scene.id.get()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn autopilot_readiness_before_frame(
+        &self,
+    ) -> performance::autopilot::AutopilotReadinessBeforeFrame {
+        let Some(target) = self.autopilot_scheduler.expected_target() else {
+            return performance::autopilot::AutopilotReadinessBeforeFrame::Pending;
+        };
+        let key = performance_runtime::PreparedTransactionKey::Scene(target.scene_id);
+        if self.cached_performance_position(&key).is_some() {
+            performance::autopilot::AutopilotReadinessBeforeFrame::Ready(target)
+        } else {
+            performance::autopilot::AutopilotReadinessBeforeFrame::Pending
+        }
+    }
+
+    /// Execute pure scheduler decisions through the one authoritative Scene
+    /// transaction seam. A host failure faults the sequence and preserves the
+    /// last visible output; it never skips to a later step.
+    fn apply_autopilot_commands(
+        &mut self,
+        commands: performance::autopilot::AutopilotCommands,
+        now: Instant,
+    ) -> Vec<image_routing::StableLayerId> {
+        use performance::autopilot::{AutopilotCommand, AutopilotFault};
+
+        let mut queue: VecDeque<_> = commands.into();
+        let mut committed_layers = Vec::new();
+        while let Some(command) = queue.pop_front() {
+            match command {
+                AutopilotCommand::CancelOwned { epoch } => {
+                    self.cancel_autopilot_owned_epoch(epoch);
+                }
+                AutopilotCommand::Prepare(target) => {
+                    if target.epoch != self.autopilot_scheduler.epoch() {
+                        continue;
+                    }
+                    if let Err(error) = self.stage_autopilot_target(target) {
+                        self.autopilot_status = format!(
+                            "Autopilot fault at step {} Scene {}: {error}",
+                            target.step_index + 1,
+                            target.scene_id.get()
+                        );
+                        queue.extend(
+                            self.autopilot_scheduler
+                                .fault(AutopilotFault::Preparation(target)),
+                        );
+                    }
+                }
+                AutopilotCommand::Commit(target) => {
+                    if target.epoch != self.autopilot_scheduler.epoch() {
+                        continue;
+                    }
+                    let key = performance_runtime::PreparedTransactionKey::Scene(target.scene_id);
+                    let committed = self.commit_cached_performance(&key, now);
+                    if committed.is_empty() {
+                        self.autopilot_status = format!(
+                            "Autopilot commit fault at step {} Scene {}; current output retained",
+                            target.step_index + 1,
+                            target.scene_id.get()
+                        );
+                        queue.clear();
+                        queue.extend(
+                            self.autopilot_scheduler
+                                .fault(AutopilotFault::Commit(target)),
+                        );
+                    } else {
+                        committed_layers.extend(committed);
+                        self.autopilot_status = format!(
+                            "Autopilot running step {} Scene {} ({} beat{} remaining)",
+                            target.step_index + 1,
+                            target.scene_id.get(),
+                            self.autopilot_scheduler.remaining_hold_beats().unwrap_or(0),
+                            if self.autopilot_scheduler.remaining_hold_beats() == Some(1) {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        committed_layers
+    }
+
+    fn play_or_resume_autopilot(&mut self, now: Instant) {
+        use performance::autopilot::{AutopilotFault, AutopilotState};
+
+        if self.autopilot_scheduler.state() == AutopilotState::Paused {
+            if self.autopilot_scheduler.resume() {
+                self.performance_boundaries
+                    .reanchor(self.mod_matrix.current_beat);
+                self.autopilot_status = "Autopilot resumed; waiting for a future media beat".into();
+            }
+            return;
+        }
+
+        if self.autopilot_plan.is_empty() {
+            match self
+                .autopilot_scheduler
+                .play(&self.autopilot_plan, &self.scenes)
+            {
+                Ok(_) => unreachable!("an empty Autopilot plan cannot start"),
+                Err(failure) => {
+                    let message = failure.to_string();
+                    self.apply_autopilot_commands(failure.commands, now);
+                    self.autopilot_status = format!("Autopilot Play rejected: {message}");
+                }
+            }
+            return;
+        }
+
+        if let Err((scene_id, error)) = self.validate_autopilot_scene_content(&self.autopilot_plan)
+        {
+            let reset = self.autopilot_scheduler.reset();
+            let mut commands = reset;
+            commands.extend(
+                self.autopilot_scheduler
+                    .fault(AutopilotFault::Reference { scene_id }),
+            );
+            self.apply_autopilot_commands(commands, now);
+            self.autopilot_status = error;
+            return;
+        }
+
+        // Play explicitly takes the performance lane. Retire any manual
+        // pending/armed transaction before the scheduler creates step 0.
+        if let Some(runtime) = self.performance_runtime.as_mut() {
+            if let Err(error) = runtime.cancel_pending() {
+                log::error!("Could not retire manual preparation for Autopilot Play: {error}");
+            }
+            runtime.clear_ready();
+        }
+        self.performance_gpu_cache.clear();
+        self.performance_staging = None;
+        self.performance_scheduled = None;
+        self.performance_boundaries
+            .reanchor(self.mod_matrix.current_beat);
+
+        match self
+            .autopilot_scheduler
+            .play(&self.autopilot_plan, &self.scenes)
+        {
+            Ok(commands) => {
+                self.autopilot_status =
+                    "Autopilot starting; first Scene waits for a future media beat".into();
+                self.apply_autopilot_commands(commands, now);
+            }
+            Err(failure) => {
+                let message = failure.to_string();
+                self.apply_autopilot_commands(failure.commands, now);
+                self.autopilot_status = format!("Autopilot Play rejected: {message}");
+            }
+        }
+    }
+
+    fn pause_autopilot(&mut self) {
+        if self.autopilot_scheduler.pause() {
+            self.performance_boundaries
+                .reanchor(self.mod_matrix.current_beat);
+            self.autopilot_status =
+                "Autopilot paused; preparation may finish but countdown and cuts are held".into();
+        } else {
+            self.autopilot_status = "Autopilot is not running".into();
+        }
+    }
+
+    fn reset_autopilot(&mut self) {
+        let commands = self.autopilot_scheduler.reset();
+        self.apply_autopilot_commands(commands, Instant::now());
+        self.performance_boundaries
+            .reanchor(self.mod_matrix.current_beat);
+        self.autopilot_status =
+            "Autopilot reset; authored plan and current visible Scene retained".into();
+    }
+
     fn poll_and_release_performance(
         &mut self,
         crossings: performance::BeatCrossings,
         gates: TransportGates,
         now: Instant,
     ) -> Vec<image_routing::StableLayerId> {
+        // Snapshot cache readiness before polling the async worker. A result
+        // first observed below is therefore ineligible for this frame's beat
+        // crossing and can release only on a later media-running boundary.
+        let readiness_before_frame = self.autopilot_readiness_before_frame();
+        let autopilot_commands =
+            self.autopilot_scheduler
+                .advance_frame(performance::autopilot::AutopilotFrameInput {
+                    crossed_beats: crossings.beats,
+                    media_running: gates.media_running,
+                    readiness_before_frame,
+                });
+        let mut committed_layers = self.apply_autopilot_commands(autopilot_commands, now);
+        match self.autopilot_scheduler.state() {
+            performance::autopilot::AutopilotState::Stalled => {
+                if let Some(target) = self.autopilot_scheduler.expected_target() {
+                    self.autopilot_status = format!(
+                        "Autopilot stalled at step {} Scene {}; current output retained while preparation continues",
+                        target.step_index + 1,
+                        target.scene_id.get()
+                    );
+                }
+            }
+            performance::autopilot::AutopilotState::Complete => {
+                self.autopilot_status = "Autopilot completed its final Scene dwell".into();
+            }
+            _ => {}
+        }
+
         let poll = self
             .performance_runtime
             .as_mut()
@@ -13574,8 +14098,9 @@ impl App {
                     }
                     self.source_staging_status =
                         format!("Discarded unowned prepared generation {}", generation.get());
-                    return Vec::new();
+                    return committed_layers;
                 };
+                let owner = intent.owner;
                 let Some(prepared) = self
                     .performance_runtime
                     .as_mut()
@@ -13585,7 +14110,18 @@ impl App {
                         "Prepared generation {} disappeared before GPU activation",
                         generation.get()
                     );
-                    return Vec::new();
+                    if let PerformanceIntentOwner::Autopilot(target) = owner {
+                        let commands = self
+                            .autopilot_scheduler
+                            .fault(performance::autopilot::AutopilotFault::Preparation(target));
+                        committed_layers.extend(self.apply_autopilot_commands(commands, now));
+                        self.autopilot_status = format!(
+                            "Autopilot preparation disappeared at step {} Scene {}",
+                            target.step_index + 1,
+                            target.scene_id.get()
+                        );
+                    }
+                    return committed_layers;
                 };
                 let preload_bytes = prepared.preload_bytes();
                 let activation = self.renderer.as_ref().map_or_else(
@@ -13611,7 +14147,7 @@ impl App {
                                         Ok(before) => Some(before),
                                         Err(error) => {
                                             self.source_staging_status = error;
-                                            return Vec::new();
+                                            return committed_layers;
                                         }
                                     }
                                 }
@@ -13622,7 +14158,7 @@ impl App {
                             {
                                 self.source_staging_status =
                                     format!("Prepared metadata publication rejected: {error}");
-                                return Vec::new();
+                                return committed_layers;
                             }
                             if let Some(before) = deferred_before {
                                 deferred_history = None;
@@ -13657,11 +14193,28 @@ impl App {
                         ) {
                             self.scene_status.clone_from(&self.source_staging_status);
                         }
+                        if let PerformanceIntentOwner::Autopilot(target) = owner {
+                            let commands = self
+                                .autopilot_scheduler
+                                .fault(performance::autopilot::AutopilotFault::Preparation(target));
+                            committed_layers.extend(self.apply_autopilot_commands(commands, now));
+                            self.autopilot_status = format!(
+                                "Autopilot GPU preparation fault at step {} Scene {}; current output retained",
+                                target.step_index + 1,
+                                target.scene_id.get()
+                            );
+                        }
                     }
                 }
             }
             performance_runtime::PreparationPoll::Failed(error) => {
-                self.performance_staging = None;
+                let owner = self
+                    .performance_staging
+                    .take()
+                    .filter(|intent| {
+                        intent.generation == error.generation && intent.key == error.key
+                    })
+                    .map(|intent| intent.owner);
                 self.source_staging_status = format!("Source preparation failed: {error}");
                 if matches!(
                     error.key,
@@ -13670,14 +14223,25 @@ impl App {
                     self.scene_status.clone_from(&self.source_staging_status);
                 }
                 log::error!("{}", self.source_staging_status);
+                if let Some(PerformanceIntentOwner::Autopilot(target)) = owner {
+                    let commands = self
+                        .autopilot_scheduler
+                        .fault(performance::autopilot::AutopilotFault::Preparation(target));
+                    committed_layers.extend(self.apply_autopilot_commands(commands, now));
+                    self.autopilot_status = format!(
+                        "Autopilot source preparation fault at step {} Scene {}; current output retained",
+                        target.step_index + 1,
+                        target.scene_id.get()
+                    );
+                }
             }
         }
 
         let Some(scheduled) = self.performance_scheduled.clone() else {
-            return Vec::new();
+            return committed_layers;
         };
         if !gates.media_running {
-            return Vec::new();
+            return committed_layers;
         }
         let due = match scheduled.trigger_mode {
             transport::TriggerMode::Immediate => true,
@@ -13687,10 +14251,11 @@ impl App {
             transport::TriggerMode::NextBar => !armed_from_new_readiness && crossings.crossed_bar(),
         };
         if !due {
-            return Vec::new();
+            return committed_layers;
         }
         self.performance_scheduled = None;
-        self.commit_cached_performance(&scheduled.key, now)
+        committed_layers.extend(self.commit_cached_performance(&scheduled.key, now));
+        committed_layers
     }
 
     fn remap_scenes_after_layer_move(&mut self, from: usize, to: usize) {
@@ -13781,6 +14346,29 @@ impl App {
         }
     }
 
+    fn scene_identity_is_reserved(&self, scene_id: performance::SceneId) -> bool {
+        self.scenes.get(scene_id).is_some()
+            || self
+                .autopilot_plan
+                .steps
+                .iter()
+                .any(|step| step.scene_id == scene_id)
+            || self.controller_profile.bindings.iter().any(|binding| {
+                matches!(
+                    binding.target,
+                    controller_profile::SavedControlAddress::ScenePrepare { scene_id: bound }
+                        | controller_profile::SavedControlAddress::SceneTrigger { scene_id: bound }
+                        if bound == scene_id
+                )
+            })
+    }
+
+    fn next_available_scene_id(&self) -> Option<performance::SceneId> {
+        (1..=u16::MAX)
+            .filter_map(performance::SceneId::new)
+            .find(|candidate| !self.scene_identity_is_reserved(*candidate))
+    }
+
     fn capture_scene(
         &mut self,
         requested_id: Option<performance::SceneId>,
@@ -13815,10 +14403,7 @@ impl App {
                 return;
             }
             None => {
-                let available = (1..=u16::MAX)
-                    .filter_map(performance::SceneId::new)
-                    .find(|candidate| self.scenes.get(*candidate).is_none());
-                let Some(scene_id) = available else {
+                let Some(scene_id) = self.next_available_scene_id() else {
                     self.scene_status = "No non-zero Scene identity is available".to_string();
                     return;
                 };
@@ -13852,6 +14437,7 @@ impl App {
                 return;
             }
         };
+        self.stop_autopilot_for_manual_control("manual Scene capture");
         self.invalidate_prepared_scene(scene_id);
         if let Err(error) = self.scenes.upsert(performance::Scene {
             id: scene_id,
@@ -14141,6 +14727,9 @@ impl App {
                 | WebAction::SeekClipSlotTimecode { .. }
                 | WebAction::PrepareScene { .. }
                 | WebAction::TriggerScene { .. }
+                | WebAction::AutopilotPlay
+                | WebAction::AutopilotPause
+                | WebAction::AutopilotReset
                 | WebAction::TapTempo
                 | WebAction::Gyro { .. }
                 | WebAction::GyroStream { .. }
@@ -15049,6 +15638,19 @@ impl App {
                     _ => return None,
                 })
             }
+            Address::ScenePrepare { scene_id } | Address::SceneTrigger { scene_id } => {
+                let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
+                let scheduled = self
+                    .performance_scheduled
+                    .as_ref()
+                    .is_some_and(|scheduled| scheduled.key == key);
+                let ready = scene_feedback_is_ready(
+                    self.scenes.get(scene_id).is_some(),
+                    self.cached_performance_position(&key).is_some(),
+                    scheduled,
+                );
+                Some(Self::normalized_bool(ready))
+            }
             Address::Transport(parameter) => Some(match parameter {
                 Param::ProgramFreeze | Param::Paused => Self::normalized_bool(self.master_paused),
                 Param::MediaFreeze => Self::normalized_bool(self.media_frozen),
@@ -15100,6 +15702,14 @@ impl App {
         let current = self.automation_current_normalized(address).unwrap_or(0.0);
         let requested = Self::automation_requested_value(value, current)
             .ok_or_else(|| "automation value is non-finite".to_string())?;
+        if address.is_scene_action()
+            && !matches!(value, controller_profile::AutomationValue::Trigger)
+        {
+            // A false OSC packet is the inert release half of a pulse. MIDI
+            // profiles admit only Momentary bindings for these addresses, so
+            // their decoder reaches here solely on the physical rising edge.
+            return Ok(current);
+        }
         let bool_value = requested >= 0.5;
         let action = match address {
             Address::LegacyMidiSlot(slot) => {
@@ -15492,6 +16102,30 @@ impl App {
                     composition_revision: self.composition_revision,
                 }
             }
+            Address::ScenePrepare { scene_id } => {
+                if self.scenes.get(scene_id).is_none() {
+                    return Err(format!(
+                        "Scene {} prepare target is absent (tombstoned)",
+                        scene_id.get()
+                    ));
+                }
+                WebAction::PrepareScene { scene_id }
+            }
+            Address::SceneTrigger { scene_id } => {
+                if self.scenes.get(scene_id).is_none() {
+                    return Err(format!(
+                        "Scene {} trigger target is absent (tombstoned)",
+                        scene_id.get()
+                    ));
+                }
+                // Scene trigger mode is authored patch state. `None` follows
+                // that canonical value instead of imposing protocol-specific
+                // quantization or an OSC/MIDI-only timing law.
+                WebAction::TriggerScene {
+                    scene_id,
+                    trigger_mode: None,
+                }
+            }
             Address::Transport(parameter) => match parameter {
                 Param::ProgramFreeze | Param::Paused => {
                     WebAction::SetProgramFrozen { frozen: bool_value }
@@ -15570,16 +16204,33 @@ impl App {
     }
 
     /// Reflect authoritative host/native/browser changes to every controller
-    /// address that has explicit MIDI feedback. The value cache prevents a
-    /// warm frame from filling either bounded protocol queue, while inbound
-    /// events update the same cache before this pass to retain source-loop
-    /// suppression.
+    /// address that has explicit MIDI feedback. A successfully addressed live
+    /// Scene action also stays enrolled while that Scene exists, allowing its
+    /// asynchronous GPU-ready edge to reach configured OSC feedback peers.
+    /// At most two addresses per bounded authored Scene can join this set.
+    /// The value cache prevents a warm frame from filling either bounded
+    /// protocol queue, while inbound events update the same cache before this
+    /// pass to retain source-loop suppression.
     fn sync_controller_profile_feedback(&mut self) {
         // Runtime addresses were resolved exactly once when this profile was
         // installed. Re-resolving saved positions here would retarget motor
         // feedback after an ordinary layer reorder even though input events
         // correctly remain attached to their StableLayerIds.
-        let active = controller_feedback_addresses(self.midi.resolved_profile());
+        let profile_active = controller_feedback_addresses(self.midi.resolved_profile());
+        let mut active = profile_active.clone();
+        active.extend(
+            self.controller_feedback_cache
+                .iter()
+                .filter_map(|(address, code)| match address {
+                    controller_profile::RuntimeControlAddress::ScenePrepare { scene_id }
+                    | controller_profile::RuntimeControlAddress::SceneTrigger { scene_id }
+                        if self.scenes.get(*scene_id).is_some() || *code != 0 =>
+                    {
+                        Some(*address)
+                    }
+                    _ => None,
+                }),
+        );
         for address in active.iter().copied() {
             let Some(normalized) = self.automation_current_normalized(address) else {
                 continue;
@@ -15594,8 +16245,16 @@ impl App {
                 controller_profile::AutomationOrigin::HostAutomation,
             );
         }
-        self.controller_feedback_cache
-            .retain(|address, _| active.contains(address));
+        self.controller_feedback_cache.retain(|address, code| {
+            profile_active.contains(address)
+                || match address {
+                    controller_profile::RuntimeControlAddress::ScenePrepare { scene_id }
+                    | controller_profile::RuntimeControlAddress::SceneTrigger { scene_id } => {
+                        self.scenes.get(*scene_id).is_some() || *code != 0
+                    }
+                    _ => false,
+                }
+        });
     }
 
     fn resolve_pending_initial_controller_profile(&mut self) {
@@ -15603,9 +16262,10 @@ impl App {
             return;
         }
         let layer_ids = self.live_layer_ids();
-        let resolved = self
-            .controller_profile
-            .resolve(|position| position.resolve(&layer_ids).copied());
+        let resolved = self.controller_profile.resolve_with_scenes(
+            |position| position.resolve(&layer_ids).copied(),
+            |scene_id| self.scenes.get(scene_id).is_some(),
+        );
         match resolved {
             Ok(profile) => {
                 self.controller_profile_pending_initial_resolution = false;
@@ -15623,7 +16283,10 @@ impl App {
                     }
                 }
             }
-            Err(controller_profile::ControllerProfileError::MissingLayer(_)) => {}
+            Err(
+                controller_profile::ControllerProfileError::MissingLayer(_)
+                | controller_profile::ControllerProfileError::MissingScene(_),
+            ) => {}
             Err(error) => {
                 self.controller_profile_pending_initial_resolution = false;
                 self.controller_status =
@@ -17026,6 +17689,12 @@ impl App {
             WebAction::SetMediaFrozen { .. } => Some(Address::Transport(Param::MediaFreeze)),
             WebAction::SetBlackout { .. } => Some(Address::Transport(Param::Blackout)),
             WebAction::SetBpm { .. } => Some(Address::Transport(Param::Bpm)),
+            WebAction::PrepareScene { scene_id } => Some(Address::ScenePrepare {
+                scene_id: *scene_id,
+            }),
+            WebAction::TriggerScene { scene_id, .. } => Some(Address::SceneTrigger {
+                scene_id: *scene_id,
+            }),
             WebAction::SetLayerParam {
                 index,
                 layer_id,
@@ -17572,6 +18241,7 @@ impl App {
                 }
             }
             WebAction::PrepareScene { scene_id } => {
+                self.stop_autopilot_for_manual_control("manual Scene preparation");
                 let key = performance_runtime::PreparedTransactionKey::Scene(scene_id);
                 if self.cached_performance_position(&key).is_some() {
                     self.scene_status = format!("Scene {} is GPU-ready", scene_id.get());
@@ -17588,9 +18258,22 @@ impl App {
                 if self.scenes.get(scene_id).is_none() {
                     self.scene_status = format!("Scene {} is absent", scene_id.get());
                 } else {
+                    self.stop_autopilot_for_manual_control("manual Scene removal");
                     self.invalidate_prepared_scene(scene_id);
                     self.scenes.remove(scene_id);
-                    self.scene_status = format!("Removed Scene {}", scene_id.get());
+                    self.scene_status = if self
+                        .autopilot_plan
+                        .steps
+                        .iter()
+                        .any(|step| step.scene_id == scene_id)
+                    {
+                        format!(
+                            "Removed Scene {}; its Autopilot step remains an inert tombstone until edited",
+                            scene_id.get()
+                        )
+                    } else {
+                        format!("Removed Scene {}", scene_id.get())
+                    };
                 }
             }
             WebAction::TriggerScene {
@@ -17610,6 +18293,29 @@ impl App {
                     self.stage_scene(scene_id, Some(mode));
                 }
             }
+            WebAction::ReplaceAutopilotPlan { plan } => {
+                let commands = self.autopilot_scheduler.reset();
+                self.apply_autopilot_commands(commands, Instant::now());
+                self.autopilot_plan = plan;
+                self.performance_boundaries
+                    .reanchor(self.mod_matrix.current_beat);
+                self.autopilot_status = match self.autopilot_plan.validate_scenes(&self.scenes) {
+                    Ok(()) if self.autopilot_plan.is_empty() => {
+                        "Autopilot plan cleared".to_string()
+                    }
+                    Ok(()) => format!(
+                        "Saved {}-step Autopilot plan (stopped)",
+                        self.autopilot_plan.len()
+                    ),
+                    Err(issue) => format!(
+                        "Saved {}-step Autopilot plan with inert tombstone: {issue}",
+                        self.autopilot_plan.len()
+                    ),
+                };
+            }
+            WebAction::AutopilotPlay => self.play_or_resume_autopilot(Instant::now()),
+            WebAction::AutopilotPause => self.pause_autopilot(),
+            WebAction::AutopilotReset => self.reset_autopilot(),
             WebAction::AddSpoutLayer { sender } => self.add_spout_layer(&sender),
             WebAction::RemoveLayer { index, layer_id } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
@@ -17877,6 +18583,7 @@ impl App {
             // contract exact for older remotes: direct master uniforms only.
             WebAction::ResetFx => self.master_effects.reset(),
             WebAction::ResetVisualProgram => {
+                self.stop_autopilot_for_manual_control("Reset Visual Program");
                 if self.revert_master_visual_state() {
                     disposition = WebActionBatchDisposition::MasterVisualReset;
                 }
@@ -19249,6 +19956,16 @@ impl App {
                 audio_layer,
                 audio_layer_id,
             } => {
+                if matches!(
+                    self.autopilot_scheduler.state(),
+                    performance::autopilot::AutopilotState::Starting
+                        | performance::autopilot::AutopilotState::Running
+                        | performance::autopilot::AutopilotState::Stalled
+                ) {
+                    self.output_error = "Offline Autopilot replay is not available in v1.2; Pause or Reset for a static current-state export, or use Program Recording for the live sequence".to_string();
+                    log::warn!("{}", self.output_error);
+                    return disposition;
+                }
                 if self
                     .export_job
                     .as_ref()
@@ -20613,6 +21330,17 @@ impl App {
                 scenes: scene_snapshots,
                 prepared_scene_id,
                 pending_scene_id,
+                autopilot: web::state::AutopilotSnapshot {
+                    plan: self.autopilot_plan.clone(),
+                    phase: self.autopilot_scheduler.state().into(),
+                    current_step: self.autopilot_scheduler.active_step_index(),
+                    next_step: self
+                        .autopilot_scheduler
+                        .expected_target()
+                        .map(|target| target.step_index),
+                    beats_remaining: self.autopilot_scheduler.remaining_hold_beats(),
+                    status: self.autopilot_status.clone(),
+                },
                 status: format!(
                     "{} / {} prepared sources, {} / {} MiB",
                     prepared_budget.source_count,
@@ -23299,7 +24027,11 @@ impl ApplicationHandler for App {
                     self.push_web_state();
 
                     let mod_ntsc = evaluated_frame.ntsc().clone();
-                    let mod_temporal = *evaluated_frame.temporal();
+                    let mod_temporal = evaluated_creative
+                        .as_ref()
+                        .map_or(*evaluated_frame.temporal(), |plan| {
+                            plan.effective_temporal()
+                        });
                     // The B14 sync latch draws its faults on the master
                     // random seed, taken from the same immutable frame sample
                     // every other consumer reads.
@@ -23778,7 +24510,12 @@ impl ApplicationHandler for App {
                         if selective_rebuild {
                             let was_holding = self.selective_transition_holding;
                             self.selective_temporal_debt = 0.0;
-                            renderer.reset_visual_generation();
+                            // VHS route/topology is downstream presentation
+                            // state. Retire delayed readbacks without erasing
+                            // the program Temporal encoder or sync latch: a
+                            // linked-dry bypass still feeds clean frames into
+                            // warm history and resumes with live/export parity.
+                            renderer.reset_output_pipeline_generation();
                             if hold_rebuild {
                                 match held_audience_action(
                                     was_holding,
@@ -24545,6 +25282,17 @@ impl ApplicationHandler for App {
                         // modulated temporal copy. Blackout disables the path
                         // exactly as it disables NTSC.
                         let mosh_active = mod_temporal.mosh.is_active() && !self.blackout;
+                        // Codec pixels, readbacks, worker jobs, and retained
+                        // output all belong to one continuous armed interval.
+                        // Linked Temporal dry keeps the visual epoch and warm
+                        // history intact, so advance this narrower token on
+                        // each edge; re-entry accepts only newly sampled work.
+                        update_mosh_interval(
+                            mosh_active,
+                            &mut self.mosh_interval_active,
+                            &mut self.mosh_interval_generation,
+                            &mut self.mosh_presented,
+                        );
                         // Harvest a completed raw readback. The generation tag
                         // rejects both pre-blackout content and delayed blackout
                         // frames that finish after the cut is released.
@@ -24604,24 +25352,34 @@ impl ApplicationHandler for App {
                                     self.selective_hold_spout_readback_epoch = None;
                                 }
                             } else if let Some(metadata) = frame.mosh_metadata {
-                                // B5: the mosh eats the finished programme.
-                                // On the global-VHS path the metadata carries
-                                // the sampled NTSC params and the worker runs
-                                // the VHS kernel first in the same hop, so
-                                // the NTSC worker is deliberately unfed while
-                                // the mosh is armed — one admission, one
-                                // frame of latency, the exact offline order.
-                                let worker = self
-                                    .mosh_worker
-                                    .get_or_insert_with(codec_mosh::MoshWorker::new);
-                                let outcome = worker.try_submit_outcome(
-                                    frame.pixels,
-                                    renderer.output_width,
-                                    renderer.output_height,
-                                    metadata,
+                                if !mosh_sample_is_current(
                                     frame.epoch,
-                                );
-                                self.mosh_live_metrics.record_admission(outcome);
+                                    metadata.generation,
+                                    self.visual_epoch,
+                                    self.mosh_interval_generation,
+                                    mosh_active,
+                                ) {
+                                    self.mosh_live_metrics.record_stale();
+                                } else {
+                                    // B5: the mosh eats the finished programme.
+                                    // On the global-VHS path the metadata carries
+                                    // the sampled NTSC params and the worker runs
+                                    // the VHS kernel first in the same hop, so
+                                    // the NTSC worker is deliberately unfed while
+                                    // the mosh is armed — one admission, one
+                                    // frame of latency, the exact offline order.
+                                    let worker = self
+                                        .mosh_worker
+                                        .get_or_insert_with(codec_mosh::MoshWorker::new);
+                                    let outcome = worker.try_submit_outcome(
+                                        frame.pixels,
+                                        renderer.output_width,
+                                        renderer.output_height,
+                                        metadata,
+                                        frame.epoch,
+                                    );
+                                    self.mosh_live_metrics.record_admission(outcome);
+                                }
                             } else if ntsc_path == LiveNtscPath::LegacyGlobal {
                                 if let Some(metadata) = frame.ntsc_metadata {
                                     let outcome = self.ntsc_worker.try_submit_outcome(
@@ -24694,7 +25452,13 @@ impl ApplicationHandler for App {
                         // stage still being armed this frame.
                         if let Some(worker) = self.mosh_worker.as_mut() {
                             if let Some(processed) = worker.try_recv() {
-                                if processed.epoch == self.visual_epoch && mosh_active {
+                                if mosh_sample_is_current(
+                                    processed.epoch,
+                                    processed.generation,
+                                    self.visual_epoch,
+                                    self.mosh_interval_generation,
+                                    mosh_active,
+                                ) {
                                     if spout_active {
                                         self.spout.try_submit(
                                             processed.pixels.clone(),
@@ -24703,7 +25467,11 @@ impl ApplicationHandler for App {
                                             processed.epoch,
                                         );
                                     }
-                                    self.mosh_presented = Some((processed.epoch, processed.pixels));
+                                    self.mosh_presented = Some((
+                                        processed.epoch,
+                                        processed.generation,
+                                        processed.pixels,
+                                    ));
                                 } else {
                                     self.mosh_live_metrics.record_stale();
                                 }
@@ -24740,6 +25508,7 @@ impl ApplicationHandler for App {
                                         elapsed_duration.as_secs_f64(),
                                     ) as u64,
                                     seed: self.master_effects.random_seed,
+                                    generation: self.mosh_interval_generation,
                                     ntsc: ntsc_metadata.take(),
                                 });
                             let slot = match renderer.begin_readback(
@@ -24805,8 +25574,15 @@ impl ApplicationHandler for App {
                         // result lands the audience keeps the clean composite
                         // rather than a frozen VHS-only frame.
                         if mosh_active {
-                            if let Some((epoch, pixels)) = self.mosh_presented.as_ref() {
-                                if *epoch == self.visual_epoch {
+                            if let Some((epoch, generation, pixels)) = self.mosh_presented.as_ref()
+                            {
+                                if mosh_sample_is_current(
+                                    *epoch,
+                                    *generation,
+                                    self.visual_epoch,
+                                    self.mosh_interval_generation,
+                                    mosh_active,
+                                ) {
                                     renderer.write_composite(pixels);
                                 }
                             }
@@ -28077,6 +28853,162 @@ mod app_state_tests {
     }
 
     #[test]
+    fn automatic_scene_ids_skip_live_autopilot_and_controller_tombstones() {
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let autopilot_id = performance::SceneId::new(1).unwrap();
+        let controller_id = performance::SceneId::new(2).unwrap();
+        let live_id = performance::SceneId::new(3).unwrap();
+        app.autopilot_plan = performance::AutopilotPlan::try_new(
+            performance::AutopilotRepeat::Loop,
+            vec![performance::AutopilotStep {
+                scene_id: autopilot_id,
+                hold_beats: performance::AutopilotHoldBeats::DEFAULT,
+            }],
+        )
+        .unwrap();
+        app.controller_profile.bindings = vec![controller_profile::ControllerBinding {
+            target: controller_profile::SavedControlAddress::ScenePrepare {
+                scene_id: controller_id,
+            },
+            ..controller_profile::ControllerBinding::default()
+        }];
+        app.scenes = performance::Scenes::try_from_vec(vec![performance::Scene {
+            id: live_id,
+            name: "Live three".into(),
+            trigger_mode: transport::TriggerMode::Immediate,
+            bindings: performance::SceneBindings::default(),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            app.next_available_scene_id().unwrap().get(),
+            4,
+            "automatic capture must not revive or retarget any stable Scene identity"
+        );
+        app.scenes.remove(live_id);
+        assert_eq!(app.next_available_scene_id().unwrap().get(), 3);
+        assert!(app.scene_identity_is_reserved(autopilot_id));
+        assert!(app.scene_identity_is_reserved(controller_id));
+    }
+
+    #[test]
+    fn typed_scene_controls_resolve_live_ids_dispatch_pulses_and_tombstone_absence() {
+        use controller_profile::{
+            AutomationOrigin, AutomationValue, ControllerBinding, ControllerProfileDocument,
+            MidiButtonMode, MidiInputSource, RuntimeControlAddress, SavedControlAddress,
+        };
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let scene_id = performance::SceneId::new(7).unwrap();
+        let document = ControllerProfileDocument {
+            name: "Scene launch pad".into(),
+            bindings: vec![ControllerBinding {
+                source: MidiInputSource::Note { note: 60 },
+                button_mode: Some(MidiButtonMode::Momentary),
+                target: SavedControlAddress::SceneTrigger { scene_id },
+                ..ControllerBinding::default()
+            }],
+            ..ControllerProfileDocument::default()
+        };
+
+        let prior_document = app.controller_profile.clone();
+        let prior_runtime = app.midi.resolved_profile().clone();
+        let error = app
+            .install_controller_profile_document(document.clone(), "test import")
+            .unwrap_err();
+        assert!(error.contains("MissingScene"));
+        assert_eq!(app.controller_profile, prior_document);
+        assert_eq!(app.midi.resolved_profile(), &prior_runtime);
+
+        app.scenes = performance::Scenes::try_from_vec(vec![performance::Scene {
+            id: scene_id,
+            name: "Authored next-bar cue".into(),
+            trigger_mode: transport::TriggerMode::NextBar,
+            bindings: performance::SceneBindings::default(),
+        }])
+        .unwrap();
+        app.install_controller_profile_document(document, "test import")
+            .unwrap();
+        assert_eq!(
+            app.midi.resolved_profile().bindings[0].target,
+            RuntimeControlAddress::SceneTrigger { scene_id }
+        );
+        assert_eq!(
+            app.automation_current_normalized(RuntimeControlAddress::SceneTrigger { scene_id }),
+            Some(0.0),
+            "an extant but unprepared Scene reports bounded not-ready feedback"
+        );
+
+        app.scene_status.clear();
+        assert_eq!(
+            app.apply_automation_control(
+                AutomationOrigin::Osc("127.0.0.1:9001".parse().unwrap()),
+                RuntimeControlAddress::SceneTrigger { scene_id },
+                AutomationValue::Gate(false),
+            )
+            .unwrap(),
+            0.0
+        );
+        assert!(app.scene_status.is_empty(), "an OSC release is inert");
+
+        app.apply_automation_control(
+            AutomationOrigin::Midi,
+            RuntimeControlAddress::SceneTrigger { scene_id },
+            AutomationValue::Trigger,
+        )
+        .unwrap();
+        assert!(app.scene_status.contains("must bind at least one layer"));
+        assert_eq!(
+            app.feedback_address_for_web_action(&web::state::WebAction::PrepareScene { scene_id }),
+            Some(RuntimeControlAddress::ScenePrepare { scene_id })
+        );
+
+        app.scenes.remove(scene_id);
+        let error = app
+            .apply_automation_control(
+                AutomationOrigin::Midi,
+                RuntimeControlAddress::SceneTrigger { scene_id },
+                AutomationValue::Trigger,
+            )
+            .unwrap_err();
+        assert!(error.contains("tombstoned"));
+        assert_eq!(
+            app.automation_current_normalized(RuntimeControlAddress::SceneTrigger { scene_id }),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn scene_feedback_falls_when_prepared_payload_is_scheduled_or_consumed() {
+        assert!(scene_feedback_is_ready(true, true, false));
+        assert!(
+            !scene_feedback_is_ready(true, true, true),
+            "an armed next-beat/bar Scene is pending, not ready"
+        );
+        assert!(
+            !scene_feedback_is_ready(true, false, false),
+            "commit consumes the cached ready payload"
+        );
+        assert!(!scene_feedback_is_ready(false, true, false));
+    }
+
+    #[test]
+    fn removed_osc_only_scene_feedback_gets_one_zero_edge_then_retires() {
+        use controller_profile::RuntimeControlAddress;
+
+        let mut app = App::new(None, None, WebState::new().expect("test token"));
+        let address = RuntimeControlAddress::SceneTrigger {
+            scene_id: performance::SceneId::new(77).unwrap(),
+        };
+        app.controller_feedback_cache.insert(address, u16::MAX);
+        app.sync_controller_profile_feedback();
+        assert!(
+            !app.controller_feedback_cache.contains_key(&address),
+            "the absent Scene's synthesized zero is published once, then the OSC-only enrollment retires"
+        );
+    }
+
+    #[test]
     fn layer_removal_invalidates_whole_targeting_scene_and_shifts_survivors() {
         let mut app = App::new(None, None, WebState::new().expect("test token"));
         app.scenes = performance::Scenes::try_from_vec(vec![
@@ -28668,6 +29600,72 @@ mod app_state_tests {
             LiveNtscPath::Disabled,
             LiveNtscPath::LegacyGlobal
         ));
+    }
+
+    #[test]
+    fn linked_temporal_dry_invalidates_delayed_mosh_work_before_reentry() {
+        let visual_epoch = 41_u64;
+        let mut generation = 1_u64;
+        let mut was_active = false;
+        let mut retained = None;
+
+        update_mosh_interval(true, &mut was_active, &mut generation, &mut retained);
+        let pre_dry_generation = generation;
+        retained = Some((visual_epoch, generation, vec![1_u8, 2, 3, 4]));
+        update_mosh_interval(true, &mut was_active, &mut generation, &mut retained);
+        assert!(retained.is_some(), "a continuously armed interval retains");
+
+        update_mosh_interval(false, &mut was_active, &mut generation, &mut retained);
+        assert!(
+            retained.is_none(),
+            "linked dry clears the narrower codec interval even though visual epoch stays 41"
+        );
+        update_mosh_interval(true, &mut was_active, &mut generation, &mut retained);
+        assert!(
+            retained.is_none(),
+            "re-entry stays on the clean composite until a fresh worker result"
+        );
+        assert_ne!(generation, pre_dry_generation);
+        assert!(
+            !mosh_sample_is_current(
+                visual_epoch,
+                pre_dry_generation,
+                visual_epoch,
+                generation,
+                true,
+            ),
+            "a readback or worker result sampled before dry cannot resurface after re-entry"
+        );
+        assert!(mosh_sample_is_current(
+            visual_epoch,
+            generation,
+            visual_epoch,
+            generation,
+            true,
+        ));
+    }
+
+    #[test]
+    fn selective_vhs_generation_reset_cannot_erase_temporal_or_sync_memory() {
+        let renderer_source = include_str!("renderer/state.rs");
+        let start = renderer_source
+            .find("pub(crate) fn reset_output_pipeline_generation")
+            .expect("output-only generation reset exists");
+        let end = renderer_source[start..]
+            .find("fn invalidate_async_output_generation")
+            .map(|offset| start + offset)
+            .expect("output-only reset delegates to async invalidation");
+        let method = &renderer_source[start..end];
+        assert!(method.contains("invalidate_async_output_generation"));
+        assert!(!method.contains("temporal_state"));
+        assert!(!method.contains("sync_latch"));
+
+        let live_source = include_str!("main.rs");
+        let (production, _tests) = live_source
+            .split_once("mod app_state_tests")
+            .expect("main.rs carries its test module");
+        assert!(production.contains("renderer.reset_output_pipeline_generation();"));
+        assert!(!production.contains("renderer.reset_visual_generation();"));
     }
 
     #[test]
@@ -29453,6 +30451,8 @@ mod app_state_tests {
             ("garden_softness", serde_json::json!(0.2)),
             ("garden_decay", serde_json::json!(0.9)),
             ("garden_max_hold_ticks", serde_json::json!(31)),
+            ("long_exposure_amount", serde_json::json!(0.65)),
+            ("long_exposure_frames", serde_json::json!(18)),
             ("score_enabled", serde_json::json!(true)),
             ("score_seed", serde_json::json!(29)),
             ("score_state_count", serde_json::json!(11)),
@@ -29486,6 +30486,8 @@ mod app_state_tests {
             temporal::RefreshGardenGate::AudioEnergy
         );
         assert_eq!(authored.garden.max_hold_ticks, 31);
+        assert_eq!(authored.long_exposure.amount, 0.65);
+        assert_eq!(authored.long_exposure.shutter_frames, 18);
         assert!(authored.score.enabled);
         assert_eq!(authored.score.seed, 29);
         assert_eq!(authored.score.state_count, 11);
@@ -34346,6 +35348,14 @@ mod app_state_tests {
         assert_eq!(
             law(temporal("key_history")),
             Some(Law::Stepped { min: 1, max: 23 })
+        );
+        assert_eq!(
+            law(temporal("long_exposure_amount")),
+            Some(Law::Unit { min: 0.0, max: 1.0 })
+        );
+        assert_eq!(
+            law(temporal("long_exposure_frames")),
+            Some(Law::Stepped { min: 2, max: 24 })
         );
         assert_eq!(law(temporal("mosh_recycle")), Some(Law::Toggle));
         // B14: the switch is a toggle and the four controls ride the

@@ -639,6 +639,16 @@ pub static CONTROL_HELP: &[HelpEntry] = &[
     ),
     entry(
         Temporal,
+        "long_exposure_amount",
+        "Blends in a photographic average of the clean current frame and its recent 30 Hz history. Zero is an exact bypass.",
+    ),
+    entry(
+        Temporal,
+        "long_exposure_frames",
+        "Sets the shutter span from two to twenty-four frames. Spans through eight are exact; longer spans keep the full trail extent with eight bounded samples.",
+    ),
+    entry(
+        Temporal,
         "loom_amount",
         "How strongly the Loom rewrites the history read into its own topology.",
     ),

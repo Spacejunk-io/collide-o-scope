@@ -2,9 +2,10 @@
 //!
 //! Profiles are deliberately independent of PatchState. Saved layer targets
 //! use patch positions and resolve atomically to runtime stable identities;
-//! the resolved profile then survives ordinary layer reorder without
-//! retargeting. Hardware callbacks never use this module directly: they put
-//! bounded raw messages on the MIDI queue and the host decodes them later.
+//! saved Scene actions use authored [`SceneId`] values directly. The resolved
+//! profile then survives ordinary reorder without retargeting. Hardware
+//! callbacks never use this module directly: they put bounded raw messages on
+//! the MIDI queue and the host decodes them later.
 
 #![allow(
     dead_code,
@@ -23,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::image_routing::StableLayerId;
-use crate::performance::SavedLayerPosition;
+use crate::performance::{SavedLayerPosition, SceneId};
 use crate::visual_rack::{GroupId, NodeId};
 
 pub const CONTROLLER_PROFILE_VERSION: u16 = 1;
@@ -533,6 +534,24 @@ pub enum RuntimeControlAddress {
         parameter: ControlParameter,
     },
     Transport(ControlParameter),
+    /// Prepare one authored Scene by stable ID. This is an action endpoint,
+    /// not a scalar parameter; MIDI resolves it to a rising-edge trigger and
+    /// OSC treats each asserted message as one pulse.
+    ScenePrepare {
+        scene_id: SceneId,
+    },
+    /// Trigger one authored Scene by stable ID using its authored trigger
+    /// mode. Keeping the ID in the runtime address prevents reorder from
+    /// redirecting a physical control to another Scene.
+    SceneTrigger {
+        scene_id: SceneId,
+    },
+}
+
+impl RuntimeControlAddress {
+    pub const fn is_scene_action(self) -> bool {
+        matches!(self, Self::ScenePrepare { .. } | Self::SceneTrigger { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,12 +587,23 @@ pub enum SavedControlAddress {
     Transport {
         parameter: ControlParameter,
     },
+    ScenePrepare {
+        scene_id: SceneId,
+    },
+    SceneTrigger {
+        scene_id: SceneId,
+    },
 }
 
 impl SavedControlAddress {
+    pub const fn is_scene_action(self) -> bool {
+        matches!(self, Self::ScenePrepare { .. } | Self::SceneTrigger { .. })
+    }
+
     fn resolve(
         self,
         layer_at_position: &mut impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+        scene_exists: &mut impl FnMut(SceneId) -> bool,
     ) -> Result<RuntimeControlAddress, ControllerProfileError> {
         Ok(match self {
             Self::LegacyMidiSlot { slot } if slot < 4 => {
@@ -615,6 +645,15 @@ impl SavedControlAddress {
                 parameter,
             },
             Self::Transport { parameter } => RuntimeControlAddress::Transport(parameter),
+            Self::ScenePrepare { scene_id } if scene_exists(scene_id) => {
+                RuntimeControlAddress::ScenePrepare { scene_id }
+            }
+            Self::SceneTrigger { scene_id } if scene_exists(scene_id) => {
+                RuntimeControlAddress::SceneTrigger { scene_id }
+            }
+            Self::ScenePrepare { scene_id } | Self::SceneTrigger { scene_id } => {
+                return Err(ControllerProfileError::MissingScene(scene_id));
+            }
         })
     }
 }
@@ -880,6 +919,13 @@ impl ControllerProfileDocument {
             if binding.button_mode.is_some() && binding.encoding != MidiValueEncoding::Absolute {
                 return Err(ControllerProfileError::ButtonEncoding(binding.id));
             }
+            if binding.target.is_scene_action()
+                && binding.button_mode != Some(MidiButtonMode::Momentary)
+            {
+                return Err(ControllerProfileError::SceneActionNeedsMomentary(
+                    binding.id,
+                ));
+            }
             if let Some(output) = binding.feedback {
                 output.bytes(0.0)?;
                 feedback += 1;
@@ -893,7 +939,18 @@ impl ControllerProfileDocument {
 
     pub fn resolve(
         &self,
+        layer_at_position: impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+    ) -> Result<ResolvedControllerProfile, ControllerProfileError> {
+        self.resolve_with_scenes(layer_at_position, |_| false)
+    }
+
+    /// Resolve portable targets against one immutable live world. The legacy
+    /// one-closure [`Self::resolve`] seam remains available for profiles with
+    /// no Scene actions; it deliberately treats every Scene as absent.
+    pub fn resolve_with_scenes(
+        &self,
         mut layer_at_position: impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+        mut scene_exists: impl FnMut(SceneId) -> bool,
     ) -> Result<ResolvedControllerProfile, ControllerProfileError> {
         self.validate()?;
         let mut bindings = Vec::with_capacity(self.bindings.len());
@@ -906,7 +963,9 @@ impl ControllerProfileDocument {
                 button_mode: binding.button_mode,
                 press_threshold: binding.press_threshold,
                 relative_step: binding.relative_step,
-                target: binding.target.resolve(&mut layer_at_position)?,
+                target: binding
+                    .target
+                    .resolve(&mut layer_at_position, &mut scene_exists)?,
                 feedback: binding.feedback,
             });
         }
@@ -994,6 +1053,18 @@ pub fn prepare_controller_profile_swap(
     Ok(PreparedControllerProfileSwap { document, runtime })
 }
 
+/// Scene-aware counterpart used by the live host. A missing stable Scene ID
+/// rejects the complete candidate before either the saved document or the
+/// MIDI decoder can change.
+pub fn prepare_controller_profile_swap_with_scenes(
+    document: ControllerProfileDocument,
+    layer_at_position: impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+    scene_exists: impl FnMut(SceneId) -> bool,
+) -> Result<PreparedControllerProfileSwap, ControllerProfileError> {
+    let runtime = document.resolve_with_scenes(layer_at_position, scene_exists)?;
+    Ok(PreparedControllerProfileSwap { document, runtime })
+}
+
 /// Shared byte-oriented import seam for a native picker or another bounded
 /// host transport. Browser JSON should use [`ControllerProfileAction`] so its
 /// lack of path authority is structural rather than a UI convention.
@@ -1003,6 +1074,15 @@ pub fn prepare_controller_profile_json_import(
 ) -> Result<PreparedControllerProfileSwap, ControllerProfileError> {
     let document = ControllerProfileDocument::from_json_bytes(bytes)?;
     prepare_controller_profile_swap(document, layer_at_position)
+}
+
+pub fn prepare_controller_profile_json_import_with_scenes(
+    bytes: &[u8],
+    layer_at_position: impl FnMut(SavedLayerPosition) -> Option<StableLayerId>,
+    scene_exists: impl FnMut(SceneId) -> bool,
+) -> Result<PreparedControllerProfileSwap, ControllerProfileError> {
+    let document = ControllerProfileDocument::from_json_bytes(bytes)?;
+    prepare_controller_profile_swap_with_scenes(document, layer_at_position, scene_exists)
 }
 
 /// Export only the portable validated profile document. The destination path
@@ -1091,6 +1171,13 @@ impl ResolvedControllerProfile {
             }
             if binding.button_mode.is_some() && binding.encoding != MidiValueEncoding::Absolute {
                 return Err(ControllerProfileError::ButtonEncoding(binding.id));
+            }
+            if binding.target.is_scene_action()
+                && binding.button_mode != Some(MidiButtonMode::Momentary)
+            {
+                return Err(ControllerProfileError::SceneActionNeedsMomentary(
+                    binding.id,
+                ));
             }
             if let Some(output) = binding.feedback {
                 output.bytes(0.0)?;
@@ -1338,8 +1425,10 @@ pub enum ControllerProfileError {
     RelativeStep(u16),
     NoteNeedsButton(u16),
     ButtonEncoding(u16),
+    SceneActionNeedsMomentary(u16),
     LegacySlot(u8),
     MissingLayer(SavedLayerPosition),
+    MissingScene(SceneId),
     NonFinite,
     Io(String),
 }
@@ -1389,6 +1478,10 @@ mod tests {
 
     fn stable(value: u64) -> StableLayerId {
         StableLayerId::new(value).unwrap()
+    }
+
+    fn scene(value: u16) -> SceneId {
+        SceneId::new(value).unwrap()
     }
 
     #[test]
@@ -1739,6 +1832,87 @@ mod tests {
                 parameter: ControlParameter::Opacity,
             }
         );
+    }
+
+    #[test]
+    fn scene_actions_round_trip_in_v1_profiles_and_resolve_only_live_stable_ids() {
+        let mut profile = ControllerProfileDocument::legacy_four_cc();
+        profile.bindings[0] = ControllerBinding {
+            id: 1,
+            source: MidiInputSource::Note { note: 60 },
+            button_mode: Some(MidiButtonMode::Momentary),
+            target: SavedControlAddress::ScenePrepare { scene_id: scene(7) },
+            ..ControllerBinding::default()
+        };
+        profile.bindings[1] = ControllerBinding {
+            id: 2,
+            source: MidiInputSource::Note { note: 61 },
+            button_mode: Some(MidiButtonMode::Momentary),
+            target: SavedControlAddress::SceneTrigger { scene_id: scene(7) },
+            ..ControllerBinding::default()
+        };
+
+        let bytes = profile.to_json_bytes().unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains(r#""scope": "scene_trigger""#));
+        let restored = ControllerProfileDocument::from_json_bytes(&bytes).unwrap();
+        assert_eq!(restored, profile);
+        assert_eq!(
+            restored.version, 1,
+            "the additive vocabulary keeps v1 readable"
+        );
+
+        assert_eq!(
+            restored.resolve_with_scenes(|_| None, |_| false),
+            Err(ControllerProfileError::MissingScene(scene(7)))
+        );
+        let resolved = restored
+            .resolve_with_scenes(|_| None, |candidate| candidate == scene(7))
+            .unwrap();
+        assert_eq!(
+            resolved.bindings[0].target,
+            RuntimeControlAddress::ScenePrepare { scene_id: scene(7) }
+        );
+        assert_eq!(
+            resolved.bindings[1].target,
+            RuntimeControlAddress::SceneTrigger { scene_id: scene(7) }
+        );
+    }
+
+    #[test]
+    fn scene_actions_require_momentary_bindings_and_emit_only_on_rising_edges() {
+        let mut profile = ControllerProfileDocument::legacy_four_cc();
+        profile.bindings[0].target = SavedControlAddress::SceneTrigger { scene_id: scene(9) };
+        assert_eq!(
+            profile.validate(),
+            Err(ControllerProfileError::SceneActionNeedsMomentary(1))
+        );
+
+        profile.bindings[0].source = MidiInputSource::Note { note: 64 };
+        profile.bindings[0].button_mode = Some(MidiButtonMode::Momentary);
+        let resolved = profile
+            .resolve_with_scenes(|_| None, |candidate| candidate == scene(9))
+            .unwrap();
+        let mut decoder = ControllerDecoder::new(resolved);
+        let mut events = Vec::new();
+        for message in [
+            [0x90, 64, 127],
+            [0x90, 64, 127],
+            [0x80, 64, 0],
+            [0x90, 64, 127],
+        ] {
+            decoder.decode(0, &message, &mut events);
+        }
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| matches!(
+            event.kind,
+            ControllerEventKind::Control {
+                address: RuntimeControlAddress::SceneTrigger { scene_id },
+                value: AutomationValue::Trigger,
+                ..
+            } if scene_id == scene(9)
+        )));
     }
 
     #[test]

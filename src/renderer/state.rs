@@ -1280,6 +1280,36 @@ mod temporal_state_tests {
 
     #[test]
     #[ignore = "requires a GPU adapter"]
+    fn gpu_long_exposure_ghosting_is_visible_deterministic_and_alpha_safe() {
+        let fixture = TemporalOriginalsGpuFixture::new(13, 9);
+        let current = [7, 19, 41, 255];
+        let dry = fixture.render(
+            &TemporalParams::default(),
+            &mut full_temporal_history_state(),
+            current,
+        );
+        let exposed_params = TemporalParams {
+            originals: TemporalOriginalsParams {
+                long_exposure: crate::temporal::LongExposureParams {
+                    amount: 1.0,
+                    shutter_frames: 24,
+                },
+                ..TemporalOriginalsParams::default()
+            },
+            ..TemporalParams::default()
+        };
+        let exposed = fixture.render(&exposed_params, &mut full_temporal_history_state(), current);
+        let repeated = fixture.render(&exposed_params, &mut full_temporal_history_state(), current);
+        assert_ne!(
+            exposed, dry,
+            "initialized history must produce visible ghosts"
+        );
+        assert_eq!(exposed, repeated, "the stratified shutter is deterministic");
+        assert!(exposed.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    #[ignore = "requires a GPU adapter"]
     fn gpu_time_displace_keeps_the_ramp_floor_path_exact_and_every_map_reaches_the_pixels() {
         use crate::effects::params::TimeDisplaceMap;
 
@@ -1905,7 +1935,7 @@ pub(crate) fn build_temporal_pipeline(
 /// Allocation-free prepared bindings for the live Exact temporal path. The
 /// legacy and originals pipelines deliberately own distinct group-1 layouts:
 /// zero originals therefore execute the frozen shader/pipeline contract,
-/// while the additive path binds the separate 128-byte originals block.
+/// while the additive path binds the separate 144-byte originals block.
 pub(crate) struct PreparedTemporalGpuResources {
     originals_pipeline: wgpu::RenderPipeline,
     texture_bind_group: wgpu::BindGroup,
@@ -3688,16 +3718,25 @@ impl Renderer {
     /// any CPU-side NTSC-presented frame. Pending map callbacks may complete,
     /// but their sequence numbers are at or below this invalidation watermark
     /// and `poll_readback` will recycle them without returning their pixels.
-    pub fn reset_visual_generation(&mut self) {
-        self.reset_visual_generation_for(TemporalResetCause::PatchGeneration);
-    }
-
     pub(crate) fn reset_visual_generation_for(&mut self, cause: TemporalResetCause) {
         self.temporal_state.reset_for(cause);
         // The B14 latched shear table is program memory: it clears on the
         // causes that begin a new program and deliberately survives a source
         // cut, a seek, and blackout.
         self.sync_latch.reset_for(cause);
+        self.invalidate_async_output_generation();
+    }
+
+    /// Retire asynchronous VHS/readback work after an output-path topology
+    /// edge without erasing program Temporal or sync-latch memory. Switching
+    /// between global/selective/disabled VHS changes only the downstream
+    /// presentation route; the accepted clean composite still warms the same
+    /// temporal history and must match offline evaluation.
+    pub(crate) fn reset_output_pipeline_generation(&mut self) {
+        self.invalidate_async_output_generation();
+    }
+
+    fn invalidate_async_output_generation(&mut self) {
         self.last_harvested_readback_sequence = self
             .last_harvested_readback_sequence
             .max(self.next_readback_sequence.saturating_sub(1));
