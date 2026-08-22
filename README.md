@@ -162,8 +162,13 @@ cancelled chooser leaves the current library and program state unchanged.
 - Runs [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) VHS simulation without
   blocking the render thread. Existing all-inherited stacks keep the global
   post-composite path; a contributing **Bypass Master FX** layer selects an
-  exact per-layer path so VHS touches inherited layers only, and links the
-  complete shared Temporal family to its dry, warm-history path.
+  exact per-layer path so VHS touches inherited layers only and, on the
+  Master-only route, links the complete shared Temporal family to its dry,
+  warm-history path.
+- Provides a separate **Bypass Temporal FX** layer control for an exact dry
+  top overlay in an admitted flat LegacyExact Program stack. Lower inherited
+  layers keep the complete Temporal family, while the contiguous Layer 1/top
+  prefix is recomposited afterward in its authored order and blend modes.
 - Provides feedback trails and arbitrary-angle slit-scan from a 24-sample
   temporal history. History advances at a fixed 30 Hz, so its approximately
   0.8-second span does not change with display or export frame rate.
@@ -678,27 +683,51 @@ max-buffer, host-planning, or cache boundaries.
 
 Each layer can independently enable **Bypass Master FX**. This skips inherited
 Digital, Analog, Cellular, Motion, and VHS processing for that layer while its
-own Layer FX, opacity, key, and blend remain active. Temporal owns one flattened
-program history, so exact per-layer temporal isolation would change stack/blend
-order. The explicit linked law is therefore program-wide: whenever at least one
-visible, positive-opacity bypass layer contributes, Feedback/Slit-Scan/Temporal
-Originals plus Melt, Sync Latch, Display Physics, and Codec Mosh all receive
-neutral parameters for the frame. The temporal encoder still accepts the clean
-program, warming history without changing the authored or modulated controls;
-the effects resume from that warm history when no contributing bypass remains.
-With VHS enabled, the engine renders coherent per-layer slices, applies direct
-master effects and VHS only to inherited slices, and recomposites in stack
-order before the linked Temporal boundary. Hidden or non-positive-opacity
-layers neither activate linked Temporal bypass nor allocate selective work.
-Live selective processing is latest-only and has a 320 MiB incremental safety
+own Layer FX, opacity, key, and blend remain active. This switch retains the
+v1.2 linked-dry law when no explicit **Bypass Temporal FX** route is active:
+whenever at least one visible, positive-opacity Master-bypass layer contributes,
+Feedback, Slit-Scan, Temporal Originals, Melt, Sync Latch, Display Physics,
+and Codec Mosh all receive neutral parameters for the entire program frame.
+The Temporal encoder still accepts the clean program, warming history without
+changing the authored or modulated controls; the effects resume from that warm
+history when no contributing bypass remains. With VHS enabled, the engine
+renders coherent per-layer slices, applies direct master effects and VHS only
+to inherited slices, and recomposites in stack order before the linked Temporal
+boundary. Hidden or non-positive-opacity layers neither activate linked
+Temporal bypass nor allocate selective work. Live
+selective processing is latest-only and has a 320 MiB incremental safety
 budget. If a resolution/layer combination exceeds that budget or processing
 fails, the engine holds the prior exact audience frame and reports the VHS
-error; it never falls back to applying global VHS to
-a bypassed layer. The bypass is non-destructive: neither **Reset FX** on the
-layer nor master **Revert** changes it. Expert media mode does not enlarge this
-selective-VHS budget. The VHS panel labels the active global or selective live
-path and reports admitted work and healthy busy/backpressure skips; it separates
+error; it never falls back to applying global VHS to a bypassed layer. The
+bypass is non-destructive: neither **Reset FX** on the layer nor master
+**Revert** changes it. Expert media mode does not enlarge this selective-VHS
+budget. The VHS panel labels the active global or selective live path and
+reports admitted work and healthy busy/backpressure skips; it separates
 unavailable worker failures, stale completions, and the current busy state.
+
+**Bypass Temporal FX** is a separate layer switch, authored independently and
+off by default. It gives a layer exact Temporal isolation without drying the
+layers below it, provided every enabled layer forms one contiguous prefix at
+the front of a flat LegacyExact Program stack. Layer 1 is the top/front layer:
+Layer 1 alone, or Layers 1–N together, may bypass Temporal; a gap or a bypassed
+layer below an inheriting layer is rejected. The engine sends only the lower
+inherited stack through Feedback, Slit-Scan, Temporal Originals, Melt, Sync
+Latch, Display Physics, and Codec Mosh, then recomposites the dry top layers
+bottom-to-top with their original Layer FX, key, opacity, and blend modes. A
+membership change resets Temporal-family history before the new wet/dry
+partition is rendered, so pixels from the previous partition cannot leak into
+it; authored controls are not reset.
+
+The exact route is currently admitted only for a flat LegacyExact Program
+stack. The toggle is transactionally rejected, leaving the prior state and
+audience frame intact, for interleaved dry layers, groups, A/B or non-Program
+buses, active mattes, advanced layer/master racks, advanced Motion, any authored
+Master/layer Motion modulation route (even at zero source or depth), routed
+Refresh Garden, or enabled VHS. When this explicit route is admitted, it takes
+precedence over Master-only LinkedDry: lower inherited layers stay temporally
+wet even if a contributing layer also bypasses Master FX. The two switches
+continue to govern their own named boundaries independently. Older patches
+that omit `bypass_temporal_fx` load it as `false`.
 
 Every slider's displayed value is also an editable numeric field. Select it,
 type any in-range value, and press Enter or leave the field to commit through
@@ -909,6 +938,9 @@ For selective VHS, export uses the same contributing-layer plan, conditional
 master processing, inherited-only VHS, straight-alpha stack composition, and
 post-composite Temporal order as live rendering, but evaluates it synchronously
 for each output frame. The legacy no-bypass and VHS-off paths remain unchanged.
+An admitted **Bypass Temporal FX** prefix follows the same live law offline:
+only the inherited background enters the complete Temporal family, including
+Codec Mosh, and the dry prefix is recomposited afterward in authored order.
 An armed codec mosh runs the identical real-codec engine synchronously per
 frame, after global NTSC; its repeatability is claimed per host — two renders
 on one machine decode identically — and deliberately never cross-machine.
@@ -967,8 +999,9 @@ different paths:
   loop-reroll choices, both freeze states, BPM, modulation, and input state. It
   applies master values and maps saved layer values positionally: direct
   effects/keying/pattern seed, transform, motion values, matte values, opacity,
-  blend, visibility, and Bypass Master FX. Racks require identical node
-  topology; groups require the same stable ID, membership, rack signature,
+  blend, visibility, Bypass Master FX, and Bypass Temporal FX. Racks require
+  identical node topology; groups require the same stable ID, membership,
+  rack signature,
   matte presence/route, and root identity. Apply Look copies compatible values
   while preserving live node/group/layer IDs, image routes, motion donors,
   Score loop driver, membership, ordering, solo/bypass, and bus assignment.
@@ -993,8 +1026,9 @@ include:
   spatial transforms, pattern seeds, reset/quality laws, and stable donors;
 - typed Collision Racks, image taps/mattes, the one-level group/root graph,
   Program/A/B assignments, and crossfade;
-- layer order, visibility, pause, blend/keying/master-FX bypass, and the complete
-  prepared Performance Set: stable clip slots, source identities, transport,
+- layer order, visibility, pause, blend/keying, both per-layer bypass switches,
+  and the complete prepared Performance Set: stable clip slots, source
+  identities, transport,
   cues, active slots, atomic Scenes, and the Scene-only Autopilot plan;
 - Freeze Program, Freeze Media, and complete modulation state, including LFO
   sample-and-hold seeds;

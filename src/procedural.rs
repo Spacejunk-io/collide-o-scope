@@ -4099,6 +4099,7 @@ mod tests {
                 paused: false,
                 visible: true,
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 reroll_on_loop: false,
                 effects: EffectsConfig::default(),
                 transform: SpatialTransform::default(),
@@ -5340,6 +5341,7 @@ scenes:
         };
         let mut source = anchor();
         source.layers[0].bypass_master_fx = true;
+        source.layers[0].bypass_temporal_fx = true;
         source.master_transform.fit = crate::spatial::FitMode::Fill;
         source.master_transform.edge = crate::spatial::EdgeMode::Repeat;
         source.master_transform.sampling = crate::spatial::SamplingMode::Nearest;
@@ -5354,6 +5356,10 @@ scenes:
             assert!(
                 layer.bypass_master_fx,
                 "procedural mutation must preserve the layer's routing topology"
+            );
+            assert!(
+                layer.bypass_temporal_fx,
+                "procedural mutation must preserve independent Temporal bypass authoring"
             );
             assert!(layer.opacity.is_finite() && (0.0..=1.0).contains(&layer.opacity));
             assert!(layer.speed.is_finite() && (0.25..=4.0).contains(&layer.speed));

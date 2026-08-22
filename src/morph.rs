@@ -1321,6 +1321,10 @@ pub struct LayerMorphSnapshot {
     /// captured by older builds leave the live value untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bypass_master_fx: Option<bool>,
+    /// Independent per-layer Temporal bypass. Optional so slots captured by
+    /// older builds leave the live Temporal-bypass value untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_temporal_fx: Option<bool>,
     /// Optional for schema evolution: a slot written before spatial controls
     /// existed must not claim or reset a live layer's transform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1356,6 +1360,7 @@ pub(crate) enum LayerMorphControl {
     Visible,
     Paused,
     BypassMasterFx,
+    BypassTemporalFx,
     Transform,
     Motion,
     Pattern,
@@ -1373,6 +1378,7 @@ impl Default for LayerMorphSnapshot {
             visible: None,
             paused: None,
             bypass_master_fx: None,
+            bypass_temporal_fx: None,
             transform: None,
             motion: None,
             key_threshold: None,
@@ -1397,6 +1403,7 @@ impl LayerMorphSnapshot {
             visible: Some(layer.visible),
             paused: Some(layer.paused),
             bypass_master_fx: Some(layer.bypass_master_fx),
+            bypass_temporal_fx: Some(layer.bypass_temporal_fx),
             transform: Some(layer.transform.sanitized()),
             motion: Some(MotionConfig::from_params_for_capture(
                 layer.motion,
@@ -1429,6 +1436,7 @@ impl LayerMorphSnapshot {
             visible: self.visible,
             paused: self.paused,
             bypass_master_fx: self.bypass_master_fx,
+            bypass_temporal_fx: self.bypass_temporal_fx,
             transform: self.transform.map(SpatialTransform::sanitized),
             motion: self.motion.map(MotionConfig::sanitized),
             key_threshold: if has_effects { None } else { legacy_key },
@@ -1487,6 +1495,10 @@ impl LayerMorphSnapshot {
                 (Some(a), Some(b)) => Some(pick(a, b, choose_b)),
                 _ => None,
             },
+            bypass_temporal_fx: match (a.bypass_temporal_fx, b.bypass_temporal_fx) {
+                (Some(a), Some(b)) => Some(pick(a, b, choose_b)),
+                _ => None,
+            },
             transform: match (a.transform, b.transform) {
                 (Some(a), Some(b)) => Some(SpatialTransform::interpolate(a, b, weights, choose_b)),
                 _ => None,
@@ -1527,6 +1539,9 @@ impl LayerMorphSnapshot {
         }
         if let Some(bypass_master_fx) = clean.bypass_master_fx {
             layer.bypass_master_fx = bypass_master_fx;
+        }
+        if let Some(bypass_temporal_fx) = clean.bypass_temporal_fx {
+            layer.bypass_temporal_fx = bypass_temporal_fx;
         }
         if let Some(transform) = clean.transform {
             layer.transform = transform;
@@ -2805,6 +2820,9 @@ impl Morph {
             LayerMorphControl::Paused => a.paused.is_some() && b.paused.is_some(),
             LayerMorphControl::BypassMasterFx => {
                 a.bypass_master_fx.is_some() && b.bypass_master_fx.is_some()
+            }
+            LayerMorphControl::BypassTemporalFx => {
+                a.bypass_temporal_fx.is_some() && b.bypass_temporal_fx.is_some()
             }
             LayerMorphControl::Transform => a.transform.is_some() && b.transform.is_some(),
             LayerMorphControl::Motion => a.motion.is_some() && b.motion.is_some(),
@@ -4669,6 +4687,7 @@ mod tests {
         assert!(!morph.controls_layer_field(3, LayerMorphControl::Visible));
         assert!(!morph.controls_layer_field(3, LayerMorphControl::Paused));
         assert!(!morph.controls_layer_field(3, LayerMorphControl::BypassMasterFx));
+        assert!(!morph.controls_layer_field(3, LayerMorphControl::BypassTemporalFx));
         assert!(!morph.controls_layer_field(4, LayerMorphControl::Opacity));
 
         b.layers[0].position = 4;
@@ -4736,6 +4755,7 @@ mod tests {
             visible: Some(high),
             paused: Some(high),
             bypass_master_fx: Some(high),
+            bypass_temporal_fx: Some(!high),
             transform: Some(SpatialTransform {
                 position: if high { [0.75, -0.5] } else { [-0.25, 0.5] },
                 scale: if high { [4.0, 4.0] } else { [1.0, 1.0] },
@@ -5764,6 +5784,7 @@ mod tests {
         assert_eq!(before.visible, Some(false));
         assert_eq!(before.paused, Some(false));
         assert_eq!(before.bypass_master_fx, Some(false));
+        assert_eq!(before.bypass_temporal_fx, Some(true));
 
         let midpoint = morph.sample(0.5).unwrap().layers.remove(0);
         close(midpoint.opacity, 0.5);
@@ -5773,6 +5794,7 @@ mod tests {
         assert_eq!(midpoint.visible, Some(true));
         assert_eq!(midpoint.paused, Some(true));
         assert_eq!(midpoint.bypass_master_fx, Some(true));
+        assert_eq!(midpoint.bypass_temporal_fx, Some(false));
         let effects = midpoint.effects.unwrap();
         close(effects.pixelate_size, 16.5);
         close(effects.rgb_split, 15.0);
@@ -5826,6 +5848,7 @@ key_threshold: 0.2
         assert_eq!(legacy.visible, None);
         assert_eq!(legacy.paused, None);
         assert_eq!(legacy.bypass_master_fx, None);
+        assert_eq!(legacy.bypass_temporal_fx, None);
         assert_eq!(legacy.transform, None);
         assert_eq!(legacy.key_threshold, Some(0.2));
 

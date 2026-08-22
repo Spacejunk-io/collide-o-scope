@@ -964,6 +964,18 @@ impl CompositionGpuExecutor {
         }
     }
 
+    /// Rebase only the shared Temporal-family memory when the exact renderer's
+    /// wet/dry membership changes. Advanced composition cannot execute the
+    /// mixed partition, but a retained executor may still exist from an older
+    /// accepted topology and must not later expose stale Temporal pixels.
+    pub(crate) fn reset_temporal_bypass_partition(&mut self) {
+        if let Some(prepared) = &mut self.prepared {
+            prepared
+                .host
+                .reset_temporal_for(TemporalResetCause::BypassPartition);
+        }
+    }
+
     #[allow(
         dead_code,
         reason = "native telemetry selects this adapter only while Advanced composition is active"
@@ -5177,6 +5189,7 @@ mod tests {
                     visible: true,
                     paused: false,
                     bypass_master_fx: false,
+                    bypass_temporal_fx: false,
                     pattern: None,
                 }),
         )
@@ -6298,6 +6311,7 @@ mod tests {
                 visible: true,
                 paused: false,
                 bypass_master_fx: false,
+                bypass_temporal_fx: false,
                 pattern: None,
             }],
         );

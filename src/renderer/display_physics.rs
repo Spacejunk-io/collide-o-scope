@@ -173,6 +173,14 @@ impl DisplayPhysicsGpu {
         }
     }
 
+    /// Revoke the held-field and phosphor memories when the Temporal wet/dry
+    /// membership changes. Validity gates make the retained texture bytes
+    /// unreachable, so this needs no full-frame clear or new allocation.
+    pub fn invalidate_memory(&mut self) {
+        self.field_valid = false;
+        self.phosphor_valid = false;
+    }
+
     fn ensure_surfaces(&mut self, device: &wgpu::Device, composite_views: &[wgpu::TextureView; 3]) {
         if self.surfaces.is_some() {
             return;

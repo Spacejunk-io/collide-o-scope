@@ -913,6 +913,12 @@ pub(crate) enum TemporalResetCause {
     Resize,
     BroadRevert,
     ManualClear,
+    /// The authored membership of the post-Temporal dry overlay changed.
+    /// Existing clean/carrier history may contain pixels from the newly dry
+    /// layer. The freeze hold has the same membership ambiguity, so it must be
+    /// rebuilt from the new partition instead of double-adding or losing dry
+    /// pixels when the toggle is edited while paused.
+    BypassPartition,
     LoopBoundary,
     Downbeat,
     BlackoutTransition,
@@ -958,6 +964,7 @@ impl TemporalResetDomains {
             | TemporalResetCause::Seek
             | TemporalResetCause::Resize
             | TemporalResetCause::BroadRevert => Self::HARD,
+            TemporalResetCause::BypassPartition => Self::HARD,
             TemporalResetCause::ManualClear => Self::MANUAL_MEMORY,
             TemporalResetCause::LoopBoundary
             | TemporalResetCause::Downbeat
@@ -2346,6 +2353,7 @@ mod tests {
             TemporalResetCause::Seek,
             TemporalResetCause::Resize,
             TemporalResetCause::BroadRevert,
+            TemporalResetCause::BypassPartition,
         ] {
             assert_eq!(
                 TemporalResetDomains::for_cause(cause),

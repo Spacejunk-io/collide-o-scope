@@ -5122,7 +5122,15 @@ function createLayerCard(layer, index) {
           <input type="checkbox" ${layer.bypass_master_fx ? 'checked' : ''} aria-label="Bypass Master FX for layer ${index + 1}" aria-describedby="layer-master-bypass-help-${index}">
           <span class="toggle-slider"></span>
         </label>
-        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.</span>
+        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain. By itself, any contributing Master bypass links the shared Temporal family dry for the whole program while history stays warm; an admitted explicit Temporal bypass uses its separate isolated route.</span>
+      </div>
+      <div class="param-row toggle-row layer-temporal-bypass" title="Keeps this layer dry above the shared Temporal result. Available for Layer 1 or a contiguous top prefix; move it above every wet layer first. Authored independently from Bypass Master FX.">
+        <label>Bypass Temporal FX</label>
+        <label class="toggle">
+          <input type="checkbox" ${layer.bypass_temporal_fx ? 'checked' : ''} aria-label="Bypass Temporal FX for layer ${index + 1}" aria-describedby="layer-temporal-bypass-help-${index}">
+          <span class="toggle-slider"></span>
+        </label>
+        <span id="layer-temporal-bypass-help-${index}" class="visually-hidden">Keeps this layer out of Feedback, Slit-Scan, Long Exposure, Melt, Display Physics, and Codec Mosh by restoring it above the wet result. Available for Layer 1 or a contiguous top prefix; move it above every wet layer first. Authored independently from Bypass Master FX. Unsupported VHS, Advanced arrangements, or authored Motion modulation routes are refused without changing the picture.</span>
       </div>
       <div class="layer-random-controls" role="group" aria-label="Layer ${index + 1} deterministic random pattern">
         <label>Seed <input class="layer-random-seed seed-input" type="number" min="0" max="4294967295" step="1" inputmode="numeric" value="${Number(layer.effects?.random_seed || 0) >>> 0}" aria-label="Layer ${index + 1} pattern seed" title="Zero restores the legacy pattern"></label>
@@ -5268,6 +5276,9 @@ function createLayerCard(layer, index) {
   });
   card.querySelector('.layer-master-bypass input').addEventListener('change', (event) => {
     sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param: 'bypass_master_fx', value: event.currentTarget.checked });
+  });
+  card.querySelector('.layer-temporal-bypass input').addEventListener('change', (event) => {
+    sendAction({ action: 'set_layer_param', ...currentLayerSelector(card, layer, index), param: 'bypass_temporal_fx', value: event.currentTarget.checked });
   });
   card.querySelector('.layer-reroll').addEventListener('click', () => {
     sendAction({
@@ -5444,6 +5455,10 @@ function updateLayerCard(card, layer, index) {
   const bypassMasterFx = card.querySelector('.layer-master-bypass input');
   if (bypassMasterFx && canSync(bypassMasterFx)) {
     bypassMasterFx.checked = !!layer.bypass_master_fx;
+  }
+  const bypassTemporalFx = card.querySelector('.layer-temporal-bypass input');
+  if (bypassTemporalFx && canSync(bypassTemporalFx)) {
+    bypassTemporalFx.checked = !!layer.bypass_temporal_fx;
   }
   const layerSeed = card.querySelector('.layer-random-seed');
   if (layerSeed && canSync(layerSeed)) layerSeed.value = String(Number(layer.effects?.random_seed || 0) >>> 0);

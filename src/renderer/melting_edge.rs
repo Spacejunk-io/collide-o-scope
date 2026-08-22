@@ -151,6 +151,15 @@ impl MeltingEdgeGpu {
         }
     }
 
+    /// Invalidate retained audience memory after the wet/dry Temporal
+    /// partition changes. The texture remains allocated, but the next armed
+    /// frame cannot sample pixels authored by a layer that has just moved to
+    /// the dry overlay.
+    pub fn invalidate_history(&mut self) {
+        self.history_valid = false;
+        self.last_store_ticks = self.total_ticks;
+    }
+
     fn ensure_surfaces(
         &mut self,
         device: &wgpu::Device,

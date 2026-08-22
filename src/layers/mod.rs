@@ -58,6 +58,10 @@ const fn default_bypass_master_fx() -> bool {
     false
 }
 
+const fn default_bypass_temporal_fx() -> bool {
+    false
+}
+
 fn allocate_layer_id() -> u64 {
     NEXT_LAYER_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -457,6 +461,10 @@ pub struct Layer {
     /// program Temporal machine also runs its neutral warm-history path.
     /// Direct layer effects, opacity, keying, and blend remain active.
     pub bypass_master_fx: bool,
+    /// Independently authored request for this layer to skip inherited
+    /// Temporal processing. Renderer/planner routing consumes this field
+    /// separately from `bypass_master_fx`.
+    pub bypass_temporal_fx: bool,
     /// Advance this layer's deterministic pattern seed at each authoritative
     /// video-loop boundary. Stills and live inputs ignore the flag.
     pub reroll_on_loop: bool,
@@ -615,6 +623,7 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            bypass_temporal_fx: default_bypass_temporal_fx(),
             reroll_on_loop: false,
             effects,
             rack: default_layer_rack(),
@@ -699,6 +708,7 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            bypass_temporal_fx: default_bypass_temporal_fx(),
             reroll_on_loop: false,
             effects,
             rack: default_layer_rack(),
@@ -795,6 +805,7 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            bypass_temporal_fx: default_bypass_temporal_fx(),
             reroll_on_loop: false,
             effects,
             rack: default_layer_rack(),
@@ -867,6 +878,7 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            bypass_temporal_fx: default_bypass_temporal_fx(),
             reroll_on_loop: false,
             effects,
             rack: default_layer_rack(),
@@ -943,6 +955,7 @@ impl Layer {
             paused: false,
             visible: true,
             bypass_master_fx: default_bypass_master_fx(),
+            bypass_temporal_fx: default_bypass_temporal_fx(),
             reroll_on_loop: false,
             effects,
             rack: default_layer_rack(),
@@ -1988,12 +2001,12 @@ fn extension_in(extension: &str, allowed: &[&str]) -> bool {
 mod tests {
     use super::{
         allocate_layer_id, content_identity_for_proxy_reference, create_layer_texture,
-        default_bypass_master_fx, default_layer_motion, default_layer_rack,
-        evaluate_transport_selection, is_still_image_file, is_supported_visual_extension,
-        is_supported_visual_file, is_video_file, layer_texture_upload_error, reset_layer_motion,
-        source_reference_for_persistence, spout_sender_from_source_path,
-        take_matching_codec_motion, validate_source_texture_dimensions,
-        write_layer_texture_checked, BlendMode,
+        default_bypass_master_fx, default_bypass_temporal_fx, default_layer_motion,
+        default_layer_rack, evaluate_transport_selection, is_still_image_file,
+        is_supported_visual_extension, is_supported_visual_file, is_video_file,
+        layer_texture_upload_error, reset_layer_motion, source_reference_for_persistence,
+        spout_sender_from_source_path, take_matching_codec_motion,
+        validate_source_texture_dimensions, write_layer_texture_checked, BlendMode,
     };
     use crate::transport::{
         ClipTransportConfig, ClipTransportState, EndBehavior, NormalizedTime, PlaybackDirection,
@@ -2171,6 +2184,7 @@ mod tests {
         // Video, still, and Spout constructors all call this one default,
         // preventing one source kind from unexpectedly entering bypass mode.
         assert!(!default_bypass_master_fx());
+        assert!(!default_bypass_temporal_fx());
     }
 
     #[test]
