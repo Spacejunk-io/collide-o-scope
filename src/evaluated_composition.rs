@@ -2516,12 +2516,6 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        let master_has_custom = self.input.master_rack.iter().any(|node| {
-            !matches!(
-                node.kind,
-                RuntimeVisualNodeKind::LegacyCanonical | RuntimeVisualNodeKind::LegacyTemporal
-            )
-        });
         let mut saw_global_master_step = false;
         let mut canonical_after_global = false;
         for node in self.input.master_rack.iter() {
@@ -2531,7 +2525,12 @@ impl<'a> Planner<'a> {
                 saw_global_master_step = true;
             }
         }
-        if (master_has_custom || canonical_after_global) && !contributing_bypass.is_empty() {
+        // A custom step after the canonical prefix remains composition-global,
+        // so distributing only that prefix over inheriting layers preserves
+        // both bypass membership and authored master order. The ambiguous case
+        // is specifically a canonical marker authored after any global step:
+        // that prefix cannot move ahead of the global step without reordering.
+        if canonical_after_global && !contributing_bypass.is_empty() {
             return Err(CompositionPlanError::AmbiguousMasterBypass {
                 layers: contributing_bypass,
             });
@@ -6769,14 +6768,73 @@ mod tests {
     }
 
     #[test]
-    fn custom_master_with_contributing_bypass_is_rejected_visibly() {
+    fn custom_master_after_canonical_with_contributing_bypass_remains_global() {
         let base = base(&[1, 2], &[1]);
         let composition = legacy_composition(&[1, 2]);
         let racks = legacy_racks(&[1, 2]);
         let mut master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
-        master
+        let custom = master
             .push(RuntimeVisualNodeKind::Transform(SpatialTransform::default()))
             .unwrap();
+        let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());
+        let steps = advanced.master().execution.steps();
+
+        assert!(matches!(
+            steps,
+            [
+                EvaluatedScopeStep::MaterializeSpatial {
+                    application: LegacyCanonicalApplication::PreCompositeLayerAdmission,
+                    ..
+                },
+                EvaluatedScopeStep::LegacyCanonical {
+                    application: LegacyCanonicalApplication::PreCompositeLayerAdmission,
+                    ..
+                },
+                EvaluatedScopeStep::LegacyTemporal { .. },
+                EvaluatedScopeStep::CollisionRack {
+                    segment_index: 0,
+                    ..
+                },
+            ]
+        ));
+        let EvaluatedScopeStep::CollisionRack {
+            plan: custom_plan, ..
+        } = &steps[3]
+        else {
+            unreachable!("the asserted final master step is the custom rack segment");
+        };
+        assert_eq!(custom_plan.passes().len(), 1);
+        assert_eq!(custom_plan.passes()[0].node_id, custom);
+        assert_eq!(
+            advanced.master().canonical_bypass_layers.as_ref(),
+            &[layer_id(1)]
+        );
+        assert_eq!(advanced.master().canonical_layers.as_ref(), &[layer_id(2)]);
+    }
+
+    #[test]
+    fn custom_master_before_canonical_with_contributing_bypass_is_rejected() {
+        let base = base(&[1, 2], &[1]);
+        let composition = legacy_composition(&[1, 2]);
+        let racks = legacy_racks(&[1, 2]);
+        let master = RuntimeVisualRack::try_from_parts(
+            vec![
+                RuntimeVisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    RuntimeVisualNodeKind::Transform(SpatialTransform::default()),
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_CANONICAL,
+                    RuntimeVisualNodeKind::LegacyCanonical,
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_TEMPORAL,
+                    RuntimeVisualNodeKind::LegacyTemporal,
+                ),
+            ],
+            Some(4),
+        )
+        .unwrap();
         assert!(matches!(
             plan(&base, &composition, &master, &racks),
             Err(CompositionPlanError::AmbiguousMasterBypass { layers })
@@ -6855,8 +6913,8 @@ mod tests {
     fn homogeneous_all_bypass_is_classified_without_false_global_ntsc() {
         let base = base_with_ntsc(&[1], &[1], true);
         let racks = legacy_racks(&[1]);
-        // A custom master with a *contributing* bypass is intentionally
-        // ambiguous. Use a grouped advanced topology with the exact master to
+        // A custom/global step *before* the canonical marker is ambiguous for
+        // bypass. Use a grouped advanced topology with the exact master to
         // exercise homogeneous NTSC classification independently.
         let group = RuntimeGroup {
             id: group_id(9),

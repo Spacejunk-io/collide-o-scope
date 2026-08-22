@@ -1321,6 +1321,20 @@ pub struct AppSnapshot {
     /// Whether the fullscreen output window is open
     #[serde(default)]
     pub output_window: bool,
+    /// Exact state of the legacy fullscreen Output controlled by
+    /// `set_output_window`. The older `output_window` aggregate is retained for
+    /// compatibility with clients that treated StageMap surfaces as Output.
+    #[serde(default)]
+    pub legacy_output_window: bool,
+    /// Session-local display selected for the legacy fullscreen Output. An
+    /// empty identifier means Automatic; unlike StageMap, this is deliberately
+    /// absent from artistic patch state.
+    #[serde(default)]
+    pub output_display: String,
+    /// Current host display inventory. Opaque identifiers are valid only for
+    /// this running host session and are revalidated by Main before use.
+    #[serde(default)]
+    pub output_displays: Vec<OutputDisplaySnapshot>,
     /// Non-empty when creating or maintaining an output surface failed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output_error: String,
@@ -1407,6 +1421,9 @@ impl Default for AppSnapshot {
             monitor_bay: crate::monitor_bay::MonitorBaySnapshot::default(),
             remote_url: String::new(),
             output_window: false,
+            legacy_output_window: false,
+            output_display: String::new(),
+            output_displays: Vec::new(),
             output_error: String::new(),
             morph: MorphSnapshot::default(),
             blackout: false,
@@ -3353,8 +3370,31 @@ impl MotionSnapshot {
 pub struct SpoutSnapshot {
     pub enabled: bool,
     pub active: bool,
+    /// Stable session preference: `native` or `1080p`.
+    #[serde(default)]
+    pub resolution: String,
+    /// Dimensions most recently delivered by the active sender. Zero means no
+    /// frame has yet been accepted for this worker generation.
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+}
+
+/// One physical display offered to the legacy fullscreen Output selector.
+/// The browser treats `id` as opaque and sends it back verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDisplaySnapshot {
+    pub id: String,
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
+    #[serde(default)]
+    pub editor: bool,
 }
 
 /// Browser-safe program recorder status. Counter fields are monotonic for one
@@ -4745,6 +4785,11 @@ pub enum WebAction {
     /// performer's requested state.
     #[serde(rename = "set_output_window")]
     SetOutputWindow { enabled: bool },
+    /// Select the physical display used by legacy fullscreen Output. Empty is
+    /// Automatic; all non-empty IDs come from `output_displays` and are
+    /// revalidated against the live winit inventory before any window moves.
+    #[serde(rename = "set_output_display")]
+    SetOutputDisplay { display_id: String },
     /// Legacy open/close command retained for older control panels.
     #[serde(rename = "toggle_output_window")]
     ToggleOutputWindow,
@@ -4903,6 +4948,10 @@ pub enum WebAction {
     /// Enable/disable the Spout output sender
     #[serde(rename = "set_spout")]
     SetSpout { enabled: bool },
+    /// Select sender dimensions without resizing the live renderer. Main
+    /// accepts only the closed `native` / `1080p` vocabulary.
+    #[serde(rename = "set_spout_resolution")]
+    SetSpoutResolution { resolution: String },
     /// Begin a real-time program recording. Main owns the native destination
     /// picker; browser payloads can never nominate a host filesystem path.
     #[serde(rename = "start_program_recording")]
@@ -5208,6 +5257,7 @@ impl WebAction {
             )),
             Self::SetBlackout { .. } => Some("master:blackout".into()),
             Self::SetOutputWindow { .. } => Some("output:enabled".into()),
+            Self::SetOutputDisplay { .. } => Some("output:display".into()),
             Self::SetNtscParam { param, .. } => Some(format!("ntsc:{param}")),
             Self::SetBpm { .. } => Some("mod:bpm".into()),
             Self::SetLfo { index, param, .. } => Some(format!("lfo:{index}:{param}")),
@@ -5244,6 +5294,7 @@ impl WebAction {
                 }
             }),
             Self::SetSpout { .. } => Some("spout:enabled".into()),
+            Self::SetSpoutResolution { .. } => Some("spout:resolution".into()),
             Self::SetStageHealthHud { .. } => Some("stage:health-hud".into()),
             Self::SetMonitorBay { .. } => Some("stage:monitor-bay".into()),
             Self::SetMonitorProbe { .. } => Some("stage:monitor-probe".into()),
@@ -5284,8 +5335,10 @@ impl WebAction {
                 | Self::ClearTemporalMemory
                 | Self::ClearMotionMemory
                 | Self::SetOutputWindow { .. }
+                | Self::SetOutputDisplay { .. }
                 | Self::ToggleOutputWindow
                 | Self::SetSpout { .. }
+                | Self::SetSpoutResolution { .. }
                 | Self::StartProgramRecording { .. }
                 | Self::FinishProgramRecording
                 | Self::CancelProgramRecording
@@ -5331,6 +5384,7 @@ impl WebAction {
             | Self::ToggleBlackout
             | Self::SetBlackout { .. }
             | Self::SetOutputWindow { .. }
+            | Self::SetOutputDisplay { .. }
             | Self::ToggleOutputWindow
             | Self::SetMasterPaused { .. }
             | Self::SetProgramFrozen { .. }
@@ -6431,6 +6485,26 @@ mod protocol_tests {
         assert!(matches!(legacy, WebAction::ToggleOutputWindow));
         assert!(legacy.is_priority());
         assert!(legacy.coalesce_key().is_none());
+
+        let display: WebAction = serde_json::from_str(
+            r#"{"action":"set_output_display","display_id":"display-0123456789abcdef-2"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &display,
+            WebAction::SetOutputDisplay { display_id }
+                if display_id == "display-0123456789abcdef-2"
+        ));
+        assert_eq!(display.coalesce_key().as_deref(), Some("output:display"));
+        assert!(display.is_priority());
+        assert!(display.is_performance_only_for_history());
+
+        let automatic: WebAction =
+            serde_json::from_str(r#"{"action":"set_output_display","display_id":""}"#).unwrap();
+        assert!(matches!(
+            automatic,
+            WebAction::SetOutputDisplay { display_id } if display_id.is_empty()
+        ));
     }
 
     #[test]
@@ -8247,8 +8321,10 @@ mod protocol_tests {
         assert!(js.contains("className = 'library-actions'"));
         assert!(js.contains("window.confirm"));
         assert!(html.contains("id=\"output-status\" role=\"status\" aria-live=\"polite\""));
-        assert!(js.contains("syncOutputWindow(msg.output_window, msg.output_error)"));
+        assert!(js.contains("syncOutputWindow(msg.legacy_output_window ?? msg.output_window, msg.output_error, msg.output_display, msg.output_displays)"));
         assert!(js.contains("sendAction({ action: 'set_output_window', enabled })"));
+        assert!(js.contains("sendAction({ action: 'set_output_display', display_id: displayId })"));
+        assert!(html.contains("id=\"output-display\""));
         assert!(js.contains("outputPendingOpen"));
         assert!(!js.contains("sendAction({ action: 'toggle_output_window' })"));
     }
@@ -9174,6 +9250,16 @@ mod protocol_tests {
                 .unwrap();
         assert!(matches!(action, WebAction::AddSpoutLayer { sender }
             if sender == "Resolume Composition"));
+
+        let action: WebAction =
+            serde_json::from_str(r#"{"action":"set_spout_resolution","resolution":"1080p"}"#)
+                .unwrap();
+        assert!(matches!(
+            &action,
+            WebAction::SetSpoutResolution { resolution } if resolution == "1080p"
+        ));
+        assert_eq!(action.coalesce_key().as_deref(), Some("spout:resolution"));
+        assert!(action.is_performance_only_for_history());
 
         let value = serde_json::to_value(WebAction::GyroCalibrate).unwrap();
         assert_eq!(value["action"], "gyro_calibrate");

@@ -70,6 +70,10 @@ pub enum PatternShape {
     Interference,
     /// The oscillator driven by polygonal radius.
     Polygon,
+    /// The exact Mandelbrot escape-time law `z <- z^2 + c`, on a fixed
+    /// aspect-correct complex-plane page. This additive, non-BENDR shape is
+    /// deliberately last so every established shader code remains frozen.
+    Mandelbrot,
 }
 
 impl PatternShape {
@@ -88,10 +92,11 @@ impl PatternShape {
             Self::Cells => 9,
             Self::Interference => 10,
             Self::Polygon => 11,
+            Self::Mandelbrot => 12,
         }
     }
 
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Scan,
         Self::Radial,
         Self::Spiral,
@@ -104,6 +109,7 @@ impl PatternShape {
         Self::Cells,
         Self::Interference,
         Self::Polygon,
+        Self::Mandelbrot,
     ];
 }
 
@@ -447,6 +453,56 @@ pub fn pattern_waveform(wave: PatternWave, pulse_width: f32, x: f32) -> f32 {
     }
 }
 
+/// The fixed escape-time horizon for the additive Mandelbrot pattern.
+///
+/// A finite renderer can prove escape, but a point that survives this many
+/// iterations is only "bounded through the limit", never claimed as proven
+/// set membership. The WGSL carries the same literal.
+pub const MANDELBROT_MAX_ITERATIONS: u32 = 256;
+
+/// Map the pattern page onto a fixed, aspect-correct complex plane. The page
+/// centre is `-0.5 + 0i`, its imaginary half-span is one, and its real
+/// half-span is `aspect`, so one source pixel has the same complex-plane scale
+/// on both axes. `uv` follows the tree's top-left-origin convention.
+fn mandelbrot_coordinate(uv: [f32; 2], aspect: f32) -> [f32; 2] {
+    [-0.5 + (uv[0] * 2.0 - 1.0) * aspect, 1.0 - uv[1] * 2.0]
+}
+
+/// Return the first one-based iteration whose orbit exceeds the canonical
+/// radius-two bailout, or `None` when the orbit remains bounded through the
+/// fixed horizon. This is the literal Mandelbrot law:
+///
+/// `z_0 = 0`, `z_(n+1) = z_n^2 + c`, escape when `|z_n|^2 > 4`.
+///
+/// The strict comparison matters: `c = -2` lives on the boundary and must not
+/// be rejected merely because its orbit reaches magnitude exactly two.
+pub fn mandelbrot_escape_count(c: [f32; 2]) -> Option<u32> {
+    let mut z = [0.0f32, 0.0f32];
+    for iteration in 1..=MANDELBROT_MAX_ITERATIONS {
+        let re_squared = z[0] * z[0];
+        let im_squared = z[1] * z[1];
+        let next = [re_squared - im_squared + c[0], 2.0 * z[0] * z[1] + c[1]];
+        z = next;
+        if z[0] * z[0] + z[1] * z[1] > 4.0 {
+            return Some(iteration);
+        }
+    }
+    None
+}
+
+/// Convert the exact integer escape time into the pattern synth's scalar
+/// colour input. Faster escape is brighter; the last admitted escape remains
+/// nonzero so it cannot be confused with a bounded-through-limit point.
+fn mandelbrot_escape_signal(uv: [f32; 2], aspect: f32) -> (f32, bool) {
+    match mandelbrot_escape_count(mandelbrot_coordinate(uv, aspect)) {
+        Some(iteration) => (
+            (MANDELBROT_MAX_ITERATIONS + 1 - iteration) as f32 / MANDELBROT_MAX_ITERATIONS as f32,
+            false,
+        ),
+        None => (0.0, true),
+    }
+}
+
 /// The whole signal path for one pixel: framing, shape, oscillator,
 /// wavefolder, comparator, colouriser. `uv` is the tree's top-left-origin
 /// texture coordinate; the reference flips it into BENDR's bottom-up frame so
@@ -501,6 +557,7 @@ pub fn pattern_synth_pixel(
     let ang = p[1].atan2(p[0]) / PATTERN_TAU + 0.5;
     let wv = |x: f32| pattern_waveform(q.wave, q.pulse_width, x);
     // The shape stage.
+    let mut mandelbrot_interior = false;
     let mut f = match q.shape {
         PatternShape::Scan => {
             let b = wv(p[1] * fy + t * 0.7);
@@ -561,6 +618,15 @@ pub fn pattern_synth_pixel(
             let rp = r * (aa.rem_euclid(seg) - seg * 0.5).cos() / (seg * 0.5).cos().max(0.01);
             wv(rp * fx * 0.5 + ph + t)
         }
+        PatternShape::Mandelbrot => {
+            // This branch deliberately reads the raw page coordinate rather
+            // than BENDR's framing domain above. Every pixel therefore names
+            // one canonical `c`; the ordinary signal and colour stages may
+            // dress the escaped scalar later but never change the orbit.
+            let (signal, interior) = mandelbrot_escape_signal(uv, aspect);
+            mandelbrot_interior = interior;
+            signal
+        }
     };
     // Wavefolder: keeps folding the signal back on itself, which is where the
     // hard banded video-synth structure comes from.
@@ -580,23 +646,31 @@ pub fn pattern_synth_pixel(
     let f = f.clamp(0.0, 1.0);
     // The colouriser.
     let sp = q.hue_spread;
-    let c = match q.color_mode {
-        PatternColorMode::Mono => [f, f, f],
-        PatternColorMode::RgbPhase => [
-            wv(f + q.hue),
-            wv(f + q.hue + sp * 0.33),
-            wv(f + q.hue + sp * 0.66),
-        ],
-        PatternColorMode::HsvSweep => pattern_hsv(q.hue + f * sp, q.saturation, mix(1.0, f, 0.25)),
-        PatternColorMode::Duotone => {
-            let a = pattern_hsv(q.hue, q.saturation, 1.0);
-            let b = pattern_hsv(glsl_fract(q.hue + sp * 0.5), q.saturation, 1.0);
-            [mix(a[0], b[0], f), mix(a[1], b[1], f), mix(a[2], b[2], f)]
-        }
-        PatternColorMode::Bands => {
-            let nb = q.color_bands.floor().max(2.0);
-            let qf = (f * nb).floor() / nb;
-            pattern_hsv(q.hue + qf * sp, q.saturation, 1.0)
+    let c = if mandelbrot_interior {
+        // Preserve the visible set under every pattern colouriser. Effects
+        // downstream may still transform it, as they do for any source.
+        [0.0; 3]
+    } else {
+        match q.color_mode {
+            PatternColorMode::Mono => [f, f, f],
+            PatternColorMode::RgbPhase => [
+                wv(f + q.hue),
+                wv(f + q.hue + sp * 0.33),
+                wv(f + q.hue + sp * 0.66),
+            ],
+            PatternColorMode::HsvSweep => {
+                pattern_hsv(q.hue + f * sp, q.saturation, mix(1.0, f, 0.25))
+            }
+            PatternColorMode::Duotone => {
+                let a = pattern_hsv(q.hue, q.saturation, 1.0);
+                let b = pattern_hsv(glsl_fract(q.hue + sp * 0.5), q.saturation, 1.0);
+                [mix(a[0], b[0], f), mix(a[1], b[1], f), mix(a[2], b[2], f)]
+            }
+            PatternColorMode::Bands => {
+                let nb = q.color_bands.floor().max(2.0);
+                let qf = (f * nb).floor() / nb;
+                pattern_hsv(q.hue + qf * sp, q.saturation, 1.0)
+            }
         }
     };
     [
@@ -685,6 +759,7 @@ impl PatternShape {
             Self::Cells => "cells",
             Self::Interference => "interference",
             Self::Polygon => "polygon",
+            Self::Mandelbrot => "mandelbrot",
         }
     }
 
@@ -855,13 +930,86 @@ mod tests {
     }
 
     #[test]
-    fn shape_wave_color_codes_are_the_frozen_bendr_table() {
+    fn shape_wave_color_codes_keep_the_frozen_bendr_prefix_and_append_mandelbrot() {
         let shape_codes: Vec<u32> = PatternShape::ALL.iter().map(|s| s.gpu_code()).collect();
-        assert_eq!(shape_codes, (0..12).collect::<Vec<u32>>());
+        assert_eq!(shape_codes, (0..13).collect::<Vec<u32>>());
+        assert_eq!(PatternShape::Mandelbrot.gpu_code(), 12);
+        assert_eq!(
+            PatternShape::from_key("mandelbrot"),
+            Some(PatternShape::Mandelbrot)
+        );
         let wave_codes: Vec<u32> = PatternWave::ALL.iter().map(|w| w.gpu_code()).collect();
         assert_eq!(wave_codes, (0..6).collect::<Vec<u32>>());
         let color_codes: Vec<u32> = PatternColorMode::ALL.iter().map(|c| c.gpu_code()).collect();
         assert_eq!(color_codes, (0..5).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn mandelbrot_escape_counts_pin_the_exact_z_squared_plus_c_law() {
+        // Interior and boundary landmarks survive the complete finite horizon.
+        assert_eq!(mandelbrot_escape_count([0.0, 0.0]), None);
+        assert_eq!(mandelbrot_escape_count([-1.0, 0.0]), None);
+        assert_eq!(mandelbrot_escape_count([-2.0, 0.0]), None);
+
+        // Strict `> 4`, checked after each recurrence: c=1 reaches z=2 on
+        // iteration two but escapes only at z=5 on iteration three. c=2
+        // similarly reaches the radius-two boundary first and escapes next.
+        assert_eq!(mandelbrot_escape_count([1.0, 0.0]), Some(3));
+        assert_eq!(mandelbrot_escape_count([2.0, 0.0]), Some(2));
+    }
+
+    #[test]
+    fn mandelbrot_fixed_page_is_aspect_correct_and_conjugate_symmetric() {
+        let centre = mandelbrot_coordinate([0.5, 0.5], ASPECT);
+        assert_eq!(centre, [-0.5, 0.0]);
+
+        // One source pixel must traverse the same complex-plane distance on
+        // either axis; otherwise a round bulb would be stretched at 16:9.
+        let right = mandelbrot_coordinate([0.5 + 1.0 / PATTERN_SYNTH_WIDTH as f32, 0.5], ASPECT);
+        let up = mandelbrot_coordinate([0.5, 0.5 - 1.0 / PATTERN_SYNTH_HEIGHT as f32], ASPECT);
+        assert!(((right[0] - centre[0]) - (up[1] - centre[1])).abs() < 1.0e-7);
+
+        let upper = mandelbrot_coordinate([0.73, 0.31], ASPECT);
+        let lower = mandelbrot_coordinate([0.73, 0.69], ASPECT);
+        assert!((upper[0] - lower[0]).abs() < 1.0e-7);
+        assert!((upper[1] + lower[1]).abs() < 1.0e-7);
+        assert_eq!(
+            mandelbrot_escape_count(upper),
+            mandelbrot_escape_count(lower)
+        );
+    }
+
+    #[test]
+    fn mandelbrot_interior_stays_black_under_every_pattern_colouriser() {
+        for color_mode in PatternColorMode::ALL {
+            let params = PatternSynthParams {
+                shape: PatternShape::Mandelbrot,
+                color_mode,
+                wavefold: 1.0,
+                comparator: 1.0,
+                comp_threshold: 0.0,
+                brightness: 1.5,
+                ..PatternSynthParams::default()
+            };
+            assert_eq!(
+                pattern_synth_pixel(&params, [0.5, 0.5], ASPECT, 123.0),
+                [0.0; 3],
+                "{color_mode:?} must not colour a bounded-through-limit point"
+            );
+        }
+
+        let exterior = PatternSynthParams {
+            shape: PatternShape::Mandelbrot,
+            color_mode: PatternColorMode::Mono,
+            ..PatternSynthParams::default()
+        };
+        let pixel = pattern_synth_pixel(&exterior, [1.0, 0.5], ASPECT, 0.0);
+        assert!(
+            pixel[0] > 0.0,
+            "an escaped point must carry its escape time"
+        );
+        assert_eq!(pixel[0], pixel[1]);
+        assert_eq!(pixel[1], pixel[2]);
     }
 
     #[test]

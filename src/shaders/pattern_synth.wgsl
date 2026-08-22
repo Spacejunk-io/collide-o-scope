@@ -95,6 +95,44 @@ fn pattern_waveform(x_in: f32) -> f32 {
     return pattern_hash21(vec2f(floor(x * 48.0), 7.31));
 }
 
+// The additive Mandelbrot pattern is the literal escape-time law, separate
+// from the twelve BENDR shape equations above. A finite pass proves escape;
+// a point surviving the horizon is only bounded through this limit.
+const MANDELBROT_MAX_ITERATIONS: u32 = 256u;
+
+// Returns (escape-time signal, bounded-through-limit flag). The fixed page is
+// centred on -0.5 + 0i with imaginary half-span one and real half-span equal
+// to the page aspect, so one source pixel has equal complex scale on both axes.
+fn mandelbrot_escape_signal(uv: vec2f, aspect: f32) -> vec2f {
+    let c = vec2f(
+        -0.5 + (uv.x * 2.0 - 1.0) * aspect,
+        1.0 - uv.y * 2.0,
+    );
+    var z = vec2f(0.0);
+    var iteration = 0u;
+    loop {
+        if iteration >= MANDELBROT_MAX_ITERATIONS {
+            break;
+        }
+        let re_squared = z.x * z.x;
+        let im_squared = z.y * z.y;
+        let next = vec2f(
+            re_squared - im_squared + c.x,
+            2.0 * z.x * z.y + c.y,
+        );
+        z = next;
+        iteration = iteration + 1u;
+        // Strictly greater than the canonical squared bailout. Magnitude
+        // exactly two is not itself an escape (notably at c = -2).
+        if z.x * z.x + z.y * z.y > 4.0 {
+            let signal = f32(MANDELBROT_MAX_ITERATIONS + 1u - iteration)
+                / f32(MANDELBROT_MAX_ITERATIONS);
+            return vec2f(signal, 0.0);
+        }
+    }
+    return vec2f(0.0, 1.0);
+}
+
 @fragment
 fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
     let t = uni.color_b.z * uni.freq_phase.w;
@@ -127,6 +165,7 @@ fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
     let r = length(p);
     let ang = atan2(p.y, p.x) / PATTERN_TAU + 0.5;
     let shape = uni.modes.x;
+    var mandelbrot_interior = false;
     var f = 0.0;
     if shape == 0u {
         // SCAN — two ramps cross-modulating.
@@ -190,6 +229,13 @@ fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
         let d1 = length(p - vec2f(0.28, 0.0));
         let d2 = length(p + vec2f(0.28, 0.0));
         f = 0.5 * (pattern_waveform(d1 * fx + t) + pattern_waveform(d2 * fy - t));
+    } else if shape == 12u {
+        // MANDELBROT — raw page coordinates name c; the BENDR framing domain
+        // cannot alter the orbit. Later signal/colour stages may dress the
+        // exact integer escape time, while bounded points remain black.
+        let sample = mandelbrot_escape_signal(in.uv, uni.color_b.w);
+        f = sample.x;
+        mandelbrot_interior = sample.y > 0.5;
     } else {
         // POLYGON
         let aa = atan2(p.y, p.x);
@@ -219,7 +265,9 @@ fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
     let sat = uni.color_a.w;
     let mode = uni.modes.z;
     var c = vec3f(f);
-    if mode == 1u {
+    if mandelbrot_interior {
+        c = vec3f(0.0);
+    } else if mode == 1u {
         // RGB PHASE — three channels of the same oscillator, offset.
         c = vec3f(
             pattern_waveform(f + hue),

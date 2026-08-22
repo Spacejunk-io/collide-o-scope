@@ -3335,6 +3335,7 @@ pub enum PatternShapeConfig {
     Cells,
     Interference,
     Polygon,
+    Mandelbrot,
 }
 
 impl PatternShapeConfig {
@@ -3353,6 +3354,7 @@ impl PatternShapeConfig {
             Self::Cells => S::Cells,
             Self::Interference => S::Interference,
             Self::Polygon => S::Polygon,
+            Self::Mandelbrot => S::Mandelbrot,
         }
     }
 
@@ -3371,6 +3373,7 @@ impl PatternShapeConfig {
             S::Cells => Self::Cells,
             S::Interference => Self::Interference,
             S::Polygon => Self::Polygon,
+            S::Mandelbrot => Self::Mandelbrot,
         }
     }
 }
@@ -11049,6 +11052,24 @@ routings:
         let restored: PatternSynthConfig = serde_yaml::from_str(&pattern_yaml).unwrap();
         assert_eq!(restored, config);
         assert_eq!(restored.to_params(), authored.sanitized());
+
+        // The exact Mandelbrot renderer is an append-only shape token. It
+        // needs no new patch section or source sentinel, so old pattern
+        // configs retain their complete serialized ABI.
+        let mandelbrot = PatternSynthConfig {
+            shape: PatternShapeConfig::Mandelbrot,
+            color_mode: PatternColorModeConfig::Mono,
+            ..PatternSynthConfig::default()
+        };
+        let mandelbrot_yaml = serde_yaml::to_string(&mandelbrot).unwrap();
+        assert!(mandelbrot_yaml.contains("shape: mandelbrot"));
+        assert_eq!(
+            serde_yaml::from_str::<PatternSynthConfig>(&mandelbrot_yaml)
+                .unwrap()
+                .to_params()
+                .shape,
+            crate::pattern_synth::PatternShape::Mandelbrot
+        );
 
         // Hostile scalars sanitize to neutral values; unknown tokens and
         // unknown fields are deserialization rejections.

@@ -1840,6 +1840,16 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
         | WebAction::RemoveScene { .. }
         | WebAction::TriggerScene { .. } => true,
         WebAction::AddSpoutLayer { sender } => valid_identifier(sender, 255),
+        WebAction::SetOutputDisplay { display_id } => {
+            display_id.is_empty()
+                || (display_id.len() <= 64
+                    && display_id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+        }
+        WebAction::SetSpoutResolution { resolution } => {
+            crate::spout_out::SpoutResolutionMode::from_key(resolution).is_some()
+        }
         WebAction::SetLayerParam {
             layer_id,
             param,
@@ -5404,5 +5414,35 @@ WORLD"
         assert!(valid_action(&decoded, 0));
         assert!(serde_json::from_str::<WebAction>(r#"{"action":"add_pattern_layer"}"#).is_ok());
         assert!(serde_json::from_str::<WebAction>(r#"{"action":"add_text_layer"}"#).is_ok());
+    }
+
+    #[test]
+    fn fullscreen_display_ids_are_bounded_opaque_session_tokens() {
+        let parse = |display_id: &str| WebAction::SetOutputDisplay {
+            display_id: display_id.to_string(),
+        };
+        assert!(valid_action(&parse(""), 0), "empty selects Automatic");
+        assert!(valid_action(&parse("display-0123456789abcdef-2"), 0));
+        let overlong = "x".repeat(65);
+        for invalid in ["display one", "display/one", "display_0123", &overlong] {
+            assert!(!valid_action(&parse(invalid), 0), "accepted {invalid:?}");
+        }
+
+        for resolution in ["native", "1080p"] {
+            assert!(valid_action(
+                &WebAction::SetSpoutResolution {
+                    resolution: resolution.to_string(),
+                },
+                0
+            ));
+        }
+        for resolution in ["1920x1080", "4k", "Native", ""] {
+            assert!(!valid_action(
+                &WebAction::SetSpoutResolution {
+                    resolution: resolution.to_string(),
+                },
+                0
+            ));
+        }
     }
 }

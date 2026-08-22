@@ -14,7 +14,10 @@
   --value-width: 48px;
   --row-height: 26px;
   --col-left: 240px;
-  --col-center: 340px;
+  /* The layers column matches the three flexible effects columns: the width
+     left after the library column and the narrow I/O column (240px each),
+     the effects-area gaps and padding (~56px total), splits four ways. */
+  --col-center: clamp(340px, calc((100vw - 536px) / 4), 640px);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -209,7 +212,9 @@ body {
 .col-center {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  /* The whole column scrolls as one surface. A long Collision Rack or
+     root order must never squeeze the layer cards below it out of reach. */
+  overflow-y: auto;
 }
 
 .scenes-panel {
@@ -325,10 +330,9 @@ body {
   .scene-actions { grid-column: 1 / -1; grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
-/* Layers section */
+/* Layers section — the column itself scrolls, so no nested scroll here. */
 .layers-section {
-  flex: 1;
-  overflow-y: auto;
+  flex: 1 0 auto;
   margin: 8px;
   padding: 4px;
 }
@@ -836,6 +840,14 @@ body {
 .fx-col {
   flex: 1 1 250px;
   min-width: 250px;
+}
+
+/* The I/O column carries status text and toggles rather than dense slider
+   banks; hold it at the library column's width so remaining width splits
+   equally across the layers, video, mod/morph, and sources columns. */
+.fx-col[data-fx-column="io"] {
+  flex: 0 1 240px;
+  min-width: 240px;
 }
 
 /* === FX GROUPS (collapsible) === */

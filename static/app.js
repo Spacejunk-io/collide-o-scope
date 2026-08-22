@@ -202,6 +202,7 @@ let mediaAuthoritativeFrozen = false;
 let mediaPendingFrozen = null;
 let mediaRequestSequence = 0;
 let outputAuthoritativeOpen = false;
+let outputAuthoritativeDisplay = '';
 let outputPendingOpen = null;
 let outputRequestSequence = 0;
 
@@ -313,7 +314,7 @@ function connect() {
         syncSpout(msg.spout);
         syncRemote(msg.remote_url);
         syncMorph(msg.morph);
-        syncOutputWindow(msg.output_window, msg.output_error);
+        syncOutputWindow(msg.legacy_output_window ?? msg.output_window, msg.output_error, msg.output_display, msg.output_displays);
         syncRecorder(msg.recorder);
         syncStageHealth(msg.stage_health);
         syncMonitorBay(msg.monitor_bay);
@@ -4142,6 +4143,7 @@ const LAYER_PATTERN_SELECT_OPTIONS = {
     ['scan', 'Scan'], ['radial', 'Radial'], ['spiral', 'Spiral'], ['plasma', 'Plasma'],
     ['lissajous', 'Lissajous'], ['rings', 'Rings'], ['starburst', 'Starburst'], ['grid', 'Grid'],
     ['tunnel', 'Tunnel'], ['cells', 'Cells'], ['interference', 'Interference'], ['polygon', 'Polygon'],
+    ['mandelbrot', 'Mandelbrot (exact z² + c)'],
   ],
   wave: [
     ['sine', 'Sine'], ['triangle', 'Triangle'], ['saw', 'Saw'],
@@ -7335,15 +7337,24 @@ function syncGyroConfig(config) {
 // --- Spout output ---
 
 const spoutEnabled = document.getElementById('spout-enabled');
+const spoutResolution = document.getElementById('spout-resolution');
 const spoutStatus = document.getElementById('spout-status');
 
 spoutEnabled.addEventListener('change', () => {
   sendAction({ action: 'set_spout', enabled: spoutEnabled.checked });
 });
 
+spoutResolution?.addEventListener('change', () => {
+  const resolution = spoutResolution.value === 'native' ? 'native' : '1080p';
+  sendAction({ action: 'set_spout_resolution', resolution });
+});
+
 function syncSpout(s) {
   if (!s) return;
   if (canSync(spoutEnabled)) spoutEnabled.checked = s.enabled;
+  if (spoutResolution && canSync(spoutResolution)) {
+    spoutResolution.value = s.resolution === 'native' ? 'native' : '1080p';
+  }
   const ind = document.getElementById('spout-indicator');
   if (s.active) {
     ind.textContent = '◉ sending';
@@ -7358,7 +7369,10 @@ function syncSpout(s) {
     spoutStatus.textContent = s.error;
     spoutStatus.className = 'audio-status error';
   } else if (s.active) {
-    spoutStatus.textContent = 'sender: collide-o-scope';
+    const dimensions = Number(s.width) > 0 && Number(s.height) > 0
+      ? ` · ${s.width}×${s.height}`
+      : '';
+    spoutStatus.textContent = `sender: collide-o-scope${dimensions}`;
     spoutStatus.className = 'audio-status';
   } else {
     spoutStatus.textContent = '';
@@ -7430,6 +7444,16 @@ function syncMorph(m) {
 // --- Fullscreen output window ---
 
 const outputWindow = document.getElementById('output-window');
+const outputDisplay = document.getElementById('output-display');
+
+outputDisplay?.addEventListener('change', () => {
+  const displayId = outputDisplay.value;
+  if (!sendAction({ action: 'set_output_display', display_id: displayId })) {
+    outputDisplay.value = outputAuthoritativeDisplay;
+    renderOutputWindow(outputAuthoritativeOpen, false, 'Control connection is offline.');
+  }
+});
+
 outputWindow.addEventListener('change', () => {
   if (outputPendingOpen !== null) return;
   const enabled = outputWindow.checked;
@@ -7452,6 +7476,7 @@ outputWindow.addEventListener('change', () => {
 function renderOutputWindow(open, pending, error = '') {
   if (canSync(outputWindow) || pending) outputWindow.checked = !!open;
   outputWindow.disabled = !!pending;
+  if (outputDisplay) outputDisplay.disabled = !!pending;
   outputWindow.setAttribute('aria-busy', String(!!pending));
   document.getElementById('output-window-hint').textContent = pending
     ? (open ? 'opening…' : 'closing…')
@@ -7459,8 +7484,31 @@ function renderOutputWindow(open, pending, error = '') {
   document.getElementById('output-status').textContent = error || '';
 }
 
-function syncOutputWindow(open, error = '') {
+function syncOutputDisplays(selected, displays) {
+  if (!outputDisplay) return;
+  const inventory = Array.isArray(displays) ? displays : [];
+  const wanted = typeof selected === 'string' ? selected : '';
+  const optionKey = JSON.stringify([wanted, inventory.map((display) => [display.id, display.label])]);
+  if (outputDisplay.dataset.optionKey !== optionKey) {
+    const options = [new Option('Automatic', '')];
+    for (const display of inventory) {
+      if (typeof display?.id !== 'string' || typeof display?.label !== 'string') continue;
+      options.push(new Option(display.label, display.id));
+    }
+    if (wanted && !inventory.some((display) => display?.id === wanted)) {
+      options.push(new Option('Selected display unavailable', wanted));
+    }
+    outputDisplay.replaceChildren(...options);
+    outputDisplay.value = wanted;
+    outputDisplay.dataset.optionKey = optionKey;
+  }
+  if (canSync(outputDisplay)) outputDisplay.value = wanted;
+}
+
+function syncOutputWindow(open, error = '', selectedDisplay = '', displays = []) {
   outputAuthoritativeOpen = !!open;
+  outputAuthoritativeDisplay = typeof selectedDisplay === 'string' ? selectedDisplay : '';
+  syncOutputDisplays(outputAuthoritativeDisplay, displays);
   if (outputPendingOpen === outputAuthoritativeOpen || error) {
     outputRequestSequence += 1;
     outputPendingOpen = null;

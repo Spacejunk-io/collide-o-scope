@@ -128,6 +128,14 @@ enum OutputWindowCommand {
     Toggle,
 }
 
+/// A live winit handle paired with the browser-safe description of the same
+/// physical display. The identifier is intentionally session-local: Main
+/// resolves it against a freshly enumerated inventory before moving Output.
+struct OutputDisplayEntry {
+    snapshot: web::state::OutputDisplaySnapshot,
+    monitor: MonitorHandle,
+}
+
 /// One venue-authored monitor endpoint. It is deliberately independent from
 /// the legacy audience Output target: closing or losing this surface cannot
 /// alter the creative image, preview, Spout, recorder, or another endpoint.
@@ -206,6 +214,91 @@ fn stage_monitor_inventory_signature(monitors: &[MonitorHandle]) -> Vec<String> 
         .collect::<Vec<_>>();
     signature.sort_unstable();
     signature
+}
+
+fn output_display_hash(bytes: &[u8]) -> u64 {
+    // Stable FNV-1a keeps browser IDs deterministic without exposing a monitor
+    // name (which may contain control characters or device-specific details).
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn output_display_id(signature: &str, ordinal: usize) -> String {
+    format!(
+        "display-{:016x}-{}",
+        output_display_hash(signature.as_bytes()),
+        ordinal + 1
+    )
+}
+
+fn output_display_entries(
+    mut monitors: Vec<MonitorHandle>,
+    main_monitor: Option<&MonitorHandle>,
+) -> Vec<OutputDisplayEntry> {
+    monitors.sort_by(|left, right| {
+        let left_position = left.position();
+        let right_position = right.position();
+        let left_size = left.size();
+        let right_size = right.size();
+        (
+            left_position.x,
+            left_position.y,
+            left_size.width,
+            left_size.height,
+            left.name().unwrap_or_default(),
+        )
+            .cmp(&(
+                right_position.x,
+                right_position.y,
+                right_size.width,
+                right_size.height,
+                right.name().unwrap_or_default(),
+            ))
+    });
+
+    monitors
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, monitor)| {
+            let position = monitor.position();
+            let size = monitor.size();
+            let name = monitor
+                .name()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "Unnamed display".to_string());
+            let editor = main_monitor.is_some_and(|main| &monitor == main);
+            let signature = format!(
+                "{}@{},{}:{}x{}",
+                name, position.x, position.y, size.width, size.height
+            );
+            let editor_suffix = if editor { " (editor)" } else { "" };
+            OutputDisplayEntry {
+                snapshot: web::state::OutputDisplaySnapshot {
+                    id: output_display_id(&signature, ordinal),
+                    label: format!(
+                        "Display {} — {} — {}×{} @ {},{}{}",
+                        ordinal + 1,
+                        name,
+                        size.width,
+                        size.height,
+                        position.x,
+                        position.y,
+                        editor_suffix
+                    ),
+                    width: size.width,
+                    height: size.height,
+                    x: position.x,
+                    y: position.y,
+                    editor,
+                },
+                monitor,
+            }
+        })
+        .collect()
 }
 
 fn acquire_stage_monitor_surfaces(
@@ -2753,13 +2846,17 @@ const fn creative_commit_impact(
 struct StagedLayerLook {
     layer_id: image_routing::StableLayerId,
     opacity: f32,
+    speed: f32,
+    fps: f32,
     blend_mode: layers::BlendMode,
+    paused: bool,
     visible: bool,
     bypass_master_fx: bool,
     effects: effects::EffectUniforms,
     transform: spatial::SpatialTransform,
     matte: image_routing::LayerMatte,
     motion: motion::MotionParams,
+    pattern: Option<pattern_synth::PatternSynthParams>,
 }
 
 #[derive(Clone)]
@@ -2782,27 +2879,82 @@ impl StagedLayerLook {
         Self {
             layer_id: layer.stable_layer_id(),
             opacity: layer.opacity,
+            speed: layer.speed,
+            fps: layer.fps,
             blend_mode: layer.blend_mode,
+            paused: layer.paused,
             visible: layer.visible,
             bypass_master_fx: layer.bypass_master_fx,
             effects: layer.effects,
             transform: layer.transform,
             matte: layer.matte,
             motion: layer.motion,
+            pattern: layer.pattern_params().copied(),
         }
     }
 
     fn install(self, layer: &mut Layer) {
         debug_assert_eq!(self.layer_id, layer.stable_layer_id());
         layer.opacity = self.opacity;
+        layer.speed = self.speed;
+        layer.fps = self.fps;
         layer.blend_mode = self.blend_mode;
+        layer.paused = self.paused;
         layer.visible = self.visible;
         layer.bypass_master_fx = self.bypass_master_fx;
         layer.effects = self.effects;
         layer.transform = self.transform;
         layer.matte = self.matte;
         layer.motion = self.motion;
+        if let (Some(pattern), Some(current)) = (self.pattern, layer.pattern_params_mut()) {
+            *current = pattern;
+        }
     }
+}
+
+/// Refuse authored states whose safety depends on a layer remaining dormant.
+/// Visibility, transport, bus weights, and modulation can all make a layer
+/// contribute on a later frame without another authoring transaction. Master
+/// ordering and the currently unsupported mixed selective-VHS path therefore
+/// validate against every authored layer, while the frame planner remains free
+/// to skip real work for non-contributors.
+fn validate_master_bypass_capability(
+    master_rack: &RuntimeVisualRack,
+    ntsc_enabled: bool,
+    layers: &[(image_routing::StableLayerId, bool)],
+) -> Result<(), String> {
+    let bypassing = layers
+        .iter()
+        .filter_map(|(layer_id, bypass)| bypass.then_some(*layer_id))
+        .collect::<Vec<_>>();
+    if bypassing.is_empty() {
+        return Ok(());
+    }
+
+    let mut saw_global_master_step = false;
+    for node in master_rack.iter() {
+        if matches!(
+            node.kind,
+            visual_rack::RuntimeVisualNodeKind::LegacyCanonical
+        ) {
+            if saw_global_master_step {
+                return Err(format!(
+                    "advanced master ordering cannot preserve inherited bypass for authored layers {bypassing:?}"
+                ));
+            }
+        } else {
+            saw_global_master_step = true;
+        }
+    }
+
+    let inheriting = layers.len().saturating_sub(bypassing.len());
+    if ntsc_enabled && inheriting != 0 {
+        return Err(format!(
+            "mixed selective VHS is not yet supported: {inheriting} inheriting layer(s), {} bypassing layer(s)",
+            bypassing.len()
+        ));
+    }
+    Ok(())
 }
 
 impl StagedMorphWorld {
@@ -4661,6 +4813,10 @@ struct App {
     /// a single-monitor system instead of creating a second same-display
     /// swapchain.
     output_on_main: bool,
+    /// Empty means Automatic. Non-empty values are opaque identifiers from the
+    /// current host-session display inventory and never enter PatchState.
+    output_display_id: String,
+    output_displays: Vec<web::state::OutputDisplaySnapshot>,
     output_error: String,
     /// Separate venue document. Artistic PatchState never captures projector
     /// geometry, monitor bindings, or calibration routes.
@@ -5043,6 +5199,8 @@ impl App {
             spout: spout_out::SpoutOut::new(),
             spout_enabled: false,
             output_on_main: false,
+            output_display_id: String::new(),
+            output_displays: Vec::new(),
             output_error: stage_map_initial_error,
             stage_map,
             stage_tools: stage_map::StageToolState::default(),
@@ -5211,6 +5369,135 @@ impl App {
         )
     }
 
+    /// Route a layer around the inheritable master prefix only after the exact
+    /// detached frame plan accepts that partition. This prevents a malformed
+    /// master ordering from entering live state and turning the renderer's
+    /// last-good-frame safety hold into what looks like a frozen toggle.
+    fn set_layer_master_bypass_transactional(&mut self, index: usize, enabled: bool) -> bool {
+        let Some(layer) = self.layers.get(index) else {
+            return false;
+        };
+        if layer.bypass_master_fx == enabled {
+            return true;
+        }
+
+        let layer_id = layer.stable_layer_id();
+        let mut layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        layers[index].bypass_master_fx = enabled;
+        let staged = self.staged_creative_graph();
+        match self.preflight_creative_graph_with_visuals(
+            &staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &self.ntsc_params,
+            &self.temporal_params,
+            &layers,
+        ) {
+            Ok(()) => {
+                self.layers[index].bypass_master_fx = enabled;
+                self.composition_status = format!(
+                    "Layer {} {} the inheritable master FX prefix",
+                    layer_id.get(),
+                    if enabled { "bypasses" } else { "inherits" }
+                );
+                true
+            }
+            Err(error) => {
+                self.composition_status = format!(
+                    "Bypass Master FX rejected for layer {}: {error}",
+                    layer_id.get()
+                );
+                log::warn!("{}", self.composition_status);
+                false
+            }
+        }
+    }
+
+    /// Browser/performance dispatch also transfers Morph ownership. Keep that
+    /// transfer inside the same transaction as bypass admission so a refused
+    /// VHS or master-order partition restores the exact authored world and the
+    /// still-active Morph instead of committing an unrelated materialization.
+    fn apply_layer_master_bypass_action(
+        &mut self,
+        index: usize,
+        layer_id: &Option<String>,
+        value: &serde_json::Value,
+    ) -> bool {
+        let Some(index) = self.resolve_layer_index(index, layer_id) else {
+            return false;
+        };
+        let Some(enabled) = value.as_bool() else {
+            return false;
+        };
+        let morph_owned = self.morph.active()
+            && self
+                .morph
+                .controls_layer_field(index, morph::LayerMorphControl::BypassMasterFx);
+        let rollback =
+            morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if morph_owned && !self.release_active_morph_for_manual_edit() {
+            return false;
+        }
+
+        let accepted = self.set_layer_master_bypass_transactional(index, enabled);
+        if !accepted {
+            if let Some((world, morph)) = rollback {
+                world.install(self);
+                self.morph = morph;
+            }
+        }
+        accepted
+    }
+
+    /// VHS remains composition-global until the selective worker can process
+    /// mixed inheriting/bypassing layers. Validate an edited candidate before
+    /// publication, and keep Morph ownership inside the same rollback seam so
+    /// enabling VHS can never create a later frame-plan freeze.
+    fn apply_ntsc_param_action(&mut self, param: &str, value: &serde_json::Value) -> bool {
+        if !Self::valid_ntsc_edit(param, value) {
+            return false;
+        }
+
+        let morph_owned = self.morph.active();
+        let rollback =
+            morph_owned.then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
+        if morph_owned && !self.release_active_morph_for_manual_edit() {
+            return false;
+        }
+
+        let mut candidate = self.ntsc_params.clone();
+        candidate.set_param(param, value);
+        let layers: Vec<_> = self.layers.iter().map(StagedLayerLook::capture).collect();
+        let staged = self.staged_creative_graph();
+        let accepted = match self.preflight_creative_graph_with_visuals(
+            &staged,
+            &self.master_effects,
+            &self.master_transform,
+            &self.master_motion,
+            &candidate,
+            &self.temporal_params,
+            &layers,
+        ) {
+            Ok(()) => {
+                self.ntsc_params = candidate;
+                true
+            }
+            Err(error) => {
+                self.composition_status = format!("VHS edit rejected: {error}");
+                log::warn!("{}", self.composition_status);
+                false
+            }
+        };
+        if !accepted {
+            if let Some((world, morph)) = rollback {
+                world.install(self);
+                self.morph = morph;
+            }
+        }
+        accepted
+    }
+
     /// Plan a detached candidate against detached base-layer matte edges.
     /// Base mattes participate in the same unified DAG and resource ledger as
     /// rack/group image taps, so their topology must never be published before
@@ -5268,6 +5555,16 @@ impl App {
             .master_rack
             .validate_for_scope(LegacyRackScope::Master)
             .map_err(|error| format!("master rack validation failed: {error}"))?;
+        let bypass_capabilities = layers
+            .iter()
+            .map(|layer| (layer.layer_id, layer.bypass_master_fx))
+            .collect::<Vec<_>>();
+        validate_master_bypass_capability(
+            &staged.master_rack,
+            ntsc_params.enabled,
+            &bypass_capabilities,
+        )
+        .map_err(|error| format!("master bypass preflight failed: {error}"))?;
         for (layer_id, rack) in &staged.layer_racks {
             if !live_ids.contains(layer_id) {
                 return Err(format!("rack references absent layer {}", layer_id.get()));
@@ -5319,13 +5616,13 @@ impl App {
                     effects: &layer.effects,
                     transform: &layer.transform,
                     opacity: layer.opacity,
-                    speed: runtime.speed,
-                    fps: runtime.fps,
+                    speed: layer.speed,
+                    fps: layer.fps,
                     blend_mode: layer.blend_mode,
                     visible: layer.visible && runtime.transport_visible(),
-                    paused: runtime.paused,
+                    paused: layer.paused,
                     bypass_master_fx: layer.bypass_master_fx,
-                    pattern: runtime.pattern_params(),
+                    pattern: layer.pattern.as_ref(),
                 }),
         );
         let mattes: Vec<_> = layers.iter().map(|layer| layer.matte).collect();
@@ -5392,8 +5689,11 @@ impl App {
             input.resource_limits.max_sampled_textures_per_shader_stage =
                 wgpu::Limits::default().max_sampled_textures_per_shader_stage;
         }
-        base.plan_composition(input)
+        let plan = base
+            .plan_composition(input)
             .map_err(|error| format!("creative graph preflight failed: {error}"))?;
+        renderer::composition::CompositionGpuExecutor::validate_plan(&plan)
+            .map_err(|error| format!("creative GPU preflight failed: {error}"))?;
         Ok(())
     }
 
@@ -6288,10 +6588,38 @@ impl App {
             insertion_index,
         )?;
 
+        let validate_bypass = |app: &Self| {
+            let mut capabilities = app
+                .layers
+                .iter()
+                .map(|existing| (existing.stable_layer_id(), existing.bypass_master_fx))
+                .collect::<Vec<_>>();
+            capabilities.push((layer_id, layer.bypass_master_fx));
+            validate_master_bypass_capability(
+                &app.master_rack,
+                app.ntsc_params.enabled,
+                &capabilities,
+            )
+        };
+        // Refuse an already-obvious incompatibility before an engaged Morph
+        // is touched. A second check below covers the sampled Morph world.
+        validate_bypass(self)?;
+
         // Morph sampling changes values only. Re-stage afterward so the
         // candidate contains the just-materialized group values as well.
+        let rollback = self
+            .morph
+            .active()
+            .then(|| (StagedMorphWorld::capture_authored(self), self.morph.clone()));
         if !self.release_active_morph_for_manual_edit() {
             return Err("active Morph sample cannot be materialized safely".into());
+        }
+        if let Err(error) = validate_bypass(self) {
+            if let Some((world, morph)) = rollback {
+                world.install(self);
+                self.morph = morph;
+            }
+            return Err(error);
         }
         let staged = stage_composition_insert_ungrouped(
             &self.composition,
@@ -7440,12 +7768,11 @@ impl App {
     /// Rebuild the cold presenter transaction only when its authored map,
     /// immutable Program source, monitor inventory, or target formats can have
     /// changed. Tool-only changes update preallocated uniforms below.
-    fn sync_stage_presenter(&mut self, event_loop: &ActiveEventLoop) {
+    fn sync_stage_presenter(&mut self, event_loop: &ActiveEventLoop, monitors: &[MonitorHandle]) {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let monitors = event_loop.available_monitors().collect::<Vec<_>>();
-        let monitor_signature = stage_monitor_inventory_signature(&monitors);
+        let monitor_signature = stage_monitor_inventory_signature(monitors);
         let source_size = [renderer.output_width, renderer.output_height];
         let authored_changed = self.stage_presenter_attempted_map.as_ref() != Some(&self.stage_map);
         let rebuild = authored_changed
@@ -7474,7 +7801,7 @@ impl App {
                 );
                 continue;
             }
-            match Self::create_stage_monitor_target(renderer, event_loop, endpoint, &monitors) {
+            match Self::create_stage_monitor_target(renderer, event_loop, endpoint, monitors) {
                 Ok(target) => targets.push(target),
                 Err(error) => {
                     failures.insert(endpoint.id.clone(), bounded_stage_runtime_status(error));
@@ -7685,6 +8012,33 @@ impl App {
         self.output_on_main || self.renderer.as_ref().is_some_and(Renderer::has_output)
     }
 
+    fn live_output_display_entries(&self, event_loop: &ActiveEventLoop) -> Vec<OutputDisplayEntry> {
+        let main_monitor = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor());
+        output_display_entries(
+            event_loop.available_monitors().collect(),
+            main_monitor.as_ref(),
+        )
+    }
+
+    fn refresh_output_displays(&mut self, event_loop: &ActiveEventLoop) {
+        let monitors = event_loop.available_monitors().collect::<Vec<_>>();
+        self.refresh_output_displays_from_monitors(&monitors);
+    }
+
+    fn refresh_output_displays_from_monitors(&mut self, monitors: &[MonitorHandle]) {
+        let main_monitor = self
+            .window
+            .as_ref()
+            .and_then(|window| window.current_monitor());
+        self.output_displays = output_display_entries(monitors.to_vec(), main_monitor.as_ref())
+            .into_iter()
+            .map(|entry| entry.snapshot)
+            .collect();
+    }
+
     /// Close either form of audience Output. On one monitor this restores the
     /// ordinary main window; on two or more it drops only the dedicated
     /// projector window and its surface.
@@ -7720,11 +8074,10 @@ impl App {
         }
     }
 
-    /// Set audience Output explicitly. A real second monitor receives a
-    /// dedicated fullscreen surface so the performer keeps the editor. With
-    /// only one monitor, reuse the main window's already-proven surface and
-    /// make that window borderless instead of creating a second HDR swapchain
-    /// on the same display.
+    /// Set audience Output explicitly. Automatic mode retains the original
+    /// policy (first genuinely distinct display, otherwise the editor surface).
+    /// An explicit browser selection instead resolves one opaque live-inventory
+    /// ID and never silently falls back to another display.
     fn set_output_window(&mut self, event_loop: &ActiveEventLoop, enabled: bool) {
         if self.output_window_open() == enabled {
             return;
@@ -7738,13 +8091,44 @@ impl App {
             .window
             .as_ref()
             .and_then(|window| window.current_monitor());
+        let monitors = event_loop.available_monitors().collect::<Vec<_>>();
+        let entries = output_display_entries(monitors.clone(), main_monitor.as_ref());
+
+        if !self.output_display_id.is_empty() {
+            let Some(target) = entries
+                .into_iter()
+                .find(|entry| entry.snapshot.id == self.output_display_id)
+                .map(|entry| entry.monitor)
+            else {
+                self.output_error =
+                    "selected fullscreen display is no longer available".to_string();
+                return;
+            };
+            // If winit cannot currently identify the editor monitor, a second
+            // same-display swapchain is not proven safe. Reuse the established
+            // main surface while still asking borderless fullscreen to land on
+            // the operator's explicit target.
+            if main_monitor.as_ref().is_none_or(|main| &target == main) {
+                let Some(window) = self.window.as_ref() else {
+                    self.output_error = "main output window is not ready".to_string();
+                    return;
+                };
+                window.set_fullscreen(Some(Fullscreen::Borderless(Some(target))));
+                window.set_cursor_visible(false);
+                self.output_on_main = true;
+                self.output_error.clear();
+                log::info!("Output opened on the selected display using the main surface");
+            } else {
+                self.open_dedicated_output_window(event_loop, target);
+            }
+            return;
+        }
+
         // A transiently unknown main monitor is not proof that another one is
         // distinct. Fail closed to the existing surface in that case.
-        let distinct_monitor = main_monitor.as_ref().and_then(|main| {
-            event_loop
-                .available_monitors()
-                .find(|monitor| monitor != main)
-        });
+        let distinct_monitor = main_monitor
+            .as_ref()
+            .and_then(|main| monitors.into_iter().find(|monitor| monitor != main));
 
         if !use_dedicated_output(main_monitor.is_some(), distinct_monitor.is_some()) {
             let Some(window) = self.window.as_ref() else {
@@ -7760,6 +8144,47 @@ impl App {
         }
 
         self.open_dedicated_output_window(event_loop, distinct_monitor.unwrap());
+    }
+
+    /// Apply one coalesced browser batch without briefly opening an
+    /// intermediate display. A stale/forged ID is refused before the current
+    /// output window or selection is changed.
+    fn apply_output_request(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        requested_display: Option<String>,
+        requested_enabled: Option<bool>,
+    ) {
+        let was_open = self.output_window_open();
+        let mut display_changed = false;
+        if let Some(display_id) = requested_display {
+            let valid = display_id.is_empty()
+                || self
+                    .live_output_display_entries(event_loop)
+                    .iter()
+                    .any(|entry| entry.snapshot.id == display_id);
+            if !valid {
+                self.output_error =
+                    "requested fullscreen display is no longer available".to_string();
+                if requested_enabled == Some(false) {
+                    self.close_output_window();
+                }
+                self.refresh_output_displays(event_loop);
+                return;
+            }
+            if display_id != self.output_display_id {
+                if was_open {
+                    self.close_output_window();
+                }
+                self.output_display_id = display_id;
+                display_changed = true;
+            }
+        }
+
+        if display_changed || requested_enabled.is_some() {
+            self.set_output_window(event_loop, requested_enabled.unwrap_or(was_open));
+        }
+        self.refresh_output_displays(event_loop);
     }
 
     fn apply_output_window_command(
@@ -8332,6 +8757,16 @@ impl App {
             &mut staged_mod_matrix,
             &mut staged_temporal,
         )?;
+        let bypass_capabilities = rebuilt
+            .iter()
+            .map(|layer| (layer.stable_layer_id(), layer.bypass_master_fx))
+            .collect::<Vec<_>>();
+        validate_master_bypass_capability(
+            &staged_master_rack,
+            staged_ntsc.enabled,
+            &bypass_capabilities,
+        )
+        .map_err(|error| format!("loaded patch master bypass preflight failed: {error}"))?;
         for (layer, rack) in rebuilt.iter_mut().zip(staged_layer_racks) {
             layer.rack = rack;
         }
@@ -8967,6 +9402,14 @@ impl App {
             }
             web::state::WebAction::ToggleOutputWindow => Some(OutputWindowCommand::Toggle),
             web::state::WebAction::Quantized { inner } => Self::output_window_command(inner),
+            _ => None,
+        }
+    }
+
+    fn output_display_request(action: &web::state::WebAction) -> Option<String> {
+        match action {
+            web::state::WebAction::SetOutputDisplay { display_id } => Some(display_id.clone()),
+            web::state::WebAction::Quantized { inner } => Self::output_display_request(inner),
             _ => None,
         }
     }
@@ -13713,8 +14156,10 @@ impl App {
                 | WebAction::ClearTemporalMemory
                 | WebAction::ClearMotionMemory
                 | WebAction::SetOutputWindow { .. }
+                | WebAction::SetOutputDisplay { .. }
                 | WebAction::ToggleOutputWindow
                 | WebAction::SetSpout { .. }
+                | WebAction::SetSpoutResolution { .. }
                 | WebAction::StartProgramRecording { .. }
                 | WebAction::FinishProgramRecording
                 | WebAction::CancelProgramRecording
@@ -16672,6 +17117,42 @@ impl App {
         &mut self,
         action: web::state::WebAction,
     ) -> WebActionBatchDisposition {
+        // Bypass has a detached planner/GPU admission step and may also own an
+        // active Morph field. Dispatch it through one result-bearing seam so a
+        // refusal is neither recorded for the next accepted frame nor allowed
+        // to materialize Morph as an unrelated side effect.
+        if let web::state::WebAction::SetLayerParam {
+            index,
+            layer_id,
+            param,
+            value,
+        } = &action
+        {
+            if param == "bypass_master_fx" {
+                let accepted = self.apply_layer_master_bypass_action(*index, layer_id, value);
+                if accepted && self.performance_recording && !self.performance_replay_dispatching {
+                    self.stage_performance_edit(&action);
+                }
+                return WebActionBatchDisposition::Continue;
+            }
+        }
+        if let web::state::WebAction::SetNtscParam { param, value } = &action {
+            let address = self.feedback_address_for_web_action(&action);
+            let accepted = self.apply_ntsc_param_action(param, value);
+            if accepted && self.performance_recording && !self.performance_replay_dispatching {
+                self.stage_performance_edit(&action);
+            }
+            if let Some(address) = address {
+                if let Some(normalized) = self.automation_current_normalized(address) {
+                    self.publish_controller_feedback(
+                        address,
+                        normalized,
+                        controller_profile::AutomationOrigin::HostAutomation,
+                    );
+                }
+            }
+            return WebActionBatchDisposition::Continue;
+        }
         // The B9 record tap sits on this seam because every final application
         // funnels through it — the drained browser batch, the downbeat
         // release, native RECOVERY, and the transform gizmo — while the
@@ -16791,6 +17272,22 @@ impl App {
             return WebActionBatchDisposition::Continue;
         }
         if self.handle_motion_web_action(&action) {
+            return WebActionBatchDisposition::Continue;
+        }
+        if let WebAction::SetLayerParam {
+            index,
+            layer_id,
+            param,
+            value,
+        } = &action
+        {
+            if param == "bypass_master_fx" {
+                self.apply_layer_master_bypass_action(*index, layer_id, value);
+                return WebActionBatchDisposition::Continue;
+            }
+        }
+        if let WebAction::SetNtscParam { param, value } = &action {
+            self.apply_ntsc_param_action(param, value);
             return WebActionBatchDisposition::Continue;
         }
         if self.manual_action_targets_active_morph(&action)
@@ -17910,7 +18407,9 @@ impl App {
                     }
                 }
             },
-            WebAction::SetOutputWindow { .. } | WebAction::ToggleOutputWindow => {
+            WebAction::SetOutputWindow { .. }
+            | WebAction::SetOutputDisplay { .. }
+            | WebAction::ToggleOutputWindow => {
                 // Handled in the action drain loop, which has the event
                 // loop needed for window creation. Never reaches here.
             }
@@ -18231,6 +18730,11 @@ impl App {
             WebAction::SetSpout { enabled } => {
                 self.spout_enabled = enabled;
             }
+            WebAction::SetSpoutResolution { resolution } => {
+                if let Some(mode) = spout_out::SpoutResolutionMode::from_key(&resolution) {
+                    self.spout.set_resolution_mode(mode);
+                }
+            }
             WebAction::StartProgramRecording { auto_import } => {
                 self.start_program_recording(auto_import);
             }
@@ -18536,6 +19040,7 @@ impl App {
                 value,
             } => {
                 if let Some(index) = self.resolve_layer_index(index, &layer_id) {
+                    debug_assert_ne!(param, "bypass_master_fx");
                     if matches!(param.as_str(), "speed" | "fps") {
                         self.clear_performance_transactions();
                     }
@@ -18571,14 +19076,6 @@ impl App {
                         "blend_mode" => {
                             if let Some(blend_mode) = Self::blend_mode_edit(&value) {
                                 layer.blend_mode = blend_mode;
-                            }
-                        }
-                        "bypass_master_fx" => {
-                            if let Some(enabled) = value.as_bool() {
-                                // Bypass is a reversible routing choice. Never
-                                // erase the layer's own effect settings when it
-                                // is enabled or disabled.
-                                layer.bypass_master_fx = enabled;
                             }
                         }
                         "key_mode" => {
@@ -18739,8 +19236,8 @@ impl App {
                     }
                 }
             }
-            WebAction::SetNtscParam { param, value } => {
-                self.ntsc_params.set_param(&param, &value);
+            WebAction::SetNtscParam { .. } => {
+                unreachable!("VHS edits are handled transactionally before this match")
             }
             WebAction::StartExport {
                 width,
@@ -18856,7 +19353,11 @@ impl App {
                             })
                         },
                     };
-                    for layer in self.layers.iter().filter(|layer| !layer.is_file_media()) {
+                    for layer in self
+                        .layers
+                        .iter()
+                        .filter(|layer| !layer.is_offline_reconstructable())
+                    {
                         log::warn!(
                             "Export: live source '{}' will be represented by deterministic black",
                             layer.filename
@@ -20217,6 +20718,9 @@ impl App {
                 SpoutSnapshot {
                     enabled: self.spout_enabled,
                     active: status.active,
+                    resolution: status.resolution_mode.key().to_string(),
+                    width: status.delivered_width,
+                    height: status.delivered_height,
                     error: status.error,
                 }
             },
@@ -20230,6 +20734,9 @@ impl App {
                 .map(|s| s.clone())
                 .unwrap_or_default(),
             output_window: self.output_window_open() || self.stage_surface_windows_open(),
+            legacy_output_window: self.output_window_open(),
+            output_display: self.output_display_id.clone(),
+            output_displays: self.output_displays.clone(),
             output_error: self.published_output_error(),
             blackout: self.blackout,
             morph: MorphSnapshot {
@@ -21471,7 +21978,13 @@ impl ApplicationHandler for App {
                     }
                     self.monitor_bay_was_armed = monitor_armed;
 
-                    // Process actions from web UI
+                    // Process actions from web UI. Display inventory is live
+                    // host state, so publish and validate it at this event-loop
+                    // boundary rather than trusting a browser's prior snapshot.
+                    // StageMap and legacy Output share this one enumeration so
+                    // steady-state monitoring adds no duplicate OS query.
+                    let monitor_inventory = event_loop.available_monitors().collect::<Vec<_>>();
+                    self.refresh_output_displays_from_monitors(&monitor_inventory);
                     let mut pending_actions: VecDeque<_> = self
                         .web_state
                         .actions
@@ -21479,6 +21992,7 @@ impl ApplicationHandler for App {
                         .map(|mut a| a.drain(..).collect())
                         .unwrap_or_default();
                     let mut requested_output = None;
+                    let mut requested_output_display = None;
                     while let Some(action) = pending_actions.pop_front() {
                         // Output-window creation needs the event loop. Fold all
                         // requests in this packet batch into one final state so
@@ -21489,6 +22003,8 @@ impl ApplicationHandler for App {
                                 requested_output.unwrap_or_else(|| self.output_window_open());
                             requested_output =
                                 Some(resolve_output_window_command(current, command));
+                        } else if let Some(display_id) = Self::output_display_request(&action) {
+                            requested_output_display = Some(display_id);
                         } else {
                             let disposition = self.handle_web_action(action);
                             Self::apply_web_action_batch_disposition(
@@ -21497,13 +22013,17 @@ impl ApplicationHandler for App {
                             );
                         }
                     }
-                    if let Some(enabled) = requested_output {
-                        self.set_output_window(event_loop, enabled);
+                    if requested_output.is_some() || requested_output_display.is_some() {
+                        self.apply_output_request(
+                            event_loop,
+                            requested_output_display,
+                            requested_output,
+                        );
                         if self.exit_if_device_lost(event_loop) {
                             return;
                         }
                     }
-                    self.sync_stage_presenter(event_loop);
+                    self.sync_stage_presenter(event_loop, &monitor_inventory);
                     if self.exit_if_device_lost(event_loop) {
                         return;
                     }
@@ -22201,7 +22721,10 @@ impl ApplicationHandler for App {
                         let renderer = self.renderer.as_ref().unwrap();
                         for layer in &mut self.layers {
                             let playing = gates.media_running && !layer.paused;
-                            if !layer.is_file_media()
+                            // The text page rides this same pump: its CPU raster
+                            // is a pending still frame, and skipping it here left
+                            // a freshly added text layer permanently transparent.
+                            if !layer.uses_ready_frame_uploads()
                                 || (!playing && layer.source_frame_initialized())
                             {
                                 continue;
@@ -22250,7 +22773,7 @@ impl ApplicationHandler for App {
                     };
                     let renderer = self.renderer.as_ref().unwrap();
                     for layer in &mut self.layers {
-                        if layer.is_file_media() {
+                        if layer.uses_ready_frame_uploads() {
                             continue;
                         }
                         let playing = gates.media_running && !layer.paused;
@@ -25104,6 +25627,60 @@ mod app_state_tests {
     }
 
     #[test]
+    fn authored_bypass_capability_closes_dormant_master_and_vhs_freeze_paths() {
+        use visual_rack::{NodeId, RuntimeVisualNode, RuntimeVisualNodeKind, RuntimeVisualRack};
+
+        let mixed = [(stable_layer(1), true), (stable_layer(2), false)];
+        let all_bypass = [(stable_layer(1), true), (stable_layer(2), true)];
+        let mut canonical_then_global =
+            RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        canonical_then_global
+            .push(RuntimeVisualNodeKind::Transform(
+                spatial::SpatialTransform::default(),
+            ))
+            .unwrap();
+
+        // A later global custom segment is compatible with canonical bypass,
+        // but VHS remains blocked for a mixed authored population even if the
+        // bypassing layer happens to be hidden or zero-weight this frame.
+        assert!(validate_master_bypass_capability(&canonical_then_global, false, &mixed).is_ok());
+        let error =
+            validate_master_bypass_capability(&canonical_then_global, true, &mixed).unwrap_err();
+        assert!(error.contains("mixed selective VHS is not yet supported"));
+        assert!(
+            validate_master_bypass_capability(&canonical_then_global, true, &all_bypass).is_ok()
+        );
+
+        let global_then_canonical = RuntimeVisualRack::try_from_parts(
+            vec![
+                RuntimeVisualNode::authored(
+                    NodeId::new(3).unwrap(),
+                    RuntimeVisualNodeKind::Transform(spatial::SpatialTransform::default()),
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_CANONICAL,
+                    RuntimeVisualNodeKind::LegacyCanonical,
+                ),
+                RuntimeVisualNode::authored(
+                    NodeId::LEGACY_TEMPORAL,
+                    RuntimeVisualNodeKind::LegacyTemporal,
+                ),
+            ],
+            Some(4),
+        )
+        .unwrap();
+        let error =
+            validate_master_bypass_capability(&global_then_canonical, false, &mixed).unwrap_err();
+        assert!(error.contains("advanced master ordering"));
+
+        // No bypass capability means neither restriction applies.
+        let inheriting = [(stable_layer(1), false), (stable_layer(2), false)];
+        assert!(
+            validate_master_bypass_capability(&global_then_canonical, true, &inheriting).is_ok()
+        );
+    }
+
+    #[test]
     fn procedural_motion_ingress_is_closed_and_classifies_its_impact() {
         let mut params = motion::MotionParams::default();
         // Every kind token is a topology edit: it changes which pass writes
@@ -27810,6 +28387,19 @@ mod app_state_tests {
         );
         assert!(!use_dedicated_output(true, false));
         assert!(use_dedicated_output(true, true));
+    }
+
+    #[test]
+    fn fullscreen_display_ids_are_stable_opaque_and_ordinally_distinct() {
+        let signature = "Projector@1920,0:1920x1080";
+        let first = output_display_id(signature, 0);
+        assert_eq!(first, output_display_id(signature, 0));
+        assert_ne!(first, output_display_id(signature, 1));
+        assert!(first.starts_with("display-"));
+        assert!(!first.contains("Projector"));
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
     }
 
     #[test]

@@ -10,13 +10,61 @@
 //! Windows-only; on other platforms the module presents the same API and
 //! reports itself unavailable.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub const SENDER_NAME: &str = "collide-o-scope";
 const RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
+pub const SPOUT_1080P_WIDTH: u32 = 1920;
+pub const SPOUT_1080P_HEIGHT: u32 = 1080;
+
+/// Resolution advertised by the Spout sender.
+///
+/// The keys are a stable host-control boundary. `Native` preserves the live
+/// renderer's dimensions; `Fixed1920x1080` scales only on the sender worker so
+/// the render thread keeps its existing nonblocking, source-sized contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SpoutResolutionMode {
+    Native = 0,
+    #[default]
+    Fixed1920x1080 = 1,
+}
+
+impl SpoutResolutionMode {
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Fixed1920x1080 => "1080p",
+        }
+    }
+
+    pub const fn from_key(key: &str) -> Option<Self> {
+        match key.as_bytes() {
+            b"native" => Some(Self::Native),
+            b"1080p" => Some(Self::Fixed1920x1080),
+            _ => None,
+        }
+    }
+
+    pub const fn output_dimensions(self, native_width: u32, native_height: u32) -> (u32, u32) {
+        match self {
+            Self::Native => (native_width, native_height),
+            Self::Fixed1920x1080 => (SPOUT_1080P_WIDTH, SPOUT_1080P_HEIGHT),
+        }
+    }
+
+    const fn from_atomic(value: u8) -> Self {
+        match value {
+            0 => Self::Native,
+            _ => Self::Fixed1920x1080,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct SpoutStatus {
@@ -26,6 +74,13 @@ pub struct SpoutStatus {
     /// Identifies the currently authoritative worker run. Status updates from
     /// an older, stopped worker are ignored.
     pub generation: u64,
+    /// Requested sender-resolution policy. The delivered dimensions remain
+    /// zero until the current worker completes a successful Spout send.
+    pub resolution_mode: SpoutResolutionMode,
+    /// Exact dimensions of the most recently delivered frame in this worker
+    /// generation, after any worker-side scaling.
+    pub delivered_width: u32,
+    pub delivered_height: u32,
     delivered_black_epoch: Option<u64>,
 }
 
@@ -45,6 +100,86 @@ struct QueuedFrame {
     height: u32,
     epoch: u64,
     kind: FrameKind,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct PreparedSenderFrame {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(any(windows, test))]
+fn rgba8_byte_len(width: u32, height: u32) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err(format!("invalid zero-sized RGBA frame {width}x{height}"));
+    }
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| format!("RGBA frame dimensions overflow host memory: {width}x{height}"))
+}
+
+/// Consume and, when requested, scale one accepted mailbox frame. This runs
+/// exclusively on the Spout worker. Main's render/readback thread never pays
+/// for the 1080p allocation or filter pass.
+#[cfg(any(windows, test))]
+fn prepare_sender_frame(
+    frame: &mut QueuedFrame,
+    mode: SpoutResolutionMode,
+) -> Result<PreparedSenderFrame, String> {
+    let expected = rgba8_byte_len(frame.width, frame.height)?;
+    if frame.pixels.len() != expected {
+        return Err(format!(
+            "invalid RGBA frame buffer for {}x{}: expected {expected} bytes, got {}",
+            frame.width,
+            frame.height,
+            frame.pixels.len()
+        ));
+    }
+
+    let (width, height) = mode.output_dimensions(frame.width, frame.height);
+    if (width, height) == (frame.width, frame.height) {
+        return Ok(PreparedSenderFrame {
+            pixels: std::mem::take(&mut frame.pixels),
+            width,
+            height,
+        });
+    }
+
+    let output_len = rgba8_byte_len(width, height)?;
+    if frame.kind == FrameKind::Black {
+        // Preserve an exact emergency black without spending worker time on a
+        // convolution whose mathematical result is already known.
+        drop(std::mem::take(&mut frame.pixels));
+        return Ok(PreparedSenderFrame {
+            pixels: vec![0; output_len],
+            width,
+            height,
+        });
+    }
+
+    let source =
+        image::RgbaImage::from_raw(frame.width, frame.height, std::mem::take(&mut frame.pixels))
+            .ok_or_else(|| {
+                format!(
+                    "could not construct RGBA source image for {}x{}",
+                    frame.width, frame.height
+                )
+            })?;
+    let scaled = image::imageops::resize(
+        &source,
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    );
+    debug_assert_eq!(scaled.as_raw().len(), output_len);
+    Ok(PreparedSenderFrame {
+        pixels: scaled.into_raw(),
+        width,
+        height,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,18 +350,40 @@ struct WorkerRun {
 pub struct SpoutOut {
     worker: Option<WorkerRun>,
     status: Arc<Mutex<SpoutStatus>>,
+    resolution_mode: Arc<AtomicU8>,
     generation: u64,
     retry_after: Option<Instant>,
 }
 
 impl SpoutOut {
     pub fn new() -> Self {
+        Self::with_resolution_mode(SpoutResolutionMode::default())
+    }
+
+    pub fn with_resolution_mode(resolution_mode: SpoutResolutionMode) -> Self {
         Self {
             worker: None,
-            status: Arc::new(Mutex::new(SpoutStatus::default())),
+            status: Arc::new(Mutex::new(SpoutStatus {
+                resolution_mode,
+                ..SpoutStatus::default()
+            })),
+            resolution_mode: Arc::new(AtomicU8::new(resolution_mode as u8)),
             generation: 0,
             retry_after: None,
         }
+    }
+
+    pub fn resolution_mode(&self) -> SpoutResolutionMode {
+        SpoutResolutionMode::from_atomic(self.resolution_mode.load(Ordering::Relaxed))
+    }
+
+    /// Change the worker-side output policy. An active worker adopts it on its
+    /// next mailbox frame; the last delivered dimensions remain authoritative
+    /// in [`SpoutStatus`] until that send succeeds.
+    pub fn set_resolution_mode(&self, resolution_mode: SpoutResolutionMode) {
+        self.resolution_mode
+            .store(resolution_mode as u8, Ordering::Relaxed);
+        lock_unpoison(&self.status).resolution_mode = resolution_mode;
     }
 
     pub fn is_running(&self) -> bool {
@@ -304,10 +461,12 @@ impl SpoutOut {
         }
 
         let generation = self.next_generation();
+        let resolution_mode = self.resolution_mode();
         {
             let mut status = lock_unpoison(&self.status);
             *status = SpoutStatus {
                 generation,
+                resolution_mode,
                 ..SpoutStatus::default()
             };
         }
@@ -315,6 +474,7 @@ impl SpoutOut {
         let mailbox = Arc::new(FrameMailbox::default());
         let worker_mailbox = mailbox.clone();
         let status = self.status.clone();
+        let worker_resolution_mode = self.resolution_mode.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("spout-out-{generation}"))
             .spawn(move || {
@@ -331,30 +491,44 @@ impl SpoutOut {
                 const DXGI_FORMAT_R8G8B8A8_UNORM: u32 = 28;
                 sender.set_format(DXGI_FORMAT_R8G8B8A8_UNORM);
 
-                while let Some(frame) = worker_mailbox.recv() {
-                    // Hold through both the validity check and the external
+                while let Some(mut frame) = worker_mailbox.recv() {
+                    // Avoid work already known to be stale, then scale outside
+                    // the barrier. A blackout can therefore supersede a colour
+                    // frame while its worker-only resize is in progress.
+                    if !worker_mailbox.is_current(&frame) {
+                        continue;
+                    }
+                    let resolution_mode = SpoutResolutionMode::from_atomic(
+                        worker_resolution_mode.load(Ordering::Relaxed),
+                    );
+                    let prepared = match prepare_sender_frame(&mut frame, resolution_mode) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            update_status(&status, generation, |current| {
+                                current.active = false;
+                                current.error = format!("spout scale: {error}");
+                                current.delivered_black_epoch = None;
+                            });
+                            continue;
+                        }
+                    };
+
+                    // Hold through the final validity check and the external
                     // send. `cut_to_black` uses this as its one-time barrier.
                     let _barrier = lock_unpoison(&worker_mailbox.send_barrier);
                     if !worker_mailbox.is_current(&frame) {
                         continue;
                     }
-                    match sender.send_image(&frame.pixels, frame.width, frame.height) {
+                    match sender.send_image(&prepared.pixels, prepared.width, prepared.height) {
                         Ok(()) => {
-                            update_status(&status, generation, |current| {
-                                if !current.active {
-                                    log::info!(
-                                        "Spout sender '{SENDER_NAME}' active ({}x{})",
-                                        frame.width,
-                                        frame.height
-                                    );
-                                }
-                                current.active = true;
-                                current.error.clear();
-                                current.delivered_black_epoch = match frame.kind {
-                                    FrameKind::Black => Some(frame.epoch),
-                                    FrameKind::Regular => None,
-                                };
-                            });
+                            record_delivery(
+                                &status,
+                                generation,
+                                prepared.width,
+                                prepared.height,
+                                frame.kind,
+                                frame.epoch,
+                            );
                         }
                         Err(error) => {
                             update_status(&status, generation, |current| {
@@ -385,10 +559,12 @@ impl SpoutOut {
     #[cfg(not(windows))]
     pub fn start(&mut self) {
         let generation = self.next_generation();
+        let resolution_mode = self.resolution_mode();
         let mut status = lock_unpoison(&self.status);
         *status = SpoutStatus {
             error: "Spout is Windows-only; Syphon output is not implemented on macOS".to_string(),
             generation,
+            resolution_mode,
             ..SpoutStatus::default()
         };
     }
@@ -398,12 +574,14 @@ impl SpoutOut {
     /// send, but it is only used on disable/drop, never for steady-state frames.
     pub fn stop(&mut self) {
         let generation = self.next_generation();
+        let resolution_mode = self.resolution_mode();
         // Invalidate status first. A send already in progress may finish while
         // we wait for the worker, but its generation-guarded update is ignored.
         {
             let mut status = lock_unpoison(&self.status);
             *status = SpoutStatus {
                 generation,
+                resolution_mode,
                 ..SpoutStatus::default()
             };
         }
@@ -458,6 +636,31 @@ fn update_status(
     }
 }
 
+#[cfg(any(windows, test))]
+fn record_delivery(
+    status: &Mutex<SpoutStatus>,
+    generation: u64,
+    width: u32,
+    height: u32,
+    kind: FrameKind,
+    epoch: u64,
+) {
+    update_status(status, generation, |current| {
+        if !current.active || current.delivered_width != width || current.delivered_height != height
+        {
+            log::info!("Spout sender '{SENDER_NAME}' active ({width}x{height})");
+        }
+        current.active = true;
+        current.error.clear();
+        current.delivered_width = width;
+        current.delivered_height = height;
+        current.delivered_black_epoch = match kind {
+            FrameKind::Black => Some(epoch),
+            FrameKind::Regular => None,
+        };
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +675,176 @@ mod tests {
             epoch,
             kind: FrameKind::Regular,
         }
+    }
+
+    #[test]
+    fn resolution_mode_keys_are_strict_stable_and_default_to_1080p() {
+        assert_eq!(
+            SpoutResolutionMode::default(),
+            SpoutResolutionMode::Fixed1920x1080
+        );
+        for mode in [
+            SpoutResolutionMode::Native,
+            SpoutResolutionMode::Fixed1920x1080,
+        ] {
+            assert_eq!(SpoutResolutionMode::from_key(mode.key()), Some(mode));
+        }
+        assert_eq!(SpoutResolutionMode::Native.key(), "native");
+        assert_eq!(SpoutResolutionMode::Fixed1920x1080.key(), "1080p");
+        assert_eq!(SpoutResolutionMode::from_key("1920x1080"), None);
+        assert_eq!(SpoutResolutionMode::from_key("Native"), None);
+
+        let output = SpoutOut::new();
+        assert_eq!(
+            output.resolution_mode(),
+            SpoutResolutionMode::Fixed1920x1080
+        );
+        assert_eq!(
+            output.status().resolution_mode,
+            SpoutResolutionMode::Fixed1920x1080
+        );
+        assert_eq!(
+            SpoutResolutionMode::Native.output_dimensions(1280, 720),
+            (1280, 720)
+        );
+        assert_eq!(
+            SpoutResolutionMode::Fixed1920x1080.output_dimensions(640, 480),
+            (SPOUT_1080P_WIDTH, SPOUT_1080P_HEIGHT)
+        );
+    }
+
+    #[test]
+    fn native_mode_preserves_dimensions_and_pixels_without_scaling() {
+        let pixels = vec![
+            1, 2, 3, 4, // pixel 0
+            5, 6, 7, 8, // pixel 1
+        ];
+        let mut frame = QueuedFrame {
+            pixels: pixels.clone(),
+            width: 2,
+            height: 1,
+            epoch: 17,
+            kind: FrameKind::Regular,
+        };
+        let prepared = prepare_sender_frame(&mut frame, SpoutResolutionMode::Native).unwrap();
+        assert_eq!((prepared.width, prepared.height), (2, 1));
+        assert_eq!(prepared.pixels, pixels);
+        assert!(frame.pixels.is_empty());
+        assert_eq!(frame.epoch, 17);
+        assert_eq!(frame.kind, FrameKind::Regular);
+    }
+
+    #[test]
+    fn fixed_mode_scales_regular_and_black_frames_to_exact_1080p() {
+        let colour = [0x12, 0x34, 0x56, 0x78];
+        let mut regular_frame = QueuedFrame {
+            pixels: colour.to_vec(),
+            width: 1,
+            height: 1,
+            epoch: 23,
+            kind: FrameKind::Regular,
+        };
+        let regular =
+            prepare_sender_frame(&mut regular_frame, SpoutResolutionMode::Fixed1920x1080).unwrap();
+        assert_eq!(
+            (regular.width, regular.height),
+            (SPOUT_1080P_WIDTH, SPOUT_1080P_HEIGHT)
+        );
+        assert_eq!(
+            regular.pixels.len(),
+            SPOUT_1080P_WIDTH as usize * SPOUT_1080P_HEIGHT as usize * 4
+        );
+        assert!(regular.pixels.chunks_exact(4).all(|pixel| pixel == colour));
+
+        let mailbox = FrameMailbox::default();
+        assert!(mailbox.queue_black(2, 2, 24));
+        let mut black_frame = mailbox.recv().expect("black frame queued");
+        let black =
+            prepare_sender_frame(&mut black_frame, SpoutResolutionMode::Fixed1920x1080).unwrap();
+        assert_eq!(
+            (black.width, black.height),
+            (SPOUT_1080P_WIDTH, SPOUT_1080P_HEIGHT)
+        );
+        assert_eq!(black.pixels.len(), regular.pixels.len());
+        assert!(black.pixels.iter().all(|byte| *byte == 0));
+        assert_eq!(black_frame.epoch, 24);
+        assert_eq!(black_frame.kind, FrameKind::Black);
+        assert!(mailbox.is_current(&black_frame));
+    }
+
+    #[test]
+    fn malformed_frames_are_refused_before_worker_scaling() {
+        let mut malformed = QueuedFrame {
+            pixels: vec![0; 15],
+            width: 2,
+            height: 2,
+            epoch: 1,
+            kind: FrameKind::Regular,
+        };
+        let error =
+            prepare_sender_frame(&mut malformed, SpoutResolutionMode::Fixed1920x1080).unwrap_err();
+        assert!(error.contains("expected 16 bytes, got 15"));
+        assert_eq!(malformed.pixels.len(), 15);
+
+        malformed.width = 0;
+        let error = prepare_sender_frame(&mut malformed, SpoutResolutionMode::Native).unwrap_err();
+        assert!(error.contains("zero-sized"));
+    }
+
+    #[test]
+    fn requested_mode_and_last_delivered_dimensions_are_separate_status_facts() {
+        let output = SpoutOut::with_resolution_mode(SpoutResolutionMode::Native);
+        output.set_resolution_mode(SpoutResolutionMode::Fixed1920x1080);
+        let requested = output.status();
+        assert_eq!(
+            requested.resolution_mode,
+            SpoutResolutionMode::Fixed1920x1080
+        );
+        assert_eq!(
+            (requested.delivered_width, requested.delivered_height),
+            (0, 0)
+        );
+
+        let generation = requested.generation;
+        record_delivery(
+            &output.status,
+            generation,
+            SPOUT_1080P_WIDTH,
+            SPOUT_1080P_HEIGHT,
+            FrameKind::Regular,
+            7,
+        );
+        let delivered = output.status();
+        assert!(delivered.active);
+        assert_eq!(
+            (delivered.delivered_width, delivered.delivered_height),
+            (SPOUT_1080P_WIDTH, SPOUT_1080P_HEIGHT)
+        );
+        assert_eq!(delivered.delivered_black_epoch, None);
+
+        record_delivery(
+            &output.status,
+            generation,
+            SPOUT_1080P_WIDTH,
+            SPOUT_1080P_HEIGHT,
+            FrameKind::Black,
+            8,
+        );
+        assert_eq!(output.status().delivered_black_epoch, Some(8));
+        record_delivery(
+            &output.status,
+            generation.wrapping_add(1),
+            640,
+            480,
+            FrameKind::Regular,
+            9,
+        );
+        let after_stale = output.status();
+        assert_eq!(
+            (after_stale.delivered_width, after_stale.delivered_height),
+            (SPOUT_1080P_WIDTH, SPOUT_1080P_HEIGHT)
+        );
+        assert_eq!(after_stale.delivered_black_epoch, Some(8));
     }
 
     #[test]
@@ -549,6 +922,23 @@ mod tests {
         assert_eq!(frame.kind, FrameKind::Regular);
         assert_eq!(frame.epoch, 5);
         assert!(mailbox.is_current(&frame));
+    }
+
+    #[test]
+    fn regular_arriving_during_scaling_cannot_starve_delivery_and_remains_latest_pending() {
+        let mailbox = FrameMailbox::default();
+        assert!(mailbox.try_queue_regular(regular(5, 0x11)));
+        let in_flight = mailbox.recv().expect("first colour frame queued");
+        assert!(mailbox.is_current(&in_flight));
+
+        assert!(mailbox.try_queue_regular(regular(5, 0x22)));
+        assert!(
+            mailbox.is_current(&in_flight),
+            "a producer faster than worker scaling must not starve every send"
+        );
+        let latest = mailbox.recv().expect("replacement colour frame queued");
+        assert_eq!(latest.pixels, vec![0x22; 4]);
+        assert!(mailbox.is_current(&latest));
     }
 
     #[test]

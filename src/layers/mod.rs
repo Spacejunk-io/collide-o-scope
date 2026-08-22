@@ -1447,6 +1447,17 @@ impl Layer {
         matches!(self.source, LayerSource::Video(_) | LayerSource::Still(_))
     }
 
+    /// Sources whose pictures arrive as CPU RGBA uploads through the
+    /// ready-frame pump: file media plus the text page, whose raster rides
+    /// the still-image publish law. Spout has its own overwrite harvest and
+    /// a pattern's producer is the GPU pass, never an upload.
+    pub fn uses_ready_frame_uploads(&self) -> bool {
+        matches!(
+            self.source,
+            LayerSource::Video(_) | LayerSource::Still(_) | LayerSource::TextPage(_)
+        )
+    }
+
     /// B7 generator sources: no file identity at all — the whole authored
     /// state travels in `LayerConfig`, so offline reconstruction is perfect
     /// by construction.
