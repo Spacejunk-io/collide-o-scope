@@ -447,6 +447,47 @@ impl VideoDecoder {
         self.seek_stats.index_builds = self.seek_stats.index_builds.saturating_add(1);
     }
 
+    /// Whether the exact selection would have to decode more pictures than
+    /// [`MAX_SEEK_DECODE_FRAMES`] permits with the index and live position
+    /// currently available. The threaded wrapper uses this only to decide
+    /// whether a first, distant request must wait for its asynchronous
+    /// keyframe index; ordinary nearby playback never waits on indexing.
+    pub(super) fn selection_exceeds_bounded_walk(
+        &self,
+        target_seconds: f64,
+        previous_accepted_identity: Option<CodecFrameIdentity>,
+    ) -> bool {
+        if !target_seconds.is_finite() {
+            return false;
+        }
+        let target_seconds = if self.duration_seconds > 0.0 {
+            target_seconds.clamp(0.0, self.duration_seconds)
+        } else {
+            target_seconds.max(0.0)
+        };
+        let frame_period = 1.0 / f64::from(self.fps.max(1.0));
+        let keyframe = self.keyframe_index.preceding(target_seconds);
+        let continue_forward = can_continue_forward(
+            self.stream_position,
+            target_seconds,
+            keyframe.source_seconds,
+            frame_period,
+            previous_accepted_identity,
+        );
+        let walk_start_seconds = if continue_forward {
+            self.stream_position
+                .map_or(keyframe.source_seconds, |position| position.source_seconds)
+        } else {
+            keyframe.source_seconds
+        };
+        bounded_walk_exceeds_limit(
+            walk_start_seconds,
+            target_seconds,
+            frame_period,
+            continue_forward,
+        )
+    }
+
     /// Select the frame at an absolute source time. FFmpeg seeks to the
     /// indexed preceding keyframe, flushes codec reorder state, and decodes
     /// forward. A recent reverse selection may be fulfilled by the bounded
@@ -1130,6 +1171,31 @@ fn can_continue_forward(
     }
 }
 
+/// A continued walk decodes pictures after the current one; a post-seek walk
+/// decodes its keyframe as picture one. Both accept a picture within half a
+/// frame of the request. Keep admission aligned with those exact laws.
+fn bounded_walk_exceeds_limit(
+    start_seconds: f64,
+    target_seconds: f64,
+    frame_period: f64,
+    continue_forward: bool,
+) -> bool {
+    if !start_seconds.is_finite()
+        || !target_seconds.is_finite()
+        || !frame_period.is_finite()
+        || frame_period <= 0.0
+    {
+        return false;
+    }
+    let terminal_frame_offset = if continue_forward {
+        f64::from(MAX_SEEK_DECODE_FRAMES)
+    } else {
+        f64::from(MAX_SEEK_DECODE_FRAMES.saturating_sub(1))
+    };
+    let maximum_reachable_seconds = start_seconds + (terminal_frame_offset + 0.5) * frame_period;
+    target_seconds > maximum_reachable_seconds
+}
+
 fn append_codec_motion_after(
     sequence: &mut Option<CodecMotionSequence>,
     rejected: &mut bool,
@@ -1371,10 +1437,11 @@ fn reserve_packed_rgba(output_len: usize) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_continue_forward, count_packet_without_frame, enable_export_motion_vectors,
-        next_loop_generation, repack_rgba_plane, require_decoded_frame_before_loop,
-        reserve_packed_rgba, should_interrupt_input, validate_media_dimensions, StreamPosition,
-        VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
+        bounded_walk_exceeds_limit, can_continue_forward, count_packet_without_frame,
+        enable_export_motion_vectors, next_loop_generation, repack_rgba_plane,
+        require_decoded_frame_before_loop, reserve_packed_rgba, should_interrupt_input,
+        validate_media_dimensions, StreamPosition, VideoDecoder, MAX_PACKETS_WITHOUT_FRAME,
+        MAX_SEEK_DECODE_FRAMES,
     };
     use crate::video::{CodecFrameIdentity, CodecTimeBase};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1394,6 +1461,50 @@ mod tests {
             source_seconds,
             pts: Some(pts),
         })
+    }
+
+    #[test]
+    fn bounded_walk_admission_matches_the_decoders_exact_reach() {
+        let start = 0.0;
+        let continued_last_reachable =
+            start + (f64::from(MAX_SEEK_DECODE_FRAMES) + 0.5) * FRAME_PERIOD;
+        assert!(!bounded_walk_exceeds_limit(
+            start,
+            continued_last_reachable,
+            FRAME_PERIOD,
+            true
+        ));
+        assert!(bounded_walk_exceeds_limit(
+            start,
+            continued_last_reachable + FRAME_PERIOD,
+            FRAME_PERIOD,
+            true
+        ));
+        let seek_last_reachable = start + (f64::from(MAX_SEEK_DECODE_FRAMES) - 0.5) * FRAME_PERIOD;
+        assert!(!bounded_walk_exceeds_limit(
+            start,
+            seek_last_reachable,
+            FRAME_PERIOD,
+            false
+        ));
+        assert!(bounded_walk_exceeds_limit(
+            start,
+            seek_last_reachable + FRAME_PERIOD,
+            FRAME_PERIOD,
+            false
+        ));
+        assert!(bounded_walk_exceeds_limit(
+            start,
+            409.075_430,
+            FRAME_PERIOD,
+            true
+        ));
+        assert!(!bounded_walk_exceeds_limit(
+            405.204_8,
+            409.075_430,
+            FRAME_PERIOD,
+            false
+        ));
     }
 
     fn accepted(pts: i64) -> Option<CodecFrameIdentity> {
