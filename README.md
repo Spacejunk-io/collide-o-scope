@@ -1086,7 +1086,7 @@ target\release\collide-o-scope.exe generate `
   --max-fingerprint-bytes 68719476736
 ```
 
-The generator — version 12 at this writing, with manifests accepting every
+The generator — version 13 at this writing, with manifests accepting every
 earlier version string — resolves and SHA-256 fingerprints visual and imported
 analysis-audio files before it commits output. It replaces private local paths
 with `cos-sha256://<digest>/<bytes>` references, so canonical anchor/piece hashes
@@ -1096,9 +1096,11 @@ one invocation. `--allow-unverified-sources` explicitly permits a logical-name
 fallback with an incomplete-identity warning.
 
 Each new piece directory contains `patch.yaml`, schema-v2 `manifest.json`, and
-deterministic `preflight.json`. The receipt records source digests, byte/search
-limits, warnings, and a narrow configuration/source-byte claim; it explicitly
-does not claim rendered-pixel identity. Generation uses typed, reflected,
+deterministic schema-v2 `preflight.json`. After round-tripping the exact emitted
+YAML, the receipt records every current-stack layer's resolved Master/Temporal
+bypass values alongside source digests, byte/search limits, warnings, and a narrow
+configuration/source-byte claim; these authored facts do not claim renderer
+admission, activation, or rendered-pixel identity. Generation uses typed, reflected,
 mean-reverting mutations in isolated deterministic domains, including Shift,
 bounded spatial values, compatible rack/group/matte/A-B values, Temporal
 Originals numeric values, and Motion numeric values. It preserves
