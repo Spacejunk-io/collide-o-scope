@@ -452,8 +452,10 @@ pub struct Layer {
     pub blend_mode: BlendMode,
     pub paused: bool,
     pub visible: bool,
-    /// When true, this layer skips the shared master shader stage while
-    /// retaining its own effects and all later program-wide stages.
+    /// When true, this layer skips the inheritable master prefix. While any
+    /// visible, positive-opacity bypass layer contributes, the one shared
+    /// program Temporal machine also runs its neutral warm-history path.
+    /// Direct layer effects, opacity, keying, and blend remain active.
     pub bypass_master_fx: bool,
     /// Advance this layer's deterministic pattern seed at each authoritative
     /// video-loop boundary. Stills and live inputs ignore the flag.

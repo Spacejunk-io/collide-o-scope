@@ -72,8 +72,16 @@ pub enum PatternShape {
     Polygon,
     /// The exact Mandelbrot escape-time law `z <- z^2 + c`, on a fixed
     /// aspect-correct complex-plane page. This additive, non-BENDR shape is
-    /// deliberately last so every established shader code remains frozen.
+    /// deliberately appended so every established shader code remains frozen.
     Mandelbrot,
+    /// Compact moving splats composited with four analytically reconstructed
+    /// earlier positions. The trail resembles retained visual memory without
+    /// holding framebuffer state, so pause and offline export remain exact.
+    MemorySplats,
+    /// Moving anisotropic Gaussian kernels, alpha-composited into a bounded
+    /// scalar field. This is a native 2D generator rather than a 3D point-cloud
+    /// import pipeline.
+    GaussianSplats,
 }
 
 impl PatternShape {
@@ -93,10 +101,12 @@ impl PatternShape {
             Self::Interference => 10,
             Self::Polygon => 11,
             Self::Mandelbrot => 12,
+            Self::MemorySplats => 13,
+            Self::GaussianSplats => 14,
         }
     }
 
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Scan,
         Self::Radial,
         Self::Spiral,
@@ -110,6 +120,8 @@ impl PatternShape {
         Self::Interference,
         Self::Polygon,
         Self::Mandelbrot,
+        Self::MemorySplats,
+        Self::GaussianSplats,
     ];
 }
 
@@ -503,6 +515,155 @@ fn mandelbrot_escape_signal(uv: [f32; 2], aspect: f32) -> (f32, bool) {
     }
 }
 
+/// Number of analytically reconstructed positions in the Memory Splats
+/// trail. Keeping this fixed makes the source's GPU cost bounded and its CPU
+/// reference byte-for-byte reproducible.
+const MEMORY_SPLAT_SAMPLES: usize = 4;
+
+/// The deterministic orbit of one splat inside its lattice cell. Hashes are
+/// computed once per cell and reused by every Memory sample — important in the
+/// full-resolution hot loop. The point remains in the cell's 0.18..0.82 box.
+fn moving_splat_point(offset: [f32; 2], h0: f32, h1: f32, t: f32, phase_radians: f32) -> [f32; 2] {
+    [
+        offset[0] + 0.5 + 0.32 * (h0 * PATTERN_TAU + phase_radians + t * (0.55 + 0.85 * h1)).sin(),
+        offset[1] + 0.5 + 0.32 * (h1 * PATTERN_TAU - phase_radians + t * (0.50 + 0.75 * h0)).cos(),
+    ]
+}
+
+/// A compact splat field with visible motion memory. The head and tail are
+/// exact points on the deterministic orbit; two intermediate trail positions
+/// are reconstructed along that recent motion segment. No framebuffer state
+/// is held, so seek, pause, replay, and offline export name the same image.
+fn memory_splats_signal(p: [f32; 2], fx: f32, freq_y: f32, phase: f32, t: f32, memory: f32) -> f32 {
+    let cell_scale = 2.0 + fx * 0.22;
+    let g = [p[0] * cell_scale, p[1] * cell_scale];
+    let gi = [g[0].floor(), g[1].floor()];
+    let gf = glsl_fract2(g);
+    let radius = 0.18 + freq_y * 0.32;
+    let lag = 0.10 + memory * 0.65;
+    let decay = 0.28 + memory * 0.55;
+    let trail_weights = [1.0, decay, decay * decay, decay * decay * decay];
+    let phase_radians = phase * PATTERN_TAU;
+    // A splat cannot leave its cell's central 64%, and the compact radius is
+    // at most 0.5. The nearest 2x2 cells are therefore complete; every omitted
+    // cell starts at least 0.68 away. This cuts the dominant per-pixel loop
+    // from 36 kernel samples to 16 without changing the field.
+    let start_x = if gf[0] < 0.5 { -1 } else { 0 };
+    let start_y = if gf[1] < 0.5 { -1 } else { 0 };
+    let mut alpha = 0.0f32;
+    for yi in 0..2 {
+        for xi in 0..2 {
+            let x = start_x + xi;
+            let y = start_y + yi;
+            let offset = [x as f32, y as f32];
+            let cell = [gi[0] + offset[0], gi[1] + offset[1]];
+            let h0 = pattern_hash21(cell);
+            let h1 = pattern_hash21([cell[0] + 5.17, cell[1] + 9.31]);
+            // Two exact orbit evaluations define all four trail positions.
+            // The naïve formulation evaluated sin/cos for every age; this
+            // interpolation halves the dominant SFU work per Memory layer.
+            let head = moving_splat_point(offset, h0, h1, t, phase_radians);
+            let tail = moving_splat_point(
+                offset,
+                h0,
+                h1,
+                t - (MEMORY_SPLAT_SAMPLES - 1) as f32 * lag,
+                phase_radians,
+            );
+            for (age, trail_weight) in trail_weights.iter().copied().enumerate() {
+                let trail_position = age as f32 / (MEMORY_SPLAT_SAMPLES - 1) as f32;
+                let point = if age == 0 {
+                    head
+                } else if age + 1 == MEMORY_SPLAT_SAMPLES {
+                    tail
+                } else {
+                    [
+                        mix(head[0], tail[0], trail_position),
+                        mix(head[1], tail[1], trail_position),
+                    ]
+                };
+                let delta = [point[0] - gf[0], point[1] - gf[1]];
+                let distance_squared = delta[0] * delta[0] + delta[1] * delta[1];
+                let inner_radius = radius * 0.35;
+                let compact = 1.0
+                    - smoothstep(
+                        inner_radius * inner_radius,
+                        radius * radius,
+                        distance_squared,
+                    );
+                let sample_alpha = (compact * trail_weight).clamp(0.0, 1.0);
+                // Front-to-back alpha union: bounded even when many trails
+                // overlap, unlike an unconstrained additive sum.
+                alpha += (1.0 - alpha) * sample_alpha;
+            }
+        }
+    }
+    alpha.clamp(0.0, 1.0)
+}
+
+/// A moving anisotropic Gaussian-splat field. `anisotropy` stretches each
+/// kernel along its own deterministic hashed major axis while its centre moves
+/// on the shared orbit. A compact support window reaches zero before any cell
+/// omitted by the nearest-2x2 search, so the bounded neighbourhood cannot
+/// introduce lattice seams.
+fn gaussian_splats_signal(
+    p: [f32; 2],
+    fx: f32,
+    freq_y: f32,
+    phase: f32,
+    t: f32,
+    anisotropy: f32,
+) -> f32 {
+    let cell_scale = 2.0 + fx * 0.22;
+    let g = [p[0] * cell_scale, p[1] * cell_scale];
+    let gi = [g[0].floor(), g[1].floor()];
+    let gf = glsl_fract2(g);
+    let sigma_major = 0.16 + freq_y * 0.24;
+    let axis_ratio = 1.0 + anisotropy * 3.0;
+    let sigma_minor = sigma_major / axis_ratio;
+    let phase_radians = phase * PATTERN_TAU;
+    let start_x = if gf[0] < 0.5 { -1 } else { 0 };
+    let start_y = if gf[1] < 0.5 { -1 } else { 0 };
+    let mut alpha = 0.0f32;
+    for yi in 0..2 {
+        for xi in 0..2 {
+            let x = start_x + xi;
+            let y = start_y + yi;
+            let offset = [x as f32, y as f32];
+            let cell = [gi[0] + offset[0], gi[1] + offset[1]];
+            let h0 = pattern_hash21(cell);
+            let h1 = pattern_hash21([cell[0] + 5.17, cell[1] + 9.31]);
+            let point = moving_splat_point(offset, h0, h1, t, phase_radians);
+            let delta = [gf[0] - point[0], gf[1] - point[1]];
+            let h2 = pattern_hash21([cell[0] + 11.7, cell[1] + 2.93]);
+            let h3 = pattern_hash21([cell[0] + 19.19, cell[1] + 7.73]);
+            let axis = [h2 * 2.0 - 1.0, h3 * 2.0 - 1.0];
+            let axis_length_squared = axis[0] * axis[0] + axis[1] * axis[1];
+            let (cos_angle, sin_angle) = if axis_length_squared > 1.0e-6 {
+                let inverse_axis_length = 1.0 / axis_length_squared.sqrt();
+                (axis[0] * inverse_axis_length, axis[1] * inverse_axis_length)
+            } else {
+                // A hash can land arbitrarily close to the origin. Preserve a
+                // unit orthonormal basis instead of flattening that rare splat.
+                (1.0, 0.0)
+            };
+            let local = [
+                delta[0] * cos_angle + delta[1] * sin_angle,
+                -delta[0] * sin_angle + delta[1] * cos_angle,
+            ];
+            let quadratic = local[0] * local[0] / (sigma_major * sigma_major)
+                + local[1] * local[1] / (sigma_minor * sigma_minor);
+            let distance_squared = delta[0] * delta[0] + delta[1] * delta[1];
+            // Gaussian rasterizers conventionally bound their footprint. The
+            // 0.66 cutoff is below the 0.68 distance to every omitted cell.
+            let support = 1.0 - smoothstep(0.56 * 0.56, 0.66 * 0.66, distance_squared);
+            let sample_alpha = ((-0.5 * quadratic).exp() * support).clamp(0.0, 1.0);
+            alpha += (1.0 - alpha) * sample_alpha;
+        }
+    }
+    alpha.clamp(0.0, 1.0)
+}
+
 /// The whole signal path for one pixel: framing, shape, oscillator,
 /// wavefolder, comparator, colouriser. `uv` is the tree's top-left-origin
 /// texture coordinate; the reference flips it into BENDR's bottom-up frame so
@@ -553,8 +714,34 @@ pub fn pattern_synth_pixel(
     let fy = 0.2 + q.freq_y * q.freq_y * 40.0;
     let ph = q.phase;
     let nf = q.symmetry.floor().max(1.0);
-    let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
-    let ang = p[1].atan2(p[0]) / PATTERN_TAU + 0.5;
+    // Polar coordinates contain a square root and atan2. Only the named polar
+    // shapes pay for them; Cartesian, Mandelbrot, and splat layers skip that
+    // full-resolution serial work entirely.
+    let r = if matches!(
+        q.shape,
+        PatternShape::Radial
+            | PatternShape::Spiral
+            | PatternShape::Plasma
+            | PatternShape::Rings
+            | PatternShape::Starburst
+            | PatternShape::Tunnel
+            | PatternShape::Polygon
+    ) {
+        (p[0] * p[0] + p[1] * p[1]).sqrt()
+    } else {
+        0.0
+    };
+    let ang = if matches!(
+        q.shape,
+        PatternShape::Radial
+            | PatternShape::Spiral
+            | PatternShape::Starburst
+            | PatternShape::Tunnel
+    ) {
+        p[1].atan2(p[0]) / PATTERN_TAU + 0.5
+    } else {
+        0.0
+    };
     let wv = |x: f32| pattern_waveform(q.wave, q.pulse_width, x);
     // The shape stage.
     let mut mandelbrot_interior = false;
@@ -627,6 +814,8 @@ pub fn pattern_synth_pixel(
             mandelbrot_interior = interior;
             signal
         }
+        PatternShape::MemorySplats => memory_splats_signal(p, fx, q.freq_y, ph, t, q.cross_mod),
+        PatternShape::GaussianSplats => gaussian_splats_signal(p, fx, q.freq_y, ph, t, q.cross_mod),
     };
     // Wavefolder: keeps folding the signal back on itself, which is where the
     // hard banded video-synth structure comes from.
@@ -760,6 +949,8 @@ impl PatternShape {
             Self::Interference => "interference",
             Self::Polygon => "polygon",
             Self::Mandelbrot => "mandelbrot",
+            Self::MemorySplats => "memory_splats",
+            Self::GaussianSplats => "gaussian_splats",
         }
     }
 
@@ -930,13 +1121,23 @@ mod tests {
     }
 
     #[test]
-    fn shape_wave_color_codes_keep_the_frozen_bendr_prefix_and_append_mandelbrot() {
+    fn shape_wave_color_codes_keep_the_frozen_prefix_and_append_new_generators() {
         let shape_codes: Vec<u32> = PatternShape::ALL.iter().map(|s| s.gpu_code()).collect();
-        assert_eq!(shape_codes, (0..13).collect::<Vec<u32>>());
+        assert_eq!(shape_codes, (0..15).collect::<Vec<u32>>());
         assert_eq!(PatternShape::Mandelbrot.gpu_code(), 12);
+        assert_eq!(PatternShape::MemorySplats.gpu_code(), 13);
+        assert_eq!(PatternShape::GaussianSplats.gpu_code(), 14);
         assert_eq!(
             PatternShape::from_key("mandelbrot"),
             Some(PatternShape::Mandelbrot)
+        );
+        assert_eq!(
+            PatternShape::from_key("memory_splats"),
+            Some(PatternShape::MemorySplats)
+        );
+        assert_eq!(
+            PatternShape::from_key("gaussian_splats"),
+            Some(PatternShape::GaussianSplats)
         );
         let wave_codes: Vec<u32> = PatternWave::ALL.iter().map(|w| w.gpu_code()).collect();
         assert_eq!(wave_codes, (0..6).collect::<Vec<u32>>());
@@ -1010,6 +1211,53 @@ mod tests {
         );
         assert_eq!(pixel[0], pixel[1]);
         assert_eq!(pixel[1], pixel[2]);
+    }
+
+    #[test]
+    fn splat_fields_are_bounded_deterministic_moving_and_rate_freezable() {
+        for shape in [PatternShape::MemorySplats, PatternShape::GaussianSplats] {
+            let params = PatternSynthParams {
+                shape,
+                color_mode: PatternColorMode::Mono,
+                freq_x: 0.42,
+                freq_y: 0.58,
+                rate: 0.73,
+                cross_mod: 0.67,
+                ..PatternSynthParams::default()
+            };
+            let mut lit = false;
+            let mut moved = false;
+            for y in 0..9 {
+                for x in 0..16 {
+                    let uv = [(x as f32 + 0.5) / 16.0, (y as f32 + 0.5) / 9.0];
+                    let first = pattern_synth_pixel(&params, uv, ASPECT, 1.25);
+                    let repeat = pattern_synth_pixel(&params, uv, ASPECT, 1.25);
+                    let later = pattern_synth_pixel(&params, uv, ASPECT, 2.75);
+                    assert_eq!(first, repeat, "{shape:?} must be deterministic");
+                    for channel in first.into_iter().chain(later) {
+                        assert!(
+                            channel.is_finite() && (0.0..=1.0).contains(&channel),
+                            "{shape:?} emitted {channel}"
+                        );
+                    }
+                    lit |= first[0] > 0.01 || later[0] > 0.01;
+                    moved |= (first[0] - later[0]).abs() > 1.0e-4;
+                }
+            }
+            assert!(lit, "{shape:?} must produce visible splats");
+            assert!(moved, "{shape:?} must move with program time");
+
+            let frozen = PatternSynthParams {
+                rate: 0.0,
+                ..params
+            };
+            let uv = [0.371, 0.629];
+            assert_eq!(
+                pattern_synth_pixel(&frozen, uv, ASPECT, 0.0),
+                pattern_synth_pixel(&frozen, uv, ASPECT, 999.0),
+                "{shape:?} with zero rate must be time-invariant"
+            );
+        }
     }
 
     #[test]

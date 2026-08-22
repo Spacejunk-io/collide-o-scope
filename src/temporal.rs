@@ -558,12 +558,47 @@ pub struct TemporalResetPolicy {
     pub downbeat: TemporalEventResetMode,
 }
 
+/// Photographic long-exposure ghosting over the clean fixed-rate history.
+///
+/// `shutter_frames` counts the virtual current frame plus prior 30 Hz ring
+/// samples. The shader clamps it against initialized history, so startup is
+/// deterministic. The shader evaluates short shutters exactly and uniformly
+/// stratifies longer ones into at most eight total samples, so the maximum
+/// per-pixel work stays independent of the 24-frame authored span.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LongExposureParams {
+    pub amount: f32,
+    pub shutter_frames: u8,
+}
+
+impl Default for LongExposureParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            shutter_frames: 12,
+        }
+    }
+}
+
+impl LongExposureParams {
+    pub(crate) fn sanitized(self) -> Self {
+        Self {
+            amount: finite_or(self.amount, 0.0).clamp(0.0, 1.0),
+            shutter_frames: self.shutter_frames.clamp(2, TEMPORAL_HISTORY_LEN as u8),
+        }
+    }
+}
+
 /// M3 authoring contract. Every member defaults to a strict zero/no-op.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TemporalOriginalsParams {
     pub loom: TemporalLoomParams,
     pub atlas: CollisionAtlasParams,
     pub garden: RefreshGardenParams,
+    /// Bounded photographic integration over the clean 30 Hz history ring.
+    /// Amount zero is an exact no-op; the runtime never allocates a second
+    /// history and never samples an unwritten layer.
+    pub long_exposure: LongExposureParams,
     pub score: CollisionScoreParams,
     pub reset: TemporalResetPolicy,
 }
@@ -574,6 +609,7 @@ impl TemporalOriginalsParams {
             loom: self.loom.sanitized(),
             atlas: self.atlas.sanitized(),
             garden: self.garden.sanitized(),
+            long_exposure: self.long_exposure.sanitized(),
             score: self.score.sanitized(),
             reset: self.reset,
         }
@@ -583,6 +619,7 @@ impl TemporalOriginalsParams {
         self.loom.amount == 0.0
             && self.atlas.amount == 0.0
             && self.garden.amount == 0.0
+            && self.long_exposure.amount == 0.0
             && !self.score.enabled
     }
 }
@@ -1241,7 +1278,7 @@ impl TemporalRigGpuUniforms {
 /// frozen; originals live in a second fixed binding so a zero/default patch
 /// can keep executing the old shader and pipeline literally unchanged.
 ///
-/// Every member is a complete 16-byte lane, mirroring eight WGSL vec4 values
+/// Every member is a complete 16-byte lane, mirroring nine WGSL vec4 values
 /// without relying on host-specific struct padding.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1262,9 +1299,11 @@ pub(crate) struct TemporalOriginalsGpuUniforms {
     pub garden_values: [f32; 4],
     /// gate, max hold ticks, observation ticks, packed runtime signals
     pub garden_modes: [u32; 4],
+    /// amount, shutter frames (current inclusive), reserved, reserved
+    pub long_exposure_values: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<TemporalOriginalsGpuUniforms>() == 128);
+const _: () = assert!(std::mem::size_of::<TemporalOriginalsGpuUniforms>() == 144);
 
 impl TemporalOriginalsGpuUniforms {
     #[allow(
@@ -1344,6 +1383,12 @@ impl TemporalOriginalsGpuUniforms {
                 params.garden.max_hold_ticks,
                 observation_ticks,
                 pack_garden_runtime(audio_energy, audio_onset, force_garden_refresh),
+            ],
+            long_exposure_values: [
+                params.long_exposure.amount,
+                f32::from(params.long_exposure.shutter_frames),
+                0.0,
+                0.0,
             ],
         }
     }
@@ -1813,6 +1858,26 @@ pub(crate) fn temporal_read_snapshot(
         },
         key_reference: temporal_key_reference_layer(previous_write, previous_valid, key_history),
     }
+}
+
+/// CPU reference for the Amdahl-bounded long-exposure sampling law. The
+/// returned ages exclude the virtual current frame (age zero). Short shutters
+/// visit every initialized age; shutters above eight total samples retain the
+/// endpoints and distribute seven history reads uniformly over the interval.
+#[cfg(test)]
+pub(crate) fn long_exposure_sample_ages(shutter_frames: u8, virtual_valid: u32) -> Vec<u32> {
+    if virtual_valid <= 1 {
+        return Vec::new();
+    }
+    let requested = u32::from(shutter_frames.clamp(2, TEMPORAL_HISTORY_LEN as u8));
+    let available = requested.min(virtual_valid.min(TEMPORAL_HISTORY_LEN));
+    let sample_count = available.min(8);
+    (1..sample_count)
+        .map(|sample_index| {
+            ((sample_index as f32 * (available - 1) as f32 / (sample_count - 1) as f32).round())
+                as u32
+        })
+        .collect()
 }
 
 /// The one hostile-dt law. It is shared with the gesture recorder so both
@@ -2378,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn originals_uniform_is_eight_explicit_vec4_lanes_and_sanitizes_controls() {
+    fn originals_uniform_is_nine_explicit_vec4_lanes_and_sanitizes_controls() {
         let params = TemporalOriginalsParams {
             loom: TemporalLoomParams {
                 amount: f32::NAN,
@@ -2395,6 +2460,10 @@ mod tests {
                 seed: 0,
                 territories: 0,
                 collision: f32::NAN,
+            },
+            long_exposure: LongExposureParams {
+                amount: f32::NAN,
+                shutter_frames: 0,
             },
             ..TemporalOriginalsParams::default()
         };
@@ -2413,7 +2482,7 @@ mod tests {
             false,
             0,
         );
-        assert_eq!(std::mem::size_of::<TemporalOriginalsGpuUniforms>(), 128);
+        assert_eq!(std::mem::size_of::<TemporalOriginalsGpuUniforms>(), 144);
         assert_eq!(
             std::mem::offset_of!(TemporalOriginalsGpuUniforms, loom_values),
             0
@@ -2446,11 +2515,16 @@ mod tests {
             std::mem::offset_of!(TemporalOriginalsGpuUniforms, garden_modes),
             112
         );
+        assert_eq!(
+            std::mem::offset_of!(TemporalOriginalsGpuUniforms, long_exposure_values),
+            128
+        );
         assert_eq!(uniforms.loom_values, [0.0, 1.0, 0.0, 1.0]);
         assert_eq!(uniforms.loom_geometry, [0.0, 16.0 / 9.0, 0.0, 0.0]);
         assert_eq!(uniforms.loom_modes, [0, 0, 1, 24]);
         assert_eq!(uniforms.atlas_values, [0.0, 0.0, 0.0, 0.0]);
         assert_eq!(uniforms.atlas_modes[0..2], [0, 1]);
+        assert_eq!(uniforms.long_exposure_values, [0.0, 2.0, 0.0, 0.0]);
         assert_eq!(uniforms.score_runtime[1..], [3, 0x5566_7788, 0x1122_3344]);
         assert_eq!(uniforms.garden_modes[2], 7);
     }
@@ -2961,6 +3035,22 @@ mod tests {
         assert_eq!(legacy.matches("textureLoad(feedback_tex").count(), 4);
         assert!(originals.contains("@group(1) @binding(0) var<uniform> u"));
         assert!(originals.contains("@group(1) @binding(1) var<uniform> originals"));
+        assert!(originals.contains("long_exposure_values: vec4f"));
+        assert_eq!(
+            originals
+                .matches("for (var sample_index = 1u; sample_index < 8u")
+                .count(),
+            2
+        );
+        assert_eq!(
+            originals
+                .matches("let sample_count = min(available, 8u)")
+                .count(),
+            2
+        );
+        assert!(originals.contains("let available = min(requested, u32(u.valid_history))"));
+        assert_eq!(originals.matches("textureLoad(history_tex").count(), 1);
+        assert!(originals.contains("let coords = min(vec2u(normalized * vec2f(dimensions))"));
         assert!(originals.contains("for (var y_offset = -1; y_offset <= 1"));
         assert!(originals.contains("for (var x_offset = -1; x_offset <= 1"));
         assert!(!originals.contains("atlas_tex"));
@@ -3229,6 +3319,54 @@ mod tests {
         state.discard_staged();
         let ramp_plan = state.stage_frame(&ramp_params, running(1.0 / 30.0), [1_920, 1_080]);
         assert_eq!(ramp_plan.originals_uniforms.atlas_values[2], 0.0);
+    }
+
+    #[test]
+    fn long_exposure_is_additive_bounded_and_neutral_by_default() {
+        let default_plan = TemporalState::default().stage_frame(
+            &TemporalParams::default(),
+            running(1.0 / 30.0),
+            [1_920, 1_080],
+        );
+        assert!(!default_plan.originals_shader_active);
+        assert_eq!(default_plan.originals_uniforms.long_exposure_values[0], 0.0);
+
+        let params = TemporalParams {
+            originals: TemporalOriginalsParams {
+                long_exposure: LongExposureParams {
+                    amount: 0.75,
+                    shutter_frames: u8::MAX,
+                },
+                ..TemporalOriginalsParams::default()
+            },
+            ..TemporalParams::default()
+        };
+        let plan =
+            TemporalState::default().stage_frame(&params, running(1.0 / 30.0), [1_920, 1_080]);
+        assert!(!plan.legacy_shader_active);
+        assert!(plan.originals_shader_active);
+        assert_eq!(plan.originals_uniforms.long_exposure_values[0], 0.75);
+        assert_eq!(
+            plan.originals_uniforms.long_exposure_values[1],
+            TEMPORAL_HISTORY_LEN as f32
+        );
+
+        let dry = TemporalParams::default();
+        assert_eq!(dry.originals.long_exposure, LongExposureParams::default());
+        assert!(dry.originals.is_zero());
+
+        assert!(long_exposure_sample_ages(24, 1).is_empty());
+        assert_eq!(long_exposure_sample_ages(5, 24), vec![1, 2, 3, 4]);
+        assert_eq!(
+            long_exposure_sample_ages(24, 24),
+            vec![3, 7, 10, 13, 16, 20, 23]
+        );
+        for valid in 0..=TEMPORAL_HISTORY_LEN {
+            let ages = long_exposure_sample_ages(24, valid);
+            assert!(ages.len() <= 7, "at most seven ring reads plus current");
+            assert!(ages.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(ages.iter().all(|age| *age < valid.max(1)));
+        }
     }
 
     #[test]
@@ -3509,7 +3647,11 @@ mod tests {
                     [1_920, 1_080],
                 );
                 hash.update(bytemuck::bytes_of(&plan.uniforms));
-                hash.update(bytemuck::bytes_of(&plan.originals_uniforms));
+                // Keep this pre-Long-Exposure sequence frozen over the
+                // established eight Originals lanes. The new ninth lane has
+                // its own active/default and live/export parity proofs above,
+                // so an additive neutral tail does not rewrite this golden.
+                hash.update(&bytemuck::bytes_of(&plan.originals_uniforms)[..128]);
                 hash.update([
                     match plan.action {
                         TemporalFrameAction::PrimeFrozenOutput => 0,

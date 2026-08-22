@@ -38,7 +38,11 @@ use crate::visual_rack::{
     RuntimeVisualNodeKind, RuntimeVisualRack, NODE_PARAM_DESCRIPTORS,
 };
 
-pub const NUM_LFOS: usize = 4;
+/// Number of routable LFO lanes. The first four lanes are the original public
+/// vocabulary; lanes 5–8 are append-only additions and start neutral because
+/// a default matrix contains no routings.
+pub const NUM_LFOS: usize = 8;
+pub const LEGACY_NUM_LFOS: usize = 4;
 pub const MAX_ROUTINGS: usize = 64;
 pub const AUDIO_SOURCE_LIVE: &str = "live";
 pub const AUDIO_SOURCE_FILE: &str = "file";
@@ -165,6 +169,7 @@ pub const TARGETS: &[(&str, f32, f32)] = &[
     ("temporal_garden_threshold", 0.0, 1.0),
     ("temporal_garden_softness", 0.0, 0.5),
     ("temporal_garden_decay", 0.0, 1.0),
+    ("temporal_long_exposure_amount", 0.0, 1.0),
     // B4 display physics: the seventeen continuous controls. The interlace
     // mode, the field-order fault, and the display model are discrete
     // authored laws with no address.
@@ -2231,6 +2236,12 @@ pub const MONITOR_SOURCE_LIST: &[ModSource] = &[
     ModSource::VideoMotion,
     ModSource::VideoBrightness,
     ModSource::VideoCut,
+    // Appended rather than inserted beside LFO 1–4 so every established
+    // monitoring-bay positional index remains stable.
+    ModSource::Lfo(4),
+    ModSource::Lfo(5),
+    ModSource::Lfo(6),
+    ModSource::Lfo(7),
 ];
 
 impl ModSource {
@@ -2240,6 +2251,10 @@ impl ModSource {
             "lfo1" => Self::Lfo(1),
             "lfo2" => Self::Lfo(2),
             "lfo3" => Self::Lfo(3),
+            "lfo4" => Self::Lfo(4),
+            "lfo5" => Self::Lfo(5),
+            "lfo6" => Self::Lfo(6),
+            "lfo7" => Self::Lfo(7),
             "audio_level" => Self::AudioLevel,
             "audio_bass" => Self::AudioBass,
             "audio_mid" => Self::AudioMid,
@@ -2293,7 +2308,11 @@ impl ModSource {
             Self::Lfo(0) => "lfo0",
             Self::Lfo(1) => "lfo1",
             Self::Lfo(2) => "lfo2",
-            Self::Lfo(_) => "lfo3",
+            Self::Lfo(3) => "lfo3",
+            Self::Lfo(4) => "lfo4",
+            Self::Lfo(5) => "lfo5",
+            Self::Lfo(6) => "lfo6",
+            Self::Lfo(_) => "lfo7",
             Self::AudioLevel => "audio_level",
             Self::AudioBass => "audio_bass",
             Self::AudioMid => "audio_mid",
@@ -4632,6 +4651,7 @@ fn apply_offset(
         "temporal_garden_threshold" => &mut tp.originals.garden.threshold,
         "temporal_garden_softness" => &mut tp.originals.garden.softness,
         "temporal_garden_decay" => &mut tp.originals.garden.decay,
+        "temporal_long_exposure_amount" => &mut tp.originals.long_exposure.amount,
         "display_il_amount" => &mut tp.display.il_amount,
         "display_il_twitter" => &mut tp.display.il_twitter,
         "display_il_judder" => &mut tp.display.il_judder,
@@ -4699,11 +4719,22 @@ mod tests {
             lfo.value(0.0, 0).to_bits(),
             lfo.value(4.0, 0).to_bits(),
             lfo.value(8.0, 0).to_bits(),
+            lfo.value(0.0, 1).to_bits(),
             lfo.value(0.0, 2).to_bits(),
+            lfo.value(0.0, 3).to_bits(),
+            lfo.value(0.0, 7).to_bits(),
         ];
         assert_eq!(
             observed,
-            [0x3f7e_a360, 0x3e14_9bd0, 0xbf45_a34b, 0x3f7b_ea1f]
+            [
+                0x3f7e_a360,
+                0x3e14_9bd0,
+                0xbf45_a34b,
+                0x3f7d_46bf,
+                0x3f7b_ea1f,
+                0x3f7a_8d7f,
+                0x3f75_1afd,
+            ]
         );
     }
 
@@ -5580,6 +5611,7 @@ mod tests {
             ("temporal_garden_threshold", (0.0, 1.0)),
             ("temporal_garden_softness", (0.0, 0.5)),
             ("temporal_garden_decay", (0.0, 1.0)),
+            ("temporal_long_exposure_amount", (0.0, 1.0)),
             ("layer1_fps", (1.0, 240.0)),
             ("layer1_key", (0.0, 1.0)),
             ("layer1_key_threshold", (0.0, 1.0)),
@@ -7621,7 +7653,25 @@ mod tests {
     fn the_monitor_source_list_is_complete_stable_and_pure_to_read() {
         // Every distinct live source exactly once (legacy band aliases
         // excluded), every name round-tripping through the closed parser.
-        assert_eq!(MONITOR_SOURCE_LIST.len(), 45);
+        assert_eq!(MONITOR_SOURCE_LIST.len(), 49);
+        assert_eq!(
+            &MONITOR_SOURCE_LIST[..LEGACY_NUM_LFOS],
+            &[
+                ModSource::Lfo(0),
+                ModSource::Lfo(1),
+                ModSource::Lfo(2),
+                ModSource::Lfo(3)
+            ]
+        );
+        assert_eq!(
+            &MONITOR_SOURCE_LIST[MONITOR_SOURCE_LIST.len() - 4..],
+            &[
+                ModSource::Lfo(4),
+                ModSource::Lfo(5),
+                ModSource::Lfo(6),
+                ModSource::Lfo(7)
+            ]
+        );
         let mut names = std::collections::HashSet::new();
         for source in MONITOR_SOURCE_LIST {
             let name = source.as_str();
@@ -7632,6 +7682,8 @@ mod tests {
                 "monitor source {name} must round-trip"
             );
         }
+        assert_eq!(ModSource::try_from_str("lfo7"), Some(ModSource::Lfo(7)));
+        assert_eq!(ModSource::try_from_str("lfo8"), None);
         // Reading the strip perturbs nothing: two reads of an untouched
         // matrix are identical.
         let matrix = ModMatrix::new();

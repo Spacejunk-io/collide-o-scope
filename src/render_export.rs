@@ -6426,7 +6426,6 @@ fn run_export(
         };
         debug_assert_eq!(evaluated_frame.context().output_size, [w, h]);
         let mod_ntsc = evaluated_frame.ntsc().clone();
-        let mod_temporal = *evaluated_frame.temporal();
         // The B14 sync latch draws its faults on the master random seed,
         // taken from the same immutable frame sample every other consumer
         // reads, so live and offline draw the identical fault stream.
@@ -6481,6 +6480,10 @@ fn run_export(
                 Some("export codec field set changed after immutable fallback planning".to_owned());
             break;
         }
+        // The same composition plan that routes the inherited master prefix
+        // owns the linked Temporal-bypass law. This copy is neutral only for
+        // the rendered frame; authored/modulated temporal state stays intact.
+        let mod_temporal = evaluated_composition.effective_temporal();
         for warning in export_motion_plan_warnings(&evaluated_composition) {
             if emitted_motion_warnings.insert(warning.clone()) {
                 progress.record_warning(warning);
@@ -8826,9 +8829,9 @@ mod tests {
     fn temporal_event_acceptance_params() -> crate::effects::params::TemporalParams {
         use crate::temporal::{
             CollisionAtlasParams, CollisionScoreLoopDriver, CollisionScoreParams,
-            CollisionScoreTrigger, RefreshGardenGate, RefreshGardenParams, TemporalEventResetMode,
-            TemporalInterpolation, TemporalLoomParams, TemporalOriginalsParams,
-            TemporalResetPolicy, TemporalTopology,
+            CollisionScoreTrigger, LongExposureParams, RefreshGardenGate, RefreshGardenParams,
+            TemporalEventResetMode, TemporalInterpolation, TemporalLoomParams,
+            TemporalOriginalsParams, TemporalResetPolicy, TemporalTopology,
         };
 
         crate::effects::params::TemporalParams {
@@ -8861,6 +8864,10 @@ mod tests {
                     decay: 0.91,
                     max_hold_ticks: 17,
                     ..RefreshGardenParams::default()
+                },
+                long_exposure: LongExposureParams {
+                    amount: 0.62,
+                    shutter_frames: 17,
                 },
                 score: CollisionScoreParams {
                     enabled: true,
@@ -9005,6 +9012,16 @@ mod tests {
             let live_plan = live_state.stage_frame(&params, live_input, [320, 180]);
             let export_plan = export_state.stage_frame(&params, export_input, [320, 180]);
             assert_eq!(live_plan, export_plan, "frame {frame} at {fps} fps");
+            assert_eq!(
+                live_plan.originals_uniforms.long_exposure_values,
+                [0.62, 17.0, 0.0, 0.0],
+                "live Long Exposure uniforms drifted at frame {frame}, {fps} fps"
+            );
+            assert_eq!(
+                export_plan.originals_uniforms.long_exposure_values,
+                live_plan.originals_uniforms.long_exposure_values,
+                "export Long Exposure uniforms diverged at frame {frame}, {fps} fps"
+            );
             consumed_boundaries =
                 consumed_boundaries.saturating_add(u64::from(live_plan.score_events_consumed));
             live_state.commit_staged();
@@ -9025,7 +9042,8 @@ mod tests {
     }
 
     #[test]
-    fn m3_event_acceptance_live_export_score_resets_and_freezes_replay_at_24_30_60() {
+    fn m3_event_acceptance_live_export_long_exposure_uniforms_score_resets_and_freezes_replay_at_24_30_60(
+    ) {
         for fps in [24_u32, 30, 60] {
             let first = temporal_live_export_acceptance_trace(fps);
             let replay = temporal_live_export_acceptance_trace(fps);
@@ -17065,10 +17083,10 @@ layers:
 
         fn matrix_with_positive_lfo() -> ModMatrix {
             let mut matrix = ModMatrix::new();
-            matrix.lfos[0].set_phase(0.25);
+            matrix.lfos[7].set_phase(0.25);
             matrix
                 .routings
-                .push(Routing::new(ModSource::Lfo(0), "brightness", 1.0));
+                .push(Routing::new(ModSource::Lfo(7), "brightness", 1.0));
             matrix
         }
 
@@ -17678,6 +17696,7 @@ layers:
             morph: None,
             snapshot_bank: None,
             scenes: crate::performance::Scenes::default(),
+            autopilot: crate::performance::AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -17802,6 +17821,7 @@ mod effects_audit {
             morph: None,
             snapshot_bank: None,
             scenes: crate::performance::Scenes::default(),
+            autopilot: crate::performance::AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),

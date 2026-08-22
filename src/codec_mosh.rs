@@ -417,6 +417,10 @@ pub struct MoshFrameMetadata {
     pub ordinal: u64,
     /// The master `random_seed` sampled with the frame.
     pub seed: u32,
+    /// One continuous armed interval. Linked Temporal dry deliberately keeps
+    /// the broader visual epoch stable, so this narrower generation prevents
+    /// a delayed pre-dry job from resurfacing after re-entry.
+    pub generation: u64,
     /// When the live global-VHS path is active while the mosh is armed, the
     /// worker runs the VHS kernel first in the same hop — one admission, one
     /// frame of latency, and the exact offline ordering (VHS, then mosh, on
@@ -430,6 +434,7 @@ pub struct MoshFrameMetadata {
 pub struct MoshProcessedFrame {
     pub pixels: Vec<u8>,
     pub epoch: u64,
+    pub generation: u64,
 }
 
 struct MoshJob {
@@ -892,6 +897,7 @@ fn mosh_worker_process(
     Ok(MoshProcessedFrame {
         pixels,
         epoch: job.epoch,
+        generation: job.metadata.generation,
     })
 }
 
@@ -906,7 +912,17 @@ impl MoshWorker {
             .spawn(move || {
                 let mut engine: Option<MoshEngine> = None;
                 let mut ntsc_state = crate::ntsc::NtscState::new();
+                let mut active_generation: Option<(u64, u64)> = None;
                 while let Ok(job) = job_rx.recv() {
+                    // A re-armed interval starts from a fresh codec/VHS state.
+                    // Old work may finish, but its tagged result is rejected by
+                    // the host and can never seed the new interval's codec.
+                    let job_generation = (job.epoch, job.metadata.generation);
+                    if active_generation != Some(job_generation) {
+                        engine = None;
+                        ntsc_state = crate::ntsc::NtscState::new();
+                        active_generation = Some(job_generation);
+                    }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         mosh_worker_process(&mut engine, &mut ntsc_state, job)
                     }))
@@ -1354,6 +1370,7 @@ mod tests {
             },
             ordinal: 0,
             seed: 1,
+            generation: 1,
             ntsc: None,
         };
         // A hostile job (length mismatch) is a typed processing error: the

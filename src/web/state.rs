@@ -10,7 +10,9 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::effects::EffectUniforms;
 use crate::image_routing::{LayerImageStage, MatteChannel};
-use crate::performance::{ClipSlotId, SavedLayerPosition, SceneId};
+use crate::performance::{
+    autopilot::AutopilotState, AutopilotPlan, ClipSlotId, SavedLayerPosition, SceneId,
+};
 use crate::spatial::{FitMode, SpatialTransform};
 use crate::transport::{ClipTransportConfig, CueId, NormalizedTime, SourceTimecode, TriggerMode};
 use crate::visual_rack::EdgeTiming;
@@ -2520,6 +2522,21 @@ pub struct RefreshGardenSnapshot {
     pub motion_route: RefreshGardenMotionRouteSnapshot,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LongExposureSnapshot {
+    pub amount: f32,
+    pub shutter_frames: u8,
+}
+
+impl Default for LongExposureSnapshot {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            shutter_frames: 12,
+        }
+    }
+}
+
 impl Default for RefreshGardenSnapshot {
     fn default() -> Self {
         Self {
@@ -2620,6 +2637,7 @@ pub struct TemporalOriginalsSnapshot {
     pub loom: TemporalLoomSnapshot,
     pub atlas: CollisionAtlasSnapshot,
     pub garden: RefreshGardenSnapshot,
+    pub long_exposure: LongExposureSnapshot,
     pub score: CollisionScoreSnapshot,
     pub reset: TemporalResetPolicySnapshot,
 }
@@ -3006,6 +3024,10 @@ impl TemporalSnapshot {
                     max_hold_ticks: p.originals.garden.max_hold_ticks,
                     matte_route,
                     motion_route,
+                },
+                long_exposure: LongExposureSnapshot {
+                    amount: p.originals.long_exposure.amount,
+                    shutter_frames: p.originals.long_exposure.shutter_frames,
                 },
                 score: CollisionScoreSnapshot {
                     enabled: p.originals.score.enabled,
@@ -3750,7 +3772,8 @@ pub struct LayerSnapshot {
     pub filename: String,
     pub visible: bool,
     /// True when the layer skips Digital/Analog/Cellular/Motion/VHS master
-    /// processing. The later program-wide Temporal stage still applies.
+    /// processing. Any contributing bypass links the complete shared
+    /// program Temporal family dry while its history continues to warm.
     #[serde(default)]
     pub bypass_master_fx: bool,
     /// Video-only deterministic pattern reroll at each decoded loop boundary.
@@ -3972,6 +3995,55 @@ pub struct SceneSnapshot {
     pub status: String,
 }
 
+/// Serializable browser vocabulary for the pure Autopilot scheduler state.
+/// Keeping the wire enum here lets the domain scheduler remain free of web
+/// serialization concerns while Main performs one exhaustive conversion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutopilotPhaseSnapshot {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+    Paused,
+    Stalled,
+    Faulted,
+    Complete,
+}
+
+impl From<AutopilotState> for AutopilotPhaseSnapshot {
+    fn from(state: AutopilotState) -> Self {
+        match state {
+            AutopilotState::Stopped => Self::Stopped,
+            AutopilotState::Starting => Self::Starting,
+            AutopilotState::Running => Self::Running,
+            AutopilotState::Paused => Self::Paused,
+            AutopilotState::Stalled => Self::Stalled,
+            AutopilotState::Faulted => Self::Faulted,
+            AutopilotState::Complete => Self::Complete,
+        }
+    }
+}
+
+/// Authored sequence plus session-only transport truth shown by the browser.
+/// Step positions are zero-based indices into `plan.steps`; the stable Scene
+/// IDs remain in the plan and are never replaced by transient live identities.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutopilotSnapshot {
+    #[serde(default)]
+    pub plan: AutopilotPlan,
+    #[serde(default)]
+    pub phase: AutopilotPhaseSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beats_remaining: Option<u64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerformanceSnapshot {
     #[serde(default)]
@@ -3980,6 +4052,9 @@ pub struct PerformanceSnapshot {
     pub prepared_scene_id: Option<SceneId>,
     #[serde(default)]
     pub pending_scene_id: Option<SceneId>,
+    /// Scene-only beat Autopilot authoring and session transport state.
+    #[serde(default)]
+    pub autopilot: AutopilotSnapshot,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
     /// Atomic Scene prepare/quantize/commit/rejection status.
@@ -4330,6 +4405,20 @@ pub enum WebAction {
         #[serde(default)]
         trigger_mode: Option<TriggerMode>,
     },
+    /// Replace the complete bounded authored Scene sequence as one ordered,
+    /// history-bearing transaction. Partial row edits never cross the wire.
+    #[serde(rename = "replace_autopilot_plan")]
+    ReplaceAutopilotPlan { plan: AutopilotPlan },
+    /// Start from the beginning, or resume the explicitly paused sequence.
+    /// Main owns validation, preparation, and the future-beat release law.
+    #[serde(rename = "autopilot_play")]
+    AutopilotPlay,
+    /// Hold cursor/countdown while retaining the one prepared lookahead.
+    #[serde(rename = "autopilot_pause")]
+    AutopilotPause,
+    /// Stop and return the cursor to step zero without changing visible media.
+    #[serde(rename = "autopilot_reset")]
+    AutopilotReset,
     /// Add a live Spout receiver layer by sender name.
     #[serde(rename = "add_spout_layer")]
     AddSpoutLayer { sender: String },
@@ -5318,6 +5407,9 @@ impl WebAction {
                 | Self::SeekClipSlotTimecode { .. }
                 | Self::PrepareScene { .. }
                 | Self::TriggerScene { .. }
+                | Self::AutopilotPlay
+                | Self::AutopilotPause
+                | Self::AutopilotReset
                 | Self::TapTempo
                 | Self::Gyro { .. }
                 | Self::GyroStream { .. }
@@ -5420,6 +5512,10 @@ impl WebAction {
             | Self::CaptureScene { .. }
             | Self::RemoveScene { .. }
             | Self::TriggerScene { .. }
+            | Self::ReplaceAutopilotPlan { .. }
+            | Self::AutopilotPlay
+            | Self::AutopilotPause
+            | Self::AutopilotReset
             | Self::SetLayerMatteInput { .. }
             | Self::InsertVisualNode { .. }
             | Self::RemoveVisualNode { .. }
@@ -6580,6 +6676,8 @@ mod protocol_tests {
         params.originals.loom.interpolation = crate::effects::params::TemporalInterpolation::Linear;
         params.originals.atlas.seed = 0xdead_beef;
         params.originals.garden.gate = crate::effects::params::RefreshGardenGate::AudioOnset;
+        params.originals.long_exposure.amount = 0.6;
+        params.originals.long_exposure.shutter_frames = 19;
         params.originals.score.enabled = true;
         params.originals.score.trigger = crate::effects::params::CollisionScoreTrigger::Manual;
         let layer_id = crate::image_routing::StableLayerId::new(91).unwrap();
@@ -6605,6 +6703,8 @@ mod protocol_tests {
         assert_eq!(snapshot.originals.loom.interpolation, "linear");
         assert_eq!(snapshot.originals.atlas.seed, 0xdead_beef);
         assert_eq!(snapshot.originals.garden.gate, "audio_onset");
+        assert_eq!(snapshot.originals.long_exposure.amount, 0.6);
+        assert_eq!(snapshot.originals.long_exposure.shutter_frames, 19);
         assert_eq!(
             snapshot.originals.garden.matte_route,
             RefreshGardenMatteRouteSnapshot::SelectedLayer {
@@ -8429,7 +8529,9 @@ mod protocol_tests {
         // itself is a checkbox, so only these four move the HTML count. The
         // JS count is untouched — the group is static markup.
         // B15's snapshot bank added one more: the recall glide.
-        assert_eq!(assert_range_tags_are_bounded(html, true), 203);
+        // Long Exposure Ghosting adds its amount and bounded shutter-length
+        // sliders to the static Temporal Originals section.
+        assert_eq!(assert_range_tags_are_bounded(html, true), 205);
         assert_eq!(assert_range_tags_are_bounded(js, false), 24);
 
         for contract in [
@@ -8475,6 +8577,8 @@ mod protocol_tests {
             "data-temporal=\"loom_amount\"",
             "data-temporal=\"atlas_collision\"",
             "data-temporal=\"garden_decay\"",
+            "data-temporal=\"long_exposure_amount\"",
+            "data-temporal=\"long_exposure_frames\"",
             "data-temporal=\"score_state_count\"",
             "data-motion-param=\"shutter_angle\"",
             "id=\"audio-gain\"",
@@ -8710,7 +8814,7 @@ mod protocol_tests {
             "param: 'bypass_master_fx'",
             "...currentLayerSelector(card, layer, index)",
             "bypassMasterFx.checked = !!layer.bypass_master_fx",
-            "Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.",
+            "Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.",
         ] {
             assert!(js.contains(contract), "missing bypass UI contract: {contract}");
         }
@@ -9175,6 +9279,16 @@ mod protocol_tests {
         let value = serde_json::to_value(current).unwrap();
         assert_eq!(value["seed"], u32::MAX);
 
+        let mut matrix = crate::modulation::ModMatrix::new();
+        matrix.lfos[7].shape = crate::modulation::LfoShape::Square;
+        matrix.lfos[7].seed = 0x7654_3210;
+        matrix.update_at_beat(0.0, 1.0 / 30.0);
+        let snapshot = ModSnapshot::from_matrix(&matrix);
+        assert_eq!(snapshot.lfos.len(), crate::modulation::NUM_LFOS);
+        assert_eq!(snapshot.lfos[7].shape, "square");
+        assert_eq!(snapshot.lfos[7].seed, 0x7654_3210);
+        assert_eq!(snapshot.lfos[7].value, 1.0);
+
         let action: WebAction = serde_json::from_str(
             r#"{"action":"set_lfo","index":2,"param":"seed","value":4294967295}"#,
         )
@@ -9197,6 +9311,12 @@ mod protocol_tests {
             "sendAction({ action: 'set_lfo', index: i, param: 'seed', value: seed })",
             "seedInput.value = String(Number(lfo.seed || 0) >>> 0)",
             "seedInput.hidden = lfo.shape !== 'sample_hold'",
+            "const NUM_LFOS = 8;",
+            "for (let i = 0; i < NUM_LFOS; i++)",
+            "['lfo4', 'L5']",
+            "['lfo5', 'L6']",
+            "['lfo6', 'L7']",
+            "['lfo7', 'L8']",
         ] {
             assert!(
                 js.contains(contract),
@@ -10094,6 +10214,131 @@ mod protocol_tests {
     }
 
     #[test]
+    fn autopilot_protocol_replaces_one_bounded_plan_and_keeps_transport_history_free() {
+        let replace: WebAction = serde_json::from_str(
+            r#"{"action":"replace_autopilot_plan","plan":{"repeat":"once","steps":[{"scene_id":4,"hold_beats":2},{"scene_id":9}]}}"#,
+        )
+        .unwrap();
+        let WebAction::ReplaceAutopilotPlan { plan } = &replace else {
+            panic!("whole-plan action");
+        };
+        assert_eq!(plan.repeat, crate::performance::AutopilotRepeat::Once);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps.get(0).unwrap().scene_id.get(), 4);
+        assert_eq!(plan.steps.get(0).unwrap().hold_beats.get(), 2);
+        assert_eq!(
+            plan.steps.get(1).unwrap().hold_beats.get(),
+            crate::performance::DEFAULT_AUTOPILOT_HOLD_BEATS
+        );
+        assert!(replace.is_priority());
+        assert_eq!(replace.coalesce_key(), None);
+        assert!(
+            !replace.is_performance_only_for_history(),
+            "authored plan replacement must reach manual history"
+        );
+
+        for wire in [
+            r#"{"action":"autopilot_play"}"#,
+            r#"{"action":"autopilot_pause"}"#,
+            r#"{"action":"autopilot_reset"}"#,
+        ] {
+            let action: WebAction = serde_json::from_str(wire).unwrap();
+            assert!(action.is_priority(), "transport lacked reserve: {wire}");
+            assert!(
+                action.is_performance_only_for_history(),
+                "transport entered authored history: {wire}"
+            );
+            assert_eq!(action.coalesce_key(), None);
+        }
+
+        let mut saturated = vec![WebAction::AddRouting; MAX_PENDING_ACTIONS];
+        assert_eq!(
+            enqueue_bounded(&mut saturated, replace),
+            EnqueueOutcome::Added
+        );
+        assert!(matches!(
+            saturated.last(),
+            Some(WebAction::ReplaceAutopilotPlan { .. })
+        ));
+    }
+
+    #[test]
+    fn autopilot_wire_rejects_invalid_beats_ids_and_oversized_sequences() {
+        for invalid in [
+            r#"{"action":"replace_autopilot_plan","plan":{"steps":[{"scene_id":0,"hold_beats":4}]}}"#,
+            r#"{"action":"replace_autopilot_plan","plan":{"steps":[{"scene_id":1,"hold_beats":0}]}}"#,
+            r#"{"action":"replace_autopilot_plan","plan":{"steps":[{"scene_id":1,"hold_beats":257}]}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WebAction>(invalid).is_err(),
+                "invalid Autopilot wire was accepted: {invalid}"
+            );
+        }
+
+        let steps = (0..=crate::performance::MAX_AUTOPILOT_STEPS)
+            .map(|_| serde_json::json!({"scene_id": 1, "hold_beats": 4}))
+            .collect::<Vec<_>>();
+        assert!(
+            serde_json::from_value::<WebAction>(serde_json::json!({
+                "action": "replace_autopilot_plan",
+                "plan": {"repeat": "loop", "steps": steps}
+            }))
+            .is_err(),
+            "the web protocol must retain the domain allocation bound"
+        );
+    }
+
+    #[test]
+    fn autopilot_snapshot_defaults_legacy_clients_and_exhaustively_maps_runtime_phase() {
+        let legacy: PerformanceSnapshot = serde_json::from_str("{}").unwrap();
+        assert!(legacy.autopilot.plan.is_empty());
+        assert_eq!(legacy.autopilot.phase, AutopilotPhaseSnapshot::Stopped);
+        assert_eq!(legacy.autopilot.current_step, None);
+
+        for (runtime, snapshot, wire) in [
+            (
+                AutopilotState::Stopped,
+                AutopilotPhaseSnapshot::Stopped,
+                "stopped",
+            ),
+            (
+                AutopilotState::Starting,
+                AutopilotPhaseSnapshot::Starting,
+                "starting",
+            ),
+            (
+                AutopilotState::Running,
+                AutopilotPhaseSnapshot::Running,
+                "running",
+            ),
+            (
+                AutopilotState::Paused,
+                AutopilotPhaseSnapshot::Paused,
+                "paused",
+            ),
+            (
+                AutopilotState::Stalled,
+                AutopilotPhaseSnapshot::Stalled,
+                "stalled",
+            ),
+            (
+                AutopilotState::Faulted,
+                AutopilotPhaseSnapshot::Faulted,
+                "faulted",
+            ),
+            (
+                AutopilotState::Complete,
+                AutopilotPhaseSnapshot::Complete,
+                "complete",
+            ),
+        ] {
+            let mapped = AutopilotPhaseSnapshot::from(runtime);
+            assert_eq!(mapped, snapshot);
+            assert_eq!(serde_json::to_value(mapped).unwrap(), wire);
+        }
+    }
+
+    #[test]
     fn prepared_performance_ids_reject_zero_or_out_of_range_at_deserialization() {
         assert!(serde_json::from_str::<WebAction>(
             r#"{"action":"activate_clip_slot","layer_id":"7","slot_id":0}"#
@@ -10200,6 +10445,15 @@ mod protocol_tests {
             "id=\"scene-capture-name\"",
             "id=\"scene-capture-mode\"",
             "id=\"scene-capture-submit\"",
+            "id=\"autopilot-plan-form\"",
+            "id=\"autopilot-repeat\"",
+            "id=\"autopilot-step-list\" class=\"autopilot-step-list\" role=\"list\"",
+            "id=\"autopilot-add-step\"",
+            "id=\"autopilot-apply-plan\"",
+            "id=\"autopilot-play\"",
+            "id=\"autopilot-pause\"",
+            "id=\"autopilot-reset\"",
+            "id=\"autopilot-status\" class=\"scene-status autopilot-status\" role=\"status\" aria-live=\"polite\"",
         ] {
             assert!(html.contains(contract), "missing accessible HTML: {contract}");
         }
@@ -10219,6 +10473,7 @@ mod protocol_tests {
             "action: 'capture_scene'",
             "action: 'remove_scene'",
             "action: 'trigger_scene'",
+            "action: 'replace_autopilot_plan'",
             "action: 'set_layer_matte_param'",
             "action: 'set_layer_matte_input'",
         ] {
@@ -10235,8 +10490,16 @@ mod protocol_tests {
         assert!(js.contains("new TextEncoder().encode(name).length <= 128"));
         assert!(js.contains("class=\"scene-recapture\""));
         assert!(js.contains("class=\"scene-remove\""));
+        assert!(js.contains("sendAutopilotTransport('autopilot_play'"));
+        assert!(js.contains("sendAutopilotTransport('autopilot_pause'"));
+        assert!(js.contains("sendAutopilotTransport('autopilot_reset'"));
+        assert!(js.contains("Missing Scene ${sceneId} (kept)"));
+        assert!(js.contains("tombstone.dataset.tombstone = ''"));
         assert!(css.contains(".scene-row.pending"));
         assert!(css.contains(".scene-capture-form"));
+        assert!(css.contains(".autopilot-step-row.current"));
+        assert!(css.contains(".autopilot-step-row.next"));
+        assert!(css.contains(".autopilot-step-row.missing"));
         assert!(css.contains(".library-actions"));
         assert!(css.contains(".layer-performance-body[hidden]"));
         assert!(css.contains(".layer-matte-body[hidden]"));

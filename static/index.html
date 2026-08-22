@@ -108,6 +108,37 @@
         </form>
         <div class="scene-list" id="scene-list" role="list"></div>
         <div class="scene-status" id="scene-status" role="status" aria-live="polite">No authored scenes</div>
+        <section class="autopilot-panel" aria-labelledby="autopilot-title">
+          <div class="autopilot-heading">
+            <h4 id="autopilot-title">Autopilot</h4>
+            <span class="dim">Scene-only beat sequence</span>
+          </div>
+          <form id="autopilot-plan-form" class="autopilot-plan-form" aria-describedby="autopilot-help">
+            <label for="autopilot-repeat">End</label>
+            <select id="autopilot-repeat" aria-label="Autopilot end-of-sequence behavior">
+              <option value="loop">Loop</option>
+              <option value="once">Once</option>
+            </select>
+            <div id="autopilot-step-list" class="autopilot-step-list" role="list" aria-label="Ordered Autopilot Scene steps"></div>
+            <div class="autopilot-author-actions" role="group" aria-label="Autopilot sequence authoring">
+              <button id="autopilot-add-step" type="button">Add Step</button>
+              <button id="autopilot-apply-plan" type="submit">Apply Sequence</button>
+            </div>
+            <p id="autopilot-help" class="scene-capture-help">Each row recalls one stable Scene ID, then holds it for 1–256 accepted media beats. Missing Scenes remain visible until explicitly repaired or removed.</p>
+          </form>
+          <div class="autopilot-transport" role="group" aria-label="Autopilot transport">
+            <button id="autopilot-play" type="button" aria-label="Play or resume Autopilot">Play</button>
+            <button id="autopilot-pause" type="button" aria-label="Pause Autopilot">Pause</button>
+            <button id="autopilot-reset" type="button" aria-label="Reset Autopilot cursor without changing the visible Scene">Reset</button>
+          </div>
+          <dl class="autopilot-telemetry" aria-label="Autopilot state">
+            <div><dt>Phase</dt><dd id="autopilot-phase">Stopped</dd></div>
+            <div><dt>Current</dt><dd id="autopilot-current">—</dd></div>
+            <div><dt>Next</dt><dd id="autopilot-next">—</dd></div>
+            <div><dt>Beats</dt><dd id="autopilot-beats">—</dd></div>
+          </dl>
+          <div id="autopilot-status" class="scene-status autopilot-status" role="status" aria-live="polite">No authored Autopilot sequence</div>
+        </section>
       </section>
         <h3 class="panel-title">Library
           <label class="lib-upload-btn" title="Add clips to the library">+
@@ -1046,6 +1077,18 @@
               <div class="audio-status">History key compares the current frame with the selected prior frame, then gates the final temporal output.</div>
 
               <div class="temporal-originals" role="region" aria-label="Temporal originals">
+                <details class="temporal-study">
+                  <summary>Long Exposure Ghosting</summary>
+                  <div class="temporal-study-body">
+                    <div class="param-row" data-temporal="long_exposure_amount" data-min="0" data-max="1" data-step="0.01">
+                      <label>Exposure</label><input type="range"><span class="value">0.00</span>
+                    </div>
+                    <div class="param-row" data-temporal="long_exposure_frames" data-min="2" data-max="24" data-step="1">
+                      <label>Shutter frames</label><input type="range"><span class="value">12</span>
+                    </div>
+                    <div class="audio-status">A clean 30 Hz box shutter (up to 0.8 seconds): exact through 8 frames, then uniformly stratified at 8 samples for bounded GPU cost.</div>
+                  </div>
+                </details>
                 <details class="temporal-study">
                   <summary>TOPOLOGY LOOM</summary>
                   <div class="temporal-study-body">

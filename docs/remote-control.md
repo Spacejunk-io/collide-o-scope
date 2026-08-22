@@ -124,7 +124,7 @@ Media is also released.
 - **Revert master visual state** restores master effects/transform/Motion,
   replaces the master Collision Rack with its exact legacy markers, and resets
   VHS and all Temporal/Originals state,
-  resets all four LFO configurations/seeds, and clears modulation routings and
+  resets all eight LFO configurations/seeds, and clears modulation routings and
   Morph automation so those defaults stay in force. It preserves layers and
   their effects, visibility and transport,
   BPM, and audio/MIDI/device choices. A layer card's **Reset FX** remains local:
@@ -139,11 +139,16 @@ Media is also released.
   live, so those systems may continue changing the rendered master afterward.
 - **Bypass Master FX** on a layer skips inherited Digital, Analog, Cellular,
   Motion, and VHS processing for that layer. Its own Layer FX, opacity, key,
-  and blend remain active; Temporal still affects the final program. When VHS
-  is enabled and a visible, positive-opacity bypass layer contributes, direct
-  master effects and VHS run only on inherited layer slices; the engine then
-  recomposites the stack before Temporal. Offline render follows the same
-  selective order. Hidden or non-positive-opacity layers create no selective
+  and blend remain active. Temporal is one flattened program-history machine,
+  so a visible, positive-opacity bypass layer links the complete shared
+  Temporal family dry for the whole program: Feedback, Slit-Scan, Temporal
+  Originals, Melt, Sync Latch, Display Physics, and Codec Mosh receive neutral
+  frame parameters. The clean program still warms temporal history, and the
+  authored/modulated controls resume unchanged when no contributing bypass
+  remains. With VHS enabled, direct master effects and VHS run only on
+  inherited layer slices; the engine then recomposites the stack before that
+  linked Temporal boundary. Offline render follows the same law. Hidden or
+  non-positive-opacity layers neither link Temporal dry nor create selective
   work. Live selective processing has a 320 MiB safety budget and no silent
   global-VHS fallback: if the current output size and contributing stack exceed
   it, the prior exact audience frame is held and the VHS panel reports how to
@@ -234,6 +239,19 @@ referenced sources ready;
 the next bar. One missing layer/slot/cue, stale topology, preparation error, or
 cancel prevents every part of the Scene from changing. Recapture repairs the
 same stable Scene; Remove deletes exactly that ID.
+
+The **Autopilot** editor below Scenes is an authored, Scene-only beat sequence:
+up to 128 ordered stable Scene IDs, 1–256 accepted media beats per step, and a
+Loop or Once ending. **Play** prepares ahead and releases the first Scene only
+on a future beat. A late Scene stalls; readiness then waits for another future
+beat, so Autopilot never skips or catches up with multiple cuts in one frame.
+Pause, Freeze Media, and Freeze Program preserve the remaining dwell. A failed
+prepare or commit holds the last visible Scene and enters a repairable fault;
+manual clip/Scene activation disarms the run. Removing a referenced Scene keeps
+its ID as a visible tombstone, and automatic Scene capture never reuses that
+reserved ID. The plan is patch state; Play/Pause/Reset are live performance
+state. Offline export refuses a moving Starting/Running/Stalled sequence while
+allowing a Paused or otherwise static plan.
 
 ### Spatial transforms
 
@@ -333,7 +351,7 @@ off when absent, preserving older-client compatibility.
 Randomization uses only stored deterministic seeds—never the wall clock or OS
 entropy—so patches and exact-seed performances are replayable.
 
-- **Master** changes the master shader-pattern seed and all four LFO seeds. In
+- **Master** changes the master shader-pattern seed and all eight LFO seeds. In
   Bounded variation mode it also varies the master effect controls listed
   below.
 - **Everything** does the same and includes every current layer. With an exact
@@ -369,7 +387,7 @@ bases, a valid variation materializes and clears an engaged A/B Morph before
 applying.
 
 Leave **Exact seed** blank to advance deterministically from the stored master
-and targeted-layer seeds. Master and Everything always derive all four LFO
+and targeted-layer seeds. Master and Everything always derive all eight LFO
 seeds from the resulting master seed; Everything also derives a positional
 stream after advancing each layer's stored seed. Enter a whole number from `0`
 through `4294967295` to replay a base seed; `0` deliberately restores the
@@ -378,7 +396,7 @@ requires the same starting effect values.
 
 Each LFO shows its own seed field when **Sample & Hold** is selected. It holds
 one deterministic value for a complete LFO cycle; changing rate changes that
-hold duration. Master and Everything rerolls update all four LFO seeds, even
+hold duration. Master and Everything rerolls update all eight LFO seeds, even
 if another waveform is currently selected, and snapshots preserve them.
 
 Decoded-video layers additionally offer **each loop**. At every authoritative
@@ -410,7 +428,7 @@ modulation targets, and use the same effect shader in offline export.
 ### Temporal Originals
 
 The **TEMPORAL** panel still begins with Feedback, Slit-Scan, and History Key,
-all sampled from the fixed 30 Hz, 24-frame history. Four additional disclosures
+all sampled from the fixed 30 Hz, 24-frame history. Five additional disclosures
 reuse that bounded memory:
 
 - **Topology Loom** maps pixel position to history age using Linear, Radial,
@@ -419,6 +437,11 @@ reuse that bounded memory:
   Quantize shape the map.
 - **Collision Atlas** assigns seeded territories and mixes their temporal
   collisions. The seed and territory count are authored, deterministic state.
+- **Long Exposure Ghosting** averages the clean current frame across a 2–24
+  frame shutter. It is exact through eight frames and uniformly stratifies
+  longer shutters into eight total samples, so the full trail span survives
+  with at most seven unfiltered same-pixel history reads and no 24-tap
+  full-resolution bottleneck, extra pass, or allocation.
 - **Refresh Garden** admits/holds memory through Temporal Δ, Luma, Chroma,
   Cellular ridge, Audio energy, Audio onset, Matte, or Motion gates, with
   bounded threshold, softness, decay, and maximum hold. **Matte layer** selects
@@ -518,6 +541,10 @@ relative to calibration because compass fusion can drift. Use the QR's HTTPS
 URL on iOS; plain HTTP never offers sensor permission.
 
 ### Routing response
+
+The matrix exposes eight LFO lanes (`L1`–`L8`). Lanes 5–8 begin with the
+standard LFO defaults and affect nothing until routed; loading a legacy patch
+preserves lanes 1–4 exactly and leaves the appended lanes neutral.
 
 Every route row supports signed depth, response curve and amount, plus
 independent attack/release slew. These controls apply equally to LFO, audio,
@@ -670,9 +697,10 @@ in a patch.
 
 Selective VHS export is synchronous but follows the live layer law: bypassed
 layers retain only their direct effects, inherited layers receive master effects
-and VHS, the stack is recomposited, and Temporal remains program-wide. A
-selective-processing failure stops the export with an error instead of silently
-applying VHS to a bypassed layer.
+and VHS, and the stack is recomposited. If any bypass layer contributes, the
+complete shared Temporal family then runs neutral while accepting the clean
+program into warm history. A selective-processing failure stops the export with
+an error instead of silently applying VHS to a bypassed layer.
 
 **VHS quality** affects both the ordinary global path and those inherited
 selective slices:
@@ -853,7 +881,15 @@ document, not patch state. It supports device selectors, omni/single-channel
 filters, note and CC sources, absolute plus three relative CC encodings,
 momentary/toggle/gate buttons, Start/Continue/Stop/24-PPQN Clock, and bounded
 feedback. Saved layer positions resolve once to live stable IDs and never
-retarget after reorder; group and rack-node mappings retain stable IDs.
+retarget after reorder; group and rack-node mappings retain stable IDs. Scene
+launch pads use additive v1 targets
+`{"scope":"scene_prepare","scene_id":12}` and
+`{"scope":"scene_trigger","scene_id":12}`. They resolve against the live
+authored Scene set by `SceneId`, never by card position. A missing ID rejects a
+profile install; if its Scene is later removed, the installed address becomes
+an inert, visibly rejected tombstone rather than selecting a neighbouring
+Scene. Scene targets require `button_mode: "momentary"`: Note/CC input emits
+one action on the physical rising edge and none while held or on release.
 
 The callback rejects malformed wire input before all state: supported channel
 messages are exactly three bytes with both data bytes below `0x80`, and the
@@ -881,6 +917,14 @@ the **OSC RUNTIME** block always shows a LAN warning. Addresses use one closed
 namespace, for example `/collide/v1/master/<parameter>`,
 `/collide/v1/layer/<stable-id>/<parameter>`,
 `/collide/v1/group/<group-id>/<parameter>`, and stable node/transport forms.
+Authored Scenes add the canonical action paths
+`/collide/v1/scene/<scene-id>/prepare` and
+`/collide/v1/scene/<scene-id>/trigger`. An asserted float/integer/true message
+is one OSC pulse; zero/false is an inert release. Trigger follows the Scene's
+authored Immediate/next-beat/next-bar mode, so MIDI, OSC, native, and browser
+launches share one timing law. Optional MIDI/OSC feedback reports `1` while
+that exact Scene transaction is GPU-ready and `0` when it is absent, staging,
+scheduled, or consumed.
 Unknown parameters, arbitrary JSON actions, file selection, peer/bind changes,
 and unbounded bundles are rejected. Datagram/string/nesting/fanout, event queue,
 packet rate, and feedback rate are all capped. Feedback suppresses only its

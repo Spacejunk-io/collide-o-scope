@@ -1238,10 +1238,18 @@ fn valid_temporal_edit(param: &str, value: &serde_json::Value) -> bool {
         ),
         "slit_interp" => value.is_boolean(),
         "key_mode" => integer_in(value, 0, 4),
-        "key_threshold" | "loom_amount" | "loom_depth" | "atlas_amount" | "atlas_collision"
-        | "garden_amount" | "garden_threshold" | "garden_decay" => number_in(value, 0.0, 1.0),
+        "key_threshold"
+        | "long_exposure_amount"
+        | "loom_amount"
+        | "loom_depth"
+        | "atlas_amount"
+        | "atlas_collision"
+        | "garden_amount"
+        | "garden_threshold"
+        | "garden_decay" => number_in(value, 0.0, 1.0),
         "key_softness" | "garden_softness" => number_in(value, 0.0, 0.5),
         "key_history" => integer_in(value, 1, 23),
+        "long_exposure_frames" => integer_in(value, 2, 24),
         "loom_topology" => matches!(
             value.as_str(),
             Some("linear" | "radial" | "spiral" | "contour" | "folded" | "kaleidoscopic")
@@ -2049,8 +2057,29 @@ fn valid_action(action: &WebAction, depth: usize) -> bool {
             valid_identifier(param, 64) && valid_transform_edit(param, value)
         }
         WebAction::ApplyMasterTransform { transform } => valid_complete_transform(transform),
-        WebAction::SetLfo { param, value, .. } => {
-            valid_identifier(param, 64) && valid_json_value(value)
+        WebAction::SetLfo {
+            index,
+            param,
+            value,
+        } => {
+            *index < crate::modulation::NUM_LFOS
+                && match param.as_str() {
+                    "shape" => value.as_str().is_some_and(|shape| {
+                        matches!(
+                            shape,
+                            "sine" | "triangle" | "saw" | "square" | "sample_hold"
+                        )
+                    }),
+                    // The engine retains the legacy clamp/wrap behavior for
+                    // finite controller values; non-finite numbers never
+                    // enter the queue.
+                    "beats" | "phase" => value.as_f64().is_some_and(f64::is_finite),
+                    "seed" => value
+                        .as_u64()
+                        .and_then(|seed| u32::try_from(seed).ok())
+                        .is_some(),
+                    _ => false,
+                }
         }
         // B10: the envelope vocabulary is closed at the gate exactly as the
         // engine applier closes it, so the queue never carries a tuple the
@@ -4208,6 +4237,10 @@ mod tests {
             ("key_threshold", serde_json::json!(1.0)),
             ("key_softness", serde_json::json!(0.5)),
             ("key_history", serde_json::json!(23)),
+            ("long_exposure_amount", serde_json::json!(0.0)),
+            ("long_exposure_amount", serde_json::json!(1.0)),
+            ("long_exposure_frames", serde_json::json!(2)),
+            ("long_exposure_frames", serde_json::json!(24)),
             ("loom_amount", serde_json::json!(1.0)),
             ("loom_topology", serde_json::json!("kaleidoscopic")),
             ("loom_interpolation", serde_json::json!("linear")),
@@ -4266,6 +4299,11 @@ mod tests {
             ("fb_zoom", serde_json::json!(0.899)),
             ("key_mode", serde_json::json!(4.5)),
             ("key_history", serde_json::json!(0)),
+            ("long_exposure_amount", serde_json::json!(-0.001)),
+            ("long_exposure_amount", serde_json::json!(1.001)),
+            ("long_exposure_frames", serde_json::json!(1)),
+            ("long_exposure_frames", serde_json::json!(25)),
+            ("long_exposure_frames", serde_json::json!(2.5)),
             ("loom_topology", serde_json::json!("hexagonal")),
             ("loom_interpolation", serde_json::json!("cubic")),
             ("loom_phase", serde_json::json!(1000.1)),
@@ -5203,6 +5241,44 @@ mod tests {
             },
             0
         ));
+    }
+
+    #[test]
+    fn lfo_ingress_exposes_exactly_eight_closed_lanes() {
+        let edit = |index, param: &str, value| WebAction::SetLfo {
+            index,
+            param: param.to_string(),
+            value,
+        };
+
+        assert!(valid_action(
+            &edit(7, "shape", serde_json::json!("sample_hold")),
+            0
+        ));
+        assert!(valid_action(
+            &edit(7, "seed", serde_json::json!(u32::MAX)),
+            0
+        ));
+        assert!(valid_action(&edit(0, "beats", serde_json::json!(128.0)), 0));
+        assert!(valid_action(&edit(0, "phase", serde_json::json!(-2.25)), 0));
+
+        assert!(!valid_action(
+            &edit(8, "shape", serde_json::json!("sine")),
+            0
+        ));
+        assert!(!valid_action(
+            &edit(0, "shape", serde_json::json!("noise")),
+            0
+        ));
+        assert!(!valid_action(
+            &edit(0, "enabled", serde_json::json!(true)),
+            0
+        ));
+        assert!(!valid_action(
+            &edit(0, "seed", serde_json::json!(u64::from(u32::MAX) + 1)),
+            0
+        ));
+        assert!(!valid_action(&edit(0, "beats", serde_json::json!("4")), 0));
     }
 
     #[test]

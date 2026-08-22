@@ -69,7 +69,13 @@ still passes through the unified patch preflight; discard is explicit.
 Controller profiles and OSC configuration are bounded documents outside the
 patch. Persisted layer references use saved positions, resolve once to live
 `StableLayerId`s, and never retarget after reorder. Group and rack-node targets
-retain `GroupId` and `NodeId` identity.
+retain `GroupId` and `NodeId` identity. The additive schema-v1
+`scene_prepare` and `scene_trigger` targets carry an authored `SceneId`
+directly. Profile installation resolves that ID against the live Scene set;
+absence rejects the candidate atomically, while later removal leaves an inert
+tombstone rather than retargeting by UI order. Scene bindings must be
+`momentary`, producing one MIDI action on a physical rising edge. Triggering
+uses the Scene's authored quantization mode.
 
 The MIDI supervisor supports independently selected input/output devices,
 channel filters, note and CC sources, absolute and three relative CC encodings,
@@ -101,6 +107,10 @@ OSC uses the same closed typed control-address vocabulary. It accepts bounded
 messages/bundles only; packets cannot select files, change peers, change bind
 authority, or invent parameter names. The default is loopback port 9000. LAN
 binding requires explicit document opt-in and always publishes a warning.
+Scene hardware paths are `/collide/v1/scene/<scene-id>/prepare` and
+`/collide/v1/scene/<scene-id>/trigger`; an asserted scalar/true is one pulse
+and zero/false is an inert release. Feedback on either stable action address
+is the bounded GPU-ready bit for that Scene transaction.
 Datagram size, string size, nesting depth, message fanout, event queues, and
 packet/feedback rates are bounded. Feedback suppresses only its source protocol
 or OSC peer, so accepted host changes can still update other surfaces.

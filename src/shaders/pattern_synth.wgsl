@@ -133,6 +133,151 @@ fn mandelbrot_escape_signal(uv: vec2f, aspect: f32) -> vec2f {
     return vec2f(0.0, 1.0);
 }
 
+// Deterministic motion shared by the two additive splat generators. The
+// centre remains within its lattice cell, keeping the neighbourhood bounded.
+fn moving_splat_point(
+    offset: vec2f,
+    h0: f32,
+    h1: f32,
+    t: f32,
+    phase_radians: f32,
+) -> vec2f {
+    return offset + 0.5 + 0.32 * vec2f(
+        sin(h0 * PATTERN_TAU + phase_radians + t * (0.55 + 0.85 * h1)),
+        cos(h1 * PATTERN_TAU - phase_radians + t * (0.50 + 0.75 * h0)),
+    );
+}
+
+// Two exact orbit endpoints and two interpolated positions make a four-sample
+// memory-like trail without framebuffer state. Program time alone therefore
+// remains enough to rebuild the exact frame during pause/seek/replay/export,
+// while the full-resolution hot loop evaluates half as many sin/cos pairs.
+fn memory_splats_signal(
+    p: vec2f,
+    fx: f32,
+    freq_y: f32,
+    phase: f32,
+    t: f32,
+    memory: f32,
+) -> f32 {
+    let g = p * (2.0 + fx * 0.22);
+    let gi = floor(g);
+    let gf = fract(g);
+    let radius = 0.18 + freq_y * 0.32;
+    let lag = 0.10 + memory * 0.65;
+    let decay = 0.28 + memory * 0.55;
+    let trail_weights = vec4f(1.0, decay, decay * decay, decay * decay * decay);
+    let phase_radians = phase * PATTERN_TAU;
+    // Complete nearest-cell search: omitted centres start at least 0.68 away,
+    // beyond the compact kernel's maximum 0.5 radius. Sixteen samples replace
+    // the naive 36-sample loop in this full-resolution hot path.
+    var start_x = 0;
+    var start_y = 0;
+    if gf.x < 0.5 {
+        start_x = -1;
+    }
+    if gf.y < 0.5 {
+        start_y = -1;
+    }
+    var alpha = 0.0;
+    for (var yi = 0; yi < 2; yi = yi + 1) {
+        for (var xi = 0; xi < 2; xi = xi + 1) {
+            let x = start_x + xi;
+            let y = start_y + yi;
+            let offset = vec2f(f32(x), f32(y));
+            let cell = gi + offset;
+            let h0 = pattern_hash21(cell);
+            let h1 = pattern_hash21(cell + vec2f(5.17, 9.31));
+            let head = moving_splat_point(offset, h0, h1, t, phase_radians);
+            let tail = moving_splat_point(offset, h0, h1, t - 3.0 * lag, phase_radians);
+            for (var age = 0; age < 4; age = age + 1) {
+                var point = head;
+                if age == 3 {
+                    // Keep the reconstructed orbit endpoints bit-exact.
+                    point = tail;
+                } else if age > 0 {
+                    point = mix(head, tail, f32(age) / 3.0);
+                }
+                let delta = point - gf;
+                let distance_squared = dot(delta, delta);
+                let inner_radius = radius * 0.35;
+                let compact = 1.0 - smoothstep(
+                    inner_radius * inner_radius,
+                    radius * radius,
+                    distance_squared,
+                );
+                let sample_alpha = clamp(compact * trail_weights[u32(age)], 0.0, 1.0);
+                alpha = alpha + (1.0 - alpha) * sample_alpha;
+            }
+        }
+    }
+    return clamp(alpha, 0.0, 1.0);
+}
+
+// Moving anisotropic Gaussian splats, alpha-unioned into a bounded scalar
+// field. Hashed major axes avoid per-pixel orientation trig; the finite support
+// is zero before a cell outside the nearest-2x2 search can contribute.
+fn gaussian_splats_signal(
+    p: vec2f,
+    fx: f32,
+    freq_y: f32,
+    phase: f32,
+    t: f32,
+    anisotropy: f32,
+) -> f32 {
+    let g = p * (2.0 + fx * 0.22);
+    let gi = floor(g);
+    let gf = fract(g);
+    let sigma_major = 0.16 + freq_y * 0.24;
+    let sigma_minor = sigma_major / (1.0 + anisotropy * 3.0);
+    let phase_radians = phase * PATTERN_TAU;
+    var start_x = 0;
+    var start_y = 0;
+    if gf.x < 0.5 {
+        start_x = -1;
+    }
+    if gf.y < 0.5 {
+        start_y = -1;
+    }
+    var alpha = 0.0;
+    for (var yi = 0; yi < 2; yi = yi + 1) {
+        for (var xi = 0; xi < 2; xi = xi + 1) {
+            let x = start_x + xi;
+            let y = start_y + yi;
+            let offset = vec2f(f32(x), f32(y));
+            let cell = gi + offset;
+            let h0 = pattern_hash21(cell);
+            let h1 = pattern_hash21(cell + vec2f(5.17, 9.31));
+            let point = moving_splat_point(offset, h0, h1, t, phase_radians);
+            let delta = gf - point;
+            let h2 = pattern_hash21(cell + vec2f(11.7, 2.93));
+            let h3 = pattern_hash21(cell + vec2f(19.19, 7.73));
+            let axis = vec2f(h2 * 2.0 - 1.0, h3 * 2.0 - 1.0);
+            let axis_length_squared = dot(axis, axis);
+            var cos_angle = 1.0;
+            var sin_angle = 0.0;
+            if axis_length_squared > 1.0e-6 {
+                let inverse_axis_length = inverseSqrt(axis_length_squared);
+                cos_angle = axis.x * inverse_axis_length;
+                sin_angle = axis.y * inverse_axis_length;
+            }
+            let local = vec2f(
+                delta.x * cos_angle + delta.y * sin_angle,
+                -delta.x * sin_angle + delta.y * cos_angle,
+            );
+            let quadratic = local.x * local.x / (sigma_major * sigma_major)
+                + local.y * local.y / (sigma_minor * sigma_minor);
+            // Finite Gaussian footprint, zero before any omitted cell's 0.68
+            // minimum distance, keeps the nearest-2x2 search seam-free.
+            let distance_squared = dot(delta, delta);
+            let support = 1.0 - smoothstep(0.56 * 0.56, 0.66 * 0.66, distance_squared);
+            let sample_alpha = clamp(exp(-0.5 * quadratic) * support, 0.0, 1.0);
+            alpha = alpha + (1.0 - alpha) * sample_alpha;
+        }
+    }
+    return clamp(alpha, 0.0, 1.0);
+}
+
 @fragment
 fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
     let t = uni.color_b.z * uni.freq_phase.w;
@@ -161,10 +306,20 @@ fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
     let fy = 0.2 + uni.freq_phase.y * uni.freq_phase.y * 40.0;
     let ph = uni.freq_phase.z;
     let fm = uni.signal.x;
-    let nf = max(1.0, floor(uni.compare_frame.z));
-    let r = length(p);
-    let ang = atan2(p.y, p.x) / PATTERN_TAU + 0.5;
     let shape = uni.modes.x;
+    let nf = max(1.0, floor(uni.compare_frame.z));
+    // Polar math is one of the expensive full-resolution fractions. Only
+    // shapes that consume radius/angle pay for it; invalid future codes retain
+    // the historical POLYGON fallback and therefore still compute radius.
+    var r = 0.0;
+    if shape == 1u || shape == 2u || shape == 3u || shape == 5u
+        || shape == 6u || shape == 8u || shape == 11u || shape > 14u {
+        r = length(p);
+    }
+    var ang = 0.0;
+    if shape == 1u || shape == 2u || shape == 6u || shape == 8u {
+        ang = atan2(p.y, p.x) / PATTERN_TAU + 0.5;
+    }
     var mandelbrot_interior = false;
     var f = 0.0;
     if shape == 0u {
@@ -236,6 +391,12 @@ fn fs_pattern(in: PatternVertexOutput) -> @location(0) vec4f {
         let sample = mandelbrot_escape_signal(in.uv, uni.color_b.w);
         f = sample.x;
         mandelbrot_interior = sample.y > 0.5;
+    } else if shape == 13u {
+        // MEMORY SPLATS — four reconstructable motion samples per point.
+        f = memory_splats_signal(p, fx, uni.freq_phase.y, ph, t, fm);
+    } else if shape == 14u {
+        // GAUSSIAN SPLATS — moving anisotropic Gaussian kernels.
+        f = gaussian_splats_signal(p, fx, uni.freq_phase.y, ph, t, fm);
     } else {
         // POLYGON
         let aa = atan2(p.y, p.x);

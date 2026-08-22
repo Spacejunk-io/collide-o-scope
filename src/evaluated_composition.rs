@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use super::{EvaluatedFramePlan, EvaluatedLayerMatte};
+use super::{EvaluatedFramePlan, EvaluatedLayer, EvaluatedLayerMatte};
 use crate::composition::{
     BusAssignment, FlattenedGroupSpan, GroupOutputStage, RuntimeComposition,
     RuntimeCompositionError, RuntimeRootItem,
@@ -187,6 +187,32 @@ pub struct MotionPlanInput<'a> {
     pub limits: MotionDeviceLimits,
 }
 
+/// Frame-local routing law for the shared program Temporal machine.
+///
+/// Temporal owns one flattened program history, so it cannot be removed from
+/// one layer after composition without changing blend order or contaminating
+/// that history. When any layer that really contributes to Program selects
+/// `bypass_master_fx`, the honest bounded law is therefore `LinkedDry`: every
+/// Temporal-family stage receives its neutral parameters for this frame. The
+/// temporal encoder still runs and accepts the clean program, keeping history
+/// warm while the authored/modulated parameters remain untouched and ready to
+/// resume.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TemporalMasterPath {
+    #[default]
+    Inherited,
+    LinkedDry,
+}
+
+impl TemporalMasterPath {
+    pub fn effective(self, authored: &TemporalParams) -> TemporalParams {
+        match self {
+            Self::Inherited => *authored,
+            Self::LinkedDry => TemporalParams::default(),
+        }
+    }
+}
+
 /// Exact omitted-patch topology. No advanced rack is compiled or allocated.
 #[derive(Debug, Clone)]
 pub struct LegacyExactCompositionPlan {
@@ -214,6 +240,7 @@ pub struct LegacyExactCompositionPlan {
         )
     )]
     topology_signature: u64,
+    temporal_master_path: TemporalMasterPath,
 }
 
 impl LegacyExactCompositionPlan {
@@ -250,6 +277,10 @@ impl LegacyExactCompositionPlan {
     )]
     pub const fn topology_signature(&self) -> u64 {
         self.topology_signature
+    }
+
+    pub const fn temporal_master_path(&self) -> TemporalMasterPath {
+        self.temporal_master_path
     }
 }
 
@@ -308,6 +339,23 @@ impl EvaluatedCompositionPlan {
     )]
     pub const fn is_legacy_exact(&self) -> bool {
         matches!(self, Self::LegacyExact(_))
+    }
+
+    /// Whether a contributing layer's master bypass has linked the complete
+    /// shared Temporal family to dry for this frame.
+    pub const fn temporal_master_path(&self) -> TemporalMasterPath {
+        match self {
+            Self::LegacyExact(plan) => plan.temporal_master_path(),
+            Self::Advanced(plan) => plan.temporal_master_path(),
+        }
+    }
+
+    /// Frame-local Temporal parameters consumed by both the in-rack Temporal
+    /// marker and the external melt/sync/display/mosh stages. The base plan
+    /// continues to expose the authored/modulated values unchanged.
+    pub fn effective_temporal(&self) -> TemporalParams {
+        self.temporal_master_path()
+            .effective(self.base().temporal())
     }
 }
 
@@ -418,7 +466,9 @@ pub struct EvaluatedSymmetryFieldPlan {
 /// The inherited canonical block historically observes each layer's
 /// `bypass_master_fx` flag. Layer markers operate on their local scope; a
 /// master marker is therefore a pre-composite admission boundary, while
-/// custom master segments and Temporal remain composition-global.
+/// custom master segments remain composition-global. Temporal is also one
+/// program-wide machine, but a contributing bypass partition links that whole
+/// machine to its neutral, warm-history path for the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegacyCanonicalApplication {
     ScopeLocal,
@@ -470,8 +520,9 @@ pub struct EvaluatedMasterScopePlan {
     pub canonical_layers: Box<[StableLayerId]>,
     /// Contributing layers retaining inherited `bypass_master_fx` behavior.
     pub canonical_bypass_layers: Box<[StableLayerId]>,
-    /// Existing selective NTSC is also a pre-composite per-layer operation;
-    /// Temporal remains the downstream composition-global boundary.
+    /// Existing selective NTSC is also a pre-composite per-layer operation.
+    /// Temporal remains downstream and composition-global; its linked-dry
+    /// disposition lives on the enclosing composition plan.
     pub selective_ntsc_layers: Box<[StableLayerId]>,
     pub selective_ntsc_bypass_layers: Box<[StableLayerId]>,
 }
@@ -1642,6 +1693,7 @@ pub struct AdvancedCompositionPlan {
     scan_processor_resources: ScanProcessorResourcePlan,
     corruption_resources: CorruptionResourcePlan,
     topology_signature: u64,
+    temporal_master_path: TemporalMasterPath,
 }
 
 /// Frame-local NTSC routing classification shared by live and offline
@@ -1683,6 +1735,10 @@ impl AdvancedCompositionPlan {
 
     pub const fn mixer(&self) -> crate::mixing_boundary::BusMixerState {
         self.mixer
+    }
+
+    pub const fn temporal_master_path(&self) -> TemporalMasterPath {
+        self.temporal_master_path
     }
 
     pub fn image_taps(&self) -> &[PlannedImageTap] {
@@ -2341,11 +2397,19 @@ impl<'a> Planner<'a> {
         {
             let topology_signature =
                 legacy_topology_signature(&flat_ids, self.input.master_rack, &self.racks);
+            let temporal_master_path = if self.base.layers().iter().any(|layer| {
+                layer.bypass_master_fx && evaluated_layer_contributes_to_program(layer)
+            }) {
+                TemporalMasterPath::LinkedDry
+            } else {
+                TemporalMasterPath::Inherited
+            };
             return Ok(EvaluatedCompositionPlan::LegacyExact(Box::new(
                 LegacyExactCompositionPlan {
                     base: self.base.clone(),
                     flattened_layers: flat_ids.into_boxed_slice(),
                     topology_signature,
+                    temporal_master_path,
                 },
             )));
         }
@@ -2516,6 +2580,11 @@ impl<'a> Planner<'a> {
                 }
             }
         }
+        let temporal_master_path = if contributing_bypass.is_empty() {
+            TemporalMasterPath::Inherited
+        } else {
+            TemporalMasterPath::LinkedDry
+        };
         let mut saw_global_master_step = false;
         let mut canonical_after_global = false;
         for node in self.input.master_rack.iter() {
@@ -2554,7 +2623,7 @@ impl<'a> Planner<'a> {
                 ScopeHostPayload {
                     materialize: master_materialize,
                     canonical: Some(master_canonical),
-                    temporal: Some(*self.base.temporal()),
+                    temporal: Some(temporal_master_path.effective(self.base.temporal())),
                     canonical_application,
                     allow_exact_scope: false,
                 },
@@ -2856,6 +2925,7 @@ impl<'a> Planner<'a> {
                 scan_processor_resources,
                 corruption_resources,
                 topology_signature,
+                temporal_master_path,
             },
         )))
     }
@@ -4247,11 +4317,7 @@ fn layer_effectively_contributes(
     bus_crossfade: f32,
     mixer: crate::mixing_boundary::BusMixerState,
 ) -> bool {
-    if !evaluated.visible
-        || !layer.admitted_to_program
-        || !evaluated.opacity.is_finite()
-        || evaluated.opacity <= 0.0
-    {
+    if !layer.admitted_to_program || !evaluated_layer_contributes_to_program(evaluated) {
         return false;
     }
     if let Some(group_id) = layer.group_id {
@@ -4278,6 +4344,14 @@ fn layer_effectively_contributes(
         BusAssignment::B => crossfade > 0.0,
         BusAssignment::Program => true,
     }
+}
+
+/// The conservative admission law shared with the legacy conditional-master
+/// compositor. Non-finite opacity should already have been sanitized by frame
+/// evaluation; if one reaches this boundary, treating it as contributing is
+/// safer than accidentally re-enabling a shared master/Temporal effect.
+fn evaluated_layer_contributes_to_program(layer: &EvaluatedLayer) -> bool {
+    layer.visible && (layer.opacity > 0.0 || !layer.opacity.is_finite())
 }
 
 /// Collapse each group and all of its members into one scheduling task. The
@@ -6810,6 +6884,22 @@ mod tests {
             &[layer_id(1)]
         );
         assert_eq!(advanced.master().canonical_layers.as_ref(), &[layer_id(2)]);
+        assert_eq!(
+            advanced.temporal_master_path(),
+            TemporalMasterPath::LinkedDry
+        );
+        let temporal_step = steps
+            .iter()
+            .find_map(|step| match step {
+                EvaluatedScopeStep::LegacyTemporal { params } => Some(params),
+                _ => None,
+            })
+            .expect("advanced master retains its Temporal marker");
+        assert_eq!(temporal_step.feedback, 0.0);
+        assert_eq!(temporal_step.melt.melt, 0.0);
+        assert_eq!(temporal_step.sync.amount, 0.0);
+        assert_eq!(temporal_step.display.phosphor, 0.0);
+        assert_eq!(temporal_step.mosh.amount, 0.0);
     }
 
     #[test]
@@ -6859,6 +6949,10 @@ mod tests {
         );
         assert!(advanced.master().selective_ntsc_bypass_layers.is_empty());
         assert!(advanced.master().canonical_bypass_layers.is_empty());
+        assert_eq!(
+            advanced.temporal_master_path(),
+            TemporalMasterPath::Inherited
+        );
     }
 
     #[test]
@@ -6907,6 +7001,10 @@ mod tests {
             &[layer_id(3)]
         );
         assert!(advanced.master().selective_ntsc_bypass_layers.is_empty());
+        assert_eq!(
+            advanced.temporal_master_path(),
+            TemporalMasterPath::Inherited
+        );
     }
 
     #[test]
@@ -6940,6 +7038,110 @@ mod tests {
         let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
         let advanced = advanced(plan(&base, &composition, &master, &racks).unwrap());
         assert_eq!(advanced.ntsc_path(), AdvancedNtscPath::AllBypass);
+        assert_eq!(
+            advanced.temporal_master_path(),
+            TemporalMasterPath::LinkedDry
+        );
+    }
+
+    #[test]
+    fn exact_contributing_master_bypass_links_the_complete_temporal_family_dry() {
+        let authored = TemporalParams {
+            feedback: 0.81,
+            originals: TemporalOriginalsParams {
+                garden: crate::temporal::RefreshGardenParams {
+                    amount: 0.72,
+                    ..Default::default()
+                },
+                long_exposure: crate::temporal::LongExposureParams {
+                    amount: 0.68,
+                    shutter_frames: 18,
+                },
+                ..Default::default()
+            },
+            display: crate::display_physics::DisplayPhysicsParams {
+                phosphor: 0.63,
+                ..Default::default()
+            },
+            melt: crate::mixing_boundary::MeltParams {
+                melt: 0.54,
+                ..Default::default()
+            },
+            mosh: crate::codec_mosh::CodecMoshParams {
+                amount: 0.45,
+                ..Default::default()
+            },
+            sync: crate::sync_latch::SyncLatchParams {
+                amount: 0.36,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut base = base_with_temporal_for(&[1, 2], &authored);
+        base.layers[0].bypass_master_fx = true;
+        let composition = legacy_composition(&[1, 2]);
+        let racks = legacy_racks(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let evaluated = plan(&base, &composition, &master, &racks).unwrap();
+
+        assert!(evaluated.is_legacy_exact());
+        assert_eq!(
+            evaluated.temporal_master_path(),
+            TemporalMasterPath::LinkedDry
+        );
+        let effective = evaluated.effective_temporal();
+        assert_eq!(effective.feedback, 0.0);
+        assert_eq!(effective.originals.garden.amount, 0.0);
+        assert_eq!(effective.originals.long_exposure.amount, 0.0);
+        assert_eq!(effective.display.phosphor, 0.0);
+        assert_eq!(effective.melt.melt, 0.0);
+        assert_eq!(effective.mosh.amount, 0.0);
+        assert_eq!(effective.sync.amount, 0.0);
+        assert_eq!(evaluated.base().temporal().feedback, authored.feedback);
+        assert_eq!(
+            evaluated.base().temporal().originals.garden.amount,
+            authored.originals.garden.amount
+        );
+        assert_eq!(
+            evaluated.base().temporal().originals.long_exposure.amount,
+            authored.originals.long_exposure.amount
+        );
+    }
+
+    #[test]
+    fn dormant_hidden_or_zero_weight_bypass_leaves_temporal_inherited() {
+        let composition = legacy_composition(&[1, 2]);
+        let racks = legacy_racks(&[1, 2]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+
+        for dormant in ["hidden", "zero"] {
+            let mut base = base(&[1, 2], &[1]);
+            if dormant == "hidden" {
+                base.layers[0].visible = false;
+            } else {
+                base.layers[0].opacity = 0.0;
+            }
+            let evaluated = plan(&base, &composition, &master, &racks).unwrap();
+            assert_eq!(
+                evaluated.temporal_master_path(),
+                TemporalMasterPath::Inherited,
+                "{dormant} bypass layer"
+            );
+        }
+    }
+
+    #[test]
+    fn nonfinite_contributing_opacity_conservatively_keeps_temporal_dry() {
+        let mut base = base(&[1], &[1]);
+        base.layers[0].opacity = f32::NAN;
+        let composition = legacy_composition(&[1]);
+        let racks = legacy_racks(&[1]);
+        let master = RuntimeVisualRack::synthetic_legacy(LegacyRackScope::Master);
+        let evaluated = plan(&base, &composition, &master, &racks).unwrap();
+        assert_eq!(
+            evaluated.temporal_master_path(),
+            TemporalMasterPath::LinkedDry
+        );
     }
 
     #[test]

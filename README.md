@@ -162,11 +162,14 @@ cancelled chooser leaves the current library and program state unchanged.
 - Runs [ntsc-rs](https://github.com/ntsc-rs/ntsc-rs) VHS simulation without
   blocking the render thread. Existing all-inherited stacks keep the global
   post-composite path; a contributing **Bypass Master FX** layer selects an
-  exact per-layer path so VHS touches inherited layers only.
+  exact per-layer path so VHS touches inherited layers only, and links the
+  complete shared Temporal family to its dry, warm-history path.
 - Provides feedback trails and arbitrary-angle slit-scan from a 24-sample
   temporal history. History advances at a fixed 30 Hz, so its approximately
   0.8-second span does not change with display or export frame rate.
-- Adds prepared clip slots, bounded cue/loop transport, and atomic Scenes;
+- Adds prepared clip slots, bounded cue/loop transport, atomic Scenes, and a
+  Scene-only beat Autopilot with stable IDs, Loop/Once endings, and no-skip
+  asynchronous preparation;
   bounded Collision Racks at master, layer, and group scope; Temporal Topology
   Loom, Collision Atlas, Refresh Garden, and Collision Score; and deterministic
   motion fields (codec, lattice, and six procedural kinds), Faraday Motion
@@ -251,15 +254,28 @@ and beat loops; and up to 64 numeric cues. Activation can be immediate, next
 beat, or next bar. Up to 128 named Scenes bind prepared slots (and optional
 cues) across as many as 256 layer positions; prepare/trigger is one atomic
 transaction, so one bad or stale binding prevents a partial scene change.
+An authored Autopilot orders up to 128 stable Scene IDs, each held for 1–256
+accepted media beats, and either loops or completes once. It prepares ahead,
+commits at most one Scene on a future beat, stalls instead of skipping when a
+Scene is late, and keeps the current audience output on any preparation or
+commit fault. Pause and media/program freeze preserve the remaining dwell;
+manual clip or Scene activation disarms the sequence. Removing a referenced
+Scene leaves an explicit tombstone for repair rather than retargeting a step.
 
 ## Temporal originals and motion
 
-The fixed 30 Hz, 24-sample program history also powers four original studies:
+The fixed 30 Hz, 24-sample program history also powers five original studies:
 
 - **Temporal Topology Loom** draws age as linear, radial, spiral, contour,
   folded, or kaleidoscopic surfaces with floor or linear history sampling.
 - **Collision Atlas** assigns seeded temporal territories and controls their
   collisions.
+- **Long Exposure Ghosting** integrates the clean current image with a
+  2–24-frame box shutter. Shutters through eight frames are exact; longer
+  shutters retain the complete interval with eight uniformly stratified
+  samples. This keeps the treatment in the existing one-pass history path,
+  with no added texture/allocation and at most seven unfiltered, same-pixel
+  history reads per pixel.
 - **Refresh Garden** admits and holds memory through temporal-delta, luma,
   chroma, cellular-ridge, audio-energy, audio-onset, matte, or motion gates.
   Matte selects a stable layer's pre- or post-local current-frame image;
@@ -357,10 +373,13 @@ its canonical hash, and its pixels.
 - **Sync latch** — tape-adjacent horizontal sync slips that heal on their own
   tick, or, latched, accumulate into a bounded per-line table until the
   switch is released and the whole displacement unwinds at once.
-- **Generator sources** — a GPU pattern synthesizer (twelve shapes, six
+- **Generator sources** — a GPU pattern synthesizer (fifteen shapes, six
   oscillators, wavefolder, comparator, five colourisers) and a CPU-typeset
   text page with two bundled faces. Both are reconstructed offline from the
   patch alone: no file identity, no placeholder, perfect self-containment.
+  The append-only shapes include the exact `z² + c` Mandelbrot renderer,
+  reconstructable moving Memory Splats, and anisotropic Gaussian Splats; the
+  splat generators are native 2D fields rather than 3D point-cloud importers.
 - **Program re-entry** — the finished program itself as an image route,
   honestly one frame old by construction, so any matte, mask, or Displace
   donor can feed the output back into the composition stably.
@@ -433,7 +452,7 @@ unchanged.
 
 | Sources | Detail |
 |---|---|
-| 4 LFOs | Sine, triangle, saw, square, or deterministic sample-and-hold; musical divisions; tap-tempo or MIDI clock |
+| 8 LFOs | Sine, triangle, saw, square, or deterministic sample-and-hold; musical divisions; tap-tempo or MIDI clock. LFOs 5–8 are neutral until routed, and legacy patches retain LFOs 1–4 unchanged. |
 | Audio | Live input, Windows system-playback loopback, or deterministic looping WAV/MP3/FLAC/Ogg/Opus/M4A/AAC analysis; level; 3–8 configurable bands; onset, brightness, noisiness; and a 32-bin display spectrum |
 | MIDI | Legacy four-CC learn surface plus a separately persisted typed profile: selected input/output, channel filters, note and absolute/relative CC sources, button modes, Start/Continue/Stop/24-PPQN Clock, and bounded feedback |
 | Phone | Calibrated yaw/pitch/roll and a multitouch XY pad |
@@ -455,7 +474,8 @@ the same frame-indexed ordering.
 
 The matrix exposes every continuous master and NTSC value, Shift amount/block
 size/density/speed, spatial position/scale/anchor/rotation/skew/skew-axis/crop,
-temporal feedback/slit-scan/history-key plus bounded Loom/Atlas/Garden values,
+temporal feedback/slit-scan/history-key plus bounded Loom/Atlas/Garden and
+Long Exposure amount values,
 the feedback-rig, display-physics, melting-edge, sync-latch, and codec-mosh
 families, bus-mixer values, the small-effects and master-optics families, key
 border/shadow dressing, gesture-canvas radius/strength/retention, motion
@@ -547,7 +567,7 @@ Freeze Program.
 **RANDOM / DICE** is deterministic. **Pattern only** changes stochastic shader
 seeds without moving effect controls. **Bounded variation** first chooses the
 seeds, then makes range-safe changes to continuous Digital/Color, analog-motion,
-Shift, core Cellular, Temporal Loom/Atlas/Garden, and M4 Motion values for the
+Shift, core Cellular, Temporal Loom/Atlas/Garden/Long Exposure, and M4 Motion values for the
 applicable scope. **Amount** sets their scale and **Grain mode** additionally
 allows the grain algorithm and color-grain switch to change. **Transform** opts
 bounded position, scale, anchor, rotation, skew/axis, and crop in; **Rack
@@ -564,14 +584,14 @@ master-FX bypass, transport, modulation routes, VHS, temporal topology/seeds/
 Score/reset/loop-driver law, and Motion algorithm/source/quality/donor/carrier
 law are never randomized.
 
-**Master** targets the master pattern plus all four LFO seeds; **Everything**
+**Master** targets the master pattern plus all eight LFO seeds; **Everything**
 also targets every current layer and can include compatible composition values.
 **Group** changes only explicitly opted compatible rack/composition values for
 the selected stable group. A layer card has its own seed and pattern-only
 reroll. Leave **Exact seed** blank to advance deterministically
 from stored master/layer seeds, or enter an unsigned 32-bit base value to
 replay it. Master keeps that base exactly; Everything derives reproducible
-per-position layer streams. Master and Everything derive all four LFO seeds
+per-position layer streams. Master and Everything derive all eight LFO seeds
 from the resulting master seed. `0` explicitly restores the legacy pattern
 family everywhere. Each LFO exposes its own 32-bit seed, and sample-and-hold
 holds one deterministic value for each complete LFO cycle. A decoded video can
@@ -658,15 +678,22 @@ max-buffer, host-planning, or cache boundaries.
 
 Each layer can independently enable **Bypass Master FX**. This skips inherited
 Digital, Analog, Cellular, Motion, and VHS processing for that layer while its
-own Layer FX, opacity, key, and blend remain active. Temporal remains a
-program-wide history stage. With VHS enabled and a visible, positive-opacity
-bypass layer contributing, the engine renders coherent per-layer slices,
-applies direct master effects and VHS only to inherited slices, recomposites in
-stack order, and then runs Temporal. Hidden or non-positive-opacity layers do
-not allocate selective work. Live selective processing is latest-only and has a
-320 MiB incremental safety budget. If a resolution/layer combination exceeds
-that budget or processing fails, the engine holds the prior exact audience
-frame and reports the VHS error; it never falls back to applying global VHS to
+own Layer FX, opacity, key, and blend remain active. Temporal owns one flattened
+program history, so exact per-layer temporal isolation would change stack/blend
+order. The explicit linked law is therefore program-wide: whenever at least one
+visible, positive-opacity bypass layer contributes, Feedback/Slit-Scan/Temporal
+Originals plus Melt, Sync Latch, Display Physics, and Codec Mosh all receive
+neutral parameters for the frame. The temporal encoder still accepts the clean
+program, warming history without changing the authored or modulated controls;
+the effects resume from that warm history when no contributing bypass remains.
+With VHS enabled, the engine renders coherent per-layer slices, applies direct
+master effects and VHS only to inherited slices, and recomposites in stack
+order before the linked Temporal boundary. Hidden or non-positive-opacity
+layers neither activate linked Temporal bypass nor allocate selective work.
+Live selective processing is latest-only and has a 320 MiB incremental safety
+budget. If a resolution/layer combination exceeds that budget or processing
+fails, the engine holds the prior exact audience frame and reports the VHS
+error; it never falls back to applying global VHS to
 a bypassed layer. The bypass is non-destructive: neither **Reset FX** on the
 layer nor master **Revert** changes it. Expert media mode does not enlarge this
 selective-VHS budget. The VHS panel labels the active global or selective live
@@ -927,7 +954,7 @@ the render loop or overwriting an earlier capture. Recall has two deliberately
 different paths:
 
 - **Load snapshot…** (`Ctrl+O`) reconstructs the saved sources, layer order,
-  prepared clip slots, and Scenes, then restores Collision Racks/composition,
+  prepared clip slots, Scenes, and authored Autopilot plan, then restores Collision Racks/composition,
   mattes and image routes, temporal/motion authoring, layer and program
   transport, both freeze states, modulation/input/LFO state, and Morph
   automation. The
@@ -968,7 +995,7 @@ include:
   Program/A/B assignments, and crossfade;
 - layer order, visibility, pause, blend/keying/master-FX bypass, and the complete
   prepared Performance Set: stable clip slots, source identities, transport,
-  cues, active slots, and atomic Scenes;
+  cues, active slots, atomic Scenes, and the Scene-only Autopilot plan;
 - Freeze Program, Freeze Media, and complete modulation state, including LFO
   sample-and-hold seeds;
 - routing curves/slew, audio band count/crossovers/ceiling, gyro calibration/configuration, and XY
@@ -987,7 +1014,7 @@ axis fallbacks. `visual_schema_version: 1` declares explicit M2 rack/composition
 topology; `0` or omission is the exact pre-rack layout synthesized with legacy
 markers, and unknown future visual-topology versions are rejected. New seeds
 default to `0` (the legacy pattern family), while prepared performance,
-Temporal Originals, Motion, per-video loop reroll, Scenes, and Freeze Media
+Temporal Originals, Motion, per-video loop reroll, Scenes, Autopilot, and Freeze Media
 default to their exact inactive/legacy laws. StageMap, controller/OSC documents,
 preset library, recovery journal, recorder state, runtime pixels, and GPU
 resources are intentionally outside `PatchState`.

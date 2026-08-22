@@ -540,6 +540,8 @@ const PROCEDURAL_TEMPORAL_GARDEN_THRESHOLD: u64 = 0x5033_4741_5244_5448;
 const PROCEDURAL_TEMPORAL_GARDEN_SOFTNESS: u64 = 0x5033_4741_5244_534f;
 const PROCEDURAL_TEMPORAL_GARDEN_DECAY: u64 = 0x5033_4741_5244_4443;
 const PROCEDURAL_TEMPORAL_GARDEN_HOLD: u64 = 0x5033_4741_5244_484f;
+const PROCEDURAL_TEMPORAL_LONG_EXPOSURE_AMOUNT: u64 = 0x4c45_5850_4f53_414d;
+const PROCEDURAL_TEMPORAL_LONG_EXPOSURE_FRAMES: u64 = 0x4c45_5850_4f53_4652;
 
 fn mutate_temporal_originals(
     anchor: &TemporalOriginalsConfig,
@@ -700,6 +702,30 @@ fn mutate_temporal_originals(
             + 0.85 * (current - anchor)
             + f64::from(rng.signed()) * f64::from(temperature) * 30.0;
         value.garden.max_hold_ticks = candidate.round().clamp(0.0, f64::from(u32::MAX)) as u32;
+    }
+    linear!(
+        value.long_exposure.amount,
+        anchor.long_exposure.amount,
+        0.0,
+        1.0,
+        0.2,
+        PROCEDURAL_TEMPORAL_LONG_EXPOSURE_AMOUNT
+    );
+    {
+        let mut rng = SplitMix64::new(domain_seed(
+            seed,
+            index,
+            PROCEDURAL_TEMPORAL_LONG_EXPOSURE_FRAMES,
+        ));
+        value.long_exposure.shutter_frames = mutate_linear(
+            f32::from(anchor.long_exposure.shutter_frames),
+            f32::from(value.long_exposure.shutter_frames),
+            2.0,
+            24.0,
+            temperature * 3.0,
+            &mut rng,
+        )
+        .round() as u8;
     }
 }
 
@@ -4095,6 +4121,7 @@ mod tests {
             morph: None,
             snapshot_bank: None,
             scenes: crate::performance::Scenes::default(),
+            autopilot: crate::performance::AutopilotPlan::default(),
             gesture_track: None,
             gesture_canvas: None,
             studies: Vec::new(),
@@ -4281,6 +4308,8 @@ mod tests {
         assert!((0.0..=1.0).contains(&left.garden.threshold));
         assert!((0.0..=0.5).contains(&left.garden.softness));
         assert!((0.0..=1.0).contains(&left.garden.decay));
+        assert!((0.0..=1.0).contains(&left.long_exposure.amount));
+        assert!((2..=24).contains(&left.long_exposure.shutter_frames));
         assert_eq!(left.loom.topology, authored.loom.topology);
         assert_eq!(left.loom.interpolation, authored.loom.interpolation);
         assert_eq!(left.atlas.seed, authored.atlas.seed);

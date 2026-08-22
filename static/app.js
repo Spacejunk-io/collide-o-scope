@@ -24,6 +24,18 @@ const sceneStatus = document.getElementById('scene-status');
 const sceneCaptureForm = document.getElementById('scene-capture-form');
 const sceneCaptureName = document.getElementById('scene-capture-name');
 const sceneCaptureMode = document.getElementById('scene-capture-mode');
+const autopilotPlanForm = document.getElementById('autopilot-plan-form');
+const autopilotRepeat = document.getElementById('autopilot-repeat');
+const autopilotStepList = document.getElementById('autopilot-step-list');
+const autopilotAddStep = document.getElementById('autopilot-add-step');
+const autopilotPlay = document.getElementById('autopilot-play');
+const autopilotPause = document.getElementById('autopilot-pause');
+const autopilotReset = document.getElementById('autopilot-reset');
+const autopilotPhase = document.getElementById('autopilot-phase');
+const autopilotCurrent = document.getElementById('autopilot-current');
+const autopilotNext = document.getElementById('autopilot-next');
+const autopilotBeats = document.getElementById('autopilot-beats');
+const autopilotStatus = document.getElementById('autopilot-status');
 let authoritativeMediaSafetyMode = 'safe';
 let authoritativeNewLayerFit = 'fit';
 // Mirrors the engine's host-session ProxySettings tuple. `rateKey` is the
@@ -195,6 +207,11 @@ let presetRevision = 0;
 let latestCreative = null;
 let latestLayerIdentities = [];
 let latestLayers = [];
+let latestAutopilotSnapshot = {};
+let latestAutopilotScenes = [];
+let autopilotDraft = { repeat: 'loop', steps: [] };
+let autopilotPlanDirty = false;
+let autopilotPendingPlanKey = null;
 let transportAuthoritativePaused = false;
 let transportPendingPaused = null;
 let transportRequestSequence = 0;
@@ -1844,6 +1861,7 @@ const TEMPORAL_PARAM_DEFAULTS = Object.freeze({
       key_threshold: 0.1,
       key_softness: 0.03,
       key_history: 1,
+      long_exposure_frames: 12,
       loom_depth: 1,
       loom_scale: 1,
       loom_folds: 1,
@@ -2445,6 +2463,7 @@ function syncTemporal(t) {
   const loom = originals.loom || {};
   const atlas = originals.atlas || {};
   const garden = originals.garden || {};
+  const longExposure = originals.long_exposure || {};
   const score = originals.score || {};
   const reset = originals.reset || {};
   const rig = t.rig || {};
@@ -2484,6 +2503,8 @@ function syncTemporal(t) {
     key_threshold: t.key_threshold,
     key_softness: t.key_softness,
     key_history: t.key_history,
+    long_exposure_amount: longExposure.amount,
+    long_exposure_frames: longExposure.shutter_frames,
     loom_amount: loom.amount,
     loom_topology: loom.topology,
     loom_interpolation: loom.interpolation,
@@ -3470,6 +3491,293 @@ function syncLibrarySlotTargets(layers) {
     : '';
 }
 
+const AUTOPILOT_MAX_STEPS = 128;
+const AUTOPILOT_MAX_HOLD_BEATS = 256;
+
+function validAutopilotSceneId(value) {
+  const sceneId = Number(value);
+  return Number.isInteger(sceneId) && sceneId >= 1 && sceneId <= 65535 ? sceneId : null;
+}
+
+function normalizeAutopilotPlan(plan = {}) {
+  const repeat = plan?.repeat === 'once' ? 'once' : 'loop';
+  const steps = Array.isArray(plan?.steps) ? plan.steps.slice(0, AUTOPILOT_MAX_STEPS)
+    .map((step) => ({
+      scene_id: validAutopilotSceneId(step?.scene_id),
+      hold_beats: Number(step?.hold_beats),
+    }))
+    .filter((step) => step.scene_id !== null)
+    .map((step) => ({
+      scene_id: step.scene_id,
+      hold_beats: Number.isInteger(step.hold_beats)
+        && step.hold_beats >= 1
+        && step.hold_beats <= AUTOPILOT_MAX_HOLD_BEATS
+        ? step.hold_beats
+        : 4,
+    })) : [];
+  return { repeat, steps };
+}
+
+function autopilotPlanKey(plan) {
+  return JSON.stringify(normalizeAutopilotPlan(plan));
+}
+
+function cloneAutopilotPlan(plan) {
+  const clean = normalizeAutopilotPlan(plan);
+  return {
+    repeat: clean.repeat,
+    steps: clean.steps.map((step) => ({ ...step })),
+  };
+}
+
+function autopilotSceneCatalog(scenes = latestAutopilotScenes) {
+  const catalog = new Map();
+  for (const scene of scenes) {
+    const sceneId = validAutopilotSceneId(scene?.id);
+    if (sceneId === null) continue;
+    catalog.set(sceneId, scene?.name || `Scene ${sceneId}`);
+  }
+  return catalog;
+}
+
+function autopilotStepName(plan, index, scenes = latestAutopilotScenes) {
+  const step = plan?.steps?.[index];
+  if (!step) return '—';
+  const sceneId = validAutopilotSceneId(step.scene_id);
+  if (sceneId === null) return '—';
+  const name = autopilotSceneCatalog(scenes).get(sceneId);
+  return name ? `${index + 1}: ${name} [${sceneId}]` : `${index + 1}: Missing Scene ${sceneId}`;
+}
+
+function setAutopilotEditorStatus(message, error = false) {
+  if (!autopilotStatus) return;
+  autopilotStatus.textContent = message;
+  autopilotStatus.classList.toggle('error', error);
+}
+
+function markAutopilotPlanDirty() {
+  autopilotPlanDirty = true;
+  autopilotPendingPlanKey = null;
+  autopilotStepList?.querySelectorAll('.autopilot-step-row').forEach((row) => {
+    row.classList.remove('current', 'next');
+  });
+  setAutopilotEditorStatus('Local sequence edits are not applied yet.');
+}
+
+function readAutopilotDraftFromControls(validate = false) {
+  const repeat = autopilotRepeat?.value === 'once' ? 'once' : 'loop';
+  const rows = Array.from(autopilotStepList?.querySelectorAll('.autopilot-step-row') || []);
+  if (validate && rows.length > AUTOPILOT_MAX_STEPS) {
+    return { error: `An Autopilot may contain at most ${AUTOPILOT_MAX_STEPS} steps.` };
+  }
+  const steps = [];
+  for (const [index, row] of rows.entries()) {
+    const sceneId = validAutopilotSceneId(row.querySelector('.autopilot-scene-select')?.value);
+    const rawBeats = row.querySelector('.autopilot-hold-beats')?.value ?? '';
+    const beats = Number(rawBeats);
+    if (validate && sceneId === null) {
+      return { error: `Step ${index + 1} must retain a valid non-zero Scene ID.` };
+    }
+    if (validate && (!Number.isInteger(beats) || beats < 1 || beats > AUTOPILOT_MAX_HOLD_BEATS)) {
+      return { error: `Step ${index + 1} beats must be an integer from 1 to ${AUTOPILOT_MAX_HOLD_BEATS}.` };
+    }
+    steps.push({
+      scene_id: sceneId,
+      // Preserve an invalid in-progress edit across row moves. The strict
+      // Apply boundary above is the only place it may approach the wire.
+      hold_beats: Number.isInteger(beats) ? beats : rawBeats,
+    });
+  }
+  return { plan: { repeat, steps } };
+}
+
+function adoptAutopilotControlsIntoDraft() {
+  const read = readAutopilotDraftFromControls(false);
+  if (read.plan) autopilotDraft = read.plan;
+}
+
+function moveAutopilotStep(index, delta) {
+  adoptAutopilotControlsIntoDraft();
+  const next = index + delta;
+  if (next < 0 || next >= autopilotDraft.steps.length) return;
+  [autopilotDraft.steps[index], autopilotDraft.steps[next]] = [
+    autopilotDraft.steps[next],
+    autopilotDraft.steps[index],
+  ];
+  markAutopilotPlanDirty();
+  renderAutopilotPlanEditor();
+  autopilotStepList?.querySelector(`[data-step-index="${next}"] .autopilot-scene-select`)?.focus();
+}
+
+function removeAutopilotStep(index) {
+  adoptAutopilotControlsIntoDraft();
+  autopilotDraft.steps.splice(index, 1);
+  markAutopilotPlanDirty();
+  renderAutopilotPlanEditor();
+}
+
+function renderAutopilotPlanEditor() {
+  if (!autopilotStepList || !autopilotRepeat) return;
+  const snapshot = latestAutopilotSnapshot || {};
+  const current = !autopilotPlanDirty && Number.isInteger(snapshot.current_step)
+    ? snapshot.current_step : null;
+  const next = !autopilotPlanDirty && Number.isInteger(snapshot.next_step)
+    ? snapshot.next_step : null;
+  const catalog = autopilotSceneCatalog();
+  const sceneKey = JSON.stringify(Array.from(catalog.entries()));
+  const renderKey = JSON.stringify({
+    draft: autopilotDraft,
+    scenes: sceneKey,
+    current,
+    next,
+  });
+  if (autopilotStepList.dataset.renderKey === renderKey) return;
+  autopilotStepList.dataset.renderKey = renderKey;
+  autopilotRepeat.value = autopilotDraft.repeat === 'once' ? 'once' : 'loop';
+  autopilotStepList.replaceChildren();
+
+  autopilotDraft.steps.forEach((step, index) => {
+    const sceneId = validAutopilotSceneId(step.scene_id);
+    const missing = sceneId !== null && !catalog.has(sceneId);
+    const row = document.createElement('article');
+    row.className = `autopilot-step-row${index === current ? ' current' : ''}${index === next ? ' next' : ''}${missing ? ' missing' : ''}`;
+    row.dataset.stepIndex = String(index);
+    if (sceneId !== null) row.dataset.sceneId = String(sceneId);
+    row.setAttribute('role', 'listitem');
+
+    const ordinal = document.createElement('span');
+    ordinal.className = 'autopilot-step-number';
+    ordinal.textContent = String(index + 1);
+    ordinal.setAttribute('aria-hidden', 'true');
+
+    const sceneLabel = document.createElement('label');
+    sceneLabel.className = 'visually-hidden';
+    sceneLabel.htmlFor = `autopilot-scene-${index}`;
+    sceneLabel.textContent = `Autopilot step ${index + 1} Scene`;
+    const sceneSelect = document.createElement('select');
+    sceneSelect.id = `autopilot-scene-${index}`;
+    sceneSelect.className = 'autopilot-scene-select';
+    sceneSelect.setAttribute('aria-label', `Autopilot step ${index + 1} Scene`);
+    if (missing) {
+      const tombstone = new Option(`Missing Scene ${sceneId} (kept)`, String(sceneId));
+      tombstone.dataset.tombstone = '';
+      sceneSelect.appendChild(tombstone);
+    }
+    for (const [candidateId, name] of catalog) {
+      sceneSelect.appendChild(new Option(`${name} [${candidateId}]`, String(candidateId)));
+    }
+    if (sceneId !== null) sceneSelect.value = String(sceneId);
+    sceneSelect.addEventListener('change', () => {
+      const selected = validAutopilotSceneId(sceneSelect.value);
+      if (selected !== null) autopilotDraft.steps[index].scene_id = selected;
+      markAutopilotPlanDirty();
+      renderAutopilotPlanEditor();
+    });
+
+    const beatsLabel = document.createElement('label');
+    beatsLabel.className = 'autopilot-beats-label';
+    beatsLabel.htmlFor = `autopilot-hold-${index}`;
+    beatsLabel.textContent = 'Beats';
+    const beatsInput = document.createElement('input');
+    beatsInput.id = `autopilot-hold-${index}`;
+    beatsInput.className = 'autopilot-hold-beats';
+    beatsInput.type = 'number';
+    beatsInput.min = '1';
+    beatsInput.max = String(AUTOPILOT_MAX_HOLD_BEATS);
+    beatsInput.step = '1';
+    beatsInput.inputMode = 'numeric';
+    beatsInput.value = String(step.hold_beats ?? 4);
+    beatsInput.setAttribute('aria-label', `Autopilot step ${index + 1} hold beats`);
+    beatsInput.addEventListener('input', () => {
+      const beats = Number(beatsInput.value);
+      autopilotDraft.steps[index].hold_beats = Number.isInteger(beats) ? beats : beatsInput.value;
+      markAutopilotPlanDirty();
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'autopilot-step-actions';
+    actions.setAttribute('role', 'group');
+    actions.setAttribute('aria-label', `Autopilot step ${index + 1} order commands`);
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.className = 'autopilot-step-up';
+    up.textContent = '↑';
+    up.disabled = index === 0;
+    up.setAttribute('aria-label', `Move Autopilot step ${index + 1} up`);
+    up.addEventListener('click', () => moveAutopilotStep(index, -1));
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.className = 'autopilot-step-down';
+    down.textContent = '↓';
+    down.disabled = index + 1 === autopilotDraft.steps.length;
+    down.setAttribute('aria-label', `Move Autopilot step ${index + 1} down`);
+    down.addEventListener('click', () => moveAutopilotStep(index, 1));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'autopilot-step-remove';
+    remove.textContent = '×';
+    remove.setAttribute('aria-label', `Remove Autopilot step ${index + 1}`);
+    remove.addEventListener('click', () => removeAutopilotStep(index));
+    actions.append(up, down, remove);
+
+    row.append(ordinal, sceneLabel, sceneSelect, beatsLabel, beatsInput, actions);
+    autopilotStepList.appendChild(row);
+  });
+
+  if (autopilotDraft.steps.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'autopilot-empty';
+    empty.textContent = catalog.size
+      ? 'No steps. Add a Scene to author the sequence.'
+      : 'Capture a Scene before adding an Autopilot step.';
+    autopilotStepList.appendChild(empty);
+  }
+}
+
+function syncAutopilot(snapshot = {}, scenes = []) {
+  latestAutopilotSnapshot = snapshot || {};
+  latestAutopilotScenes = Array.isArray(scenes) ? scenes : [];
+  const authoritativePlan = normalizeAutopilotPlan(snapshot?.plan);
+  const authoritativeKey = autopilotPlanKey(authoritativePlan);
+  if (autopilotPendingPlanKey && authoritativeKey === autopilotPendingPlanKey) {
+    autopilotPlanDirty = false;
+    autopilotPendingPlanKey = null;
+  }
+  if (!autopilotPlanDirty) autopilotDraft = cloneAutopilotPlan(authoritativePlan);
+  renderAutopilotPlanEditor();
+
+  const phase = ['stopped', 'starting', 'running', 'paused', 'stalled', 'faulted', 'complete']
+    .includes(snapshot?.phase) ? snapshot.phase : 'stopped';
+  const current = Number.isInteger(snapshot?.current_step) ? snapshot.current_step : null;
+  const next = Number.isInteger(snapshot?.next_step) ? snapshot.next_step : null;
+  if (autopilotPhase) autopilotPhase.textContent = phase.replace('_', ' ');
+  if (autopilotCurrent) autopilotCurrent.textContent = autopilotStepName(authoritativePlan, current, scenes);
+  if (autopilotNext) autopilotNext.textContent = autopilotStepName(authoritativePlan, next, scenes);
+  if (autopilotBeats) {
+    autopilotBeats.textContent = Number.isInteger(snapshot?.beats_remaining)
+      ? String(snapshot.beats_remaining)
+      : '—';
+  }
+  if (autopilotPlay) autopilotPlay.disabled = authoritativePlan.steps.length === 0;
+  if (autopilotPause) autopilotPause.disabled = !['starting', 'running', 'stalled'].includes(phase);
+  if (autopilotReset) autopilotReset.disabled = phase === 'stopped' && current === null;
+
+  const currentSceneId = current === null ? null : authoritativePlan.steps[current]?.scene_id;
+  const nextSceneId = next === null ? null : authoritativePlan.steps[next]?.scene_id;
+  sceneList?.querySelectorAll('.scene-row').forEach((row) => {
+    const sceneId = validAutopilotSceneId(row.dataset.sceneId);
+    row.classList.toggle('autopilot-current', sceneId !== null && sceneId === currentSceneId);
+    row.classList.toggle('autopilot-next', sceneId !== null && sceneId === nextSceneId);
+  });
+
+  if (!autopilotPlanDirty) {
+    const fallback = authoritativePlan.steps.length
+      ? `${authoritativePlan.steps.length} step${authoritativePlan.steps.length === 1 ? '' : 's'} · ${authoritativePlan.repeat}`
+      : 'No authored Autopilot sequence';
+    setAutopilotEditorStatus(snapshot?.status || fallback, phase === 'faulted');
+  }
+}
+
 function syncPerformance(performanceState = {}) {
   if (!sceneList || !sceneStatus) return;
   const scenes = Array.isArray(performanceState?.scenes) ? performanceState.scenes : [];
@@ -3497,6 +3805,7 @@ function syncPerformance(performanceState = {}) {
       if (!Number.isInteger(sceneId) || sceneId <= 0 || sceneId > 65535) continue;
       const row = document.createElement('article');
       row.className = `scene-row${scene.prepared ? ' prepared' : ''}${scene.pending ? ' pending' : ''}`;
+      row.dataset.sceneId = String(sceneId);
       row.setAttribute('role', 'listitem');
       const bindings = (scene.bindings || []).map((binding) => {
         const donor = layerNames.get(String(binding.layer_id)) || `missing ${binding.layer_id}`;
@@ -3585,6 +3894,7 @@ function syncPerformance(performanceState = {}) {
   sceneStatus.textContent = diagnostics.join(' · ')
     || (scenes.length ? `${scenes.length} authored scene${scenes.length === 1 ? '' : 's'}` : 'No authored scenes');
   sceneStatus.classList.toggle('error', !!performanceState?.image_routing_status);
+  syncAutopilot(performanceState?.autopilot || {}, scenes);
 }
 
 sceneCaptureForm?.addEventListener('submit', (event) => {
@@ -3605,6 +3915,73 @@ sceneCaptureForm?.addEventListener('submit', (event) => {
     sceneStatus.textContent = 'Control connection is offline; the scene was not captured.';
     sceneStatus.classList.add('error');
   }
+});
+
+autopilotRepeat?.addEventListener('change', () => {
+  autopilotDraft.repeat = autopilotRepeat.value === 'once' ? 'once' : 'loop';
+  markAutopilotPlanDirty();
+});
+
+autopilotAddStep?.addEventListener('click', () => {
+  adoptAutopilotControlsIntoDraft();
+  if (autopilotDraft.steps.length >= AUTOPILOT_MAX_STEPS) {
+    setAutopilotEditorStatus(`An Autopilot may contain at most ${AUTOPILOT_MAX_STEPS} steps.`, true);
+    return;
+  }
+  const firstSceneId = autopilotSceneCatalog().keys().next().value;
+  if (!firstSceneId) {
+    setAutopilotEditorStatus('Capture at least one Scene before adding a step.', true);
+    return;
+  }
+  autopilotDraft.steps.push({ scene_id: firstSceneId, hold_beats: 4 });
+  markAutopilotPlanDirty();
+  renderAutopilotPlanEditor();
+  const added = autopilotDraft.steps.length - 1;
+  autopilotStepList?.querySelector(`[data-step-index="${added}"] .autopilot-scene-select`)?.focus();
+});
+
+autopilotPlanForm?.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const read = readAutopilotDraftFromControls(true);
+  if (read.error) {
+    setAutopilotEditorStatus(read.error, true);
+    return;
+  }
+  const plan = read.plan;
+  if (!sendAction({ action: 'replace_autopilot_plan', plan })) {
+    setAutopilotEditorStatus('Control connection is offline; the sequence was not applied.', true);
+    return;
+  }
+  autopilotDraft = cloneAutopilotPlan(plan);
+  autopilotPlanDirty = true;
+  autopilotPendingPlanKey = autopilotPlanKey(plan);
+  setAutopilotEditorStatus(
+    plan.steps.length
+      ? `Applying ${plan.steps.length} Autopilot step${plan.steps.length === 1 ? '' : 's'}…`
+      : 'Clearing the authored Autopilot sequence…',
+  );
+});
+
+function sendAutopilotTransport(action, pendingMessage) {
+  if (action === 'autopilot_play' && autopilotPlanDirty) {
+    setAutopilotEditorStatus('Apply the local sequence edits before pressing Play.', true);
+    return;
+  }
+  if (sendAction({ action })) {
+    setAutopilotEditorStatus(pendingMessage);
+  } else {
+    setAutopilotEditorStatus('Control connection is offline; Autopilot transport was not changed.', true);
+  }
+}
+
+autopilotPlay?.addEventListener('click', () => {
+  sendAutopilotTransport('autopilot_play', 'Starting or resuming Autopilot…');
+});
+autopilotPause?.addEventListener('click', () => {
+  sendAutopilotTransport('autopilot_pause', 'Pausing Autopilot…');
+});
+autopilotReset?.addEventListener('click', () => {
+  sendAutopilotTransport('autopilot_reset', 'Resetting the Autopilot cursor…');
 });
 
 function syncExportAudioLayers(layers) {
@@ -4144,6 +4521,8 @@ const LAYER_PATTERN_SELECT_OPTIONS = {
     ['lissajous', 'Lissajous'], ['rings', 'Rings'], ['starburst', 'Starburst'], ['grid', 'Grid'],
     ['tunnel', 'Tunnel'], ['cells', 'Cells'], ['interference', 'Interference'], ['polygon', 'Polygon'],
     ['mandelbrot', 'Mandelbrot (exact z² + c)'],
+    ['memory_splats', 'Memory Splats (motion trails)'],
+    ['gaussian_splats', 'Gaussian Splats (anisotropic)'],
   ],
   wave: [
     ['sine', 'Sine'], ['triangle', 'Triangle'], ['saw', 'Saw'],
@@ -4737,13 +5116,13 @@ function createLayerCard(layer, index) {
         <span class="value">${Number(layer.effects?.key_shadow ?? 0).toFixed(2)}</span>
       </div>
       <div class="audio-status">This layer's key reveals layers beneath it. Chroma modes use the RGB target and tolerance.</div>
-      <div class="param-row toggle-row layer-master-bypass" title="Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.">
+      <div class="param-row toggle-row layer-master-bypass" title="Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.">
         <label>Bypass Master FX</label>
         <label class="toggle">
           <input type="checkbox" ${layer.bypass_master_fx ? 'checked' : ''} aria-label="Bypass Master FX for layer ${index + 1}" aria-describedby="layer-master-bypass-help-${index}">
           <span class="toggle-slider"></span>
         </label>
-        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; Temporal still affects the final program.</span>
+        <span id="layer-master-bypass-help-${index}" class="visually-hidden">Skips Digital/Analog/Cellular/Motion/VHS master processing; own Layer FX/opacity/key/blend remain; any contributing bypass links the shared Temporal family dry for the whole program while history stays warm.</span>
       </div>
       <div class="layer-random-controls" role="group" aria-label="Layer ${index + 1} deterministic random pattern">
         <label>Seed <input class="layer-random-seed seed-input" type="number" min="0" max="4294967295" step="1" inputmode="numeric" value="${Number(layer.effects?.random_seed || 0) >>> 0}" aria-label="Layer ${index + 1} pattern seed" title="Zero restores the legacy pattern"></label>
@@ -5879,6 +6258,7 @@ const MOD_TARGETS = [
   ['temporal_key_threshold', 'Temporal Key Threshold'],
   ['temporal_key_softness', 'Temporal Key Softness'],
   ['temporal_key_history', 'Temporal Key History'],
+  ['temporal_long_exposure_amount', 'Temporal Long Exposure'],
   ['motion_shutter_angle', 'Motion Shutter Angle'],
   ['motion_shutter_phase', 'Motion Shutter Phase'],
   ['motion_shutter_curvature', 'Motion Shutter Curvature'],
@@ -5965,6 +6345,7 @@ const LFO_SHAPES = [
   ['square', 'Sqr'],
   ['sample_hold', 'S&H'],
 ];
+const NUM_LFOS = 8;
 
 const LFO_RATES = [
   [16, '4 bars'],
@@ -6019,8 +6400,9 @@ function optionsHtml(pairs, selected, groups = null) {
     .join('');
 }
 
-// Build the 4 static LFO rows once.
-for (let i = 0; i < 4; i++) {
+// Build the fixed engine LFO bank once. Lanes 5–8 remain neutral until a
+// routing selects them, exactly like an untouched legacy lane.
+for (let i = 0; i < NUM_LFOS; i++) {
   const row = document.createElement('div');
   row.className = 'lfo-row';
   row.dataset.lfo = i;
@@ -6056,6 +6438,10 @@ const MOD_SOURCES = [
   ['lfo1', 'L2'],
   ['lfo2', 'L3'],
   ['lfo3', 'L4'],
+  ['lfo4', 'L5'],
+  ['lfo5', 'L6'],
+  ['lfo6', 'L7'],
+  ['lfo7', 'L8'],
   ['audio_level', 'Level'],
   ['audio_bass', 'Bass'],
   ['audio_mid', 'Mid'],
