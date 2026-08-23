@@ -26383,8 +26383,9 @@ impl ApplicationHandler for App {
                                     // carries the sampled NTSC params and the
                                     // worker runs VHS after mosh in the same hop, so
                                     // the NTSC worker is deliberately unfed while
-                                    // the mosh is armed — one admission, one
-                                    // frame of latency, the exact offline order.
+                                    // the mosh is armed — one latest-only admission,
+                                    // no second queue, and the exact offline order;
+                                    // completion is host-dependent.
                                     let worker = self
                                         .mosh_worker
                                         .get_or_insert_with(codec_mosh::MoshWorker::new);

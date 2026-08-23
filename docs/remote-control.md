@@ -415,9 +415,9 @@ error status. The additive metric snapshot defaults to zero with the active path
 off when absent, preserving older-client compatibility.
 
 When both stages are active, Codec Mosh and VHS share the bounded latest-only
-worker hop in Mosh→VHS order. Asynchronous completion occupies one to two
-audience frames without chaining a second worker; blackout remains the
-absolute operation after the completed replacement.
+worker hop in Mosh→VHS order. There is no backlog or second queued worker;
+completion latency depends on output size, settings, and hardware. Blackout
+remains the absolute operation after the completed replacement.
 
 ### Random / Dice
 

@@ -516,9 +516,9 @@ pub struct MoshFrameMetadata {
     /// When the live final-program VHS path is active while the mosh is armed,
     /// the worker runs the VHS kernel after Codec Mosh in the same hop — one
     /// admission, one latest-only asynchronous hop, and the exact offline
-    /// ordering (mosh, then VHS, on the same pixels). Completion occupies one
-    /// to two audience frames. `None` when VHS is disabled or when an isolated
-    /// Temporal-bypass route owns the dry overlay.
+    /// ordering (mosh, then VHS, on the same pixels). Completion is
+    /// host-dependent; queue depth remains bounded. `None` when VHS is disabled
+    /// or when an isolated Temporal-bypass route owns the dry overlay.
     pub ntsc: Option<crate::ntsc::NtscFrameMetadata>,
 }
 

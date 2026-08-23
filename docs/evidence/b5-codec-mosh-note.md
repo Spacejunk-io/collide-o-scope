@@ -65,9 +65,9 @@ a bounded motion wake around it.
   lazily constructed on the first armed frame. `MoshFrameMetadata` travels
   with the pixels on the readback tag. When VHS is also armed, that same worker
   hop runs **Mosh then VHS** — one admission and one latest-only asynchronous
-  hop whose completion occupies one to two audience frames. Results are
-  generation-checked before replacement; blackout remains the final absolute
-  operation.
+  hop with no backlog or second queued stage. Completion latency depends on
+  output size, settings, and hardware. Results are generation-checked before
+  replacement; blackout remains the final absolute operation.
 - **One audience order everywhere:** creative composition / Temporal → Codec
   Mosh → final-program VHS → blackout. Master bypass is resolved during
   creative composition and does not create a selective or per-layer VHS path.
@@ -115,10 +115,10 @@ a bounded motion wake around it.
 `threads = 1` decode to equal framemd5 sequences (the `_repeat`
 assertion). **Cross-machine bit-identity is explicitly not claimed** — a
 different libavcodec build may encode differently — and the sidecar's
-encoder identity is the record of why. The stage's documented live costs
-are one to two frames of audience latency and the occasional deliberate
-re-acquisition (bitrate sweeps and decoder deaths snap the picture back);
-both are behavior, not defects.
+encoder identity is the record of why. The stage's documented live costs are
+host-dependent asynchronous completion with bounded latest-only admission and
+the occasional deliberate re-acquisition (bitrate sweeps and decoder deaths
+snap the picture back); both are behavior, not defects.
 
 The motion wake and codec history remain program-level. Layer Mosh Send is a
 spatial influence field over that one result, not an assertion of separate
