@@ -3395,10 +3395,11 @@ pub struct Renderer {
     // blackout clear and before asynchronous global VHS replacement),
     // published only at the frame-acceptance decision. Unlike the held
     // audience snapshot it IS sampled — any image tap can route it — so it
-    // carries TEXTURE_BINDING and its own view. `program_tap_valid` is the
-    // admission fact the planner consumes: false until the first accepted
-    // frame publishes, false again after an explicit invalidation (patch
-    // load), and false in every freshly built renderer by construction.
+    // carries TEXTURE_BINDING and its own view. The route is admitted for this
+    // resource's whole lifetime; `program_tap_valid` is only content readiness:
+    // false until the first accepted frame publishes, false again after an
+    // explicit invalidation (patch load), and false in every freshly built
+    // renderer by construction.
     program_tap_texture: wgpu::Texture,
     program_tap_view: wgpu::TextureView,
     program_tap_valid: bool,
@@ -3782,9 +3783,10 @@ impl Renderer {
             view_formats: &[],
         });
         // wgpu guarantees zero initialization, so before the first publish the
-        // tap reads defined transparent black rather than uninitialized data —
-        // though the planner keeps unpublished routes on the named diagnostic
-        // path and nothing binds it until `program_tap_valid` is true.
+        // tap contains defined transparent black rather than uninitialized
+        // data. Live leaves the persistent route unbound until
+        // `program_tap_valid` is true, and the executor supplies its own zero
+        // fallback with `donor_valid=false` in that cold interval.
         let program_tap_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Program re-entry tap"),
             size: wgpu::Extent3d {
@@ -4411,9 +4413,16 @@ impl Renderer {
         self.program_tap_valid = true;
     }
 
-    /// Whether the tap holds a committed frame. This is the planner's
-    /// admission fact: before the first publish (and after an invalidation) a
-    /// routed tap resolves transparent with a named diagnostic.
+    /// The persistent programme-tap route is supported whenever a Renderer
+    /// exists because its backing texture is allocated with the renderer.
+    /// Content readiness is deliberately separate in `program_tap_valid`.
+    pub const fn program_tap_route_supported(&self) -> bool {
+        true
+    }
+
+    /// Whether the persistent tap holds a committed frame. Before the first
+    /// publish (and after invalidation), planning still retains the route while
+    /// `program_tap_view` leaves its executor binding unready and neutral.
     pub fn program_tap_valid(&self) -> bool {
         self.program_tap_valid
     }

@@ -4750,9 +4750,8 @@ fn plan_export_composition_inner(
             .with_gesture_canvas(true)
             // The offline tap surface exists for the whole job and frame
             // zero reads its defined-transparent contents, so admission is
-            // unconditional — the same shape as the canvas above. Live
-            // admission flips true at the first accepted frame, after which
-            // both sides plan a routed tap identically.
+            // unconditional — the same capability law as live. Content
+            // readiness changes the executor binding, never route topology.
             .with_program_tap(true)
             .with_studies(&graph.studies)
             .with_authored_motion_modulation(
@@ -5499,7 +5498,7 @@ fn run_export(
     // The B16 programme re-entry tap: one retained copy of final slot 2,
     // published at the acceptance decision exactly as live publishes it. wgpu
     // zero initialization keeps frame zero's routed taps defined transparent,
-    // pixel-identical to live's pre-first-commit diagnostic resolution.
+    // pixel-identical to live's unbound pre-first-commit fallback.
     let program_tap_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Export program re-entry tap"),
         size: wgpu::Extent3d {
@@ -5515,6 +5514,11 @@ fn run_export(
         view_formats: &[],
     });
     let program_tap_view = program_tap_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    // Capability is job-lifetime, but readiness begins cold exactly as live.
+    // This distinction matters for every routed rack kind, not only Displace:
+    // an inverted mask or Symmetry fallback can distinguish a valid transparent
+    // donor from an unavailable one even when their sampled texels are equal.
+    let mut program_tap_valid = false;
     // Codec Mosh is a synchronous CPU replacement. When a top prefix bypasses
     // Temporal, retain the pre-mosh wet+dry programme transactionally until
     // ffmpeg accepts the corresponding moshed-wet+dry frame. The surface stays
@@ -6888,14 +6892,18 @@ fn run_export(
                     },
                     None => crate::renderer::composition::GestureCanvasBinding::default(),
                 });
-                // The programme tap binds the job-lifetime export surface
-                // under a constant epoch: the texture never rebuilds inside
-                // one job, so the tap bind groups are built against it
-                // exactly once.
-                executor.bind_program_tap(crate::renderer::composition::ProgramTapBinding::bound(
-                    program_tap_view.clone(),
-                    1,
-                ));
+                // Match live readiness exactly: the route is planned for the
+                // job's whole lifetime, but frame zero is unbound until one
+                // frame reaches the acceptance seam below. The texture never
+                // rebuilds inside a job, so every later frame uses epoch one.
+                executor.bind_program_tap(if program_tap_valid {
+                    crate::renderer::composition::ProgramTapBinding::bound(
+                        program_tap_view.clone(),
+                        1,
+                    )
+                } else {
+                    crate::renderer::composition::ProgramTapBinding::default()
+                });
                 match executor.prepare(&device, &queue, &evaluated_composition, &source_descriptors)
                 {
                     Ok(CompositionPreparedKind::Advanced { .. }) => {}
@@ -7689,6 +7697,7 @@ fn run_export(
                 },
             );
             queue.submit(std::iter::once(tap_encoder.finish()));
+            program_tap_valid = true;
         }
         if advanced_history_staged {
             if let Some(executor) = composition_gpu.as_mut() {
@@ -14086,6 +14095,14 @@ layers:
             source[build..build + 900].contains("wgpu::TextureUsages::TEXTURE_BINDING"),
             "the tap is a routable sampled surface, unlike the held-audience copy"
         );
+        let frame_loop = source
+            .find("for frame_num in 0..total_frames")
+            .expect("the offline render loop exists");
+        let cold_readiness = concat!("let mut program_tap_", "valid = false;");
+        assert!(
+            source[build..frame_loop].contains(cold_readiness),
+            "the persistent route must begin content-cold just as live does"
+        );
 
         let bind = source
             .find("executor.bind_program_tap(")
@@ -14097,6 +14114,11 @@ layers:
             prepare > 0,
             "the tap must be bound before prepare builds the tap bind groups"
         );
+        assert!(
+            source[bind..bind + prepare].contains("if program_tap_valid")
+                && source[bind..bind + prepare].contains("ProgramTapBinding::default()"),
+            "frame zero must retain the route while binding an unready donor"
+        );
 
         let publish = source
             .find("label: Some(\"Export program tap publish\"),")
@@ -14104,6 +14126,17 @@ layers:
         assert!(
             source[..publish].contains("temporal_state.commit_staged();"),
             "publication belongs after the frame reached ffmpeg, not before it"
+        );
+        let accepted_tail = &source[publish..publish + 1_500];
+        let submitted = accepted_tail
+            .find("queue.submit(std::iter::once(tap_encoder.finish()));")
+            .expect("the accepted tap copy is submitted");
+        let ready = accepted_tail
+            .find("program_tap_valid = true;")
+            .expect("accepted publication marks the tap ready");
+        assert!(
+            submitted < ready,
+            "readiness must publish only after the accepted copy is submitted"
         );
         // The ordinary copy reads final slot 2. Isolated Codec Mosh instead
         // selects the retained pre-mosh wet+dry candidate, so the tap never
@@ -14114,8 +14147,8 @@ layers:
                 && source[publish..publish + 900].contains("texture: program_tap_source,"),
             "the offline tap copy must select the deliberate pre-mosh programme source"
         );
-        // Admission is unconditional offline: the surface exists for the whole
-        // job and frame zero reads its defined-transparent contents.
+        // Admission is unconditional offline because the surface exists for
+        // the whole job; the readiness guard above keeps frame zero unbound.
         assert!(
             source.contains(".with_program_tap(true)"),
             "the offline planner admits the job-lifetime tap unconditionally"

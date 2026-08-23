@@ -6194,7 +6194,7 @@ impl App {
         .with_program_tap(
             self.renderer
                 .as_ref()
-                .is_some_and(renderer::Renderer::program_tap_valid),
+                .is_some_and(renderer::Renderer::program_tap_route_supported),
         )
         .with_studies(&self.study_library)
         .with_authored_motion_modulation(mod_matrix.has_authored_motion_routing());
@@ -7833,8 +7833,8 @@ impl App {
             renderer.reset_visual_generation_for(temporal::TemporalResetCause::PatchGeneration);
             // A new program generation must not composite its first frame
             // through the previous program's audience image. The next
-            // accepted frame re-publishes; until then a routed tap is the
-            // named transparent diagnostic.
+            // accepted frame re-publishes; until then the stable route remains
+            // present but its unbound donor is defined neutral.
             renderer.invalidate_program_tap();
         }
         if let Some(executor) = self.composition_gpu.as_mut() {
@@ -24374,7 +24374,7 @@ impl ApplicationHandler for App {
                             advanced_program_history_initialized,
                         )
                         .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
-                        .with_program_tap(renderer.program_tap_valid())
+                        .with_program_tap(renderer.program_tap_route_supported())
                         .with_studies(&self.study_library)
                         .with_authored_motion_modulation(
                             self.mod_matrix.has_authored_motion_routing(),
@@ -24452,7 +24452,7 @@ impl ApplicationHandler for App {
                                 advanced_program_history_initialized,
                             )
                             .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
-                            .with_program_tap(renderer.program_tap_valid())
+                            .with_program_tap(renderer.program_tap_route_supported())
                             .with_studies(&self.study_library)
                             .with_authored_motion_modulation(
                                 self.mod_matrix.has_authored_motion_routing(),
@@ -24544,7 +24544,7 @@ impl ApplicationHandler for App {
                                 )
                                 .with_layer_mattes(&authored_layer_mattes, false)
                                 .with_gesture_canvas(self.gesture_canvas_plan.canvases > 0)
-                                .with_program_tap(renderer.program_tap_valid())
+                                .with_program_tap(renderer.program_tap_route_supported())
                                 .with_studies(&self.study_library)
                                 .with_authored_motion_modulation(
                                     self.mod_matrix.has_authored_motion_routing(),
@@ -35540,15 +35540,33 @@ mod app_state_tests {
             "blackout's clear must remain the absolute final audience operation, after the copy"
         );
 
-        // Live admission is the renderer's published-validity fact at every
-        // in-loop plan construction, so the first accepted frame re-plans a
-        // routed tap from the named transparent diagnostic to the tap itself.
-        // (Concatenated so this test's own literal cannot count itself.)
-        let admission = concat!(".with_program_tap(renderer.", "program_tap_valid())");
+        // Live planning follows persistent resource capability, never the
+        // frame-local committed-content bit. This keeps the authored RackNode
+        // in one topology while the first unbound frame remains neutral and
+        // the next accepted frame makes its donor ready. (Concatenated so this
+        // test's own literal cannot count itself.)
+        let admission = concat!(
+            ".with_program_tap(renderer.",
+            "program_tap_route_supported())"
+        );
         assert_eq!(
             source.matches(admission).count(),
             3,
-            "all three in-loop plan constructions consult the renderer's tap validity"
+            "all three in-loop plan constructions consult tap capability"
+        );
+        let preflight = concat!(
+            ".is_some_and(renderer::Renderer::",
+            "program_tap_route_supported)"
+        );
+        assert_eq!(
+            source.matches(preflight).count(),
+            1,
+            "creative preflight must use the same tap-capability law"
+        );
+        let readiness_as_admission = concat!(".with_program_tap(renderer.", "program_tap_valid())");
+        assert!(
+            !source.contains(readiness_as_admission),
+            "content readiness must never mutate live RackNode topology"
         );
 
         // A new program generation invalidates the tap beside the renderer's
