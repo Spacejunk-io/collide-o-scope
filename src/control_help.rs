@@ -808,7 +808,7 @@ pub static CONTROL_HELP: &[HelpEntry] = &[
     entry(
         Ntsc,
         "enabled",
-        "Runs composite VHS once over the finished programme, independently of per-layer Master bypass. It follows Codec Mosh in their shared bounded worker hop (Mosh then VHS), so it costs one frame of latency rather than adding another hop.",
+        "Runs composite VHS once over the finished programme, independently of per-layer Master bypass. It follows Codec Mosh in their shared bounded worker hop (Mosh then VHS), retaining the documented one-to-two-audience-frame live cost without adding another worker hop.",
     ),
     entry(Ntsc, "tape_speed", "Which tape speed is being emulated. Slower speeds carry less bandwidth and degrade more."),
     entry(Ntsc, "composite_noise_intensity", "How much noise rides on the composite signal as a whole."),

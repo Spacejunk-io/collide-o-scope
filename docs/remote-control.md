@@ -415,9 +415,9 @@ error status. The additive metric snapshot defaults to zero with the active path
 off when absent, preserving older-client compatibility.
 
 When both stages are active, Codec Mosh and VHS share the bounded latest-only
-worker hop in Mosh→VHS order. This retains one asynchronous frame of live
-latency rather than chaining a second worker; blackout remains the absolute
-operation after the completed replacement.
+worker hop in Mosh→VHS order. Asynchronous completion occupies one to two
+audience frames without chaining a second worker; blackout remains the
+absolute operation after the completed replacement.
 
 ### Random / Dice
 
@@ -751,7 +751,7 @@ recording-audio claim.
 
 **STAGE HEALTH → Preview HUD** paints FPS, p50/p95/p99 frame time, missed
 deadlines, per-layer decode age/queue/drop state, active output identity/mode,
-and known media/performance/NTSC/motion budgets on the editor preview only. The
+and known media/performance/Mosh-Send/motion budgets on the editor preview only. The
 HUD cannot enter audience, Composite, Spout, recording, or export pixels.
 
 `StageMap` is a separately persisted venue YAML document, never PatchState.

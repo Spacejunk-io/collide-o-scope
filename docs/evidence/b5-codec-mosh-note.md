@@ -64,9 +64,10 @@ a bounded motion wake around it.
   with the error named in the additive `AppSnapshot::codec_mosh` block,
   lazily constructed on the first armed frame. `MoshFrameMetadata` travels
   with the pixels on the readback tag. When VHS is also armed, that same worker
-  hop runs **Mosh then VHS** — one admission and one asynchronous frame of live
-  latency. Results are generation-checked before replacement; blackout remains
-  the final absolute operation.
+  hop runs **Mosh then VHS** — one admission and one latest-only asynchronous
+  hop whose completion occupies one to two audience frames. Results are
+  generation-checked before replacement; blackout remains the final absolute
+  operation.
 - **One audience order everywhere:** creative composition / Temporal → Codec
   Mosh → final-program VHS → blackout. Master bypass is resolved during
   creative composition and does not create a selective or per-layer VHS path.
@@ -142,7 +143,7 @@ enter Codec Mosh.
 | Staging | one full-frame RGBA job vec, shared with final-program VHS |
 | Layer-send GPU resources | Lazy only below full send: 2×R8 + 1×RGBA8 = 6 nominal texel bytes/output pixel (backend alignment/metadata excluded) |
 | Layer-send resource churn | 0 per-layer buffers/bind groups after source-cache warmup; dynamic uniform arenas grow only with admitted layer topology |
-| Layer-send GPU work | Default/unkeyed/unwarped layer: one R8 composite; support-changing layer: one base-FX coverage + one R8 composite; then one byte copy + alpha-only pack |
+| Layer-send GPU work | Default/unkeyed/unwarped layer: one R8 composite; support-changing layer: one base-FX coverage + one R8 composite; then one full-frame RGBA texture copy + one alpha-only pack pass |
 | New readbacks or worker hops | 0 |
 | New wire actions | 0 (twelve `mosh_*` params ride `set_temporal`; `mosh_send` rides `set_layer_param`) |
 

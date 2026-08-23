@@ -8304,7 +8304,7 @@ function syncStageHealth(health = {}) {
   const budgets = health?.budgets || {};
   document.getElementById('stage-health-budgets').textContent = [
     budgetText('GPU', budgets.gpu), budgetText('media', budgets.media),
-    budgetText('NTSC', budgets.ntsc), budgetText('motion', budgets.motion),
+    budgetText('Mosh send', budgets.ntsc), budgetText('motion', budgets.motion),
   ].join(' · ');
   const rows = (Array.isArray(health?.layers) ? health.layers : []).slice(0, 256).map(layer => {
     const row = document.createElement('div');

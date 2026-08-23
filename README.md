@@ -162,8 +162,8 @@ cancelled chooser leaves the current library and program state unchanged.
   blocking the render thread. The audience order is **creative composition /
   Temporal → Codec Mosh → final-program VHS → blackout**, independent of
   per-layer **Bypass Master FX**. When Codec Mosh is armed, Mosh and VHS share
-  one bounded worker hop in that order, preserving the one-frame asynchronous
-  latency.
+  one bounded worker hop in that order; asynchronous completion occupies one
+  to two audience frames without paying for a second queued stage.
 - Provides a separate **Bypass Temporal FX** layer control for an exact dry
   top overlay in an admitted flat LegacyExact Program stack. Lower inherited
   layers keep the complete Temporal family, while the contiguous Layer 1/top
